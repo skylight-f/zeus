@@ -56,7 +56,7 @@ import { taskAgentRunStatusLabels } from '../../task/TaskRunStatusChip.js';
 import { WorkspaceDrawer } from '../../ui/WorkspaceDrawer.js';
 import { CommandCenterPanel } from '../../CommandCenterPanel.js';
 import { ProjectSourceWorkspace } from '../../code/ProjectSourceWorkspace.js';
-import { formatRuntimeAdapterDetectionFacts, InlineRecoveryPrompt, ProjectCreateDialog, ProjectStartGuide, ProjectWorkspaceModeToolbar, SidebarNav } from './WorkspaceChrome.js';
+import { formatRuntimeAdapterDetectionFacts, InlineRecoveryPrompt, ProjectCreateDialog, ProjectStartGuide, ProjectWorkspaceNavigation, SidebarNav } from './WorkspaceChrome.js';
 import { GENERIC_SHELL_CRITICAL_CONFIRMATION_PHRASE } from './workspaceFormatters.js';
 import {
   browserNativeConversationStartStorage,
@@ -562,10 +562,14 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     .filter((group) => group.items.length > 0);
   const visibleSettingsItems = visibleSettingsGroups.flatMap((group) => group.items);
   const settingsNavigationTabStop = visibleSettingsItems.some(([id]) => id === settingsCategory) ? settingsCategory : visibleSettingsItems[0]?.[0];
+  const projectWorkspaceNavigationVisible = Boolean(selectedProject);
+  /** 会话使用项目/会话来源列表；其他模式由各自工作区提供紧邻活动栏的上下文导航。 */
+  const projectSessionSourceListVisible =
+    Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
 
   return (
     <main
-      className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${activeProjectSection === 'sessions' && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' ? ' session-codex-parity-v1' : ''}`}
+      className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${projectSessionSourceListVisible ? ' session-codex-parity-v1 project-session-source-list-shell' : ''}${projectWorkspaceNavigationVisible ? ' project-navigation-rail-shell' : ''}`}
       data-theme={appShellSettings.appearance}
       data-language={appShellSettings.appLanguage}
       data-project-sidebar-resizing={projectSidebarResizing ? 'true' : 'false'}
@@ -753,11 +757,29 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           />
         ) : null}
       </MotionPresence>
-      {activeNavTarget !== 'settings' ? (
+      {projectWorkspaceNavigationVisible && selectedProject ? (
+        <ProjectWorkspaceNavigation
+          project={selectedProject}
+          projects={orderedProjects}
+          onSelectProject={(project) => openProjectView(project, activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          canCreateProject={projectCreationReady && !creatingProjectBusy}
+          createProjectBusy={creatingProjectBusy}
+          activeNavTarget={activeNavTarget}
+          section={activeProjectSection}
+          codeMode={projectCodeWorkspaceMode}
+          language={appShellSettings.appLanguage}
+          onOpen={(section, codeMode) => openProjectView(selectedProject, section, codeMode)}
+          onNavigate={handleMainNavigate}
+          onCreateProject={openProjectCreateDialog}
+          onCreateConversation={prepareNewConversationDraft}
+        />
+      ) : null}
+      {activeNavTarget !== 'settings' && (!selectedProject || projectSessionSourceListVisible) ? (
         <SidebarNav
           activeNavTarget={activeNavTarget}
           activeProjectId={activeProjectId}
           activeProjectSection={activeProjectSection}
+          activeProjectCodeMode={projectCodeWorkspaceMode}
           projects={orderedProjects}
           pinnedProjectIds={appShellSettings.pinnedProjectIds}
           collapsedProjectIds={appShellSettings.collapsedProjectIds}
@@ -786,7 +808,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           pendingProjectDeleteId={pendingProjectDeleteId}
         />
       ) : null}
-      {activeNavTarget !== 'settings' ? (
+      {projectSessionSourceListVisible ? (
         <div
           className="project-sidebar-resizer"
           role="separator"
@@ -817,18 +839,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               const choice = await props.nativeConversationClient.loadNativeConversationChoice(run.projectId, run.conversationId);
               await selectNativeConversation(choice);
             }}
-          />
-        ) : null}
-        {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && selectedProject ? (
-          <ProjectWorkspaceModeToolbar
-            project={selectedProject}
-            projects={orderedProjects}
-            onSelectProject={(project) => openProjectView(project, activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
-            section={activeProjectSection}
-            codeMode={projectCodeWorkspaceMode}
-            language={appShellSettings.appLanguage}
-            onOpen={(section, codeMode) => openProjectView(selectedProject, section, codeMode)}
-            onCreateConversation={prepareNewConversationDraft}
           />
         ) : null}
         {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'code' && selectedProject ? (
