@@ -105,9 +105,11 @@ export function resolveNativeConversationSelectionPresentation(conversation: Nat
   return interactiveConversationStages.has(conversation.stage) ? 'interactive' : 'history';
 }
 
-export type TaskConversationDrawerTarget =
+/** 顶部入口与任务状态共用会话抽屉，并保留所属项目及稳定导航身份。 */
+export type SessionDrawerTarget =
   | Readonly<{
-      taskId: string;
+      projectId: string;
+      taskId?: string;
       conversationId: string;
       navigationId: string;
       status: 'opening' | 'error';
@@ -751,9 +753,10 @@ export function resolveSessionDrawerInitialFocusTarget(drawer: HTMLElement): HTM
   return drawer.querySelector<HTMLElement>('button:not(:disabled), [tabindex="0"]') ?? drawer;
 }
 
+/** 在所属项目内统一解析真实会话身份与创建期间保留的导航身份。 */
 export function resolveSelectedNativeConversationForProject(choices: NativeConversationChoice[], selectedConversationId: string | null, activeProjectId: string | undefined): NativeConversationChoice | null {
   if (!selectedConversationId || !activeProjectId) return null;
-  return choices.find((conversation) => resolveConversationNavigationId(conversation) === selectedConversationId && conversation.projectId === activeProjectId) ?? null;
+  return choices.find((conversation) => (resolveConversationNavigationId(conversation) === selectedConversationId || conversation.id === selectedConversationId) && conversation.projectId === activeProjectId) ?? null;
 }
 
 export function resolveConversationNavigationId(conversation: NativeConversationChoice): string {

@@ -85,22 +85,18 @@ export function ProjectStartGuide(props: { language: AppLanguage; busy: boolean;
         <FolderOpen size={32} weight="regular" />
       </div>
       <h1 id="project-start-title">{zh ? '让想法，从这里开始' : 'Your ideas start here'}</h1>
-      <p className="project-start-description">{zh ? '选择一个工作文件夹，创建项目，开始你的第一个任务。' : 'Choose a working folder, create a project, and start your first task.'}</p>
+      <p className="project-start-description">{zh ? '选择一个工作文件夹，创建你的项目。' : 'Choose a working folder and create your project.'}</p>
       <div className="project-start-action">
         <Button variant="primary" size="regular" onClick={props.onChooseFolder} disabled={props.busy || !props.available} busy={props.busy}>
           <FolderPlus size={18} aria-hidden="true" />
           {zh ? '选择工作文件夹' : 'Choose working folder'}
         </Button>
       </div>
-      <ol className="project-start-steps" aria-label={zh ? '开始工作的三个步骤' : 'Three steps to start'}>
+      <ol className="project-start-steps" aria-label={zh ? '创建项目的两个步骤' : 'Two steps to create a project'}>
         <li aria-current="step">{zh ? '选择文件夹' : 'Choose a folder'}</li>
         <li>
           <span aria-hidden="true">→</span>
-          {zh ? '创建任务' : 'Create a task'}
-        </li>
-        <li>
-          <span aria-hidden="true">→</span>
-          {zh ? '确认并推送' : 'Review and push'}
+          {zh ? '创建项目' : 'Create a project'}
         </li>
       </ol>
       <p className="project-start-note">{zh ? '模型可稍后接入 · 项目与任务保存在本机' : 'Connect a model later · Projects and tasks stay on your Mac'}</p>
@@ -537,28 +533,9 @@ export function ProjectWorkspaceNavigation(props: {
 }) {
   /** 导航文案跟随当前应用语言。 */
   const zh = props.language === 'zh-CN';
-  /** Option 将普通导航临时切换为当前项目的新会话入口。 */
-  const [optionPressed, setOptionPressed] = useState(false);
-  useEffect(() => {
-    const syncOptionState = (event: globalThis.KeyboardEvent) => setOptionPressed(event.altKey);
-    const releaseOption = () => setOptionPressed(false);
-    window.addEventListener('keydown', syncOptionState);
-    window.addEventListener('keyup', syncOptionState);
-    window.addEventListener('blur', releaseOption);
-    return () => {
-      window.removeEventListener('keydown', syncOptionState);
-      window.removeEventListener('keyup', syncOptionState);
-      window.removeEventListener('blur', releaseOption);
-    };
-  }, []);
-  const conversationLabel = optionPressed ? (zh ? '新会话' : 'New conversation') : zh ? '会话' : 'Conversations';
-  const conversationTitle = optionPressed
-    ? zh
-      ? `在“${props.project.name}”中创建新会话`
-      : `Create a new conversation in “${props.project.name}”`
-    : zh
-      ? '打开会话；按住 Option 点击可在当前项目创建新会话'
-      : 'Open conversations; Option-click to create one in the current project';
+  /** 会话入口仍使用 Option 点击创建新会话，避免在窄侧栏重复放置当前会话抽屉按钮。 */
+  const conversationLabel = zh ? '会话' : 'Conversations';
+  const conversationTitle = zh ? '打开会话；按住 Option 点击可在当前项目创建新会话' : 'Open conversations; Option-click to create one in the current project';
   /** 各工作区的可见名称。 */
   const labels: Record<ProjectWorkspaceEntryId, string> = {
     tasks: zh ? '任务' : 'Tasks',
@@ -748,8 +725,8 @@ export function ProjectWorkspaceNavigation(props: {
               </span>
               <span className="project-workspace-mode-label">{label}</span>
             </button>
-          );
-        })}
+            );
+          })}
         <span className="project-workspace-mode-rail-spacer" aria-hidden="true" />
         <button
           type="button"
@@ -1409,7 +1386,8 @@ export function SidebarNav(props: {
                     'data-source-list-item': 'true',
                     'aria-label': `${props.appLanguage === 'zh-CN' ? '项目' : 'Project'}${copy.labelSeparator}${project.name}`,
                     'aria-current': isActiveProject ? 'true' : undefined,
-                    onClick: () => props.onOpenProjectSection(project, props.activeProjectSection === 'project-settings' ? 'tasks' : props.activeProjectSection),
+                    // 侧边栏项目名称固定作为该项目的任务页入口。
+                    onClick: () => props.onOpenProjectSection(project, 'tasks'),
                   }}
                   actions={
                     <>

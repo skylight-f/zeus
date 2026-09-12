@@ -194,7 +194,6 @@ export interface SessionWorkspaceActions {
   onOpenTaskGitReview?: (taskId: string, workspaceId: string | null, mode: 'commit' | 'push-only') => void;
   onOpenTaskGitDelivery?: (taskId: string, workspaceId?: string | null) => void;
   onOpenProjectCommands?: () => void;
-  onOpenImportSettings?: (conversation: NativeConversationChoice) => void;
   onNextTurnSettingsChange?: (settings: ComposerRuntimeSettings) => void | Promise<void>;
   onPermissionModeChange?: (permissionMode: NativePermissionMode) => void | Promise<void>;
   onCollaborationModeChange?: (collaborationMode: NativeCollaborationMode) => void | Promise<void>;
@@ -1643,6 +1642,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const browserSnapshotRef = useRef<ZeusBrowserConversationSnapshot | null>(null);
   const [requestErrors, setRequestErrors] = useState<Record<string, string>>({});
   const [interruptArmed, setInterruptArmed] = useState(false);
+  /** 子智能体列表仅由用户主动打开，历史加载和新增智能体不改变面板状态。 */
   const [contextWorkspace, setContextWorkspace] = useState<SessionContextWorkspace>({ kind: 'none' });
   const contextWorkspaceRef = useRef<SessionContextWorkspace>(contextWorkspace);
   contextWorkspaceRef.current = contextWorkspace;
@@ -1774,8 +1774,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const subagentActivity = useMemo(() => projectSubagentActivity(Object.values(props.state?.items ?? {})), [props.state?.items]);
   const subagentThreadIds = useMemo(() => [...new Set([...subagentActivity.threadIds, ...(props.subagentListSnapshot?.items.map((item) => item.id) ?? [])])].sort(), [props.subagentListSnapshot?.items, subagentActivity.threadIds]);
   const subagentSnapshotRevision = props.subagentListSnapshot?.items.map((item) => `${item.id}:${item.status}:${item.updatedAt ?? ''}`).join('|') ?? '';
-  const subagentSignature = subagentThreadIds.join(',');
-  const autoOpenedSubagentSignatureRef = useRef('');
 
   useLayoutEffect(() => {
     contextReturnFocusRef.current = null;
@@ -1793,19 +1791,10 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     setGoalPanelOpen(false);
     setGoalBusy(false);
     setGoalError(null);
-    autoOpenedSubagentSignatureRef.current = '';
     setBrowserResizing(false);
     setQuickActionsPopoverOpen(false);
     browserResizeActiveRef.current = false;
   }, [escapeController, props.conversation?.id]);
-
-  useEffect(() => {
-    if (!subagentSignature || subagentSignature === autoOpenedSubagentSignatureRef.current) return;
-    autoOpenedSubagentSignatureRef.current = subagentSignature;
-    if (contextWorkspace.kind !== 'none' || !actions.onLoadSubagents || !actions.onLoadSubagentThread) return;
-    setContextFullWidth(false);
-    setContextWorkspace({ kind: 'subagents' });
-  }, [actions.onLoadSubagentThread, actions.onLoadSubagents, contextWorkspace.kind, subagentSignature]);
 
   useEffect(() => {
     if (!props.state || legacy || composerRuntimeSettingsDirtyRef.current) return;
@@ -2519,16 +2508,14 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
               ) : null}
             </div>
           </div>
-          {/* 摘要与详情独占通栏，展开高度不再影响标题栏工具的位置。 */}
-          <div key={`runtime:${displayedHeader.conversationId}`} className="session-thread-subtitle-row">
-            {!legacy && props.state ? (
-              <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} contextLabel={displayedHeader.contextLabel ?? undefined} />
-            ) : displayedHeader.contextLabel ? (
+          {/* 运行详情归左侧正文；旧会话或未就绪会话仅在标题下保留项目名称。 */}
+          {(legacy || !props.state) && displayedHeader.contextLabel ? (
+            <div className="session-thread-subtitle-row">
               <small className="session-thread-project-name" title={displayedHeader.contextLabel}>
                 {displayedHeader.contextLabel}
               </small>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
         </header>
       ) : null}
 
@@ -2546,7 +2533,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
 
       {legacy && props.conversation ? (
         <>
-          <LegacyConversationBanner conversation={props.conversation} language={props.language} onOpenImportSettings={actions.onOpenImportSettings} />
+          <LegacyConversationBanner language={props.language} />
           {props.loadState === 'loading' ? (
             <p className="session-legacy-load-status" role="status" aria-live="polite">
               <span className="session-command-spinner" aria-hidden="true" />
@@ -2582,7 +2569,10 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 data-browser-resizing={browserResizing || undefined}
               >
                 <div className="session-conversation-pane">
-                  {!displayedHeader ? <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} /> : null}
+                  {/* 固定在左栏内挂载，开关右侧工作区不重建详情，也不改变浏览器高度。 */}
+                  <div key={`runtime:${displayedHeader?.conversationId ?? props.state.conversationId}`} className="session-thread-subtitle-row">
+                    <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} contextLabel={displayedHeader?.contextLabel ?? undefined} />
+                  </div>
                   <SessionTranscriptProjection
                     state={props.state}
                     controller={props.stateController}

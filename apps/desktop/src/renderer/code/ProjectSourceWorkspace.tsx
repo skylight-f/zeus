@@ -179,6 +179,8 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   const [loadingTree, setLoadingTree] = useState(true);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 只记录解码失败的内容版本；图片在磁盘更新后可自动重新预览。 */
+  const [failedImageRevision, setFailedImageRevision] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
   useApplicationErrorDialog(error, {
     language: zh ? 'zh-CN' : 'en',
@@ -431,12 +433,8 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
         if (active) setTabs((current) => current.map((candidate) => (candidate.document.relativePath === relativePath ? { ...candidate, document, draft: document.content, externalChange: false } : candidate)));
       } catch {
         if (active) {
+          // 外部删除、重命名或暂时不可访问只更新标签状态，保留内容，不弹出操作失败提示。
           setTabs((current) => current.map((candidate) => (candidate.document.relativePath === relativePath ? { ...candidate, externalChange: true } : candidate)));
-          setError(
-            zh
-              ? `“${relativePath}”已在磁盘中删除、重命名或变得不可访问。标签内容仍保留，可另存为或关闭。`
-              : `“${relativePath}” was deleted, renamed, or became inaccessible on disk. The tab content is retained and can be saved as or closed.`,
-          );
         }
       }
     }
@@ -829,7 +827,9 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
             ))}
           </div>
           {changePreview?.projectId === props.project.id ? (
-            <section className="project-source-change-preview">
+            <>
+              <div className="project-source-editor-track-placeholder" aria-hidden="true" />
+              <section className="project-source-change-preview">
               <header>
                 <span>
                   {changePreview.path} · {changePreview.staged ? (zh ? 'HEAD → 暂存区' : 'HEAD → Index') : zh ? '暂存区 → 工作区' : 'Index → Working tree'}
@@ -843,7 +843,8 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
               ) : (
                 <p>{zh ? '当前快照没有此文件的文本差异，请刷新更改；二进制文件不支持文本对比。' : 'No text diff in this snapshot. Refresh changes; binary files cannot be compared as text.'}</p>
               )}
-            </section>
+              </section>
+            </>
           ) : activeTab ? (
             <>
               <nav className="project-source-breadcrumbs" aria-label={zh ? '文件路径' : 'File path'}>
@@ -851,10 +852,20 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                   <span key={`${part}-${index}`}>{part}</span>
                 ))}
               </nav>
-              {!activeTab.document.editable ? (
+              {activeTab.document.imagePreviewUrl && failedImageRevision !== activeTab.document.revision.sha256 ? (
+                <section className="project-source-image-preview" aria-label={zh ? '图片预览' : 'Image preview'}>
+                  <img
+                    key={`${activeTab.document.relativePath}:${activeTab.document.revision.sha256}`}
+                    src={activeTab.document.imagePreviewUrl}
+                    alt={activeTab.document.name}
+                    decoding="async"
+                    onError={() => setFailedImageRevision(activeTab.document.revision.sha256)}
+                  />
+                </section>
+              ) : !activeTab.document.editable ? (
                 <section className="project-source-readonly" aria-label={zh ? '文件不可编辑' : 'File is read-only'}>
-                  <strong>{zh ? '此文件只能查看或在外部应用中打开' : 'This file is view-only in Zeus'}</strong>
-                  <p>{readOnlyReason(activeTab.document, zh)}</p>
+                  <strong>{activeTab.document.imagePreviewUrl ? (zh ? '无法预览此图片' : 'Unable to preview this image') : zh ? '此文件只能查看或在外部应用中打开' : 'This file is view-only in Zeus'}</strong>
+                  <p>{activeTab.document.imagePreviewUrl ? (zh ? '图片可能已损坏，或当前格式无法解码。' : 'The image may be damaged or cannot be decoded.') : readOnlyReason(activeTab.document, zh)}</p>
                   <Button
                     variant="secondary"
                     onClick={() => {
@@ -882,23 +893,36 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                   />
                 </Suspense>
               )}
-              <footer className="project-source-statusbar">
-                <span>{activeTab.document.language}</span>
-                <span>UTF-8{activeTab.document.hasBom ? ' BOM' : ''}</span>
-                <span>{activeTab.document.eol.toUpperCase()}</span>
-                <span>
-                  Ln {activeTab.cursorLine}, Col {activeTab.cursorColumn}
-                </span>
-                {activeTab.externalChange ? <strong>{zh ? '磁盘内容已变化' : 'Disk content changed'}</strong> : null}
-              </footer>
             </>
           ) : (
-            <section className="project-source-editor-empty">
-              <FolderOpen aria-hidden="true" />
-              <strong>{zh ? '从左侧目录打开一个文件' : 'Open a file from the source tree'}</strong>
-              <span>{zh ? '打开文件后，可以在这里查看和编辑代码。' : 'Open a file to view and edit its code here.'}</span>
-            </section>
+            <>
+              <div className="project-source-editor-track-placeholder" aria-hidden="true" />
+              <section className="project-source-editor-empty">
+                <FolderOpen aria-hidden="true" />
+                <strong>{zh ? '从左侧目录打开一个文件' : 'Open a file from the source tree'}</strong>
+                <span>{zh ? '打开文件后，可以在这里查看和编辑代码。' : 'Open a file to view and edit its code here.'}</span>
+              </section>
+            </>
           )}
+          <footer className="project-source-statusbar">
+            {activeTab ? (
+              activeTab.document.imagePreviewUrl ? (
+                <span>{zh ? '图片 · 只读' : 'Image · Read-only'}</span>
+              ) : (
+                <>
+                  <span>{activeTab.document.language}</span>
+                  <span>UTF-8{activeTab.document.hasBom ? ' BOM' : ''}</span>
+                  <span>{activeTab.document.eol.toUpperCase()}</span>
+                  <span>
+                    Ln {activeTab.cursorLine}, Col {activeTab.cursorColumn}
+                  </span>
+                </>
+              )
+            ) : (
+              <span>{zh ? '未打开文件' : 'No file open'}</span>
+            )}
+            {activeTab?.externalChange ? <strong>{zh ? '磁盘内容已变化' : 'Disk content changed'}</strong> : null}
+          </footer>
         </main>
       </div>
 
@@ -1178,11 +1202,11 @@ function operationTitle(operation: NonNullable<FileOperation>, zh: boolean): str
 
 function readOnlyReason(document: ProjectSourceDocument, zh: boolean): string {
   const reasons = zh
-    ? { binary: '检测到二进制内容。', invalid_encoding: '文件不是有效的 UTF-8 文本。', too_large: '文件超过 2 MiB 编辑上限。', symlink: '符号链接文件在 Zeus 中保持只读。', not_regular_file: '目标不是普通文件。' }
+    ? { binary: '检测到二进制内容。', invalid_encoding: '文件不是有效的 UTF-8 文本。', too_large: '文件超过页内读取上限，请在外部应用中打开。', symlink: '符号链接文件在 Zeus 中保持只读。', not_regular_file: '目标不是普通文件。' }
     : {
         binary: 'Binary content was detected.',
         invalid_encoding: 'The file is not valid UTF-8 text.',
-        too_large: 'The file exceeds the 2 MiB editor limit.',
+        too_large: 'The file exceeds the inline viewing limit. Open it externally.',
         symlink: 'Symlink files remain read-only in Zeus.',
         not_regular_file: 'The target is not a regular file.',
       };
