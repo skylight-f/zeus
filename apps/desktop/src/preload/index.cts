@@ -213,6 +213,7 @@ contextBridge.exposeInMainWorld('zeus', {
   quitFromMenuBarUsage: () => ipcRenderer.invoke('zeus:menu-bar-usage:quit'),
   listProjectSourceDirectory: (input: unknown) => ipcRenderer.invoke('zeus:project-source:list-directory', input),
   searchProjectSourceEntries: (input: unknown) => ipcRenderer.invoke('zeus:project-source:search', input),
+  searchProjectSourceContent: (input: unknown) => ipcRenderer.invoke('zeus:project-source:search-content', input),
   readProjectSourceFile: (input: unknown) => ipcRenderer.invoke('zeus:project-source:read-file', input),
   saveProjectSourceFile: (input: unknown) => invokeProjectSourceCommand('zeus:project-source:save-file', 'desktop.project_source.save_file', input),
   createProjectSourceEntry: (input: unknown) => invokeProjectSourceCommand('zeus:project-source:create-entry', 'desktop.project_source.create_entry', input),

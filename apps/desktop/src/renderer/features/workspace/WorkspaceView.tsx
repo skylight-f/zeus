@@ -2,7 +2,7 @@ import { MotionPresence } from '../../ui/MotionPresence.js';
 import { RuntimeSettingsPane } from '../../settings/RuntimeSettingsPane.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
 import type { UpdateAppShellSettingsRequest } from '../settings/settingsContracts.js';
-import type { SidebarConversationFilters } from '@zeus/shared';
+import type { ProjectSourceContentMatch, SidebarConversationFilters } from '@zeus/shared';
 import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { RuntimeXtermPane } from '../runtime/RuntimeXtermPane.js';
 import { handleInlineRailKeyboardNavigation } from './workspaceSupport.js';
@@ -22,7 +22,7 @@ import { PuzzlePieceIcon } from '@phosphor-icons/react/dist/csr/PuzzlePiece';
 import { TerminalIcon } from '@phosphor-icons/react/dist/csr/Terminal';
 import { ArrowCircleUpIcon } from '@phosphor-icons/react/dist/csr/ArrowCircleUp';
 import { DatabaseIcon } from '@phosphor-icons/react/dist/csr/Database';
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import type { DashboardClient, ProjectRecord } from '../../apiClient.js';
 import { openAutomaticUpdateIndicatorInMain } from '../../appShellBridge.js';
 import { ProjectGitWorkbench } from '../../git/ProjectGitWorkbench.js';
@@ -141,6 +141,8 @@ function ProjectSettingsWorkspace(props: { project: ProjectRecord; commandClient
 
 export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions: WorkspaceDomainActions; operations: WorkspaceOperations }) {
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
+  const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string } | null>(null);
+  const [pendingGlobalSource, setPendingGlobalSource] = useState<{ projectId: string; relativePath: string; line: number } | null>(null);
   /** 一次编辑一个字段，新增字段无需继续拉长页面。 */
   const [taskField, setTaskField] = useState<'status' | 'priority' | 'runStatus'>('status');
   const { state, domainActions, operations } = input;
@@ -442,6 +444,24 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     }
     openProjectSection(project, section, codeMode);
   };
+  /** 全局搜索允许跨项目跳转；等目标工作区真正挂载后再打开详情或源码文件。 */
+  useEffect(() => {
+    if (!pendingGlobalTask || pendingGlobalTask.projectId !== activeProjectId || activeProjectSection !== 'tasks') return;
+    const target = pendingGlobalTask;
+    setPendingGlobalTask(null);
+    void openTaskDetailPane(target.taskId);
+  }, [activeProjectId, activeProjectSection, openTaskDetailPane, pendingGlobalTask]);
+  useEffect(() => {
+    if (!pendingGlobalSource || pendingGlobalSource.projectId !== activeProjectId || activeProjectSection !== 'code' || projectCodeWorkspaceMode !== 'source') return;
+    const target = pendingGlobalSource;
+    const frame = window.requestAnimationFrame(() => {
+      const workspace = projectSourceWorkspaceRef.current;
+      if (!workspace) return;
+      setPendingGlobalSource(null);
+      void workspace.openFile(target.relativePath, target.line);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeProjectId, activeProjectSection, pendingGlobalSource, projectCodeWorkspaceMode, projectSourceWorkspaceRef]);
   /** 任务详情也可从会话页打开；接入上下文仍由原工作面身份约束，关闭或切换后旧回执失效。 */
   const modelSetupTask = snapshot.tasks.find((task) => task.id === taskModelPushTaskId);
   const taskModelSetupContext: TaskModelSetupContext | undefined =
@@ -772,6 +792,19 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           onNavigate={handleMainNavigate}
           onCreateProject={openProjectCreateDialog}
           onCreateConversation={prepareNewConversationDraft}
+          tasks={snapshot.tasks}
+          conversationGroups={nativeConversationGroups}
+          onOpenTask={(task) => {
+            const project = orderedProjects.find((candidate) => candidate.id === task.projectId);
+            if (!project) return;
+            setPendingGlobalTask({ taskId: task.id, projectId: task.projectId });
+            openProjectSection(project, 'tasks');
+          }}
+          onOpenConversation={(conversation) => void selectNativeConversation(conversation)}
+          onOpenSourceMatch={(project: ProjectRecord, match: ProjectSourceContentMatch) => {
+            setPendingGlobalSource({ projectId: project.id, relativePath: match.relativePath, line: match.line });
+            openProjectSection(project, 'code', 'source');
+          }}
         />
       ) : null}
       {activeNavTarget !== 'settings' && (!selectedProject || projectSessionSourceListVisible) ? (

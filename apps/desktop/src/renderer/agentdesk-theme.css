@@ -1702,6 +1702,11 @@ body:has(.macos-ai-app.zeus-shell) {
   font-weight: 400;
 }
 
+.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-search-field input:focus-visible {
+  outline: 0 !important;
+  box-shadow: none !important;
+}
+
 /* 快捷入口使用整行浅灰悬停底色，避免白色背景下反馈不可见。 */
 .macos-ai-app.zeus-shell .project-first-sidebar .codex-source-list-quick-actions .project-quick-action {
   inline-size: 100%;
@@ -3373,6 +3378,25 @@ body:has(.macos-ai-app.zeus-shell) {
   -webkit-app-region: no-drag;
 }
 
+.macos-ai-app.zeus-shell .project-workspace-add-project-select {
+  flex: 0 0 30px;
+  inline-size: 30px;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-add-project-select > .project-workspace-add-project {
+  inline-size: 30px;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-add-project .zeus-select-trigger-icon {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-add-project .zeus-select-chevron {
+  display: none;
+}
+
 .macos-ai-app.zeus-shell .project-workspace-add-project:hover:not(:disabled),
 .macos-ai-app.zeus-shell .project-workspace-add-project:focus-visible {
   background: var(--zeus-source-list-hover);
@@ -3385,51 +3409,195 @@ body:has(.macos-ai-app.zeus-shell) {
   opacity: 0.45;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-add-project > svg {
+.macos-ai-app.zeus-shell .project-workspace-add-project svg {
   block-size: 18px;
   inline-size: 18px;
 }
 
-/* 标题栏中段承担上下文提示和拖拽语义，避免多项目槽位后出现没有视觉重心的长空白。 */
-.macos-ai-app.zeus-shell .project-workspace-header-context {
-  align-items: center;
-  color: var(--agentdesk-text-secondary);
-  display: flex;
-  font-size: 12px;
-  gap: 7px;
+/* 标题栏中段改为可操作的全局搜索，结果层不参与窗口拖拽。 */
+.macos-ai-app.zeus-shell .project-global-search {
+  inline-size: clamp(280px, 32vw, 520px);
   inset-inline-start: 50%;
-  letter-spacing: -0.005em;
-  max-inline-size: min(360px, 34vw);
-  min-inline-size: 0;
-  pointer-events: none;
   position: absolute;
   transform: translateX(-50%);
+  z-index: 4;
+  -webkit-app-region: no-drag;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-header-context > span,
-.macos-ai-app.zeus-shell .project-workspace-header-context > strong {
+.macos-ai-app.zeus-shell .project-global-search-field {
+  align-items: center;
+  background: color-mix(in srgb, var(--zeus-control-bg) 88%, transparent);
+  border: 1px solid var(--zeus-product-line-soft);
+  border-radius: 7px;
+  color: var(--zeus-product-subtle);
+  display: flex;
+  gap: 7px;
+  min-block-size: 28px;
+  padding: 0 10px;
+  transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.macos-ai-app.zeus-shell .project-global-search.is-open .project-global-search-field,
+.macos-ai-app.zeus-shell .project-global-search-field:focus-within {
+  border-color: color-mix(in srgb, var(--agentdesk-accent) 56%, var(--zeus-product-line));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--agentdesk-accent) 12%, transparent);
+  background: var(--zeus-control-bg);
+}
+
+.macos-ai-app.zeus-shell .project-global-search-field > svg {
+  flex: 0 0 auto;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-field > input {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--zeus-product-text);
+  font: inherit;
+  font-size: 12px;
+  inline-size: 100%;
+  min-inline-size: 0;
+  outline: 0;
+  padding: 0;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-field > input:focus-visible {
+  outline: 0 !important;
+  box-shadow: none !important;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-field > input::placeholder {
+  color: var(--zeus-product-subtle);
+}
+
+.macos-ai-app.zeus-shell .project-global-search-popover {
+  background: var(--zeus-card-background);
+  border: 1px solid var(--zeus-card-border);
+  border-radius: 10px;
+  box-shadow: 0 16px 40px color-mix(in srgb, #111827 18%, transparent), 0 3px 10px color-mix(in srgb, #111827 10%, transparent);
+  box-sizing: border-box;
+  inset-block-start: calc(100% + 7px);
+  inset-inline-start: 50%;
+  max-block-size: min(520px, calc(100vh - 72px));
+  overflow: auto;
+  padding: 6px;
+  position: absolute;
+  transform: translateX(-50%);
+  inline-size: min(560px, calc(100vw - 32px));
+}
+
+.macos-ai-app.zeus-shell .project-global-search-scopes {
+  align-items: center;
+  color: var(--zeus-product-muted);
+  display: grid;
+  font-size: 12px;
+  gap: 4px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 4px;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-scope {
+  align-items: center;
+  background: var(--zeus-source-list-hover);
+  border-radius: 7px;
+  border: 1px solid transparent;
+  display: flex;
+  gap: 7px;
+  justify-content: center;
+  min-block-size: 34px;
+  padding: 0 8px;
+  text-align: center;
+  width: 100%;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-scope:hover,
+.macos-ai-app.zeus-shell .project-global-search-scope:focus-visible {
+  background: var(--zeus-surface-hover, var(--zeus-source-list-hover));
+  border-color: var(--zeus-product-line);
+}
+
+.macos-ai-app.zeus-shell .project-global-search-scope.is-active {
+  background: color-mix(in srgb, var(--agentdesk-accent) 18%, var(--zeus-source-list-hover));
+}
+
+.macos-ai-app.zeus-shell .project-global-search-scope span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-header-context > span {
-  color: var(--zeus-product-subtle);
-  font-weight: 500;
+.macos-ai-app.zeus-shell .project-global-search-scopes svg,
+.macos-ai-app.zeus-shell .project-global-search-group > header svg {
+  block-size: 15px;
+  inline-size: 15px;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-header-context > i {
-  color: var(--zeus-product-line-strong, var(--zeus-product-line));
-  font-style: normal;
+.macos-ai-app.zeus-shell .project-global-search-group + .project-global-search-group {
+  border-block-start: 1px solid var(--zeus-product-line-soft);
+  margin-block-start: 5px;
+  padding-block-start: 5px;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-header-context > strong {
-  color: var(--zeus-product-text);
+.macos-ai-app.zeus-shell .project-global-search-group > header {
+  align-items: center;
+  color: var(--zeus-product-muted);
+  display: flex;
+  font-size: 11px;
   font-weight: 620;
+  gap: 6px;
+  min-block-size: 26px;
+  padding: 0 8px;
 }
 
-.macos-ai-app.zeus-shell .project-workspace-project-slots:has(> .project-workspace-project-slot:nth-child(3)) ~ .project-workspace-header-context {
-  display: none;
+.macos-ai-app.zeus-shell .project-global-search-group > div {
+  display: grid;
+  gap: 1px;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--zeus-product-text);
+  cursor: pointer;
+  display: grid;
+  font: inherit;
+  gap: 2px;
+  min-block-size: 42px;
+  padding: 6px 9px;
+  text-align: start;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group button:is(:hover, .is-active) {
+  background: var(--zeus-source-list-hover);
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group button strong,
+.macos-ai-app.zeus-shell .project-global-search-group button small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group button strong {
+  font-size: 12px;
+  font-weight: 580;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group button small,
+.macos-ai-app.zeus-shell .project-global-search-group p,
+.macos-ai-app.zeus-shell .project-global-search-empty,
+.macos-ai-app.zeus-shell .project-global-search-hint {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+}
+
+.macos-ai-app.zeus-shell .project-global-search-group p,
+.macos-ai-app.zeus-shell .project-global-search-empty,
+.macos-ai-app.zeus-shell .project-global-search-hint {
+  margin: 0;
+  padding: 9px;
 }
 
 .macos-ai-app.zeus-shell .project-workspace-mode-rail {
@@ -3591,17 +3759,6 @@ body:has(.macos-ai-app.zeus-shell) {
   margin-block-end: 6px;
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-context-title {
-  align-items: center;
-  color: var(--zeus-product-text);
-  display: flex;
-  font-size: 15px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-  min-block-size: 32px;
-  padding-inline: 8px;
-}
-
 /* 无项目时活动栏不可用，保留全局入口作为空状态导航兜底。 */
 .macos-ai-app.zeus-shell .project-first-sidebar .project-global-tools {
   border-block-start: 1px solid var(--zeus-product-line-soft);
@@ -3696,12 +3853,6 @@ body:has(.macos-ai-app.zeus-shell) {
 
 .macos-ai-app.zeus-shell.project-navigation-rail-shell .session-thread-header {
   padding-inline-start: var(--session-gutter);
-}
-
-@media (max-width: 1180px) {
-  .macos-ai-app.zeus-shell .project-workspace-header-context {
-    display: none;
-  }
 }
 
 @media (max-width: 759px) {
@@ -3858,10 +4009,6 @@ body:has(.macos-ai-app.zeus-shell) {
   padding-inline-start: max(24px, calc((100% - var(--session-thread-max)) / 2));
   padding-inline-end: 24px;
 }
-.macos-ai-app.zeus-shell .workspace-view-project-code .project-source-toolbar {
-  border-radius: 0 !important;
-}
-
 /* 任务页复用统一外框，移除内部重复卡片及其外围空隙。 */
 .macos-ai-app.zeus-shell .workspace-view-project-tasks > .task-management-detail-pane {
   padding: 0 !important;
@@ -3996,7 +4143,7 @@ body:has(.macos-ai-app.zeus-shell) {
   border-radius: 6px;
 }
 
-/* 源码目录和标签采用平面列表，避免通用按钮皮肤挤占内容。 */
+/* 源码目录保持平面列表；标签选中态使用独立圆角面，贴近编辑器标签的层级表达。 */
 .macos-ai-app.zeus-shell .project-source-tree-scroll {
   padding: 4px 0 20px;
 }
@@ -4028,36 +4175,39 @@ body:has(.macos-ai-app.zeus-shell) {
   box-shadow: none;
 }
 .macos-ai-app.zeus-shell .project-source-tabs {
-  gap: 0;
-  padding: 0;
+  gap: 4px;
+  padding: 4px 8px 0;
   align-items: stretch;
-  min-height: 34px;
-  background: var(--zeus-product-panel-muted);
+  min-height: 38px;
+  background: var(--zeus-code-editor-bg);
   border-radius: 0 !important;
   box-shadow: none !important;
 }
 .macos-ai-app.zeus-shell .project-source-tab {
   flex: 0 0 auto;
   display: flex;
-  gap: 8px;
   min-width: 100px;
   max-width: 220px;
   min-height: 34px;
-  padding: 0 6px 0 0;
-  border: 0;
-  border-right: 1px solid var(--zeus-control-border);
-  border-top: 2px solid transparent;
-  border-radius: 0 !important;
+  box-sizing: border-box;
+  padding: 0 4px 0 0;
+  border: 1px solid transparent;
+  border-radius: 8px !important;
   box-shadow: none !important;
   background: transparent !important;
 }
 .macos-ai-app.zeus-shell .project-source-tab.active {
-  background: var(--zeus-code-editor-bg) !important;
-  border-top-color: var(--zeus-control-accent);
+  background: color-mix(in srgb, var(--zeus-control-text) 8%, var(--zeus-code-editor-bg)) !important;
+  border-color: var(--zeus-control-border) !important;
   color: var(--zeus-control-text);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--zeus-control-text) 10%, transparent) !important;
+}
+.macos-ai-app.zeus-shell .project-source-tab.active > [role='tab'] {
+  font-weight: 600;
 }
 .macos-ai-app.zeus-shell .project-source-tab:not(.active):hover:not(:disabled):not([aria-disabled='true']) {
-  background: color-mix(in srgb, var(--zeus-control-accent) 5%, transparent) !important;
+  background: color-mix(in srgb, var(--zeus-control-text) 4%, transparent) !important;
+  border-color: transparent !important;
 }
 .macos-ai-app.zeus-shell .project-source-tab > [role='tab'] {
   min-width: 0;

@@ -6,7 +6,6 @@ import { Collapsible } from '../ui/Collapsible.js';
 import { Suspense, forwardRef, lazy, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { sourceConflictExtensions } from './sourceConflictExtensions.js';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
-import { FloppyDiskIcon as FloppyDisk } from '@phosphor-icons/react/dist/csr/FloppyDisk';
 import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
@@ -631,33 +630,6 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
 
   return (
     <section className="project-source-workspace" style={{ '--zeus-source-tree-width': `${treeWidth}px` } as CSSProperties} data-tree-open={treeDrawerOpen ? 'true' : 'false'}>
-      <header className="project-source-toolbar">
-        <button type="button" className="project-source-tree-toggle" onClick={() => setTreeDrawerOpen((open) => !open)} aria-label={zh ? '显示代码目录' : 'Show source tree'}>
-          <FolderOpen aria-hidden="true" />
-        </button>
-        <span className="project-source-project-identity">
-          <strong>{props.project.name}</strong>
-          <small>{props.project.localPath}</small>
-        </span>
-        <span className="project-source-toolbar-actions">
-          <button type="button" onClick={() => beginOperation({ kind: 'create-file', parentRelativePath: activePath ? parentPath(activePath) : '' })} title={zh ? '新建文件' : 'New file'}>
-            <File aria-hidden="true" />
-            <Plus aria-hidden="true" />
-          </button>
-          <button type="button" onClick={() => beginOperation({ kind: 'create-directory', parentRelativePath: activePath ? parentPath(activePath) : '' })} title={zh ? '新建目录' : 'New folder'}>
-            <Folder aria-hidden="true" />
-            <Plus aria-hidden="true" />
-          </button>
-          <Button size="compact" variant="secondary" onClick={() => void (activePath ? saveTab(activePath) : Promise.resolve())} disabled={!activeTab?.dirty || activeTab.saving}>
-            <FloppyDisk aria-hidden="true" />
-            {zh ? '保存' : 'Save'}
-          </Button>
-          <Button size="compact" variant="secondary" onClick={() => void saveAll()} disabled={!dirty}>
-            {zh ? '保存全部' : 'Save all'}
-          </Button>
-        </span>
-      </header>
-
       {notice || activeTab?.externalChange ? (
         <div className="project-source-message success" role="status">
           <span>{notice ?? (zh ? '文件已在外部发生变化，请重新加载或另存为。' : 'The file changed externally. Reload it or save it as a new file.')}</span>
@@ -706,7 +678,37 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       <div className="project-source-main">
         <aside className="project-source-tree" style={{ '--source-module-share': `${sourceShare}%` } as CSSProperties} aria-label={zh ? '代码目录' : 'Source tree'}>
           <details className="project-source-module" open>
-            <summary>{zh ? '源码' : 'Source'}</summary>
+            <summary>
+              <span>{zh ? '源码' : 'Source'}</span>
+              <span className="project-source-module-actions" aria-label={zh ? '源码操作' : 'Source actions'}>
+                <button
+                  type="button"
+                  title={zh ? '新建文件' : 'New file'}
+                  aria-label={zh ? '新建文件' : 'New file'}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    beginOperation({ kind: 'create-file', parentRelativePath: activePath ? parentPath(activePath) : '' });
+                  }}
+                >
+                  <File aria-hidden="true" />
+                  <Plus aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  title={zh ? '新建目录' : 'New folder'}
+                  aria-label={zh ? '新建目录' : 'New folder'}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    beginOperation({ kind: 'create-directory', parentRelativePath: activePath ? parentPath(activePath) : '' });
+                  }}
+                >
+                  <Folder aria-hidden="true" />
+                  <Plus aria-hidden="true" />
+                </button>
+              </span>
+            </summary>
             <label className="project-source-search">
               <MagnifyingGlass aria-hidden="true" />
               <input type="search" value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} placeholder={zh ? '搜索文件名' : 'Search file names'} />
@@ -791,6 +793,15 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
 
         <main className="project-source-editor-pane">
           <div className="project-source-tabs" role="tablist" aria-label={zh ? '已打开文件' : 'Open files'}>
+            <button
+              type="button"
+              className="project-source-tree-toggle"
+              onClick={() => setTreeDrawerOpen((open) => !open)}
+              aria-label={zh ? '显示代码目录' : 'Show source tree'}
+              aria-expanded={treeDrawerOpen}
+            >
+              <FolderOpen aria-hidden="true" />
+            </button>
             {tabs.map((tab) => (
               <div key={tab.document.relativePath} className={`project-source-tab${tab.document.relativePath === activePath ? ' active' : ''}`}>
                 <button
