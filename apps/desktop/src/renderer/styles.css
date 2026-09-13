@@ -11414,7 +11414,7 @@ html[data-zeus-theme='dark'] .startup-failure-shell {
   content: '';
   inline-size: 8px;
   inset-block-start: -5px;
-  inset-inline-start: 42px;
+  inset-inline-start: var(--zeus-select-arrow-left, 42px);
   position: absolute;
   transform: rotate(45deg);
 }
