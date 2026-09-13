@@ -1,3 +1,4 @@
+import { zeusReleaseBaseUrl } from '@zeus/shared';
 import {
   type AiCliAdapterDescriptor,
   type AiRuntimeLogEntry,
@@ -639,7 +640,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
         currentVersion,
         latestVersion: currentVersion,
         channel: 'stable',
-        releasePageUrl: 'https://github.com/imchenway/zeus/releases/latest',
+        releasePageUrl: `${zeusReleaseBaseUrl}/latest`,
         artifact: null,
         executionHostProtocolVersion: options.executionHost?.protocolVersion ?? 2,
         automaticInstallEnabled: false,

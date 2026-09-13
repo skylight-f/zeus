@@ -47,7 +47,10 @@
     "format": "prettier --write \"**/*.{ts,tsx,cts,cjs,mjs,js,json,yml,yaml}\" --ignore-path .prettierignore",
     "format:check": "prettier --check \"**/*.{ts,tsx,cts,cjs,mjs,js,json,yml,yaml}\" --ignore-path .prettierignore",
     "security:audit": "pnpm audit --audit-level=moderate",
-    "verify:quick": "pnpm verify:publish"
+    "verify:quick": "pnpm verify:publish",
+    "release:fork:prepare": "node scripts/prepare-fork-release.mjs",
+    "release:config": "node scripts/distribution-config.mjs",
+    "upstream:check": "node scripts/sync-upstream.mjs"
   },
   "dependencies": {
     "@fastify/websocket": "^11.0.1",
@@ -80,12 +83,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/imchenway/zeus.git"
+    "url": "git+https://github.com/skylight-f/zeus.git"
   },
   "bugs": {
-    "url": "https://github.com/imchenway/zeus/issues"
+    "url": "https://github.com/skylight-f/zeus/issues"
   },
-  "homepage": "https://github.com/imchenway/zeus#readme",
+  "homepage": "https://github.com/skylight-f/zeus#readme",
   "pnpm": {
     "overrides": {
       "esbuild": "0.28.1",

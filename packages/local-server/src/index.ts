@@ -1,3 +1,4 @@
+import { zeusReleaseManifestUrl, isZeusReleaseUrl } from '@zeus/shared';
 import { parseJsonObject } from './localServerPlatformSupport.js';
 import type { AsyncQuestionAnswer } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
@@ -612,10 +613,10 @@ const telegramNotificationSettingsKey = 'telegram.notificationSettings';
 const telegramSecuritySettingsKey = 'telegram.securitySettings';
 
 function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean): string {
-  const fallback = 'https://github.com/imchenway/zeus/releases/latest/download/zeus-release-manifest.json';
+  const fallback = zeusReleaseManifestUrl;
   const candidate = configured?.trim() || fallback;
   const url = new URL(candidate);
-  if (url.protocol === 'https:' && url.hostname === 'github.com' && url.pathname.startsWith('/imchenway/zeus/releases/')) return url.toString();
+  if (isZeusReleaseUrl(candidate)) return url.toString();
   if (allowUntrustedTest && url.protocol === 'http:' && url.hostname === '127.0.0.1' && Boolean(url.port)) return url.toString();
   throw new Error('Zeus release update manifest URL is not trusted.');
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /* global console, process */
+import { zeusDistribution } from '../packages/shared/src/distribution.ts';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,8 +18,8 @@ import {
 } from './release-workflow-wait-policy.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
-const repository = 'imchenway/zeus';
-const homebrewRepository = 'imchenway/homebrew-tap';
+const repository = zeusDistribution.repository;
+const homebrewRepository = zeusDistribution.homebrewRepository;
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
@@ -148,7 +149,7 @@ function collectPreflight(input) {
   if (secretsRead.error) {
     blockers.push(`无法读取 GitHub Actions Secrets：${secretsRead.error}`);
   } else {
-    if (!secretNames.has('HOMEBREW_TAP_TOKEN')) blockers.push('GitHub Actions 缺少 HOMEBREW_TAP_TOKEN');
+    if (zeusDistribution.homebrewEnabled && !secretNames.has('HOMEBREW_TAP_TOKEN')) blockers.push('GitHub Actions 缺少 HOMEBREW_TAP_TOKEN');
     if (input.requireAppleDistribution) {
       for (const name of ['MACOS_CERTIFICATE', 'MACOS_CERTIFICATE_PASSWORD']) {
         if (!secretNames.has(name)) blockers.push(`严格 Apple 分发缺少 ${name}`);
@@ -282,6 +283,8 @@ async function verifyPublishedRelease(input) {
       throw new Error('GitHub manifest 资产元数据与下载文件不一致。');
     }
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    if (manifest.distributionId !== zeusDistribution.id || manifest.repository !== repository || manifest.sourceCommit !== input.headSha || manifest.channel !== zeusDistribution.channel)
+      throw new Error('公开清单不属于当前二开发行版或候选提交。');
     const manifestArtifact = manifest.artifacts?.find((artifact) => artifact.arch === 'arm64' && artifact.kind === 'dmg' && artifact.fileName === expectedDmgName);
     if (manifest.version !== input.releaseVersion || manifest.channel !== 'stable' || !manifestArtifact) {
       throw new Error('公开 manifest 的版本、通道或 DMG 记录不一致。');
@@ -306,9 +309,9 @@ async function verifyPublishedRelease(input) {
       }
     }
 
-    const cask = gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/zeus.rb?ref=main`]);
+    const cask = zeusDistribution.homebrewEnabled ? gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/zeus.rb?ref=main`]) : '# 当前发行版未启用 Homebrew Tap\n';
     for (const expected of [`version "${input.releaseVersion}"`, `sha256 "${dmgSha256}"`, 'depends_on arch: :arm64']) {
-      if (!cask.includes(expected)) throw new Error(`Homebrew Tap Cask 与公开 DMG 不一致，缺少：${expected}`);
+      if (zeusDistribution.homebrewEnabled && !cask.includes(expected)) throw new Error(`Homebrew Tap Cask 与公开 DMG 不一致，缺少：${expected}`);
     }
 
     const releaseNotesSnapshotPath = join(input.outputDirectory, `${input.tag}-release-notes.md`);
@@ -354,7 +357,7 @@ function buildPublishResult(input) {
     `- DMG：${input.dmgName}，${input.dmgSize} 字节，SHA-256 ${input.dmgSha256}`,
     `- manifest：${input.manifestSize} 字节，SHA-256 ${input.manifestSha256}`,
     `- Release notes SHA-256：${input.releaseNotesSha256}`,
-    `- Homebrew Cask SHA-256：${input.caskSha256}`,
+    zeusDistribution.homebrewEnabled ? `- Homebrew Cask SHA-256：${input.caskSha256}` : '- Homebrew：当前发行版未启用',
     `- Developer ID 签名：${input.signed ? '是' : '否'}`,
     `- Apple 公证：${input.notarized ? '是' : '否'}`,
     input.deepVerified ? '- 公开 DMG 已回下载并通过 `hdiutil verify`。' : '- 默认快速模式未回下载完整 DMG；正式 DMG 已在上传前通过 `hdiutil verify`。',

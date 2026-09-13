@@ -1,3 +1,4 @@
+import { zeusDistribution } from '../packages/shared/src/distribution.ts';
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 
@@ -31,7 +32,7 @@ export function validateReleaseNotes(markdown, version) {
   for (const heading of ['## 如何升级', '## 系统要求与已知限制', '## 发布验证']) {
     if (!markdown.includes(`\n${heading}\n`)) throw new Error(`Release notes 缺少必要章节：${heading}`);
   }
-  if (!markdown.includes('brew upgrade --cask imchenway/tap/zeus')) throw new Error('Release notes 缺少 Homebrew 升级命令。');
+  if (zeusDistribution.homebrewEnabled && !markdown.includes(`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus`)) throw new Error('Release notes 缺少 Homebrew 升级命令。');
   if (!markdown.includes(`Zeus-${version}-arm64.dmg`)) throw new Error(`Release notes 缺少版本化 DMG 名称：Zeus-${version}-arm64.dmg。`);
   if (/releases\/v[^\s]+\.md|TASK_\d+/u.test(markdown)) throw new Error('Release notes 泄漏内部任务或发布文档路径。');
   const leakedCommentary = markdown.match(/用户要求只返回|confidence\s*[=:：]|uncertainties\s*[=:：]|以下无其他字段|最终正文如上/iu)?.[0];

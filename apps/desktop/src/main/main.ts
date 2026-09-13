@@ -1,3 +1,4 @@
+import { isZeusReleaseUrl } from '@zeus/shared';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, type FSWatcher, mkdtempSync, readFileSync } from 'node:fs';
@@ -2914,7 +2915,7 @@ async function initializeApplication(): Promise<void> {
         /** 发布清单中的链接也必须属于 Zeus 官方发布目录。 */
         openDownloadPage: async (value) => {
           const url = new URL(value);
-          if (url.origin !== 'https://github.com' || !/^\/imchenway\/zeus\/releases(?:\/|$)/u.test(url.pathname)) throw new Error('更新下载页面不是 Zeus 官方发布地址。');
+          if (!isZeusReleaseUrl(url.toString())) throw new Error('更新下载页面不是 Zeus 官方发布地址。');
           const result = await openExternalHttpsUrl({ url: value, openExternal: (target) => shell.openExternal(target) });
           if (!result.opened) throw new Error('无法打开更新下载页面，请稍后重试。');
         },

@@ -1,3 +1,4 @@
+import { zeusDistribution } from '@zeus/shared';
 import { temporaryWorkspaceId } from '@zeus/shared';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
@@ -575,8 +576,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const settingsNavigationTabStop = visibleSettingsItems.some(([id]) => id === settingsCategory) ? settingsCategory : visibleSettingsItems[0]?.[0];
   const projectWorkspaceNavigationVisible = Boolean(selectedProject);
   /** 会话使用项目/会话来源列表；其他模式由各自工作区提供紧邻活动栏的上下文导航。 */
-  const projectSessionSourceListVisible =
-    Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
+  const projectSessionSourceListVisible = Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
 
   return (
     <main
@@ -858,7 +858,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       ) : null}
       <section className="workspace ai-workspace" ref={workspaceScrollRef}>
         {activeNavTarget === 'projects' && snapshot.projects.length === 0 ? (
-          <ProjectStartGuide language={appShellSettings.appLanguage} busy={projectDirectoryChoosing || creatingProjectBusy} available={Boolean(props.onCreateCurrentProject)} onStartTemporary={() => prepareNewConversationDraft(true)} onChooseFolder={() => void chooseProjectDirectoryForCreate()} />
+          <ProjectStartGuide
+            language={appShellSettings.appLanguage}
+            busy={projectDirectoryChoosing || creatingProjectBusy}
+            available={Boolean(props.onCreateCurrentProject)}
+            onStartTemporary={() => prepareNewConversationDraft(true)}
+            onChooseFolder={() => void chooseProjectDirectoryForCreate()}
+          />
         ) : null}
         {activeNavTarget === 'skills' ? <ExtensionsWorkspace client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} /> : null}
         {activeNavTarget === 'automations' ? (
@@ -1995,15 +2001,17 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                               <small>{settingsWorkspaceCopy.release.notarizationDescription}</small>
                             </span>
                           </section>
-                          <section className="settings-state-row settings-release-cask-state-row" aria-label={settingsWorkspaceCopy.release.caskAria}>
-                            <span className="settings-row-copy">
-                              <strong>{settingsWorkspaceCopy.release.caskTitle}</strong>
-                            </span>
-                            <span className="settings-row-field">
-                              <span>{formatReleasePresenceStatus('homebrewCask', releaseStatus.homebrewCask, settingsWorkspaceCopy.release)}</span>
-                              <small>{releaseStatus.readiness.canBuildUnsignedArtifacts ? settingsWorkspaceCopy.release.unsignedBuildAvailable : settingsWorkspaceCopy.release.unsignedBuildUnavailable}</small>
-                            </span>
-                          </section>
+                          {zeusDistribution.homebrewEnabled ? (
+                            <section className="settings-state-row settings-release-cask-state-row" aria-label={settingsWorkspaceCopy.release.caskAria}>
+                              <span className="settings-row-copy">
+                                <strong>{settingsWorkspaceCopy.release.caskTitle}</strong>
+                              </span>
+                              <span className="settings-row-field">
+                                <span>{formatReleasePresenceStatus('homebrewCask', releaseStatus.homebrewCask, settingsWorkspaceCopy.release)}</span>
+                                <small>{releaseStatus.readiness.canBuildUnsignedArtifacts ? settingsWorkspaceCopy.release.unsignedBuildAvailable : settingsWorkspaceCopy.release.unsignedBuildUnavailable}</small>
+                              </span>
+                            </section>
+                          ) : null}
                           <section className="settings-log-row release-detail-row" aria-label={settingsWorkspaceCopy.release.detailAria}>
                             <span className="settings-row-copy">
                               <strong>{settingsWorkspaceCopy.release.detailTitle}</strong>

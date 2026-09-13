@@ -1,3 +1,4 @@
+import { zeusReleaseBaseUrl } from '@zeus/shared';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { projectTerminalOutput } from '@zeus/shared';
 import { cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig } from '@zeus/shared';
@@ -589,7 +590,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
         currentVersion: '0.1.0',
         latestVersion: '0.1.0',
         channel: 'stable',
-        releasePageUrl: 'https://github.com/imchenway/zeus/releases/latest',
+        releasePageUrl: `${zeusReleaseBaseUrl}/latest`,
         artifact: null,
         executionHostProtocolVersion: 2,
         automaticInstallEnabled: false,

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /* global console, process */
+import { zeusDistribution } from '../packages/shared/src/distribution.ts';
 import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,7 @@ import { releaseWorkflowWaitLimitMs } from './release-workflow-wait-policy.mjs';
 import { parseBoolean } from './release-script-utils.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
-const repository = 'imchenway/zeus';
+const repository = zeusDistribution.repository;
 const releaseFiles = ['package.json', 'apps/desktop/package.json'];
 const formatExtensions = new Set(['.ts', '.tsx', '.cts', '.cjs', '.mjs', '.js', '.json', '.yml', '.yaml']);
 // 仓库其他目录中的 Markdown 仍按文档处理；本地任务记录统一由 docs/ 路径识别。

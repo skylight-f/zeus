@@ -5,6 +5,7 @@ Zeus 是一款 AI 研发工作台，将项目与任务管理、Coding Agent 会�
 ## 功能
 
 - 管理项目、任务和 Coding Agent 会话。
+- 不选项目也可启动临时会话，默认工作目录为当前 Zeus 数据目录下的 `workspaces/temporary`；文件和会话历史保留在本机。
 - 在创建任务中粘贴 GitHub Issue、Jira 工作项或禅道详情链接，读取标题和正文后确认创建；受限内容通过 Zeus 登录，GitHub 与 Jira 附件保留为来源链接。
 - 浏览和编辑项目源码，搜索文件与代码内容。
 - 接入 Codex、Claude、Gemini 等 Coding Agent，并保存执行日志。
@@ -22,35 +23,19 @@ AI 访问网站和执行浏览器操作无需 Zeus 逐次确认，包括点击�
 
 ## 安装
 
-当前 Homebrew 安装包支持 Apple Silicon Mac，要求 macOS 13 或更高版本。
+二开发布流程当前面向 Apple Silicon Mac，要求 macOS 13 或更高版本。首次自有 Release 发布前，下载页可能没有安装包。
 
-```bash
-brew install --cask imchenway/tap/zeus
-```
+二开版从本仓库 Releases 获取安装包；自己的 Homebrew Tap 尚未启用，请勿使用上游 Tap 更新二开版。
 
-安装完成后，可从“应用程序”打开 Zeus。升级使用：
+前往 [GitHub Releases](https://github.com/skylight-f/zeus/releases) 下载安装包。
 
-```bash
-brew upgrade --cask imchenway/tap/zeus
-```
-
-彻底卸载 Zeus（包括 Homebrew Cask 已登记的本地配置）使用：
-
-```bash
-brew uninstall --cask --zap imchenway/tap/zeus
-```
-
-如需保留本地项目、会话和配置，请去掉 `--zap`，使用 `brew uninstall --cask imchenway/tap/zeus`。
-
-也可以前往 [GitHub Releases](https://github.com/imchenway/zeus/releases) 下载安装包。
-
-应用内更新会识别当前安装方式：Homebrew 管理的应用沿用 Homebrew 更新；手动从 DMG 安装的应用，在正式签名、公证、版本兼容和安装位置条件满足时，可下载后确认重启安装。自动安装条件不足时，仍可在更新弹窗点击“下载更新”，完成校验后点击“打开安装包”；结束工作并退出 Zeus，再将新版拖入“应用程序”完成替换。只有缺少匹配当前 Mac 的安装包时才引导前往发布页。临时签名的旧版需先手动安装一次正式签名版本，才能使用后续的直接自动安装。
+本发行版暂未启用 Homebrew。手动从 DMG 安装的应用，在正式签名、公证、版本兼容和安装位置条件满足时，可下载后确认重启安装。自动安装条件不足时，仍可在更新弹窗点击“下载更新”，完成校验后点击“打开安装包”；结束工作并退出 Zeus，再将新版拖入“应用程序”完成替换。只有缺少匹配当前 Mac 的安装包时才引导前往发布页。临时签名的旧版需先手动安装一次正式签名版本，才能使用后续的直接自动安装。
 
 正式发布使用已有的 `REQUIRE_APPLE_DISTRIBUTION=true` 检查证书和公证配置；没有凭据时保留手动升级入口。开发验证无需配置正式证书。
 
 ## 首次打开
 
-当前公开版本尚未经过 Apple 公证。首次打开时，如果 macOS 提示无法验证 Zeus：
+未配置 Apple 公证的候选包首次打开时，如果 macOS 提示无法验证 Zeus：
 
 1. 关闭提示窗口。
 2. 打开“系统设置”。
@@ -67,7 +52,7 @@ brew uninstall --cask --zap imchenway/tap/zeus
 requirement，用于减少升级后因代码身份变化而重复询问“文稿”“下载”等隐私权限。用户主动选择项目、附件或导出位置时，macOS 仍可能
 按真实目录访问边界请求授权。配置 Developer ID 与公证凭据后，仍可显式启用严格 Apple 分发。
 
-版本更新内容见 [GitHub Releases](https://github.com/imchenway/zeus/releases)。
+版本更新内容见 [GitHub Releases](https://github.com/skylight-f/zeus/releases)。
 
 网络代理位于“设置 → 通用”，可选择不使用代理、跟随系统与启动环境或手动配置。手动模式分别填写 HTTP/HTTPS 协议、主机名、端口号（1–65535）及绕过列表；已有代理地址会自动拆分回填。保存后等待任务结束，完全退出并重新打开 Zeus 生效；仅关闭窗口或保留后台任务不会切换代理。“检查连接”用当前表单分别检查内置浏览器和模型宿主网络，不切换运行中代理；收到网站响应不表示模型认证成功。默认模式保留系统与启动环境；手动模式不支持 SOCKS 或账号密码，本机回环请求始终直连。
 
@@ -97,3 +82,15 @@ requirement，用于减少升级后因代码身份变化而重复询问“文稿
 
 Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控件出现、消失或文本值变化，并返回可继续操作的新快照。条件未满足时只报告超时，不重放动作；确认范围仅为可访问的界面状态。默认返回紧凑控件或较小的差异，首次未缓存观察附带截图，后续确认按需使用 `include_screenshot`；需要全部控件属性时使用 `full_output`。优点是减少额外等待与模型往返；复杂界面可能需要补充完整观察，实际性能需以相同流程复测。
 发布正文由发布准备流程写入 `releases/v<版本>.md`。任务记录与验收证据统一保留在本地 `docs/`，整个目录已加入 Git 忽略规则，不随源码提交。旧记录可从 Git 历史查阅，不维护新旧两套发布文档路径。
+
+## 二开维护与发布
+
+本仓库是 [imchenway/zeus](https://github.com/imchenway/zeus) 的二开发行版，保留上游署名和许可证。统一发行配置位于 `packages/shared/src/distribution.ts`，更新只接受 `skylight-f/zeus` 的清单和安装包。
+
+- `pnpm release:config`：查看二开发行配置。
+- `pnpm upstream:check`：查看上游同步入口；GitHub 的 `Sync upstream` 工作流每周检查稳定版本并准备待审阅 PR。
+- `pnpm release:fork:prepare`：准备首次或后续二开版本，默认只预览文件改动。
+- `pnpm verify:publish`：本地及 CI 统一门禁。
+- GitHub `Release` 工作流：默认只构建候选，显式选择公开发布后才创建标签和 Release。
+
+详细操作见 [二开发布流程](releases/FORK-MAINTENANCE.md)。应用身份尚沿用当前 Zeus 安装，现有数据不自动迁移；二开更新来源与上游已经隔离，但当前发行版还不能与原版并行安装。
