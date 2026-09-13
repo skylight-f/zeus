@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  push:
+    branches: [develop]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -26,13 +28,69 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag != '' && inputs.tag || github.ref }}-${{ inputs.commit_sha != '' && inputs.commit_sha || github.sha }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  preflight:
+  source-verify:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.31.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 检查触发发布的源码
+        env:
+          ZEUS_VERIFY_BASE: ${{ github.event.before }}
+          ZEUS_VERIFY_HEAD: ${{ github.sha }}
+        run: pnpm verify:publish
+
+  candidate:
+    needs: source-verify
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && needs.source-verify.result == 'success'))
     runs-on: ubuntu-latest
     outputs:
+      ready: ${{ steps.candidate.outputs.ready }}
+      publish: ${{ steps.candidate.outputs.publish }}
+      commit_sha: ${{ steps.candidate.outputs.commit_sha }}
+      tag: ${{ steps.candidate.outputs.tag }}
+      require_apple_distribution: ${{ steps.candidate.outputs.require_apple_distribution }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.commit_sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 准备或复用发行候选
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRE_APPLE_DISTRIBUTION: ${{ github.event_name == 'push' && vars.REQUIRE_APPLE_DISTRIBUTION == 'true' || inputs.require_apple_distribution == true }}
+        run: node scripts/prepare-automatic-release.mjs
+
+  preflight:
+    needs: candidate
+    if: ${{ needs.candidate.outputs.ready == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ needs.candidate.outputs.publish }}
+      commit_sha: ${{ needs.candidate.outputs.commit_sha }}
+      tag: ${{ needs.candidate.outputs.tag }}
+      require_apple_distribution: ${{ needs.candidate.outputs.require_apple_distribution }}
       release_branch: ${{ steps.distribution.outputs.release_branch }}
       homebrew_enabled: ${{ steps.distribution.outputs.homebrew_enabled }}
       homebrew_repository: ${{ steps.distribution.outputs.homebrew_repository }}
@@ -41,7 +99,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
+          ref: ${{ needs.candidate.outputs.commit_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -49,12 +107,12 @@ jobs:
         id: distribution
         run: node scripts/distribution-config.mjs --github-output
       - name: 校验公开发布输入、目标占用与必要凭据
-        if: ${{ inputs.publish_release }}
+        if: ${{ needs.candidate.outputs.publish == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ inputs.commit_sha }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          REQUIRE_APPLE_DISTRIBUTION: ${{ inputs.require_apple_distribution }}
+          RELEASE_COMMIT: ${{ needs.candidate.outputs.commit_sha }}
+          RELEASE_TAG: ${{ needs.candidate.outputs.tag }}
+          REQUIRE_APPLE_DISTRIBUTION: ${{ needs.candidate.outputs.require_apple_distribution }}
           CSC_LINK: ${{ secrets.MACOS_CERTIFICATE }}
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -114,7 +172,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
+          ref: ${{ needs.preflight.outputs.commit_sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 10.31.0
@@ -138,13 +196,13 @@ jobs:
       APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      ZEUS_REQUIRE_DISTRIBUTABLE_RELEASE: ${{ inputs.publish_release && inputs.require_apple_distribution && '1' || '0' }}
+      ZEUS_REQUIRE_DISTRIBUTABLE_RELEASE: ${{ needs.preflight.outputs.publish == 'true' && needs.preflight.outputs.require_apple_distribution == 'true' && '1' || '0' }}
     steps:
       - name: 检出固定发布候选
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
+          ref: ${{ needs.preflight.outputs.commit_sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 10.31.0
@@ -175,7 +233,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: zeus-macos-${{ inputs.commit_sha != '' && inputs.commit_sha || github.sha }}
+          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
           path: |
             dist/Zeus-*.dmg
             dist/zeus-release-manifest.json
@@ -184,7 +242,7 @@ jobs:
         if: ${{ steps.upload_release_artifact.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zeus-macos-${{ inputs.commit_sha != '' && inputs.commit_sha || github.sha }}
+          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
           path: |
             dist/Zeus-*.dmg
             dist/zeus-release-manifest.json
@@ -192,21 +250,21 @@ jobs:
           overwrite: true
 
   publish:
-    if: ${{ inputs.publish_release }}
+    if: ${{ needs.preflight.outputs.publish == 'true' }}
     needs: [preflight, verify, package-mac]
     runs-on: ubuntu-latest
     environment: release
     env:
       GH_TOKEN: ${{ github.token }}
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      RELEASE_COMMIT: ${{ inputs.commit_sha }}
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
     steps:
       - name: 检出固定发布候选
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.commit_sha }}
+          ref: ${{ needs.preflight.outputs.commit_sha }}
       - name: 检出 Homebrew Tap
         if: ${{ needs.preflight.outputs.homebrew_enabled == 'true' }}
         uses: actions/checkout@v4
@@ -217,7 +275,7 @@ jobs:
       - name: 下载已校验正式产物
         uses: actions/download-artifact@v4
         with:
-          name: zeus-macos-${{ inputs.commit_sha }}
+          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
           path: dist
       - uses: actions/setup-node@v4
         with:

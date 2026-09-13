@@ -91,7 +91,7 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 - `pnpm upstream:check`：查看上游同步入口；GitHub 的 `Sync upstream` 工作流每周检查稳定版本并准备待审阅 PR。
 - `pnpm release:fork:prepare`：准备首次或后续二开版本，默认只预览文件改动。
 - `pnpm verify:publish`：本地及 CI 统一门禁。
-- GitHub `Release` 工作流：默认只构建候选，显式选择公开发布后才创建标签和 Release。
+- 远端 `develop` 更新后，`Release` 先检查源码，再自动准备版本、检查、构建并发布自己的 Release：首次 `0.1.0`，后续默认递增补丁号。手动运行仍默认只构建候选。
 
 详细操作见 [二开发布流程](releases/FORK-MAINTENANCE.md)。应用身份尚沿用当前 Zeus 安装，现有数据不自动迁移；二开更新来源与上游已经隔离，但当前发行版还不能与原版并行安装。
 

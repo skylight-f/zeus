@@ -26,7 +26,22 @@
 
 二开功能保持模块边界：发行信息集中配置，主题样式单独维护，业务功能通过少量入口接入。每次同步真实验证临时会话、导航、全局搜索、技能分类和滚动、自动化卡片以及更新来源。
 
-## 首次发布及后续候选
+## 合入 develop 后自动发布
+
+Custom 开发 → 合入并推送远端 develop → Release 源码检查成功 → 准备候选 → 候选检查与打包 → 创建标签并公开 Release。
+
+首次自动发布使用 `0.1.0`，后续默认递增补丁号。上游 `v*` 标签不参与比较；自己的标签、草稿和已有候选说明占用版本，避免覆盖。脚本同步三个 package.json，生成含变更链接的中文发布说明，并由 Actions 正常推送版本提交到 develop。开发者开始下一轮工作前先拉取这个提交。需要调整次版本或主版本时，在功能提交中同步提高三个包版本，自动发布会保留高于已占用版本的版本号。
+
+启用条件：本工作流已推送到 develop，Actions 允许运行，分支规则允许 `GITHUB_TOKEN` 写入版本提交，标签规则允许创建 `skylight-v*`。工作流声明 `contents: write`，但不会绕过仓库保护；禁止机器人直接推送的仓库需先由维护者调整策略，否则准备阶段会失败。配置了 `release` Environment 审批人时仍会等待审批。仓库 Actions Variable `REQUIRE_APPLE_DISTRIBUTION=true` 可强制签名、公证，凭据名称见上文。
+
+自动流程直接监听本仓库 develop 推送，先在 Release 内执行源码检查，不依赖默认分支上的工作流，也不接受 PR 或手动 CI 触发。重跑失败的 Release 可以复用同一候选；已发布候选不会再递增。触发提交已落后时跳过；构建期间 develop 更新则停止旧候选发布，由新提交对应的 Release 接续。自动和手动 Release 共用串行队列。机器人使用 `GITHUB_TOKEN` 推送不会再次触发 push 工作流，因此当前 Release 会显式检查新候选，不依赖递归 CI。
+
+GitHub 限制 [GITHUB_TOKEN 引发的递归工作流](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。只在本地合并不会触发远端发布。
+
+## 手动候选构建与发布
+
+日常合入 develop 使用上面的自动流程；以下入口用于显式准备、检查和恢复候选。不要同时为一次更新运行本地全流程发布命令和自动发布。
+
 
 先写中文发布说明，标题为 `# Zeus X.Y.Z 更新内容`，包括“如何升级”“系统要求与已知限制”“发布验证”。只填写已经取得的验证事实，提供本仓库 Release 地址和 `Zeus-X.Y.Z-arm64.dmg` 文件名；未启用 Homebrew 时不推荐 Tap 命令。
 
@@ -41,7 +56,7 @@ pnpm dev
 
 在 Actions → Release 中填写 develop 的完整 40 位 commit SHA 和 `skylight-vX.Y.Z`，保持 `publish_release=false`，执行候选构建并下载 Actions 产物检查。公开发布时重新选择同一提交并启用 `publish_release`；需要自动安装则同时选择严格 Apple 分发。
 
-公开流程会复核 develop 的固定提交、不可变标签、清单归属、候选 sourceCommit 和版本，门禁及打包通过后才发布。当前产物为 macos-latest 架构构建的 DMG（当前主要验收 arm64），不声称同时支持 Intel。旧的 `pnpm release` 是会提交并推送 develop 的全流程工具，首次发行请使用上述显式流程；只有明确授权公开发布时才运行它。
+公开流程会复核 develop 的固定提交、不可变标签、清单归属、候选 sourceCommit 和版本，门禁及打包通过后才发布。当前产物为 macos-latest 架构构建的 DMG（当前主要验收 arm64），不声称同时支持 Intel。旧的 `pnpm release` 是会提交并推送 develop 的全流程工具，自动发布已接管 develop 的日常发行；只有明确授权公开发布时才运行它。
 
 GitHub Release 和 Homebrew 分步执行。发布后 Tap 同步失败，应基于已公开清单和 DMG 单独恢复 Tap 同步。重新构建的 DMG 摘要若变化，流程会拒绝覆盖既有 Release；内容改变应递增版本。运行时先从自己的发布源检查，再校验摘要、签名与现有安装身份，通过用户确认和宿主关闭流程后安装。
 
