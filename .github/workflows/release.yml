@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: 要构建的固定候选提交；公开发布时必须是 origin/main 当前提交
+        description: 要构建的固定候选提交；公开发布时必须是 origin/develop 当前提交
         required: false
         default: ''
       tag:
@@ -12,7 +12,7 @@ on:
         required: false
         default: ''
       publish_release:
-        description: 发布 GitHub Release 并同步 imchenway/homebrew-tap
+        description: 发布二开 GitHub Release；启用 Homebrew 时同步自己的 Tap
         required: true
         type: boolean
         default: false
@@ -32,12 +32,22 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    outputs:
+      release_branch: ${{ steps.distribution.outputs.release_branch }}
+      homebrew_enabled: ${{ steps.distribution.outputs.homebrew_enabled }}
+      homebrew_repository: ${{ steps.distribution.outputs.homebrew_repository }}
     steps:
       - name: 检出固定发布候选
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ inputs.commit_sha != '' && inputs.commit_sha || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 校验二开发行归属
+        id: distribution
+        run: node scripts/distribution-config.mjs --github-output
       - name: 校验公开发布输入、目标占用与必要凭据
         if: ${{ inputs.publish_release }}
         env:
@@ -63,11 +73,12 @@ jobs:
             echo "检出提交与候选提交不一致：expected=$RELEASE_COMMIT actual=$(git rev-parse HEAD)" >&2
             exit 1
           fi
-          if [ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
-            echo '公开发布候选必须精确等于 origin/main，拒绝发布漂移或未推送提交。' >&2
+          if [ "$(git ls-remote origin refs/heads/${{ steps.distribution.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+            echo '公开发布候选必须精确等于 origin/develop，拒绝发布漂移或未推送提交。' >&2
             exit 1
           fi
-          expected_tag="v$(node -p "require('./package.json').version")"
+          node scripts/distribution-config.mjs --check-version
+          expected_tag="$(node scripts/distribution-config.mjs --tag)"
           if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" != "$expected_tag" ]; then
             echo "公开发布要求目标 tag 与 package.json 版本一致：expected=$expected_tag actual=${RELEASE_TAG:-empty}" >&2
             exit 1
@@ -91,7 +102,7 @@ jobs:
               exit 1
             fi
           fi
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+          if [ "${{ steps.distribution.outputs.homebrew_enabled }}" = "true" ] && [ -z "$HOMEBREW_TAP_TOKEN" ]; then
             echo '公开 Homebrew 发布缺少 HOMEBREW_TAP_TOKEN。' >&2
             exit 1
           fi
@@ -184,6 +195,7 @@ jobs:
     if: ${{ inputs.publish_release }}
     needs: [preflight, verify, package-mac]
     runs-on: ubuntu-latest
+    environment: release
     env:
       GH_TOKEN: ${{ github.token }}
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -196,9 +208,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.commit_sha }}
       - name: 检出 Homebrew Tap
+        if: ${{ needs.preflight.outputs.homebrew_enabled == 'true' }}
         uses: actions/checkout@v4
         with:
-          repository: imchenway/homebrew-tap
+          repository: ${{ needs.preflight.outputs.homebrew_repository }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: .tmp/homebrew-tap
       - name: 下载已校验正式产物
@@ -206,6 +219,16 @@ jobs:
         with:
           name: zeus-macos-${{ inputs.commit_sha }}
           path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 复核下载产物的发行归属和提交
+        run: |
+          node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json --check-version
+          if [ "$(git ls-remote origin refs/heads/${{ needs.preflight.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+            echo '构建期间 develop 已变化，请重新选择发布候选。' >&2
+            exit 1
+          fi
       - name: 检查或创建不可变标签
         run: |
           remote_tag_commit="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')"
@@ -249,11 +272,13 @@ jobs:
               dist/Zeus-*.dmg \
               dist/zeus-release-manifest.json \
               --verify-tag \
+              --latest \
               --title "Zeus $RELEASE_TAG" \
               --notes-file "$release_notes_file"
           fi
           echo "Zeus $version GitHub Release 已就绪。"
       - name: 同步 Homebrew Cask
+        if: ${{ needs.preflight.outputs.homebrew_enabled == 'true' }}
         run: |
           mkdir -p .tmp/homebrew-tap/Casks
           cp dist/homebrew/zeus.rb .tmp/homebrew-tap/Casks/zeus.rb

@@ -157,7 +157,7 @@ export interface SessionWorkspaceActions {
   /** 解释失败原因后可直接打开对应的现有设置页。 */
   onOpenAiSettings?: (section: 'runtime' | 'models') => void;
   onOpenComputerSettings?: () => void;
-  onSelectNewConversationProject?: (projectId: string) => void;
+  onSelectNewConversationProject?: (projectId: string) => void | Promise<void>;
   onLoadNewConversationProjectGit?: (projectId: string) => Promise<ProjectGitWorkbenchSnapshot>;
   onExecuteNewConversationProjectGit?: (projectId: string, repositoryId: string, action: ProjectGitAction) => Promise<ProjectGitActionResponse>;
   onReconnect?: () => void | Promise<void>;
@@ -2375,7 +2375,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           data-quick-actions-popover-open={quickActionsPopoverOpen || undefined}
           style={{ '--session-context-width': `${resolvedBrowserTargetWidth}px` } as CSSProperties}
         >
-          <div key={displayedHeader.conversationId} className="session-thread-title-copy" data-conversation-transition="true">
+          <div key={displayedHeader.conversationId} className="session-thread-title-copy session-thread-title-overview" data-conversation-transition="true">
             <span className="session-thread-title-row">
               {displayedHeader.taskId && actions.onOpenTaskDetail ? (
                 <button
@@ -2423,6 +2423,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 </span>
               ) : null}
             </span>
+            {!legacy && props.state ? (
+              <div className="session-thread-header-runtime">
+                <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} contextLabel={displayedHeader.contextLabel ?? undefined} />
+              </div>
+            ) : null}
           </div>
           <div className="session-context-header-tools">
             <div ref={setContextToolbarHost} className="session-context-toolbar-host" />
@@ -2569,10 +2574,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 data-browser-resizing={browserResizing || undefined}
               >
                 <div className="session-conversation-pane">
-                  {/* 固定在左栏内挂载，开关右侧工作区不重建详情，也不改变浏览器高度。 */}
-                  <div key={`runtime:${displayedHeader?.conversationId ?? props.state.conversationId}`} className="session-thread-subtitle-row">
-                    <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} contextLabel={displayedHeader?.contextLabel ?? undefined} />
-                  </div>
                   <SessionTranscriptProjection
                     state={props.state}
                     controller={props.stateController}

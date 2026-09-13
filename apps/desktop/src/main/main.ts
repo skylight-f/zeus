@@ -1,3 +1,4 @@
+import { isZeusReleaseUrl } from './desktopDistribution.js';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, type FSWatcher, mkdtempSync, readFileSync } from 'node:fs';
@@ -435,7 +436,10 @@ function desktopRoot(): string {
 }
 
 function developmentAppIconPath(): string | undefined {
-  return app.isPackaged ? undefined : join(desktopRoot(), 'assets', 'icon-dev.png');
+  if (app.isPackaged) return undefined;
+  const developmentIcon = join(desktopRoot(), 'dist', 'branding', 'icon-dev.png');
+  // 开发图标为可选定制资源；干净源码检出使用仓库自带图标，避免阻断启动。
+  return existsSync(developmentIcon) ? developmentIcon : join(desktopRoot(), 'assets', 'icon.png');
 }
 
 /** 开发宿主继续使用独立数据目录，并在 macOS Dock 中显式展示开发图标。 */
@@ -2299,7 +2303,7 @@ async function toggleMenuBarUsageWindow(anchor: MenuBarUsageClickAnchor): Promis
 
 function setupTray(): void {
   if (!tray) {
-    const trayIconPath = join(desktopRoot(), 'assets/trayTemplate.png');
+    const trayIconPath = join(desktopRoot(), 'dist/branding/trayTemplate.png');
     const trayIcon = nativeImage.createFromBuffer(readFileSync(trayIconPath));
     if (trayIcon.isEmpty()) throw new Error(`Zeus tray icon is empty: ${trayIconPath}`);
     trayIcon.setTemplateImage(true);
@@ -2911,7 +2915,7 @@ async function initializeApplication(): Promise<void> {
         /** 发布清单中的链接也必须属于 Zeus 官方发布目录。 */
         openDownloadPage: async (value) => {
           const url = new URL(value);
-          if (url.origin !== 'https://github.com' || !/^\/imchenway\/zeus\/releases(?:\/|$)/u.test(url.pathname)) throw new Error('更新下载页面不是 Zeus 官方发布地址。');
+          if (!isZeusReleaseUrl(url.toString())) throw new Error('更新下载页面不是 Zeus 官方发布地址。');
           const result = await openExternalHttpsUrl({ url: value, openExternal: (target) => shell.openExternal(target) });
           if (!result.opened) throw new Error('无法打开更新下载页面，请稍后重试。');
         },

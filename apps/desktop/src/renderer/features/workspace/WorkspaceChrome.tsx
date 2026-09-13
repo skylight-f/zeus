@@ -1,5 +1,5 @@
 import { MotionPresence } from '../../ui/MotionPresence.js';
-import { normalizeSidebarConversationFilters, sidebarConversationRunStatuses, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
+import { temporaryWorkspaceId, normalizeSidebarConversationFilters, sidebarConversationRunStatuses, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
 import { Collapsible } from '../../ui/Collapsible.js';
 import { handleSourceListKeyboardNavigation } from './workspaceSupport.js';
 import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
@@ -75,8 +75,8 @@ function readLegacySidebarConversationFilters(): SidebarConversationFilters | un
   }
 }
 
-/** 首次工作面复用项目创建，不引入独立引导状态或模型前置依赖。 */
-export function ProjectStartGuide(props: { language: AppLanguage; busy: boolean; available: boolean; onChooseFolder: () => void }) {
+/** 首次工作面允许直接开始临时会话，也可选择项目目录。 */
+export function ProjectStartGuide(props: { language: AppLanguage; busy: boolean; available: boolean; onStartTemporary: () => void; onChooseFolder: () => void }) {
   /** 引导文案沿用应用语言。 */
   const zh = props.language === 'zh-CN';
   return (
@@ -85,21 +85,17 @@ export function ProjectStartGuide(props: { language: AppLanguage; busy: boolean;
         <FolderOpen size={32} weight="regular" />
       </div>
       <h1 id="project-start-title">{zh ? '让想法，从这里开始' : 'Your ideas start here'}</h1>
-      <p className="project-start-description">{zh ? '选择一个工作文件夹，创建你的项目。' : 'Choose a working folder and create your project.'}</p>
+      <p className="project-start-description">{zh ? '直接开始临时会话，或选择文件夹创建项目。' : 'Start a temporary conversation, or choose a folder for a project.'}</p>
       <div className="project-start-action">
-        <Button variant="primary" size="regular" onClick={props.onChooseFolder} disabled={props.busy || !props.available} busy={props.busy}>
+        <Button variant="primary" size="regular" onClick={props.onStartTemporary} disabled={props.busy || !props.available}>
+          {zh ? '开始临时会话' : 'Start temporary conversation'}
+        </Button>
+        <Button variant="secondary" size="regular" onClick={props.onChooseFolder} disabled={props.busy || !props.available} busy={props.busy}>
           <FolderPlus size={18} aria-hidden="true" />
           {zh ? '选择工作文件夹' : 'Choose working folder'}
         </Button>
       </div>
-      <ol className="project-start-steps" aria-label={zh ? '创建项目的两个步骤' : 'Two steps to create a project'}>
-        <li aria-current="step">{zh ? '选择文件夹' : 'Choose a folder'}</li>
-        <li>
-          <span aria-hidden="true">→</span>
-          {zh ? '创建项目' : 'Create a project'}
-        </li>
-      </ol>
-      <p className="project-start-note">{zh ? '模型可稍后接入 · 项目与任务保存在本机' : 'Connect a model later · Projects and tasks stay on your Mac'}</p>
+      <p className="project-start-note">{zh ? '临时会话使用默认目录，文件和会话历史保存在本机' : 'Temporary conversations use the default folder; files and history stay on your Mac'}</p>
     </section>
   );
 }
@@ -112,6 +108,7 @@ export function ProjectCreateDialog(props: {
   directoryBusy: boolean;
   error?: string;
   copy: ReturnType<typeof getLanguageCopy>['sidebar'];
+  onStartTemporary?: () => void;
   onNameChange: (name: string) => void;
   onChooseDirectory: () => void;
   onClose: () => void;
@@ -188,6 +185,11 @@ export function ProjectCreateDialog(props: {
           ) : null}
         </div>
         <footer className="project-create-dialog-footer">
+          {props.onStartTemporary ? (
+            <Button variant="secondary" size="regular" onClick={props.onStartTemporary} disabled={interactionBusy}>
+              {props.copy.createTemporary}
+            </Button>
+          ) : null}
           <Button variant="secondary" size="regular" onClick={props.onClose} disabled={interactionBusy}>
             {props.copy.createCancel}
           </Button>
@@ -278,10 +280,7 @@ export function ProjectRenameDialog(props: {
 }
 
 type GlobalSearchSourceResult = ProjectSourceContentMatch & { project: ProjectRecord };
-type GlobalSearchSelection =
-  | { kind: 'task'; task: TaskRecord }
-  | { kind: 'conversation'; conversation: NativeConversationChoice; projectName: string }
-  | { kind: 'source'; result: GlobalSearchSourceResult };
+type GlobalSearchSelection = { kind: 'task'; task: TaskRecord } | { kind: 'conversation'; conversation: NativeConversationChoice; projectName: string } | { kind: 'source'; result: GlobalSearchSourceResult };
 type GlobalSearchScope = 'all' | 'task' | 'conversation' | 'source';
 
 /** 标题栏的全局搜索同时覆盖本地任务、已加载会话和所有项目的源码文本。 */
@@ -331,11 +330,7 @@ function ProjectGlobalSearch(props: {
       normalizedQuery
         ? conversations
             .filter(({ conversation, projectName, taskTitle }) =>
-              [conversationDisplayTitle(conversation.title, taskTitle, props.language), conversation.summary, projectName, taskTitle]
-                .filter(Boolean)
-                .join('\n')
-                .toLocaleLowerCase()
-                .includes(normalizedQuery),
+              [conversationDisplayTitle(conversation.title, taskTitle, props.language), conversation.summary, projectName, taskTitle].filter(Boolean).join('\n').toLocaleLowerCase().includes(normalizedQuery),
             )
             .sort((left, right) => Date.parse(right.conversation.activityAt ?? right.conversation.updatedAt) - Date.parse(left.conversation.activityAt ?? left.conversation.updatedAt))
             .slice(0, 6)
@@ -354,16 +349,15 @@ function ProjectGlobalSearch(props: {
   useEffect(() => {
     const revision = ++requestRevisionRef.current;
     setSourceTruncated(false);
-    if (normalizedQuery.length < 2 || !window.zeus?.searchProjectSourceContent) {
+    const searchProjectSourceContent = window.zeus?.searchProjectSourceContent;
+    if (normalizedQuery.length < 2 || !searchProjectSourceContent) {
       setSourceResults([]);
       setSourceLoading(false);
       return;
     }
     setSourceLoading(true);
     const timer = window.setTimeout(() => {
-      void Promise.allSettled(
-        props.projects.map(async (project) => ({ project, result: await window.zeus.searchProjectSourceContent({ projectId: project.id, query: normalizedQuery }) })),
-      ).then((settled) => {
+      void Promise.allSettled(props.projects.map(async (project) => ({ project, result: await searchProjectSourceContent({ projectId: project.id, query: normalizedQuery }) }))).then((settled) => {
         if (requestRevisionRef.current !== revision) return;
         const fulfilled = settled.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []));
         setSourceResults(fulfilled.flatMap(({ project, result }) => result.matches.map((match) => ({ ...match, project }))).slice(0, 10));
@@ -383,10 +377,7 @@ function ProjectGlobalSearch(props: {
     [conversationResults, searchScope, sourceResults, taskResults],
   );
   const visibleTaskResults = useMemo(() => (searchScope === 'all' || searchScope === 'task' ? taskResults : []), [searchScope, taskResults]);
-  const visibleConversationResults = useMemo(
-    () => (searchScope === 'all' || searchScope === 'conversation' ? conversationResults : []),
-    [conversationResults, searchScope],
-  );
+  const visibleConversationResults = useMemo(() => (searchScope === 'all' || searchScope === 'conversation' ? conversationResults : []), [conversationResults, searchScope]);
   const visibleSourceResults = useMemo(() => (searchScope === 'all' || searchScope === 'source' ? sourceResults : []), [searchScope, sourceResults]);
   useEffect(() => setActiveIndex(0), [normalizedQuery, searchScope]);
   useEffect(() => {
@@ -444,12 +435,7 @@ function ProjectGlobalSearch(props: {
               <WorkspaceTasksIcon aria-hidden="true" />
               <span>{zh ? '任务' : 'Tasks'}</span>
             </button>
-            <button
-              type="button"
-              className={`project-global-search-scope ${searchScope === 'conversation' ? 'is-active' : ''}`}
-              onClick={() => setSearchScope('conversation')}
-              aria-pressed={searchScope === 'conversation'}
-            >
+            <button type="button" className={`project-global-search-scope ${searchScope === 'conversation' ? 'is-active' : ''}`} onClick={() => setSearchScope('conversation')} aria-pressed={searchScope === 'conversation'}>
               <ChatCircleDots aria-hidden="true" />
               <span>{zh ? '会话' : 'Conversations'}</span>
             </button>
@@ -462,7 +448,11 @@ function ProjectGlobalSearch(props: {
             <GlobalSearchGroup title={zh ? '任务' : 'Tasks'} icon={<WorkspaceTasksIcon aria-hidden="true" />}>
               {visibleTaskResults.map((task, index) => (
                 <button key={task.id} type="button" className={activeIndex === index ? 'is-active' : ''} onMouseEnter={() => setActiveIndex(index)} onClick={() => activate({ kind: 'task', task })}>
-                  <strong>{task.title}</strong><small>{projectName(task.projectId)}{task.taskCode ? ` · ${task.taskCode}` : ''}</small>
+                  <strong>{task.title}</strong>
+                  <small>
+                    {projectName(task.projectId)}
+                    {task.taskCode ? ` · ${task.taskCode}` : ''}
+                  </small>
                 </button>
               ))}
             </GlobalSearchGroup>
@@ -471,9 +461,31 @@ function ProjectGlobalSearch(props: {
             <GlobalSearchGroup title={zh ? '会话' : 'Conversations'} icon={<ChatCircleDots aria-hidden="true" />}>
               {visibleConversationResults.map(({ conversation, projectName: resultProjectName, taskTitle }, index) => {
                 const itemIndex = visibleTaskResults.length + index;
+                const title = conversationDisplayTitle(conversation.title, taskTitle, props.language);
+                const summary = conversation.summary?.trim();
                 return (
-                  <button key={conversation.navigationId ?? conversation.id} type="button" className={activeIndex === itemIndex ? 'is-active' : ''} onMouseEnter={() => setActiveIndex(itemIndex)} onClick={() => activate({ kind: 'conversation', conversation, projectName: resultProjectName })}>
-                    <strong>{conversationDisplayTitle(conversation.title, taskTitle, props.language)}</strong><small>{resultProjectName}{taskTitle ? ` · ${taskTitle}` : ''}</small>
+                  <button
+                    key={conversation.navigationId ?? conversation.id}
+                    type="button"
+                    className={activeIndex === itemIndex ? 'is-active' : ''}
+                    onMouseEnter={() => setActiveIndex(itemIndex)}
+                    onClick={() => activate({ kind: 'conversation', conversation, projectName: resultProjectName })}
+                  >
+                    <strong>{title}</strong>
+                    {summary && summary !== title ? <small className="project-global-search-summary">{summary}</small> : null}
+                    <small>
+                      {resultProjectName}
+                      {taskTitle ? ` · ${taskTitle}` : ''}
+                      {Number.isFinite(Date.parse(conversation.activityAt ?? conversation.updatedAt)) ? (
+                        <>
+                          {' '}
+                          · {zh ? '最近活动 ' : 'Last active '}
+                          <time dateTime={conversation.activityAt ?? conversation.updatedAt}>
+                            {new Date(conversation.activityAt ?? conversation.updatedAt).toLocaleString(props.language, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          </time>
+                        </>
+                      ) : null}
+                    </small>
                   </button>
                 );
               })}
@@ -484,8 +496,18 @@ function ProjectGlobalSearch(props: {
               {visibleSourceResults.map((result, index) => {
                 const itemIndex = visibleTaskResults.length + visibleConversationResults.length + index;
                 return (
-                  <button key={`${result.project.id}:${result.relativePath}:${result.line}:${result.column}`} type="button" className={activeIndex === itemIndex ? 'is-active' : ''} onMouseEnter={() => setActiveIndex(itemIndex)} onClick={() => activate({ kind: 'source', result })}>
-                    <strong>{result.relativePath}{result.matchKind === 'content' ? `:${result.line}` : ''}</strong><small>{result.preview || result.project.name}</small>
+                  <button
+                    key={`${result.project.id}:${result.relativePath}:${result.line}:${result.column}`}
+                    type="button"
+                    className={activeIndex === itemIndex ? 'is-active' : ''}
+                    onMouseEnter={() => setActiveIndex(itemIndex)}
+                    onClick={() => activate({ kind: 'source', result })}
+                  >
+                    <strong>
+                      {result.relativePath}
+                      {result.matchKind === 'content' ? `:${result.line}` : ''}
+                    </strong>
+                    <small>{result.preview || result.project.name}</small>
                   </button>
                 );
               })}
@@ -504,7 +526,10 @@ function ProjectGlobalSearch(props: {
 function GlobalSearchGroup(props: { title: string; icon: ReactNode; children: ReactNode }) {
   return (
     <section className="project-global-search-group">
-      <header>{props.icon}<span>{props.title}</span></header>
+      <header>
+        {props.icon}
+        <span>{props.title}</span>
+      </header>
       <div>{props.children}</div>
     </section>
   );
@@ -533,7 +558,7 @@ export function ProjectWorkspaceNavigation(props: {
 }) {
   /** 导航文案跟随当前应用语言。 */
   const zh = props.language === 'zh-CN';
-  /** 会话入口仍使用 Option 点击创建新会话，避免在窄侧栏重复放置当前会话抽屉按钮。 */
+  /** 会话入口支持 Option 点击创建新会话。 */
   const conversationLabel = zh ? '会话' : 'Conversations';
   const conversationTitle = zh ? '打开会话；按住 Option 点击可在当前项目创建新会话' : 'Open conversations; Option-click to create one in the current project';
   /** 各工作区的可见名称。 */
@@ -583,6 +608,19 @@ export function ProjectWorkspaceNavigation(props: {
     }
     if (project.id !== props.project.id) props.onSelectProject(project);
   };
+  /** 关闭项目槽位；关闭当前项目时切换到相邻的已打开项目。 */
+  const closeProjectSlot = (slotId: string) => {
+    if (projectSlots.length <= 1) return;
+    const closingIndex = projectSlots.findIndex((slot) => slot.id === slotId);
+    const closingSlot = closingIndex >= 0 ? projectSlots[closingIndex] : undefined;
+    if (!closingSlot) return;
+    const nextSlots = projectSlots.filter((slot) => slot.id !== slotId);
+    setProjectSlots(nextSlots);
+    if (closingSlot.projectId !== props.project.id) return;
+    const replacementSlot = nextSlots[closingIndex] ?? nextSlots[closingIndex - 1];
+    const replacementProject = replacementSlot ? props.projects.find((project) => project.id === replacementSlot.projectId) : undefined;
+    if (replacementProject) props.onSelectProject(replacementProject);
+  };
   return (
     <>
       <header className="project-workspace-project-switcher" aria-label={props.project.name}>
@@ -592,11 +630,7 @@ export function ProjectWorkspaceNavigation(props: {
             const active = slotProject?.id === props.project.id;
             const emptyValue = `__empty_project_slot_${slot.id}`;
             return (
-              <span
-                key={slot.id}
-                className={`project-workspace-project-slot${active ? ' is-active' : ''}`}
-                data-project-slot-id={slot.id}
-              >
+              <span key={slot.id} className={`project-workspace-project-slot${active ? ' is-active' : ''}`} data-project-slot-id={slot.id}>
                 <button
                   type="button"
                   className="project-workspace-project-slot-primary"
@@ -636,14 +670,27 @@ export function ProjectWorkspaceNavigation(props: {
                   triggerLabel={slotProject?.name ?? (zh ? '选择项目' : 'Select project')}
                   triggerIcon={<FolderOpen size={18} aria-hidden="true" />}
                   triggerClassName="project-workspace-project-slot-trigger"
-                  triggerTitle={zh ? '点击右侧箭头切换项目' : 'Use the arrow to change project'}
+                  triggerTitle={zh ? '点击左侧箭头切换项目' : 'Use the left arrow to change project'}
                   searchable
                   searchPlaceholder={zh ? '搜索项目' : 'Search projects'}
                   emptyLabel={zh ? '没有可选择的项目' : 'No projects available'}
                   popoverMinWidth={260}
-                  popoverArrowAlignment="end"
+                  popoverArrowAlignment="start"
                   size="compact"
                 />
+                <button
+                  type="button"
+                  className="project-workspace-project-slot-close"
+                  disabled={projectSlots.length <= 1}
+                  aria-label={slotProject ? (zh ? `关闭项目 ${slotProject.name}` : `Close project ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
+                  title={projectSlots.length <= 1 ? (zh ? '至少保留一个项目' : 'Keep at least one project open') : slotProject ? (zh ? `关闭 ${slotProject.name}` : `Close ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    closeProjectSlot(slot.id);
+                  }}
+                >
+                  <X size={15} weight="regular" aria-hidden="true" />
+                </button>
               </span>
             );
           })}
@@ -696,7 +743,7 @@ export function ProjectWorkspaceNavigation(props: {
           }}
         >
           <span className="project-workspace-mode-icon" aria-hidden="true">
-            <PencilSimple size={18} weight="regular" />
+            <ChatCircleDots size={18} weight="regular" />
           </span>
           <span className="project-workspace-mode-label">{conversationLabel}</span>
         </button>
@@ -725,8 +772,8 @@ export function ProjectWorkspaceNavigation(props: {
               </span>
               <span className="project-workspace-mode-label">{label}</span>
             </button>
-            );
-          })}
+          );
+        })}
         <span className="project-workspace-mode-rail-spacer" aria-hidden="true" />
         <button
           type="button"
@@ -1155,7 +1202,7 @@ export function SidebarNav(props: {
       <div className="project-window-control-reserved-space" aria-hidden="true" />
       <nav className="project-quick-actions codex-source-list-quick-actions project-context-actions" aria-label={contextTitle}>
         {showConversationNavigation ? (
-          <button type="button" className="project-quick-action" onClick={props.onCreateConversation} disabled={!props.activeProjectId}>
+          <button type="button" className="project-quick-action" onClick={props.onCreateConversation} disabled={props.createProjectBusy}>
             <span className="project-quick-action-icon" aria-hidden="true">
               <svg viewBox="0 0 20 20" focusable="false">
                 <path d="M4.2 14.9 4.8 11 12.6 3.2a2 2 0 0 1 2.8 0l1.4 1.4a2 2 0 0 1 0 2.8L9 15.2l-3.9.6Z" />
@@ -1384,38 +1431,40 @@ export function SidebarNav(props: {
                     type: 'button',
                     tabIndex: isActiveProject ? 0 : -1,
                     'data-source-list-item': 'true',
-                    'aria-label': `${props.appLanguage === 'zh-CN' ? '项目' : 'Project'}${copy.labelSeparator}${project.name}`,
+                    'aria-label': project.id === temporaryWorkspaceId ? (props.appLanguage === 'zh-CN' ? '临时会话' : 'Temporary conversations') : `${props.appLanguage === 'zh-CN' ? '项目' : 'Project'}${copy.labelSeparator}${project.name}`,
                     'aria-current': isActiveProject ? 'true' : undefined,
                     // 侧边栏项目名称固定作为该项目的任务页入口。
-                    onClick: () => props.onOpenProjectSection(project, 'tasks'),
+                    onClick: () => props.onOpenProjectSection(project, project.id === temporaryWorkspaceId ? 'sessions' : 'tasks'),
                   }}
                   actions={
-                    <>
-                      <button type="button" className="project-settings-button" aria-label={`${copy.projectSettingsPrefix}${copy.labelSeparator}${project.name}`} onClick={() => props.onOpenProjectSection(project, 'project-settings')}>
-                        <GearSix aria-hidden="true" weight="regular" />
-                      </button>
-                      <div className={`project-row-actions ${menuOpen ? 'open' : ''} ${menuClosing ? 'closing' : ''}`.trim()} onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}>
-                        <button
-                          type="button"
-                          className="project-more-button"
-                          ref={(button) => {
-                            if (button) {
-                              projectMenuButtonRefs.current.set(project.id, button);
-                            } else {
-                              projectMenuButtonRefs.current.delete(project.id);
-                            }
-                          }}
-                          aria-label={`${copy.moreProjectActionsPrefix}${copy.labelSeparator}${project.name}`}
-                          aria-haspopup="menu"
-                          aria-expanded={menuOpen}
-                          aria-controls={menuVisible ? `project-more-menu-${project.id}` : undefined}
-                          onClick={(event) => toggleProjectMoreMenu(project.id, event.currentTarget)}
-                        >
-                          <DotsThreeVertical aria-hidden="true" weight="regular" />
+                    project.id === temporaryWorkspaceId ? undefined : (
+                      <>
+                        <button type="button" className="project-settings-button" aria-label={`${copy.projectSettingsPrefix}${copy.labelSeparator}${project.name}`} onClick={() => props.onOpenProjectSection(project, 'project-settings')}>
+                          <GearSix aria-hidden="true" weight="regular" />
                         </button>
-                      </div>
-                      {projectMorePopover ? (projectMenuPortalHost ? createPortal(projectMorePopover, projectMenuPortalHost) : projectMorePopover) : null}
-                    </>
+                        <div className={`project-row-actions ${menuOpen ? 'open' : ''} ${menuClosing ? 'closing' : ''}`.trim()} onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}>
+                          <button
+                            type="button"
+                            className="project-more-button"
+                            ref={(button) => {
+                              if (button) {
+                                projectMenuButtonRefs.current.set(project.id, button);
+                              } else {
+                                projectMenuButtonRefs.current.delete(project.id);
+                              }
+                            }}
+                            aria-label={`${copy.moreProjectActionsPrefix}${copy.labelSeparator}${project.name}`}
+                            aria-haspopup="menu"
+                            aria-expanded={menuOpen}
+                            aria-controls={menuVisible ? `project-more-menu-${project.id}` : undefined}
+                            onClick={(event) => toggleProjectMoreMenu(project.id, event.currentTarget)}
+                          >
+                            <DotsThreeVertical aria-hidden="true" weight="regular" />
+                          </button>
+                        </div>
+                        {projectMorePopover ? (projectMenuPortalHost ? createPortal(projectMorePopover, projectMenuPortalHost) : projectMorePopover) : null}
+                      </>
+                    )
                   }
                 />
                 {showConversationNavigation && conversationGroup && ((conversationGroup.conversations?.length ?? 0) > 0 || conversationGroup.tasks.some((task) => task.conversations.length > 0)) ? (

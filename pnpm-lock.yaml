@@ -49,6 +49,9 @@ importers:
         specifier: ^8.18.2
         version: 8.21.0
     devDependencies:
+      '@skylight/distribution':
+        specifier: workspace:*
+        version: link:packages/skylight-distribution
       '@eslint/js':
         specifier: ^9.29.0
         version: 9.39.4
@@ -91,6 +94,9 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@skylight/distribution':
+        specifier: workspace:*
+        version: link:../../packages/skylight-distribution
       '@zeus/ai-runtime':
         specifier: workspace:*
         version: link:../../packages/ai-runtime
@@ -249,6 +255,12 @@ importers:
         version: 0.12.1
 
   packages/shared: {}
+
+  packages/skylight-distribution:
+    dependencies:
+      '@zeus/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/storage:
     dependencies:

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { zeusDistribution, releaseTag, versionFromReleaseTag, releasePackagePaths, distributionPackagePath } from './desktop-distribution.mjs';
 /* global console, process */
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -20,8 +21,8 @@ function main() {
   const sourceNotesPath = requiredFile(process.env.RELEASE_NOTES_FILE, 'RELEASE_NOTES_FILE');
   const applyChanges = parseBoolean('APPLY_CHANGES', process.env.APPLY_CHANGES, false);
   const latestTag = resolveLatestStableTag();
-  const baseVersion = latestTag.slice(1);
-  const targetNotesPath = join(repositoryRoot, 'releases', `v${releaseVersion}.md`);
+  const baseVersion = versionFromReleaseTag(latestTag);
+  const targetNotesPath = join(repositoryRoot, 'releases', `${releaseTag(releaseVersion)}.md`);
   const sourceNotes = readFileSync(sourceNotesPath, 'utf8');
 
   assertVersionAfterTag(releaseVersion, latestTag, '。');
@@ -101,14 +102,14 @@ function requiredFile(rawValue, name) {
 }
 
 function resolveLatestStableTag() {
-  const tag = git(['describe', '--tags', '--abbrev=0', '--match', 'v[0-9]*']);
-  if (!/^v\d+\.\d+\.\d+$/u.test(tag)) throw new Error(`最新稳定标签格式无效：${tag}`);
+  const tag = git(['describe', '--tags', '--abbrev=0', '--match', `${zeusDistribution.releaseTagPrefix}[0-9]*`]);
+  if (!versionFromReleaseTag(tag)) throw new Error(`最新稳定标签格式无效：${tag}`);
   return tag;
 }
 
 function assertTagDoesNotExist(version) {
-  const result = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/tags/v${version}`], { cwd: repositoryRoot });
-  if (result.status === 0) throw new Error(`标签 v${version} 已存在，拒绝重新准备同版本。`);
+  const result = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/tags/${releaseTag(version)}`], { cwd: repositoryRoot });
+  if (result.status === 0) throw new Error(`标签 ${releaseTag(version)} 已存在，拒绝重新准备同版本。`);
 }
 
 function readPackage(path) {
@@ -136,7 +137,7 @@ function resolvePreparationState(input) {
 
 function assertOnlyPreparedPathsChanged(status, targetNotesPath) {
   if (!status) return;
-  const allowed = new Set(['package.json', 'apps/desktop/package.json', relativeToRepository(targetNotesPath)]);
+  const allowed = new Set([...releasePackagePaths, relativeToRepository(targetNotesPath)]);
   const unexpected = status
     .split(/\r?\n/u)
     .map((line) => line.slice(3).split(' -> ').at(-1))
@@ -147,7 +148,9 @@ function assertOnlyPreparedPathsChanged(status, targetNotesPath) {
 }
 
 function applyCandidateChanges(input) {
+  const distributionPackage = join(repositoryRoot, distributionPackagePath);
   const originalFiles = [
+    { path: distributionPackage, existed: true, content: readFileSync(distributionPackage, 'utf8') },
     { path: input.rootPackagePath, existed: true, content: readFileSync(input.rootPackagePath, 'utf8') },
     { path: input.desktopPackagePath, existed: true, content: readFileSync(input.desktopPackagePath, 'utf8') },
     { path: input.targetNotesPath, existed: existsSync(input.targetNotesPath), content: existsSync(input.targetNotesPath) ? readFileSync(input.targetNotesPath, 'utf8') : '' },
@@ -159,6 +162,7 @@ function applyCandidateChanges(input) {
     mkdirSync(dirname(input.targetNotesPath), { recursive: true });
     writeFileSync(input.rootPackagePath, nextRootPackage);
     writeFileSync(input.desktopPackagePath, nextDesktopPackage);
+    writeFileSync(distributionPackage, JSON.stringify({ ...JSON.parse(originalFiles[0].content), version: input.releaseVersion }, null, 2) + '\n');
     writeFileSync(input.targetNotesPath, input.sourceNotes);
     run('pnpm', ['exec', 'prettier', '--check', 'package.json', 'apps/desktop/package.json']);
     run('git', ['diff', '--check', '--', 'package.json', 'apps/desktop/package.json']);
@@ -194,7 +198,7 @@ function buildPlan(input) {
     '',
     '## 边界',
     '',
-    '- 本命令最多只修改 `package.json`、`apps/desktop/package.json` 和目标 Release notes。',
+    '- 本命令只同步发行包、根包、桌面包版本和目标 Release notes。',
     '- 本命令不创建分支、提交、PR、标签、GitHub Release 或 Homebrew Tap 变更。',
     '- 写入后必须人工审阅 Git 变更，再进入本地发布门禁。',
     '',

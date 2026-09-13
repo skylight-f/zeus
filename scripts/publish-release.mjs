@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { releaseTag, assertDistributionVersions } from './desktop-distribution.mjs';
 /* global console, process */
+import { zeusDistribution } from './desktop-distribution.mjs';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,8 +19,8 @@ import {
 } from './release-workflow-wait-policy.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
-const repository = 'imchenway/zeus';
-const homebrewRepository = 'imchenway/homebrew-tap';
+const repository = zeusDistribution.repository;
+const homebrewRepository = zeusDistribution.homebrewRepository;
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
@@ -33,7 +35,7 @@ async function main() {
   const deepVerifyPublicDmg = parseBoolean('DEEP_VERIFY_PUBLIC_DMG', process.env.DEEP_VERIFY_PUBLIC_DMG, false);
   const confirmation = process.env.PUBLISH_CONFIRMATION?.trim() ?? '';
   const localGateSummaryPath = optionalFile(process.env.LOCAL_GATE_SUMMARY_FILE, 'LOCAL_GATE_SUMMARY_FILE');
-  const tag = `v${releaseVersion}`;
+  const tag = releaseTag(releaseVersion);
   const outputDirectory = resolveOutputDirectory(releaseVersion);
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
 
@@ -97,10 +99,11 @@ async function main() {
 function collectPreflight(input) {
   const blockers = [];
   const headSha = git(['rev-parse', 'HEAD']);
+  assertDistributionVersions();
   const branch = git(['branch', '--show-current']) || '(detached HEAD)';
   const worktreeStatus = git(['status', '--short']);
   const originUrl = git(['remote', 'get-url', 'origin']);
-  const remoteMainSha = resolveRemoteReference('refs/heads/main');
+  const remoteMainSha = resolveRemoteReference(`refs/heads/${zeusDistribution.releaseBranch}`);
   const localTagSha = resolveLocalTagSha(input.tag);
   const remoteTagSha = resolveRemoteTagSha(input.tag);
   const ghAuth = captureRemoteRead('检查 GitHub CLI 登录状态', 'gh', ['auth', 'status', '--hostname', 'github.com'], { allowFailure: true });
@@ -113,11 +116,11 @@ function collectPreflight(input) {
   let packageVersion = null;
   let desktopVersion = null;
 
-  if (branch !== 'main') blockers.push(`当前分支必须是 main，实际为 ${branch}`);
+  if (branch !== zeusDistribution.releaseBranch) blockers.push(`当前分支必须是 develop，实际为 ${branch}`);
   if (worktreeStatus) blockers.push('工作区必须干净');
   if (!isExpectedOrigin(originUrl)) blockers.push(`origin 不是 ${repository}：${originUrl}`);
-  if (!remoteMainSha) blockers.push('无法读取 origin/main 远程提交');
-  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin/main 不一致：local=${headSha} remote=${remoteMainSha}`);
+  if (!remoteMainSha) blockers.push('无法读取 origin/develop 远程提交');
+  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin/develop 不一致：local=${headSha} remote=${remoteMainSha}`);
   if (ghAuth.status !== 0) blockers.push(`GitHub CLI 未完成可用登录：${commandFailureDetail(ghAuth)}`);
 
   try {
@@ -148,7 +151,7 @@ function collectPreflight(input) {
   if (secretsRead.error) {
     blockers.push(`无法读取 GitHub Actions Secrets：${secretsRead.error}`);
   } else {
-    if (!secretNames.has('HOMEBREW_TAP_TOKEN')) blockers.push('GitHub Actions 缺少 HOMEBREW_TAP_TOKEN');
+    if (zeusDistribution.homebrewEnabled && !secretNames.has('HOMEBREW_TAP_TOKEN')) blockers.push('GitHub Actions 缺少 HOMEBREW_TAP_TOKEN');
     if (input.requireAppleDistribution) {
       for (const name of ['MACOS_CERTIFICATE', 'MACOS_CERTIFICATE_PASSWORD']) {
         if (!secretNames.has(name)) blockers.push(`严格 Apple 分发缺少 ${name}`);
@@ -195,11 +198,11 @@ function buildPlan(preflight, input) {
     `- 标签：${input.tag}`,
     `- 分支：${preflight.branch}`,
     `- 候选提交：${preflight.headSha}`,
-    `- origin/main：${preflight.remoteMainSha || '未读取到'}`,
+    `- origin/develop：${preflight.remoteMainSha || '未读取到'}`,
     `- 根包／桌面包版本：${preflight.packageVersion ?? '未读取到'} / ${preflight.desktopVersion ?? '未读取到'}`,
     `- Release notes：${preflight.releaseNotesPath}`,
     `- 本地快速检查摘要：${preflight.localGateSummaryPath || '未提供'}`,
-    `- main CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
+    `- develop CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
     `- 本地／远程标签：${preflight.localTagSha || '无'} / ${preflight.remoteTagSha || '无'}`,
     `- GitHub Release：${preflight.release.exists ? preflight.release.data.url : '无'}`,
     `- GitHub CLI 登录：${preflight.ghAuthenticated ? '可用' : '不可用'}`,
@@ -225,7 +228,7 @@ function buildPlan(preflight, input) {
     '',
     '## 不在本命令中执行',
     '',
-    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入 main。',
+    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入 develop。',
     '- 不强推、不改写已存在标签、不删除失败发布留下的标签。',
     '- Workflow 在阻塞检查通过前不创建标签；失败后可对同一候选提交幂等重试。',
     '',
@@ -282,6 +285,8 @@ async function verifyPublishedRelease(input) {
       throw new Error('GitHub manifest 资产元数据与下载文件不一致。');
     }
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    if (manifest.distributionId !== zeusDistribution.id || manifest.repository !== repository || manifest.sourceCommit !== input.headSha || manifest.channel !== zeusDistribution.channel)
+      throw new Error('公开清单不属于当前二开发行版或候选提交。');
     const manifestArtifact = manifest.artifacts?.find((artifact) => artifact.arch === 'arm64' && artifact.kind === 'dmg' && artifact.fileName === expectedDmgName);
     if (manifest.version !== input.releaseVersion || manifest.channel !== 'stable' || !manifestArtifact) {
       throw new Error('公开 manifest 的版本、通道或 DMG 记录不一致。');
@@ -306,9 +311,9 @@ async function verifyPublishedRelease(input) {
       }
     }
 
-    const cask = gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/zeus.rb?ref=main`]);
+    const cask = zeusDistribution.homebrewEnabled ? gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/zeus.rb?ref=main`]) : '# 当前发行版未启用 Homebrew Tap\n';
     for (const expected of [`version "${input.releaseVersion}"`, `sha256 "${dmgSha256}"`, 'depends_on arch: :arm64']) {
-      if (!cask.includes(expected)) throw new Error(`Homebrew Tap Cask 与公开 DMG 不一致，缺少：${expected}`);
+      if (zeusDistribution.homebrewEnabled && !cask.includes(expected)) throw new Error(`Homebrew Tap Cask 与公开 DMG 不一致，缺少：${expected}`);
     }
 
     const releaseNotesSnapshotPath = join(input.outputDirectory, `${input.tag}-release-notes.md`);
@@ -354,7 +359,7 @@ function buildPublishResult(input) {
     `- DMG：${input.dmgName}，${input.dmgSize} 字节，SHA-256 ${input.dmgSha256}`,
     `- manifest：${input.manifestSize} 字节，SHA-256 ${input.manifestSha256}`,
     `- Release notes SHA-256：${input.releaseNotesSha256}`,
-    `- Homebrew Cask SHA-256：${input.caskSha256}`,
+    zeusDistribution.homebrewEnabled ? `- Homebrew Cask SHA-256：${input.caskSha256}` : '- Homebrew：当前发行版未启用',
     `- Developer ID 签名：${input.signed ? '是' : '否'}`,
     `- Apple 公证：${input.notarized ? '是' : '否'}`,
     input.deepVerified ? '- 公开 DMG 已回下载并通过 `hdiutil verify`。' : '- 默认快速模式未回下载完整 DMG；正式 DMG 已在上传前通过 `hdiutil verify`。',
@@ -382,7 +387,10 @@ function validateLocalGateSummary(path, version, headSha) {
 }
 
 function findSuccessfulCiRun(headSha) {
-  const result = ghJson(['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', 'main', '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'], true);
+  const result = ghJson(
+    ['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', zeusDistribution.releaseBranch, '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'],
+    true,
+  );
   if (!result.ok || !Array.isArray(result.value)) return null;
   return result.value.find((run) => run.headSha === headSha && run.event === 'push' && run.status === 'completed' && run.conclusion === 'success') ?? null;
 }
@@ -444,7 +452,7 @@ function dispatchReleaseWorkflow(tag, commitSha, requireAppleDistribution) {
     '--repo',
     repository,
     '--ref',
-    'main',
+    zeusDistribution.releaseBranch,
     '--field',
     `commit_sha=${commitSha}`,
     '--field',

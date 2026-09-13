@@ -1,3 +1,5 @@
+import { zeusDistribution, skylightToolPages } from '../../skylight/index.js';
+import { temporaryWorkspaceId } from '@zeus/shared';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
 import type { UpdateAppShellSettingsRequest } from '../settings/settingsContracts.js';
@@ -44,8 +46,6 @@ import { DigitalEmployeeTemplatesSettings } from '../digital-employees/DigitalEm
 import { ImRobotSettingsPane } from '../telegram/ImRobotSettingsPane.js';
 import { ProjectDigitalEmployeesPanel } from '../digital-employees/ProjectDigitalEmployeesPanel.js';
 import { ProjectModelsSettings } from '../../settings/ProjectModelsSettings.js';
-import { ExtensionsWorkspace } from '../skills/ExtensionsWorkspace.js';
-import { AutomationsWorkspace } from '../automations/AutomationsWorkspace.js';
 import { defaultTaskTableEnumSortOrders, normalizeTaskTableEnumSortOrders } from '../../task/taskWorkspaceModel.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { Button } from '../../ui/Button.js';
@@ -574,8 +574,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const settingsNavigationTabStop = visibleSettingsItems.some(([id]) => id === settingsCategory) ? settingsCategory : visibleSettingsItems[0]?.[0];
   const projectWorkspaceNavigationVisible = Boolean(selectedProject);
   /** 会话使用项目/会话来源列表；其他模式由各自工作区提供紧邻活动栏的上下文导航。 */
-  const projectSessionSourceListVisible =
-    Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
+  const projectSessionSourceListVisible = Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
 
   return (
     <main
@@ -661,6 +660,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               setProjectCreateForm((current) => ({ ...current, name }));
               if (projectCreateError) setProjectCreateError(undefined);
             }}
+            onStartTemporary={() => prepareNewConversationDraft(true)}
             onChooseDirectory={() => void chooseProjectDirectoryForCreate()}
             onClose={closeProjectCreateDialog}
             onSubmit={(event) => void createCurrentProject(event)}
@@ -771,7 +771,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
         <ProjectWorkspaceNavigation
           project={selectedProject}
           projects={orderedProjects}
-          onSelectProject={(project) => openProjectView(project, activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
           activeNavTarget={activeNavTarget}
@@ -781,7 +781,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           onOpen={(section, codeMode) => openProjectView(selectedProject, section, codeMode)}
           onNavigate={handleMainNavigate}
           onCreateProject={openProjectCreateDialog}
-          onCreateConversation={prepareNewConversationDraft}
+          onCreateConversation={() => prepareNewConversationDraft()}
           tasks={snapshot.tasks}
           conversationGroups={nativeConversationGroups}
           onOpenTask={(task) => {
@@ -796,6 +796,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             openProjectSection(project, 'code', 'source');
           }}
         />
+      ) : null}
+      {projectWorkspaceNavigationVisible ? (
+        <>
+          {/* 空槽位仅预留布局；接入真实工具时再添加导航语义和可访问名称。 */}
+          <div className="project-workspace-tool-rail" data-workspace-tool-slot="right" aria-hidden="true" />
+          <div className="project-workspace-status-bar" data-workspace-tool-slot="bottom" aria-hidden="true" />
+        </>
       ) : null}
       {activeNavTarget !== 'settings' && (!selectedProject || projectSessionSourceListVisible) ? (
         <SidebarNav
@@ -816,7 +823,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
           onCreateProject={openProjectCreateDialog}
-          onCreateConversation={prepareNewConversationDraft}
+          onCreateConversation={() => prepareNewConversationDraft()}
           onSelectConversation={(conversation) => void selectNativeConversation(conversation)}
           onArchiveConversation={archiveConversation}
           onNavigate={handleMainNavigate}
@@ -849,11 +856,19 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       ) : null}
       <section className="workspace ai-workspace" ref={workspaceScrollRef}>
         {activeNavTarget === 'projects' && snapshot.projects.length === 0 ? (
-          <ProjectStartGuide language={appShellSettings.appLanguage} busy={projectDirectoryChoosing || creatingProjectBusy} available={projectCreationReady} onChooseFolder={() => void chooseProjectDirectoryForCreate()} />
+          <ProjectStartGuide
+            language={appShellSettings.appLanguage}
+            busy={projectDirectoryChoosing || creatingProjectBusy}
+            available={Boolean(props.onCreateCurrentProject)}
+            onStartTemporary={() => prepareNewConversationDraft(true)}
+            onChooseFolder={() => void chooseProjectDirectoryForCreate()}
+          />
         ) : null}
-        {activeNavTarget === 'skills' ? <ExtensionsWorkspace client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} /> : null}
+        {activeNavTarget === 'skills' ? (
+          <skylightToolPages.extensions client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} />
+        ) : null}
         {activeNavTarget === 'automations' ? (
-          <AutomationsWorkspace
+          <skylightToolPages.automations
             client={props.commandClient ?? null}
             projects={snapshot.projects}
             language={appShellSettings.appLanguage}
@@ -1986,15 +2001,17 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                               <small>{settingsWorkspaceCopy.release.notarizationDescription}</small>
                             </span>
                           </section>
-                          <section className="settings-state-row settings-release-cask-state-row" aria-label={settingsWorkspaceCopy.release.caskAria}>
-                            <span className="settings-row-copy">
-                              <strong>{settingsWorkspaceCopy.release.caskTitle}</strong>
-                            </span>
-                            <span className="settings-row-field">
-                              <span>{formatReleasePresenceStatus('homebrewCask', releaseStatus.homebrewCask, settingsWorkspaceCopy.release)}</span>
-                              <small>{releaseStatus.readiness.canBuildUnsignedArtifacts ? settingsWorkspaceCopy.release.unsignedBuildAvailable : settingsWorkspaceCopy.release.unsignedBuildUnavailable}</small>
-                            </span>
-                          </section>
+                          {zeusDistribution.homebrewEnabled ? (
+                            <section className="settings-state-row settings-release-cask-state-row" aria-label={settingsWorkspaceCopy.release.caskAria}>
+                              <span className="settings-row-copy">
+                                <strong>{settingsWorkspaceCopy.release.caskTitle}</strong>
+                              </span>
+                              <span className="settings-row-field">
+                                <span>{formatReleasePresenceStatus('homebrewCask', releaseStatus.homebrewCask, settingsWorkspaceCopy.release)}</span>
+                                <small>{releaseStatus.readiness.canBuildUnsignedArtifacts ? settingsWorkspaceCopy.release.unsignedBuildAvailable : settingsWorkspaceCopy.release.unsignedBuildUnavailable}</small>
+                              </span>
+                            </section>
+                          ) : null}
                           <section className="settings-log-row release-detail-row" aria-label={settingsWorkspaceCopy.release.detailAria}>
                             <span className="settings-row-copy">
                               <strong>{settingsWorkspaceCopy.release.detailTitle}</strong>
