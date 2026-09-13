@@ -2949,6 +2949,26 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   server.get('/api/usage-overview', async () => usageOverviewService.read());
 
   server.get(
+    '/api/usage-analytics',
+    async (
+      request: FastifyRequest<{
+        Querystring: { range?: string; projectId?: string; model?: string };
+      }>,
+      reply,
+    ) => {
+      const range = request.query.range ?? '30d';
+      if (range !== '7d' && range !== '30d' && range !== '90d' && range !== 'all') {
+        return reply.code(400).send({ error: 'ZEUS_USAGE_RANGE_INVALID', message: 'range must be 7d, 30d, 90d, or all.' });
+      }
+      return usageOverviewService.readAnalytics({
+        range,
+        projectId: request.query.projectId?.trim() || null,
+        model: request.query.model?.trim() || null,
+      });
+    },
+  );
+
+  server.get(
     '/api/codex/usage-analytics',
     async (
       request: FastifyRequest<{

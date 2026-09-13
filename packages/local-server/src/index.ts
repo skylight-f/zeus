@@ -1630,6 +1630,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     ledger: codexUsageLedger,
     codexUsage: codexUsageService,
     modelConnections,
+    projects,
+    conversations,
     now,
   });
   let usageRefreshTimer: ReturnType<typeof setInterval> | undefined;

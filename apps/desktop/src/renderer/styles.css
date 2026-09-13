@@ -981,6 +981,89 @@ a {
   font-style: normal;
 }
 
+.macos-ai-app .codex-usage-provider-tabs {
+  display: flex;
+  gap: 8px;
+  min-inline-size: 0;
+  overflow-x: auto;
+  padding-block-end: 2px;
+  scrollbar-width: thin;
+}
+
+.macos-ai-app .codex-usage-provider-tabs > button {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 2px;
+  min-block-size: 42px;
+  min-inline-size: 112px;
+  padding: 8px 12px;
+  border: 1px solid var(--zeus-product-line-soft);
+  border-radius: 10px;
+  background: var(--zeus-product-panel-muted);
+  color: var(--zeus-product-muted);
+  text-align: start;
+  white-space: nowrap;
+}
+
+.macos-ai-app .codex-usage-provider-tabs > button:hover,
+.macos-ai-app .codex-usage-provider-tabs > button[aria-selected='true'] {
+  border-color: color-mix(in srgb, var(--zeus-product-accent) 55%, var(--zeus-product-line-soft));
+  background: color-mix(in srgb, var(--zeus-product-accent) 10%, var(--zeus-product-panel));
+  color: var(--zeus-product-text);
+}
+
+.macos-ai-app .codex-usage-provider-tabs > button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--zeus-product-accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.macos-ai-app .codex-usage-provider-tabs > button > small {
+  color: var(--zeus-product-muted);
+  font-size: 10px;
+}
+
+.macos-ai-app .codex-usage-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.macos-ai-app .codex-usage-provider-card {
+  display: grid;
+  gap: 12px;
+  min-inline-size: 0;
+  padding: 14px;
+  border: 1px solid var(--zeus-product-line-soft);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--zeus-product-panel) 88%, var(--zeus-product-canvas));
+}
+
+.macos-ai-app .codex-usage-provider-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.macos-ai-app .codex-usage-provider-card > header > span {
+  display: grid;
+  gap: 3px;
+  min-inline-size: 0;
+}
+
+.macos-ai-app .codex-usage-provider-card > header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macos-ai-app .codex-usage-provider-card > header em {
+  flex: 0 0 auto;
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
 .macos-ai-app .codex-usage-local-tabs-header {
   align-items: flex-end;
 }
