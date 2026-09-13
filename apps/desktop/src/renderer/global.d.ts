@@ -9,6 +9,7 @@ import type {
   CreateProjectSourceEntryInput,
   MoveProjectSourceEntryInput,
   ProjectSourceDirectorySnapshot,
+  ProjectSourceContentSearchResult,
   ProjectSourceDocument,
   ProjectSourceEntry,
   ProjectSourceEvent,
@@ -141,6 +142,7 @@ declare global {
       quitFromMenuBarUsage: () => Promise<{ quitting: true }>;
       listProjectSourceDirectory: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDirectorySnapshot>;
       searchProjectSourceEntries: (input: { projectId: string; query: string }) => Promise<ProjectSourceSearchResult>;
+      searchProjectSourceContent: (input: { projectId: string; query: string }) => Promise<ProjectSourceContentSearchResult>;
       readProjectSourceFile: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDocument>;
       saveProjectSourceFile: (input: SaveProjectSourceFileInput) => Promise<ProjectSourceDocument>;
       createProjectSourceEntry: (input: CreateProjectSourceEntryInput) => Promise<ProjectSourceEntry>;

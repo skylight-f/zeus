@@ -1,7 +1,8 @@
+import { temporaryWorkspaceId } from '@zeus/shared';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
 import type { UpdateAppShellSettingsRequest } from '../settings/settingsContracts.js';
-import type { SidebarConversationFilters } from '@zeus/shared';
+import type { ProjectSourceContentMatch, SidebarConversationFilters } from '@zeus/shared';
 import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { RuntimeXtermPane } from '../runtime/RuntimeXtermPane.js';
 import { handleInlineRailKeyboardNavigation } from './workspaceSupport.js';
@@ -21,7 +22,7 @@ import { PuzzlePieceIcon } from '@phosphor-icons/react/dist/csr/PuzzlePiece';
 import { TerminalIcon } from '@phosphor-icons/react/dist/csr/Terminal';
 import { ArrowCircleUpIcon } from '@phosphor-icons/react/dist/csr/ArrowCircleUp';
 import { DatabaseIcon } from '@phosphor-icons/react/dist/csr/Database';
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import type { DashboardClient, ProjectRecord } from '../../apiClient.js';
 import { openAutomaticUpdateIndicatorInMain } from '../../appShellBridge.js';
 import { ProjectGitWorkbench } from '../../git/ProjectGitWorkbench.js';
@@ -54,7 +55,7 @@ import { taskAgentRunStatusLabels } from '../../task/TaskRunStatusChip.js';
 import { WorkspaceDrawer } from '../../ui/WorkspaceDrawer.js';
 import { CommandCenterPanel } from '../../CommandCenterPanel.js';
 import { ProjectSourceWorkspace } from '../../code/ProjectSourceWorkspace.js';
-import { formatRuntimeAdapterDetectionFacts, InlineRecoveryPrompt, ProjectCreateDialog, ProjectStartGuide, ProjectWorkspaceModeToolbar, SidebarNav } from './WorkspaceChrome.js';
+import { formatRuntimeAdapterDetectionFacts, InlineRecoveryPrompt, ProjectCreateDialog, ProjectStartGuide, ProjectWorkspaceNavigation, SidebarNav } from './WorkspaceChrome.js';
 import { GENERIC_SHELL_CRITICAL_CONFIRMATION_PHRASE } from './workspaceFormatters.js';
 import {
   browserNativeConversationStartStorage,
@@ -139,6 +140,8 @@ function ProjectSettingsWorkspace(props: { project: ProjectRecord; commandClient
 
 export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions: WorkspaceDomainActions; operations: WorkspaceOperations }) {
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
+  const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string } | null>(null);
+  const [pendingGlobalSource, setPendingGlobalSource] = useState<{ projectId: string; relativePath: string; line: number } | null>(null);
   /** 一次编辑一个字段，新增字段无需继续拉长页面。 */
   const [taskField, setTaskField] = useState<'status' | 'priority' | 'runStatus'>('status');
   const { state, domainActions, operations } = input;
@@ -322,7 +325,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     openProjectCreateDialog,
     openTaskConflictAiConversation,
     openTaskConversationDrawer,
-    openNativeConversationDrawer,
     openNativeConversationPage,
     openTaskCreateModal,
     openTaskDetailPane,
@@ -422,6 +424,36 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     updateTaskBoardSettings,
     workspaceDrawerPortalStyle,
   } = operations;
+  const openProjectView: typeof openProjectSection = (project, section, codeMode = projectCodeWorkspaceMode) => {
+    if (section === 'sessions') {
+      const group = nativeConversationGroups.find((item) => item.projectId === project.id);
+      const conversations = [...(group?.conversations ?? []), ...(group?.tasks.flatMap((task) => task.conversations) ?? [])];
+      const latest = conversations.filter((conversation) => conversation.projectId === project.id && !conversation.archived).sort((a, b) => Date.parse(b.activityAt ?? b.updatedAt) - Date.parse(a.activityAt ?? a.updatedAt))[0];
+      if (latest) {
+        void selectNativeConversation(latest);
+        return;
+      }
+    }
+    openProjectSection(project, section, codeMode);
+  };
+  /** 全局搜索允许跨项目跳转；等目标工作区真正挂载后再打开详情或源码文件。 */
+  useEffect(() => {
+    if (!pendingGlobalTask || pendingGlobalTask.projectId !== activeProjectId || activeProjectSection !== 'tasks') return;
+    const target = pendingGlobalTask;
+    setPendingGlobalTask(null);
+    void openTaskDetailPane(target.taskId);
+  }, [activeProjectId, activeProjectSection, openTaskDetailPane, pendingGlobalTask]);
+  useEffect(() => {
+    if (!pendingGlobalSource || pendingGlobalSource.projectId !== activeProjectId || activeProjectSection !== 'code' || projectCodeWorkspaceMode !== 'source') return;
+    const target = pendingGlobalSource;
+    const frame = window.requestAnimationFrame(() => {
+      const workspace = projectSourceWorkspaceRef.current;
+      if (!workspace) return;
+      setPendingGlobalSource(null);
+      void workspace.openFile(target.relativePath, target.line);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeProjectId, activeProjectSection, pendingGlobalSource, projectCodeWorkspaceMode, projectSourceWorkspaceRef]);
   /** 任务详情也可从会话页打开；接入上下文仍由原工作面身份约束，关闭或切换后旧回执失效。 */
   const modelSetupTask = snapshot.tasks.find((task) => task.id === taskModelPushTaskId);
   const taskModelSetupContext: TaskModelSetupContext | undefined =
@@ -541,10 +573,14 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     .filter((group) => group.items.length > 0);
   const visibleSettingsItems = visibleSettingsGroups.flatMap((group) => group.items);
   const settingsNavigationTabStop = visibleSettingsItems.some(([id]) => id === settingsCategory) ? settingsCategory : visibleSettingsItems[0]?.[0];
+  const projectWorkspaceNavigationVisible = Boolean(selectedProject);
+  /** 会话使用项目/会话来源列表；其他模式由各自工作区提供紧邻活动栏的上下文导航。 */
+  const projectSessionSourceListVisible =
+    Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
 
   return (
     <main
-      className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${activeProjectSection === 'sessions' && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' ? ' session-codex-parity-v1' : ''}`}
+      className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${projectSessionSourceListVisible ? ' session-codex-parity-v1 project-session-source-list-shell' : ''}${projectWorkspaceNavigationVisible ? ' project-navigation-rail-shell' : ''}`}
       data-theme={appShellSettings.appearance}
       data-language={appShellSettings.appLanguage}
       data-project-sidebar-resizing={projectSidebarResizing ? 'true' : 'false'}
@@ -626,6 +662,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               setProjectCreateForm((current) => ({ ...current, name }));
               if (projectCreateError) setProjectCreateError(undefined);
             }}
+            onStartTemporary={() => prepareNewConversationDraft(true)}
             onChooseDirectory={() => void chooseProjectDirectoryForCreate()}
             onClose={closeProjectCreateDialog}
             onSubmit={(event) => void createCurrentProject(event)}
@@ -732,11 +769,49 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           />
         ) : null}
       </MotionPresence>
-      {activeNavTarget !== 'settings' ? (
+      {projectWorkspaceNavigationVisible && selectedProject ? (
+        <ProjectWorkspaceNavigation
+          project={selectedProject}
+          projects={orderedProjects}
+          onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          canCreateProject={projectCreationReady && !creatingProjectBusy}
+          createProjectBusy={creatingProjectBusy}
+          activeNavTarget={activeNavTarget}
+          section={activeProjectSection}
+          codeMode={projectCodeWorkspaceMode}
+          language={appShellSettings.appLanguage}
+          onOpen={(section, codeMode) => openProjectView(selectedProject, section, codeMode)}
+          onNavigate={handleMainNavigate}
+          onCreateProject={openProjectCreateDialog}
+          onCreateConversation={() => prepareNewConversationDraft()}
+          tasks={snapshot.tasks}
+          conversationGroups={nativeConversationGroups}
+          onOpenTask={(task) => {
+            const project = orderedProjects.find((candidate) => candidate.id === task.projectId);
+            if (!project) return;
+            setPendingGlobalTask({ taskId: task.id, projectId: task.projectId });
+            openProjectSection(project, 'tasks');
+          }}
+          onOpenConversation={(conversation) => void selectNativeConversation(conversation)}
+          onOpenSourceMatch={(project: ProjectRecord, match: ProjectSourceContentMatch) => {
+            setPendingGlobalSource({ projectId: project.id, relativePath: match.relativePath, line: match.line });
+            openProjectSection(project, 'code', 'source');
+          }}
+        />
+      ) : null}
+      {projectWorkspaceNavigationVisible ? (
+        <>
+          {/* 空槽位仅预留布局；接入真实工具时再添加导航语义和可访问名称。 */}
+          <div className="project-workspace-tool-rail" data-workspace-tool-slot="right" aria-hidden="true" />
+          <div className="project-workspace-status-bar" data-workspace-tool-slot="bottom" aria-hidden="true" />
+        </>
+      ) : null}
+      {activeNavTarget !== 'settings' && (!selectedProject || projectSessionSourceListVisible) ? (
         <SidebarNav
           activeNavTarget={activeNavTarget}
           activeProjectId={activeProjectId}
           activeProjectSection={activeProjectSection}
+          activeProjectCodeMode={projectCodeWorkspaceMode}
           projects={orderedProjects}
           pinnedProjectIds={appShellSettings.pinnedProjectIds}
           collapsedProjectIds={appShellSettings.collapsedProjectIds}
@@ -750,7 +825,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
           onCreateProject={openProjectCreateDialog}
-          onCreateConversation={prepareNewConversationDraft}
+          onCreateConversation={() => prepareNewConversationDraft()}
           onSelectConversation={(conversation) => void selectNativeConversation(conversation)}
           onArchiveConversation={archiveConversation}
           onNavigate={handleMainNavigate}
@@ -765,7 +840,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           pendingProjectDeleteId={pendingProjectDeleteId}
         />
       ) : null}
-      {activeNavTarget !== 'settings' ? (
+      {projectSessionSourceListVisible ? (
         <div
           className="project-sidebar-resizer"
           role="separator"
@@ -783,7 +858,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       ) : null}
       <section className="workspace ai-workspace" ref={workspaceScrollRef}>
         {activeNavTarget === 'projects' && snapshot.projects.length === 0 ? (
-          <ProjectStartGuide language={appShellSettings.appLanguage} busy={projectDirectoryChoosing || creatingProjectBusy} available={projectCreationReady} onChooseFolder={() => void chooseProjectDirectoryForCreate()} />
+          <ProjectStartGuide language={appShellSettings.appLanguage} busy={projectDirectoryChoosing || creatingProjectBusy} available={Boolean(props.onCreateCurrentProject)} onStartTemporary={() => prepareNewConversationDraft(true)} onChooseFolder={() => void chooseProjectDirectoryForCreate()} />
         ) : null}
         {activeNavTarget === 'skills' ? <ExtensionsWorkspace client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} /> : null}
         {activeNavTarget === 'automations' ? (
@@ -795,22 +870,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               if (!run.conversationId || !props.nativeConversationClient) return;
               const choice = await props.nativeConversationClient.loadNativeConversationChoice(run.projectId, run.conversationId);
               await selectNativeConversation(choice);
-            }}
-          />
-        ) : null}
-        {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'automations' && selectedProject ? (
-          <ProjectWorkspaceModeToolbar
-            project={selectedProject}
-            projects={orderedProjects}
-            onSelectProject={(project) => openProjectSection(project, activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
-            section={activeProjectSection}
-            codeMode={projectCodeWorkspaceMode}
-            language={appShellSettings.appLanguage}
-            onOpen={(section, codeMode) => openProjectSection(selectedProject, section, codeMode)}
-            currentConversationAvailable={Boolean(selectedNativeConversation) && !state.conversationDraftOpen}
-            currentConversationOpen={Boolean(sessionDrawerTarget)}
-            onOpenCurrentConversation={() => {
-              if (selectedNativeConversation) void openNativeConversationDrawer(selectedNativeConversation);
             }}
           />
         ) : null}

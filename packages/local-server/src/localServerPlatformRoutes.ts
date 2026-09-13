@@ -2051,6 +2051,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   /** 后台发现只在普通可写宿主中被项目命令或恢复入口触发。 */
   const repositoryDiscovery = new ProjectRepositoryDiscoveryService({ db, projects, repositories: projectRepositories, settings, publishRealtimeEvent, redactSensitiveText });
   const workManagementProjectOperations = new WorkManagementProjectOperations({
+    temporaryWorkspaceDirectory: join(dataLayout.root, 'workspaces', 'temporary'),
     repositoryDiscovery,
     projects,
     sharedPaths: projectSharedPaths,

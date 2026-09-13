@@ -3197,12 +3197,6 @@ a {
   box-shadow: inset var(--zeus-control-focus);
   outline: 0;
 }
-/* 当前会话是右侧抽屉入口，独立于左侧工作区切换。 */
-.project-workspace-mode-toolbar > .project-workspace-current-conversation {
-  flex: 0 0 auto;
-  margin-inline-start: auto;
-  white-space: nowrap;
-}
 .project-workspace-mode-toolbar nav button span {
   align-items: center;
   color: var(--zeus-project-menu-muted);
@@ -17880,6 +17874,50 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   padding: 9px 10px;
 }
 
+/* 类型、标题与优先级共用外框，保留独立键盘操作及下拉浮层。 */
+.macos-ai-app .task-create-title-control {
+  display: grid;
+  grid-template-columns: minmax(0, 128px) minmax(0, 1fr) 68px;
+  min-inline-size: 0;
+  border: 1px solid var(--zeus-control-border);
+  border-radius: var(--agentdesk-radius-control, 9px);
+  background: var(--zeus-control-bg);
+}
+
+.macos-ai-app .task-create-title-control:focus-within {
+  border-color: var(--zeus-focus-line);
+  box-shadow: var(--zeus-control-focus);
+}
+
+.macos-ai-app .task-create-title-control .zeus-select-trigger {
+  min-block-size: 34px;
+  border: 0;
+  border-inline-end: 1px solid var(--zeus-control-border);
+  border-radius: var(--agentdesk-radius-control, 9px) 0 0 var(--agentdesk-radius-control, 9px);
+  box-shadow: none;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.macos-ai-app .task-create-title-control .zeus-select-value {
+  color: inherit;
+  font: inherit;
+}
+
+.macos-ai-app .task-create-title-control > .task-create-title-input {
+  min-inline-size: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+
+.macos-ai-app .task-create-title-control .task-create-priority-select > .zeus-select-trigger {
+  border-inline-end: 0;
+  border-inline-start: 1px solid var(--zeus-control-border);
+  border-radius: 0 var(--agentdesk-radius-control, 9px) var(--agentdesk-radius-control, 9px) 0;
+}
+
 .macos-ai-app .task-create-field-attachments,
 .macos-ai-app .task-detail-field-attachments {
   display: grid;
@@ -23290,6 +23328,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
 }
 .macos-ai-app .project-start-action {
   display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
   justify-content: center;
 }
 /* 步骤仅作流程提示；每段与前导箭头一起换行，避免窄窗口出现孤立箭头。 */
@@ -23344,11 +23384,11 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
 .macos-ai-app .task-create-settings-toggle {
   margin-inline-end: auto;
 }
-/* 展开后优先级与父任务并排，标签单独一行。 */
+/* 优先级常驻标题右侧，更多设置保留父任务与标签。 */
 .macos-ai-app .task-create-options {
   border-block-start: 1px solid var(--zeus-product-line-soft);
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   padding-block-start: 12px;
 }

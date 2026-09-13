@@ -1499,6 +1499,11 @@ function setupIpc(): void {
     if (typeof input?.projectId !== 'string' || typeof input.query !== 'string') throw new TypeError('项目源码搜索请求无效。');
     return service.search(input.projectId, input.query);
   });
+  ipcMain.handle('zeus:project-source:search-content', (event, input: { projectId?: unknown; query?: unknown }) => {
+    const service = requireProjectSourceWorkspace(event);
+    if (typeof input?.projectId !== 'string' || typeof input.query !== 'string') throw new TypeError('项目源码内容搜索请求无效。');
+    return service.searchContent(input.projectId, input.query);
+  });
   ipcMain.handle('zeus:project-source:read-file', (event, input: { projectId?: unknown; relativePath?: unknown }) => {
     const service = requireProjectSourceWorkspace(event);
     if (typeof input?.projectId !== 'string' || typeof input.relativePath !== 'string') throw new TypeError('项目源码读取请求无效。');
