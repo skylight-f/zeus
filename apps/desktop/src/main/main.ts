@@ -527,7 +527,16 @@ async function resolveMainWindowStateForLaunch(persisted: PersistedMainWindowSta
 function revealMainWindow(window: BrowserWindow): void {
   if (window.isDestroyed()) return;
   // macOS 直接启动、open 启动和 Codex Run 启动都必须把真实主窗口带到前台；
-  // 否则用户会看到进程存在但没有可交互窗口，功能验证也无法继续。
+  // 菜单栏入口还必须重新声明普通应用身份并恢复 Dock 图标，不能只显示窗口。
+  if (process.platform === 'darwin') {
+    app.setActivationPolicy('regular');
+    const dock = app.dock;
+    if (dock) {
+      void dock.show().catch((error: unknown) => {
+        console.error('Zeus 恢复主窗口时无法显示 macOS Dock 图标。', error);
+      });
+    }
+  }
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
