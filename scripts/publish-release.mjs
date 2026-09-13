@@ -101,7 +101,7 @@ function collectPreflight(input) {
   const branch = git(['branch', '--show-current']) || '(detached HEAD)';
   const worktreeStatus = git(['status', '--short']);
   const originUrl = git(['remote', 'get-url', 'origin']);
-  const remoteMainSha = resolveRemoteReference('refs/heads/main');
+  const remoteMainSha = resolveRemoteReference('refs/heads/develop');
   const localTagSha = resolveLocalTagSha(input.tag);
   const remoteTagSha = resolveRemoteTagSha(input.tag);
   const ghAuth = captureRemoteRead('检查 GitHub CLI 登录状态', 'gh', ['auth', 'status', '--hostname', 'github.com'], { allowFailure: true });
@@ -114,11 +114,11 @@ function collectPreflight(input) {
   let packageVersion = null;
   let desktopVersion = null;
 
-  if (branch !== 'main') blockers.push(`当前分支必须是 main，实际为 ${branch}`);
+  if (branch !== 'develop') blockers.push(`当前分支必须是 develop，实际为 ${branch}`);
   if (worktreeStatus) blockers.push('工作区必须干净');
   if (!isExpectedOrigin(originUrl)) blockers.push(`origin 不是 ${repository}：${originUrl}`);
-  if (!remoteMainSha) blockers.push('无法读取 origin/main 远程提交');
-  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin/main 不一致：local=${headSha} remote=${remoteMainSha}`);
+  if (!remoteMainSha) blockers.push('无法读取 origin/develop 远程提交');
+  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin/develop 不一致：local=${headSha} remote=${remoteMainSha}`);
   if (ghAuth.status !== 0) blockers.push(`GitHub CLI 未完成可用登录：${commandFailureDetail(ghAuth)}`);
 
   try {
@@ -196,11 +196,11 @@ function buildPlan(preflight, input) {
     `- 标签：${input.tag}`,
     `- 分支：${preflight.branch}`,
     `- 候选提交：${preflight.headSha}`,
-    `- origin/main：${preflight.remoteMainSha || '未读取到'}`,
+    `- origin/develop：${preflight.remoteMainSha || '未读取到'}`,
     `- 根包／桌面包版本：${preflight.packageVersion ?? '未读取到'} / ${preflight.desktopVersion ?? '未读取到'}`,
     `- Release notes：${preflight.releaseNotesPath}`,
     `- 本地快速检查摘要：${preflight.localGateSummaryPath || '未提供'}`,
-    `- main CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
+    `- develop CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
     `- 本地／远程标签：${preflight.localTagSha || '无'} / ${preflight.remoteTagSha || '无'}`,
     `- GitHub Release：${preflight.release.exists ? preflight.release.data.url : '无'}`,
     `- GitHub CLI 登录：${preflight.ghAuthenticated ? '可用' : '不可用'}`,
@@ -226,7 +226,7 @@ function buildPlan(preflight, input) {
     '',
     '## 不在本命令中执行',
     '',
-    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入 main。',
+    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入 develop。',
     '- 不强推、不改写已存在标签、不删除失败发布留下的标签。',
     '- Workflow 在阻塞检查通过前不创建标签；失败后可对同一候选提交幂等重试。',
     '',
@@ -385,7 +385,7 @@ function validateLocalGateSummary(path, version, headSha) {
 }
 
 function findSuccessfulCiRun(headSha) {
-  const result = ghJson(['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', 'main', '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'], true);
+  const result = ghJson(['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', 'develop', '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'], true);
   if (!result.ok || !Array.isArray(result.value)) return null;
   return result.value.find((run) => run.headSha === headSha && run.event === 'push' && run.status === 'completed' && run.conclusion === 'success') ?? null;
 }
@@ -447,7 +447,7 @@ function dispatchReleaseWorkflow(tag, commitSha, requireAppleDistribution) {
     '--repo',
     repository,
     '--ref',
-    'main',
+    'develop',
     '--field',
     `commit_sha=${commitSha}`,
     '--field',

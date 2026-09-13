@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: 要构建的固定候选提交；公开发布时必须是 origin/main 当前提交
+        description: 要构建的固定候选提交；公开发布时必须是 origin/develop 当前提交
         required: false
         default: ''
       tag:
@@ -72,8 +72,8 @@ jobs:
             echo "检出提交与候选提交不一致：expected=$RELEASE_COMMIT actual=$(git rev-parse HEAD)" >&2
             exit 1
           fi
-          if [ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
-            echo '公开发布候选必须精确等于 origin/main，拒绝发布漂移或未推送提交。' >&2
+          if [ "$(git ls-remote origin refs/heads/develop | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+            echo '公开发布候选必须精确等于 origin/develop，拒绝发布漂移或未推送提交。' >&2
             exit 1
           fi
           node scripts/distribution-config.mjs --check-version
@@ -224,8 +224,8 @@ jobs:
       - name: 复核下载产物的发行归属和提交
         run: |
           node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json --check-version
-          if [ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
-            echo '构建期间 main 已变化，请重新选择发布候选。' >&2
+          if [ "$(git ls-remote origin refs/heads/develop | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+            echo '构建期间 develop 已变化，请重新选择发布候选。' >&2
             exit 1
           fi
       - name: 检查或创建不可变标签

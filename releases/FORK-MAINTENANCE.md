@@ -8,10 +8,10 @@
 
 ## 一次性仓库设置
 
-1. 确认 origin 是自己的仓库，添加 `upstream` 指向 `https://github.com/imchenway/zeus.git`。集成分支使用 develop，发布分支使用 main。
+1. 确认 origin 是自己的仓库，添加 `upstream` 指向 `https://github.com/imchenway/zeus.git`。main 保持上游镜像；develop 集成二开并承载固定发布候选。Common 基于上游，Custom 在 Common 之上承载完整定制，审阅后才合入 develop。
 2. 将工作流合入默认分支后，在 fork 的 Actions 中启用工作流。允许 Actions 创建 PR；同步工作流需要 contents 和 pull-requests 写权限。
-3. 为 main 和 develop 配置分支保护：通过 CI、经 PR 合并，保留 merge commit，不 squash 上游同步历史。
-4. 可配置 `release` Environment，仅允许 main 发布；审核人和保护规则需要在 GitHub 设置中启用，YAML 引用 Environment 本身不会自动启用审核。
+3. 为 main 和 develop 配置分支保护；main 只快进同步上游，二开 PR 仅进入 develop。将 GitHub 默认分支设为 develop，让其中的二开 CI 和定时同步工作流生效；不要为启用工作流向 main 写入二开文件。
+4. 可配置 `release` Environment，仅允许 develop 发布；审核人和保护规则需要在 GitHub 设置中启用，YAML 引用 Environment 本身不会自动启用审核。
 5. 需要应用内自动安装时，配置自己的 Developer ID 和公证凭据：`MACOS_CERTIFICATE`、`MACOS_CERTIFICATE_PASSWORD`，以及 Apple ID 三项或 App Store Connect API Key 三项。它们当前由 preflight/package 作业从仓库 Secrets 读取。没有签名和公证时只允许手动安装，不冒充可自动安装的版本。
 
 ## 保持上游同步
@@ -20,7 +20,7 @@
 
 发现冲突时工作流失败并列出冲突文件；到本地从 develop 建立同名同步分支，fetch 指定上游 tag，然后 merge、逐项解决冲突、运行门禁，再推送 PR。禁止整片选择 ours/theirs。上游改动与二开同时修改发行配置时必须保留自己的渠道。
 
-自动创建的 PR 可能需要批准才能启动 CI，不能假设创建 PR 等于检查通过；必要时从 Actions 手动启动 CI 并选择同步分支。合入 develop 后，通过独立发布 PR 进入 main。
+自动创建的 PR 可能需要批准才能启动 CI，不能假设创建 PR 等于检查通过；必要时从 Actions 手动启动 CI 并选择同步分支。同步 PR 只进入 develop，保留 merge commit；main 的上游镜像独立维护。
 
 `releases/upstream-baseline.json` 初始基线为空，表示尚未核实；首次成功同步写入真实 tag/commit。不要手填猜测的上游提交。每份生成清单还记录二开 sourceCommit，便于问题追溯。
 
@@ -37,11 +37,11 @@ pnpm verify:publish
 pnpm dev
 ```
 
-版本号只是例子，应高于当前版本和已公开版本。准备命令只修改两个 package.json 和版本发布说明，不提交、不推送、不创建标签。先审阅、提交到自己的仓库，并通过 PR 合入 main。
+版本号只是例子，应高于当前版本和已公开版本。准备命令只修改两个 package.json 和版本发布说明，不提交、不推送、不创建标签。先审阅、提交到自己的仓库，并通过 PR 合入 develop。
 
-在 Actions → Release 中填写 main 的完整 40 位 commit SHA 和 `vX.Y.Z`，保持 `publish_release=false`，执行候选构建并下载 Actions 产物检查。公开发布时重新选择同一提交并启用 `publish_release`；需要自动安装则同时选择严格 Apple 分发。
+在 Actions → Release 中填写 develop 的完整 40 位 commit SHA 和 `vX.Y.Z`，保持 `publish_release=false`，执行候选构建并下载 Actions 产物检查。公开发布时重新选择同一提交并启用 `publish_release`；需要自动安装则同时选择严格 Apple 分发。
 
-公开流程会复核 main 的固定提交、不可变标签、清单归属、候选 sourceCommit 和版本，门禁及打包通过后才发布。当前产物为 macos-latest 架构构建的 DMG（当前主要验收 arm64），不声称同时支持 Intel。旧的 `pnpm release` 是会提交并推送 main 的全流程工具，首次发行请使用上述显式流程；只有明确授权公开发布时才运行它。
+公开流程会复核 develop 的固定提交、不可变标签、清单归属、候选 sourceCommit 和版本，门禁及打包通过后才发布。当前产物为 macos-latest 架构构建的 DMG（当前主要验收 arm64），不声称同时支持 Intel。旧的 `pnpm release` 是会提交并推送 develop 的全流程工具，首次发行请使用上述显式流程；只有明确授权公开发布时才运行它。
 
 GitHub Release 和 Homebrew 分步执行。发布后 Tap 同步失败，应基于已公开清单和 DMG 单独恢复 Tap 同步。重新构建的 DMG 摘要若变化，流程会拒绝覆盖既有 Release；内容改变应递增版本。运行时先从自己的发布源检查，再校验摘要、签名与现有安装身份，通过用户确认和宿主关闭流程后安装。
 

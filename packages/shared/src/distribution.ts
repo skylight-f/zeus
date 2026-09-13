@@ -3,7 +3,7 @@ export const zeusDistribution = {
   id: 'skylight-f.zeus',
   repository: 'skylight-f/zeus',
   upstreamRepository: 'imchenway/zeus',
-  releaseBranch: 'main',
+  releaseBranch: 'develop',
   integrationBranch: 'develop',
   channel: 'stable',
   // 建立并验证自己的 Tap 后再启用，首次发行不依赖第二个仓库。
