@@ -27,8 +27,8 @@ esac
 dmg="$release_output_dir/Zeus-${version}-${package_arch}.dmg"
 generated_cask="$release_output_dir/homebrew/zeus.rb"
 release_manifest="$release_output_dir/zeus-release-manifest.json"
-source_repository="$(node --input-type=module -e "import { zeusDistribution as d } from './packages/shared/src/distribution.ts'; process.stdout.write(d.repository)")"
-homebrew_tap="$(node --input-type=module -e "import { zeusDistribution as d } from './packages/shared/src/distribution.ts'; process.stdout.write(d.homebrewTap)")"
+source_repository="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.repository)")"
+homebrew_tap="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.homebrewTap)")"
 node scripts/generate-homebrew-cask.mjs "$version" "$package_arch" "$dmg" "$generated_cask"
 
 for required in "$dmg" "$app" "$generated_cask"; do

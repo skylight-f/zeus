@@ -1,4 +1,4 @@
-import { zeusReleaseBaseUrl } from '@zeus/shared';
+import { zeusReleaseBaseUrl } from '../../skylight/distribution.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { projectTerminalOutput } from '@zeus/shared';
 import { cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig } from '@zeus/shared';

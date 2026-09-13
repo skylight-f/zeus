@@ -1,4 +1,4 @@
-import { zeusDistribution } from '@zeus/shared';
+import { upstreamDistribution, type DistributionConfig } from '@zeus/shared';
 import type { UserFacingErrorCause } from '@zeus/shared';
 
 /** Local Server 的发布清单与更新判定规则。 */
@@ -198,10 +198,11 @@ export function evaluateReleaseUpdateAvailability(input: EvaluateReleaseUpdateAv
 }
 
 /** 校验远程更新清单；签名、公证布尔值只能开启后续复验，不能替代本机产物校验。 */
-export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopbackDownloadUrls?: boolean } = {}): ReleaseUpdateManifest {
+export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopbackDownloadUrls?: boolean; distribution?: DistributionConfig } = {}): ReleaseUpdateManifest {
+  const zeusDistribution = options.distribution ?? upstreamDistribution;
   if (!isRecord(value)) throw new Error('Release update manifest must be an object.');
   if (value.app !== 'Zeus' || value.schemaVersion !== 1) throw new Error('Release update manifest identity or schema is incompatible.');
-  if (value.distributionId !== zeusDistribution.id || value.repository !== zeusDistribution.repository) throw new Error('更新清单不属于当前二开发行版。');
+  if (((zeusDistribution.requireManifestIdentity || value.distributionId !== undefined) && value.distributionId !== zeusDistribution.id) || value.repository !== zeusDistribution.repository) throw new Error('更新清单不属于当前二开发行版。');
   if (value.channel !== zeusDistribution.channel) throw new Error('更新清单与当前发行渠道不一致。');
   if (value.channel !== 'stable' && value.channel !== 'preview') throw new Error('Release update manifest channel is invalid.');
   if (
@@ -226,7 +227,7 @@ export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopb
   const homebrewTap = typeof value.homebrew.tap === 'string' ? normalizeRepository(value.homebrew.tap) : '';
   if (
     homebrewTap !== zeusDistribution.homebrewTap ||
-    value.homebrew.enabled !== zeusDistribution.homebrewEnabled ||
+    ((zeusDistribution.requireManifestIdentity || value.homebrew.enabled !== undefined) && value.homebrew.enabled !== zeusDistribution.homebrewEnabled) ||
     value.homebrew.cask !== 'zeus' ||
     typeof value.homebrew.installCommand !== 'string' ||
     typeof value.homebrew.upgradeCommand !== 'string' ||
@@ -267,7 +268,7 @@ function normalizeRepository(repository: string): string {
     .trim()
     .replace(/^https:\/\/github\.com\//u, '')
     .replace(/\.git$/u, '');
-  return trimmed || zeusDistribution.repository;
+  return trimmed || upstreamDistribution.repository;
 }
 
 function normalizeVersion(version: string): string {

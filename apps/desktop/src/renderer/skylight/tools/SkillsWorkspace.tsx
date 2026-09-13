@@ -1,16 +1,16 @@
-import { MotionPresence } from '../../ui/MotionPresence.js';
-import { FormDialog } from '../../ui/FormDialog.js';
-import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
+import { MotionPresence } from '../toolPageHost.js';
+import { FormDialog } from '../toolPageHost.js';
+import { reportApplicationError } from '../toolPageHost.js';
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
-import { Button } from '../../ui/Button.js';
+import { Button } from '../toolPageHost.js';
 import { ExtensionSourceFields, emptyExtensionSource } from './ExtensionSourceFields.js';
-import type { SkillCatalog, SkillDescriptor, SkillInstallSource } from '../codex/codexContracts.js';
-import type { NativeConversationAppClient } from '../workspace/workspaceSupport.js';
-import { SkillSelector, skillCatalogChangedEvent } from './SkillSelector.js';
-import { readSkillWorkflowPreferences, skillWorkflowDefinitions, writeSkillWorkflowDefault, type SkillWorkflowId } from './skillWorkflowPreferences.js';
+import type { SkillCatalog, SkillDescriptor, SkillInstallSource } from '../toolPageHost.js';
+import type { NativeConversationAppClient } from '../toolPageHost.js';
+import { SkillSelector, skillCatalogChangedEvent } from '../toolPageHost.js';
+import { readSkillWorkflowPreferences, skillWorkflowDefinitions, writeSkillWorkflowDefault, type SkillWorkflowId } from '../toolPageHost.js';
 
 type SkillsClient = Pick<NativeConversationAppClient, 'loadSkills' | 'installSkill' | 'removeSkill'>;
 

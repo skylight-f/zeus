@@ -1,29 +1,52 @@
-/** 二开发行配置：上游同步不得覆盖此文件；更新来源和发布脚本共同使用。 */
-export const zeusDistribution = {
-  id: 'skylight-f.zeus',
-  repository: 'skylight-f/zeus',
+/** 通用发行契约；具体二开配置由应用组装入口注入。 */
+export interface DistributionConfig {
+  readonly id: string;
+  readonly repository: string;
+  readonly upstreamRepository: string;
+  readonly releaseBranch: string;
+  readonly releaseTagPrefix: string;
+  readonly integrationBranch: string;
+  readonly channel: 'stable' | 'preview';
+  readonly homebrewEnabled: boolean;
+  readonly homebrewTap: string;
+  readonly homebrewRepository: string;
+  readonly cask: string;
+  readonly requireManifestIdentity: boolean;
+}
+
+/** 未注入二开配置时沿用上游来源及既有清单格式。 */
+export const upstreamDistribution: DistributionConfig = Object.freeze({
+  id: 'imchenway.zeus',
+  repository: 'imchenway/zeus',
   upstreamRepository: 'imchenway/zeus',
-  releaseBranch: 'develop',
-  integrationBranch: 'develop',
+  releaseBranch: 'main',
+  releaseTagPrefix: 'v',
+  integrationBranch: 'main',
   channel: 'stable',
-  // 建立并验证自己的 Tap 后再启用，首次发行不依赖第二个仓库。
-  homebrewEnabled: false,
-  homebrewTap: 'skylight-f/tap',
-  homebrewRepository: 'skylight-f/homebrew-tap',
+  homebrewEnabled: true,
+  homebrewTap: 'imchenway/tap',
+  homebrewRepository: 'imchenway/homebrew-tap',
   cask: 'zeus',
-} as const;
+  requireManifestIdentity: false,
+});
 
-export const zeusReleaseBaseUrl = `https://github.com/${zeusDistribution.repository}/releases`;
-export const zeusReleaseManifestUrl = `${zeusReleaseBaseUrl}/latest/download/zeus-release-manifest.json`;
-export const zeusHomebrewCask = `${zeusDistribution.homebrewTap}/${zeusDistribution.cask}`;
-
-/** 仅允许本发行版的 GitHub Release 地址，不接受名称相似的仓库或 URL 凭据。 */
-export function isZeusReleaseUrl(value: string, downloadOnly = false): boolean {
-  try {
-    const url = new URL(value);
-    const prefix = `/${zeusDistribution.repository}/releases/`;
-    return url.protocol === 'https:' && url.hostname === 'github.com' && !url.port && !url.username && !url.password && url.pathname.startsWith(downloadOnly ? `${prefix}download/` : prefix);
-  } catch {
-    return false;
-  }
+/** 每个宿主持有自己的不可变配置，不通过全局可变单例切换更新来源。 */
+export function createDistributionContext(config: DistributionConfig = upstreamDistribution) {
+  const zeusDistribution = Object.freeze({ ...config });
+  const zeusReleaseBaseUrl = `https://github.com/${zeusDistribution.repository}/releases`;
+  return {
+    zeusDistribution,
+    zeusReleaseBaseUrl,
+    zeusReleaseManifestUrl: `${zeusReleaseBaseUrl}/latest/download/zeus-release-manifest.json`,
+    zeusHomebrewCask: `${zeusDistribution.homebrewTap}/${zeusDistribution.cask}`,
+    isZeusReleaseUrl(value: string, downloadOnly = false): boolean {
+      try {
+        const url = new URL(value);
+        const prefix = `/${zeusDistribution.repository}/releases/`;
+        return url.protocol === 'https:' && url.hostname === 'github.com' && !url.port && !url.username && !url.password && url.pathname.startsWith(downloadOnly ? `${prefix}download/` : prefix);
+      } catch {
+        return false;
+      }
+    },
+  };
 }

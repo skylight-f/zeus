@@ -1,4 +1,4 @@
-import { zeusDistribution } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution, versionFromReleaseTag } from './desktop-distribution.mjs';
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 
@@ -18,7 +18,9 @@ export function parseBoolean(name, rawValue, defaultValue) {
 
 export function assertVersionAfterTag(version, tag, suffix = '') {
   const target = version.split('.').map(Number);
-  const base = tag.slice(1).split('.').map(Number);
+  const baseVersion = versionFromReleaseTag(tag);
+  if (!baseVersion) throw new Error(`不属于本发行版的标签：${tag}`);
+  const base = baseVersion.split('.').map(Number);
   for (let index = 0; index < 3; index += 1) {
     if (target[index] > base[index]) return;
     if (target[index] < base[index]) break;
@@ -34,7 +36,7 @@ export function validateReleaseNotes(markdown, version) {
   }
   if (zeusDistribution.homebrewEnabled && !markdown.includes(`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus`)) throw new Error('Release notes 缺少 Homebrew 升级命令。');
   if (!markdown.includes(`Zeus-${version}-arm64.dmg`)) throw new Error(`Release notes 缺少版本化 DMG 名称：Zeus-${version}-arm64.dmg。`);
-  if (/releases\/v[^\s]+\.md|TASK_\d+/u.test(markdown)) throw new Error('Release notes 泄漏内部任务或发布文档路径。');
+  if (/releases\/(?:skylight-)?v[^\s]+\.md|TASK_\d+/u.test(markdown)) throw new Error('Release notes 泄漏内部任务或发布文档路径。');
   const leakedCommentary = markdown.match(/用户要求只返回|confidence\s*[=:：]|uncertainties\s*[=:：]|以下无其他字段|最终正文如上/iu)?.[0];
   if (leakedCommentary) throw new Error(`Release notes 混入生成过程说明“${leakedCommentary}”。`);
   const draftOnlyPublicationState = markdown.match(/本次发布前需完成以下验证流程|将由\s*(?:Release Workflow|发布流程)|发布流程将在草稿通过后执行|尚未发生/iu)?.[0];

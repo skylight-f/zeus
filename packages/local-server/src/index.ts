@@ -1,4 +1,4 @@
-import { zeusReleaseManifestUrl, isZeusReleaseUrl } from '@zeus/shared';
+import { createDistributionContext, type DistributionConfig } from '@zeus/shared';
 import { parseJsonObject } from './localServerPlatformSupport.js';
 import type { AsyncQuestionAnswer } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
@@ -250,6 +250,8 @@ function claimCodexFinalizationOwnership(error: unknown): unknown {
 }
 
 export interface CreateLocalServerOptions {
+  /** 宿主注入发行信息；未提供时使用上游配置。 */
+  distribution?: DistributionConfig;
   dbPath: string;
   apiToken: string;
   /** Electron Main 派生并经 Execution Host bootstrap 贯穿；Core 不得自行回退到生产 service。 */
@@ -612,7 +614,8 @@ export type TelegramDispatchPreviewBody = TelegramUpdate;
 const telegramNotificationSettingsKey = 'telegram.notificationSettings';
 const telegramSecuritySettingsKey = 'telegram.securitySettings';
 
-function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean): string {
+function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean, distribution?: DistributionConfig): string {
+  const { zeusReleaseManifestUrl, isZeusReleaseUrl } = createDistributionContext(distribution);
   const fallback = zeusReleaseManifestUrl;
   const candidate = configured?.trim() || fallback;
   const url = new URL(candidate);
@@ -827,7 +830,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const readGitStatus = async (cwd: string): Promise<GitStatusSummary> => (await runGitStatusHeavyJob(cwd)).status;
   const readGitDiff = async (cwd: string): Promise<GitDiffSummary> => (await runGitDiffHeavyJob(cwd)).diff;
   const releaseEnvironment = process.env;
-  const releaseUpdateManifestUrl = resolveReleaseUpdateManifestUrl(options.releaseUpdateManifestUrl, Boolean(options.allowUntrustedReleaseUpdateTest));
+  const releaseUpdateManifestUrl = resolveReleaseUpdateManifestUrl(options.releaseUpdateManifestUrl, Boolean(options.allowUntrustedReleaseUpdateTest), options.distribution);
   const telegramRuntimeConfirmations = new Map<string, TelegramRuntimeConfirmation>();
   const telegramRuntimeSummarySentLogCounts = new Map<string, Set<number>>();
   const telegramCommandRunMessages = new Map<string, { chatId: number; messageId?: number }>();

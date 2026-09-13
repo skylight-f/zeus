@@ -1,4 +1,4 @@
-import { zeusDistribution, zeusHomebrewCask } from '@zeus/shared';
+import { zeusDistribution, zeusHomebrewCask } from './desktopDistribution.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants as fsConstants, createReadStream, type Stats } from 'node:fs';

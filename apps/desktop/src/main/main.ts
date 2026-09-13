@@ -1,4 +1,4 @@
-import { isZeusReleaseUrl } from '@zeus/shared';
+import { isZeusReleaseUrl } from './desktopDistribution.js';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, type FSWatcher, mkdtempSync, readFileSync } from 'node:fs';
@@ -437,7 +437,7 @@ function desktopRoot(): string {
 
 function developmentAppIconPath(): string | undefined {
   if (app.isPackaged) return undefined;
-  const developmentIcon = join(desktopRoot(), 'assets', 'icon-dev.png');
+  const developmentIcon = join(desktopRoot(), 'dist', 'branding', 'icon-dev.png');
   // 开发图标为可选定制资源；干净源码检出使用仓库自带图标，避免阻断启动。
   return existsSync(developmentIcon) ? developmentIcon : join(desktopRoot(), 'assets', 'icon.png');
 }
@@ -2303,7 +2303,7 @@ async function toggleMenuBarUsageWindow(anchor: MenuBarUsageClickAnchor): Promis
 
 function setupTray(): void {
   if (!tray) {
-    const trayIconPath = join(desktopRoot(), 'assets/trayTemplate.png');
+    const trayIconPath = join(desktopRoot(), 'dist/branding/trayTemplate.png');
     const trayIcon = nativeImage.createFromBuffer(readFileSync(trayIconPath));
     if (trayIcon.isEmpty()) throw new Error(`Zeus tray icon is empty: ${trayIconPath}`);
     trayIcon.setTemplateImage(true);

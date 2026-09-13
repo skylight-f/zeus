@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { releaseTag } from './desktop-distribution.mjs';
 /* global console, process */
-import { zeusDistribution } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution } from './desktop-distribution.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -42,7 +43,7 @@ export function renderReleaseManifest(input) {
   const homebrewTap = normalizeHomebrewTap(input.homebrewTap);
   if (repository !== zeusDistribution.repository || homebrewTap !== zeusDistribution.homebrewTap) throw new Error('发布来源与二开配置不一致。');
   if ((input.channel ?? 'stable') !== zeusDistribution.channel) throw new Error('发布渠道与二开配置不一致。');
-  const tag = `v${version}`;
+  const tag = releaseTag(version);
   const releaseBaseUrl = `https://github.com/${repository}/releases`;
   const releaseDownloadBaseUrl = `${releaseBaseUrl}/download/${tag}`;
   const manifest = {
@@ -96,7 +97,7 @@ async function discoverArtifacts({ distDir, version, repository }) {
       fileName,
       sha256: await sha256File(filePath),
       sizeBytes: fileStat.size,
-      downloadUrl: `https://github.com/${repository}/releases/download/v${version}/${encodeURIComponent(fileName)}`,
+      downloadUrl: `https://github.com/${repository}/releases/download/${releaseTag(version)}/${encodeURIComponent(fileName)}`,
     });
   }
   return artifacts.sort((left, right) => `${left.arch}-${left.kind}`.localeCompare(`${right.arch}-${right.kind}`));

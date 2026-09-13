@@ -33,6 +33,7 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     outputs:
+      release_branch: ${{ steps.distribution.outputs.release_branch }}
       homebrew_enabled: ${{ steps.distribution.outputs.homebrew_enabled }}
       homebrew_repository: ${{ steps.distribution.outputs.homebrew_repository }}
     steps:
@@ -72,12 +73,12 @@ jobs:
             echo "检出提交与候选提交不一致：expected=$RELEASE_COMMIT actual=$(git rev-parse HEAD)" >&2
             exit 1
           fi
-          if [ "$(git ls-remote origin refs/heads/develop | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+          if [ "$(git ls-remote origin refs/heads/${{ steps.distribution.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
             echo '公开发布候选必须精确等于 origin/develop，拒绝发布漂移或未推送提交。' >&2
             exit 1
           fi
           node scripts/distribution-config.mjs --check-version
-          expected_tag="v$(node -p "require('./package.json').version")"
+          expected_tag="$(node scripts/distribution-config.mjs --tag)"
           if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" != "$expected_tag" ]; then
             echo "公开发布要求目标 tag 与 package.json 版本一致：expected=$expected_tag actual=${RELEASE_TAG:-empty}" >&2
             exit 1
@@ -224,7 +225,7 @@ jobs:
       - name: 复核下载产物的发行归属和提交
         run: |
           node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json --check-version
-          if [ "$(git ls-remote origin refs/heads/develop | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
+          if [ "$(git ls-remote origin refs/heads/${{ needs.preflight.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
             echo '构建期间 develop 已变化，请重新选择发布候选。' >&2
             exit 1
           fi
@@ -271,6 +272,7 @@ jobs:
               dist/Zeus-*.dmg \
               dist/zeus-release-manifest.json \
               --verify-tag \
+              --latest \
               --title "Zeus $RELEASE_TAG" \
               --notes-file "$release_notes_file"
           fi

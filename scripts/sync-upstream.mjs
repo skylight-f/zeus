@@ -2,7 +2,7 @@
 /* global process, console */
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { zeusDistribution as d } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution as d } from './desktop-distribution.mjs';
 
 // 仅显式启动的同步工作流可以写分支；本地命令只输出配置。
 if (process.env.GITHUB_ACTIONS !== 'true' || process.env.GITHUB_REPOSITORY !== d.repository) {

@@ -1,4 +1,4 @@
-import { zeusDistribution } from '@zeus/shared';
+import { zeusDistribution, skylightToolPages } from '../../skylight/index.js';
 import { temporaryWorkspaceId } from '@zeus/shared';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
@@ -46,8 +46,6 @@ import { DigitalEmployeeTemplatesSettings } from '../digital-employees/DigitalEm
 import { ImRobotSettingsPane } from '../telegram/ImRobotSettingsPane.js';
 import { ProjectDigitalEmployeesPanel } from '../digital-employees/ProjectDigitalEmployeesPanel.js';
 import { ProjectModelsSettings } from '../../settings/ProjectModelsSettings.js';
-import { ExtensionsWorkspace } from '../skills/ExtensionsWorkspace.js';
-import { AutomationsWorkspace } from '../automations/AutomationsWorkspace.js';
 import { defaultTaskTableEnumSortOrders, normalizeTaskTableEnumSortOrders } from '../../task/taskWorkspaceModel.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { Button } from '../../ui/Button.js';
@@ -866,9 +864,11 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             onChooseFolder={() => void chooseProjectDirectoryForCreate()}
           />
         ) : null}
-        {activeNavTarget === 'skills' ? <ExtensionsWorkspace client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} /> : null}
+        {activeNavTarget === 'skills' ? (
+          <skylightToolPages.extensions client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} />
+        ) : null}
         {activeNavTarget === 'automations' ? (
-          <AutomationsWorkspace
+          <skylightToolPages.automations
             client={props.commandClient ?? null}
             projects={snapshot.projects}
             language={appShellSettings.appLanguage}

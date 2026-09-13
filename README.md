@@ -81,11 +81,11 @@ requirement，用于减少升级后因代码身份变化而重复询问“文稿
 开启 Computer Use 后可控制另一个独立的 Zeus Test 实例，无需额外 QA 模式；当前宿主、控制服务和正式 Zeus 实例仍禁止控制，敏感操作仍需用户确认。多个 Test 同时运行时使用应用绝对路径指定目标。
 
 Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控件出现、消失或文本值变化，并返回可继续操作的新快照。条件未满足时只报告超时，不重放动作；确认范围仅为可访问的界面状态。默认返回紧凑控件或较小的差异，首次未缓存观察附带截图，后续确认按需使用 `include_screenshot`；需要全部控件属性时使用 `full_output`。优点是减少额外等待与模型往返；复杂界面可能需要补充完整观察，实际性能需以相同流程复测。
-发布正文由发布准备流程写入 `releases/v<版本>.md`。任务记录与验收证据统一保留在本地 `docs/`，整个目录已加入 Git 忽略规则，不随源码提交。旧记录可从 Git 历史查阅，不维护新旧两套发布文档路径。
+发布正文由发布准备流程写入 `releases/skylight-v<版本>.md`。任务记录与验收证据统一保留在本地 `docs/`，整个目录已加入 Git 忽略规则，不随源码提交。旧记录可从 Git 历史查阅，不维护新旧两套发布文档路径。
 
 ## 二开维护与发布
 
-本仓库是 [imchenway/zeus](https://github.com/imchenway/zeus) 的二开发行版，保留上游署名和许可证。统一发行配置位于 `packages/shared/src/distribution.ts`，更新只接受 `skylight-f/zeus` 的清单和安装包。
+本仓库是 [imchenway/zeus](https://github.com/imchenway/zeus) 的二开发行版，保留上游署名和许可证。统一发行配置位于 `packages/skylight-distribution/src/index.ts`，更新只接受 `skylight-f/zeus` 的清单和安装包。
 
 - `pnpm release:config`：查看二开发行配置。
 - `pnpm upstream:check`：查看上游同步入口；GitHub 的 `Sync upstream` 工作流每周检查稳定版本并准备待审阅 PR。
@@ -94,3 +94,12 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 - GitHub `Release` 工作流：默认只构建候选，显式选择公开发布后才创建标签和 Release。
 
 详细操作见 [二开发布流程](releases/FORK-MAINTENANCE.md)。应用身份尚沿用当前 Zeus 安装，现有数据不自动迁移；二开更新来源与上游已经隔离，但当前发行版还不能与原版并行安装。
+
+### 二开模块边界
+
+- `packages/skylight-distribution/`：发行配置与品牌图标；构建生成 `apps/desktop/dist/branding/`，运行、浏览器扩展及安装器读取同一份资源。
+- `apps/desktop/src/renderer/skylight/tools/`：自动化、扩展与技能管理页面；`toolPageHost.ts` 是唯一宿主适配面。
+- 通用服务只接收 `DistributionConfig`，不依赖 SkyLight 包；页面由工作台组装入口注册，业务客户端、存储和权限仍由宿主管理。
+- `pnpm verify:architecture` 检查上述依赖边界，并随 `pnpm verify:publish` 执行。日常仍在原项目目录运行 `pnpm dev`。
+
+SkyLight 发行版本从 `0.1.0` 独立递增，版本源为 `packages/skylight-distribution/package.json`；发布标签为 `skylight-v<版本>`，上游 `v<版本>` 标签只用于追溯。旧 `0.3.x` 客户端首次切换需手动安装，之后使用新的递增版本更新。

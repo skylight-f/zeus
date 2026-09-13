@@ -1,4 +1,4 @@
-import { isZeusReleaseUrl } from '@zeus/shared';
+import { isZeusReleaseUrl } from './desktopDistribution.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, createReadStream, existsSync, realpathSync } from 'node:fs';

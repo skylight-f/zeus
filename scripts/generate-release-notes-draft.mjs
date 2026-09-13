@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { releaseTag, versionFromReleaseTag } from './desktop-distribution.mjs';
 /* global console, process */
-import { zeusDistribution } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution } from './desktop-distribution.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -131,7 +132,7 @@ function buildEvidence() {
 
 /** 以完整范围摘要与受限的源码差异构造发布说明输入。 */
 async function buildPrompt(currentEvidencePath, currentEvidence) {
-  const ignoredReleaseNotes = join(repositoryRoot, 'releases', `v${releaseVersion}.md`);
+  const ignoredReleaseNotes = join(repositoryRoot, 'releases', `${releaseTag(releaseVersion)}.md`);
   /** 读取时限制内存占用，避免大批文档变化在截断前撑满子进程缓冲区。 */
   const committedDiff = await readCommittedDiff();
   return `你负责为 Zeus ${releaseVersion} 生成一份面向用户的候选 Release notes。
@@ -218,8 +219,8 @@ function git(args, options = {}) {
 
 function resolveBaseTag(rawValue) {
   const requested = rawValue?.trim();
-  const tag = requested || git(['describe', '--tags', '--abbrev=0', '--match', 'v[0-9]*']);
-  if (!/^v\d+\.\d+\.\d+$/u.test(tag)) {
+  const tag = requested || git(['describe', '--tags', '--abbrev=0', '--match', `${zeusDistribution.releaseTagPrefix}[0-9]*`]);
+  if (!versionFromReleaseTag(tag)) {
     throw new Error(`BASE_TAG 必须是稳定版本标签，例如 v0.1.9；当前值为 ${tag || 'empty'}。`);
   }
   git(['rev-parse', '--verify', `${tag}^{commit}`]);

@@ -1,18 +1,19 @@
 #!/usr/bin/env node
+import { releaseTag, releasePackagePaths, readDistributionVersion } from './desktop-distribution.mjs';
 /* global process, console */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { zeusDistribution as d } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution as d } from './desktop-distribution.mjs';
 import { requiredVersion, assertVersionAfterTag, validateReleaseNotes } from './release-script-utils.mjs';
 
 // 支持尚无自有 GitHub Release 的首次发布；只准备文件，不提交、推送或发布。
-const version = requiredVersion(process.env.RELEASE_VERSION);
-const paths = ['package.json', 'apps/desktop/package.json'];
+const version = requiredVersion(process.env.RELEASE_VERSION || readDistributionVersion());
+const paths = releasePackagePaths;
 const packages = paths.map((path) => JSON.parse(readFileSync(path, 'utf8')));
 if (packages[0].version !== packages[1].version) throw new Error('根包与桌面包版本不一致。');
-assertVersionAfterTag(version, `v${packages[0].version}`);
-const tag = `v${version}`;
+if (version !== readDistributionVersion()) assertVersionAfterTag(version, releaseTag(readDistributionVersion()));
+const tag = releaseTag(version);
 const tags = execFileSync('git', ['tag', '--list', tag], { encoding: 'utf8' }).trim();
 if (tags) throw new Error('目标版本已存在本地标签，请选择新的版本号。');
 const notesPath = resolve(process.env.RELEASE_NOTES_FILE || '');

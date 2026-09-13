@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { releaseTag, assertDistributionVersions } from './desktop-distribution.mjs';
 /* global console, process */
-import { zeusDistribution } from '../packages/shared/src/distribution.ts';
+import { zeusDistribution } from './desktop-distribution.mjs';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -34,7 +35,7 @@ async function main() {
   const deepVerifyPublicDmg = parseBoolean('DEEP_VERIFY_PUBLIC_DMG', process.env.DEEP_VERIFY_PUBLIC_DMG, false);
   const confirmation = process.env.PUBLISH_CONFIRMATION?.trim() ?? '';
   const localGateSummaryPath = optionalFile(process.env.LOCAL_GATE_SUMMARY_FILE, 'LOCAL_GATE_SUMMARY_FILE');
-  const tag = `v${releaseVersion}`;
+  const tag = releaseTag(releaseVersion);
   const outputDirectory = resolveOutputDirectory(releaseVersion);
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
 
@@ -98,10 +99,11 @@ async function main() {
 function collectPreflight(input) {
   const blockers = [];
   const headSha = git(['rev-parse', 'HEAD']);
+  assertDistributionVersions();
   const branch = git(['branch', '--show-current']) || '(detached HEAD)';
   const worktreeStatus = git(['status', '--short']);
   const originUrl = git(['remote', 'get-url', 'origin']);
-  const remoteMainSha = resolveRemoteReference('refs/heads/develop');
+  const remoteMainSha = resolveRemoteReference(`refs/heads/${zeusDistribution.releaseBranch}`);
   const localTagSha = resolveLocalTagSha(input.tag);
   const remoteTagSha = resolveRemoteTagSha(input.tag);
   const ghAuth = captureRemoteRead('检查 GitHub CLI 登录状态', 'gh', ['auth', 'status', '--hostname', 'github.com'], { allowFailure: true });
@@ -114,7 +116,7 @@ function collectPreflight(input) {
   let packageVersion = null;
   let desktopVersion = null;
 
-  if (branch !== 'develop') blockers.push(`当前分支必须是 develop，实际为 ${branch}`);
+  if (branch !== zeusDistribution.releaseBranch) blockers.push(`当前分支必须是 develop，实际为 ${branch}`);
   if (worktreeStatus) blockers.push('工作区必须干净');
   if (!isExpectedOrigin(originUrl)) blockers.push(`origin 不是 ${repository}：${originUrl}`);
   if (!remoteMainSha) blockers.push('无法读取 origin/develop 远程提交');
@@ -385,7 +387,10 @@ function validateLocalGateSummary(path, version, headSha) {
 }
 
 function findSuccessfulCiRun(headSha) {
-  const result = ghJson(['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', 'develop', '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'], true);
+  const result = ghJson(
+    ['run', 'list', '--repo', repository, '--workflow', 'CI', '--branch', zeusDistribution.releaseBranch, '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'],
+    true,
+  );
   if (!result.ok || !Array.isArray(result.value)) return null;
   return result.value.find((run) => run.headSha === headSha && run.event === 'push' && run.status === 'completed' && run.conclusion === 'success') ?? null;
 }
@@ -447,7 +452,7 @@ function dispatchReleaseWorkflow(tag, commitSha, requireAppleDistribution) {
     '--repo',
     repository,
     '--ref',
-    'develop',
+    zeusDistribution.releaseBranch,
     '--field',
     `commit_sha=${commitSha}`,
     '--field',

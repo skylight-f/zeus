@@ -2,9 +2,9 @@
 
 ## 当前渠道
 
-发行仓库为 `skylight-f/zeus`，上游为 `imchenway/zeus`。发行版 ID 为 `skylight-f.zeus`，版本独立递增，目前实现稳定渠道。预览清单会被稳定客户端拒绝；不要把预览版本标记为 latest。首次自有 Release 尚未发布时，更新检查不可用属于真实状态，不回退到上游。
+发行仓库为 `skylight-f/zeus`，上游为 `imchenway/zeus`。发行版 ID 为 `skylight-f.zeus`，版本从 `0.1.0` 独立递增，目前实现稳定渠道。二开标签使用 `skylight-v0.1.0`，保留上游的 `v0.1.0` 等历史标签。预览清单会被稳定客户端拒绝；不要把预览版本标记为 latest。首次自有 Release 尚未发布时，更新检查不可用属于真实状态，不回退到上游。
 
-`packages/shared/src/distribution.ts` 是运行时和发布脚本的共同来源，脚本需要 Node 24。Homebrew 默认关闭；创建并验证 `skylight-f/homebrew-tap`、配置 `HOMEBREW_TAP_TOKEN` 后，才将 `homebrewEnabled` 改为 true。
+`packages/skylight-distribution/package.json` 是二开版本来源，发布准备脚本同步根包和桌面包版本，构建会检查三者一致。`packages/skylight-distribution/src/index.ts` 是发行渠道和标签前缀的共同来源，脚本需要 Node 24。Homebrew 默认关闭；创建并验证 `skylight-f/homebrew-tap`、配置 `HOMEBREW_TAP_TOKEN` 后，才将 `homebrewEnabled` 改为 true。
 
 ## 一次性仓库设置
 
@@ -31,15 +31,15 @@
 先写中文发布说明，标题为 `# Zeus X.Y.Z 更新内容`，包括“如何升级”“系统要求与已知限制”“发布验证”。只填写已经取得的验证事实，提供本仓库 Release 地址和 `Zeus-X.Y.Z-arm64.dmg` 文件名；未启用 Homebrew 时不推荐 Tap 命令。
 
 ```bash
-RELEASE_VERSION=0.4.0 RELEASE_NOTES_FILE=/absolute/path/notes.md pnpm release:fork:prepare
-RELEASE_VERSION=0.4.0 RELEASE_NOTES_FILE=/absolute/path/notes.md APPLY_CHANGES=1 pnpm release:fork:prepare
+RELEASE_VERSION=0.1.0 RELEASE_NOTES_FILE=/absolute/path/notes.md pnpm release:fork:prepare
+RELEASE_VERSION=0.1.0 RELEASE_NOTES_FILE=/absolute/path/notes.md APPLY_CHANGES=1 pnpm release:fork:prepare
 pnpm verify:publish
 pnpm dev
 ```
 
-版本号只是例子，应高于当前版本和已公开版本。准备命令只修改两个 package.json 和版本发布说明，不提交、不推送、不创建标签。先审阅、提交到自己的仓库，并通过 PR 合入 develop。
+首次使用 `0.1.0`，后续版本必须高于本发行版当前版本和已公开的 SkyLight 版本，上游标签不参与比较。准备命令同步三个 package.json 和版本发布说明，不提交、不推送、不创建标签。先审阅、提交到自己的仓库，并通过 PR 合入 develop。
 
-在 Actions → Release 中填写 develop 的完整 40 位 commit SHA 和 `vX.Y.Z`，保持 `publish_release=false`，执行候选构建并下载 Actions 产物检查。公开发布时重新选择同一提交并启用 `publish_release`；需要自动安装则同时选择严格 Apple 分发。
+在 Actions → Release 中填写 develop 的完整 40 位 commit SHA 和 `skylight-vX.Y.Z`，保持 `publish_release=false`，执行候选构建并下载 Actions 产物检查。公开发布时重新选择同一提交并启用 `publish_release`；需要自动安装则同时选择严格 Apple 分发。
 
 公开流程会复核 develop 的固定提交、不可变标签、清单归属、候选 sourceCommit 和版本，门禁及打包通过后才发布。当前产物为 macos-latest 架构构建的 DMG（当前主要验收 arm64），不声称同时支持 Intel。旧的 `pnpm release` 是会提交并推送 develop 的全流程工具，首次发行请使用上述显式流程；只有明确授权公开发布时才运行它。
 
@@ -54,3 +54,5 @@ GitHub Release 和 Homebrew 分步执行。发布后 Tap 同步失败，应基�
 升级前备份重要数据；出现需要回退的数据库迁移时，使用匹配备份恢复，不能只降级程序。优先发布递增版本的修复包，避免更改已经公开的标签和资产。
 
 参考：[GitHub 工作流触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)、[Environment 设置](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)。
+
+从旧 `0.3.x` 版本切换到二开 `0.1.0` 时需要手动安装；现有自动更新比较会把 `0.1.0` 判为旧版本，不修改该保护。首次安装后按 `0.1.0 → 0.1.1` 更新。发布时明确将自己的 Release 设为 latest，保留历史标签和资产。
