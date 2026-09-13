@@ -435,7 +435,10 @@ function desktopRoot(): string {
 }
 
 function developmentAppIconPath(): string | undefined {
-  return app.isPackaged ? undefined : join(desktopRoot(), 'assets', 'icon-dev.png');
+  if (app.isPackaged) return undefined;
+  const developmentIcon = join(desktopRoot(), 'assets', 'icon-dev.png');
+  // 开发图标为可选定制资源；干净源码检出使用仓库自带图标，避免阻断启动。
+  return existsSync(developmentIcon) ? developmentIcon : join(desktopRoot(), 'assets', 'icon.png');
 }
 
 /** 开发宿主继续使用独立数据目录，并在 macOS Dock 中显式展示开发图标。 */
