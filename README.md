@@ -98,9 +98,9 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 - `pnpm release:config`：检查发行来源及应用版本一致性。
 - `pnpm release:distribution:prepare`：使用已审阅的发布说明准备版本文件，支持首次发行；默认预览，显式设置 `APPLY_CHANGES=1` 才写入文件。
 - `pnpm release`：执行受控发布流程；在当前 Astra 源码项目中也可通过内置 `/release` 命令调用，仍经过项目权限与高风险确认。
-- `Astra Release` 工作流在 `skylight-f/zeus` 的 `develop` 每次推送后自动检查并构建当前提交，不要求设置自动发布变量。通过后，在该次 Actions 的 Artifacts 下载 `Astra-macos-<提交 SHA>`，内含 `Astra-<版本>-<架构>.dmg` 和更新清单；安装后应用名为 `Astra.app`。默认不递增版本、不回写分支、不创建 GitHub Release。
+- `Astra Release` 工作流在 `skylight-f/zeus` 的 `develop` 每次推送后自动检查、准备发行候选、构建并公开发布 GitHub Release。版本沿用 `skylight-v` 标签序列递增补丁号；已准备的有效候选会复用。通过后可在 Releases 下载 `Astra-<版本>-<架构>.dmg`，安装后应用名为 `Astra.app`；Actions 的 `Astra-macos-<提交 SHA>` 产物同时保留安装包和更新清单。
 - 手动运行 `Astra Release` 默认也只构建候选；公开发布需要显式选择 `publish_release`，填写固定提交 SHA、匹配的 `skylight-v<版本>` 标签，并准备对应发布正文。
-- 可选自动发布：维护者设置仓库变量 `ZEUS_AUTO_RELEASE=true` 后，`develop` 推送会先检查源码，再准备递增补丁版本和发布候选；该功能需要 Actions 写入分支的权限。失败重试复用同一候选，不覆盖已有标签。先通过手动候选验收，再启用自动发布。
+- 自动发布需要 Actions 写入分支的权限。失败重试复用同一候选，不覆盖已有标签。若需暂停公开发布，将仓库变量 `ZEUS_AUTO_RELEASE` 显式设为 `false`；此时 `develop` 推送只检查并构建原始提交，不递增版本、不回写分支、不创建 GitHub Release。删除该变量或设为 `true` 恢复自动发布。
 - 构建要求仓库已启用 GitHub Actions，允许使用工作流引用的 Actions 且有 macOS runner 额度。签名与公证凭据可选；设置 `REQUIRE_APPLE_DISTRIBUTION=true` 的自动公开发布必须提供完整 Apple 凭据。Homebrew 未启用时无需配置 Tap token。自动发布期间若发行分支更新，流程会拒绝发布过时候选。
 - 可选上游同步：`pnpm upstream:check` 默认只显示同步入口。设置 `ZEUS_UPSTREAM_SYNC=true` 启用 `Sync upstream` 工作流，集成分支默认 `develop`；自定义时将 `ZEUS_INTEGRATION_BRANCH` 与发行配置保持一致。定时执行需要该工作流存在于仓库默认分支，可将默认分支设为 `develop`。同步产生待审阅 PR，遇到冲突停止，不强行覆盖。
 

@@ -79,7 +79,8 @@ jobs:
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          ZEUS_AUTO_RELEASE: ${{ vars.ZEUS_AUTO_RELEASE }}
+          # 本仓库 develop 默认公开发布；显式设为 false 时仅构建候选。
+          ZEUS_AUTO_RELEASE: ${{ vars.ZEUS_AUTO_RELEASE || 'true' }}
           REQUIRE_APPLE_DISTRIBUTION: ${{ github.event_name == 'push' && vars.REQUIRE_APPLE_DISTRIBUTION == 'true' || inputs.require_apple_distribution == true }}
         run: node scripts/prepare-automatic-release.mjs
 
