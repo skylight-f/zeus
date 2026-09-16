@@ -1,4 +1,4 @@
-name: Release
+name: Astra Release
 
 on:
   push:
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   source-verify:
-    if: ${{ github.event_name == 'push' && vars.ZEUS_AUTO_RELEASE == 'true' && github.repository == 'skylight-f/zeus' }}
+    if: ${{ github.event_name == 'push' && github.repository == 'skylight-f/zeus' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -235,12 +235,18 @@ jobs:
           ZEUS_FAST_RELEASE: '1'
           ZEUS_RELEASE_OUTPUT_DIR: dist
         run: pnpm verify:release
+      - name: 核验 Astra 候选产物归属
+        env:
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json
       - name: 上传已校验正式产物
         id: upload_release_artifact
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
+          name: ${{ needs.preflight.outputs.app_name }}-macos-${{ needs.preflight.outputs.commit_sha }}
+          if-no-files-found: error
           path: |
             dist/*.dmg
             dist/zeus-release-manifest.json
@@ -249,7 +255,8 @@ jobs:
         if: ${{ steps.upload_release_artifact.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
-          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
+          name: ${{ needs.preflight.outputs.app_name }}-macos-${{ needs.preflight.outputs.commit_sha }}
+          if-no-files-found: error
           path: |
             dist/*.dmg
             dist/zeus-release-manifest.json
@@ -283,7 +290,7 @@ jobs:
       - name: 下载已校验正式产物
         uses: actions/download-artifact@v4
         with:
-          name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
+          name: ${{ needs.preflight.outputs.app_name }}-macos-${{ needs.preflight.outputs.commit_sha }}
           path: dist
       - uses: actions/setup-node@v4
         with:

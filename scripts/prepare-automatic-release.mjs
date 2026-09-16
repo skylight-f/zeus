@@ -138,7 +138,7 @@ export function prepareAutomaticCandidate({ root, sourceSha, releases }) {
     git(root, 'push', 'origin', `HEAD:refs/heads/${distribution.releaseBranch}`);
   } catch (error) {
     const actual = git(root, 'ls-remote', 'origin', `refs/heads/${distribution.releaseBranch}`).split(/\s+/u)[0];
-    if (actual !== commit) throw new Error('版本提交推送失败：main 可能已更新，或分支规则不允许 Actions 写入；未强推。', { cause: error });
+    if (actual !== commit) throw new Error(`版本提交推送失败：${distribution.releaseBranch} 可能已更新，或分支规则不允许 Actions 写入；未强推。`, { cause: error });
   }
   return { ready: true, publish: true, commit_sha: commit, tag, source: sourceSha };
 }
@@ -149,12 +149,18 @@ function main() {
   let result;
   if (process.env.GITHUB_EVENT_NAME === 'push') {
     if (process.env.GITHUB_REPOSITORY !== distribution.repository) throw new Error('自动发布仓库与发行配置不一致。');
-    if (process.env.ZEUS_AUTO_RELEASE !== 'true') throw new Error('自动发布未启用，请先配置 ZEUS_AUTO_RELEASE。');
     if (event.deleted || event.ref !== `refs/heads/${distribution.releaseBranch}` || event.repository?.full_name !== distribution.repository) throw new Error(`自动发布只接受本仓库 ${distribution.releaseBranch} 推送。`);
     const origin = git(repositoryRoot, 'remote', 'get-url', 'origin');
     if (![`https://github.com/${distribution.repository}`, `https://github.com/${distribution.repository}.git`, `git@github.com:${distribution.repository}.git`].includes(origin)) throw new Error('origin 与发行仓库不一致。');
-    const releases = JSON.parse(execFileSync('gh', ['api', `repos/${distribution.repository}/releases?per_page=100`, '--paginate', '--slurp'], { encoding: 'utf8' })).flat();
-    result = prepareAutomaticCandidate({ root: repositoryRoot, sourceSha: event.after, releases });
+    if (process.env.ZEUS_AUTO_RELEASE === 'true') {
+      const releases = JSON.parse(execFileSync('gh', ['api', `repos/${distribution.repository}/releases?per_page=100`, '--paginate', '--slurp'], { encoding: 'utf8' })).flat();
+      result = prepareAutomaticCandidate({ root: repositoryRoot, sourceSha: event.after, releases });
+    } else {
+      // 普通 develop 推送只构建原始提交，不递增版本、不写入分支、不创建公开发行。
+      const commit = git(repositoryRoot, 'rev-parse', 'HEAD');
+      if (!/^[a-f0-9]{40}$/u.test(event.after ?? '') || commit !== event.after) throw new Error('构建候选必须精确匹配本次推送提交。');
+      result = { ready: true, publish: false, commit_sha: commit, tag: releaseTag(packageVersion(repositoryRoot)) };
+    }
   } else if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') {
     const publish = parseBoolean('publish_release', String(event.inputs?.publish_release ?? 'false'), false);
     const commit = git(repositoryRoot, 'rev-parse', 'HEAD');

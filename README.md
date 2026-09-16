@@ -91,15 +91,17 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 
 本仓库基于 [Zeus](https://github.com/imchenway/zeus) 开发，独立发行并持续贡献通用功能。应用版本由根目录 `package.json` 维护，桌面包同步该版本；二开使用 `skylight-v<版本>` 标签，只按本渠道版本递增。更新来源为 `skylight-f/zeus`，严格核验发行 ID 和仓库，不回退到上游更新源。Homebrew 暂未启用，请从本仓库 Releases 获取发行包。
 
-`main` 保持上游镜像，`develop` 集成二开并承载发行。通用功能从上游基线建立 `feature/*`，向上游交付时使用 `contrib/*`；发行配置、版本提交和品牌资源仅进入二开分支。恢复二开配置后不要直接以 `develop` 向上游提交 PR。同步上游通过 `sync/*` PR 审阅，若合并改变二开发行配置或独立版本，脚本停止并交由本地处理。
+`main` 保持上游镜像，`develop` 集成二开并承载发行。向上贡献从上游基线建立 `reSync/feature/*`（功能与优化）或 `reSync/fix/*`（修复），只包含适用于上游的改进；发行配置、版本提交、品牌资源及二开兼容代码直接进入 `develop`。不要直接以 `develop` 向上游提交 PR。同步上游通过 `sync/*` PR 审阅，若合并改变二开发行配置或独立版本，脚本停止并交由本地处理。
 
 应用显示名在 `packages/distribution/src/config.json` 的 `appName` 配置，正式应用包、安装包与 Dev 窗口使用同一名称。改名保留既有 Bundle ID、数据根和钥匙串兼容关系，不能与原版并行运行；测试包仍使用隔离的 `Zeus Test` 身份。首次安装改名版本需手动完成，旧程序不会自动学会新应用包名称；本项目不自动迁移或删除旧数据。
 
 - `pnpm release:config`：检查发行来源及应用版本一致性。
 - `pnpm release:distribution:prepare`：使用已审阅的发布说明准备版本文件，支持首次发行；默认预览，显式设置 `APPLY_CHANGES=1` 才写入文件。
 - `pnpm release`：执行受控发布流程；在当前 Astra 源码项目中也可通过内置 `/release` 命令调用，仍经过项目权限与高风险确认。
-- `Release` 工作流默认由维护者手动运行，只构建候选；公开发布需要显式选择 `publish_release`。
+- `Astra Release` 工作流在 `skylight-f/zeus` 的 `develop` 每次推送后自动检查并构建当前提交，不要求设置自动发布变量。通过后，在该次 Actions 的 Artifacts 下载 `Astra-macos-<提交 SHA>`，内含 `Astra-<版本>-<架构>.dmg` 和更新清单；安装后应用名为 `Astra.app`。默认不递增版本、不回写分支、不创建 GitHub Release。
+- 手动运行 `Astra Release` 默认也只构建候选；公开发布需要显式选择 `publish_release`，填写固定提交 SHA、匹配的 `skylight-v<版本>` 标签，并准备对应发布正文。
 - 可选自动发布：维护者设置仓库变量 `ZEUS_AUTO_RELEASE=true` 后，`develop` 推送会先检查源码，再准备递增补丁版本和发布候选；该功能需要 Actions 写入分支的权限。失败重试复用同一候选，不覆盖已有标签。先通过手动候选验收，再启用自动发布。
+- 构建要求仓库已启用 GitHub Actions，允许使用工作流引用的 Actions 且有 macOS runner 额度。签名与公证凭据可选；设置 `REQUIRE_APPLE_DISTRIBUTION=true` 的自动公开发布必须提供完整 Apple 凭据。Homebrew 未启用时无需配置 Tap token。自动发布期间若发行分支更新，流程会拒绝发布过时候选。
 - 可选上游同步：`pnpm upstream:check` 默认只显示同步入口。设置 `ZEUS_UPSTREAM_SYNC=true` 启用 `Sync upstream` 工作流，集成分支默认 `develop`；自定义时将 `ZEUS_INTEGRATION_BRANCH` 与发行配置保持一致。定时执行需要该工作流存在于仓库默认分支，可将默认分支设为 `develop`。同步产生待审阅 PR，遇到冲突停止，不强行覆盖。
 
 `packages/distribution/` 提供发行配置，应用、浏览器扩展及安装器从 apps/desktop/assets/ 读取同一份图标并生成构建资源；内部包版本不参与应用发行编号。`apps/desktop/src/renderer/tooling/` 管理自动化、扩展与技能页面，通过宿主适配面调用已有客户端能力。`pnpm verify:architecture` 检查这些依赖边界。

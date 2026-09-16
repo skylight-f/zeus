@@ -19,6 +19,7 @@ else console.log(JSON.stringify({ ...distribution, version: distributionVersion 
 const manifestIndex = process.argv.indexOf('--manifest');
 if (manifestIndex >= 0) {
   const manifest = JSON.parse(readFileSync(process.argv[manifestIndex + 1], 'utf8'));
+  if (manifest.displayName !== distributionAppName) throw new Error('产物应用名与发行配置不一致。');
   if (manifest.distributionId !== distribution.id || manifest.repository !== distribution.repository || manifest.channel !== distribution.channel) throw new Error('产物清单与发行配置不一致。');
   if (process.env.RELEASE_COMMIT && manifest.sourceCommit !== process.env.RELEASE_COMMIT) throw new Error('产物提交与发布候选不一致。');
   if (process.env.RELEASE_TAG && releaseTag(manifest.version) !== process.env.RELEASE_TAG) throw new Error('产物版本与发布标签不一致。');
