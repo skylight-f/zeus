@@ -1649,43 +1649,39 @@
   opacity: 1;
 }
 
-/* 回答选区的两个动作与本地注释锚点保持轻量，不遮挡正文。 */
+/* 评论入口仅由按钮自身提供留白，右边缘对齐选区。 */
 .session-selection-toolbar {
   inset: auto;
   margin: 0;
+  padding: 0;
   background: color-mix(in srgb, var(--session-canvas, #fff) 96%, transparent);
   border: 1px solid var(--session-line, rgb(0 0 0 / 10%));
-  border-radius: 10px;
-  box-shadow: 0 6px 20px rgb(0 0 0 / 14%);
+  border-radius: 7px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 12%);
   display: flex;
   overflow: hidden;
   position: fixed;
-  transform: translate(-50%, calc(-100% - 12px));
+  transform: translate(-100%, -100%);
   z-index: 1000;
 }
 
 .session-selection-toolbar[data-placement='below'] {
-  transform: translate(-50%, 0);
+  transform: translate(-100%, 0);
 }
 
 .session-selection-toolbar > button {
   appearance: none;
   background: transparent;
   border: 0;
-  border-inline-end: 1px solid var(--session-line, rgb(0 0 0 / 10%));
   color: var(--session-text, #171717);
   cursor: pointer;
   font: inherit;
   font-size: 13px;
   font-weight: 600;
   line-height: 18px;
-  min-block-size: 30px;
-  padding-inline: 12px;
+  min-block-size: 26px;
+  padding: 4px 8px;
   white-space: nowrap;
-}
-
-.session-selection-toolbar > button:last-child {
-  border-inline-end: 0;
 }
 
 .session-selection-toolbar > button:hover:not(:disabled):not([aria-disabled='true']),
@@ -1693,11 +1689,11 @@
   background: var(--session-control-hover, rgb(0 0 0 / 6%));
 }
 
-/* 批注编号与确认操作统一使用品牌色，保持白色数字和图标对比。 */
-.macos-ai-app .session-response-annotation-marker {
+/* 批注主操作沿用发送按钮的品牌底色和白色前景，优先于会话通用按钮继承规则。 */
+.macos-ai-app.zeus-shell .session-response-annotation-marker {
   align-items: center;
   background: var(--zeus-brand-primary);
-  border: 2px solid white;
+  border: 2px solid var(--session-canvas);
   border-radius: 999px;
   box-shadow: 0 3px 12px rgb(15 23 42 / 24%);
   color: white;
@@ -1720,8 +1716,7 @@
   z-index: 998;
 }
 
-.macos-ai-app .session-response-annotation-marker:hover:not(:disabled),
-.macos-ai-app .session-response-annotation-marker[aria-expanded='true'] {
+.macos-ai-app.zeus-shell .session-response-annotation-marker[aria-expanded='true'] {
   background: var(--zeus-brand-primary);
   box-shadow: 0 4px 16px color-mix(in srgb, var(--zeus-brand-primary) 38%, transparent);
 }
@@ -1736,13 +1731,13 @@
   box-sizing: border-box;
   inset: auto;
   margin: 0;
-  background: rgb(255 255 255 / 98%);
-  border: 1px solid rgb(23 23 23 / 10%);
+  background: var(--session-canvas);
+  border: 1px solid var(--session-line);
   border-radius: 999px;
-  box-shadow: 0 8px 28px rgb(15 23 42 / 18%);
+  box-shadow: var(--zeus-card-shadow);
   backdrop-filter: blur(20px);
-  color: #202124;
-  color-scheme: light;
+  color: var(--session-text);
+  color-scheme: inherit;
   font:
     14px/1.4 -apple-system,
     BlinkMacSystemFont,
@@ -1770,14 +1765,14 @@
   min-block-size: 36px;
 }
 
-/* 显式覆盖通用输入样式，保持浏览器同款无边框文本区。 */
-.macos-ai-app.zeus-shell .session-response-annotation-row > textarea {
+/* 输入区继承浮层主题；优先于深色会话的通用输入规则，避免出现异色矩形。 */
+.macos-ai-app.zeus-shell .session-response-annotation-editor .session-response-annotation-row > textarea {
   background: transparent;
   border: 0;
   border-radius: 0;
   box-shadow: none;
   box-sizing: border-box;
-  color: #202124;
+  color: var(--session-text);
   flex: 1 1 auto;
   font: inherit;
   inline-size: 100%;
@@ -1792,16 +1787,16 @@
 }
 
 .session-response-annotation-row > textarea::placeholder {
-  color: #8b8b8b;
+  color: var(--session-text-muted);
 }
 
-.session-response-annotation-editor button {
+.macos-ai-app.zeus-shell .session-response-annotation-editor button {
   appearance: none;
   align-items: center;
   background: transparent;
   border: 0;
   border-radius: 999px;
-  color: #737373;
+  color: var(--session-text-muted);
   cursor: pointer;
   display: inline-flex;
   flex: 0 0 auto;
@@ -1817,24 +1812,31 @@
   inline-size: 18px;
 }
 
-.session-response-annotation-editor button:hover:not(:disabled) {
-  background: rgb(0 0 0 / 6%);
-  color: #202124;
+.macos-ai-app.zeus-shell .session-response-annotation-editor button:hover:not(:disabled) {
+  background: var(--zeus-interaction-hover);
+  color: var(--session-text);
 }
 
-.session-response-annotation-editor .session-response-annotation-save {
+.macos-ai-app.zeus-shell .session-response-annotation-editor .session-response-annotation-save {
   background: var(--zeus-brand-primary);
   color: white;
 }
 
-.session-response-annotation-editor .session-response-annotation-save:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--zeus-brand-primary) 90%, black);
+.macos-ai-app.zeus-shell .session-response-annotation-editor .session-response-annotation-save:hover:not(:disabled),
+.macos-ai-app.zeus-shell .session-response-annotation-marker:hover:not(:disabled) {
+  background: var(--zeus-interaction-primary-hover);
   color: white;
+}
+
+/* 按下反馈与会话发送按钮使用同一个主题值。 */
+.macos-ai-app.zeus-shell .session-response-annotation-marker:active:not(:disabled),
+.macos-ai-app.zeus-shell .session-response-annotation-editor .session-response-annotation-save:active:not(:disabled) {
+  background: var(--zeus-interaction-primary-pressed);
 }
 
 /* 次要操作按需展开，保留原有删除和取消能力。 */
 .session-response-annotation-options {
-  border-top: 1px solid rgb(32 33 36 / 10%);
+  border-top: 1px solid var(--session-line);
   display: flex;
   justify-content: space-between;
   margin: 2px 5px 5px;
@@ -2086,8 +2088,8 @@
 @media (max-width: 760px) {
   .session-selection-toolbar > button {
     font-size: 12px;
-    min-block-size: 28px;
-    padding-inline: 10px;
+    min-block-size: 26px;
+    padding-inline: 8px;
   }
 
   .session-codex-parity-v1 .session-code-comment-panel,
@@ -2097,7 +2099,7 @@
   }
 }
 
-/* ZEUS-0236：新会话执行上下文位于输入正文上方，项目与分支都使用真实可切换事实。 */
+/* ZEUS-0236：新会话执行上下文位于输入正文上方，项目目录显示当前分支，工作树单独配置来源和新分支。 */
 .session-codex-parity-v1 .session-new-conversation-context {
   align-items: center;
   background: color-mix(in srgb, var(--session-line-soft) 58%, transparent);
@@ -7820,8 +7822,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 /* 每轮变更卡片只消费该 turn 的 provider diff；Undo/Reapply 不读取全局 Git 工作区。 */
 .session-codex-parity-v1 .session-turn-change-card {
   background: var(--session-canvas);
-  border: 0;
+  /* 会话画布与卡片同色时，沿用环境信息卡片的细边线保持完整轮廓。 */
+  border: 1px solid var(--zeus-card-border, var(--session-line));
   border-radius: 13px;
+  box-sizing: border-box;
   box-shadow: none;
   flex: 0 0 auto;
   inline-size: min(var(--session-thread-max), 100%);
@@ -8488,8 +8492,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   display: flex;
   inline-size: 7px;
   inset-block: 0;
-  inset-inline-start: -3px;
-  justify-content: center;
+  /* 拖动区完整留在会话侧，避免原生网页覆盖细线及指针命中区域。 */
+  inset-inline-start: -7px;
+  justify-content: flex-end;
   min-block-size: 0;
   outline: 0;
   position: absolute;
@@ -8499,7 +8504,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-browser-resizer::before {
   /* 常驻细线区分同色会话与浏览器；随主题调整明暗，不依赖悬停才显现。 */
-  background: color-mix(in srgb, var(--session-text) 35%, var(--session-canvas));
+  background: var(--session-line);
   content: '';
   inline-size: 1px;
   transition:
@@ -12639,4 +12644,87 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 
 .session-source-tabs {
   overflow-x: auto;
+}
+
+.session-conversation-workspace-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  color: var(--zeus-product-muted);
+}
+
+.session-conversation-workspace-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.session-conversation-workspace-icon[data-workspace-mode='worktree'] {
+  color: var(--zeus-product-accent);
+}
+
+.macos-ai-app .session-conversation-tree-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.session-new-conversation-current-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-inline-size: 0;
+  padding: 0 8px;
+  color: var(--session-text-muted);
+}
+
+.session-new-conversation-current-branch svg {
+  flex: 0 0 auto;
+  inline-size: 16px;
+  block-size: 16px;
+}
+
+.session-new-conversation-current-branch > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-worktree-branch-popover .session-new-worktree-fields {
+  display: grid;
+  gap: 8px;
+  padding: 12px 8px 4px;
+  margin-block-start: 6px;
+  border-block-start: 1px solid var(--zeus-product-border);
+}
+
+.session-worktree-branch-popover .session-new-worktree-fields > button {
+  justify-self: start;
+}
+
+.session-new-worktree-fields > label {
+  display: grid;
+  gap: 5px;
+  min-inline-size: 0;
+}
+
+.session-new-worktree-fields input {
+  box-sizing: border-box;
+  inline-size: 100%;
+  min-inline-size: 0;
+  min-block-size: 34px;
+  padding: 6px 10px;
+  color: var(--zeus-product-text);
+  background: var(--zeus-product-panel);
+  border: 1px solid var(--zeus-product-border);
+  border-radius: 8px;
+}
+
+.session-new-worktree-fields > small,
+.session-new-worktree-fields > label > span {
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+
+.session-new-worktree-fields > [role='alert'] {
+  margin: 0;
+  color: var(--zeus-control-danger-text, #b33a3a);
+  font-size: 12px;
 }

@@ -1,3 +1,4 @@
+import type { ConversationWorktreeOptions } from '@zeus/shared';
 import type { ConversationFeatureCatalog } from '@zeus/shared';
 import type { AssistantMessageMetadata, AsyncQuestionAnswer, AsyncQuestionResponse } from '@zeus/shared';
 import type { UserFacingErrorCause } from '@zeus/shared';
@@ -883,6 +884,8 @@ export interface NativeConversationMessage {
 }
 
 export interface NativeConversationChoice {
+  workspaceMode?: 'direct' | 'worktree' | null;
+  executionPath?: string | null;
   id: string;
   /** 首条提交的持久创建操作身份；只用于列表关联，缺失时不能推断会话已创建成功。 */
   creationOperationIdentity?: string | null;
@@ -1244,6 +1247,8 @@ export interface TaskWorkspaceIndexSnapshot extends TaskWorkspaceRecord {
 }
 
 export interface TaskWorkspaceIndexCollection {
+  /** 已发现但尚未加入对应任务环境的仓库，所有仓库采用相同补入流程。 */
+  pendingRepositories?: Array<{ environmentId: string; repositoryId: string; repositoryName: string; relativePath: string; branchName: string }>;
   taskId: string;
   projectId: string;
   items: TaskWorkspaceIndexSnapshot[];
@@ -1494,6 +1499,8 @@ export type StartNativeConversationRequest =
     };
 
 export interface StartProjectConversationRequest {
+  worktree?: ConversationWorktreeOptions;
+  workspaceMode?: 'direct' | 'worktree';
   agentKind?: 'codex' | 'pi' | 'claude';
   mode: 'create';
   content: string;

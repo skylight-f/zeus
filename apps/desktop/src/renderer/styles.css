@@ -13539,6 +13539,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 }
 
 .macos-ai-app .task-status-chip {
+  /* 胶囊可随窄列收缩，内边距与边框计入可用宽度。 */
+  box-sizing: border-box;
+  min-inline-size: 0;
   align-items: center;
   background: var(--task-status-tone-bg);
   border: 1px solid var(--task-status-tone-line);
@@ -13558,6 +13561,11 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 }
 
 .macos-ai-app .task-status-chip strong {
+  /* 长状态在胶囊内部省略，保留完整文字供辅助技术与标题读取。 */
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--task-status-tone-text);
   font-size: 11px;
   font-weight: 650;
@@ -16247,6 +16255,35 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   block-size: 100%;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+}
+
+/* 新增仓库独立占据内容行并限高，保留文件审查区域的可用高度。 */
+.macos-ai-app .task-git-delivery-content.has-pending-repositories {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+/* 补入是所有仓库共用的正常流程，使用中性提示并允许长路径换行。 */
+.macos-ai-app .task-git-delivery-target-issues.task-git-delivery-pending {
+  max-block-size: 220px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  margin: 0 20px 12px;
+  color: inherit;
+  background: var(--zeus-product-panel);
+}
+
+/* 仓库身份与补入动作分列，长分支或相对路径仍能换行。 */
+.macos-ai-app .task-git-delivery-pending-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* 名称与分支分行显示，避免紧贴按钮或重复路径。 */
+.macos-ai-app .task-git-delivery-pending-row > span {
+  display: grid;
+  min-inline-size: 0;
 }
 
 .macos-ai-app .task-git-delivery-scopebar {
