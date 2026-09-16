@@ -84,12 +84,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/imchenway/zeus.git"
+    "url": "git+https://github.com/skylight-f/zeus.git"
   },
   "bugs": {
-    "url": "https://github.com/imchenway/zeus/issues"
+    "url": "https://github.com/skylight-f/zeus/issues"
   },
-  "homepage": "https://github.com/imchenway/zeus#readme",
+  "homepage": "https://github.com/skylight-f/zeus#readme",
   "pnpm": {
     "overrides": {
       "esbuild": "0.28.1",

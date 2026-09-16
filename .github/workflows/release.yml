@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [develop]
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   source-verify:
-    if: ${{ github.event_name == 'push' && vars.ZEUS_AUTO_RELEASE == 'true' && github.repository == 'imchenway/zeus' }}
+    if: ${{ github.event_name == 'push' && vars.ZEUS_AUTO_RELEASE == 'true' && github.repository == 'skylight-f/zeus' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
