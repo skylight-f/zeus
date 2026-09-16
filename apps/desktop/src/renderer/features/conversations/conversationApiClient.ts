@@ -16,6 +16,7 @@ import type {
   NativeConversationModelHistoryV2Item,
   NativeConversationProcessV2Item,
   NativeConversationReadableSnapshot,
+  NativeConversationExecutionContext,
   NativeConversationResourceV2Item,
   NativeConversationSnapshotV2Page,
   NativeConversationStartDispatchResult,
@@ -63,6 +64,8 @@ export interface ConversationApiClient {
   /** 一次取得同一事件进度下的会话结构与消息尾页。 */
   loadNativeConversationReadableSnapshot: (projectId: string, conversationId: string) => Promise<NativeConversationReadableSnapshot>;
   loadNativeConversationSessionMetrics: (projectId: string, conversationId: string) => Promise<NativeSessionMetricsSnapshot>;
+  /** 单独刷新执行现场，避免命令事件触发正文重载。 */
+  loadNativeConversationExecutionContext: (projectId: string, conversationId: string) => Promise<NativeConversationExecutionContext>;
   loadNativeConversationModelHistoryV2: (
     projectId: string,
     conversationId: string,
@@ -72,13 +75,13 @@ export interface ConversationApiClient {
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; limit?: number; byteLimit?: number },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number },
   ) => Promise<NativeConversationSnapshotV2Page<NativeConversationModelHistoryV2Item>>;
   loadNativeConversationProcessV2: (
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
   ) => Promise<NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>>;
   loadNativeConversationResourcesV2: (projectId: string, conversationId: string, options?: { cursor?: string; limit?: number; byteLimit?: number }) => Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
   loadNativeConversationChangeSetV2: (projectId: string, conversationId: string, turnId: string) => Promise<NativeConversationChangeSetV2Summary>;
@@ -197,6 +200,7 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
       }),
     loadConversationNavigation: (projectId, conversationId) => transport.request<ConversationNavigationSnapshot>(`${conversationPath(projectId, conversationId)}/navigation`),
     loadNativeConversationSessionMetrics: (projectId, conversationId) => transport.request<NativeSessionMetricsSnapshot>(`${conversationPath(projectId, conversationId)}/session-metrics`),
+    loadNativeConversationExecutionContext: (projectId, conversationId) => transport.request<NativeConversationExecutionContext>(`${conversationPath(projectId, conversationId)}/execution-context`),
     loadNativeConversationModelHistoryV2: (projectId, conversationId, options) =>
       transport.request<NativeConversationSnapshotV2Page<NativeConversationModelHistoryV2Item>>(`${conversationPath(projectId, conversationId)}/model-history${pageQuery(options)}`),
     loadNativeConversationTurnModelHistoryV2: (projectId, conversationId, turnId, options) =>

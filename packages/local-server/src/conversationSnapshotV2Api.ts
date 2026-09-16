@@ -48,6 +48,13 @@ type ProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compact
 export function registerConversationSnapshotV2Api(options: ConversationSnapshotV2ApiOptions): void {
   const { server, repository } = options;
 
+  // 命令后的环境刷新只读取目录与分支，不重新装载会话正文或推进同步游标。
+  server.get('/api/projects/:projectId/conversations/:conversationId/execution-context', async (request: FastifyRequest<{ Params: ConversationParams }>, reply) => {
+    if (!hasConversationAccess(options, request.params)) return conversationNotFound(reply);
+    markV2Response(reply);
+    return (await options.readExecutionContext?.(request.params.conversationId)) ?? { cwd: null, branch: null, isGitRepository: null };
+  });
+
   // 已完成的提交可能不在历史首屏或活动队列中，按耐久身份单独核对。
   server.get('/api/projects/:projectId/conversations/:conversationId/submissions/:submissionId/receipt', async (request: FastifyRequest<{ Params: ConversationParams & { submissionId: string } }>, reply) => {
     if (!hasConversationAccess(options, request.params)) return conversationNotFound(reply);
@@ -159,6 +166,7 @@ export function registerConversationSnapshotV2Api(options: ConversationSnapshotV
       return repository.listTurnModelHistoryPage({
         ...pageInput(request.params.conversationId, request.query),
         turnId: request.params.turnId,
+        direction: pageDirection(request.query.direction),
       });
     } catch (error) {
       return sendSnapshotV2Error(reply, error);
@@ -180,6 +188,7 @@ export function registerConversationSnapshotV2Api(options: ConversationSnapshotV
         return repository.listProcessPage({
           ...pageInput(request.params.conversationId, request.query),
           turnId: request.params.turnId,
+          direction: pageDirection(request.query.direction),
           ...(request.query.kind === undefined ? {} : { kind: parseProcessKind(request.query.kind) }),
         });
       } catch (error) {
@@ -283,6 +292,12 @@ export function registerConversationSnapshotV2Api(options: ConversationSnapshotV
       reply,
     ) => readContent(request, reply),
   );
+}
+
+/** 分页方向属于外部输入，只接受已定义的正序和倒序。 */
+function pageDirection(value: string | undefined): 'forward' | 'tail' {
+  if (value === undefined || value === 'forward' || value === 'tail') return value ?? 'forward';
+  throw new ConversationSnapshotV2Error('ZEUS_CONVERSATION_SNAPSHOT_V2_INVALID_CURSOR', '分页方向无效。', 400);
 }
 
 function pageInput(conversationId: string, query: PageQuery): { conversationId: string; cursor?: string; entryLimit?: number; byteLimit?: number } {

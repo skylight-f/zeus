@@ -159,7 +159,7 @@ export function prepareZeusDataRootIdentity(input: PrepareZeusDataRootIdentityIn
   if (existsSync(zeusDataRootIdentityPath(root))) return readAndVerifyZeusDataRootIdentity(root, expected);
 
   const rootExists = existsSync(root);
-  if (rootExists) assertCanonicalPrivateRoot(root);
+  if (rootExists) assertCanonicalOwnedRoot(root);
   const existingEntries = rootExists ? readdirSync(root) : [];
   const mayAdoptKnownProductionRoot =
     existingEntries.length > 0 &&
@@ -169,6 +169,12 @@ export function prepareZeusDataRootIdentity(input: PrepareZeusDataRootIdentityIn
     (input.knownProductionAdoptionRoots ?? []).some((candidate) => normalizeRoot(candidate) === root);
 
   if (existingEntries.length > 0 && !mayAdoptKnownProductionRoot) {
+    if (expected.profile === 'development') {
+      throw dataRootIdentityError(
+        'ZEUS_DATA_ROOT_OFFLINE_ADOPTION_REQUIRED',
+        `开发数据目录 ${root} 已有文件，但缺少身份标记，无法确认归属。请保留原目录，将 ZEUS_USER_DATA_DIR 指向新的空目录后重新启动；已有数据需要单独确认迁移，当前离线认领工具不支持开发目录。首次指定外接屏请使用 ZEUS_TEST_DISPLAY_ID，无需提前写入窗口位置文件。仅点击重新启动不会解决此问题。`,
+      );
+    }
     throw dataRootIdentityError('ZEUS_DATA_ROOT_OFFLINE_ADOPTION_REQUIRED', `Zeus 数据根 ${root} 非空但缺少持久身份标记。为避免 Test/正式资料互认，必须在所有 Zeus/Provider/Execution Host 退出后执行显式离线 adoption；启动链不会自动猜测。`);
   }
 
@@ -240,7 +246,7 @@ export function publishProvisionedZeusDataRootIdentity(
   },
 ): ZeusDataRootIdentityMarker {
   const root = normalizeRoot(input.rootPath);
-  assertCanonicalPrivateRoot(root);
+  assertCanonicalOwnedRoot(root);
   if (existsSync(zeusDataRootIdentityPath(root))) {
     throw dataRootIdentityError('ZEUS_DATA_ROOT_IDENTITY_EXISTS', `Zeus 数据根身份已经存在，拒绝覆盖：${root}`);
   }
@@ -250,7 +256,7 @@ export function publishProvisionedZeusDataRootIdentity(
 
 export function readAndVerifyZeusDataRootIdentity(rootPath: string, expected?: ExpectedZeusDataRootIdentity): ZeusDataRootIdentityMarker {
   const root = normalizeRoot(rootPath);
-  assertCanonicalPrivateRoot(root);
+  assertCanonicalOwnedRoot(root);
   const markerPath = zeusDataRootIdentityPath(root);
   const descriptor = openSync(markerPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
@@ -381,7 +387,7 @@ function assertOfflineAdoptionProfilePathIsolation(root: string, profile: ZeusDa
 }
 
 function inspectOfflineAdoptionRoot(root: string): OfflineAdoptionInspection {
-  assertCanonicalPrivateRoot(root);
+  assertCanonicalOwnedRoot(root);
   if (pathEntryExistsNoFollow(zeusDataRootIdentityPath(root))) {
     throw dataRootIdentityError('ZEUS_DATA_ROOT_IDENTITY_EXISTS', `Zeus 数据根身份已经存在，离线 adoption 拒绝覆盖：${root}`);
   }
@@ -610,7 +616,7 @@ function pathEntryExistsNoFollow(path: string): boolean {
 }
 
 function publishNewMarker(root: string, expected: ReturnType<typeof normalizeExpectedIdentity>): ZeusDataRootIdentityMarker {
-  assertCanonicalPrivateRoot(root);
+  assertCanonicalOwnedRoot(root);
   const payload: ZeusDataRootIdentityPayload = {
     format: markerFormat,
     formatVersion: markerFormatVersion,
@@ -764,10 +770,10 @@ function assertPrivateMarkerStats(stats: BigIntStats): void {
   if (stats.size <= 0n || stats.size > BigInt(maximumMarkerBytes)) throw dataRootIdentityError('ZEUS_DATA_ROOT_IDENTITY_INVALID', 'Zeus 数据根身份标记超出有界读取范围。');
 }
 
-function assertCanonicalPrivateRoot(root: string): void {
+/** 数据根只校验目录归属与真实路径；私有权限由敏感文件和专用子目录各自保证。 */
+function assertCanonicalOwnedRoot(root: string): void {
   const stats = lstatSync(root);
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw dataRootIdentityError('ZEUS_DATA_ROOT_PATH_UNSAFE', `Zeus 数据根必须是普通目录且不能是符号链接：${root}`);
-  if ((stats.mode & 0o077) !== 0) throw dataRootIdentityError('ZEUS_DATA_ROOT_PATH_UNSAFE', `Zeus 数据根权限范围过宽：${root}`);
   if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) throw dataRootIdentityError('ZEUS_DATA_ROOT_PATH_UNSAFE', `Zeus 数据根不属于当前用户：${root}`);
   if (realpathSync(root) !== root) throw dataRootIdentityError('ZEUS_DATA_ROOT_PATH_DRIFT', `Zeus 数据根包含符号链接或规范路径漂移：${root}`);
 }
@@ -782,7 +788,7 @@ function createCanonicalPrivateRoot(root: string): void {
   if (realpathSync(ancestor) !== ancestor) throw dataRootIdentityError('ZEUS_DATA_ROOT_PATH_DRIFT', `Zeus 数据根父路径包含符号链接：${ancestor}`);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
-  assertCanonicalPrivateRoot(root);
+  assertCanonicalOwnedRoot(root);
 }
 
 function syncDirectory(path: string): void {
@@ -842,6 +848,7 @@ function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoExcepti
   return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
 }
 
+/** Electron 跨进程只保留消息，前置稳定错误码以便界面生成简述，原始诊断仍留在详情。 */
 function dataRootIdentityError(code: string, message: string, cause?: unknown): Error {
-  return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code, failClosed: true as const });
+  return Object.assign(new Error(`${code}: ${message}`, cause === undefined ? undefined : { cause }), { code, failClosed: true as const });
 }

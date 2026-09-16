@@ -5,10 +5,12 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createZeusDataLayout } from '../packages/local-server/src/zeusDataLayout.js';
+import { describeUserFacingError } from '../packages/shared/src/userFacingError.js';
 import {
   expectedBundleIdForDataRootProfile,
   prepareZeusDataRootIdentity,
   readAndVerifyZeusDataRootIdentity,
+  verifyZeusDataRootHostIdentity,
   zeusDataRootHostIdentity,
   zeusDataRootIdentityPath,
   type ZeusDataRootHostIdentity,
@@ -35,6 +37,8 @@ try {
   };
   assert.equal(observed.emptyRootClaim && (observed.emptyRootClaim as { mode: string }).mode, '0600');
   assert.equal(testStats.nlink, 1);
+
+  observed.directoryPermissions = await verifyDirectoryPermissions();
 
   const development = claimEmptyRoot(join(probeRoot, 'empty-development-root'), 'development');
   observed.bundleIdentitySemantics = {
@@ -93,6 +97,32 @@ try {
     markerAbsent: true,
     sentinel: 'must-survive\n',
   });
+
+  /** 开发目录同样拒绝非空无标记根，但必须提供开发模式可执行的恢复说明。 */
+  const developmentRecovery = rejectionCode(() => {
+    try {
+      claimEmptyRoot(customRoot, 'development');
+    } catch (error) {
+      assert.match((error as Error).message, /ZEUS_USER_DATA_DIR.*新的空目录/u);
+      assert.match((error as Error).message, /ZEUS_TEST_DISPLAY_ID/u);
+      assert.match((error as Error).message, /不支持开发目录/u);
+      /** 跨进程丢失 code 属性后，仍能从消息前缀识别原因，详情保留恢复说明。 */
+      const explanation = describeUserFacingError(new Error(`Error invoking remote method 'zeus:get-local-server-config': Error: ${(error as Error).message}`), 'zh-CN', '启动未能完成，请查看错误详情。');
+      assert.equal(explanation.message, '无法确认本地数据目录的归属，启动已停止。');
+      assert.match(explanation.details, /ZEUS_USER_DATA_DIR/u);
+      assert.equal(describeUserFacingError(error, 'en').message, 'Startup stopped because the local data folder could not be identified.');
+      throw error;
+    }
+  });
+  assert.equal(developmentRecovery, 'ZEUS_DATA_ROOT_OFFLINE_ADOPTION_REQUIRED');
+  assert.equal(await pathExists(zeusDataRootIdentityPath(customRoot)), false);
+  assert.equal(await readFile(sentinel, 'utf8'), 'must-survive\n');
+  observed.developmentRecovery = developmentRecovery;
+  /** 未识别错误在启动页使用简述，默认调用方仍保留既有原因解释。 */
+  const unknownStartupError = 'unrecognized startup diagnostic /private/tmp/example';
+  assert.equal(describeUserFacingError(unknownStartupError, 'zh-CN', '启动未能完成，请查看错误详情。').message, '启动未能完成，请查看错误详情。');
+  assert.equal(describeUserFacingError(unknownStartupError).message, unknownStartupError);
+  assert.equal(describeUserFacingError(unknownStartupError, 'zh-CN', '启动未能完成，请查看错误详情。').details, unknownStartupError);
 
   const knownLegacyRoot = join(probeRoot, 'known-production-legacy-root');
   await mkdir(knownLegacyRoot, { mode: 0o700 });
@@ -175,6 +205,42 @@ try {
 }
 
 process.stdout.write(`${JSON.stringify({ status: 'passed', observed }, null, 2)}\n`);
+
+/** 验证根目录可读权限不阻断启动，敏感文件与运行子目录继续独立保护。 */
+async function verifyDirectoryPermissions(): Promise<Record<string, unknown>> {
+  /** 使用已有探针的隔离根，覆盖空目录认领和已有身份再次启动。 */
+  const root = join(probeRoot, 'readable-root');
+  await mkdir(root, { mode: 0o755 });
+  await chmod(root, 0o755);
+  /** 身份绑定与正常桌面准备入口使用相同参数。 */
+  const identity = {
+    profile: 'test' as const,
+    bundleId: expectedBundleIdForDataRootProfile('test'),
+    keychainService: resolveDesktopKeychainService({ profile: 'test', dataRootPath: root }),
+  };
+  /** 完整准备必须接受已有 0755 根，并为敏感子目录设置私有权限。 */
+  const prepared = prepareZeusDataRoot(root, [], identity);
+  assert.equal((await lstat(root)).mode & 0o777, 0o755);
+  for (const directory of [prepared.layout.dataDirectory, prepared.layout.providersDirectory, prepared.layout.runtimeDirectory, prepared.layout.electronUserData]) {
+    assert.equal((await lstat(directory)).mode & 0o777, 0o700);
+  }
+  assert.equal((await lstat(zeusDataRootIdentityPath(root))).mode & 0o777, 0o600);
+  assert.equal(prepareZeusDataRoot(root, [], identity).rootIdentity.rootId, prepared.rootIdentity.rootId);
+  /** 纯读取和宿主校验同样接受该根，且不改目录权限或身份文件。 */
+  const before = await treeEvidence(root);
+  assert.equal(readAndVerifyZeusDataRootIdentity(root, identity).rootId, prepared.rootIdentity.rootId);
+  verifyZeusDataRootHostIdentity({ rootPath: root, expected: zeusDataRootHostIdentity(prepared.rootIdentity), keychainService: identity.keychainService });
+  assert.deepEqual(await treeEvidence(root), before);
+  assert.equal((await lstat(root)).mode & 0o777, 0o755);
+  /** 数据根放行不放宽敏感身份文件的权限要求。 */
+  await chmod(zeusDataRootIdentityPath(root), 0o644);
+  assert.equal(
+    rejectionCode(() => readAndVerifyZeusDataRootIdentity(root, identity)),
+    'ZEUS_DATA_ROOT_IDENTITY_UNSAFE',
+  );
+  await chmod(zeusDataRootIdentityPath(root), 0o600);
+  return { readableRootAccepted: true, repeatedPreparationAccepted: true, readOnlyVerificationUnchanged: true, privateChildrenPreserved: true, unsafeMarkerRejected: true };
+}
 
 function claimEmptyRoot(root: string, profile: ZeusDataRootProfile): { marker: ReturnType<typeof prepareZeusDataRootIdentity>; hostIdentity: ZeusDataRootHostIdentity; keychainService: string } {
   const keychainService = resolveDesktopKeychainService({ profile, dataRootPath: root });

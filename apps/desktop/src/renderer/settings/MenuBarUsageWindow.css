@@ -112,19 +112,12 @@ body:has(.menu-bar-usage-root),
   white-space: nowrap;
 }
 
+/* 复用启动页品牌资源，小尺寸保持完整轮廓，不再叠加字母底框。 */
 .menu-bar-usage-mark {
-  display: grid;
   inline-size: 24px;
   block-size: 24px;
   flex: 0 0 24px;
-  place-items: center;
-  border: 1px solid color-mix(in srgb, var(--usage-accent) 25%, transparent);
-  border-radius: var(--usage-radius-control, 8px);
-  background: var(--usage-accent-soft);
-  color: var(--zeus-brand-text);
-  font-size: 14px;
-  font-weight: 800;
-  font-style: italic;
+  background: url('../../../dist/branding/startup-mark.png') center / contain no-repeat;
 }
 
 /* 时间与刷新按钮作为一组，长文案省略但保留完整悬浮提示。 */
@@ -466,6 +459,13 @@ body:has(.menu-bar-usage-root),
   grid-template-columns: minmax(0, 1fr) 86px;
   align-items: start;
   gap: 14px;
+}
+
+/* 各额度独立排列，保留余额和重置时间；内容超高时复用浮窗滚动区域。 */
+.menu-bar-usage-account-quotas {
+  display: grid;
+  min-inline-size: 0;
+  gap: 10px;
 }
 
 .menu-bar-usage-account-quota,
@@ -884,14 +884,6 @@ body:has(.menu-bar-usage-root),
   color: var(--usage-muted);
 }
 
-/* 浮窗装饰沿用主题分隔线，不再叠加固定白色高光。 */
-.menu-bar-usage-mark {
-  border-color: var(--usage-accent-border);
-  background: var(--usage-accent-soft);
-  box-shadow: 0 8px 18px -15px color-mix(in srgb, var(--usage-accent) 70%, transparent);
-  color: var(--zeus-brand-text);
-}
-
 .menu-bar-usage-freshness[data-stale='true'] {
   color: var(--usage-warning);
 }
@@ -1139,12 +1131,12 @@ body:has(.menu-bar-usage-root),
   color: var(--usage-text);
 }
 
-/* 浮窗使用不透明主题表面，避免系统浅色模糊材质透入应用深色模式。 */
+/* 独立用量窗口共用面板底色，避免大面积灰底及系统模糊材质透入。 */
 .menu-bar-usage-root,
 .menu-bar-usage-root[data-appearance='dark'],
 .menu-bar-usage-root[data-appearance='system'] {
   background: var(--usage-bg);
-  --usage-bg: #f7f8fa;
+  --usage-bg: var(--usage-panel);
   --usage-panel: #fff;
   --usage-panel-strong: #fff;
   --usage-panel-inset: rgb(120 128 140 / 8%);
@@ -1152,7 +1144,6 @@ body:has(.menu-bar-usage-root),
   --usage-edge: var(--usage-line);
 }
 .menu-bar-usage-root[data-appearance='dark'] {
-  --usage-bg: #17191d;
   --usage-panel: #24272c;
   --usage-panel-strong: #24272c;
   --usage-panel-inset: rgb(0 0 0 / 10%);
@@ -1161,7 +1152,6 @@ body:has(.menu-bar-usage-root),
 }
 @media (prefers-color-scheme: dark) {
   .menu-bar-usage-root[data-appearance='system'] {
-    --usage-bg: #17191d;
     --usage-panel: #24272c;
     --usage-panel-strong: #24272c;
     --usage-panel-inset: rgb(0 0 0 / 10%);

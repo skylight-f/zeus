@@ -50,6 +50,9 @@ import {
   DigitalEmployeeProjectEventRepository,
   DigitalEmployeeRepository,
   DigitalEmployeeTemplateRepository,
+  DigitalTeamNodeAttemptRepository,
+  DigitalTeamWorkflowRunRepository,
+  DigitalTeamWorkflowTemplateRepository,
   ImRepository,
   ProjectionDatabaseRuntimeManager,
   ProjectRepository,
@@ -76,7 +79,7 @@ import { createTelegramBotMessageClient, getTelegramConfigurationState, type Tel
 import { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { type CodexRemoteControlSnapshot, registerCodexPublicCommandRoutes } from './codexPublicCommandRoutes.js';
 import { CodexSubagentQueryApplication } from './codexSubagentQueryApplication.js';
 import { registerCodexSubagentQueryRoutes } from './codexSubagentQueryRoutes.js';
@@ -88,6 +91,8 @@ import { createDigitalEmployeeOrchestrator, type DigitalEmployeeOrchestrator } f
 import { type AutomationScheduler, createAutomationScheduler } from './automationScheduler.js';
 import { registerAutomationRoutes } from './automationRoutes.js';
 import { registerDigitalEmployeeRoutes } from './digitalEmployeeRoutes.js';
+import { DigitalTeamWorkflowCoordinator } from './digitalTeamWorkflowCoordinator.js';
+import { registerDigitalTeamWorkflowRoutes } from './digitalTeamWorkflowRoutes.js';
 import { registerConversationCapabilityQueryRoutes } from './conversationCapabilityQueryRoutes.js';
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
 import { registerConversationChoiceQueryRoutes } from './conversationChoiceQueryRoutes.js';
@@ -463,6 +468,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   let closeLocalServerResources: () => Promise<void>;
   let digitalEmployeeOrchestrator: DigitalEmployeeOrchestrator | null = null;
   let taskWorkManagement: TaskWorkManagementController | null = null;
+  let digitalTeamWorkflowCoordinator: DigitalTeamWorkflowCoordinator | null = null;
   let automationScheduler: AutomationScheduler | null = null;
   server.get('/health', async () => {
     const storage = db.storageHealthSnapshot();
@@ -859,7 +865,12 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       if (!cwdSource) return { cwd: null, branch: null, isGitRepository: null };
       const cwd = resolve(cwdSource);
       const git = await getGitWorkingContext(cwd);
-      return { cwd, branch: git.branch, isGitRepository: git.isRepository };
+      /** 实际命令可以覆盖默认工作目录；仅采用 Provider 记录的绝对路径。 */
+      const recentCwd = conversationSnapshotV2.readRecentCommandCwd(conversationId);
+      if (!recentCwd || !isAbsolute(recentCwd)) return { cwd, branch: git.branch, isGitRepository: git.isRepository };
+      /** 分支始终从对应目录实时读取；同目录复用本次查询。 */
+      const recentGit = resolve(recentCwd) === cwd ? git : await getGitWorkingContext(recentCwd);
+      return { cwd, branch: git.branch, isGitRepository: git.isRepository, recentCommand: { cwd: recentCwd, branch: recentGit.branch, isGitRepository: recentGit.isRepository } };
     },
     readQueueState: (conversationId) => {
       const conversation = conversations.getRecordById(conversationId);
@@ -2975,6 +2986,33 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     readOnlyValidation: Boolean(readOnlyValidation),
   });
 
+  /** 数字团队复用现有任务、会话、证据与 Git 能力，只新增冻结图和节点尝试账本。 */
+  digitalTeamWorkflowCoordinator = new DigitalTeamWorkflowCoordinator({
+    templates: new DigitalTeamWorkflowTemplateRepository(db, () => now().toISOString()),
+    runs: new DigitalTeamWorkflowRunRepository(db, () => now().toISOString()),
+    attempts: new DigitalTeamNodeAttemptRepository(db, () => now().toISOString()),
+    projects,
+    tasks,
+    projectRepositories,
+    employees: digitalEmployees,
+    environments: taskEnvironments,
+    workspaces: taskWorkspaces,
+    submissions: conversationSubmissions,
+    conversations,
+    turns: conversationTurns,
+    providerItems: conversationProviderItems,
+    turnChanges: turnChangeSets,
+    artifacts: artifactStore,
+    taskWork: taskWorkManagement,
+    taskCreation: { create: (input, taskId, context) => workManagementCoreOperations.createUserTask(input, taskId, context) },
+    save: () => db.save(),
+    publish: publishRealtimeEvent,
+    now,
+    readOnlyValidation: Boolean(readOnlyValidation),
+  });
+  taskWorkManagement.bindDigitalTeamTools(digitalTeamWorkflowCoordinator.workTools);
+  registerDigitalTeamWorkflowRoutes({ server, application: workManagementCommands, coordinator: digitalTeamWorkflowCoordinator, save: () => db.save() });
+
   if (!readOnlyValidation) {
     automationScheduler = createAutomationScheduler({
       tasks: automationTasks,
@@ -3744,12 +3782,14 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     }
     automationScheduler = null;
     try {
+      await digitalTeamWorkflowCoordinator?.close();
       await digitalEmployeeOrchestrator?.close();
       await taskWorkManagement?.close();
     } catch (error) {
       cleanupErrors.push(error);
     }
     digitalEmployeeOrchestrator = null;
+    digitalTeamWorkflowCoordinator = null;
     taskWorkManagement = null;
     commandCenter.close();
     if (platformMutableState.usageRefreshTimer) {
@@ -3854,6 +3894,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       if (!readOnlyValidation) {
         workManagementTaskEffects.recover();
         repositoryDiscovery.recover();
+        digitalTeamWorkflowCoordinator?.kick();
       }
     },
     projectGitQueries,

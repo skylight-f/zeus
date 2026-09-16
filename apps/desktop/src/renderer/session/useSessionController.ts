@@ -20,6 +20,7 @@ import {
   type NativeConversationModelHistoryV2Item,
   type NativeConversationProcessV2Item,
   type NativeConversationReadableSnapshot,
+  type NativeConversationExecutionContext,
   type NativeConversationResourceV2Item,
   type NativeConversationSnapshot,
   type NativeConversationSnapshotV2Page,
@@ -180,6 +181,8 @@ export interface SessionControllerClient {
   /** 首次加载、重连和发送后核对共用同一份结构与消息读取结果。 */
   loadNativeConversationReadableSnapshot(projectId: string, conversationId: string): Promise<NativeConversationReadableSnapshot>;
   loadNativeConversationSessionMetrics?(projectId: string, conversationId: string): Promise<NativeSessionMetricsSnapshot>;
+  /** 有界读取环境事实，不影响正文和队列状态。 */
+  loadNativeConversationExecutionContext?(projectId: string, conversationId: string): Promise<NativeConversationExecutionContext>;
   loadNativeConversationChoice(projectId: string, conversationId: string): Promise<NativeConversationChoice>;
   loadNativeConversationQueueV2(projectId: string, conversationId: string): Promise<NativeQueueSnapshot>;
   loadNativeSubmissionReceipt?(projectId: string, conversationId: string, submissionId: string): Promise<NativeSubmissionReceipt>;
@@ -192,13 +195,13 @@ export interface SessionControllerClient {
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; limit?: number; byteLimit?: number },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number },
   ): Promise<NativeConversationSnapshotV2Page<NativeConversationModelHistoryV2Item>>;
   loadNativeConversationProcessV2?(
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
   ): Promise<NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>>;
   loadNativeConversationResourcesV2?(projectId: string, conversationId: string, options?: { cursor?: string; limit?: number; byteLimit?: number }): Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
   loadNativeConversationChangeSetV2?(projectId: string, conversationId: string, turnId: string): Promise<NativeConversationChangeSetV2Summary>;
@@ -538,6 +541,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let realtimeConnectionPromise: Promise<void> | null = null;
   let connectionToken = 0;
   let sessionMetricsHydrationToken = 0;
+  /** 同时只允许一个环境读取，连续命令合并为读取后的下一次刷新。 */
+  let executionContextHydrationPending = false;
+  /** 读取期间有更新时丢弃旧结果，继续取得最新执行目录。 */
+  let executionContextHydrationRequested = false;
   let identityEpoch = 0;
   let disposed = false;
   let startPromise: Promise<void> | null = null;
@@ -723,6 +730,32 @@ export function createSessionController(options: CreateSessionControllerOptions)
       dispatch({ type: 'session_metrics_hydrated', conversationId, sessionMetrics });
     } catch {
       // 聚合指标是渐进增强；失败不能遮住已经取得的会话正文，后续稳定事件仍会刷新指标。
+    }
+  }
+
+  /** 命令开始、结束及轮次结束时更新两处环境展示，查询失败保留已有事实。 */
+  async function hydrateExecutionContext(): Promise<void> {
+    /** 老客户端缺少此只读能力时沿用首屏环境。 */
+    const load = options.client.loadNativeConversationExecutionContext;
+    if (!load || disposed) return;
+    executionContextHydrationRequested = true;
+    if (executionContextHydrationPending) return;
+    executionContextHydrationPending = true;
+    try {
+      while (executionContextHydrationRequested && !disposed) {
+        executionContextHydrationRequested = false;
+        /** 重连前的读取不得覆盖新连接的执行现场。 */
+        const token = connectionToken;
+        try {
+          /** 路径由当前会话的只读接口提供，禁止从工具正文猜测。 */
+          const executionContext = await load(options.projectId, options.conversationId);
+          if (!disposed && token === connectionToken && !executionContextHydrationRequested) dispatch({ type: 'execution_context_hydrated', conversationId: options.conversationId, executionContext });
+        } catch {
+          // 环境读取失败不影响正在执行的命令；下次命令事件继续刷新。
+        }
+      }
+    } finally {
+      executionContextHydrationPending = false;
     }
   }
 
@@ -961,6 +994,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const eventQueue = event.type === 'conversation.queue.changed' ? nativeQueueSnapshotFrom(event.payload.queue) : null;
     const projectedEvent: NativeConversationEvent = event.type === 'conversation.queue.changed' && eventQueue ? { ...event, payload: { ...event.payload, queue: queueWithPendingSteering(eventQueue) } } : event;
     dispatch({ type: 'event_received', event: projectedEvent, ...(suppressRequestAuthority ? { suppressRequestAuthority: true } : {}) });
+    if (event.type === 'conversation.turn.completed' || ((event.type === 'conversation.item.started' || event.type === 'conversation.item.completed') && event.payload.itemType === 'commandExecution')) void hydrateExecutionContext();
     if (event.type === 'conversation.turn.change_set.changed') hydrateFullTerminalChangeSet(event);
     if (event.type === 'conversation.request.created' && !suppressRequestAuthority && requestId) {
       if (eventCarriesRequestDetails(event, requestId)) {
@@ -2235,6 +2269,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     }
   }
 
+  /** 同时补齐本轮正文和过程；新会话从最近页开始，已有缓存沿原游标继续。 */
   async function loadTurnProcessV2(turnIdentity: string): Promise<void> {
     const loadProcess = options.client.loadNativeConversationProcessV2;
     const loadHistory = options.client.loadNativeConversationTurnModelHistoryV2;
@@ -2248,6 +2283,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const pagingKey = turn?.providerTurnId ?? turnIdentity;
     const currentProcessPage = current.v2Paging.processByTurn[pagingKey];
     const currentHistoryPage = current.v2Paging.historyByTurn?.[pagingKey];
+    /** 新读取先呈现最近过程；已存在的游标继续原方向，保留缓存的连续范围。 */
+    const direction = currentProcessPage?.direction ?? currentHistoryPage?.direction ?? (currentProcessPage?.loaded || currentHistoryPage?.loaded ? 'forward' : 'tail');
     if (currentProcessPage?.loading || currentHistoryPage?.loading) return;
     const shouldLoadProcess = Boolean(loadProcess && !(currentProcessPage?.loaded && !currentProcessPage.hasMore));
     const shouldLoadHistory = Boolean(loadHistory && !(currentHistoryPage?.loaded && !currentHistoryPage.hasMore));
@@ -2259,6 +2296,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           ? {
               ...paging.historyByTurn,
               [pagingKey]: {
+                direction,
                 nextCursor: currentHistoryPage?.nextCursor ?? null,
                 hasMore: currentHistoryPage?.hasMore ?? true,
                 loading: true,
@@ -2272,6 +2310,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           ...(shouldLoadProcess
             ? {
                 [pagingKey]: {
+                  direction,
                   nextCursor: currentProcessPage?.nextCursor ?? null,
                   hasMore: currentProcessPage?.hasMore ?? true,
                   loading: true,
@@ -2286,10 +2325,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const processResult = shouldLoadProcess
       ? loadProcess!(options.projectId, options.conversationId, localTurnId, {
           ...(currentProcessPage?.nextCursor ? { cursor: currentProcessPage.nextCursor } : {}),
-          // 展开是明确读取意图。多数真实长轮在 128 条过程项以内，一次补齐可避免
-          // 完成态只显示运行过程的前一小段；超大轮次仍由后续哨兵继续分页。
-          limit: 128,
-          byteLimit: 256 * 1024,
+          // 首次读取与后续页使用同一小批量预算，避免长轮次一次挂载大量内容。
+          direction,
+          limit: 48,
+          byteLimit: 96 * 1024,
         }).then(
           (page) => ({ page, error: null as unknown }),
           (error: unknown) => ({ page: null, error }),
@@ -2298,8 +2337,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const historyResult = shouldLoadHistory
       ? loadHistory!(options.projectId, options.conversationId, localTurnId, {
           ...(currentHistoryPage?.nextCursor ? { cursor: currentHistoryPage.nextCursor } : {}),
-          limit: 128,
-          byteLimit: 256 * 1024,
+          direction,
+          limit: 48,
+          byteLimit: 96 * 1024,
         }).then(
           (page) => ({ page, error: null as unknown }),
           (error: unknown) => ({ page: null, error }),
@@ -2320,6 +2360,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           ? {
               ...paging.historyByTurn,
               [pagingKey]: {
+                direction,
                 nextCursor: currentHistoryPage?.nextCursor ?? null,
                 hasMore: currentHistoryPage?.hasMore ?? true,
                 loading: false,
@@ -2332,6 +2373,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           ? {
               ...paging.processByTurn,
               [pagingKey]: {
+                direction,
                 nextCursor: currentProcessPage?.nextCursor ?? null,
                 hasMore: currentProcessPage?.hasMore ?? true,
                 loading: false,

@@ -1,10 +1,10 @@
 @import './ui/brand.css';
 
 :root {
-  /* 设置尚未加载时随系统，避免启动阶段固定显示白底。 */
+  /* 设置尚未加载时使用系统对应的统一表面色，避免启动阶段出现另一层灰底。 */
   color-scheme: light dark;
   color: light-dark(#202124, #ebedf0);
-  background: light-dark(#f7f8fa, #17191d);
+  background: light-dark(#fff, #24272c);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -657,7 +657,7 @@ body {
   max-inline-size: 100vw;
   min-block-size: 100vh;
   min-inline-size: 0;
-  background: light-dark(#f7f8fa, #17191d);
+  background: light-dark(#fff, #24272c);
   overflow: hidden;
 }
 
@@ -9332,15 +9332,19 @@ html[data-zeus-theme='dark'] .startup-failure-shell {
   text-wrap: pretty;
 }
 
-/* 错误说明直接展开详情，不再另设重复入口。 */
+/* 简述与诊断分开，详情只通过明确入口展开。 */
 .startup-failure-content details {
+  margin-block-start: 8px;
   min-inline-size: 0;
   text-align: start;
 }
 
 .startup-failure-content summary {
   border-radius: 4px;
+  color: var(--zeus-brand-text);
   cursor: pointer;
+  font-size: 14px;
+  inline-size: fit-content;
   list-style: none;
 }
 
@@ -10325,6 +10329,13 @@ html[data-zeus-theme='dark'] .startup-failure-shell {
   margin-block: 0 6px;
   min-block-size: 22px;
   padding-inline: 0;
+}
+
+/* 底部入口独立锚定，空项目时无需用空列表撑开侧栏。 */
+.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-footer {
+  flex: 0 0 auto;
+  margin-block-start: auto;
+  min-inline-size: 0;
 }
 
 .macos-ai-app.zeus-shell .project-first-sidebar .project-global-settings {
@@ -15969,8 +15980,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   background: var(--zeus-interaction-hover);
 }
 
+/* 交互状态独立于页面底色，统一表面后仍能辨识当前位置。 */
 .macos-ai-app .task-git-review-file-tree li.is-active label {
-  background: var(--zeus-product-panel-muted);
+  background: var(--zeus-interaction-hover);
 }
 
 .macos-ai-app .task-git-review-file-tree button {
@@ -17332,7 +17344,8 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
 }
 
 .macos-ai-app .task-git-conflict-side-pane {
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  position: relative;
 }
 
 .macos-ai-app .task-git-conflict-pane-header {
@@ -17347,13 +17360,18 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
 }
 
 .macos-ai-app .task-git-conflict-pane-header > strong {
+  padding-inline-end: 64px;
   min-inline-size: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* 处理状态放在标题行，保持三栏编辑区从同一高度开始。 */
 .macos-ai-app .task-git-conflict-side-state {
+  position: absolute;
+  inset-block-start: 7px;
+  inset-inline-end: 0;
   min-block-size: 18px;
   padding: 0 10px 3px;
   color: var(--zeus-product-muted);
@@ -19667,8 +19685,9 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   justify-content: flex-start;
 }
 
+/* 交互状态独立于页面底色，统一表面后仍能辨识当前位置。 */
 .macos-ai-app .task-detail-more-popover > .zeus-button[data-zeus-primitive='button']:hover:not(:disabled) {
-  background: var(--zeus-product-panel-muted);
+  background: var(--zeus-interaction-hover);
 }
 
 .macos-ai-app .task-detail-more-popover > .zeus-button[data-zeus-primitive='button']:focus-visible {
@@ -22895,15 +22914,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   letter-spacing: -0.025em;
   text-wrap: balance;
 }
-.macos-ai-app .project-start-description {
-  max-inline-size: 44ch;
-  margin: 14px auto 24px;
-  font-size: 14px;
-  line-height: 1.75;
-  color: var(--zeus-product-muted);
-  text-wrap: pretty;
-}
 .macos-ai-app .project-start-action {
+  margin-block-start: 24px;
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
@@ -22926,13 +22938,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   display: flex;
   align-items: center;
   gap: 12px;
-}
-.macos-ai-app .project-start-note {
-  margin: 16px 0 0;
-  font-size: 12px;
-  line-height: 1.65;
-  color: var(--zeus-product-muted);
-  text-wrap: balance;
 }
 .macos-ai-app .task-flow-context {
   margin: 0;

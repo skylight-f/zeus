@@ -624,6 +624,8 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
                     onChooseAttachments: connectedActions.onChooseAttachments,
                     onAddAttachments: connectedActions.onAddAttachments,
                     onRemoveAttachment: connectedActions.onRemoveAttachment,
+                    // 历史会话继续输入时，浏览器批注与普通附件使用同一份草稿。
+                    onStageBrowserComments: connectedActions.onStageBrowserComments,
                     onRemoveBrowserSubmission: connectedActions.onRemoveBrowserSubmission,
                     onContextDraftChange: connectedActions.onContextDraftChange,
                     onNextTurnSettingsChange: connectedActions.onNextTurnSettingsChange,
@@ -1699,7 +1701,16 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   /** 环境卡在浏览器旁占用实际空间，避免遮盖原生网页。 */
   const [browserEnvironmentHost, setBrowserEnvironmentHost] = useState<HTMLDivElement | null>(null);
   const [contextFullWidth, setContextFullWidth] = useState(false);
-  const [browserPaneShare, setBrowserPaneShare] = useState(56);
+  /** 分栏比例属于本机阅读偏好，跨会话和重启恢复。 */
+  const [browserPaneShare, setBrowserPaneShare] = useState(() => {
+    try {
+      /** 非法或缺失的偏好回退到默认比例。 */
+      const saved = Number(browserConversationStorage()?.getItem('zeus.session-context.pane-share'));
+      return Number.isFinite(saved) && saved >= 38 && saved <= 72 ? saved : 56;
+    } catch {
+      return 56;
+    }
+  });
   const [browserResizing, setBrowserResizing] = useState(false);
   const [quickActionsPopoverOpen, setQuickActionsPopoverOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
@@ -2133,6 +2144,16 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     }
   }
 
+  useEffect(() => {
+    if (browserResizing) return;
+    try {
+      browserConversationStorage()?.setItem('zeus.session-context.pane-share', String(browserPaneShare));
+    } catch {
+      // 存储不可用时仍允许调整当前布局。
+    }
+  }, [browserPaneShare, browserResizing]);
+
+  /** 拖拽只更新显示比例，松手后统一保存。 */
   function updateBrowserPaneShare(clientX: number): void {
     const split = browserSplitRef.current;
     if (!split) return;
@@ -2886,7 +2907,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                           conversationId={props.state?.conversationId ?? props.conversation.id}
                           initialSnapshot={browserSnapshotRef.current}
                           language={props.language}
-                          disabled={interactionReadOnly || nonResumableNative || !actions.onStageBrowserComments}
+                          disabled={composerReadOnly || !actions.onStageBrowserComments}
                           expanded={contextFullWidth}
                           canSplit={browserLayoutWidth > 840}
                           onClose={closeContextWorkspace}
@@ -3788,7 +3809,8 @@ function SessionRuntimeDetails(props: { state: NativeSessionState; conversation:
     complete: usage?.apiEquivalentUsd !== null && usage?.priceCoverage === 1 && usage?.historyComplete === true,
   };
   const mcpStartup = props.state.mcpStartup?.value ?? null;
-  const executionContext = props.state.snapshot?.executionContext;
+  /** 环境展示优先采用最近命令事实，不改变会话默认目录和相对文件打开语义。 */
+  const executionContext = props.state.snapshot?.executionContext?.recentCommand ?? props.state.snapshot?.executionContext;
   const nativeSession = props.state.snapshot?.nativeSession ?? props.conversation?.nativeSession;
   const performance = metrics?.performance ?? null;
   const activity = metrics?.activity ?? null;

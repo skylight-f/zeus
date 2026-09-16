@@ -183,6 +183,8 @@ export { createMacOSKeychainStore, getSecretPresenceLabel, type SecretPresenceLa
 export { prepareUnifiedConversationStoreMigration, readUnifiedConversationStoreMigrationStatus, type ConversationStoreMigrationStatus } from './conversationStoreMigration.js';
 
 export type { BrowserAutomationContentItem, BrowserAutomationPort, BrowserAutomationToolCall, BrowserAutomationToolResult } from './browserAutomation.js';
+export { DigitalTeamWorkflowCoordinator, type DigitalTeamWorkflowCoordinatorOptions } from './digitalTeamWorkflowCoordinator.js';
+export { DigitalTeamWorkflowRouteError, registerDigitalTeamWorkflowRoutes, type DigitalTeamWorkflowRouteCoordinator } from './digitalTeamWorkflowRoutes.js';
 export {
   browserFrozenArgumentSchema,
   browserFrozenContractEntries,
@@ -3121,6 +3123,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const gitIntegrationOperations = createGitIntegrationOperations({
     settings,
     aiRuntimeManager,
+    stopPersistedOrphanRuntimeSession,
     appendAuditLog,
     codexNativeCoordinator,
     conversationSubmissions,

@@ -512,6 +512,8 @@ export interface NativeConversationExecutionContext {
   cwd: string | null;
   branch: string | null;
   isGitRepository: boolean | null;
+  /** 最近原生命令现场；缺失时继续展示会话默认目录。 */
+  recentCommand?: Pick<NativeConversationExecutionContext, 'cwd' | 'branch' | 'isGitRepository'>;
 }
 
 export type NativeConversationStage = 'created' | 'connecting' | 'queued' | 'running' | 'waiting_user' | 'waiting_approval' | 'completed' | 'failed' | 'paused' | 'ready' | 'archived';
@@ -851,8 +853,8 @@ export interface NativeConversationV2PagingState {
     oldestLoadedSequence: number | null;
   };
   /** 旧 Renderer 快照在升级后的首次导航中可能尚未携带该字段。 */
-  historyByTurn?: Record<string, { nextCursor: string | null; hasMore: boolean; loading: boolean; loaded: boolean; error: string | null }>;
-  processByTurn: Record<string, { nextCursor: string | null; hasMore: boolean; loading: boolean; loaded: boolean; error: string | null }>;
+  historyByTurn?: Record<string, { /** 倒序页在上方补齐更早过程，缺省为既有正序缓存。 */ direction?: 'forward' | 'tail'; nextCursor: string | null; hasMore: boolean; loading: boolean; loaded: boolean; error: string | null }>;
+  processByTurn: Record<string, { /** 倒序页在上方补齐更早过程，缺省为既有正序缓存。 */ direction?: 'forward' | 'tail'; nextCursor: string | null; hasMore: boolean; loading: boolean; loaded: boolean; error: string | null }>;
   resources: { nextCursor: string | null; hasMore: boolean; loading: boolean; loaded: boolean; error: string | null; items: NativeConversationResourceV2Item[] };
   changeSetsByTurn: Record<
     string,

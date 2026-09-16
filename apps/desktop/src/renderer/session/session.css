@@ -112,10 +112,10 @@
   inline-size: 20px;
 }
 
-/* 环境信息与来源通过内容底色和圆角分组，常驻和弹出状态均不叠加描边阴影。 */
+/* 环境信息常驻卡片与弹层仅用细边框区分同色背景，保持无阴影的扁平外观。 */
 .session-codex-parity-v1 .session-quick-actions-card {
-  background: var(--session-canvas);
-  border: 0;
+  background: var(--zeus-card-background, var(--session-canvas));
+  border: 1px solid var(--zeus-card-border, var(--session-line));
   border-radius: 18px;
   box-sizing: border-box;
   box-shadow: none;
@@ -639,7 +639,8 @@
   overflow-y: auto;
   outline: none;
   overscroll-behavior: contain;
-  padding: 28px var(--session-gutter) 24px;
+  /* 右侧留白由共用列宽预留，原生滚动条占用其中一部分，避免额外撑宽滚动区。 */
+  padding: 28px 0 24px var(--session-gutter);
   position: relative;
   scroll-behavior: smooth;
 }
@@ -657,12 +658,13 @@
     .session-turn-process,
     .session-turn-process-control,
     .session-transcript-empty,
+    .session-transcript-thinking,
     .session-queued-messages,
     .session-latest-turn-spacer
   ) {
   flex: 0 0 auto;
-  inline-size: min(var(--session-thread-max), 100%);
-  margin-inline: auto;
+  inline-size: min(var(--session-thread-max), calc(100cqw - 2 * var(--session-gutter)));
+  margin-inline: max(0px, calc((100cqw - 2 * var(--session-gutter) - var(--session-thread-max)) / 2)) 0;
 }
 
 .session-codex-parity-v1 .session-thread-item-notice {
@@ -812,7 +814,7 @@
 }
 
 .session-codex-parity-v1 .session-queued-message[data-queue-status='steering'] {
-  background: var(--session-working-soft, var(--session-selected));
+  background: var(--session-working-soft, var(--session-canvas));
 }
 
 .session-codex-parity-v1 .session-queued-message-content {
@@ -1267,7 +1269,7 @@
 }
 
 .session-codex-parity-v1 :is(.session-async-question, .session-async-question-reminder) .session-message-delivery-actions button {
-  background: var(--session-selected);
+  background: var(--session-canvas);
   border-color: transparent;
   border-radius: 8px;
   color: var(--session-text);
@@ -1691,17 +1693,20 @@
   background: var(--session-control-hover, rgb(0 0 0 / 6%));
 }
 
+/* 与浏览器批注一致：蓝底白边编号、白色胶囊和黑色确认按钮。 */
 .macos-ai-app .session-response-annotation-marker {
   align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  box-shadow: none;
-  color: var(--zeus-brand-text);
+  background: #1689e8;
+  border: 2px solid white;
+  border-radius: 999px;
+  box-shadow: 0 3px 12px rgb(15 23 42 / 24%);
+  color: white;
   cursor: pointer;
   display: flex;
   font:
-    700 10px/1 system-ui,
+    650 11px/1 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
     sans-serif;
   block-size: 24px;
   inline-size: 24px;
@@ -1711,27 +1716,19 @@
   justify-content: center;
   position: absolute;
   transform: translate(5px, -5px);
-  transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    box-shadow 120ms ease,
-    color 120ms ease;
+  transition: box-shadow 120ms ease;
   z-index: 998;
 }
 
-.macos-ai-app .session-response-annotation-marker:hover:not(:disabled):not([aria-disabled='true']),
+.macos-ai-app .session-response-annotation-marker:hover:not(:disabled),
 .macos-ai-app .session-response-annotation-marker[aria-expanded='true'] {
-  background: var(--session-control-hover, rgb(0 0 0 / 6%));
+  background: #1689e8;
+  box-shadow: 0 4px 16px rgb(22 137 232 / 38%);
 }
 
-/* 气泡直接表达评论语义，保留完整点击范围。 */
-.session-response-annotation-marker > svg {
-  inline-size: 22px;
-  block-size: 22px;
-}
-
-.session-response-annotation-marker:focus-visible {
-  outline: 2px solid var(--session-focus-outline, var(--session-accent, var(--zeus-brand-primary)));
+.session-response-annotation-marker:focus-visible,
+.session-response-annotation-editor button:focus-visible {
+  outline: 2px solid #0b82f6;
   outline-offset: 2px;
 }
 
@@ -1739,133 +1736,121 @@
   box-sizing: border-box;
   inset: auto;
   margin: 0;
-  background: var(--session-canvas, #fff);
-  border: 1px solid var(--session-line-soft, var(--session-line, rgb(0 0 0 / 10%)));
-  border-radius: 10px;
-  box-shadow:
-    0 12px 30px var(--session-shadow, rgb(0 0 0 / 12%)),
-    0 2px 6px var(--session-shadow-soft, rgb(0 0 0 / 8%));
-  color: var(--session-text, #171717);
-  display: grid;
-  gap: 0;
-  inline-size: min(300px, calc(100vw - 24px));
+  background: rgb(255 255 255 / 98%);
+  border: 1px solid rgb(23 23 23 / 10%);
+  border-radius: 999px;
+  box-shadow: 0 8px 28px rgb(15 23 42 / 18%);
+  backdrop-filter: blur(20px);
+  color: #202124;
+  color-scheme: light;
+  font:
+    14px/1.4 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  inline-size: min(296px, calc(100vw - 24px));
   overflow: auto;
-  padding: 0;
+  padding: 4px 5px;
   position: fixed;
   z-index: 1001;
+}
+
+.session-response-annotation-editor[data-expanded='true'] {
+  border-radius: 20px;
 }
 
 .session-response-annotation-editor[data-placement='above'] {
   transform: translateY(-100%);
 }
 
-.session-response-annotation-editor header,
-.session-response-annotation-editor footer {
+.session-response-annotation-row {
   align-items: center;
   display: flex;
-  justify-content: space-between;
+  gap: 3px;
+  min-block-size: 36px;
 }
 
-.session-response-annotation-editor header {
-  padding: 7px 7px 7px 10px;
-}
-
-.session-response-annotation-editor header strong {
-  font-size: 12px;
-  font-weight: 650;
-  line-height: 17px;
-}
-
-/* 批注输入区自行管理边框与留白，避免通用表单圆角、投影覆盖后贴住弹层边缘。 */
-.macos-ai-app.zeus-shell .session-response-annotation-editor > textarea {
+/* 显式覆盖通用输入样式，保持浏览器同款无边框文本区。 */
+.macos-ai-app.zeus-shell .session-response-annotation-row > textarea {
   background: transparent;
-  border: 1px solid var(--session-line-soft, var(--session-line, rgb(0 0 0 / 10%)));
-  border-radius: 6px;
+  border: 0;
+  border-radius: 0;
   box-shadow: none;
   box-sizing: border-box;
-  color: inherit;
+  color: #202124;
+  flex: 1 1 auto;
   font: inherit;
-  font-size: 13px;
-  inline-size: auto;
-  line-height: 18px;
-  margin: 8px 10px 0;
-  max-block-size: 120px;
-  min-block-size: 62px;
+  inline-size: 100%;
+  margin: 0;
+  max-block-size: 112px;
+  min-block-size: 28px;
   min-inline-size: 0;
   outline: 0;
-  padding: 8px 9px;
-  resize: vertical;
+  overflow-y: auto;
+  padding: 4px 5px;
+  resize: none;
 }
 
-/* 聚焦沿用主题焦点色，只加深单层边线，不绘制外扩光圈。 */
-.macos-ai-app.zeus-shell .session-response-annotation-editor > textarea:focus-visible {
-  border-color: var(--session-focus-outline, var(--session-text-muted, #60656f));
-  box-shadow: none;
-  outline: 0;
-}
-
-/* 系统强制配色时用内收轮廓保留焦点辨识，不越出输入区。 */
-@media (forced-colors: active) {
-  .macos-ai-app.zeus-shell .session-response-annotation-editor > textarea:focus-visible {
-    outline: 1px solid Highlight;
-    outline-offset: -2px;
-  }
+.session-response-annotation-row > textarea::placeholder {
+  color: #8b8b8b;
 }
 
 .session-response-annotation-editor button {
   appearance: none;
+  align-items: center;
   background: transparent;
   border: 0;
-  border-radius: 6px;
-  color: inherit;
+  border-radius: 999px;
+  color: #737373;
   cursor: pointer;
-  font-size: 11px;
-  min-block-size: 26px;
-  padding-inline: 7px;
-}
-
-.session-response-annotation-editor footer {
-  gap: 4px;
-  justify-content: flex-end;
-  padding: 7px 8px;
-}
-
-.session-response-annotation-editor footer > button:first-child {
-  color: var(--session-text-muted, #60656f);
-  margin-inline-end: auto;
-}
-
-.session-response-annotation-editor footer > button:last-child {
-  background: var(--zeus-product-accent);
-  color: white;
-  font-weight: 650;
-  padding-inline: 10px;
-}
-
-.session-response-annotation-editor button:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--session-control-hover, rgb(0 0 0 / 6%));
-}
-
-.session-response-annotation-editor footer > button:first-child:hover:not(:disabled):not([aria-disabled='true']) {
-  background: color-mix(in srgb, var(--session-danger, #c43d3d) 9%, transparent);
-  color: var(--session-danger, #c43d3d);
-}
-
-.session-response-annotation-editor footer > button:last-child:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-interaction-primary-hover);
-  color: white;
-}
-
-.session-response-annotation-editor button:focus-visible {
-  outline: 2px solid var(--session-focus-outline, var(--session-accent, var(--zeus-brand-primary)));
-  outline-offset: 1px;
-}
-
-.session-response-annotation-editor header > button {
-  color: var(--session-text-muted, #60656f);
-  font-size: 17px;
-  inline-size: 26px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  block-size: 30px;
+  inline-size: 30px;
+  min-block-size: 30px;
+  justify-content: center;
   padding: 0;
+}
+
+.session-response-annotation-editor button > svg {
+  block-size: 18px;
+  inline-size: 18px;
+}
+
+.session-response-annotation-editor button:hover:not(:disabled) {
+  background: rgb(0 0 0 / 6%);
+  color: #202124;
+}
+
+.session-response-annotation-editor .session-response-annotation-save {
+  background: #181818;
+  color: white;
+}
+
+.session-response-annotation-editor .session-response-annotation-save:hover:not(:disabled) {
+  background: #000;
+  color: white;
+}
+
+/* 次要操作按需展开，保留原有删除和取消能力。 */
+.session-response-annotation-options {
+  border-top: 1px solid rgb(32 33 36 / 10%);
+  display: flex;
+  justify-content: space-between;
+  margin: 2px 5px 5px;
+  padding-top: 6px;
+}
+
+.session-response-annotation-options > button {
+  inline-size: auto;
+  padding-inline: 8px;
+}
+
+@media (forced-colors: active) {
+  .macos-ai-app.zeus-shell .session-response-annotation-row > textarea:focus-visible {
+    outline: 1px solid Highlight;
+    outline-offset: -2px;
+  }
 }
 
 /* 评论和回答注释共享一个输入框上下文胶囊，发送后仍可在用户消息中辨认。 */
@@ -2188,7 +2173,8 @@
   opacity: 0.48;
 }
 
-.session-codex-parity-v1 .session-terminal-panel button:focus-visible,
+.session-codex-parity-v1 .session-terminal-error > button:focus-visible,
+.session-codex-parity-v1 .session-terminal-empty-state > button:focus-visible,
 .session-codex-parity-v1 .session-terminal-resizer:focus-visible {
   box-shadow: 0 0 0 3px var(--session-focus);
   outline: 1px solid var(--session-focus-outline);
@@ -2224,90 +2210,7 @@
   user-select: none;
 }
 
-.session-codex-parity-v1 .session-terminal-header {
-  align-items: stretch;
-  background: var(--session-control);
-  border-block-end: 1px solid var(--session-line-soft);
-  display: flex;
-  flex: 0 0 38px;
-  justify-content: space-between;
-  min-inline-size: 0;
-  padding-inline-end: 5px;
-}
-
-.session-codex-parity-v1 .session-terminal-tabs {
-  align-items: stretch;
-  display: flex;
-  flex: 1 1 auto;
-  min-inline-size: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.session-codex-parity-v1 .session-terminal-tabs::-webkit-scrollbar {
-  display: none;
-}
-
-.session-codex-parity-v1 .session-terminal-tab-shell {
-  align-items: center;
-  border-inline-end: 1px solid var(--session-line-soft);
-  display: flex;
-  flex: 0 1 184px;
-  min-inline-size: 104px;
-  position: relative;
-}
-
-.session-codex-parity-v1 .session-terminal-tab-shell[data-active='true'] {
-  background: var(--session-canvas);
-  box-shadow: inset 0 2px 0 var(--session-focus-outline);
-}
-
-.session-codex-parity-v1 .session-terminal-tab {
-  align-items: center;
-  background: transparent;
-  border: 0;
-  display: grid;
-  flex: 1 1 auto;
-  gap: 7px;
-  grid-template-columns: 15px minmax(0, 1fr) 7px;
-  min-block-size: 37px;
-  min-inline-size: 0;
-  padding: 0 5px 0 10px;
-  text-align: start;
-}
-
-.session-codex-parity-v1 .session-terminal-tab > svg {
-  block-size: 15px;
-  color: var(--session-text-muted);
-  inline-size: 15px;
-}
-
-.session-codex-parity-v1 .session-terminal-tab > span {
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.session-codex-parity-v1 .session-terminal-tab > i {
-  background: var(--session-text-muted);
-  block-size: 6px;
-  border-radius: 999px;
-  inline-size: 6px;
-}
-
-.session-codex-parity-v1 .session-terminal-tab > i[data-status='running'] {
-  background: var(--session-success);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--session-success) 13%, transparent);
-}
-
-.session-codex-parity-v1 .session-terminal-tab > i:is([data-status='failed'], [data-status='lost']) {
-  background: var(--session-danger);
-}
-
-.session-codex-parity-v1 .session-terminal-tab-close,
-.session-codex-parity-v1 .session-terminal-new,
-.session-codex-parity-v1 .session-terminal-panel-close,
+/* 错误提示保留独立关闭控件；终端标签与工具栏使用共享样式。 */
 .session-codex-parity-v1 .session-terminal-error > button {
   align-items: center;
   background: transparent;
@@ -2318,36 +2221,8 @@
   padding: 0;
 }
 
-.session-codex-parity-v1 .session-terminal-tab-close {
-  block-size: 24px;
-  flex: 0 0 24px;
-  inline-size: 24px;
-  margin-inline-end: 4px;
-  opacity: 0;
-}
-
-.session-codex-parity-v1 .session-terminal-tab-shell:hover .session-terminal-tab-close,
-.session-codex-parity-v1 .session-terminal-tab-shell[data-active='true'] .session-terminal-tab-close,
-.session-codex-parity-v1 .session-terminal-tab-close:focus-visible {
-  opacity: 1;
-}
-
-.session-codex-parity-v1 .session-terminal-new,
-.session-codex-parity-v1 .session-terminal-panel-close {
-  align-self: center;
-  block-size: 28px;
-  flex: 0 0 28px;
-  inline-size: 28px;
-  margin: 0 3px;
-}
-
-.session-codex-parity-v1 :is(.session-terminal-tab-close, .session-terminal-new, .session-terminal-panel-close, .session-terminal-error > button):hover:not(:disabled) {
+.session-codex-parity-v1 .session-terminal-error > button:hover:not(:disabled) {
   background: var(--session-control-hover);
-}
-
-.session-codex-parity-v1 :is(.session-terminal-tab-close, .session-terminal-new, .session-terminal-panel-close) svg {
-  block-size: 15px;
-  inline-size: 15px;
 }
 
 .session-codex-parity-v1 .session-terminal-error {
@@ -2412,24 +2287,6 @@
   overflow: hidden;
 }
 
-.session-codex-parity-v1 .session-terminal-viewport {
-  block-size: 100%;
-  box-sizing: border-box;
-  inline-size: 100%;
-  min-block-size: 0;
-  min-inline-size: 0;
-  overflow: hidden;
-  padding: 8px 10px 6px;
-}
-
-.session-codex-parity-v1 .session-terminal-viewport > .xterm {
-  block-size: 100%;
-}
-
-.session-codex-parity-v1 .session-terminal-viewport .xterm-viewport {
-  background-color: transparent !important;
-}
-
 .session-codex-parity-v1 .session-terminal-empty-state {
   align-content: center;
   justify-items: center;
@@ -2467,23 +2324,6 @@
 @keyframes session-terminal-spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@media (max-width: 560px) {
-  .session-codex-parity-v1 .session-terminal-tab-shell {
-    flex-basis: 144px;
-  }
-}
-
-@media (forced-colors: active) {
-  .session-codex-parity-v1 .session-terminal-tab-shell[data-active='true'] {
-    outline: 2px solid Highlight;
-    outline-offset: -2px;
-  }
-
-  .session-codex-parity-v1 .session-terminal-tab > i {
-    forced-color-adjust: none;
   }
 }
 
@@ -2766,7 +2606,9 @@
   flex: 0 0 auto;
   flex-direction: column;
   gap: 14px;
-  inline-size: 100%;
+  /* 容器宽度包含原生滚动条，正文列与输入框保持同一个水平基准。 */
+  inline-size: min(var(--session-thread-max), calc(100cqw - 2 * var(--session-gutter)));
+  margin-inline: max(0px, calc((100cqw - 2 * var(--session-gutter) - var(--session-thread-max)) / 2)) 0;
   min-block-size: 0;
   min-inline-size: 0;
 }
@@ -3117,8 +2959,8 @@
 
 .session-transcript > .session-answered-request {
   flex: 0 0 auto;
-  inline-size: min(var(--session-thread-max), 100%);
-  margin-inline: auto;
+  inline-size: min(var(--session-thread-max), calc(100cqw - 2 * var(--session-gutter)));
+  margin-inline: max(0px, calc((100cqw - 2 * var(--session-gutter) - var(--session-thread-max)) / 2)) 0;
 }
 
 .session-answered-request-heading {
@@ -3258,20 +3100,14 @@
   font-weight: 590;
 }
 
-.session-answered-request-options > li.is-custom-answer {
-  align-items: stretch;
-  gap: 7px;
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.session-answered-request-custom-status {
-  align-items: center;
+.session-answered-request-custom-content {
+  /* 中间列容纳标题、附件和正文，两侧沿用选项行的整体居中规则。 */
   display: grid;
-  gap: 8px;
-  grid-template-columns: 17px minmax(0, 1fr) auto;
+  gap: 7px;
+  min-inline-size: 0;
 }
 
-.session-answered-request-custom-status > small {
+.session-answered-request-custom-content > small {
   font-size: 12px;
   font-weight: 500;
 }
@@ -3388,7 +3224,7 @@
 }
 
 @media (max-width: 760px) {
-  .session-answered-request-options > li {
+  .session-answered-request-options > li:not(.is-custom-answer) {
     grid-template-columns: 17px minmax(0, 1fr);
   }
 
@@ -3396,23 +3232,19 @@
     grid-row: 1 / span 2;
   }
 
-  .session-answered-request-options em {
+  .session-answered-request-options > li:not(.is-custom-answer) > em {
     grid-column: 2;
-  }
-
-  .session-answered-request-custom-status > em {
-    grid-column: 3;
   }
 }
 .session-codex-parity-v1 {
-  --session-canvas: rgb(255 255 255);
+  /* 所有常驻表面跟随侧栏主题，不再维护控件、代码与标题各自的灰阶。 */
+  --session-canvas: var(--zeus-card-background, #fff);
   --session-sidebar: var(--session-canvas);
   --session-text: rgb(34 37 41);
   --session-text-muted: rgb(104 108 115);
-  --session-selected: rgb(241 242 242);
   --session-line: rgb(227 228 229);
   --session-line-soft: rgb(238 239 240);
-  --session-control: rgb(250 250 250);
+  --session-control: var(--session-canvas);
   --session-control-hover: var(--zeus-interaction-hover);
   --session-focus: color-mix(in srgb, var(--zeus-brand-primary) 16%, transparent);
   --session-focus-outline: var(--zeus-brand-text);
@@ -3424,8 +3256,8 @@
   --session-warning: rgb(126 85 30);
   /* 完成和已回答状态直接跟随当前主题的品牌文字色。 */
   --session-success: var(--zeus-brand-text);
-  --session-header: rgb(255 255 255 / 0.94);
-  --session-code: rgb(247 248 248);
+  --session-header: var(--session-canvas);
+  --session-code: var(--session-canvas);
   --session-shimmer: rgb(255 255 255 / 0.72);
   --session-shadow: rgb(34 37 41 / 0.09);
   --session-shadow-soft: rgb(34 37 41 / 0.05);
@@ -3445,11 +3277,11 @@
   --zeus-product-muted: var(--session-text-muted);
   --zeus-product-subtle: var(--session-text-muted);
   --zeus-product-text-subtle: var(--session-text-muted);
-  --zeus-product-selected: var(--session-selected);
+  --zeus-product-selected: var(--agentdesk-selection, var(--zeus-interaction-hover));
   --zeus-source-sidebar: var(--session-sidebar);
-  --zeus-source-list-selected: var(--session-selected);
+  --zeus-source-list-selected: var(--agentdesk-selection, var(--zeus-interaction-hover));
   --zeus-native-row-hover: var(--zeus-interaction-hover);
-  --zeus-project-menu-selected-bg: var(--session-selected);
+  --zeus-project-menu-selected-bg: var(--agentdesk-selection, var(--zeus-interaction-hover));
   --zeus-project-menu-line: var(--session-line);
 }
 
@@ -3459,9 +3291,9 @@
   font-size: 14px;
 }
 
-/* 页面底色衬托白色内容卡片，避免同色背景吞掉圆角轮廓。 */
+/* 会话正文、标题和浏览器外壳与导航侧栏共用主题底色。 */
 .session-codex-parity-v1 .session-workspace-root {
-  background: var(--zeus-page-background, var(--session-canvas));
+  background: var(--zeus-card-background, var(--session-canvas));
   color: var(--session-text);
   display: flex;
   flex: 1 1 auto;
@@ -3476,14 +3308,12 @@
 .theme-dark.session-codex-parity-v1,
 .theme-dark .session-codex-parity-v1,
 html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
-  --session-canvas: rgb(24 26 29);
+  --session-canvas: var(--zeus-card-background, #24272c);
   --session-sidebar: var(--session-canvas);
   --session-text: rgb(235 237 240);
   --session-text-muted: rgb(167 172 180);
-  --session-selected: rgb(47 50 55);
   --session-line: rgb(72 76 83);
   --session-line-soft: rgb(57 61 67);
-  --session-control: rgb(39 42 47);
   --session-control-hover: var(--zeus-interaction-hover);
   --session-focus: color-mix(in srgb, var(--zeus-brand-primary) 16%, transparent);
   --session-focus-outline: var(--zeus-brand-text);
@@ -3493,8 +3323,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   --session-message-action: rgb(157 162 170);
   --session-danger: rgb(246 157 157);
   --session-warning: rgb(234 190 119);
-  --session-header: rgb(24 26 29 / 0.94);
-  --session-code: rgb(36 39 43);
+
   --session-shimmer: rgb(235 237 240 / 0.2);
   --session-shadow: rgb(0 0 0 / 0.32);
   --session-shadow-soft: rgb(0 0 0 / 0.2);
@@ -3522,14 +3351,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   .theme-system.session-codex-parity-v1,
   .theme-system .session-codex-parity-v1,
   html[data-zeus-theme='system'] body > .macos-ai-app .session-codex-parity-v1 {
-    --session-canvas: rgb(24 26 29);
+    --session-canvas: var(--zeus-card-background, #24272c);
     --session-sidebar: var(--session-canvas);
     --session-text: rgb(235 237 240);
     --session-text-muted: rgb(167 172 180);
-    --session-selected: rgb(47 50 55);
     --session-line: rgb(72 76 83);
     --session-line-soft: rgb(57 61 67);
-    --session-control: rgb(39 42 47);
     --session-control-hover: var(--zeus-interaction-hover);
     --session-focus: color-mix(in srgb, var(--zeus-brand-primary) 16%, transparent);
     --session-focus-outline: var(--zeus-brand-text);
@@ -3539,8 +3366,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
     --session-message-action: rgb(157 162 170);
     --session-danger: rgb(246 157 157);
     --session-warning: rgb(234 190 119);
-    --session-header: rgb(24 26 29 / 0.94);
-    --session-code: rgb(36 39 43);
+
     --session-shimmer: rgb(235 237 240 / 0.2);
     --session-shadow: rgb(0 0 0 / 0.32);
     --session-shadow-soft: rgb(0 0 0 / 0.2);
@@ -3622,7 +3448,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 /* 标题工具共用顶栏，以留白衔接正文，不绘制横向装饰分隔线。 */
 .session-codex-parity-v1 .session-thread-header {
   align-items: center;
-  background: var(--zeus-page-background, var(--session-header));
+  background: var(--zeus-card-background, var(--session-header));
   border-block-end: 0;
   display: grid;
   flex: 0 0 auto;
@@ -3861,6 +3687,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-transcript-shell {
+  /* 列宽参照滚动区外壳，避免滚动条出现时正文整体向左偏移。 */
+  container-type: inline-size;
   display: flex;
   flex: 1 1 auto;
   min-block-size: 0;
@@ -3884,7 +3712,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-loading-line {
   animation: session-loading-pulse 650ms ease-in-out infinite alternate;
-  background: var(--session-selected);
+  background: var(--session-line);
   border-radius: 5px;
   block-size: 12px;
   inline-size: min(32rem, 74%);
@@ -4169,7 +3997,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-runtime-detail-body {
   display: grid;
   gap: 12px 20px;
-  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+  /* 保留空列，让模型设置与用量字段使用相同的列起点。 */
+  grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
   margin: 0;
   min-inline-size: 0;
 }
@@ -4201,7 +4030,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   min-inline-size: 0;
 }
 
-/* 路径独占通栏并换行，复制按钮独立占位，避免隐藏路径尾部或挤出横向滚动条。 */
+/* 环境按目录、分支、线程、日志顺序排成两行两列，窄容器再收为单列。 */
 .session-codex-parity-v1 .session-runtime-detail-group[data-group='environment'] .session-runtime-detail-body {
   gap: 8px 20px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4213,16 +4042,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   grid-template-columns: 100px minmax(0, 1fr);
 }
 
-.session-codex-parity-v1 .session-runtime-detail-body > [data-wide='true'] {
-  grid-column: 1 / -1;
-}
-
 .session-codex-parity-v1 .session-runtime-detail-group[data-group='environment'] dd {
   font-size: 11px;
 }
 
 .session-codex-parity-v1 .session-runtime-code-value {
-  /* 单行或换行路径均与复制按钮按整行高度居中。 */
+  /* 复制按钮独立占位，不随长值收缩。 */
   align-items: center;
   display: flex;
   gap: 6px;
@@ -4232,12 +4057,31 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-runtime-code-value > code {
   background: transparent;
   color: inherit;
+  display: inline-flex;
   font-family: var(--zeus-mono-font, 'SFMono-Regular', 'SF Mono', Consolas, monospace);
   font-size: inherit;
   min-inline-size: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
   padding: 0;
-  white-space: normal;
+  white-space: nowrap;
+}
+
+/* 首段尾部显示省略号，末段从左侧裁切，始终保留真实路径或标识的结尾。 */
+.session-codex-parity-v1 .session-runtime-code-start {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-codex-parity-v1 .session-runtime-code-end {
+  display: flex;
+  justify-content: flex-end;
+  min-inline-size: 0;
+  overflow: hidden;
+}
+
+.session-codex-parity-v1 .session-runtime-code-end > span {
+  flex: 0 0 auto;
 }
 
 .session-codex-parity-v1 .session-runtime-copy-button {
@@ -4307,20 +4151,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   padding-inline: 12px;
 }
 
-.session-codex-parity-v1 .session-transcript {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-  gap: 14px;
-  min-block-size: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: 28px var(--session-gutter) 24px;
-  position: relative;
-  scroll-behavior: smooth;
-}
-
 .session-codex-parity-v1
   .session-transcript
   > :where(
@@ -4335,11 +4165,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
     .session-turn-process,
     .session-turn-process-control,
     .session-transcript-empty,
+    .session-transcript-thinking,
     .session-latest-turn-spacer
   ) {
   flex: 0 0 auto;
-  inline-size: min(var(--session-thread-max), 100%);
-  margin-inline: auto;
+  inline-size: min(var(--session-thread-max), calc(100cqw - 2 * var(--session-gutter)));
+  margin-inline: max(0px, calc((100cqw - 2 * var(--session-gutter) - var(--session-thread-max)) / 2)) 0;
 }
 
 .session-codex-parity-v1 .session-transcript-empty {
@@ -4369,12 +4200,25 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 /* 结构化回答沿用正文列宽和询问卡片；普通消息继续使用右侧气泡。 */
 .session-codex-parity-v1 .session-thread-item-user:not([data-question-answer]) {
   align-self: flex-end;
-  background: var(--session-selected);
+  background: var(--session-canvas);
   border-radius: 14px;
   inline-size: fit-content !important;
-  margin-inline-end: max(var(--session-gutter), calc((100% - var(--session-thread-max)) / 2)) !important;
+  justify-self: end;
+  margin-inline: auto 0 !important;
   max-inline-size: min(77%, var(--session-markdown-max));
   padding: 10px 13px;
+}
+
+/* 编辑态只有一层输入表面；焦点落在外框，避免灰气泡内再套一圈输入框。 */
+.session-codex-parity-v1 .session-thread-item-user.is-editing {
+  background: var(--zeus-card-background, var(--session-canvas));
+  border: 1px solid var(--zeus-card-border, var(--session-line));
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.session-codex-parity-v1 .session-thread-item-user.is-editing:focus-within {
+  border-color: var(--zeus-control-accent);
 }
 
 /* 排队消息由正文气泡和正常占位的底栏组成，短消息也为常显操作留出宽度。 */
@@ -4386,7 +4230,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-thread-item-user:not([data-question-answer]) > .session-queued-message-bubble {
-  background: var(--session-selected);
+  background: var(--session-canvas);
   border-radius: 14px;
   padding: 10px 13px;
 }
@@ -4425,7 +4269,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   font-size: 12px;
 }
 
-/* 消息、摘要与状态入口共用内缩；宽度包含内边距，避免居中时起点偏移或窄分栏溢出。 */
+/* 消息、摘要与状态入口贴齐共用列左缘，卡片内部留白由各自内容负责。 */
 .session-codex-parity-v1 .session-reasoning-summary,
 .session-codex-parity-v1 .session-transcript-thinking,
 .session-codex-parity-v1 .session-turn-process-control,
@@ -4437,7 +4281,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-thread-item-error,
 .session-codex-parity-v1 .session-thread-item-unknown {
   box-sizing: border-box;
-  padding-inline: 2px;
+  padding-inline: 0;
 }
 
 .session-codex-parity-v1 .session-thread-item-commentary,
@@ -4491,17 +4335,26 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   max-inline-size: 100%;
 }
 
-.session-codex-parity-v1 .session-user-message-editor > textarea {
+.session-codex-parity-v1 .session-thread-item-user .session-user-message-editor > textarea {
+  appearance: none;
   background: transparent;
   border: 0;
-  border-radius: 8px;
+  border-radius: 0;
+  color: var(--session-text);
+  font: inherit;
   box-shadow: none;
   inline-size: 100%;
   line-height: 1.58;
   max-block-size: 48vh;
   min-block-size: 72px;
-  padding: 4px 5px;
+  padding: 0;
   resize: none;
+}
+
+/* 键盘焦点由编辑面外框呈现，文本区不再叠加内描边或浏览器默认轮廓。 */
+.session-codex-parity-v1 .session-thread-item-user .session-user-message-editor > textarea:focus-visible {
+  box-shadow: none;
+  outline: 0;
 }
 
 .session-codex-parity-v1 .session-user-message-editor > footer {
@@ -4519,9 +4372,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-user-message-editor > footer button {
   background: transparent;
   border: 0;
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--session-text-muted);
-  padding-inline: 10px;
+  block-size: 28px;
+  min-block-size: 28px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 20px;
+  padding: 4px 10px;
 }
 
 .session-codex-parity-v1 .session-user-message-editor > footer button:hover:not(:disabled):not([aria-disabled='true']) {
@@ -4530,13 +4388,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-user-message-editor > footer .session-user-message-editor-submit {
-  background: var(--zeus-product-accent);
-  color: white;
+  background: var(--session-text);
+  color: var(--zeus-card-background, var(--session-canvas));
 }
 
 .session-codex-parity-v1 .session-user-message-editor > footer .session-user-message-editor-submit:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-interaction-primary-hover);
-  color: white;
+  background: color-mix(in srgb, var(--session-text) 88%, var(--session-canvas));
+  color: var(--zeus-card-background, var(--session-canvas));
 }
 
 .session-codex-parity-v1 .session-markdown :where(h1, h2, h3, h4, p, ul, ol, blockquote, pre) {
@@ -4617,8 +4475,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-markdown pre {
-  background: var(--session-code);
-  border: 0;
+  /* 代码使用实色主题表面与边界，避免浅色页面中只剩等宽文字。 */
+  background: var(--session-selected);
+  border: 1px solid var(--session-line);
   border-radius: 8px;
   font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
   font-size: 12px;
@@ -4629,8 +4488,11 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-markdown :not(pre) > code {
-  background: var(--session-control-hover);
+  /* 行内代码是持续可见的内容标记，不使用低对比度的悬停色。 */
+  background: var(--session-selected);
+  border: 1px solid var(--session-line);
   border-radius: 4px;
+  box-decoration-break: clone;
   font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
   font-size: 0.91em;
   padding: 1px 4px;
@@ -4750,9 +4612,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   display: flex;
   font-size: 14px;
   gap: 8px;
-  /* 会话容器已经提供左右留白，状态行与正文共用同一宽度。 */
-  inline-size: min(var(--session-thread-max), 100%);
-  margin: 0 auto;
 }
 
 /* 消息间距由内部时间线保留；底部状态与最后一条过程只留紧凑行距。 */
@@ -5373,7 +5232,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-request-preview {
-  background: var(--session-selected);
+  background: var(--session-canvas);
   border-radius: 7px;
   font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
   font-size: 12px;
@@ -5479,7 +5338,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .is-compact-approval .session-request-preview {
   /* 命令保留原始行与参数边界，长行横向查看，不拆成碎片。 */
-  background: var(--session-selected);
+  background: var(--session-canvas);
   box-sizing: border-box;
   color: var(--session-text);
   font-size: 12px;
@@ -5807,7 +5666,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-delivery-mode button[aria-pressed='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
   color: var(--session-text);
   font-weight: 600;
 }
@@ -5868,7 +5730,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-composer-dropdown-trigger[aria-expanded='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
   color: var(--session-text);
 }
 
@@ -6304,7 +6169,19 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   padding: 8px 10px 8px 14px;
 }
 
+/* 正文可打开预览；标题与折叠箭头是两个独立的键盘入口。 */
+.session-codex-parity-v1 .session-plan-summary[data-preview-enabled='true'] {
+  cursor: pointer;
+}
+
+.session-codex-parity-v1 .session-plan-summary-heading {
+  align-items: center;
+  display: flex;
+  min-inline-size: 0;
+}
+
 .session-codex-parity-v1 .session-plan-summary-title,
+.session-codex-parity-v1 .session-plan-summary-collapse,
 .session-codex-parity-v1 .session-plan-summary nav > button,
 .session-codex-parity-v1 .session-plan-entry {
   align-items: center;
@@ -6324,6 +6201,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   min-block-size: 28px;
 }
 
+.session-codex-parity-v1 .session-plan-summary-collapse {
+  border-radius: 6px;
+  justify-content: center;
+  min-block-size: 28px;
+  min-inline-size: 28px;
+  padding: 4px;
+}
+
 .session-codex-parity-v1 .session-plan-summary-title > strong {
   font-size: 14px;
   font-weight: 620;
@@ -6335,14 +6220,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   inline-size: 18px;
 }
 
-.session-codex-parity-v1 .session-plan-summary-title > svg:last-child {
+.session-codex-parity-v1 .session-plan-summary-collapse > svg {
   block-size: 13px;
   color: var(--session-text-muted);
   inline-size: 13px;
   transition: transform 140ms ease-out;
 }
 
-.session-codex-parity-v1 .session-plan-summary[data-collapsed='true'] .session-plan-summary-title > svg:last-child {
+.session-codex-parity-v1 .session-plan-summary[data-collapsed='true'] .session-plan-summary-collapse > svg {
   transform: rotate(-90deg);
 }
 
@@ -6587,14 +6472,17 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-question-option.is-primary,
 .session-codex-parity-v1 .session-question-option.is-recommended,
 .session-codex-parity-v1 .session-question-option[aria-pressed='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
 }
 
 .session-codex-parity-v1 .session-question-index,
 .session-codex-parity-v1 button.session-question-index {
   align-items: center;
   appearance: none;
-  background: color-mix(in oklab, var(--session-selected) 78%, var(--session-canvas));
+  background: color-mix(in oklab, var(--session-canvas) 78%, var(--session-canvas));
   border: 1px solid var(--session-line);
   border-radius: 999px;
   color: var(--session-text-muted);
@@ -6802,7 +6690,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-collaboration-mode[data-active='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
   color: var(--session-text);
 }
 
@@ -6880,7 +6771,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   }
 
   .session-codex-parity-v1 .session-thread-item-user:not([data-question-answer]) {
-    margin-inline-end: 0 !important;
     max-inline-size: 88%;
   }
 
@@ -7019,7 +6909,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .browser-workspace {
-  background: var(--session-canvas);
+  /* 浏览器外壳沿用会话底色，避免导航栏在分栏交界处形成白色台阶。 */
+  background: var(--zeus-card-background, var(--session-canvas));
   color: var(--session-text);
   display: flex;
   flex: 1 1 auto;
@@ -7047,7 +6938,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .browser-tab-strip {
   align-items: center;
-  background: var(--session-header);
+  background: var(--zeus-card-background, var(--session-header));
   border-block-end: 0;
   display: flex;
   flex: 0 0 40px;
@@ -7073,11 +6964,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .browser-tab-shell {
   align-items: center;
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 8px 8px 0 0;
+  /* 标签与工具栏同色，当前标签通过底部细线标记。 */
+  border: 0;
+  border-block-end: 2px solid transparent;
+  border-radius: 0;
   display: flex;
   flex: 0 1 200px;
-  min-block-size: 36px;
+  min-block-size: 32px;
   min-inline-size: 120px;
   max-inline-size: 220px;
   overflow: hidden;
@@ -7090,8 +6983,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .browser-tab-shell.selected {
   background: var(--session-canvas);
-  border-color: var(--session-line-soft);
-  border-block-end-color: var(--session-canvas);
+  border-block-end-color: var(--session-text);
   min-inline-size: 140px;
 }
 
@@ -7204,13 +7096,15 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .browser-toolbar {
   align-items: center;
-  background: var(--session-canvas);
+  background: transparent;
   border-block-end: 0;
   display: flex;
-  flex: 0 0 46px;
+  box-sizing: border-box;
+  flex: 0 0 44px;
   gap: 8px;
   min-inline-size: 0;
-  padding: 7px 10px;
+  min-block-size: 44px;
+  padding: 6px 8px;
 }
 
 .session-codex-parity-v1 .browser-navigation-actions {
@@ -7274,9 +7168,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   inline-size: 13px;
 }
 
-.session-codex-parity-v1 .browser-address-form input {
+/* 地址框由外层统一绘制，内部文本输入不重复套用全局深色表单的底色和阴影。 */
+.session-codex-parity-v1 .browser-workspace .browser-toolbar .browser-address-form input {
   background: transparent;
   border: 0;
+  border-radius: 0;
+  box-shadow: none;
   color: var(--session-text);
   flex: 1 1 auto;
   min-block-size: 30px;
@@ -7340,9 +7237,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .browser-native-viewport {
-  background: white;
+  /* 原生网页按剩余高度收缩；最小高度会越过终端边界，父层裁切无法约束原生视图。 */
+  background: var(--session-canvas);
   flex: 1 1 auto;
-  min-block-size: 120px;
+  min-block-size: 0;
   min-inline-size: 0;
   position: relative;
 }
@@ -7552,7 +7450,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-browser-sidecar,
 .session-codex-parity-v1 .session-browser-pane {
-  background: var(--session-canvas);
+  /* 外壳与会话连续，网页自己的背景仍由原生页面负责。 */
+  background: var(--zeus-card-background, var(--session-canvas));
 }
 
 /* 会话资源保持 Codex 的“正文内引用 + 独立资源卡”两种密度，不把路径退化成裸文本。 */
@@ -8319,7 +8218,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-turn-diff-files > button[aria-current='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
 }
 
 .session-codex-parity-v1 .session-turn-diff-files > button > span {
@@ -8609,21 +8511,15 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   inline-size: 16px;
 }
 
-.session-codex-parity-v1 .browser-toolbar {
-  box-sizing: border-box;
-  flex-basis: 48px;
-  min-block-size: 48px;
-  padding: 7px 10px;
-}
-
 .session-codex-parity-v1 .browser-navigation-toolbar {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
 }
 
 .session-codex-parity-v1 .browser-address-form {
-  background: var(--session-control-hover);
-  border: 1px solid var(--session-line-soft);
+  /* 地址框与工具栏同色，用一条细边框标识输入范围，保持扁平。 */
+  background: var(--zeus-card-background, var(--session-control));
+  border: 1px solid var(--zeus-card-border, var(--session-line));
   border-radius: 8px;
   justify-self: stretch;
   min-inline-size: 0;
@@ -8633,7 +8529,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .browser-address-form:focus-within {
   background: var(--session-canvas);
   border-color: var(--session-focus-outline);
-  box-shadow: 0 0 0 2px var(--session-focus);
+  box-shadow: none;
 }
 
 .session-codex-parity-v1 .browser-address-form input {
@@ -8911,7 +8807,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-browser-preview-card {
   align-items: center;
-  background: var(--session-selected);
+  background: var(--session-canvas);
   border: 1px solid var(--session-line);
   border-radius: 12px;
   display: flex;
@@ -9596,12 +9492,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   > :where(.session-thread-item, .session-activity-group, .session-reasoning-summary, .session-plan-summary, .session-plan-entry, .session-question-panel, .session-plan-progress, .session-transcript-thinking) {
   inline-size: 100%;
   margin-inline: 0;
-}
-
-/* 用户中途引导仍是用户消息；进入当前轮次的网格过程区后继续保持右对齐。 */
-.session-codex-parity-v1 .session-live-turn-row > .session-thread-item-user:not([data-question-answer]) {
-  justify-self: end;
-  margin-inline: 0 !important;
 }
 
 /* 每条用户可见的中间摘要都是单轮处理过程内部的阶段锚点；顶层始终只有一个折叠入口。 */
@@ -10362,7 +10252,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .structured-composer-option[data-active='true'] {
-  background: var(--session-selected);
+  /* 同色表面用细轮廓保留选中提示。 */
+  background: var(--session-canvas);
+  outline: 1px solid var(--session-text-muted);
+  outline-offset: -1px;
 }
 
 .session-codex-parity-v1 .structured-composer-option[data-disabled='true'] {
@@ -10944,7 +10837,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   background: var(--zeus-interaction-hover);
 }
 .session-codex-parity-v1 .session-new-conversation-context-select.zeus-select[data-zeus-primitive='select'][data-control-size='compact'][data-open='true'] > .zeus-select-trigger {
-  background: color-mix(in srgb, var(--session-selected) 72%, transparent);
+  background: color-mix(in srgb, var(--session-canvas) 72%, transparent);
 }
 
 .session-codex-parity-v1 .session-new-conversation-context-select.zeus-select[data-zeus-primitive='select'][data-control-size='compact'] > .zeus-select-trigger:focus-visible {
@@ -10990,7 +10883,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 .session-codex-parity-v1 .session-composer-dropdown.zeus-select[data-zeus-primitive='select'][data-control-size='compact'][data-open='true'] > .session-composer-dropdown-trigger {
-  background: var(--session-composer-trigger-active-bg, var(--session-selected));
+  background: var(--session-composer-trigger-active-bg, var(--session-canvas));
   color: var(--session-composer-trigger-color, var(--session-text));
 }
 
@@ -11409,7 +11302,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 .session-codex-parity-v1 {
   --session-working-color: color-mix(in oklab, var(--session-accent) 38%, var(--session-text-muted));
   --session-working-halo: color-mix(in oklab, var(--session-working-color) 15%, transparent);
-  --session-working-soft: color-mix(in oklab, var(--session-working-color) 12%, var(--session-selected));
+  --session-working-soft: color-mix(in oklab, var(--session-working-color) 12%, var(--session-canvas));
   --session-working-cycle: 1800ms;
   --session-working-spinner-cycle: 1800ms;
 }
@@ -11949,7 +11842,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 .session-codex-parity-v1 .session-recovered-request {
-  background: color-mix(in srgb, var(--session-selected) 58%, transparent);
+  background: color-mix(in srgb, var(--session-canvas) 58%, transparent);
   border: 0;
   border-inline-start: 3px solid color-mix(in srgb, var(--session-warning) 66%, var(--session-line));
   border-radius: 10px;
@@ -12126,10 +12019,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   display: none;
 }
 
-/* 文件与浏览器共用正文底色，标签保留圆角，不叠加分栏细线。 */
+/* 文件与浏览器顶栏沿用会话底色，保持上下连续且不叠加分栏细线。 */
 .session-codex-parity-v1 .session-thread-header[data-context-toolbar='true'] {
   align-items: stretch;
-  background: var(--session-canvas);
+  background: var(--zeus-card-background, var(--session-canvas));
   box-sizing: border-box;
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--session-context-width);
@@ -12146,9 +12039,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 
 /* 顶栏与正文使用同一分栏宽度，标签起点与内容对齐。 */
 .session-codex-parity-v1 .session-thread-header[data-context-toolbar='true'] > .session-context-header-tools {
-  align-items: stretch;
+  align-items: center;
   border-inline-start: 0;
-  padding: 6px 8px 0;
+  padding: 6px 8px;
 }
 
 .session-codex-parity-v1 .session-thread-header[data-context-toolbar='true'][data-context-full-width='true'] > .session-thread-title-copy {
@@ -12162,22 +12055,23 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 
 .session-codex-parity-v1 .session-thread-header[data-context-toolbar='true'] .session-thread-header-actions {
   gap: 5px;
-  padding-block-end: 6px;
+  padding-block-end: 0;
 }
 
 .session-codex-parity-v1 .session-context-toolbar-host > :is(.browser-tab-strip, .session-context-workspace-header) {
   background: transparent;
   border: 0;
   flex: 1 1 0;
-  min-block-size: 38px;
+  min-block-size: 32px;
   padding: 0;
 }
 
 .session-codex-parity-v1 .session-context-toolbar-host .session-context-workspace-title {
+  /* 文件标题与浏览器当前标签使用相同的平面细线标记。 */
   background: var(--session-canvas);
   border: 0;
-  border-block-end: 0;
-  border-radius: 9px 9px 0 0;
+  border-block-end: 2px solid var(--session-text);
+  border-radius: 0;
   align-self: stretch;
   padding-inline: 12px;
 }
@@ -12267,9 +12161,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 /* 主提交控件的按下反馈保持品牌色和白字对比。 */
-.session-codex-parity-v1 .session-user-message-editor > footer .session-user-message-editor-submit:active:not(:disabled),
-.session-codex-parity-v1 .session-rui-inline-actions button[type='submit']:active:not(:disabled),
-.session-response-annotation-editor footer > button:last-child:active:not(:disabled) {
+.session-codex-parity-v1 .session-rui-inline-actions button[type='submit']:active:not(:disabled) {
   background: var(--zeus-interaction-primary-pressed);
   color: white;
 }
@@ -12422,11 +12314,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 /* 读取反馈局部呈现，正文失败保留原有阅读锚点与重试入口。 */
 .session-codex-parity-v1 .session-navigation-status {
   position: absolute;
-  left: 48px;
+  /* 目录反馈沿用正文列起点，不能固定贴在宽会话外壳的左侧。 */
+  left: max(var(--session-gutter), calc((100% - var(--session-thread-max)) / 2));
   bottom: 12px;
-  right: 16px;
   width: fit-content;
-  max-width: calc(100% - 64px);
+  max-width: min(var(--session-thread-max), calc(100% - 2 * var(--session-gutter)));
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -12436,6 +12329,18 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   background: var(--session-canvas);
   color: var(--session-text-muted);
   font-size: 12px;
+}
+/* 长错误允许换行，重试入口保留完整可点击宽度。 */
+.session-codex-parity-v1 .session-navigation-status > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.session-codex-parity-v1 .session-navigation-status > button {
+  flex-shrink: 0;
+}
+/* 浏览旧消息时为返回按钮让出一行，窄分栏也不会互相遮挡。 */
+.session-codex-parity-v1 .session-transcript-shell:has(> .session-return-latest[data-visible='true']) > .session-navigation-status {
+  bottom: 56px;
 }
 .session-codex-parity-v1 .session-navigation-placeholder {
   /* 保留可观察的读取锚点，后台补读不制造多条空白消息。 */
