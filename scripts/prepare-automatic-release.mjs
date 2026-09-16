@@ -26,7 +26,8 @@ export function selectAutomaticVersion(currentVersion, tags, notesExist) {
     const parts = highest.split('.').map(Number);
     version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
   }
-  while (notesExist(releaseTag(version))) {
+  // 高于当前包版本的手写说明用于下一次候选；当前及历史版本说明不覆盖。
+  while (compareVersions(version, requiredVersion(currentVersion)) <= 0 && notesExist(releaseTag(version))) {
     const parts = version.split('.').map(Number);
     version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
   }
@@ -46,7 +47,7 @@ export function automaticReleaseNotes(version, sourceSha, previousTag) {
     '## 如何升级',
     '',
     `从 [${distributionAppName} 发布页](${base}/releases/tag/${releaseTag(version)}) 下载 ${distributionArtifactPrefix}-${version}-arm64.dmg，退出 ${distributionAppName} 后安装。`,
-    ...(distribution.homebrewEnabled ? [`Homebrew：\`brew upgrade --cask ${distribution.homebrewTap}/zeus\`。`] : []),
+    ...(distribution.homebrewEnabled ? [`Homebrew：\`brew upgrade --cask ${distribution.homebrewTap}/${distribution.cask}\`。`] : []),
     '',
     '## 系统要求与已知限制',
     '',
@@ -91,7 +92,8 @@ function readAutomaticCandidate(root, commit) {
   const notesPath = `releases/${tag}.md`;
   const paths = git(root, 'diff-tree', '--no-commit-id', '--name-only', '-r', commit).split('\n');
   const allowed = new Set([...releasePackagePaths, notesPath]);
-  if (!paths.includes(notesPath) || paths.some((path) => !allowed.has(path))) return null;
+  // 手写说明可能已在源提交中，候选只同步两个版本文件也应支持失败重试。
+  if ((!paths.includes(notesPath) && !releasePackagePaths.every((path) => paths.includes(path))) || paths.some((path) => !allowed.has(path))) return null;
   validateReleaseNotes(readFileSync(resolve(root, notesPath), 'utf8'), version);
   return { commit_sha: commit, tag, source };
 }
@@ -119,15 +121,16 @@ export function prepareAutomaticCandidate({ root, sourceSha, releases }) {
   const tag = releaseTag(version);
   const published = releases.filter((release) => !release.draft && !release.prerelease && versionFromReleaseTag(release.tag_name));
   published.sort((left, right) => compareVersions(versionFromReleaseTag(right.tag_name), versionFromReleaseTag(left.tag_name)));
-  const notes = automaticReleaseNotes(version, sourceSha, published[0]?.tag_name);
+  const notesPath = `releases/${tag}.md`;
+  const preparedNotesExist = existsSync(resolve(root, notesPath));
+  const notes = preparedNotesExist ? readFileSync(resolve(root, notesPath), 'utf8') : automaticReleaseNotes(version, sourceSha, published[0]?.tag_name);
   validateReleaseNotes(notes, version);
   for (const path of releasePackagePaths) {
     const absolute = resolve(root, path);
     writeFileSync(absolute, JSON.stringify({ ...JSON.parse(readFileSync(absolute, 'utf8')), version }, null, 2) + '\n');
   }
   mkdirSync(resolve(root, 'releases'), { recursive: true });
-  const notesPath = `releases/${tag}.md`;
-  writeFileSync(resolve(root, notesPath), notes, { flag: 'wx' });
+  if (!preparedNotesExist) writeFileSync(resolve(root, notesPath), notes, { flag: 'wx' });
   git(root, 'config', 'user.name', 'Zeus Release Bot');
   git(root, 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com');
   git(root, 'add', '--', ...releasePackagePaths, notesPath);

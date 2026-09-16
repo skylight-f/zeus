@@ -300,7 +300,7 @@ function buildDeterministicFallback() {
       '',
       '## 如何升级',
       '',
-      ...(zeusDistribution.homebrewEnabled ? [`- Homebrew 用户可执行 \`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus\`。`] : []),
+      ...(zeusDistribution.homebrewEnabled ? [`- Homebrew 用户可执行 \`brew upgrade --cask ${zeusDistribution.homebrewTap}/${zeusDistribution.cask}\`。`] : []),
       `- 也可以下载 \`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg\`，退出正在运行的 ${distributionAppName} 后覆盖安装。`,
       '',
       '## 系统要求与已知限制',
@@ -334,7 +334,7 @@ function validateDraft(markdown) {
   for (const heading of ['## 如何升级', '## 系统要求与已知限制', '## 发布验证']) {
     if (!markdown.includes(`\n${heading}\n`)) throw new Error(`发布内容缺少必要章节：${heading}`);
   }
-  if (zeusDistribution.homebrewEnabled && !markdown.includes(`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus`)) {
+  if (zeusDistribution.homebrewEnabled && !markdown.includes(`brew upgrade --cask ${zeusDistribution.homebrewTap}/${zeusDistribution.cask}`)) {
     throw new Error('发布内容缺少 Homebrew 升级命令。');
   }
   if (!markdown.includes(`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg`)) {

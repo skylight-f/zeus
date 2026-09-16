@@ -312,7 +312,7 @@ async function verifyPublishedRelease(input) {
       }
     }
 
-    const cask = zeusDistribution.homebrewEnabled ? gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/zeus.rb?ref=main`]) : '# 当前发行版未启用 Homebrew Tap\n';
+    const cask = zeusDistribution.homebrewEnabled ? gh(['api', '-H', 'Accept: application/vnd.github.raw+json', `repos/${homebrewRepository}/contents/Casks/${zeusDistribution.cask}.rb?ref=main`]) : '# 当前发行版未启用 Homebrew Tap\n';
     for (const expected of [`version "${input.releaseVersion}"`, `sha256 "${dmgSha256}"`, 'depends_on arch: :arm64']) {
       if (zeusDistribution.homebrewEnabled && !cask.includes(expected)) throw new Error(`Homebrew Tap Cask 与公开 DMG 不一致，缺少：${expected}`);
     }

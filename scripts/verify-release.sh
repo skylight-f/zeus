@@ -27,7 +27,8 @@ case "$arch" in
 esac
 
 dmg="$release_output_dir/${artifact_prefix}-${version}-${package_arch}.dmg"
-generated_cask="$release_output_dir/homebrew/zeus.rb"
+homebrew_cask="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.cask)")"
+generated_cask="$release_output_dir/homebrew/$homebrew_cask.rb"
 release_manifest="$release_output_dir/zeus-release-manifest.json"
 source_repository="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.repository)")"
 homebrew_tap="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.homebrewTap)")"
@@ -106,10 +107,11 @@ node -e '
   const fs = require("fs");
   const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   if (manifest.homebrew?.tap !== process.argv[2]) process.exit(1);
-  if (manifest.homebrew?.installCommand !== `brew install --cask ${process.argv[2]}/zeus`) process.exit(1);
+  if (manifest.homebrew?.cask !== process.argv[5]) process.exit(1);
+  if (manifest.homebrew?.installCommand !== `brew install --cask ${process.argv[2]}/${process.argv[5]}`) process.exit(1);
   if (manifest.signed !== (process.argv[3] === "true")) process.exit(1);
   if (manifest.notarized !== (process.argv[4] === "true")) process.exit(1);
-' "$release_manifest" "$homebrew_tap" "$signed" "$notarized"
+' "$release_manifest" "$homebrew_tap" "$signed" "$notarized" "$homebrew_cask"
 
 if [ "$signed" != "true" ]; then
   echo 'Zeus verify-release: Developer ID signing is not configured; local ad-hoc DMG verified only, without Apple notarization.' >&2

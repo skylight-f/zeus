@@ -78,9 +78,9 @@ export function renderReleaseManifest(input) {
     homebrew: {
       enabled: zeusDistribution.homebrewEnabled,
       tap: homebrewTap,
-      cask: 'zeus',
-      installCommand: `brew install --cask ${homebrewTap}/zeus`,
-      upgradeCommand: `brew upgrade --cask ${homebrewTap}/zeus`,
+      cask: zeusDistribution.cask,
+      installCommand: `brew install --cask ${homebrewTap}/${zeusDistribution.cask}`,
+      upgradeCommand: `brew upgrade --cask ${homebrewTap}/${zeusDistribution.cask}`,
     },
   };
   return `${JSON.stringify(manifest, null, 2)}\n`;

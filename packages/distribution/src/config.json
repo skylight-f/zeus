@@ -7,9 +7,9 @@
   "releaseTagPrefix": "skylight-v",
   "integrationBranch": "develop",
   "channel": "stable",
-  "homebrewEnabled": false,
+  "homebrewEnabled": true,
   "homebrewTap": "skylight-f/tap",
   "homebrewRepository": "skylight-f/homebrew-tap",
-  "cask": "zeus",
+  "cask": "astra",
   "requireManifestIdentity": true
 }

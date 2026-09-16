@@ -1024,7 +1024,7 @@ export const languageCopy = {
         releaseSigningWaiting: '等待 Apple 签名证书',
         releaseNotarizationConfigured: '公证凭据已配置',
         releaseNotarizationWaiting: '等待 Apple 公证凭据',
-        releaseCaskDetected: '已检测到 Casks/zeus.rb',
+        releaseCaskDetected: '已检测到 Homebrew Cask',
         releaseCaskWaiting: '等待 Homebrew cask 文件',
         unsignedBuildAvailable: '未签名构建可用',
         unsignedBuildUnavailable: '未签名构建不可用',

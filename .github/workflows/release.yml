@@ -98,6 +98,7 @@ jobs:
       app_name: ${{ steps.distribution.outputs.app_name }}
       homebrew_enabled: ${{ steps.distribution.outputs.homebrew_enabled }}
       homebrew_repository: ${{ steps.distribution.outputs.homebrew_repository }}
+      homebrew_cask: ${{ steps.distribution.outputs.homebrew_cask }}
     steps:
       - name: 检出固定发布候选
         uses: actions/checkout@v4
@@ -251,7 +252,7 @@ jobs:
           path: |
             dist/*.dmg
             dist/zeus-release-manifest.json
-            dist/homebrew/zeus.rb
+            dist/homebrew/${{ needs.preflight.outputs.homebrew_cask }}.rb
       - name: 首次上传失败后安全重试一次
         if: ${{ steps.upload_release_artifact.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
@@ -261,7 +262,7 @@ jobs:
           path: |
             dist/*.dmg
             dist/zeus-release-manifest.json
-            dist/homebrew/zeus.rb
+            dist/homebrew/${{ needs.preflight.outputs.homebrew_cask }}.rb
           overwrite: true
 
   publish:
@@ -353,17 +354,19 @@ jobs:
           echo "$APP_NAME $version GitHub Release 已就绪。"
       - name: 同步 Homebrew Cask
         if: ${{ needs.preflight.outputs.homebrew_enabled == 'true' }}
+        env:
+          HOMEBREW_CASK: ${{ needs.preflight.outputs.homebrew_cask }}
         run: |
           mkdir -p .tmp/homebrew-tap/Casks
-          cp dist/homebrew/zeus.rb .tmp/homebrew-tap/Casks/zeus.rb
+          cp "dist/homebrew/$HOMEBREW_CASK.rb" ".tmp/homebrew-tap/Casks/$HOMEBREW_CASK.rb"
           cd .tmp/homebrew-tap
-          if [ -z "$(git status --porcelain -- Casks/zeus.rb)" ]; then
+          if [ -z "$(git status --porcelain -- "Casks/$HOMEBREW_CASK.rb")" ]; then
             echo 'Homebrew Cask 已是当前版本，无需提交。'
             exit 0
           fi
           git diff --check
           git config user.name 'Zeus Release Bot'
           git config user.email 'actions@users.noreply.github.com'
-          git add Casks/zeus.rb
-          git commit -m "更新 Zeus $(ruby -ne 'puts $1 if $_ =~ /version \"([^\"]+)\"/' Casks/zeus.rb) Cask"
+          git add "Casks/$HOMEBREW_CASK.rb"
+          git commit -m "更新 $APP_NAME $(ruby -ne 'puts $1 if $_ =~ /version \"([^\"]+)\"/' "Casks/$HOMEBREW_CASK.rb") Cask"
           git push origin HEAD:main

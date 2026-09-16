@@ -24,7 +24,7 @@ function normalizeCaskArchitecture(arch) {
 
 export function renderHomebrewCask({ version, arch, sha256 }) {
   const normalizedArch = normalizeCaskArchitecture(arch);
-  return `cask "zeus" do
+  return `cask "${zeusDistribution.cask}" do
   version "${version}"
   sha256 "${sha256}"
 
@@ -33,7 +33,7 @@ export function renderHomebrewCask({ version, arch, sha256 }) {
   desc "Local-first AI development workbench"
   homepage "https://github.com/${zeusDistribution.repository}"
 
-  depends_on :macos
+  depends_on macos: :ventura
   depends_on arch: ${normalizedArch.homebrew}
 
   app "${distributionAppName}.app"
@@ -62,7 +62,7 @@ async function main() {
   const version = process.argv[2] ?? JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8')).version;
   const arch = process.argv[3] ?? (process.arch === 'x64' ? 'x64' : 'arm64');
   const dmgPath = process.argv[4] ?? join(rootDir, 'dist', `${distributionArtifactPrefix}-${version}-${arch}.dmg`);
-  const outputPath = process.argv[5] ?? join(rootDir, 'dist', 'homebrew', 'zeus.rb');
+  const outputPath = process.argv[5] ?? join(rootDir, 'dist', 'homebrew', `${zeusDistribution.cask}.rb`);
   const result = await generateHomebrewCask({
     version,
     arch,

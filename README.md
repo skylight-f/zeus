@@ -29,27 +29,27 @@ AI 访问网站和执行浏览器操作无需 Zeus 逐次确认，包括点击�
 
 ## 安装
 
-当前 Homebrew 安装包支持 Apple Silicon Mac，要求 macOS 13 或更高版本。
+Astra 安装包支持 Apple Silicon Mac，要求 macOS 13 或更高版本。Homebrew 配置已接入发布流程；首次使用前，维护者需完成下方的 Tap 初始化并发布 Cask。
 
 ```bash
-brew install --cask imchenway/tap/zeus
+brew install --cask skylight-f/tap/astra
 ```
 
-安装完成后，可从“应用程序”打开 Zeus。升级使用：
+安装完成后，可从“应用程序”打开 Astra。升级使用：
 
 ```bash
-brew upgrade --cask imchenway/tap/zeus
+brew upgrade --cask skylight-f/tap/astra
 ```
 
-彻底卸载 Zeus（包括 Homebrew Cask 已登记的本地配置）使用：
+卸载 Astra 并保留本地项目、会话和配置：
 
 ```bash
-brew uninstall --cask --zap imchenway/tap/zeus
+brew uninstall --cask skylight-f/tap/astra
 ```
 
-如需保留本地项目、会话和配置，请去掉 `--zap`，使用 `brew uninstall --cask imchenway/tap/zeus`。
+需要清除本地数据时才添加 `--zap`。Astra 当前沿用 Zeus 的 bundle ID 和数据目录；`--zap` 会删除 Cask 登记的 Zeus 配置、缓存和日志，共用这些数据的 Zeus 也会受影响。
 
-也可以前往 [GitHub Releases](https://github.com/imchenway/zeus/releases) 下载安装包。
+Tap 尚未上线时，可以前往 [Astra Releases](https://github.com/skylight-f/zeus/releases) 下载安装包。已通过 DMG 安装的用户需先退出 Astra、保留用户数据并移走原 `Astra.app`，再执行 Homebrew 安装；不要使用 `--force` 覆盖现有应用。
 
 应用内更新会识别当前安装方式：Homebrew 管理的应用沿用 Homebrew 更新；手动从 DMG 安装的应用，在正式签名、公证、版本兼容和安装位置条件满足时，可下载后确认重启安装。自动安装条件不足时，仍可在更新弹窗点击“下载更新”，完成校验后点击“打开安装包”；结束工作并退出 Zeus，再将新版拖入“应用程序”完成替换。只有缺少匹配当前 Mac 的安装包时才引导前往发布页。临时签名的旧版需先手动安装一次正式签名版本，才能使用后续的直接自动安装。
 
@@ -110,13 +110,15 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 
 ## 发行配置与发布
 
-应用版本统一由根目录 `package.json` 维护，桌面包同步该版本，发布标签使用 `v<版本>`。更新来源为 `imchenway/zeus`，Homebrew 使用 `imchenway/tap/zeus`。
+应用版本统一由根目录 `package.json` 维护，桌面包同步该版本，发布标签使用 `skylight-v<版本>`。更新来源为 `skylight-f/zeus`，Homebrew 使用 `skylight-f/tap/astra`；Cask 名称、清单、下载地址和升级命令统一读取 `packages/distribution/src/config.json`。
+
+首次启用 Homebrew 时，创建公开仓库 `skylight-f/homebrew-tap` 并初始化 `main` 分支，在 Astra 源码仓库配置 Actions secret `HOMEBREW_TAP_TOKEN`，授予该 Tap 仓库 Contents 读写权限。发布流程从实际 DMG 计算 SHA-256，生成 `dist/homebrew/astra.rb`，在 GitHub Release 就绪后同步至 Tap 的 `Casks/astra.rb`。首次同步成功后，上方安装命令才可用；不要把本地配置完成视为已公开上线。
 
 - `pnpm release:config`：检查发行来源及应用版本一致性。
 - `pnpm release:distribution:prepare`：使用已审阅的发布说明准备版本文件，支持首次发行；默认预览，显式设置 `APPLY_CHANGES=1` 才写入文件。
 - `pnpm release`：执行受控发布流程；在当前 Zeus 源码项目中也可通过内置 `/release` 命令调用，仍经过项目权限与高风险确认。
-- `Release` 工作流默认由维护者手动运行，只构建候选；公开发布需要显式选择 `publish_release`。
-- 可选自动发布：维护者设置仓库变量 `ZEUS_AUTO_RELEASE=true` 后，`main` 推送会先检查源码，再准备递增补丁版本和发布候选；该功能需要 Actions 写入分支的权限。失败重试复用同一候选，不覆盖已有标签。
+- `Astra Release` 工作流手动运行时默认只构建候选；公开发布需要显式选择 `publish_release`。
+- 本发行版的 `develop` 推送默认自动发布：先检查源码，再准备递增补丁版本和发布候选；设置仓库变量 `ZEUS_AUTO_RELEASE=false` 可关闭自动公开发布。该功能需要 Actions 写入分支的权限，启用 Homebrew 后还需先配置 Tap 和写入凭据。下一版本的 `releases/skylight-v<版本>.md` 可提前编写，自动发布会校验并复用正文；失败重试复用同一候选，不覆盖已有标签。
 - 可选上游同步：`pnpm upstream:check` 默认只显示同步入口，上游仓库自身直接跳过。衍生仓库可配置自己的发行来源，并设置 `ZEUS_UPSTREAM_SYNC=true` 启用 `Sync upstream` 工作流；集成分支默认 `main`，自定义时需将 `ZEUS_INTEGRATION_BRANCH` 与发行配置保持一致。同步产生待审阅 PR，遇到冲突停止，不强行覆盖。
 
 `packages/distribution/` 提供发行配置，应用、浏览器扩展及安装器从 apps/desktop/assets/ 读取同一份图标并生成构建资源；内部包版本不参与应用发行编号。`apps/desktop/src/renderer/tooling/` 管理自动化、扩展与技能页面，通过宿主适配面调用已有客户端能力。`pnpm verify:architecture` 检查这些依赖边界。

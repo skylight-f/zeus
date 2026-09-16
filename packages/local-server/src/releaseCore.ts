@@ -66,7 +66,7 @@ export interface ReleaseUpdateManifest {
   homebrew: {
     enabled: boolean;
     tap: string;
-    cask: 'zeus';
+    cask: string;
     installCommand: string;
     upgradeCommand: string;
   };
@@ -228,7 +228,7 @@ export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopb
   if (
     homebrewTap !== zeusDistribution.homebrewTap ||
     ((zeusDistribution.requireManifestIdentity || value.homebrew.enabled !== undefined) && value.homebrew.enabled !== zeusDistribution.homebrewEnabled) ||
-    value.homebrew.cask !== 'zeus' ||
+    value.homebrew.cask !== zeusDistribution.cask ||
     typeof value.homebrew.installCommand !== 'string' ||
     typeof value.homebrew.upgradeCommand !== 'string' ||
     !isTrustedGithubUrl(value.releasePageUrl, repository) ||
@@ -256,7 +256,7 @@ export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopb
     homebrew: {
       enabled: zeusDistribution.homebrewEnabled,
       tap: homebrewTap,
-      cask: 'zeus',
+      cask: zeusDistribution.cask,
       installCommand: value.homebrew.installCommand,
       upgradeCommand: value.homebrew.upgradeCommand,
     },

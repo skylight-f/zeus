@@ -10,6 +10,7 @@ export const zeusDistribution = JSON.parse(readFileSync(distributionConfigPath, 
 export const distributionAppName = zeusDistribution.appName ?? 'Zeus';
 if (!/^[A-Za-z][A-Za-z0-9]*(?: [A-Za-z0-9]+)*$/u.test(distributionAppName)) throw new Error('应用名只接受字母、数字及单个分隔空格。');
 export const distributionArtifactPrefix = distributionAppName.replaceAll(' ', '-');
+if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(zeusDistribution.cask)) throw new Error('Homebrew Cask 名称只接受小写字母、数字及单个分隔连字符。');
 
 export function distributionPackageIdentity(variant = 'release') {
   // 测试包保留既有只读验收契约；正式显示名不改变测试宿主身份。

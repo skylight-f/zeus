@@ -10,7 +10,10 @@ if ((process.argv.includes('--manifest') || process.argv.includes('--check-versi
   throw new Error('当前 Actions 仓库与发行配置不一致，拒绝发布。');
 if (process.argv.includes('--github-output')) {
   if (!process.env.GITHUB_OUTPUT) throw new Error('缺少 GITHUB_OUTPUT。');
-  appendFileSync(process.env.GITHUB_OUTPUT, `app_name=${distributionAppName}\nrelease_branch=${distribution.releaseBranch}\nhomebrew_enabled=${distribution.homebrewEnabled}\nhomebrew_repository=${distribution.homebrewRepository}\n`);
+  appendFileSync(
+    process.env.GITHUB_OUTPUT,
+    `app_name=${distributionAppName}\nrelease_branch=${distribution.releaseBranch}\nhomebrew_enabled=${distribution.homebrewEnabled}\nhomebrew_repository=${distribution.homebrewRepository}\nhomebrew_cask=${distribution.cask}\n`,
+  );
 }
 const distributionVersion = assertDistributionVersions();
 if (process.argv.includes('--tag')) console.log(releaseTag(distributionVersion));
