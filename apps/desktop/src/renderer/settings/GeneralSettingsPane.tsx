@@ -1,3 +1,4 @@
+import { distributionAppName } from '../tooling/distribution.js';
 import { useRef, useState } from 'react';
 import type { AppShellSettings } from '../apiClient.js';
 import type { SettingsApiClient } from '../features/settings/settingsApiClient.js';
@@ -73,7 +74,7 @@ export function GeneralSettingsPane(props: {
         ) : null}
       </header>
       <NativeSettingsPane label={zh ? '界面与通知' : 'Appearance and notifications'}>
-        <NativeControlRow title={zh ? '应用语言' : 'Language'} description={zh ? '选择 Zeus 的界面语言。' : 'Choose the Zeus interface language.'}>
+        <NativeControlRow title={zh ? '应用语言' : 'Language'} description={zh ? `选择 ${distributionAppName} 的界面语言。` : `Choose the ${distributionAppName} interface language.`}>
           <ZeusSelect
             size="regular"
             ariaLabel={zh ? '应用语言' : 'Language'}

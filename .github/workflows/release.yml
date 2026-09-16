@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: 要构建的固定候选提交；公开发布时必须是 origin/main 当前提交
+        description: 要构建的固定候选提交；公开发布时必须是发行分支当前提交
         required: false
         default: ''
       tag:
@@ -93,6 +93,7 @@ jobs:
       tag: ${{ needs.candidate.outputs.tag }}
       require_apple_distribution: ${{ needs.candidate.outputs.require_apple_distribution }}
       release_branch: ${{ steps.distribution.outputs.release_branch }}
+      app_name: ${{ steps.distribution.outputs.app_name }}
       homebrew_enabled: ${{ steps.distribution.outputs.homebrew_enabled }}
       homebrew_repository: ${{ steps.distribution.outputs.homebrew_repository }}
     steps:
@@ -133,7 +134,7 @@ jobs:
             exit 1
           fi
           if [ "$(git ls-remote origin refs/heads/${{ steps.distribution.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
-            echo '公开发布候选必须精确等于 origin/main，拒绝发布漂移或未推送提交。' >&2
+            echo '公开发布候选必须精确等于发行分支，拒绝发布漂移或未推送提交。' >&2
             exit 1
           fi
           node scripts/distribution-config.mjs --check-version
@@ -236,7 +237,7 @@ jobs:
         with:
           name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
           path: |
-            dist/Zeus-*.dmg
+            dist/*.dmg
             dist/zeus-release-manifest.json
             dist/homebrew/zeus.rb
       - name: 首次上传失败后安全重试一次
@@ -245,7 +246,7 @@ jobs:
         with:
           name: zeus-macos-${{ needs.preflight.outputs.commit_sha }}
           path: |
-            dist/Zeus-*.dmg
+            dist/*.dmg
             dist/zeus-release-manifest.json
             dist/homebrew/zeus.rb
           overwrite: true
@@ -255,6 +256,7 @@ jobs:
     needs: [preflight, verify, package-mac]
     runs-on: ubuntu-latest
     env:
+      APP_NAME: ${{ needs.preflight.outputs.app_name }}
       GH_TOKEN: ${{ github.token }}
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       RELEASE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
@@ -284,7 +286,7 @@ jobs:
         run: |
           node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json --check-version
           if [ "$(git ls-remote origin refs/heads/${{ needs.preflight.outputs.release_branch }} | awk '{print $1}')" != "$RELEASE_COMMIT" ]; then
-            echo '构建期间 main 已变化，请重新选择发布候选。' >&2
+            echo '构建期间发行分支已变化，请重新选择发布候选。' >&2
             exit 1
           fi
       - name: 检查或创建不可变标签
@@ -303,7 +305,7 @@ jobs:
           fi
           git config user.name 'Zeus Release Bot'
           git config user.email 'actions@users.noreply.github.com'
-          git tag -a "$RELEASE_TAG" "$RELEASE_COMMIT" -m "Zeus $RELEASE_TAG"
+          git tag -a "$RELEASE_TAG" "$RELEASE_COMMIT" -m "$APP_NAME $RELEASE_TAG"
           git push origin "refs/tags/$RELEASE_TAG"
       - name: 发布或核对 GitHub Release
         run: |
@@ -327,14 +329,14 @@ jobs:
             fi
           else
             gh release create "$RELEASE_TAG" \
-              dist/Zeus-*.dmg \
+              dist/*.dmg \
               dist/zeus-release-manifest.json \
               --verify-tag \
               --latest \
-              --title "Zeus $RELEASE_TAG" \
+              --title "$APP_NAME $RELEASE_TAG" \
               --notes-file "$release_notes_file"
           fi
-          echo "Zeus $version GitHub Release 已就绪。"
+          echo "$APP_NAME $version GitHub Release 已就绪。"
       - name: 同步 Homebrew Cask
         if: ${{ needs.preflight.outputs.homebrew_enabled == 'true' }}
         run: |

@@ -1,3 +1,4 @@
+import { distributionAppName } from './desktopDistribution.js';
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { rename, unlink } from 'node:fs/promises';
@@ -171,7 +172,7 @@ function validateInstallerPaths(input: ReleaseInstallerBootstrap): void {
     throw new Error('Zeus release installer App paths are invalid.');
   }
   if (target === staged || target === backup || staged === backup) throw new Error('Zeus release installer App paths must be distinct.');
-  if (!input.testMode && basename(target) !== 'Zeus.app') throw new Error('Production release installer can only replace Zeus.app.');
+  if (!input.testMode && basename(target) !== `${distributionAppName}.app`) throw new Error(`Production release installer can only replace ${distributionAppName}.app.`);
   if (input.testMode) {
     for (const path of [target, staged, backup, resolve(input.userDataPath)]) {
       if (!isUnderTemporaryRoot(path)) throw new Error('Test release installer paths must remain under the system temporary directory.');

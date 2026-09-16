@@ -6,6 +6,7 @@ import { basename, join, posix, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { pathToFileURL, URL } from 'node:url';
+import { distributionPackageIdentity } from './desktop-distribution.mjs';
 
 /** 只读取完整包的身份，不执行包内程序；打包和运行验收共用这一检查。 */
 function verifyPackagedAppIdentity(appPath, variant) {
@@ -19,7 +20,7 @@ function verifyPackagedAppIdentity(appPath, variant) {
     }
   };
   /** 测试身份的包名、进程名和应用身份必须保持一致。 */
-  const expected = variant === 'test' ? { bundleId: 'dev.hypha.zeus.test', name: 'Zeus Test', executable: 'Zeus Test' } : { bundleId: 'dev.hypha.zeus', name: 'Zeus', executable: 'Zeus' };
+  const expected = distributionPackageIdentity(variant);
   /** 同时读取用户可见版本和构建版本，禁止验收样本只改其中之一。 */
   const actual = { bundleId: readInfo('CFBundleIdentifier'), name: readInfo('CFBundleName'), executable: readInfo('CFBundleExecutable'), version: readInfo('CFBundleShortVersionString'), buildVersion: readInfo('CFBundleVersion') };
   if (basename(appPath) !== `${expected.name}.app` || actual.bundleId !== expected.bundleId || actual.name !== expected.name || actual.executable !== expected.executable || actual.version !== actual.buildVersion) {
@@ -171,7 +172,7 @@ export function assertPackagedUpdateProgressHelper(appRoot) {
 export function verifyPackagedApp(appPath) {
   const appRoot = resolve(appPath);
   /** 正式产物与测试产物分别校验，拒绝改名的系统小程序样本。 */
-  const identity = verifyPackagedAppIdentity(appRoot, basename(appRoot) === 'Zeus Test.app' ? 'test' : 'release');
+  const identity = verifyPackagedAppIdentity(appRoot, basename(appRoot) === `${distributionPackageIdentity('test').name}.app` ? 'test' : 'release');
   const asarPath = join(appRoot, 'Contents/Resources/app.asar');
   const renderer = assertPackagedRendererEntrypoint(asarPath);
   const preload = assertPackagedPreloadEntrypoint(asarPath);

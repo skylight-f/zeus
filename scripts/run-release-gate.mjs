@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { zeusDistribution, releaseTag, versionFromReleaseTag, releasePackagePaths } from './desktop-distribution.mjs';
 /* global console, process */
 import { spawnSync } from 'node:child_process';
@@ -51,10 +52,10 @@ async function main() {
   });
 
   const architecture = process.arch === 'x64' ? 'x64' : 'arm64';
-  const dmgPath = join(releaseOutputDirectory, `Zeus-${expectedVersion}-${architecture}.dmg`);
+  const dmgPath = join(releaseOutputDirectory, `${distributionArtifactPrefix}-${expectedVersion}-${architecture}.dmg`);
   const manifestPath = join(releaseOutputDirectory, 'zeus-release-manifest.json');
   const generatedCaskPath = join(releaseOutputDirectory, 'homebrew', 'zeus.rb');
-  const appPath = join(releaseOutputDirectory, architecture === 'arm64' ? 'mac-arm64' : 'mac', 'Zeus.app');
+  const appPath = join(releaseOutputDirectory, architecture === 'arm64' ? 'mac-arm64' : 'mac', `${distributionAppName}.app`);
 
   for (const path of [dmgPath, manifestPath, generatedCaskPath, appPath]) {
     if (!existsSync(path)) throw new Error(`发布门禁缺少必需产物：${path}`);
@@ -75,10 +76,10 @@ async function main() {
   const outputDirectory = resolveOutputDirectory(expectedVersion, headSha.slice(0, 12));
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
 
-  const summaryPath = join(outputDirectory, `Zeus-${expectedVersion}-release-gate-summary.md`);
+  const summaryPath = join(outputDirectory, `${distributionArtifactPrefix}-${expectedVersion}-release-gate-summary.md`);
   const notesSnapshotPath = join(outputDirectory, basename(releaseNotesPath));
-  const manifestSnapshotPath = join(outputDirectory, `Zeus-${expectedVersion}-release-manifest.json`);
-  const caskSnapshotPath = join(outputDirectory, `Zeus-${expectedVersion}-homebrew-cask.rb`);
+  const manifestSnapshotPath = join(outputDirectory, `${distributionArtifactPrefix}-${expectedVersion}-release-manifest.json`);
+  const caskSnapshotPath = join(outputDirectory, `${distributionArtifactPrefix}-${expectedVersion}-homebrew-cask.rb`);
   copyFileSync(releaseNotesPath, notesSnapshotPath);
   copyFileSync(manifestPath, manifestSnapshotPath);
   copyFileSync(generatedCaskPath, caskSnapshotPath);
@@ -155,7 +156,7 @@ function validateGeneratedCask(path, version, sha256, architecture) {
 function buildSummary(input) {
   const gatekeeperText = input.gatekeeper.output || `退出码 ${input.gatekeeper.status}`;
   return [
-    `# Zeus ${input.expectedVersion} 发布门禁摘要`,
+    `# ${distributionAppName} ${input.expectedVersion} 发布门禁摘要`,
     '',
     '## 候选范围',
     '',

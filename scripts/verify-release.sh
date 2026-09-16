@@ -11,20 +11,22 @@ release_output_dir="${ZEUS_RELEASE_OUTPUT_DIR:-.tmp/zeus-release/verify}"
 ZEUS_PACKAGE_OUTPUT_DIR="$release_output_dir" pnpm package:mac:release
 
 version="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json','utf8')).version)")"
+app_name="$(node --input-type=module -e "import { distributionAppName } from './scripts/desktop-distribution.mjs'; process.stdout.write(distributionAppName)")"
+artifact_prefix="$(node --input-type=module -e "import { distributionArtifactPrefix } from './scripts/desktop-distribution.mjs'; process.stdout.write(distributionArtifactPrefix)")"
 arch="$(uname -m)"
 case "$arch" in
   arm64)
     package_arch="arm64"
-    app="$release_output_dir/mac-arm64/Zeus.app"
+    app="$release_output_dir/mac-arm64/$app_name.app"
     ;;
   x86_64)
     package_arch="x64"
-    app="$release_output_dir/mac/Zeus.app"
+    app="$release_output_dir/mac/$app_name.app"
     ;;
   *) echo "Zeus verify-release: unsupported macOS arch $arch" >&2; exit 1 ;;
 esac
 
-dmg="$release_output_dir/Zeus-${version}-${package_arch}.dmg"
+dmg="$release_output_dir/${artifact_prefix}-${version}-${package_arch}.dmg"
 generated_cask="$release_output_dir/homebrew/zeus.rb"
 release_manifest="$release_output_dir/zeus-release-manifest.json"
 source_repository="$(node --input-type=module -e "import { zeusDistribution as d } from './scripts/desktop-distribution.mjs'; process.stdout.write(d.repository)")"
@@ -38,7 +40,7 @@ for required in "$dmg" "$app" "$generated_cask"; do
   fi
 done
 
-app_executable="$app/Contents/MacOS/Zeus"
+app_executable="$app/Contents/MacOS/$app_name"
 if [ ! -x "$app_executable" ]; then
   echo "Zeus verify-release: packaged app executable is missing or not executable: $app_executable" >&2
   exit 1
@@ -80,8 +82,8 @@ if ! ELECTRON_RUN_AS_NODE=1 "$app_executable" scripts/verify-packaged-app-health
   exit 1
 fi
 
-if ! grep -q 'app "Zeus.app"' "$generated_cask"; then
-  echo 'Zeus verify-release: Homebrew cask must install Zeus.app' >&2
+if ! grep -Fq "app \"$app_name.app\"" "$generated_cask"; then
+  echo "发行校验：Homebrew cask 必须安装 $app_name.app" >&2
   exit 1
 fi
 

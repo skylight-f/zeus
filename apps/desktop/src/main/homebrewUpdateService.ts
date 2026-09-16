@@ -1,4 +1,4 @@
-import { zeusDistribution, zeusHomebrewCask } from './desktopDistribution.js';
+import { distributionAppName, zeusDistribution, zeusHomebrewCask } from './desktopDistribution.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants as fsConstants, createReadStream, type Stats } from 'node:fs';
@@ -275,7 +275,7 @@ async function inspectCask(brewPath: string): Promise<HomebrewCaskInfo> {
   let appTarget: string | null = null;
   for (const artifact of artifacts) {
     if (!isRecord(artifact) || !Array.isArray(artifact.app) || typeof artifact.target !== 'string') continue;
-    if (artifact.app.includes('Zeus.app')) appTarget = resolve(artifact.target);
+    if (artifact.app.includes(`${distributionAppName}.app`)) appTarget = resolve(artifact.target);
   }
   const installedVersion = typeof cask.installed === 'string' && cask.installed.trim() ? cask.installed.trim() : null;
   if (typeof cask.version !== 'string' || typeof cask.tap !== 'string' || typeof cask.url !== 'string' || typeof cask.sha256 !== 'string') {

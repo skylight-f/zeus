@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { releaseTag } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
@@ -47,7 +48,9 @@ export function renderReleaseManifest(input) {
   const releaseBaseUrl = `https://github.com/${repository}/releases`;
   const releaseDownloadBaseUrl = `${releaseBaseUrl}/download/${tag}`;
   const manifest = {
+    // app 是既有更新协议标识，改名只改变展示字段及安装包名称。
     app: 'Zeus',
+    displayName: distributionAppName,
     distributionId: zeusDistribution.id,
     sourceCommit: input.sourceCommit ?? null,
     upstream: input.upstream ?? null,
@@ -87,7 +90,7 @@ async function discoverArtifacts({ distDir, version, repository }) {
   const files = await readdir(distDir).catch(() => []);
   const artifacts = [];
   for (const fileName of files) {
-    const match = fileName.match(new RegExp(`^Zeus-${version}-(arm64|x64)\\.(dmg)$`, 'u'));
+    const match = fileName.match(new RegExp(`^${distributionArtifactPrefix}-${version}-(arm64|x64)\\.(dmg)$`, 'u'));
     if (!match) continue;
     const filePath = join(distDir, fileName);
     const fileStat = await stat(filePath);
@@ -113,7 +116,8 @@ export async function generateReleaseManifest({ version, channel = 'stable', rep
     repository: normalizedRepository,
   });
   const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();
-  const upstream = JSON.parse(await readFile(join(rootDir, 'releases/upstream-baseline.json'), 'utf8'));
+  // 上游自身不产生同步基线；派生发行仍须读取真实记录，缺失或损坏时阻断发布。
+  const upstream = zeusDistribution.repository === zeusDistribution.upstreamRepository ? null : JSON.parse(await readFile(join(rootDir, 'releases/upstream-baseline.json'), 'utf8'));
   const content = renderReleaseManifest({
     sourceCommit,
     upstream,

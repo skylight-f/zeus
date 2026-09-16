@@ -1,5 +1,7 @@
 /** 通用发行契约；具体发行配置由应用组装入口注入。 */
 export interface DistributionConfig {
+  /** 展示与打包名称；省略时保持上游应用名和更新协议兼容。 */
+  readonly appName?: string;
   readonly id: string;
   readonly repository: string;
   readonly upstreamRepository: string;
@@ -35,6 +37,7 @@ export function createDistributionContext(config: DistributionConfig = upstreamD
   const zeusDistribution = Object.freeze({ ...config });
   const zeusReleaseBaseUrl = `https://github.com/${zeusDistribution.repository}/releases`;
   return {
+    appName: zeusDistribution.appName ?? 'Zeus',
     zeusDistribution,
     zeusReleaseBaseUrl,
     zeusReleaseManifestUrl: `${zeusReleaseBaseUrl}/latest/download/zeus-release-manifest.json`,

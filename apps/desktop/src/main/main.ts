@@ -1,4 +1,4 @@
-import { isZeusReleaseUrl } from './desktopDistribution.js';
+import { distributionAppName, isZeusReleaseUrl } from './desktopDistribution.js';
 
 import { registerFilePreview } from './filePreview.js';
 import { filePreviewMime, filePreviewKind, filePreviewLimits, type FilePreviewIntent } from '@zeus/shared';
@@ -245,7 +245,7 @@ const storageRecoveryRestart = new StorageRecoveryRestartCoordinator();
 const execFile = promisify(execFileCallback);
 const savedDisplayAvailabilityTimeoutMs = 2_000;
 const testDistributionName = 'Zeus Test';
-const developmentDistributionName = 'Zeus Dev';
+const developmentDistributionName = `${distributionAppName} Dev`;
 const menuBarUsageWindowSize = { width: 360, height: 520 } as const;
 const menuBarUsageWindowGap = 6;
 const menuBarUsageWindowBlurDelayMs = 150;
@@ -288,7 +288,7 @@ function isTestDistribution(): boolean {
 }
 
 function desktopDisplayName(): string {
-  return isTestDistribution() ? testDistributionName : app.isPackaged ? 'Zeus' : developmentDistributionName;
+  return isTestDistribution() ? testDistributionName : app.isPackaged ? distributionAppName : developmentDistributionName;
 }
 
 function broadcastAutomaticUpdateIndicator(state: HomebrewUpdateIndicatorState): void {
@@ -356,7 +356,7 @@ function applyExplicitUserDataDirectory(): void {
 
   const profileName = activeDataRootProfile();
   const target = join(homedir(), profileName === 'production' ? '.zeus' : profileName === 'test' ? defaultTestDataRoot() : '.zeus-development');
-  const legacyCandidates = profileName === 'production' ? [join(app.getPath('appData'), '@zeus', 'desktop'), join(app.getPath('appData'), desktopDisplayName())].filter((path, index, paths) => paths.indexOf(path) === index) : [];
+  const legacyCandidates = profileName === 'production' ? [join(app.getPath('appData'), '@zeus', 'desktop'), join(app.getPath('appData'), 'Zeus')].filter((path, index, paths) => paths.indexOf(path) === index) : [];
   const targetInitialized = profileName === 'production' ? existsSync(join(target, 'data', 'zeus.db')) || existsSync(join(target, 'zeus.db')) || existsSync(join(target, 'zeus.config.json')) : existsSync(target);
   const legacy = legacyCandidates.find((path) => existsSync(join(path, 'zeus.db')) || existsSync(join(path, 'zeus.config.json')));
   if (app.isPackaged && !targetInitialized && legacy) {
@@ -624,7 +624,7 @@ function readPackagedResourceIdentity(): string | null {
 /** 各类窗口在创建前统一核对资源，避免把新包的二进制片段读成网页。 */
 function rendererEntryUrl(surface?: 'menu-bar-usage' | 'task-git-delivery' | 'project-git-diff', parameters?: Record<string, string>): string {
   if (app.isPackaged && (!startupResourceIdentity || readPackagedResourceIdentity() !== startupResourceIdentity)) {
-    throw new Error(nativeText('应用文件已更新或暂时不可用。请重新启动 Zeus 后再打开窗口。', 'Application files have changed or are unavailable. Restart Zeus before opening this window.'));
+    throw new Error(nativeText(`应用文件已更新或暂时不可用。请重新启动 ${distributionAppName} 后再打开窗口。`, `Application files have changed or are unavailable. Restart ${distributionAppName} before opening this window.`));
   }
   const url = new URL(process.env.ZEUS_DEV_SERVER_URL ?? pathToFileURL(join(desktopRoot(), 'dist/renderer/index.html')).toString());
   if (surface) url.searchParams.set('surface', surface);
@@ -2077,7 +2077,7 @@ function setupIpc(): void {
       snapshot,
       chooseFile: () =>
         dialog.showSaveDialog({
-          title: nativeText('导出 Zeus 设置', 'Export Zeus settings'),
+          title: nativeText(`导出 ${distributionAppName} 设置`, `Export ${distributionAppName} settings`),
           defaultPath: 'zeus-settings.json',
           filters: [{ name: 'Zeus Settings JSON', extensions: ['json'] }],
         }),
@@ -2088,7 +2088,7 @@ function setupIpc(): void {
     importSettingsSnapshotFromFile({
       chooseFile: () =>
         dialog.showOpenDialog({
-          title: nativeText('导入 Zeus 设置', 'Import Zeus settings'),
+          title: nativeText(`导入 ${distributionAppName} 设置`, `Import ${distributionAppName} settings`),
           properties: ['openFile'],
           filters: [{ name: 'Zeus Settings JSON', extensions: ['json'] }],
         }),
@@ -2099,7 +2099,7 @@ function setupIpc(): void {
     importBusinessDataSnapshotFromFile({
       chooseFile: () =>
         dialog.showOpenDialog({
-          title: nativeText('导入 Zeus 数据备份', 'Import a Zeus data backup'),
+          title: nativeText(`导入 ${distributionAppName} 数据备份`, `Import a ${distributionAppName} data backup`),
           properties: ['openFile'],
           filters: [{ name: 'Zeus Business Data JSON', extensions: ['json'] }],
         }),
@@ -2151,7 +2151,7 @@ function setupIpc(): void {
       },
       chooseFile: () =>
         dialog.showSaveDialog({
-          title: nativeText('导出 Zeus 运行日志', 'Export Zeus run logs'),
+          title: nativeText(`导出 ${distributionAppName} 运行日志`, `Export ${distributionAppName} run logs`),
           defaultPath: (payload as { fileName?: string }).fileName ?? 'zeus-runtime.log',
           filters: [{ name: 'Runtime Log', extensions: ['log', 'txt'] }],
         }),
@@ -3044,8 +3044,8 @@ async function initializeApplication(): Promise<void> {
         notifyReady: (latestVersion, showProgress) => {
           if (isZeusApplicationForeground() || !appShellSettings.desktopNotificationsEnabled || !Notification.isSupported()) return false;
           const notification = new Notification({
-            title: appShellSettings.appLanguage === 'zh-CN' ? 'Zeus 更新已下载' : 'Zeus Update Downloaded',
-            body: appShellSettings.appLanguage === 'zh-CN' ? `Zeus ${latestVersion} 已下载。重启后可安装更新。` : `Zeus ${latestVersion} is downloaded. Restart to install the update.`,
+            title: appShellSettings.appLanguage === 'zh-CN' ? `${distributionAppName} 更新已下载` : `${distributionAppName} Update Downloaded`,
+            body: appShellSettings.appLanguage === 'zh-CN' ? `${distributionAppName} ${latestVersion} 已下载。重启后可安装更新。` : `${distributionAppName} ${latestVersion} is downloaded. Restart to install the update.`,
           });
           notification.on('click', showProgress);
           notification.show();
@@ -3191,7 +3191,10 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
     } catch (error) {
       console.error('Zeus 无法读取活动数量，且显式停止活动工作失败；已取消重启。', error);
       await showRestartCancelled(
-        nativeText('无法确认正在运行的工作，也未能完成停止操作。为避免影响这些工作，本次重启已取消。', 'Zeus could not determine which work is active or finish stopping it. Restarting was cancelled to avoid affecting that work.'),
+        nativeText(
+          '无法确认正在运行的工作，也未能完成停止操作。为避免影响这些工作，本次重启已取消。',
+          `${distributionAppName} could not determine which work is active or finish stopping it. Restarting was cancelled to avoid affecting that work.`,
+        ),
       );
       return cancelRequestedRestart();
     }
@@ -3202,7 +3205,7 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
     const effectfulTurnDetail =
       typeof status.effectfulTurnCount === 'number'
         ? nativeText(`其中 ${status.effectfulTurnCount} 个已开始执行可能修改文件或其他应用的操作`, `${status.effectfulTurnCount} have started actions that may change files or other apps`)
-        : nativeText('无法确认其中多少个已开始修改文件或其他应用', 'Zeus cannot confirm how many have started changing files or other apps');
+        : nativeText('无法确认其中多少个已开始修改文件或其他应用', `${distributionAppName} cannot confirm how many have started changing files or other apps`);
     const confirmed = await confirmRequestedRestart(
       nativeText(
         `重启会停止 ${status.activeTurnCount} 个正在处理的请求（${effectfulTurnDetail}）、${status.waitingRequestCount} 个等待回答或授权的请求、${status.activeRuntimeCount} 个其他运行中的工具，以及 ${status.activeCommandRunCount} 个命令。`,
@@ -3223,7 +3226,7 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
   const options = {
     type: 'warning' as const,
     title: nativeText('仍有工作正在运行', 'Work is still running'),
-    message: nativeText('退出 Zeus 时如何处理正在运行的工作？', 'What should happen to active work when you quit Zeus?'),
+    message: nativeText(`退出 ${distributionAppName} 时如何处理正在运行的工作？`, `What should happen to active work when you quit ${distributionAppName}?`),
     detail: nativeText(
       `正在处理 ${status.activeTurnCount} 个请求，${status.waitingRequestCount} 个请求等待回答或授权，另有 ${status.activeRuntimeCount} 个工具和 ${status.activeCommandRunCount} 个命令正在运行。`,
       `${status.activeTurnCount} requests are being processed, ${status.waitingRequestCount} are awaiting answers or approvals, and ${status.activeRuntimeCount} other tools and ${status.activeCommandRunCount} commands are running.`,
@@ -3286,7 +3289,7 @@ async function confirmRequestedRestart(detail: string): Promise<boolean> {
   const options = {
     type: 'warning' as const,
     title: nativeText('重启会停止正在运行的工作', 'Restarting will stop active work'),
-    message: nativeText('停止正在运行的工作并重启 Zeus？', 'Stop active work and restart Zeus?'),
+    message: nativeText(`停止正在运行的工作并重启 ${distributionAppName}？`, `Stop active work and restart ${distributionAppName}?`),
     detail,
     buttons: [nativeText('停止工作并重启', 'Stop work and restart'), nativeText('取消', 'Cancel')],
     defaultId: 1,
@@ -3302,7 +3305,7 @@ async function showRestartCancelled(detail: string): Promise<void> {
   const options = {
     type: 'warning' as const,
     title: nativeText('重启已取消', 'Restart cancelled'),
-    message: nativeText('Zeus 将保持打开。', 'Zeus will remain open.'),
+    message: nativeText(`${distributionAppName} 将保持打开。`, `${distributionAppName} will remain open.`),
     detail,
     buttons: [nativeText('知道了', 'OK')],
     defaultId: 0,

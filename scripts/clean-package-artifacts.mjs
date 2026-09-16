@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /* global console, process */
+import { distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { lstat, readdir, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 /** 只识别打包器生成的稳定版本安装包及配套文件。 */
-const artifactPattern = /^Zeus-(Test-)?(\d+\.\d+\.\d+)-(arm64|x64)\.(dmg|zip)(\.blockmap)?$/u;
+const artifactPattern = new RegExp(`^(?:(Zeus-Test)-|${distributionArtifactPrefix}-)(\\d+\\.\\d+\\.\\d+)-(arm64|x64)\\.(dmg|zip)(\\.blockmap)?$`, 'u');
 
 /** 按身份和架构保留最新实际安装包；默认只预览，不递归删除目录或跟随符号链接。 */
 export async function cleanPackageArtifacts(outputRoot, { apply = false, variant, arch } = {}) {

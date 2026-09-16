@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /* global process, console */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { zeusDistribution as d } from './desktop-distribution.mjs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { zeusDistribution as d, assertDistributionVersions } from './desktop-distribution.mjs';
 
 // 上游仓库无需同步自身；默认关闭远端写入，本地命令只输出配置。
 if (d.repository === d.upstreamRepository) {
@@ -14,6 +14,7 @@ if (d.repository === d.upstreamRepository) {
   const run = (command, args) => execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const git = (...args) => run('git', args);
   const origin = git('remote', 'get-url', 'origin');
+  const originalVersion = assertDistributionVersions();
   if (![`https://github.com/${d.repository}`, `https://github.com/${d.repository}.git`, `git@github.com:${d.repository}.git`].includes(origin)) throw new Error('同步目标与发行仓库不一致。');
   const release = JSON.parse(run('gh', ['api', `repos/${d.upstreamRepository}/releases/latest`]));
   const tag = release.tag_name;
@@ -39,7 +40,13 @@ if (d.repository === d.upstreamRepository) {
         git('merge', '--abort');
         throw new Error(`上游同步存在冲突，请本地解决后推送 ${branch}，不会强制选择任何一侧：\n${conflicts}`);
       }
-      // 上游通常不含本发行配置；若双方修改，交由真实冲突处理，不做静默覆盖。
+      // 即使 Git 自动合并成功，也不能把上游发行身份或版本带入二开渠道。
+      const mergedDistribution = JSON.parse(readFileSync('packages/distribution/src/config.json', 'utf8'));
+      const mergedVersions = ['package.json', 'apps/desktop/package.json'].map((path) => JSON.parse(readFileSync(path, 'utf8')).version);
+      if (Object.keys(d).some((key) => mergedDistribution[key] !== d[key]) || mergedVersions.some((version) => version !== originalVersion)) {
+        git('merge', '--abort');
+        throw new Error('上游同步改变了二开发行配置或独立版本，请本地审阅合并并保留二开渠道与版本；尚未提交或推送。');
+      }
       mkdirSync('releases', { recursive: true });
       writeFileSync('releases/upstream-baseline.json', JSON.stringify({ repository: d.upstreamRepository, tag, commit: upstreamSha }, null, 2) + '\n');
       git('add', 'releases/upstream-baseline.json');

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { releaseTag, versionFromReleaseTag } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
@@ -31,8 +32,8 @@ assertVersionAfterTag(releaseVersion, baseTag, '。');
 const outputDirectory = resolveOutputDirectory(releaseVersion, shortHeadSha);
 mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
 
-const evidencePath = join(outputDirectory, `Zeus-${releaseVersion}-release-evidence.md`);
-const draftPath = join(outputDirectory, `Zeus-${releaseVersion}-release-notes-draft.md`);
+const evidencePath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-release-evidence.md`);
+const draftPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-release-notes-draft.md`);
 const evidence = buildEvidence();
 
 writeFileSync(evidencePath, evidence, { mode: 0o600 });
@@ -135,7 +136,7 @@ async function buildPrompt(currentEvidencePath, currentEvidence) {
   const ignoredReleaseNotes = join(repositoryRoot, 'releases', `${releaseTag(releaseVersion)}.md`);
   /** 读取时限制内存占用，避免大批文档变化在截断前撑满子进程缓冲区。 */
   const committedDiff = await readCommittedDiff();
-  return `你负责为 Zeus ${releaseVersion} 生成一份面向用户的候选 Release notes。
+  return `你负责为 ${distributionAppName} ${releaseVersion} 生成一份面向用户的候选 Release notes。
 
 这只是只读内容生成，不发布、不修改源码、不运行验证命令。最终响应必须满足输出 Schema；markdown 字段只能包含 Release notes 正文，confidence、uncertainties 或生成过程说明只能放在各自字段，禁止追加到 markdown。
 
@@ -151,9 +152,9 @@ async function buildPrompt(currentEvidencePath, currentEvidence) {
 3. 用用户能理解的功能和交互变化组织内容，不把 commit subject、文件清单或内部实现名直接当作发布卖点。
 4. 只写证据支持的事实；发布验证章节使用发布后仍然成立的门禁契约表述，说明公开 Release 只有在固定候选通过哪些检查后才会创建。不得写当前生成阶段、草稿状态、尚未发生或将在稍后执行，也不得把门禁写成已经取得的结果。
 5. 当前公开制品若仍是 ad-hoc、未公证，只能描述为手动升级，不得声称应用内自动安装可用。
-6. 必须使用简体中文，标题必须精确为“# Zeus ${releaseVersion} 更新内容”。
+6. 必须使用简体中文，标题必须精确为“# ${distributionAppName} ${releaseVersion} 更新内容”。
 7. 必须包含“## 如何升级”“## 系统要求与已知限制”“## 发布验证”三个二级标题；前面按真实变化生成一至四个用户向主题。
-8. “如何升级”必须包含本发行版 https://github.com/${zeusDistribution.repository}/releases 和版本化 DMG 文件名 \`Zeus-${releaseVersion}-arm64.dmg\`。Homebrew 状态：${zeusDistribution.homebrewEnabled ? '已启用，写明本发行版 Tap 升级命令' : '尚未启用，不要推荐 Homebrew 安装或升级'}。
+8. “如何升级”必须包含本发行版 https://github.com/${zeusDistribution.repository}/releases 和版本化 DMG 文件名 \`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg\`。Homebrew 状态：${zeusDistribution.homebrewEnabled ? '已启用，写明本发行版 Tap 升级命令' : '尚未启用，不要推荐 Homebrew 安装或升级'}。
 9. 不写营销套话，不虚构性能数字，不使用源码行号或内部任务编号充当用户说明。
 10. 这是最终公开正文的候选版本，不要写 GitHub Release 已发布、Tap 已同步或用户已经完成升级，也不要留下只在草稿阶段成立的时态。
 ${automatedRelease ? '11. 本次用于无人值守发布。confidence 只评价正文中的用户向变更事实；这些事实均有明确证据时设为 high 且 uncertainties 返回空数组。发布门禁必须先完成才允许创建公开 Release，因此“发布验证”应写成长期有效的公开条件，不写“将执行”“尚未发生”或草稿通过后的步骤。任何用户向变更事实的疑点都必须放入 uncertainties，禁止用“待确认”“待验证”“TODO”“TBD”等占位语掩盖。已有证据支持的限制影响可以如实使用“可能”等概率表达。' : '11. 发布验证没有同一候选提交证据时，保留“待发布门禁确认”。'}
@@ -290,7 +291,7 @@ function buildDeterministicFallback() {
   const validationLine = automatedRelease ? '- 公开 Release 只在固定候选提交通过类型检查、正式打包、DMG 完整性和更新清单一致性校验后创建。' : '- 当前为候选草稿，正式结果待发布门禁确认。';
   return {
     markdown: [
-      `# Zeus ${releaseVersion} 更新内容`,
+      `# ${distributionAppName} ${releaseVersion} 更新内容`,
       '',
       '## 本次更新',
       '',
@@ -300,7 +301,7 @@ function buildDeterministicFallback() {
       '## 如何升级',
       '',
       ...(zeusDistribution.homebrewEnabled ? [`- Homebrew 用户可执行 \`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus\`。`] : []),
-      `- 也可以下载 \`Zeus-${releaseVersion}-arm64.dmg\`，退出正在运行的 Zeus 后覆盖安装。`,
+      `- 也可以下载 \`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg\`，退出正在运行的 ${distributionAppName} 后覆盖安装。`,
       '',
       '## 系统要求与已知限制',
       '',
@@ -328,7 +329,7 @@ function normalizeMarkdown(value) {
 }
 
 function validateDraft(markdown) {
-  const requiredTitle = `# Zeus ${releaseVersion} 更新内容`;
+  const requiredTitle = `# ${distributionAppName} ${releaseVersion} 更新内容`;
   if (!markdown.startsWith(`${requiredTitle}\n`)) throw new Error(`发布内容标题必须是：${requiredTitle}`);
   for (const heading of ['## 如何升级', '## 系统要求与已知限制', '## 发布验证']) {
     if (!markdown.includes(`\n${heading}\n`)) throw new Error(`发布内容缺少必要章节：${heading}`);
@@ -336,8 +337,8 @@ function validateDraft(markdown) {
   if (zeusDistribution.homebrewEnabled && !markdown.includes(`brew upgrade --cask ${zeusDistribution.homebrewTap}/zeus`)) {
     throw new Error('发布内容缺少 Homebrew 升级命令。');
   }
-  if (!markdown.includes(`Zeus-${releaseVersion}-arm64.dmg`)) {
-    throw new Error(`发布内容缺少版本化 DMG 名称：Zeus-${releaseVersion}-arm64.dmg。`);
+  if (!markdown.includes(`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg`)) {
+    throw new Error(`发布内容缺少版本化 DMG 名称：${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg。`);
   }
   if (!automatedRelease && !markdown.includes('待发布门禁确认')) {
     throw new Error('发布内容没有保留“待发布门禁确认”的验证边界。');

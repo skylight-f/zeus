@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { zeusDistribution, releaseTag, versionFromReleaseTag, releasePackagePaths } from './desktop-distribution.mjs';
 /* global console, process */
 import { spawnSync } from 'node:child_process';
@@ -67,8 +68,8 @@ function main() {
     }
   }
 
-  const planPath = join(outputDirectory, `Zeus-${releaseVersion}-release-prepare-${applyChanges ? 'result' : 'plan'}.md`);
-  const notesSnapshotPath = join(outputDirectory, `Zeus-${releaseVersion}-release-notes-reviewed.md`);
+  const planPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-release-prepare-${applyChanges ? 'result' : 'plan'}.md`);
+  const notesSnapshotPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-release-notes-reviewed.md`);
   if (resolve(sourceNotesPath) !== resolve(notesSnapshotPath)) copyFileSync(sourceNotesPath, notesSnapshotPath);
   writeFileSync(
     planPath,
@@ -174,7 +175,7 @@ function applyCandidateChanges(input) {
 
 function buildPlan(input) {
   return [
-    `# Zeus ${input.releaseVersion} 发布候选准备${input.applyChanges ? '结果' : '计划'}`,
+    `# ${distributionAppName} ${input.releaseVersion} 发布候选准备${input.applyChanges ? '结果' : '计划'}`,
     '',
     '## 输入',
     '',

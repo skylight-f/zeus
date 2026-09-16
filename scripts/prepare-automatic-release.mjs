@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 /* global console, process */
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -36,15 +37,15 @@ export function automaticReleaseNotes(version, sourceSha, previousTag) {
   const base = `https://github.com/${distribution.repository}`;
   const changes = previousTag ? `${base}/compare/${previousTag}...${sourceSha}` : `${base}/commit/${sourceSha}`;
   return [
-    `# Zeus ${version} 更新内容`,
+    `# ${distributionAppName} ${version} 更新内容`,
     '',
     '## 本次更新',
     '',
-    `本版本汇总 main 中通过检查的改动。[查看完整变更](${changes})。`,
+    `本版本汇总发行分支中通过检查的改动。[查看完整变更](${changes})。`,
     '',
     '## 如何升级',
     '',
-    `从 [Zeus 发布页](${base}/releases/tag/${releaseTag(version)}) 下载 Zeus-${version}-arm64.dmg，退出 Zeus 后安装。`,
+    `从 [${distributionAppName} 发布页](${base}/releases/tag/${releaseTag(version)}) 下载 ${distributionArtifactPrefix}-${version}-arm64.dmg，退出 ${distributionAppName} 后安装。`,
     ...(distribution.homebrewEnabled ? [`Homebrew：\`brew upgrade --cask ${distribution.homebrewTap}/zeus\`。`] : []),
     '',
     '## 系统要求与已知限制',
@@ -103,7 +104,7 @@ export function prepareAutomaticCandidate({ root, sourceSha, releases }) {
   const remoteHead = git(root, 'rev-parse', 'FETCH_HEAD');
   git(root, 'checkout', '--detach', remoteHead);
   const candidate = readAutomaticCandidate(root, remoteHead);
-  if (remoteHead !== sourceSha && candidate?.source !== sourceSha) return { ready: false, reason: 'main 已更新，跳过过时的 CI 结果。' };
+  if (remoteHead !== sourceSha && candidate?.source !== sourceSha) return { ready: false, reason: '发行分支已更新，跳过过时的 CI 结果。' };
   const tags = remoteTags(root);
   if (candidate) {
     if (tags.has(candidate.tag) && tags.get(candidate.tag) !== candidate.commit_sha) throw new Error('已有发行标签指向其他提交，拒绝覆盖。');
@@ -149,7 +150,7 @@ function main() {
   if (process.env.GITHUB_EVENT_NAME === 'push') {
     if (process.env.GITHUB_REPOSITORY !== distribution.repository) throw new Error('自动发布仓库与发行配置不一致。');
     if (process.env.ZEUS_AUTO_RELEASE !== 'true') throw new Error('自动发布未启用，请先配置 ZEUS_AUTO_RELEASE。');
-    if (event.deleted || event.ref !== `refs/heads/${distribution.releaseBranch}` || event.repository?.full_name !== distribution.repository) throw new Error('自动发布只接受本仓库 main 推送。');
+    if (event.deleted || event.ref !== `refs/heads/${distribution.releaseBranch}` || event.repository?.full_name !== distribution.repository) throw new Error(`自动发布只接受本仓库 ${distribution.releaseBranch} 推送。`);
     const origin = git(repositoryRoot, 'remote', 'get-url', 'origin');
     if (![`https://github.com/${distribution.repository}`, `https://github.com/${distribution.repository}.git`, `git@github.com:${distribution.repository}.git`].includes(origin)) throw new Error('origin 与发行仓库不一致。');
     const releases = JSON.parse(execFileSync('gh', ['api', `repos/${distribution.repository}/releases?per_page=100`, '--paginate', '--slurp'], { encoding: 'utf8' })).flat();

@@ -1,3 +1,4 @@
+import { distributionAppName } from './desktopDistribution.js';
 import { isZeusReleaseUrl } from './desktopDistribution.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -402,7 +403,7 @@ async function stageUpdateApp(input: { dmgPath: string; transactionId: string; t
   const stagedAppPath = join(targetParent, `.${basename(input.targetAppPath, '.app')}.update-${input.transactionId}.app`);
   const mount = await mountDmg(input.dmgPath);
   try {
-    const appName = input.testMode ? basename(input.targetAppPath) : 'Zeus.app';
+    const appName = input.testMode ? basename(input.targetAppPath) : `${distributionAppName}.app`;
     const sourceAppPath = join(mount, appName);
     const sourceStat = await lstat(sourceAppPath);
     if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) throw new Error(`更新 DMG 缺少 ${appName}。`);

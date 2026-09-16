@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -27,15 +28,15 @@ export function renderHomebrewCask({ version, arch, sha256 }) {
   version "${version}"
   sha256 "${sha256}"
 
-  url "https://github.com/${zeusDistribution.repository}/releases/download/${zeusDistribution.releaseTagPrefix}#{version}/Zeus-#{version}-${normalizedArch.artifact}.dmg"
-  name "Zeus"
+  url "https://github.com/${zeusDistribution.repository}/releases/download/${zeusDistribution.releaseTagPrefix}#{version}/${distributionArtifactPrefix}-#{version}-${normalizedArch.artifact}.dmg"
+  name "${distributionAppName}"
   desc "Local-first AI development workbench"
   homepage "https://github.com/${zeusDistribution.repository}"
 
   depends_on :macos
   depends_on arch: ${normalizedArch.homebrew}
 
-  app "Zeus.app"
+  app "${distributionAppName}.app"
 
   uninstall quit: "dev.hypha.zeus"
 
@@ -60,7 +61,7 @@ export async function generateHomebrewCask({ version, arch, dmgPath, outputPath 
 async function main() {
   const version = process.argv[2] ?? JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8')).version;
   const arch = process.argv[3] ?? (process.arch === 'x64' ? 'x64' : 'arm64');
-  const dmgPath = process.argv[4] ?? join(rootDir, 'dist', `Zeus-${version}-${arch}.dmg`);
+  const dmgPath = process.argv[4] ?? join(rootDir, 'dist', `${distributionArtifactPrefix}-${version}-${arch}.dmg`);
   const outputPath = process.argv[5] ?? join(rootDir, 'dist', 'homebrew', 'zeus.rb');
   const result = await generateHomebrewCask({
     version,

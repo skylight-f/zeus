@@ -65,6 +65,9 @@ async function verifyCustomizationBoundaries(): Promise<void> {
     [`${rendererRoot}WorkspacePage.tsx`, new Set([`${customRoot}tools/base.css`, `${customRoot}tools/theme.css`])],
     [`${rendererRoot}features/workspace/WorkspaceView.tsx`, new Set([`${customRoot}index.js`])],
     [`${rendererRoot}features/workspace/useWorkspaceQueryState.tsx`, new Set([`${customRoot}distribution.js`])],
+    [`${rendererRoot}features/workspace/WorkspaceChrome.tsx`, new Set([`${customRoot}distribution.js`])],
+    [`${rendererRoot}settings/GeneralSettingsPane.tsx`, new Set([`${customRoot}distribution.js`])],
+    [`${rendererRoot}settings/MenuBarUsageWindow.tsx`, new Set([`${customRoot}distribution.js`])],
   ]);
   const distributionConsumers = new Set(['apps/desktop/src/main/desktopDistribution.ts', `${customRoot}distribution.ts`]);
   const files = [...(await collectFiles('packages')), ...(await collectFiles('apps/desktop/src'))].filter((path) => /\.(?:ts|tsx|cts|mjs|js)$/u.test(path));

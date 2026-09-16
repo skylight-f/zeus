@@ -6,6 +6,17 @@ const distributionConfigPath = resolve(import.meta.dirname, '..', 'packages/dist
 /** 发布前检查运行在干净检出目录，直接读取受版本控制的发行配置，不依赖构建产物 dist。 */
 export const zeusDistribution = JSON.parse(readFileSync(distributionConfigPath, 'utf8'));
 
+/** 应用名与安装包前缀统一从发行配置派生，不更改数据根或系统身份。 */
+export const distributionAppName = zeusDistribution.appName ?? 'Zeus';
+if (!/^[A-Za-z][A-Za-z0-9]*(?: [A-Za-z0-9]+)*$/u.test(distributionAppName)) throw new Error('应用名只接受字母、数字及单个分隔空格。');
+export const distributionArtifactPrefix = distributionAppName.replaceAll(' ', '-');
+
+export function distributionPackageIdentity(variant = 'release') {
+  // 测试包保留既有只读验收契约；正式显示名不改变测试宿主身份。
+  const name = variant === 'test' ? 'Zeus Test' : distributionAppName;
+  return { name, executable: name, bundleId: variant === 'test' ? 'dev.hypha.zeus.test' : 'dev.hypha.zeus' };
+}
+
 /** 根包是唯一应用版本源，发布时同步桌面包；内部工作区包不参与发行编号。 */
 export const releasePackagePaths = ['package.json', 'apps/desktop/package.json'];
 

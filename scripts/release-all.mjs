@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { releaseTag, versionFromReleaseTag, releasePackagePaths, assertDistributionVersions } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
@@ -50,7 +51,7 @@ async function main() {
   fetchReleaseFacts(stableRelease.tag);
   const publicCommit = git(['rev-parse', `${stableRelease.tag}^{commit}`]);
   const headSha = initialHeadSha;
-  announceReleaseStage('核对本地 main 与 origin/main');
+  announceReleaseStage('核对本地发行分支与 origin 的发行分支');
   assertMainRelationship(headSha);
   const packageVersion = readMatchingPackageVersion();
   const nextVersion = resolveTargetVersion(stableRelease.version);
@@ -58,16 +59,16 @@ async function main() {
   const state = resolveReleaseState({ stableRelease, publicCommit, headSha, packageVersion, nextVersion });
 
   if (state.type === 'already_published') {
-    const resultPath = join(outputDirectory, `Zeus-${stableRelease.version}-release-already-current.md`);
+    const resultPath = join(outputDirectory, `${distributionArtifactPrefix}-${stableRelease.version}-release-already-current.md`);
     writeFileSync(
       resultPath,
       [
-        `# Zeus ${stableRelease.version} 已是当前公开稳定版`,
+        `# ${distributionAppName} ${stableRelease.version} 已是当前公开稳定版`,
         '',
-        `- 本地 main：${headSha}`,
+        `- 本地发行分支：${headSha}`,
         `- 公开标签：${stableRelease.tag} → ${publicCommit}`,
         `- GitHub Release：${stableRelease.url}`,
-        '- 最新公开标签之后没有新的 main 提交，本次没有创建新版本或执行任何写操作。',
+        '- 最新公开标签之后没有新的发行分支提交，本次没有创建新版本或执行任何写操作。',
         '',
       ].join('\n'),
       { mode: 0o600 },
@@ -93,7 +94,7 @@ async function main() {
   await ensureReleaseCommit(releaseState);
   announceReleaseStage('执行本地阻塞级发布门禁');
   await ensureFastLocalGate(releaseState);
-  announceReleaseStage('安全推送 main');
+  announceReleaseStage('安全推送发行分支');
   ensureMainPushed(releaseState);
   announceReleaseStage('创建并回验公开发布');
   await ensurePublished(releaseState);
@@ -101,7 +102,7 @@ async function main() {
   releaseState.phase = 'completed';
   releaseState.completedAt = new Date().toISOString();
   writeState(releaseState);
-  const resultPath = join(outputDirectory, `Zeus-${releaseState.version}-release-result.md`);
+  const resultPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseState.version}-release-result.md`);
   writeFileSync(resultPath, buildFinalResult(releaseState), { mode: 0o600 });
   const artifactPaths = [resultPath];
   for (const source of [releaseState.notesPath, releaseState.gateSummaryPath, releaseState.publishResultPath]) {
@@ -110,7 +111,7 @@ async function main() {
     if (resolve(source) !== resolve(destination)) copyFileSync(source, destination);
     artifactPaths.push(destination);
   }
-  console.log(`Zeus ${releaseState.version} 已完成 main 推送、公开发布与产物回验。`);
+  console.log(`${distributionAppName} ${releaseState.version} 已完成发行分支推送、公开发布与产物回验。`);
   for (const path of artifactPaths) console.log(`ZEUS_ARTIFACT_FILE=${path}`);
 }
 
@@ -136,11 +137,11 @@ async function runIsolatedRelease(input) {
     throw new Error(`隔离发布副本已经偏离发布源，拒绝覆盖或清理：source=${input.sourceHead} isolated=${isolatedHead}`);
   }
   if (captureInDirectory(isolatedRepository, 'git', ['merge-base', '--is-ancestor', `origin/${zeusDistribution.releaseBranch}`, input.sourceHead], true).status !== 0) {
-    throw new Error(`origin/main 已领先发布源或与之分叉，拒绝隔离发布：source=${input.sourceHead}`);
+    throw new Error(`origin 的发行分支已领先发布源或与之分叉，拒绝隔离发布：source=${input.sourceHead}`);
   }
 
   console.log(`检测到未提交内容，改用隔离发布副本：${isolatedRepository}`);
-  console.log(`发布源固定为本地 main HEAD：${input.sourceHead}`);
+  console.log(`发布源固定为本地发行分支 HEAD：${input.sourceHead}`);
   console.log('暂存、未暂存和未跟踪内容均不会复制、提交或打包；原工作区保持原样。');
 
   await runStage('准备隔离发布依赖', 'pnpm', ['install', '--frozen-lockfile'], process.env, { cwd: isolatedRepository });
@@ -175,9 +176,9 @@ async function runIsolatedRelease(input) {
     { cwd: isolatedRepository, preserveArtifactLines: true },
   );
   const currentOriginalHead = git(['rev-parse', 'HEAD']);
-  if (currentOriginalHead === input.sourceHead) console.log(`隔离发布已完成；原工作区和本地 main 仍保持在 ${input.sourceHead.slice(0, 12)}。`);
-  else console.log(`隔离发布已完成；原工作区的 main 在执行期间由其他流程移动到 ${currentOriginalHead.slice(0, 12)}，本脚本没有改写它。`);
-  console.log('请在处理完未提交内容后显式同步 origin/main；脚本不会自动 stash、恢复、合并或变基。');
+  if (currentOriginalHead === input.sourceHead) console.log(`隔离发布已完成；原工作区和本地发行分支仍保持在 ${input.sourceHead.slice(0, 12)}。`);
+  else console.log(`隔离发布已完成；原工作区的发行分支在执行期间由其他流程移动到 ${currentOriginalHead.slice(0, 12)}，本脚本没有改写它。`);
+  console.log('请在处理完未提交内容后显式同步 origin 的发行分支；脚本不会自动 stash、恢复、合并或变基。');
 }
 
 function isRecoverableIsolatedReleaseCommit(isolatedRepository, sourceHead, isolatedHead) {
@@ -224,7 +225,7 @@ function seedIsolatedReleaseState(isolatedRepository, sourceHead) {
   if (!existsSync(notesSource)) throw new Error(`隔离恢复缺少仓库 Release notes：${notesSource}`);
   const notesDirectory = join(stateDirectory, 'notes');
   mkdirSync(notesDirectory, { recursive: true, mode: 0o700 });
-  const notesPath = join(notesDirectory, `Zeus-${version}-release-notes-draft.md`);
+  const notesPath = join(notesDirectory, `${distributionArtifactPrefix}-${version}-release-notes-draft.md`);
   copyFileSync(notesSource, notesPath);
   const isolatedState = {
     schemaVersion: 1,
@@ -265,7 +266,7 @@ function buildIsolationValidationResult(input, isolatedRepository) {
 
 function assertRepositoryPreflight() {
   const branch = git(['branch', '--show-current']) || '(detached HEAD)';
-  if (branch !== zeusDistribution.releaseBranch) throw new Error(`一键发布只能从本地 main 执行，当前分支为 ${branch}。`);
+  if (branch !== zeusDistribution.releaseBranch) throw new Error(`一键发布只能从本地发行分支执行，当前分支为 ${branch}。`);
   const origin = git(['remote', 'get-url', 'origin']);
   if (![`https://github.com/${repository}.git`, `https://github.com/${repository}`, `git@github.com:${repository}.git`].includes(origin)) {
     throw new Error(`origin 不是受控仓库 ${repository}：${origin}`);
@@ -387,11 +388,11 @@ function fetchReleaseFacts(tag) {
 
 function assertMainRelationship(headSha) {
   const remoteMainSha = resolveRemoteReference(`refs/heads/${zeusDistribution.releaseBranch}`);
-  if (!remoteMainSha) throw new Error('无法读取 origin/main。');
+  if (!remoteMainSha) throw new Error('无法读取 origin 的发行分支。');
   if (remoteMainSha === headSha) return;
   const relationship = capture('git', ['merge-base', '--is-ancestor', remoteMainSha, headSha], true);
   if (relationship.status !== 0) {
-    throw new Error(`origin/main 已领先本地 main 或与之分叉，拒绝自动合并或强推：local=${headSha} remote=${remoteMainSha}`);
+    throw new Error(`origin 的发行分支已领先本地发行分支或与之分叉，拒绝自动合并或强推：local=${headSha} remote=${remoteMainSha}`);
   }
 }
 
@@ -403,14 +404,14 @@ function resolveReleaseState(input) {
   }
   if (input.packageVersion === input.stableRelease.version && input.headSha === input.publicCommit) {
     const worktreeStatus = git(['status', '--short']);
-    if (worktreeStatus) throw new Error(`发布 main 必须以已提交内容为准；当前工作区不干净：\n${worktreeStatus}`);
+    if (worktreeStatus) throw new Error(`发布分支必须以已提交内容为准；当前工作区不干净：\n${worktreeStatus}`);
     return { type: 'already_published' };
   }
   if (input.packageVersion === input.nextVersion) {
     if (!currentState) throw new Error(`检测到包版本 ${input.packageVersion} 高于公开稳定版，但缺少一键发布恢复状态，拒绝推断或创建新版本。`);
     validateState(currentState, input.stableRelease);
     if (currentState.releaseCommit && currentState.releaseCommit !== input.headSha && !rebindUnpublishedReleaseRepair(currentState, input.headSha)) {
-      throw new Error(`本地 main 已偏离发布提交，且当前阶段不允许自动恢复：expected=${currentState.releaseCommit} actual=${input.headSha}`);
+      throw new Error(`本地发行分支已偏离发布提交，且当前阶段不允许自动恢复：expected=${currentState.releaseCommit} actual=${input.headSha}`);
     }
     return { type: 'resume', value: currentState };
   }
@@ -513,7 +514,7 @@ function assertNoActiveReleaseWorkflow(replacementCommit) {
 function isSupersededUnstartedReleaseRun(run, replacementCommit, remoteMainSha) {
   const createdAtMs = Date.parse(run.createdAt ?? '');
   // 重新绑定发生在新候选 push 之前；安全链必须是“幽灵提交 < 当前远程 main < 本地新候选”。
-  // 旧 Workflow 即使随后苏醒，也会在公开写入预检中因不再等于 origin/main 而失败。
+  // 旧 Workflow 即使随后苏醒，也会在公开写入预检中因不再等于 origin 的发行分支而失败。
   if (
     run.status !== 'queued' ||
     !run.headSha ||
@@ -571,7 +572,7 @@ function formatReleaseCandidate(state) {
   if (!['initialized', 'notes_generated', 'release_committed'].includes(state.phase)) return;
   const currentHead = git(['rev-parse', 'HEAD']);
   const expectedHead = state.releaseCommit ?? state.sourceHead;
-  if (currentHead !== expectedHead) throw new Error(`格式检查前本地 main 已偏离候选提交：expected=${expectedHead} actual=${currentHead}`);
+  if (currentHead !== expectedHead) throw new Error(`格式检查前本地发行分支已偏离候选提交：expected=${expectedHead} actual=${currentHead}`);
   const worktreeStatus = git(['status', '--short']);
   if (worktreeStatus) throw new Error(`格式检查要求干净候选：\n${worktreeStatus}`);
   const paths = git(['diff', '--name-only', '--diff-filter=ACMR', `${state.baseTag}^{commit}`, currentHead, '--'])
@@ -645,14 +646,14 @@ function syncReleaseNotesSnapshot(state) {
   if (!existsSync(notesTarget)) throw new Error(`恢复发布缺少仓库 Release notes：${notesTarget}`);
   const notesDirectory = join(state.stateDirectory, 'notes');
   mkdirSync(notesDirectory, { recursive: true, mode: 0o700 });
-  const notesPath = join(notesDirectory, `Zeus-${state.version}-release-notes-draft.md`);
+  const notesPath = join(notesDirectory, `${distributionArtifactPrefix}-${state.version}-release-notes-draft.md`);
   copyFileSync(notesTarget, notesPath);
   state.notesPath = notesPath;
 }
 
 async function ensureReleaseNotes(state) {
   if (state.notesPath && existsSync(state.notesPath)) return;
-  if (git(['rev-parse', 'HEAD']) !== state.sourceHead) throw new Error('生成 Release notes 前本地 main 已偏离绑定的候选提交。');
+  if (git(['rev-parse', 'HEAD']) !== state.sourceHead) throw new Error('生成 Release notes 前本地发行分支已偏离绑定的候选提交。');
   const notesDirectory = join(state.stateDirectory, 'notes');
   mkdirSync(notesDirectory, { recursive: true, mode: 0o700 });
   await runStage('生成 Release notes', 'pnpm', ['release:notes:draft'], {
@@ -663,7 +664,7 @@ async function ensureReleaseNotes(state) {
     AUTOMATED_RELEASE: 'true',
     ZEUS_COMMAND_RUN_DIR: notesDirectory,
   });
-  const notesPath = join(notesDirectory, `Zeus-${state.version}-release-notes-draft.md`);
+  const notesPath = join(notesDirectory, `${distributionArtifactPrefix}-${state.version}-release-notes-draft.md`);
   if (!existsSync(notesPath)) throw new Error(`Release notes 阶段没有生成预期文件：${notesPath}`);
   state.notesPath = notesPath;
   state.phase = 'notes_generated';
@@ -673,7 +674,7 @@ async function ensureReleaseNotes(state) {
 async function ensureReleaseCommit(state) {
   const currentHead = git(['rev-parse', 'HEAD']);
   if (state.releaseCommit) {
-    if (currentHead !== state.releaseCommit) throw new Error(`本地 main 已偏离发布提交：expected=${state.releaseCommit} actual=${currentHead}`);
+    if (currentHead !== state.releaseCommit) throw new Error(`本地发行分支已偏离发布提交：expected=${state.releaseCommit} actual=${currentHead}`);
     return;
   }
   const notesTarget = `releases/${state.tag}.md`;
@@ -682,7 +683,7 @@ async function ensureReleaseCommit(state) {
     commitPreparedCandidate(state, notesTarget);
     return;
   }
-  if (currentHead !== state.sourceHead) throw new Error(`发布候选写入前 main 已变化：expected=${state.sourceHead} actual=${currentHead}`);
+  if (currentHead !== state.sourceHead) throw new Error(`发布候选写入前发行分支已变化：expected=${state.sourceHead} actual=${currentHead}`);
   const prepareDirectory = join(state.stateDirectory, 'prepare');
   mkdirSync(prepareDirectory, { recursive: true, mode: 0o700 });
   await runStage('写入版本与发布正文', 'pnpm', ['release:prepare'], {
@@ -761,15 +762,15 @@ async function ensureFastLocalGate(state) {
   });
   // 发布提交固定了 package.json 与 lockfile，typecheck 前必须让本机依赖与锁定内容一致，避免新增依赖只进入 lockfile、未落入 node_modules 时误判为源码错误。
   await runStage('同步锁定依赖', 'pnpm', ['install', '--frozen-lockfile'], process.env);
-  // 自动格式化和版本文件都已进入固定候选；必须在任何 main 推送前运行与 CI 相同的阻塞级检查。
+  // 自动格式化和版本文件都已进入固定候选；必须在任何发行分支推送前运行与 CI 相同的阻塞级检查。
   await runStage('本地阻塞级 TypeScript 检查', 'pnpm', ['typecheck'], process.env);
   const gateDirectory = join(state.stateDirectory, 'gate');
   mkdirSync(gateDirectory, { recursive: true, mode: 0o700 });
-  const summaryPath = join(gateDirectory, `Zeus-${state.version}-release-fast-preflight-summary.md`);
+  const summaryPath = join(gateDirectory, `${distributionArtifactPrefix}-${state.version}-release-fast-preflight-summary.md`);
   writeFileSync(
     summaryPath,
     [
-      `# Zeus ${state.version} 快速发布前置摘要`,
+      `# ${distributionAppName} ${state.version} 快速发布前置摘要`,
       '',
       `- 候选提交：${state.releaseCommit}`,
       `- 公开基线：${state.baseTag}`,
@@ -799,11 +800,11 @@ function ensureMainPushed(state) {
     return;
   }
   if (!remoteMainSha || capture('git', ['merge-base', '--is-ancestor', remoteMainSha, state.releaseCommit], true).status !== 0) {
-    throw new Error(`推送前 origin/main 已领先或分叉，拒绝自动合并或强推：remote=${remoteMainSha ?? 'missing'} release=${state.releaseCommit}`);
+    throw new Error(`推送前 origin 的发行分支已领先或分叉，拒绝自动合并或强推：remote=${remoteMainSha ?? 'missing'} release=${state.releaseCommit}`);
   }
   pushMainWithVerification(state);
   const pushedSha = resolveRemoteReference(`refs/heads/${zeusDistribution.releaseBranch}`);
-  if (pushedSha !== state.releaseCommit) throw new Error(`main 推送后远端提交不一致：expected=${state.releaseCommit} actual=${pushedSha ?? 'missing'}`);
+  if (pushedSha !== state.releaseCommit) throw new Error(`发行分支推送后远端提交不一致：expected=${state.releaseCommit} actual=${pushedSha ?? 'missing'}`);
   state.phase = 'main_pushed';
   writeState(state);
 }
@@ -822,7 +823,7 @@ async function ensurePublished(state) {
     WAIT_FOR_COMPLETION: 'true',
     ZEUS_COMMAND_RUN_DIR: publishDirectory,
   });
-  const publishResultPath = join(publishDirectory, `Zeus-${state.version}-publish-result.md`);
+  const publishResultPath = join(publishDirectory, `${distributionArtifactPrefix}-${state.version}-publish-result.md`);
   if (!existsSync(publishResultPath)) throw new Error(`公开发布没有生成预期回验结果：${publishResultPath}`);
   state.publishResultPath = publishResultPath;
   state.phase = 'published';
@@ -837,11 +838,11 @@ function assertReleaseHead(state) {
 
 function buildFinalResult(state) {
   return [
-    `# Zeus ${state.version} 端到端发布结果`,
+    `# ${distributionAppName} ${state.version} 端到端发布结果`,
     '',
     `- Release notes 范围：${state.baseTag}..${state.sourceHead}`,
     `- 发布提交：${state.releaseCommit}`,
-    `- main CI：${state.ciUrl ?? '快速发布未串行等待；verify:publish 已由 Release Workflow 执行'}`,
+    `- 发行分支 CI：${state.ciUrl ?? '快速发布未串行等待；verify:publish 已由 Release Workflow 执行'}`,
     `- GitHub Release：https://github.com/${repository}/releases/tag/${state.tag}`,
     `- 本地快速检查摘要：${state.gateSummaryPath}`,
     `- 公开资产回验：${state.publishResultPath}`,
@@ -1001,11 +1002,11 @@ function pushMainWithVerification(state) {
   if (!result.error && result.status === 0) return;
   const remoteMainSha = resolveRemoteReference(`refs/heads/${zeusDistribution.releaseBranch}`);
   if (remoteMainSha === state.releaseCommit) {
-    console.log(`main 推送返回异常，但远程已复验为目标提交 ${state.releaseCommit.slice(0, 12)}，继续安全续跑。`);
+    console.log(`发行分支推送返回异常，但远程已复验为目标提交 ${state.releaseCommit.slice(0, 12)}，继续安全续跑。`);
     return;
   }
-  const error = releaseCommandError('安全推送 main', 'git', args, result, timeout, 1, 1);
-  error.userReason = `${error.userReason}远程 main 仍未复验为目标提交，脚本不会盲目重复推送。`;
+  const error = releaseCommandError('安全推送发行分支', 'git', args, result, timeout, 1, 1);
+  error.userReason = `${error.userReason}远程发行分支仍未复验为目标提交，脚本不会盲目重复推送。`;
   throw error;
 }
 
@@ -1103,9 +1104,9 @@ function formatReleaseFailure(error) {
 
 function describeReleaseFailureImpact(state) {
   if (!state) return '尚未创建或改写发布版本，未执行发布提交、push、GitHub Release 或 Homebrew Tap 写入。';
-  if (['initialized', 'notes_generated'].includes(state.phase)) return `已保留 ${state.tag} 的本地恢复状态，尚未推送 main 或创建公开发布。`;
-  if (['release_committed', 'gate_passed'].includes(state.phase)) return `本地 ${state.tag} 发布提交已形成，但未确认 main 已推送，也未确认公开发布完成。`;
-  if (state.phase === 'main_pushed') return `main 已推送到 ${state.releaseCommit?.slice(0, 12) ?? '目标提交'}，公开 Release 与 Homebrew Tap 尚未确认完成。`;
+  if (['initialized', 'notes_generated'].includes(state.phase)) return `已保留 ${state.tag} 的本地恢复状态，尚未推送发行分支或创建公开发布。`;
+  if (['release_committed', 'gate_passed'].includes(state.phase)) return `本地 ${state.tag} 发布提交已形成，但未确认发行分支已推送，也未确认公开发布完成。`;
+  if (state.phase === 'main_pushed') return `发行分支已推送到 ${state.releaseCommit?.slice(0, 12) ?? '目标提交'}，公开 Release 与 Homebrew Tap 尚未确认完成。`;
   if (['published', 'completed'].includes(state.phase)) return `${state.tag} 已进入公开发布收尾阶段；必须以公开回验结果确认最终状态。`;
   return `已保留 ${state.tag} 的发布恢复状态，未完成阶段不会被冒充为成功。`;
 }

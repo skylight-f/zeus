@@ -1,3 +1,4 @@
+import { distributionAppName } from '../tooling/distribution.js';
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { calculateUncachedInputTokens, type CodexOfficialRateWindow, type UsageOverviewSnapshot, type UsageProviderSummary } from '@zeus/shared';
 import type { AppShellSettings, DashboardClient } from '../apiClient.js';
@@ -27,31 +28,31 @@ const copy = {
     signedOut: '未登录',
     unavailableStatus: '配额异常',
     removedStatus: '已移除',
-    officialAndLocal: '官方配额 + Zeus 本地统计',
-    localQuotaUnavailable: 'Zeus 本地统计；官方配额暂不可用',
-    localQuotaSignIn: 'Zeus 本地统计；登录后可查看官方配额',
-    today: '今日 Zeus Token',
-    todayShort: '今日 Zeus Token',
+    officialAndLocal: `官方配额 + ${distributionAppName} 本地统计`,
+    localQuotaUnavailable: `${distributionAppName} 本地统计；官方配额暂不可用`,
+    localQuotaSignIn: `${distributionAppName} 本地统计；登录后可查看官方配额`,
+    today: `今日 ${distributionAppName} Token`,
+    todayShort: `今日 ${distributionAppName} Token`,
     todaySummary: '今日',
-    sevenDays: '近 7 日 Zeus Token',
-    sevenDaysShort: '近 7 日 Zeus',
+    sevenDays: `近 7 日 ${distributionAppName} Token`,
+    sevenDaysShort: `近 7 日 ${distributionAppName}`,
     sevenDaysSummary: '近 7 日',
     cache: '缓存命中率',
     cacheUnsupported: '供应源未提供',
     cost: '近 7 日估算费用',
     costShort: '7 日估算费用',
     noPrice: '暂无价格',
-    localEstimate: 'Zeus 本地估算',
-    localUsage: 'Zeus 本地统计',
-    localUsageIncomplete: 'Zeus 本地记录不完整',
-    recentUsage: 'Zeus 本地 Token',
+    localEstimate: `${distributionAppName} 本地估算`,
+    localUsage: `${distributionAppName} 本地统计`,
+    localUsageIncomplete: `${distributionAppName} 本地记录不完整`,
+    recentUsage: `${distributionAppName} 本地 Token`,
     accountRecentUsage: 'Codex 账户 Token',
     officialUsageUnavailable: '官方账户暂未提供日用量',
     insufficientHistory: '用量积累后显示趋势',
     missingDay: '暂无数据',
     fullStatistics: '用量详情',
-    showZeus: '显示 Zeus',
-    quitZeus: '退出 Zeus',
+    showZeus: `显示 ${distributionAppName}`,
+    quitZeus: `退出 ${distributionAppName}`,
     retry: '重新读取',
     refreshed: '刷新',
     stale: '上次成功结果',
@@ -79,31 +80,31 @@ const copy = {
     signedOut: 'Signed out',
     unavailableStatus: 'Quota error',
     removedStatus: 'Removed',
-    officialAndLocal: 'Official quota + Zeus local stats',
-    localQuotaUnavailable: 'Zeus local stats; official quota unavailable',
-    localQuotaSignIn: 'Zeus local stats; sign in for official quota',
-    today: 'Zeus tokens today',
-    todayShort: 'Zeus today',
+    officialAndLocal: `Official quota + ${distributionAppName} local stats`,
+    localQuotaUnavailable: `${distributionAppName} local stats; official quota unavailable`,
+    localQuotaSignIn: `${distributionAppName} local stats; sign in for official quota`,
+    today: `${distributionAppName} tokens today`,
+    todayShort: `${distributionAppName} today`,
     todaySummary: 'Today',
-    sevenDays: 'Zeus tokens in 7 days',
-    sevenDaysShort: 'Zeus · 7 days',
+    sevenDays: `${distributionAppName} tokens in 7 days`,
+    sevenDaysShort: `${distributionAppName} · 7 days`,
     sevenDaysSummary: '7 days',
     cache: 'Cache hit rate',
     cacheUnsupported: 'Not provided',
     cost: 'Estimated cost · 7 days',
     costShort: '7-day estimate',
     noPrice: 'No pricing',
-    localEstimate: 'Zeus local estimate',
-    localUsage: 'Zeus local usage',
-    localUsageIncomplete: 'Incomplete Zeus local history',
-    recentUsage: 'Zeus local tokens',
+    localEstimate: `${distributionAppName} local estimate`,
+    localUsage: `${distributionAppName} local usage`,
+    localUsageIncomplete: `Incomplete ${distributionAppName} local history`,
+    recentUsage: `${distributionAppName} local tokens`,
     accountRecentUsage: 'Codex account tokens',
     officialUsageUnavailable: 'Official daily account usage is unavailable',
     insufficientHistory: 'A trend appears after usage is recorded',
     missingDay: 'No data',
     fullStatistics: 'Usage details',
-    showZeus: 'Show Zeus',
-    quitZeus: 'Quit Zeus',
+    showZeus: `Show ${distributionAppName}`,
+    quitZeus: `Quit ${distributionAppName}`,
     retry: 'Reload',
     refreshed: 'Refreshed',
     stale: 'Last successful result',
@@ -206,14 +207,19 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
   const freshness = updatedAt ? formatUpdatedAt(updatedAt, surfaceSettings.language, error ? text.stale : text.refreshed) : loading ? text.loading : error ? text.failed : text.loading;
 
   return (
-    <main className="menu-bar-usage-root" data-appearance={surfaceSettings.appearance} lang={surfaceSettings.language} aria-label={surfaceSettings.language === 'zh-CN' ? 'Zeus 菜单栏用量浮窗' : 'Zeus menu bar usage'}>
+    <main
+      className="menu-bar-usage-root"
+      data-appearance={surfaceSettings.appearance}
+      lang={surfaceSettings.language}
+      aria-label={surfaceSettings.language === 'zh-CN' ? `${distributionAppName} 菜单栏用量浮窗` : `${distributionAppName} menu bar usage`}
+    >
       <section className="menu-bar-usage-surface">
         <header className="menu-bar-usage-header">
           <span className="menu-bar-usage-identity">
             <span className="menu-bar-usage-mark" aria-hidden="true">
-              Z
+              {distributionAppName.charAt(0)}
             </span>
-            <strong>Zeus</strong>
+            <strong>{distributionAppName}</strong>
           </span>
           <span className="menu-bar-usage-refresh-status">
             <small className="menu-bar-usage-freshness" data-stale={stale && !loading ? 'true' : 'false'} aria-live="polite" title={freshness}>

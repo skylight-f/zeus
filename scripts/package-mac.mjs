@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 import { verifyPackagedApp } from './verify-packaged-app-health.mjs';
 import { cleanPackageArtifacts } from './clean-package-artifacts.mjs';
+import { distributionArtifactPrefix, distributionPackageIdentity } from './desktop-distribution.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(scriptDir, '..');
@@ -24,7 +25,7 @@ export function electronDistDirName(version, arch) {
 /** 日常产物默认使用测试身份，正式发布必须显式选择。 */
 export function packagedAppPathForArch(arch, variant = 'test', requestedOutputRoot) {
   const outputRoot = requestedOutputRoot ?? (variant === 'test' ? join(rootDir, 'dist', 'test') : join(rootDir, 'dist'));
-  const appName = variant === 'test' ? 'Zeus Test.app' : 'Zeus.app';
+  const appName = `${distributionPackageIdentity(variant).name}.app`;
   return join(outputRoot, arch === 'arm64' ? 'mac-arm64' : 'mac', appName);
 }
 
@@ -205,7 +206,16 @@ export async function packageMac({ dmg = false } = {}) {
   const signingArgs = buildElectronBuilderSigningArgs(packageEnv, variant);
   const electronDistArgs = electronDist ? [`--config.electronDist=${electronDist}`] : [];
   const outputArgs = configuredOutputRoot ? [`--config.directories.output=${outputRoot}`] : [];
-  await run('pnpm', ['--filter', '@zeus/desktop', 'exec', 'electron-builder', '--mac', ...(dmg ? ['dmg'] : ['--dir']), '--config', builderConfig, ...electronDistArgs, ...outputArgs, ...signingArgs], {
+  const identity = distributionPackageIdentity(variant);
+  const artifactPrefix = variant === 'test' ? 'Zeus-Test' : distributionArtifactPrefix;
+  const brandingArgs = [
+    `--config.productName=${identity.name}`,
+    `--config.mac.executableName=${identity.executable}`,
+    `--config.artifactName=${artifactPrefix}-\${version}-\${arch}.\${ext}`,
+    `--config.dmg.title=${identity.name}`,
+    `--config.dmg.artifactName=${artifactPrefix}-\${version}-\${arch}.dmg`,
+  ];
+  await run('pnpm', ['--filter', '@zeus/desktop', 'exec', 'electron-builder', '--mac', ...(dmg ? ['dmg'] : ['--dir']), '--config', builderConfig, ...brandingArgs, ...electronDistArgs, ...outputArgs, ...signingArgs], {
     cwd: rootDir,
     env: packageEnv,
   });

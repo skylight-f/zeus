@@ -1,3 +1,4 @@
+import { distributionAppName } from '../../tooling/distribution.js';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { temporaryWorkspaceId, normalizeSidebarConversationFilters, sidebarConversationRunStatusGroup, sidebarConversationRunStatusGroups, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
 import { Collapsible } from '../../ui/Collapsible.js';
@@ -1320,7 +1321,9 @@ export function SidebarNav(props: {
       <div className="project-window-control-reserved-space" aria-hidden="true" />
       {props.mainLayout === 'upstream' ? (
         <nav className="project-quick-actions codex-source-list-quick-actions" aria-label={copy.quickActionsLabel}>
-          <strong className="project-sidebar-brand">Zeus</strong>
+          <strong className="project-sidebar-brand" title={distributionAppName === 'Zeus' ? undefined : '基于 Zeus'}>
+            {distributionAppName}
+          </strong>
           <button type="button" className="project-quick-action" onClick={props.onCreateConversation} disabled={!props.activeProjectId}>
             <span className="project-quick-action-icon" aria-hidden="true">
               <svg viewBox="0 0 20 20" focusable="false">
@@ -1726,27 +1729,27 @@ export function AutomaticUpdateIndicatorButton(props: { state: AutomaticUpdateIn
   const label =
     props.state.phase === 'ready'
       ? zh
-        ? `Zeus ${version} 等待重启`
-        : `Zeus ${version} ready to restart`
+        ? `${distributionAppName} ${version} 等待重启`
+        : `${distributionAppName} ${version} ready to restart`
       : props.state.phase === 'downloaded'
         ? zh
-          ? `Zeus ${version} 等待手动安装`
-          : `Zeus ${version} ready for manual installation`
+          ? `${distributionAppName} ${version} 等待手动安装`
+          : `${distributionAppName} ${version} ready for manual installation`
         : props.state.phase === 'manual'
           ? zh
-            ? `Zeus ${version} · 下载新版`
-            : `Zeus ${version} · Download new version`
+            ? `${distributionAppName} ${version} · 下载新版`
+            : `${distributionAppName} ${version} · Download new version`
           : props.state.phase === 'retrying'
             ? zh
-              ? `Zeus ${version} 等待重试`
-              : `Zeus ${version} waiting to retry`
+              ? `${distributionAppName} ${version} 等待重试`
+              : `${distributionAppName} ${version} waiting to retry`
             : props.state.phase === 'preparing'
               ? zh
-                ? `正在下载 Zeus ${version}${progress ? ` · ${progress}` : ''}`
-                : `Downloading Zeus ${version}${progress ? ` · ${progress}` : ''}`
+                ? `正在下载 ${distributionAppName} ${version}${progress ? ` · ${progress}` : ''}`
+                : `Downloading ${distributionAppName} ${version}${progress ? ` · ${progress}` : ''}`
               : zh
-                ? `Zeus ${version} 可用`
-                : `Zeus ${version} available`;
+                ? `${distributionAppName} ${version} 可用`
+                : `${distributionAppName} ${version} available`;
   const icon =
     props.state.phase === 'ready' || props.state.phase === 'downloaded' ? (
       <CheckCircle aria-hidden="true" weight="fill" />

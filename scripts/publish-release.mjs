@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { releaseTag, assertDistributionVersions } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
@@ -40,7 +41,7 @@ async function main() {
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
 
   const preflight = collectPreflight({ releaseVersion, tag, requireAppleDistribution, localGateSummaryPath });
-  const planPath = join(outputDirectory, `Zeus-${releaseVersion}-publish-${applyRemote ? 'execution' : 'plan'}.md`);
+  const planPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-publish-${applyRemote ? 'execution' : 'plan'}.md`);
   writeFileSync(planPath, buildPlan(preflight, { releaseVersion, tag, applyRemote, requireAppleDistribution, waitForCompletion }), { mode: 0o600 });
   console.log(`ZEUS_ARTIFACT_FILE=${planPath}`);
 
@@ -73,7 +74,7 @@ async function main() {
   }
 
   if (workflowRun && !waitForCompletion) {
-    const resultPath = join(outputDirectory, `Zeus-${releaseVersion}-publish-dispatched.md`);
+    const resultPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-publish-dispatched.md`);
     writeFileSync(resultPath, buildDispatchedResult({ releaseVersion, tag, headSha: preflight.headSha, workflowRun }), { mode: 0o600 });
     console.log(`Release Workflow 已触发：${workflowRun.url}`);
     console.log(`ZEUS_ARTIFACT_FILE=${resultPath}`);
@@ -88,7 +89,7 @@ async function main() {
   if (!release.exists) throw new Error(`Release Workflow 结束后仍未找到 GitHub Release：${tag}`);
 
   const verification = await verifyPublishedRelease({ releaseVersion, tag, headSha: preflight.headSha, release, outputDirectory, workflowRun, requireAppleDistribution, deepVerifyPublicDmg });
-  const resultPath = join(outputDirectory, `Zeus-${releaseVersion}-publish-result.md`);
+  const resultPath = join(outputDirectory, `${distributionArtifactPrefix}-${releaseVersion}-publish-result.md`);
   writeFileSync(resultPath, buildPublishResult(verification), { mode: 0o600 });
   console.log(`公开发布与${deepVerifyPublicDmg ? '完整 DMG' : '轻量资产'}对账通过：${resultPath}`);
   for (const path of [resultPath, verification.releaseNotesSnapshotPath, verification.manifestSnapshotPath, verification.caskSnapshotPath]) {
@@ -116,11 +117,11 @@ function collectPreflight(input) {
   let packageVersion = null;
   let desktopVersion = null;
 
-  if (branch !== zeusDistribution.releaseBranch) blockers.push(`当前分支必须是 main，实际为 ${branch}`);
+  if (branch !== zeusDistribution.releaseBranch) blockers.push(`当前分支必须是配置的发行分支，实际为 ${branch}`);
   if (worktreeStatus) blockers.push('工作区必须干净');
   if (!isExpectedOrigin(originUrl)) blockers.push(`origin 不是 ${repository}：${originUrl}`);
-  if (!remoteMainSha) blockers.push('无法读取 origin/main 远程提交');
-  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin/main 不一致：local=${headSha} remote=${remoteMainSha}`);
+  if (!remoteMainSha) blockers.push('无法读取 origin 的发行分支远程提交');
+  else if (remoteMainSha !== headSha) blockers.push(`本地 HEAD 与 origin 的发行分支不一致：local=${headSha} remote=${remoteMainSha}`);
   if (ghAuth.status !== 0) blockers.push(`GitHub CLI 未完成可用登录：${commandFailureDetail(ghAuth)}`);
 
   try {
@@ -191,18 +192,18 @@ function collectPreflight(input) {
 
 function buildPlan(preflight, input) {
   return [
-    `# Zeus ${input.releaseVersion} 公开发布${input.applyRemote ? '执行前置' : '计划'}`,
+    `# ${distributionAppName} ${input.releaseVersion} 公开发布${input.applyRemote ? '执行前置' : '计划'}`,
     '',
     '## 候选事实',
     '',
     `- 标签：${input.tag}`,
     `- 分支：${preflight.branch}`,
     `- 候选提交：${preflight.headSha}`,
-    `- origin/main：${preflight.remoteMainSha || '未读取到'}`,
+    `- origin 的发行分支：${preflight.remoteMainSha || '未读取到'}`,
     `- 根包／桌面包版本：${preflight.packageVersion ?? '未读取到'} / ${preflight.desktopVersion ?? '未读取到'}`,
     `- Release notes：${preflight.releaseNotesPath}`,
     `- 本地快速检查摘要：${preflight.localGateSummaryPath || '未提供'}`,
-    `- main CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
+    `- 发行分支 CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,
     `- 本地／远程标签：${preflight.localTagSha || '无'} / ${preflight.remoteTagSha || '无'}`,
     `- GitHub Release：${preflight.release.exists ? preflight.release.data.url : '无'}`,
     `- GitHub CLI 登录：${preflight.ghAuthenticated ? '可用' : '不可用'}`,
@@ -228,7 +229,7 @@ function buildPlan(preflight, input) {
     '',
     '## 不在本命令中执行',
     '',
-    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入 main。',
+    '- 不创建或合入 PR；候选改动必须在进入本命令前已通过正常代码交付进入发行分支。',
     '- 不强推、不改写已存在标签、不删除失败发布留下的标签。',
     '- Workflow 在阻塞检查通过前不创建标签；失败后可对同一候选提交幂等重试。',
     '',
@@ -237,7 +238,7 @@ function buildPlan(preflight, input) {
 
 function buildDispatchedResult(input) {
   return [
-    `# Zeus ${input.releaseVersion} 公开发布已触发`,
+    `# ${distributionAppName} ${input.releaseVersion} 公开发布已触发`,
     '',
     `- 标签：${input.tag}`,
     `- 提交：${input.headSha}`,
@@ -258,7 +259,7 @@ async function verifyPublishedRelease(input) {
   const actualNotes = normalizeText(input.release.data.body ?? '');
   if (actualNotes !== expectedNotes) throw new Error('GitHub Release notes 与标签候选的仓库 Release notes 不一致。');
 
-  const expectedDmgName = `Zeus-${input.releaseVersion}-arm64.dmg`;
+  const expectedDmgName = `${distributionArtifactPrefix}-${input.releaseVersion}-arm64.dmg`;
   const expectedAssets = new Set([expectedDmgName, 'zeus-release-manifest.json']);
   const actualAssets = input.release.data.assets ?? [];
   const actualAssetNames = new Set(actualAssets.map((asset) => asset.name));
@@ -350,7 +351,7 @@ async function verifyPublishedRelease(input) {
 
 function buildPublishResult(input) {
   return [
-    `# Zeus ${input.releaseVersion} 公开发布结果`,
+    `# ${distributionAppName} ${input.releaseVersion} 公开发布结果`,
     '',
     `- 标签：${input.tag}`,
     `- 发布提交：${input.headSha}`,
@@ -379,8 +380,8 @@ function optionalFile(rawValue, name) {
 
 function validateLocalGateSummary(path, version, headSha) {
   const content = readFileSync(path, 'utf8');
-  const validTitle = content.includes(`# Zeus ${version} 快速发布前置摘要`) || content.includes(`# Zeus ${version} 发布门禁摘要`);
-  if (!validTitle) throw new Error(`本地检查摘要与候选版本不一致，缺少 Zeus ${version} 标题。`);
+  const validTitle = content.includes(`# ${distributionAppName} ${version} 快速发布前置摘要`) || content.includes(`# ${distributionAppName} ${version} 发布门禁摘要`);
+  if (!validTitle) throw new Error(`本地检查摘要与候选版本不一致，缺少 ${distributionAppName} ${version} 标题。`);
   for (const expected of [`- 候选提交：${headSha}`]) {
     if (!content.includes(expected)) throw new Error(`本地检查摘要与候选版本不一致，缺少：${expected}`);
   }

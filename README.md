@@ -107,6 +107,8 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 
 ## 发行配置与发布
 
+应用展示名由 `packages/distribution/src/config.json` 的 `appName` 配置，缺省为 Zeus；正式应用包、安装包、更新器与发布说明共用此名称。该配置不改变 Bundle ID、数据目录或更新协议，测试包保持 `Zeus Test`。派生发行改名后的首次安装需手动完成。
+
 应用版本统一由根目录 `package.json` 维护，桌面包同步该版本，发布标签使用 `v<版本>`。更新来源为 `imchenway/zeus`，Homebrew 使用 `imchenway/tap/zeus`。
 
 - `pnpm release:config`：检查发行来源及应用版本一致性。
