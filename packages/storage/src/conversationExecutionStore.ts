@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { randomId } from './randomId.js';
 import type { ArtifactRef } from './artifactStore.js';
 import type { ZeusDatabasePort } from './databasePort.js';
+import { conversationProcessProviderItemId } from '@zeus/shared';
+import { ConversationTranscriptRepository, hashConversationTranscriptContent, providerEntryId } from './conversationTranscriptStore.js';
 
 export const conversationSchemaGeneration = '2026-08-16-unified-conversation-segments';
 
@@ -26,6 +28,8 @@ export interface ConversationExecutionSnapshotRecord {
   permissionMode: string;
   collaborationMode: string;
   workspaceIdentityJson: string;
+  /** 冻结目标与能力来源；引擎实际回执另存配置证据。 */
+  contextCapacityJson: string;
   routeFingerprint: string;
   createdAt: string;
 }
@@ -268,6 +272,8 @@ interface ExecutionSnapshotInput {
   permissionMode: string;
   collaborationMode: string;
   workspaceIdentity: unknown;
+  /** 当前分段计划使用的预算与真实模型容量。 */
+  contextCapacity?: unknown;
   createdAt: string;
 }
 
@@ -337,6 +343,8 @@ export function migrateUnifiedConversationStoreSchema(db: ZeusDatabasePort): voi
       workspace_identity_json TEXT NOT NULL, route_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL
     )
   `);
+  addColumn(db, 'conversations', 'context_capacity_tokens', 'INTEGER CHECK (context_capacity_tokens IS NULL OR context_capacity_tokens > 0)');
+  addColumn(db, 'conversation_execution_snapshots', 'context_capacity_json', "TEXT NOT NULL DEFAULT 'null'");
   db.execute(`CREATE INDEX IF NOT EXISTS idx_conversation_execution_snapshots ON conversation_execution_snapshots(conversation_id, created_at, id)`);
   db.execute(`
     CREATE TABLE IF NOT EXISTS conversation_runtime_segments (
@@ -576,7 +584,13 @@ export function migrateUnifiedConversationStoreSchema(db: ZeusDatabasePort): voi
 
 /** 统一会话账本仓储；运行适配器不得自行维护产品队列或切换状态。 */
 export class ConversationExecutionRepository {
-  constructor(private readonly db: ZeusDatabasePort) {}
+  /** 会话显示身份与位置索引。 */
+  private readonly transcript: ConversationTranscriptRepository;
+
+  /** 绑定共享 SQLite，并确保业务事实与显示位置处于同一事务。 */
+  constructor(private readonly db: ZeusDatabasePort) {
+    this.transcript = new ConversationTranscriptRepository(db);
+  }
 
   setDispatchEnabled(enabled: boolean): void {
     this.db.execute(`UPDATE conversation_store_metadata SET dispatch_enabled = ? WHERE singleton = 1 AND schema_generation = ?`, [enabled ? 1 : 0, conversationSchemaGeneration]);
@@ -598,8 +612,8 @@ export class ConversationExecutionRepository {
       `INSERT INTO conversation_execution_snapshots
        (id, conversation_id, runtime_kind, connection_id, credential_slot_id, endpoint_identity,
         protocol_family, model_id, effort, service_tier, permission_mode, collaboration_mode,
-        workspace_identity_json, route_fingerprint, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        workspace_identity_json, route_fingerprint, created_at, context_capacity_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         input.conversationId,
@@ -616,6 +630,7 @@ export class ConversationExecutionRepository {
         workspaceIdentityJson,
         routeFingerprint,
         input.createdAt,
+        JSON.stringify(input.contextCapacity ?? null),
       ],
     );
     return this.getExecutionSnapshot(id)!;
@@ -1077,52 +1092,58 @@ export class ConversationExecutionRepository {
     capabilityLoss?: unknown;
     confirmedAt: string;
   }): ConversationModelHistoryRecord {
-    if (input.role === 'user') {
-      /** 本地提交或同轮原生消息均可确认身份；旧问题答复的原生身份保存在来源字段中。 */
-      const providerItemId = stringOrNull(parseJsonRecord(input.content).providerItemId) ?? stringOrNull(parseJsonRecord(input.reasoningSource).itemId);
-      /** 仅复用用户历史，不把同一提交的模型回复或工具活动合并进来。 */
-      const existing = this.db.get<ModelHistoryRow>(
-        `SELECT * FROM conversation_model_history
+    return this.db.transaction(() => {
+      if (input.role === 'user') {
+        /** 本地提交或同轮原生消息均可确认身份；旧问题答复的原生身份保存在来源字段中。 */
+        const providerItemId = stringOrNull(parseJsonRecord(input.content).providerItemId) ?? stringOrNull(parseJsonRecord(input.reasoningSource).itemId);
+        /** 仅复用用户历史，不把同一提交的模型回复或工具活动合并进来。 */
+        const existing = this.db.get<ModelHistoryRow>(
+          `SELECT * FROM conversation_model_history
           WHERE conversation_id = ? AND role = 'user'
             AND (submission_id = ? OR (turn_id = ? AND segment_id = ? AND (
               CASE WHEN json_valid(content_json) THEN json_extract(content_json, '$.providerItemId') END = ?
               OR CASE WHEN json_valid(reasoning_source_json) THEN json_extract(reasoning_source_json, '$.itemId') END = ?
             )))
           ORDER BY sequence LIMIT 1`,
-        [input.conversationId, input.submissionId ?? null, input.turnId, input.segmentId, providerItemId, providerItemId],
-      );
-      if (existing) {
-        // 回显可能先于发送回执写入；沿用历史序号补齐提交身份，避免冷开时丢失客户端关联。
-        if (!existing.submission_id && input.submissionId) {
-          this.db.execute(`UPDATE conversation_model_history SET submission_id = ? WHERE id = ?`, [input.submissionId, existing.id]);
-          existing.submission_id = input.submissionId;
+          [input.conversationId, input.submissionId ?? null, input.turnId, input.segmentId, providerItemId, providerItemId],
+        );
+        if (existing) {
+          // 回显可能先于发送回执写入；沿用历史序号补齐提交身份，避免冷开时丢失客户端关联。
+          if (!existing.submission_id && input.submissionId) {
+            this.db.execute(`UPDATE conversation_model_history SET submission_id = ? WHERE id = ?`, [input.submissionId, existing.id]);
+            existing.submission_id = input.submissionId;
+          }
+          const record = mapModelHistory(existing);
+          this.registerModelHistoryTranscript(record, input);
+          return record;
         }
-        return mapModelHistory(existing);
       }
-    }
-    const sequence = this.nextSequence(input.conversationId, 'model_history_sequence');
-    const id = `conversation_model_history_${randomId(12)}`;
-    this.db.execute(
-      `INSERT INTO conversation_model_history
+      const sequence = this.nextSequence(input.conversationId, 'model_history_sequence');
+      const id = `conversation_model_history_${randomId(12)}`;
+      this.db.execute(
+        `INSERT INTO conversation_model_history
        (id, conversation_id, sequence, turn_id, submission_id, segment_id, role, content_json,
         reasoning_source_json, tool_pair_id, capability_loss_json, confirmed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        input.conversationId,
-        sequence,
-        input.turnId,
-        input.submissionId ?? null,
-        input.segmentId,
-        input.role,
-        JSON.stringify(input.content),
-        input.reasoningSource === undefined ? null : JSON.stringify(input.reasoningSource),
-        input.toolPairId ?? null,
-        input.capabilityLoss === undefined ? null : JSON.stringify(input.capabilityLoss),
-        input.confirmedAt,
-      ],
-    );
-    return this.modelHistoryById(id)!;
+        [
+          id,
+          input.conversationId,
+          sequence,
+          input.turnId,
+          input.submissionId ?? null,
+          input.segmentId,
+          input.role,
+          JSON.stringify(input.content),
+          input.reasoningSource === undefined ? null : JSON.stringify(input.reasoningSource),
+          input.toolPairId ?? null,
+          input.capabilityLoss === undefined ? null : JSON.stringify(input.capabilityLoss),
+          input.confirmedAt,
+        ],
+      );
+      const record = this.modelHistoryById(id)!;
+      this.registerModelHistoryTranscript(record, input);
+      return record;
+    });
   }
 
   confirmedModelHistory(conversationId: string, throughSequence?: number): ConversationModelHistoryRecord[] {
@@ -1245,26 +1266,32 @@ export class ConversationExecutionRepository {
     startedAt: string;
     completedAt?: string | null;
   }): ConversationProcessItemRecord {
-    const existing = input.sourceEventId ? this.processItemBySourceEventId(input.segmentId, input.sourceEventId) : undefined;
-    if (existing) {
-      this.db.execute(
-        `UPDATE conversation_process_items
+    return this.db.transaction(() => {
+      const existing = input.sourceEventId ? this.processItemBySourceEventId(input.segmentId, input.sourceEventId) : undefined;
+      if (existing) {
+        this.db.execute(
+          `UPDATE conversation_process_items
             SET status = ?, title = ?, detail_json = ?, completed_at = COALESCE(?, completed_at)
           WHERE id = ?`,
-        [input.status, input.title, JSON.stringify(input.detail), input.completedAt ?? null, existing.id],
-      );
-      return this.processItemById(existing.id)!;
-    }
-    const processSequence = this.nextSequence(input.conversationId, 'process_sequence');
-    const id = `conversation_process_${randomId(12)}`;
-    this.db.execute(
-      `INSERT INTO conversation_process_items
+          [input.status, input.title, JSON.stringify(input.detail), input.completedAt ?? null, existing.id],
+        );
+        const record = this.processItemById(existing.id)!;
+        this.registerProcessTranscript(record, input.detail);
+        return record;
+      }
+      const processSequence = this.nextSequence(input.conversationId, 'process_sequence');
+      const id = `conversation_process_${randomId(12)}`;
+      this.db.execute(
+        `INSERT INTO conversation_process_items
        (id, conversation_id, turn_id, segment_id, process_sequence, kind, status, title,
         detail_json, source_event_id, started_at, completed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, input.conversationId, input.turnId, input.segmentId, processSequence, input.kind, input.status, input.title, JSON.stringify(input.detail), input.sourceEventId ?? null, input.startedAt, input.completedAt ?? null],
-    );
-    return this.processItemById(id)!;
+        [id, input.conversationId, input.turnId, input.segmentId, processSequence, input.kind, input.status, input.title, JSON.stringify(input.detail), input.sourceEventId ?? null, input.startedAt, input.completedAt ?? null],
+      );
+      const record = this.processItemById(id)!;
+      this.registerProcessTranscript(record, input.detail);
+      return record;
+    });
   }
 
   /** 按运行分段和调用身份恢复过程，供后续结果补齐同一条调用。 */
@@ -1361,13 +1388,14 @@ export class ConversationExecutionRepository {
     return this.db.select<ModelRequestRow>(`SELECT * FROM conversation_model_requests WHERE conversation_id = ? AND turn_id = ? ORDER BY request_sequence`, [conversationId, turnId]).map(mapModelRequest);
   }
 
-  /** Provider 可能先发送 usage、后发送 contextCompaction item；item 到达后统一修正该内部轮次的请求类型。 */
-  markTurnModelRequestsAsContextCompaction(conversationId: string, turnId: string): void {
+  /** 压缩完成项可能晚于用量到达；仅修正其起止范围内的请求，避免吞掉同轮普通回答的容量回报。 */
+  markModelRequestsAsContextCompaction(conversationId: string, turnId: string, startedAt: string, completedAt: string): void {
     this.db.execute(
       `UPDATE conversation_model_requests
           SET request_kind = 'context_compaction'
-        WHERE conversation_id = ? AND turn_id = ? AND request_kind <> 'context_compaction'`,
-      [conversationId, turnId],
+        WHERE conversation_id = ? AND turn_id = ? AND request_kind <> 'context_compaction'
+          AND occurred_at >= ? AND occurred_at <= ?`,
+      [conversationId, turnId, startedAt, completedAt],
     );
   }
 
@@ -1582,6 +1610,80 @@ export class ConversationExecutionRepository {
     );
   }
 
+  /** 把确认历史关联到首次出现时已经确定的显示身份与位置。 */
+  private registerModelHistoryTranscript(
+    record: ConversationModelHistoryRecord,
+    input: {
+      conversationId: string;
+      turnId: string;
+      segmentId: string;
+      role: 'user' | 'assistant' | 'tool';
+      content: unknown;
+      submissionId?: string | null;
+      reasoningSource?: unknown;
+      toolPairId?: string | null;
+      capabilityLoss?: unknown;
+      confirmedAt: string;
+    },
+  ): void {
+    const content = parseJsonRecord(input.content);
+    const reasoning = parseJsonRecord(input.reasoningSource);
+    const providerItemId =
+      stringOrNull(content.providerItemId) ??
+      (content.agentKind === 'pi' || this.db.get<{ runtime_kind: string }>(`SELECT runtime_kind FROM conversation_runtime_segments WHERE id = ?`, [input.segmentId])?.runtime_kind === 'pi' ? stringOrNull(content.stageId) : null) ??
+      stringOrNull(reasoning.itemId) ??
+      stringOrNull(reasoning.providerItemId);
+    const reasoningBlock = input.role === 'assistant' && reasoning.readableSummary === true;
+    const facet = input.toolPairId ? 'tool_activity' : reasoningBlock ? 'reasoning_block' : 'body';
+    const clientMessageId = input.submissionId
+      ? (this.db.get<{ client_message_id: string | null }>(`SELECT client_message_id FROM conversation_submissions WHERE id = ? AND conversation_id = ?`, [input.submissionId, input.conversationId])?.client_message_id ?? null)
+      : null;
+    const preferredEntryId = input.role === 'user' && clientMessageId ? `user-message:${clientMessageId}` : providerItemId ? providerEntryId(input.segmentId, providerItemId, facet) : `history:${record.id}`;
+    const existingEnvelope = this.transcript.envelopeForEntry(input.conversationId, preferredEntryId);
+    const inheritedContentRevision = existingEnvelope?.sources.find((source) => source.domain === 'provider_item' && source.sourceId === providerItemId && source.facet === facet)?.contentRevision ?? null;
+    this.transcript.registerSource({
+      conversationId: input.conversationId,
+      sourceDomain: 'model_history',
+      sourceScope: input.segmentId,
+      sourceId: record.id,
+      facet,
+      preferredEntryId,
+      kind: input.role === 'user' ? 'ordinary_input' : input.toolPairId ? 'tool_activity' : 'content',
+      turnId: input.turnId,
+      segmentId: input.segmentId,
+      displayStageId: stringOrNull(content.stageId) ?? stringOrNull(reasoning.stageId),
+      startsStage: reasoningBlock,
+      firstSeenAt: input.confirmedAt,
+      orderingEvidence: providerItemId ? 'provider' : 'live',
+      contentHash: hashConversationTranscriptContent([input.content, input.reasoningSource, input.toolPairId, input.capabilityLoss]),
+      inheritedContentRevision,
+    });
+  }
+
+  /** 把过程开始、进度与终态持续更新到同一显示条目。 */
+  private registerProcessTranscript(record: ConversationProcessItemRecord, detail: unknown): void {
+    const detailRecord = parseJsonRecord(detail);
+    const providerItemId = conversationProcessProviderItemId(record.sourceEventId);
+    const facet = record.kind === 'reasoning' ? 'reasoning_block' : 'tool_activity';
+    this.transcript.registerSource({
+      conversationId: record.conversationId,
+      sourceDomain: 'process',
+      sourceScope: record.segmentId,
+      sourceId: record.id,
+      facet,
+      preferredEntryId: providerItemId ? providerEntryId(record.segmentId, providerItemId, facet) : `process:${record.id}`,
+      kind: 'tool_activity',
+      turnId: record.turnId,
+      segmentId: record.segmentId,
+      displayStageId: stringOrNull(detailRecord.stageId),
+      startsStage: record.kind === 'reasoning',
+      firstSeenAt: record.startedAt,
+      orderingEvidence: providerItemId ? 'provider' : 'live',
+      contentHash: hashConversationTranscriptContent([record.kind, record.status, record.title, record.detailJson, record.completedAt]),
+    });
+  }
+
+  /** 分配原业务集合自己的递增序号；这些序号不参与跨集合展示排序。 */
   private nextSequence(conversationId: string, column: 'timeline_sequence' | 'model_history_sequence' | 'sync_event_sequence' | 'process_sequence' | 'model_request_sequence'): number {
     this.db.execute(`INSERT OR IGNORE INTO conversation_sequence_counters (conversation_id) VALUES (?)`, [conversationId]);
     this.db.execute(`UPDATE conversation_sequence_counters SET ${column} = ${column} + 1 WHERE conversation_id = ?`, [conversationId]);
@@ -1963,6 +2065,8 @@ interface ExecutionSnapshotRow {
   permission_mode: string;
   collaboration_mode: string;
   workspace_identity_json: string;
+  /** 不可变计划，不混入运行回执。 */
+  context_capacity_json: string;
   route_fingerprint: string;
   created_at: string;
 }
@@ -2111,6 +2215,7 @@ function mapExecutionSnapshot(row: ExecutionSnapshotRow): ConversationExecutionS
     permissionMode: row.permission_mode,
     collaborationMode: row.collaboration_mode,
     workspaceIdentityJson: row.workspace_identity_json,
+    contextCapacityJson: row.context_capacity_json,
     routeFingerprint: row.route_fingerprint,
     createdAt: row.created_at,
   };

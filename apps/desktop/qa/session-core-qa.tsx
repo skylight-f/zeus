@@ -27,7 +27,7 @@ import { ModalPortal } from '../src/renderer/ui/ModalPortal.js';
 import { AsyncQuestionPanel } from '../src/renderer/session/AsyncQuestionMessage.js';
 import { normalizeRequestQuestions, RequestUserInputPanel } from '../src/renderer/session/PendingRequestSurface.js';
 import { PlanImplementationRequestSurface } from '../src/renderer/session/PlanImplementationRequestSurface.js';
-import { createInitialSessionState } from '../src/renderer/session/sessionReducer.js';
+import { createInitialSessionState, sessionReducer } from '../src/renderer/session/sessionReducer.js';
 import type { ComposerInputHandle } from '../src/renderer/session/MarkdownComposerEditor.js';
 import { buildTaskCreateInitialForm, getLanguageCopy, TaskCreateModal } from '../src/renderer/features/workspace/workspaceSupport.js';
 
@@ -40,13 +40,31 @@ interface QaScene {
 }
 
 const scenes: QaScene[] = [
+  {
+    query: 'tool-design',
+    title: '工具操作与文件资源',
+    summary: '真实会话组件的图标、状态和资源展示。',
+    answer: '',
+    activities: [
+      { type: 'dynamicToolCall', status: 'completed', payload: { namespace: 'zeus_browser', tool: 'open', arguments: { url: 'https://example.com/orders' }, success: true } },
+      { type: 'dynamicToolCall', status: 'completed', payload: { toolName: 'zeus_computer_get_app_state', arguments: { app: 'com.github.electron' }, output: JSON.stringify({ application: { name: 'Zeus Test' } }) } },
+      {
+        type: 'dynamicToolCall',
+        status: 'completed',
+        payload: { namespace: 'zeus_computer', tool: 'click', arguments: { app: 'com.github.electron' }, contentItems: [{ type: 'inputText', text: JSON.stringify({ status: 'waiting_for_user' }) }] },
+      },
+      { type: 'dynamicToolCall', status: 'completed', payload: { namespace: 'zeus_browser', tool: 'click', success: false } },
+      { type: 'commandExecution', status: 'completed', payload: { commandActions: [{ type: 'read', path: '/skills/accessibility/SKILL.md' }] } },
+      { type: 'commandExecution', status: 'completed', payload: { command: 'pnpm lint', exitCode: 2 } },
+    ],
+  },
   // 复用用户附件原文，覆盖时序图、流程图、语法错误与普通代码。
   {
     query: 'mermaid',
     title: '会话图表预览',
     summary: '共用 Markdown 渲染器的 Mermaid 预览与源码回退。',
     answer:
-      '## 附件原始时序图\n\n```mermaid\nsequenceDiagram\n    autonumber\n    participant U as 用户(前端)\n    participant A as SocialImportLogApplication<br/>(@Transactional)\n    participant P as SocialImportProvider\n    participant E as socialGoodsImportLookupExecutor<br/>(10 线程，独立池)\n    participant X as 第三方接口\n\n    U->>A: 提交 40 行文件 (needLookup=true)\n    A->>P: prepareProcessQuery(rows)\n    Note over P: 条码去重 40 → 20\n\n    par 滑动窗口，最多 10 个在飞\n        P->>E: submit(条码1)\n        P->>E: submit(条码2)\n        P->>E: ... 最多 10 个\n    end\n    E->>X: HTTP 并发查询\n    X-->>E: 结果\n    E-->>P: 完成一个 → 立刻补下一个\n    Note over P: 20 次外呼全部完成(约 222ms)\n\n    P->>P: 按 barcode → payload 回写 40 行\n    P-->>A: query 已填充\n    Note over A: 之后才是原有的批量落库逻辑\n    A-->>U: 导入结果\n```\n\n## 流程图\n\n```mermaid\nflowchart LR\n  A[开始] --> B{检查格式}\n  B -->|正确| C[显示预览]\n  B -->|错误| D[保留源码]\n```\n\n## 错误语法回退\n\n```mermaid\nflowchart LR\n  A[未闭合\n```\n\n## 普通代码保持原样\n\n```text\nsequenceDiagram\n  A->>B: 普通代码\n```',
+      '## 表格复制验收\n\n| 名称 | 值 |\n| :--- | ---: |\n| **中文** | `a\\|b` |\n| 空值 | |\n\n## 附件原始时序图\n\n```mermaid\nsequenceDiagram\n    autonumber\n    participant U as 用户(前端)\n    participant A as SocialImportLogApplication<br/>(@Transactional)\n    participant P as SocialImportProvider\n    participant E as socialGoodsImportLookupExecutor<br/>(10 线程，独立池)\n    participant X as 第三方接口\n\n    U->>A: 提交 40 行文件 (needLookup=true)\n    A->>P: prepareProcessQuery(rows)\n    Note over P: 条码去重 40 → 20\n\n    par 滑动窗口，最多 10 个在飞\n        P->>E: submit(条码1)\n        P->>E: submit(条码2)\n        P->>E: ... 最多 10 个\n    end\n    E->>X: HTTP 并发查询\n    X-->>E: 结果\n    E-->>P: 完成一个 → 立刻补下一个\n    Note over P: 20 次外呼全部完成(约 222ms)\n\n    P->>P: 按 barcode → payload 回写 40 行\n    P-->>A: query 已填充\n    Note over A: 之后才是原有的批量落库逻辑\n    A-->>U: 导入结果\n```\n\n## 流程图\n\n```mermaid\nflowchart LR\n  A[开始] --> B{检查格式}\n  B -->|正确| C[显示预览]\n  B -->|错误| D[保留源码]\n```\n\n## 错误语法回退\n\n```mermaid\nflowchart LR\n  A[未闭合\n```\n\n## 普通代码保持原样\n\n```text\nsequenceDiagram\n  A->>B: 普通代码\n```',
     activities: [],
   },
   { query: 'goal', title: '目标状态与继续执行', summary: '生产组件的目标详情和输入框对齐检查。', answer: '', activities: [] },
@@ -159,6 +177,7 @@ export function SessionQaApp(props: { scene: QaScene }) {
   useEffect(() => {
     window.zeus?.reportRendererBootstrapReady?.();
   }, []);
+  if (props.scene.query === 'tool-design') return <ToolDesignQa scene={props.scene} />;
   if (props.scene.query === 'mermaid') return <MermaidPreviewQa answer={props.scene.answer} />;
   if (props.scene.query === 'goal') return <GoalQa />;
   if (props.scene.query === 'navigation') return <NavigationQa />;
@@ -202,6 +221,66 @@ export function SessionQaApp(props: { scene: QaScene }) {
           </a>
         ))}
       </nav>
+    </main>
+  );
+}
+
+/** 直接挂载生产组件，切换主题和窄列检查，不复制图标或链接实现。 */
+function ToolDesignQa(props: { scene: QaScene }) {
+  /** 两种主题使用同一批操作，便于比较对比度。 */
+  const [dark, setDark] = useState(true);
+  /** 窄列覆盖长文件名换行，不改动生产正文列宽。 */
+  const [narrow, setNarrow] = useState(false);
+  /** 记录真实组件发出的打开目标；此页不冒充宿主文件打开验收。 */
+  const [opened, setOpened] = useState('尚未打开资源');
+  /** 与真实会话相同的资源结构，不依赖项目文件存在。 */
+  const document: ConversationResource = {
+    id: 'tool-design-doc',
+    kind: 'file',
+    presentation: 'inline',
+    displayName: '本轮设计记录',
+    projectRelativePath: 'docs/设计记录.md',
+    iconKind: 'markdown',
+    location: { line: 253 },
+    projectId: 'qa',
+    conversationId: 'qa',
+    turnId: 'qa',
+    itemId: 'qa',
+    createdAt: '',
+    updatedAt: '',
+  };
+  /** HTML 卡和源文件链接引用同一个本地资源。 */
+  const page: ConversationResource = { ...document, id: 'tool-design-html', displayName: '业务流程图', projectRelativePath: 'docs/流程图.html', iconKind: 'html', presentation: 'card', location: undefined };
+  /** 点击后核对组件的默认打开目标。 */
+  function open(resource: ConversationResource, target: ConversationOpenTarget): void {
+    setOpened(`${resource.displayName} → ${target}`);
+  }
+  return (
+    <main className={`macos-ai-app zeus-shell session-codex-parity-v1 qa-error-layout theme-${dark ? 'dark' : 'light'}`} data-theme={dark ? 'dark' : 'light'}>
+      <header className="qa-error-layout-heading">
+        <h1>{props.scene.title}</h1>
+        <nav>
+          <button type="button" onClick={() => setDark(!dark)}>
+            {dark ? '切换浅色' : '切换深色'}
+          </button>
+          <button type="button" onClick={() => setNarrow(!narrow)}>
+            {narrow ? '恢复宽列' : '检查窄列'}
+          </button>
+        </nav>
+      </header>
+      <section className="qa-error-layout-note" style={{ maxWidth: narrow ? 320 : 800 }}>
+        {props.scene.activities.map((_, index) => (
+          <SessionActivityGroup key={index} items={[activity(props.scene, index)]} language="zh-CN" category="tools" />
+        ))}
+        <p>
+          请查看 <ConversationInlineResource resource={document} label="本轮设计记录 (line 253)" language="zh-CN" onOpenResource={open} />。
+        </p>
+        <p>
+          <ConversationInlineResource resource={{ ...page, presentation: 'inline' }} label="订单与库存同步流程说明及异常处理记录文件名称换行验证.html" language="zh-CN" onOpenResource={open} />
+        </p>
+        <ConversationResourceCards resources={[page]} language="zh-CN" onOpenResource={open} />
+        <p role="status">{opened}</p>
+      </section>
     </main>
   );
 }
@@ -352,13 +431,19 @@ function QueueActionsQa() {
       id: `qa-submission-${index + 1}`,
       content: text,
       position: index + 1,
-      status: scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted' ? 'resolved' : scenario === 'queued' || scenario === 'restoring' ? 'queued' : 'paused',
+      status: scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted' ? 'resolved' : scenario === 'queued' || scenario === 'restoring' ? 'queued' : scenario === 'failed' ? 'failed' : 'paused',
       pausedReason: ['queued', 'accepted', 'restoring'].includes(scenario) ? null : scenario,
       providerTurnId: scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted' ? 'qa-turn' : null,
       createdAt: '2026-09-10T02:00:00Z',
       attachments: sample === 'attachment' ? [{ name: '排队消息说明.md', mime: 'text/markdown', size: 128, kind: 'file' as const, localPath: '/qa/排队消息说明.md' }] : [],
       error:
-        scenario === 'outcome_unknown' || scenario === 'recovery_required' ? { code: 'ZEUS_CODEX_RPC_PROTOCOL_ERROR', message: 'Codex 响应无法读取，已发出的操作需要核对结果。', recoveryRequired: scenario === 'recovery_required' } : null,
+        scenario === 'outcome_unknown'
+          ? { code: 'ZEUS_CODEX_RPC_PROTOCOL_ERROR', message: 'Codex 响应无法读取，已发出的操作需要核对结果。', recoveryRequired: true }
+          : scenario === 'recovery_required'
+            ? { code: 'ZEUS_NATIVE_PROVIDER_STATE_UNCONFIRMED', message: 'Provider thread state cannot confirm a safe idle dispatch boundary.' }
+            : scenario === 'failed' || scenario === 'preflight_failed'
+              ? { code: 'ZEUS_NATIVE_SUBMISSION_NOT_DISPATCHED', message: '消息在发送前失败。' }
+              : null,
     }))
     .filter((submission) => outcomes[submission.id] !== 'deleted');
   /** 已接纳消息恢复为普通历史，检查底栏消失后不会重复正文或遗留占位。 */
@@ -405,22 +490,25 @@ function QueueActionsQa() {
       throw new Error('预览操作失败，原消息保留。');
     }
     setOutcomes((current) => ({ ...current, [id]: outcome }));
-    setResult(`${outcome === 'accepted' ? '引导' : '删除'}回调已触发：${id}`);
+    setResult(`${outcome === 'accepted' ? '发送' : '删除'}回调已触发：${id}`);
   }
   /** 沿用既有运行检查，确认状态变化没有重新开放未知送达消息的操作。 */
   function checkActions(): void {
     /** 已接纳消息退出队列操作，其余按真实状态计算可见入口。 */
     const pendingCount = submissions.filter((submission) => submission.status !== 'resolved').length;
     /** 正常排队与已确认未发送可取消，恢复期间仍由生产权限控制。 */
-    const expectedDelete = ['queued', 'restoring', 'recovered_unsent'].includes(scenario) ? pendingCount : 0;
+    const expectedDelete = ['queued', 'restoring', 'recovered_unsent', 'preflight_failed'].includes(scenario) ? pendingCount : 0;
     /** 引导入口只在 queued 状态显示，不可用原因由生产组件说明。 */
     const expectedSteer = ['queued', 'restoring'].includes(scenario) ? pendingCount : 0;
-    /** 两种结果未知状态都仅提供检查处理状态。 */
-    const expectedCheck = ['outcome_unknown', 'recovery_required'].includes(scenario) ? pendingCount : 0;
+    /** 送达未知只检查；写前失败和待恢复消息提供先核对再发送的重试。 */
+    const expectedCheck = scenario === 'outcome_unknown' ? pendingCount : 0;
+    /** 无需错误详情也能重试已确认未发送的消息。 */
+    const expectedRetry = ['failed', 'preflight_failed', 'recovery_required', 'recovered_unsent'].includes(scenario) ? pendingCount : 0;
     if (
       surface.current?.querySelectorAll('.session-queued-thread-delete').length !== expectedDelete ||
       surface.current?.querySelectorAll('.session-queued-thread-steer').length !== expectedSteer ||
-      [...(surface.current?.querySelectorAll('button') ?? [])].filter((button) => button.textContent === (language === 'zh-CN' ? '检查处理状态' : 'Check processing status')).length !== expectedCheck
+      [...(surface.current?.querySelectorAll('button') ?? [])].filter((button) => button.textContent === (language === 'zh-CN' ? '检查处理状态' : 'Check processing status')).length !== expectedCheck ||
+      [...(surface.current?.querySelectorAll('button') ?? [])].filter((button) => button.textContent === (language === 'zh-CN' ? '重试' : 'Retry')).length !== expectedRetry
     )
       throw new Error(`队列操作检查失败：${scenario}`);
     setResult(`运行检查通过：${scenario} / ${sample} / ${language}`);
@@ -442,9 +530,9 @@ function QueueActionsQa() {
                 resetPreview();
               }}
             >
-              {['queued', 'restoring', 'outcome_unknown', 'recovery_required', 'recovered_unsent', 'accepted'].map((value, index) => (
+              {['queued', 'restoring', 'outcome_unknown', 'recovery_required', 'recovered_unsent', 'accepted', 'failed', 'preflight_failed'].map((value, index) => (
                 <option key={value} value={value}>
-                  {['正常排队', '正在恢复', '送达未知', '引导待核对', '已确认未发送', '已接纳'][index]}
+                  {['正常排队', '正在恢复', '送达未知', '等待恢复', '已确认未发送', '已接纳', '发送失败', '发送前准备失败'][index]}
                 </option>
               ))}
             </select>
@@ -490,6 +578,7 @@ function QueueActionsQa() {
           transcriptHydrated
           onSendQueuedNow={(id) => runAction(id, 'accepted')}
           onCancelQueuedSubmission={(id) => runAction(id, 'deleted')}
+          onRetryQueuedSubmission={(id) => runAction(id, 'accepted')}
           onRecoverQueue={() => setResult('检查处理状态回调已触发')}
         />
       </div>
@@ -2447,7 +2536,7 @@ function NavigationQa() {
   }, [streaming]);
   useEffect(() => () => cancelAnimationFrame(frameRef.current), []);
   /** 实际正文只投影已经读取的轮次。 */
-  const state = useMemo<NativeSessionState>(() => {
+  const baseState = useMemo<NativeSessionState>(() => {
     /** 时间线保持用户与答复的真实相对顺序。 */
     const items: NativeSessionItemBuffer[] = [...loaded]
       .sort((a, b) => a - b)
@@ -2466,7 +2555,7 @@ function NavigationQa() {
           type: role === 'user' ? 'userMessage' : 'agentMessage',
           phase: role === 'user' ? 'user' : 'final_answer',
           status: 'completed',
-          text: role === 'user' ? entry.prompt : entry.response.repeat(3) + (index === count - 1 ? ' 生成内容。'.repeat(revision % 200) : ''),
+          text: role === 'user' ? entry.prompt : entry.response.repeat(3),
           payload: {
             v2Sequence: entry.sequence + (role === 'user' ? 0 : 1),
             ...(taskHistory && role === 'user' ? { taskPushLayout: taskLayout } : {}),
@@ -2475,6 +2564,18 @@ function NavigationQa() {
               : {}),
           },
           resources: [],
+          transcript: {
+            placement: {
+              entryId: role === 'user' ? `user-message:${entry.clientUserMessageId ?? index}` : `answer-${index}`,
+              order: (index * 2 + (role === 'user' ? 1 : 2)) * 1024,
+              orderEpoch: 1,
+              placementRevision: 1,
+              turnId: entry.turnId,
+              openingInputId: `user-message:${entry.clientUserMessageId ?? index}`,
+              displayStageId: null,
+            },
+            sources: [{ domain: 'provider_item', scope: 'qa-navigation', sourceId: role === 'user' ? `user-${index}` : `answer-${index}`, facet: 'body', revision: 1, contentRevision: 1 }],
+          },
           updatedAt: entry.occurredAt,
         }));
       });
@@ -2483,7 +2584,7 @@ function NavigationQa() {
       conversationId,
       transportState: 'ready',
       conversationState: 'idle',
-      transcriptRevision: revision,
+      transcriptRevision: 0,
       pendingRequests: entries.flatMap((entry, index) =>
         entry.requestId && loaded.has(index)
           ? [
@@ -2515,7 +2616,37 @@ function NavigationQa() {
       ),
       terminalTurnIds: Object.fromEntries(entries.map((entry) => [entry.turnId, 'completed'])),
     };
-  }, [loaded, entries, revision, count, taskHistory, taskLayout, questionHistory, questionPayload, questionResponse, conversationId]);
+  }, [loaded, entries, count, taskHistory, taskLayout, questionHistory, questionPayload, questionResponse, conversationId]);
+
+  /** 持续生成经过正式归约器，使浏览器回归覆盖内容修订和增量投影。 */
+  const projectedState = useRef<{ base: NativeSessionState; state: NativeSessionState } | null>(null);
+  const state = useMemo(() => {
+    if (projectedState.current?.base !== baseState) projectedState.current = { base: baseState, state: baseState };
+    const previous = projectedState.current.state;
+    const answer = previous.items[`assistant-${count - 1}`];
+    if (!answer || !revision) return previous;
+    const transcript = { ...answer.transcript!, sources: answer.transcript!.sources.map((source) => ({ ...source, revision: revision + 1, contentRevision: revision + 1 })) };
+    const next = sessionReducer(previous, {
+      type: 'event_received',
+      event: {
+        id: `qa-delta-${revision}`,
+        type: 'conversation.item.completed',
+        createdAt: answer.updatedAt!,
+        payload: {
+          projectId: previous.projectId ?? '',
+          conversationId,
+          threadId: 'qa-navigation',
+          turnId: answer.turnId,
+          itemId: answer.providerItemId!,
+          itemType: answer.type,
+          textContent: entries[count - 1]!.response.repeat(3) + ' 生成内容。'.repeat(revision % 200),
+          transcript,
+        },
+      },
+    });
+    projectedState.current.state = next;
+    return next;
+  }, [baseState, revision, count, conversationId, entries]);
 
   /** 记录真实帧间隔、长任务和预览容器身份；采样本身不移动鼠标或正文。 */
   function recordFrames() {
@@ -2809,7 +2940,7 @@ function GoalHistoryQa(props: { initialGoal: NativeGoalSnapshot }) {
     const readable: NativeConversationReadableSnapshot = {
       snapshot: {
         schemaVersion: 2,
-        structureGeneration: '2026-09-03-conversation-stage-identity',
+        structureGeneration: '2026-09-16-transcript-placement',
         conversationSchemaGeneration: '2026-08-16-unified-conversation-segments',
         throughEventSeq: 0,
         eventStreamGeneration: null,
@@ -2823,7 +2954,7 @@ function GoalHistoryQa(props: { initialGoal: NativeGoalSnapshot }) {
       },
       history: {
         schemaVersion: 2,
-        structureGeneration: '2026-09-03-conversation-stage-identity',
+        structureGeneration: '2026-09-16-transcript-placement',
         conversationId: 'qa',
         kind: 'model_history',
         throughEventSeq: 0,

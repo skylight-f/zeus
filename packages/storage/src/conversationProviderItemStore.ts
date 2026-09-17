@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ZeusDatabasePort } from './databasePort.js';
 import type { ConversationAgentKind, ConversationItemPhase, ConversationItemStatus, ConversationItemType, ZeusConversationItemRecord } from './conversationItemTypes.js';
+import { ConversationTranscriptRepository, hashConversationTranscriptContent, providerEntryId, providerFacet } from './conversationTranscriptStore.js';
 
 export const conversationProviderItemStoreGeneration = '2026-08-25-provider-item-ingestion-v2';
 
@@ -203,7 +204,13 @@ function nextModelHistorySequence(db: ZeusDatabasePort, conversationId: string):
  * 这里仅保存流式预览和协议身份，避免重新制造第二套 UI 正文事实。
  */
 export class ConversationProviderItemRepository {
-  constructor(private readonly db: ZeusDatabasePort) {}
+  /** 会话显示身份与位置索引。 */
+  private readonly transcript: ConversationTranscriptRepository;
+
+  /** 绑定共享 SQLite，使活动内容与其显示位置共享事务。 */
+  constructor(private readonly db: ZeusDatabasePort) {
+    this.transcript = new ConversationTranscriptRepository(db);
+  }
 
   appendDelta(input: ProviderItemBaseInput & { delta: string; status?: ConversationItemStatus }): ZeusConversationItemRecord {
     const existing = this.getByProvider(input.providerThreadId, input.providerItemId);
@@ -350,14 +357,15 @@ export class ConversationProviderItemRepository {
       completedAt: string | null;
     },
   ): ZeusConversationItemRecord {
-    assertItemInput(input);
-    assertProviderItemIdentity(this.getByProvider(input.providerThreadId, input.providerItemId), input);
-    const text = boundedUtf8(input.textContent, maximumProjectionTextBytes);
-    const payload = boundedJsonProjection(input.payload, maximumProjectionPayloadBytes);
-    const truncated = text.truncated || payload.truncated;
-    const id = providerItemStateId(input.providerThreadId, input.providerItemId);
-    this.db.execute(
-      `INSERT INTO conversation_provider_item_states
+    return this.db.transaction(() => {
+      assertItemInput(input);
+      assertProviderItemIdentity(this.getByProvider(input.providerThreadId, input.providerItemId), input);
+      const text = boundedUtf8(input.textContent, maximumProjectionTextBytes);
+      const payload = boundedJsonProjection(input.payload, maximumProjectionPayloadBytes);
+      const truncated = text.truncated || payload.truncated;
+      const id = providerItemStateId(input.providerThreadId, input.providerItemId);
+      this.db.execute(
+        `INSERT INTO conversation_provider_item_states
        (id, conversation_id, turn_id, provider_thread_id, provider_turn_id, provider_item_id,
         item_type, status, phase, text_projection, payload_projection_json, projection_truncated,
         started_at, completed_at, updated_at, agent_kind, native_item_id, structure_generation)
@@ -378,28 +386,70 @@ export class ConversationProviderItemRepository {
          agent_kind = excluded.agent_kind,
          native_item_id = excluded.native_item_id,
          structure_generation = excluded.structure_generation`,
-      [
-        id,
-        input.conversationId,
-        input.turnId,
-        input.providerThreadId,
-        input.providerTurnId,
-        input.providerItemId,
-        input.itemType,
-        input.status,
-        input.phase,
-        text.value,
-        payload.value,
-        truncated ? 1 : 0,
-        input.startedAt,
-        input.completedAt,
-        input.updatedAt,
-        input.agentKind ?? 'codex',
-        input.nativeItemId ?? input.providerItemId,
-        conversationProviderItemStoreGeneration,
-      ],
-    );
-    return this.getByProvider(input.providerThreadId, input.providerItemId)!;
+        [
+          id,
+          input.conversationId,
+          input.turnId,
+          input.providerThreadId,
+          input.providerTurnId,
+          input.providerItemId,
+          input.itemType,
+          input.status,
+          input.phase,
+          text.value,
+          payload.value,
+          truncated ? 1 : 0,
+          input.startedAt,
+          input.completedAt,
+          input.updatedAt,
+          input.agentKind ?? 'codex',
+          input.nativeItemId ?? input.providerItemId,
+          conversationProviderItemStoreGeneration,
+        ],
+      );
+      const record = this.getByProvider(input.providerThreadId, input.providerItemId)!;
+      this.registerTranscript(record);
+      return record;
+    });
+  }
+
+  /** 首次 Provider 可见项确定位置，后续进度和终态只更新来源修订。 */
+  private registerTranscript(record: ZeusConversationItemRecord): void {
+    const segmentId =
+      this.db.get<{ id: string }>(
+        `SELECT id FROM conversation_runtime_segments
+          WHERE conversation_id = ? AND native_session_id = ?
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+        [record.conversationId, record.providerThreadId],
+      )?.id ?? record.providerThreadId;
+    const facet = providerFacet(record.itemType);
+    const payload = parseProjectionJson(record.payloadJson);
+    const payloadRecord = payload !== null && typeof payload === 'object' && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+    const userMessage = record.itemType === 'userMessage';
+    const clientMessageId = userMessage
+      ? (this.db.get<{ client_message_id: string | null }>(
+          `SELECT client_message_id FROM conversation_messages
+            WHERE conversation_id = ? AND provider_item_id = ? AND role = 'user'
+            ORDER BY created_at, id LIMIT 1`,
+          [record.conversationId, record.providerItemId],
+        )?.client_message_id ?? null)
+      : null;
+    this.transcript.registerSource({
+      conversationId: record.conversationId,
+      sourceDomain: 'provider_item',
+      sourceScope: record.providerThreadId,
+      sourceId: record.providerItemId,
+      facet,
+      preferredEntryId: userMessage && clientMessageId ? `user-message:${clientMessageId}` : providerEntryId(segmentId, record.providerItemId, facet),
+      kind: userMessage ? 'ordinary_input' : facet === 'tool_activity' ? 'tool_activity' : 'content',
+      turnId: record.turnId,
+      segmentId,
+      displayStageId: typeof payloadRecord.stageId === 'string' && payloadRecord.stageId.trim() ? payloadRecord.stageId : null,
+      startsStage: facet === 'reasoning_block',
+      firstSeenAt: record.startedAt ?? record.updatedAt,
+      orderingEvidence: 'provider',
+      contentHash: hashConversationTranscriptContent([record.itemType, record.status, record.phase, record.textContent, record.payloadJson, record.completedAt]),
+    });
   }
 }
 

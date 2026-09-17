@@ -1,5 +1,5 @@
 import { Collapsible } from '../ui/Collapsible.js';
-import { type FocusEvent, type KeyboardEvent, memo, type ReactNode, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { type FocusEvent, type KeyboardEvent, createContext, useContext, memo, type ReactNode, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
 import { CircleIcon as Circle } from '@phosphor-icons/react/dist/csr/Circle';
@@ -12,11 +12,67 @@ import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr
 import { PlugsIcon as Plugs } from '@phosphor-icons/react/dist/csr/Plugs';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { WrenchIcon as Wrench } from '@phosphor-icons/react/dist/csr/Wrench';
+import { BrowserIcon as Browser } from '@phosphor-icons/react/dist/csr/Browser';
+import { DesktopIcon as Desktop } from '@phosphor-icons/react/dist/csr/Desktop';
+import { CubeIcon as Cube } from '@phosphor-icons/react/dist/csr/Cube';
+import { activityOutcome, activityOutcomeLabel, nativeActivityTitle, nativeActivityTool } from './activityPresentation.js';
 import type { ConversationFileLocation, ConversationOpenTarget, ConversationResource, ConversationResourcePreview } from '@zeus/shared';
 import { ConversationResourceCards, defaultOpenTarget, isImageResource } from './ConversationResources.js';
 import { isAssistantDeliverableItem, type NativeConversationToolResultPage, type NativePendingRequest, type NativeSessionItemBuffer, type NativeTurnPlanSnapshot, type NativeTurnSnapshot } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import type { CodexApiClient } from '../features/codex/codexApiClient.js';
+
+/** 会话及其子线程共用当前连接的技能清单读取入口。 */
+export const ActivitySkillCatalogContext = createContext<CodexApiClient['loadSkills'] | undefined>(undefined);
+
+/** 冻结路径仅用于定位清单，目录哈希不作为用户可见名称。 */
+const frozenSkillPath = /(?:^|[\\/])skill-resources[\\/]([a-f0-9]{64})[\\/][a-f0-9]{24}[\\/]SKILL\.md$/u;
+
+/** 只补充展示字段，原始命令、路径和历史身份保持不变。 */
+function useNamedSkillItems(items: NativeSessionItemBuffer[]): NativeSessionItemBuffer[] {
+  /** 读取入口由工作区提供，避免组件自行建立服务连接。 */
+  const loadSkills = useContext(ActivitySkillCatalogContext);
+  /** 只在实际读取的快照集合改变时加载，流式输出不重复触发请求。 */
+  const snapshotIds = [
+    ...new Set(
+      items.flatMap((item) =>
+        commandActions(item).flatMap((action) => {
+          /** 普通文件与插件目录无需请求冻结清单。 */
+          const match = primitive(action.path ?? action.filePath)?.match(frozenSkillPath);
+          return match ? [match[1]!] : [];
+        }),
+      ),
+    ),
+  ]
+    .sort()
+    .join(',');
+  /** 路径和名称来自同一不可变清单，不能从当前技能目录猜测旧名称。 */
+  const [resolved, setResolved] = useState<{ loader: typeof loadSkills; names: Map<string, string> } | null>(null);
+  useEffect(() => {
+    if (!loadSkills || !snapshotIds) return;
+    /** 旧请求返回后不能覆盖已经切换的会话或连接。 */
+    let cancelled = false;
+    void Promise.allSettled(snapshotIds.split(',').map((id) => loadSkills(undefined, false, id))).then((results) => {
+      if (cancelled) return;
+      /** 缺失清单降级为通用技能标题，其余清单仍正常显示。 */
+      const names = new Map<string, string>();
+      for (const result of results) if (result.status === 'fulfilled') for (const skill of result.value.skills) names.set(skill.path.replace(/\\/gu, '/'), skill.name);
+      setResolved({ loader: loadSkills, names });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadSkills, snapshotIds]);
+  return useMemo(
+    () =>
+      items.map((item) => {
+        if (!resolved || resolved.loader !== loadSkills || !commandActions(item).some((action) => primitive(action.path ?? action.filePath)?.match(frozenSkillPath))) return item;
+        return { ...item, payload: { ...item.payload, commandActions: commandActions(item).map((action) => ({ ...action, skillName: resolved.names.get((primitive(action.path ?? action.filePath) ?? '').replace(/\\/gu, '/')) })) } };
+      }),
+    [items, resolved, loadSkills],
+  );
+}
 
 const operationalTypes = new Set(['commandexecution', 'command', 'mcptoolcall', 'dynamictoolcall', 'websearch', 'imageview', 'toolcall', 'tool', 'filechange', 'file', 'contextcompaction', 'providerevent']);
 const MAX_ACTIVITY_OUTPUT_CHARACTERS = 40_000;
@@ -52,16 +108,18 @@ interface SessionActivityGroupProps {
 
 /** 活动组保留真实过程；单条无详情的整理记录直接显示，避免标题与明细重复。 */
 export const SessionActivityGroup = memo(function SessionActivityGroup(props: SessionActivityGroupProps) {
-  const liveItem = [...props.items].reverse().find((item) => item.status !== 'completed' && item.status !== 'failed') ?? null;
+  /** 摘要、活动行与展开详情使用同一份名称投影。 */
+  const items = useNamedSkillItems(props.items);
+  const liveItem = [...items].reverse().find((item) => activityOutcome(item) === 'running') ?? null;
   const active = Boolean(liveItem);
-  const summary = activitySummary(props.items, props.language, active);
-  const imageResources = activityImageResources(props.items);
-  const detailItems = imageResources.length > 0 ? props.items.filter((item) => normalizeType(item.type) !== 'imageview' || item.resources.length === 0) : props.items;
+  const summary = activitySummary(items, props.language, active);
+  const imageResources = activityImageResources(items);
+  const detailItems = imageResources.length > 0 ? items.filter((item) => normalizeType(item.type) !== 'imageview' || item.resources.length === 0) : items;
   const [open, setOpen] = useState(false);
-  const GroupIcon = activityGroupIcon(props.items, liveItem);
+  const GroupIcon = activityGroupIcon(items, liveItem);
 
   // 单条整理只有在没有正文详情、资源或可加载结果时才省去折叠层。
-  const singleCompaction = props.items.length === 1 && normalizeType(props.items[0]!.type) === 'contextcompaction' && props.items[0]!.status !== 'failed' ? props.items[0]! : null;
+  const singleCompaction = items.length === 1 && normalizeType(items[0]!.type) === 'contextcompaction' && items[0]!.status !== 'failed' ? items[0]! : null;
   if (singleCompaction && !activityItemDetail(singleCompaction) && !activityToolResult(singleCompaction) && singleCompaction.resources.length === 0) {
     return (
       <section className="session-activity-group" data-active={active || undefined} data-activity-category={props.category} data-item-count={1} data-motion-active={props.motionActive || undefined}>
@@ -71,7 +129,7 @@ export const SessionActivityGroup = memo(function SessionActivityGroup(props: Se
   }
 
   return (
-    <section className="session-activity-group" data-active={active || undefined} data-activity-category={props.category} data-item-count={props.items.length} data-motion-active={props.motionActive || undefined} aria-label={summary}>
+    <section className="session-activity-group" data-active={active || undefined} data-activity-category={props.category} data-item-count={items.length} data-motion-active={props.motionActive || undefined} aria-label={summary}>
       <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
         <summary>
           <span className="session-activity-group-icon" aria-hidden="true">
@@ -157,21 +215,27 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
   const title = activityItemTitle(props.item, props.language);
   const detail = activityItemDetail(props.item);
   const target = activityItemTarget(props.item, props.language);
+  /** 技能链接显示完整名称标题，保留原有文件打开入口。 */
+  const skillActivity = activitySkillNames([props.item]).length > 0;
   const [open, setOpen] = useState(false);
   const Icon = activityItemIcon(props.item);
   const toolResult = activityToolResult(props.item);
   const titleNode = target ? (
     <span className="session-activity-item-title">
-      <span>{target.prefix}</span>{' '}
+      {!skillActivity ? (
+        <>
+          <span>{target.prefix}</span>{' '}
+        </>
+      ) : null}
       <button type="button" className="session-activity-resource-link" title={target.title} onClick={() => void props.onOpenResource?.(target.resource, defaultOpenTarget(target.resource))}>
-        {target.label}
+        {skillActivity ? title : target.label}
       </button>
     </span>
   ) : (
     <span className="session-activity-item-title">{title}</span>
   );
   return (
-    <li data-status={props.item.status} data-motion-active={props.motionActive || undefined}>
+    <li data-status={activityOutcome(props.item)} data-motion-active={props.motionActive || undefined}>
       <span className="session-activity-item-icon" aria-hidden="true">
         <Icon weight="regular" />
       </span>
@@ -586,7 +650,21 @@ export function SessionTurnProcessDisclosure(props: {
   );
 }
 
+/** 折叠摘要使用当轮技能名称；无法解析时只说明读取技能及数量。 */
 function activitySummary(items: NativeSessionItemBuffer[], language: SessionUiLanguage, active = false): string {
+  /** 单条原生操作直接显示具体对象，不必展开才能识别。 */
+  const nativeTitle = items.length === 1 ? nativeActivityTitle(items[0]!, language === 'zh-CN') : null;
+  if (nativeTitle) return nativeTitle;
+  /** 结束不等于成功，折叠时仍能看到失败、接管与未确认结果。 */
+  const outcomes = items.map(activityOutcome);
+  /** 只调整摘要文字，保留原有分组、顺序与展开行为。 */
+  const exceptions = [...new Set(outcomes)].filter((outcome) => outcome !== 'running' && outcome !== 'completed');
+  if (exceptions.length > 0) {
+    return [
+      language === 'zh-CN' ? (active ? '正在处理' : '操作记录') : active ? 'Working' : 'Activity',
+      ...exceptions.map((outcome) => `${outcomes.filter((value) => value === outcome).length} ${language === 'zh-CN' ? '项' : '·'}${activityOutcomeLabel(outcome, language === 'zh-CN')}`),
+    ].join(' · ');
+  }
   const compactions = items.filter((item) => normalizeType(item.type) === 'contextcompaction');
   if (compactions.length === items.length) {
     return language === 'zh-CN' ? (active ? '正在整理较早对话以继续工作' : '已整理较早对话') : active ? 'Organizing earlier conversation to continue' : 'Organized earlier conversation';
@@ -603,7 +681,11 @@ function activitySummary(items: NativeSessionItemBuffer[], language: SessionUiLa
     if (activitySkillNames([item]).length > 0 && actions.every((action) => ['read', 'listfiles'].includes(normalizeType(primitive(action.type) ?? '')))) return false;
     return actions.some((action) => !['read', 'listfiles', 'search'].includes(normalizeType(primitive(action.type) ?? '')));
   }).length;
-  const otherTools = items.filter((item) => !['commandexecution', 'command', 'websearch', 'imageview', 'filechange', 'file', 'contextcompaction'].includes(normalizeType(item.type))).length;
+  /** 原生工具按真实来源显示，不与文件和命令动作串成同一个工具名。 */
+  const browserTools = items.some((item) => nativeActivityTool(item.payload)?.kind === 'browser');
+  /** 桌面操作使用独立来源，具体应用名称保留在每条操作上。 */
+  const computerTools = items.some((item) => nativeActivityTool(item.payload)?.kind === 'computer');
+  const otherTools = items.filter((item) => !nativeActivityTool(item.payload) && !['commandexecution', 'command', 'websearch', 'imageview', 'filechange', 'file', 'contextcompaction'].includes(normalizeType(item.type))).length;
   if (language === 'zh-CN') {
     if (active) {
       const activeParts = [
@@ -614,6 +696,8 @@ function activitySummary(items: NativeSessionItemBuffer[], language: SessionUiLa
         skills.length > 0 ? '读取技能' : null,
         imageViews > 0 ? '查看图像' : null,
         genericCommandCount > 0 ? '运行命令' : null,
+        browserTools ? '浏览器操作' : null,
+        computerTools ? '桌面操作' : null,
         otherTools > 0 ? '使用工具' : null,
       ].filter(Boolean);
       return `正在处理：${activeParts.join('、')}`;
@@ -623,9 +707,11 @@ function activitySummary(items: NativeSessionItemBuffer[], language: SessionUiLa
       actionTypes.has('read') || actionTypes.has('listfiles') ? '读取文件' : null,
       actionTypes.has('search') ? '搜索文件' : null,
       webSearches > 0 ? '搜索了网页' : null,
-      skills.length > 0 ? `读取了${skills.length === 1 ? skills[0] : `${skills.length} 个`}技能` : null,
+      skills.length > 0 ? `读取了${skills.length === 1 ? (skills[0] ? ` ${skills[0]} ` : '') : ` ${skills.length} 个`}技能` : null,
       imageViews > 0 ? `查看了 ${imageViews} 张图像` : null,
       genericCommandCount > 0 ? '运行了命令' : null,
+      browserTools ? '已进行浏览器操作' : null,
+      computerTools ? '已进行桌面操作' : null,
       otherTools > 0 ? '使用了工具' : null,
     ].filter(Boolean);
     return completedParts.join('、') || '完成了处理';
@@ -635,9 +721,11 @@ function activitySummary(items: NativeSessionItemBuffer[], language: SessionUiLa
     actionTypes.has('read') || actionTypes.has('listfiles') ? (active ? 'reading files' : 'read files') : null,
     actionTypes.has('search') ? (active ? 'searching files' : 'searched files') : null,
     webSearches > 0 ? (active ? 'searching the web' : 'searched the web') : null,
-    skills.length > 0 ? `${active ? 'reading' : 'read'} ${skills.length === 1 ? skills[0] : `${skills.length} skills`}` : null,
+    skills.length > 0 ? `${active ? 'reading' : 'read'} ${skills.length === 1 ? `${skills[0] ? `${skills[0]} ` : ''}skill` : `${skills.length} skills`}` : null,
     imageViews > 0 ? `${active ? 'viewing' : 'viewed'} ${imageViews} ${imageViews === 1 ? 'image' : 'images'}` : null,
     genericCommandCount > 0 ? (active ? 'running commands' : 'ran commands') : null,
+    browserTools ? (active ? 'browser operations' : 'performed browser operations') : null,
+    computerTools ? (active ? 'desktop operations' : 'performed desktop operations') : null,
     otherTools > 0 ? (active ? 'using tools' : 'used tools') : null,
   ].filter(Boolean);
   return `${active ? 'Working: ' : ''}${englishParts.join(', ') || (active ? 'processing' : 'completed work')}`;
@@ -659,33 +747,54 @@ function activityImageResources(items: NativeSessionItemBuffer[]): ConversationR
   return [...unique.values()];
 }
 
+/** 纯来源使用专属图标，混合组仍按已有类别展示。 */
 function activityGroupIcon(items: NativeSessionItemBuffer[], liveItem: NativeSessionItemBuffer | null) {
+  if (items.every((item) => nativeActivityTool(item.payload)?.kind === 'browser')) return Browser;
+  if (items.every((item) => nativeActivityTool(item.payload)?.kind === 'computer')) return Desktop;
+  if (items.some((item) => nativeActivityTool(item.payload))) return Wrench;
   if (items.some((item) => ['filechange', 'file'].includes(normalizeType(item.type)))) return PencilSimple;
   if (items.every((item) => normalizeType(item.type) === 'imageview')) return Image;
-  if (items.every((item) => activitySkillNames([item]).length > 0)) return Wrench;
+  if (items.every((item) => activitySkillNames([item]).length > 0)) return Cube;
   if (liveItem) return activityItemIcon(liveItem);
   if (items.some((item) => commandActions(item).some((action) => normalizeType(primitive(action.type) ?? '') === 'search') || normalizeType(item.type) === 'websearch')) return MagnifyingGlass;
   if (items.some((item) => commandActions(item).some((action) => ['read', 'listfiles'].includes(normalizeType(primitive(action.type) ?? ''))))) return BookOpen;
   return activityItemIcon(items[items.length - 1]!);
 }
 
-function activitySkillNames(items: NativeSessionItemBuffer[]): string[] {
-  const names = items.flatMap((item) =>
-    commandActions(item).flatMap((action) => {
-      const path = primitive(action.path ?? action.filePath);
-      if (!path || !/(^|[\\/])SKILL\.md$/u.test(path)) return [];
-      const segments = path.split(/[\\/]/u).filter(Boolean);
-      return segments.length >= 2 ? [segments[segments.length - 2]!] : [];
-    }),
-  );
-  return [...new Set(names)];
+/** 按读取路径去重；无法确认名称时保留技能计数，绝不显示目录哈希。 */
+function activitySkillNames(items: NativeSessionItemBuffer[]): Array<string | null> {
+  /** 不同技能可以同名，读取同一个文件则只计一次。 */
+  const names = new Map<string, string | null>();
+  for (const item of items)
+    for (const action of commandActions(item)) {
+      /** 只把读取技能入口识别为技能活动，搜索或写入仍按原动作显示。 */
+      const path = primitive(action.path ?? action.filePath)?.replace(/\\/gu, '/');
+      if (normalizeType(primitive(action.type) ?? '') !== 'read' || !path || !/(^|\/)SKILL\.md$/u.test(path)) continue;
+      /** 未冻结的技能继续使用具名目录；不透明目录统一等待真实名称。 */
+      const directory = path.split('/').at(-2);
+      names.set(path, primitive(action.skillName) ?? (directory && !/^[a-f0-9]{24,64}$/iu.test(directory) ? directory : null));
+    }
+  return [...names.values()];
 }
 
+/** 实时行和展开详情共享技能标题，未知名称不回退到内部目录标识。 */
 function activityItemTitle(item: NativeSessionItemBuffer, language: SessionUiLanguage): string {
+  /** 原生工具按来源、动作和真实结果展示，内部名称留在详情。 */
+  const nativeTitle = nativeActivityTitle(item, language === 'zh-CN');
+  if (nativeTitle) return nativeTitle;
+  /** 非成功结果不再沿用“已读取”“已编辑”等成功式措辞。 */
+  const outcome = activityOutcome(item);
+  if (outcome !== 'completed' && outcome !== 'running') {
+    /** 失败状态仍保留原命令或文件目标，便于直接定位问题。 */
+    const target = commandText(item.payload.command) ?? primitive(item.payload.path ?? item.payload.filePath ?? commandActions(item)[0]?.path ?? item.payload.toolName ?? item.payload.tool);
+    return `${activityOutcomeLabel(outcome, language === 'zh-CN')} · ${target ? truncate(singleLine(target), 120) : language === 'zh-CN' ? '操作' : 'Operation'}`;
+  }
   const skills = activitySkillNames([item]);
   if (skills.length > 0) {
     const active = item.status !== 'completed' && item.status !== 'failed';
-    return language === 'zh-CN' ? `${active ? '正在读取' : '已读取'} ${skills.join('、')} 技能` : `${active ? 'Reading' : 'Read'} ${skills.join(', ')} ${skills.length === 1 ? 'skill' : 'skills'}`;
+    /** 未解析名称不泄漏哈希，多技能仍保留实际数量。 */
+    const label = skills.every(Boolean) ? skills.join(language === 'zh-CN' ? '、' : ', ') : skills.length > 1 ? String(skills.length) : '';
+    return language === 'zh-CN' ? `${active ? '正在读取' : '已读取'}${label ? ` ${label} ` : ''}技能` : `${active ? 'Reading' : 'Read'} ${label ? `${label} ` : ''}${skills.length === 1 ? 'skill' : 'skills'}`;
   }
   const payload = item.payload;
   const type = normalizeType(item.type);
@@ -736,6 +845,8 @@ function activityItemTarget(
   title: string;
   resource: ConversationResource;
 } | null {
+  // 原生标题已经包含来源、目标和动作，资源链接不能将其覆盖为“已使用”。
+  if (nativeActivityTool(item.payload)) return null;
   const resource = item.resources.find((candidate) => candidate.kind === 'file' || candidate.kind === 'website');
   if (!resource) return null;
   const type = normalizeType(item.type);
@@ -774,14 +885,19 @@ function activityItemTarget(
               ? 'Using'
               : 'Used';
   return {
-    prefix,
+    prefix: ['completed', 'running'].includes(activityOutcome(item)) ? prefix : activityOutcomeLabel(activityOutcome(item), language === 'zh-CN'),
     label: resource.displayName,
     title: resource.kind === 'file' ? resource.projectRelativePath : resource.url,
     resource,
   };
 }
 
+/** 同一类别的实时行与历史行共用图标，技能与普通文件读取明确区分。 */
 function activityItemIcon(item: NativeSessionItemBuffer) {
+  /** 名称必须命中原生注册命名空间才显示操作环境图标。 */
+  const tool = nativeActivityTool(item.payload);
+  if (tool) return tool.kind === 'browser' ? Browser : Desktop;
+  if (activitySkillNames([item]).length > 0) return Cube;
   const type = normalizeType(item.type);
   if (type === 'commandexecution' || type === 'command') {
     const actionType = primitive(commandActions(item)[0]?.type);
@@ -803,9 +919,19 @@ function activityItemDetail(item: NativeSessionItemBuffer): {
   cwd: string | null;
   output: string | null;
 } | null {
-  const command = commandText(item.payload.command);
+  /** 原始工具身份保留在展开详情，摘要不暴露内部命名。 */
+  const nativeTool = nativeActivityTool(item.payload);
+  const command = commandText(item.payload.command) ?? (nativeTool ? `zeus_${nativeTool.kind}.${nativeTool.method}` : null);
   const cwd = primitive(item.payload.cwd);
-  const output = primitive(item.payload.aggregatedOutput ?? item.payload.output ?? item.payload.stdout ?? item.payload.stderr) ?? activityToolResult(item)?.projection ?? presentationLiveText(item);
+  /** 原生工具的文本返回同样可以展开，图片仍走已有资源预览。 */
+  const nativeOutput = Array.isArray(item.payload.contentItems)
+    ? item.payload.contentItems
+        .filter(isRecord)
+        .filter((part) => part.type === 'inputText')
+        .map((part) => primitive(part.text) ?? '')
+        .join('\n')
+    : null;
+  const output = primitive(item.payload.aggregatedOutput ?? item.payload.output ?? item.payload.stdout ?? item.payload.stderr) ?? activityToolResult(item)?.projection ?? nativeOutput ?? presentationLiveText(item);
   return command || cwd || output ? { command, cwd, output } : null;
 }
 

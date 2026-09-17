@@ -1,3 +1,5 @@
+import { contextCapacitySelectionAllowed, contextCapacitySelectionOptions, contextCapacitySelectionFromValue, contextCapacitySelectionValue } from './contextCapacitySelection.js';
+import { ActivitySkillCatalogContext } from './SessionActivity.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { temporaryWorkspaceId, isConversationWorktreeOptions, type ConversationWorktreeOptions, type AsyncQuestionAnswer } from '@zeus/shared';
@@ -116,6 +118,8 @@ export interface SessionWorkspaceTask {
 export type SessionStartMode = 'create' | 'resume' | 'reference_legacy';
 
 export interface SessionWorkspaceStartInput {
+  /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
+  contextCapacityTokens?: number | null;
   mode: SessionStartMode;
   source?: 'code_review';
   stageId?: string;
@@ -141,6 +145,8 @@ export interface SessionWorkspaceStartInput {
 }
 
 export interface ProjectSessionWorkspaceStartInput {
+  /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
+  contextCapacityTokens?: number | null;
   source?: 'code_review';
   inheritConversationId?: string;
   worktree?: ConversationWorktreeOptions;
@@ -169,7 +175,7 @@ export interface SessionWorkspaceActions {
   onLoadCapabilities?: (projectId: string) => Promise<CodexConversationCapabilities>;
   onLoadProjectConfig?: (projectId: string) => Promise<ProjectConfig>;
   onSaveProjectModelServiceTierPreference?: (projectId: string, input: ProjectModelServiceTierPreference) => Promise<ProjectConfig>;
-  onLoadSkills?: (projectId?: string, forceReload?: boolean) => Promise<import('../features/codex/codexContracts.js').SkillCatalog>;
+  onLoadSkills?: import('../features/codex/codexApiClient.js').CodexApiClient['loadSkills'];
   onLoadDigitalEmployees?: (projectId: string) => Promise<import('../features/digital-employees/digitalEmployeeContracts.js').DigitalEmployeeRecord[]>;
   /** 任务讨论沿用当前任务的有效配置。 */
   onLoadTaskWorkSettings?: (taskId: string) => Promise<import('@zeus/shared').EmployeeWorkSettings>;
@@ -817,7 +823,7 @@ export function createConnectedSessionActions(input: { controller: SessionContro
       // 发送失败交回输入区显示；前置校验错误不一定经过控制器的运行操作状态。
       return input.controller.send(effectiveDelivery, effectiveDelivery === 'steer_now' ? (currentState.activeTurnId ?? undefined) : undefined, effectiveDelivery === 'queue' ? settings : undefined).then(() => undefined);
     },
-    onStageBrowserComments: (prepared) => input.controller.setBrowserSubmission(prepared),
+    onStageBrowserComments: (prepared) => input.controller.stageBrowserComments(prepared),
     onRemoveBrowserSubmission: () => input.controller.setBrowserSubmission(null),
     onContextDraftChange: (draft) => input.controller.setContextDraft(draft),
     onInterrupt: () => settle(input.controller.interruptActiveTurn()),
@@ -1097,6 +1103,7 @@ function buildProjectConversationStartPayload(input: ProjectSessionWorkspaceStar
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
     ...serviceTierWireOverride(input.serviceTierSelection),
+    ...(input.contextCapacityTokens !== undefined ? { contextCapacityTokens: input.contextCapacityTokens } : {}),
     ...(input.goalObjective ? { goalObjective: input.goalObjective } : {}),
     ...(input.pluginReferences?.length ? { pluginReferences: input.pluginReferences } : {}),
     ...(input.expertMentions?.length ? { expertMentions: input.expertMentions } : {}),
@@ -1325,6 +1332,7 @@ function buildStartNativeConversationPayload(input: SessionWorkspaceStartInput):
       permissionMode: input.permissionMode ?? 'auto',
       collaborationMode: input.collaborationMode ?? 'default',
       ...serviceTierWireOverride(input.serviceTierSelection),
+      ...(input.contextCapacityTokens !== undefined ? { contextCapacityTokens: input.contextCapacityTokens } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.effort ? { effort: input.effort } : {}),
       ...(input.agentKind ? { agentKind: input.agentKind } : {}),
@@ -1452,6 +1460,8 @@ export function isDurableNativeConversationAcceptance(
 }
 
 export interface NewConversationDraft {
+  /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
+  contextCapacityTokens?: number | null;
   worktreeDrafts?: Record<string, ConversationWorktreeOptions>;
   workspaceMode?: 'direct' | 'worktree';
   content: string;
@@ -1666,7 +1676,7 @@ type SessionContextWorkspace =
   | { kind: 'browser' }
   | { kind: 'subagents' }
   | { kind: 'plan'; item: NativeSessionItemBuffer }
-  | { kind: 'file'; request: FilePreviewRequest }
+  | { kind: 'file'; request: FilePreviewRequest; location?: ConversationFileLocation }
   | { kind: 'source'; preview: ConversationResourcePreview; viewMode: SourceWorkspaceViewMode }
   | { kind: 'turn_diff'; turnId: string; initialFileId?: string };
 
@@ -1928,6 +1938,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     const projectId = props.state?.projectId ?? props.conversation?.projectId;
     const conversationId = props.state?.conversationId ?? props.conversation?.id;
     if (!props.state || !projectId || !conversationId || legacy || composerReadOnly) return;
+    settings = { ...composerRuntimeSettings, ...settings };
     composerRuntimeSettingsDirtyRef.current = true;
     writeConversationNextTurnSettings(browserConversationStorage(), projectId, conversationId, settings);
     const preferenceKind = conversationRuntimePreferenceKind(owner, props.conversation?.title);
@@ -2244,14 +2255,14 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   }
 
   /** 图片使用弹窗并保留右侧内容，其他文件打开审阅并记录返回焦点。 */
-  const openFilePreview = useCallback((request: FilePreviewRequest, image = false): void => {
+  const openFilePreview = useCallback((request: FilePreviewRequest, image = false, location?: ConversationFileLocation): void => {
     if (image) {
       setImagePreviewRequest(request);
       return;
     }
     contextReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setContextFullWidth(false);
-    setContextWorkspace({ kind: 'file', request });
+    setContextWorkspace({ kind: 'file', request, location });
   }, []);
 
   /** 会话图片使用弹窗，其余资源进入右侧；显式的系统和编辑器操作按用户选择执行。 */
@@ -2261,7 +2272,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       /** 代码和文本保留行评论，其他格式交给通用文件预览。 */
       const path = resource.kind === 'file' ? resource.projectRelativePath : resource.displayName;
       if (isImageResource(resource) || !isConversationSourcePreviewable(path)) {
-        openFilePreview({ kind: 'resource', projectId: resource.projectId, conversationId: resource.conversationId, resourceId: resource.id }, isImageResource(resource));
+        openFilePreview(
+          { kind: 'resource', projectId: resource.projectId, conversationId: resource.conversationId, resourceId: resource.id },
+          isImageResource(resource),
+          location ?? (resource.kind === 'file' ? resource.location : undefined),
+        );
         return;
       }
     }
@@ -2273,7 +2288,9 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     if (!result.opened) throw new Error('conversation_resource_open_failed');
     if (result.mode === 'zeus_source' && result.preview) {
       setContextFullWidth(false);
-      setContextWorkspace({ kind: 'source', preview: result.preview, viewMode: defaultSourceWorkspaceViewMode(result.preview) });
+      /** 点击位置优先于资源首次登记的位置，重新打开同文件也产生新定位。 */
+      const preview = result.preview.kind === 'source' ? { ...result.preview, location: location ?? (resource.kind === 'file' ? resource.location : undefined) ?? result.preview.location } : result.preview;
+      setContextWorkspace({ kind: 'source', preview, viewMode: defaultSourceWorkspaceViewMode(preview) });
       return;
     }
     if (result.mode === 'zeus_browser') {
@@ -2553,26 +2570,9 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     return null;
   }
 
-  /** 完整会话共享附件预览路由，创建会话前沿用独立附件容器。 */
-  const workspace = (
-    <section
-      className="session-workspace-root"
-      aria-label={copy.workspace}
-      data-transport-state={props.state?.transportState ?? props.loadState ?? 'empty'}
-      data-embedded-in-task={props.embeddedInTask || undefined}
-      data-conversation-state={props.state?.conversationState ?? (legacy ? 'legacy_readonly' : 'empty')}
-      onKeyDownCapture={handleWorkspaceKeyDownCapture}
-      onPointerDownCapture={(event) => {
-        if (!contextOpen || !(event.target instanceof Element)) return;
-        const active = Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
-        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? contextActivityKind : 'none' });
-      }}
-      onFocusCapture={(event) => {
-        if (!contextOpen || !(event.target instanceof Element)) return;
-        const active = Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
-        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? contextActivityKind : 'none' });
-      }}
-    >
+  /** 顶栏、正文与浏览器作为整体让出终端空间，保持各工作面的边界对齐。 */
+  const primaryPane = (
+    <>
       <MotionPresence>{imagePreviewRequest ? <FilePreviewDialog request={imagePreviewRequest} zh={props.language === 'zh-CN'} onClose={() => setImagePreviewRequest(null)} /> : null}</MotionPresence>
       {displayedHeader ? (
         <header
@@ -2983,6 +2983,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                       {contextWorkspace.kind === 'file' ? (
                         <FilePreviewWorkspace
                           request={contextWorkspace.request}
+                          location={contextWorkspace.location}
                           language={props.language}
                           toolbarHost={contextToolbarHost}
                           canSplit={browserLayoutWidth > 840}
@@ -3040,20 +3041,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
               </div>
             </div>
           </div>
-          {(terminalMounted || terminalOpen) && terminalAvailable && props.terminalClient && props.conversation && props.projectPath ? (
-            <SessionTerminalPanel
-              client={props.terminalClient}
-              language={props.language}
-              visible={terminalOpen}
-              projectId={props.conversation.projectId}
-              projectName={owner?.projectName ?? props.conversation.projectId}
-              projectPath={props.projectPath}
-              taskId={props.task?.id ?? props.conversation.taskId ?? undefined}
-              cwd={props.state?.snapshot?.executionContext?.cwd}
-              focusRequest={terminalFocusRequest}
-              onClose={closeSessionTerminal}
-            />
-          ) : null}
           <MotionPresence>
             {goalPanelOpen ? (
               <GoalPanel
@@ -3100,9 +3087,52 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           onChooseAttachments={actions.onChooseStartAttachments}
         />
       )}
+    </>
+  );
+
+  /** 完整会话共享附件预览路由，创建会话前沿用独立附件容器。 */
+  const workspace = (
+    <section
+      className="session-workspace-root"
+      aria-label={copy.workspace}
+      data-transport-state={props.state?.transportState ?? props.loadState ?? 'empty'}
+      data-embedded-in-task={props.embeddedInTask || undefined}
+      data-conversation-state={props.state?.conversationState ?? (legacy ? 'legacy_readonly' : 'empty')}
+      onKeyDownCapture={handleWorkspaceKeyDownCapture}
+      onPointerDownCapture={(event) => {
+        if (!contextOpen || !(event.target instanceof Element)) return;
+        const active = Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
+        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? contextActivityKind : 'none' });
+      }}
+      onFocusCapture={(event) => {
+        if (!contextOpen || !(event.target instanceof Element)) return;
+        const active = Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
+        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? contextActivityKind : 'none' });
+      }}
+    >
+      <div className="session-primary-pane">{primaryPane}</div>
+      {(terminalMounted || terminalOpen) && terminalAvailable && props.terminalClient && props.conversation && props.projectPath ? (
+        <SessionTerminalPanel
+          key={props.conversation.projectId}
+          client={props.terminalClient}
+          language={props.language}
+          visible={terminalOpen}
+          projectId={props.conversation.projectId}
+          projectName={owner?.projectName ?? props.conversation.projectId}
+          projectPath={props.projectPath}
+          taskId={props.task?.id ?? props.conversation.taskId ?? undefined}
+          cwd={props.state?.snapshot?.executionContext?.cwd}
+          focusRequest={terminalFocusRequest}
+          onClose={closeSessionTerminal}
+        />
+      ) : null}
     </section>
   );
-  return <FilePreviewOpenContext.Provider value={props.conversation ? openFilePreview : null}>{workspace}</FilePreviewOpenContext.Provider>;
+  return (
+    <ActivitySkillCatalogContext.Provider value={actions.onLoadSkills}>
+      <FilePreviewOpenContext.Provider value={props.conversation ? openFilePreview : null}>{workspace}</FilePreviewOpenContext.Provider>
+    </ActivitySkillCatalogContext.Provider>
+  );
 }
 
 export function selectDockedTurnPlan(state: NativeSessionState): NativeSessionState['turnsByProviderId'][string]['plan'] {
@@ -3239,6 +3269,8 @@ export function NewConversationComposer(props: {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(!props.capabilities);
   const [selectedModelId, setSelectedModelId] = useState(() => restoredDraft?.selectedModelId ?? '');
   const [selectedEffort, setSelectedEffort] = useState(() => restoredDraft?.selectedEffort ?? '');
+  /** 本次覆盖只保存在新建草稿中，不写入已有会话下一轮设置。 */
+  const [contextCapacityTokens, setContextCapacityTokens] = useState<number | null | undefined>(() => restoredDraft?.contextCapacityTokens);
   const [serviceTierSelection, setServiceTierSelection] = useState<NativeServiceTierSelection>(() => restoredDraft?.serviceTierSelection ?? { type: 'standard' });
   const [isComposing, setIsComposing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -3260,8 +3292,22 @@ export function NewConversationComposer(props: {
   const [goalInputOpen, setGoalInputOpen] = useState(() => restoredDraft?.goalInputOpen ?? false);
   const [goalObjective, setGoalObjective] = useState(() => restoredDraft?.goalObjective ?? '');
   useLayoutEffect(() => {
-    props.drafts?.set(draftKey, { workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, goalInputOpen, goalObjective, tokenDraft });
-  }, [props.drafts, draftKey, workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, goalInputOpen, goalObjective, tokenDraft]);
+    props.drafts?.set(draftKey, {
+      workspaceMode,
+      worktreeDrafts,
+      content,
+      attachments,
+      permissionMode,
+      collaborationMode,
+      selectedModelId,
+      selectedEffort,
+      serviceTierSelection,
+      contextCapacityTokens,
+      goalInputOpen,
+      goalObjective,
+      tokenDraft,
+    });
+  }, [props.drafts, draftKey, workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, contextCapacityTokens, goalInputOpen, goalObjective, tokenDraft]);
   const inputResources = useConversationInputResources({
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef,
@@ -3429,6 +3475,7 @@ export function NewConversationComposer(props: {
           permissionMode,
           collaborationMode,
           serviceTierSelection,
+          contextCapacityTokens: contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens,
           model: selectedModel?.id,
           effort: selectedEffort || undefined,
           ...(submittedGoal ? { goalObjective: submittedGoal } : {}),
@@ -3449,6 +3496,7 @@ export function NewConversationComposer(props: {
           permissionMode,
           collaborationMode,
           serviceTierSelection,
+          contextCapacityTokens: contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens,
           model: selectedModel?.id,
           effort: selectedEffort || undefined,
           ...(submittedGoal ? { goalObjective: submittedGoal } : {}),
@@ -3689,7 +3737,16 @@ export function NewConversationComposer(props: {
           <span className="session-composer-trailing-actions">
             {selectedModel ? (
               <span className="session-composer-runtime-settings">
-                <ContextUsageIndicator unifiedUsage={null} language={props.language} />
+                <ZeusSelect
+                  size="compact"
+                  ariaLabel={props.language === 'zh-CN' ? '上下文容量' : 'Context capacity'}
+                  value={contextCapacitySelectionValue(contextCapacityTokens, capabilities?.projectContextCapacityTokens)}
+                  disabled={submitting || !props.owner}
+                  options={contextCapacitySelectionOptions(selectedModel.contextCapacity, props.language === 'zh-CN')}
+                  triggerTitle={selectedModel.contextCapacity?.reason}
+                  onChange={(value) => setContextCapacityTokens(contextCapacitySelectionFromValue(value))}
+                />
+                <ContextUsageIndicator contextCapacityTokens={contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens} unifiedUsage={null} language={props.language} />
                 {selectedModel.serviceTiers.length ? (
                   <ServiceTierToggle
                     language={props.language}
@@ -3747,6 +3804,7 @@ export function NewConversationComposer(props: {
                   inputResources.processing ||
                   !props.owner ||
                   (!selectedModel && !needsModelSetup) ||
+                  (!needsModelSetup && !contextCapacitySelectionAllowed(contextCapacityTokens, capabilities?.projectContextCapacityTokens, selectedModel?.contextCapacity)) ||
                   (!needsModelSetup && (goalInputActive ? !goalObjectiveValid : !content.trim() && attachments.length === 0))
                 }
                 aria-busy={submitting || undefined}
@@ -3799,6 +3857,7 @@ function readConversationNextTurnSettings(storage: Pick<Storage, 'getItem'> | un
       return null;
     }
     return {
+      ...(parsed.contextCapacityTokens === null || typeof parsed.contextCapacityTokens === 'number' ? { contextCapacityTokens: parsed.contextCapacityTokens } : {}),
       model: parsed.model,
       ...(parsed.effort ? { effort: parsed.effort } : {}),
       ...(Object.prototype.hasOwnProperty.call(parsed, 'serviceTier') ? { serviceTier: parsed.serviceTier } : {}),
@@ -3831,6 +3890,7 @@ function composerRuntimeSettingsFromState(
   const requestedServiceTier = hasSourceServiceTier ? source?.serviceTier : undefined;
   const serviceTier = typeof requestedServiceTier === 'string' && capability && !capability.serviceTiers.some((tier) => tier.id === requestedServiceTier) ? null : requestedServiceTier;
   return {
+    contextCapacityTokens: state.snapshot?.contextCapacityTokens ?? null,
     model,
     ...(effort ? { effort } : {}),
     ...(hasSourceServiceTier ? { serviceTier } : {}),
@@ -3928,7 +3988,16 @@ function SessionRuntimeDetails(props: { state: NativeSessionState; conversation:
       nativeSessionPath: runtimeFact(nativeSession?.path ?? null, props.language === 'zh-CN' ? '暂无会话记录文件位置。' : 'The conversation record file location is unavailable.'),
     },
   };
-  return <RuntimeDetails runtime={runtime} language={props.language} scope="session" mcpStartup={mcpStartup} />;
+  return (
+    <RuntimeDetails
+      contextCapacityEvidence={props.state.snapshot?.contextCapacityEvidence}
+      contextCapacityTokens={props.state.snapshot?.contextCapacityTokens ?? props.conversation?.contextCapacityTokens}
+      runtime={runtime}
+      language={props.language}
+      scope="session"
+      mcpStartup={mcpStartup}
+    />
+  );
 }
 
 function runtimeFact<T>(value: T | null | undefined, reason: string): NativeRuntimeFact<T> {

@@ -1,9 +1,10 @@
-import type { ConversationResource } from '@zeus/shared';
+import type { ConversationResource, ConversationFileLocation } from '@zeus/shared';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
 import { OpenWithMenu } from './ConversationResources.js';
 import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
 import type { ConversationOpenTarget } from '@zeus/shared';
-import { FilePreview, PreviewImage } from '../code/FilePreview.js';
+import { FilePreview, FileReviewContent, PreviewImage } from '../code/FilePreview.js';
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowsInIcon as ArrowsIn } from '@phosphor-icons/react/dist/csr/ArrowsIn';
@@ -24,6 +25,7 @@ export type SourceWorkspaceViewMode = 'preview' | 'source';
 
 /** Markdown 默认展示排版，其余文件直接展示源码。 */
 export function defaultSourceWorkspaceViewMode(preview: ConversationResourcePreview): SourceWorkspaceViewMode {
+  if (preview.kind === 'source' && preview.location?.line) return 'source';
   return supportsMarkdownPreview(preview) ? 'preview' : 'source';
 }
 
@@ -91,11 +93,24 @@ function SourceWorkspaceView(props: {
   const [openTarget, setOpenTarget] = useState<ConversationOpenTarget>('system_default');
   /** 展示宿主打开失败，不吞掉权限或应用错误。 */
   const [openError, setOpenError] = useState<unknown>(null);
+  /** 成功提示绑定资源，切换文件不会显示上一文件的复制结果。 */
+  const [copiedResourceId, setCopiedResourceId] = useState<string | null>(null);
+  /** 复制提示短暂显示，卸载或提示变更时取消定时器。 */
+  useEffect(() => {
+    if (!copiedResourceId) return;
+    /** 提示持续到期后恢复复制入口。 */
+    const timeout = window.setTimeout(() => setCopiedResourceId(null), 1600);
+    return () => window.clearTimeout(timeout);
+  }, [copiedResourceId]);
+  /** 工具栏只展示当前文件的复制结果。 */
+  const copied = copiedResourceId === props.preview.resource.id;
   useApplicationErrorDialog(openError, { language: zh ? 'zh-CN' : 'en' });
   /** 统一处理复制与外部应用打开。 */
   async function openResource(target: ConversationOpenTarget): Promise<void> {
     try {
+      if (target === 'copy_path') setCopiedResourceId(null);
       await props.onOpen?.(target, props.preview.resource);
+      if (target === 'copy_path' && props.onOpen) setCopiedResourceId(props.preview.resource.id);
     } catch (error) {
       setOpenError(error);
     }
@@ -207,23 +222,25 @@ function SourceWorkspaceView(props: {
             </button>
           </div>
         ))}
-        <select
-          className="session-source-add-tab"
-          aria-label={zh ? '打开文件标签' : 'Open file tab'}
-          value=""
-          disabled={!props.onOpenFile || !props.resources?.length}
-          onChange={(event) => {
-            const resource = props.resources?.find((candidate) => candidate.id === event.currentTarget.value);
-            if (resource) void Promise.resolve(props.onOpenFile?.(resource)).catch(setOpenError);
-          }}
-        >
-          <option value="">＋</option>
-          {props.resources?.map((resource) => (
-            <option key={resource.id} value={resource.id}>
-              {resource.displayName}
-            </option>
-          ))}
-        </select>
+        {props.onOpenFile && props.resources?.length ? (
+          <select
+            className="session-source-add-tab"
+            aria-label={zh ? '打开文件标签' : 'Open file tab'}
+            value=""
+            title={zh ? '打开本会话中的文件' : 'Open a file from this conversation'}
+            onChange={(event) => {
+              const resource = props.resources?.find((candidate) => candidate.id === event.currentTarget.value);
+              if (resource) void Promise.resolve(props.onOpenFile?.(resource)).catch(setOpenError);
+            }}
+          >
+            <option value="">{zh ? '打开文件…' : 'Open file…'}</option>
+            {props.resources?.map((resource) => (
+              <option key={resource.id} value={resource.id}>
+                {resource.displayName}
+              </option>
+            ))}
+          </select>
+        ) : null}
       </div>
       <nav aria-label={zh ? '源码预览操作' : 'Source preview actions'}>
         <button
@@ -234,9 +251,6 @@ function SourceWorkspaceView(props: {
           onClick={() => props.onFullWidthChange(!props.fullWidth)}
         >
           {props.fullWidth ? <ArrowsIn aria-hidden="true" /> : <ArrowsOut aria-hidden="true" />}
-        </button>
-        <button type="button" aria-label={zh ? '关闭源码预览' : 'Close source preview'} title={zh ? '关闭' : 'Close'} onClick={props.onClose}>
-          <X aria-hidden="true" />
         </button>
       </nav>
     </header>
@@ -264,8 +278,11 @@ function SourceWorkspaceView(props: {
             </button>
           ) : null}
           <button type="button" aria-label={zh ? '复制路径' : 'Copy path'} title={zh ? '复制路径' : 'Copy path'} disabled={!props.onOpen} onClick={() => void openResource('copy_path')}>
-            <Copy aria-hidden="true" />
+            {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
           </button>
+          <span role="status" className="session-source-copy-status">
+            {copied ? (zh ? '已复制路径' : 'Path copied') : ''}
+          </span>
           <div className="session-source-open-group">
             <button type="button" disabled={!props.onOpen} onClick={() => void openResource(openTarget)}>
               {zh ? '打开' : 'Open'}
@@ -286,79 +303,85 @@ function SourceWorkspaceView(props: {
         </div>
       </div>
       {sourcePreview?.truncated ? <div role="status">{zh ? '预览已截断' : 'Preview truncated'}</div> : null}
-      <div className={renderedMarkdown ? 'session-source-markdown-scroll' : `session-source-scroll ${props.preview.kind === 'image' ? 'session-image-preview' : ''}`}>
-        {props.preview.kind === 'image' ? (
-          <PreviewImage key={props.preview.dataUrl} url={props.preview.dataUrl} name={props.preview.resource.displayName} zh={zh} />
-        ) : renderedMarkdown ? (
-          <ConversationMarkdown text={props.preview.content} streamId={`source-preview:${props.preview.resource.id}`} phase="final" language={props.language} />
-        ) : (
-          <Suspense fallback={<div role="status">{zh ? '正在打开源码…' : 'Opening source…'}</div>}>
-            <SourceCodePreview
-              key={props.preview.resource.id}
-              path={displayPath}
-              content={props.preview.content}
-              language={props.preview.language}
-              label={zh ? `${displayPath} 源码` : `${displayPath} source`}
-              projectId={props.preview.resource.kind === 'file' ? props.preview.resource.projectId : undefined}
-              conversationId={props.preview.resource.kind === 'file' ? props.preview.resource.conversationId : undefined}
-              resourceId={props.preview.resource.kind === 'file' ? props.preview.resource.id : undefined}
-              blameLabels={{
-                locale: props.language,
-                show: zh ? '显示 Git blame' : 'Show Git blame',
-                hide: zh ? '隐藏 Git blame' : 'Hide Git blame',
-                loading: zh ? '正在加载 Git blame…' : 'Loading Git blame…',
-                unavailable: zh ? 'Git blame 暂不可用' : 'Git blame unavailable',
-                retry: zh ? '重试' : 'Retry',
-              }}
-              location={props.preview.location}
-              widgets={widgets}
-              focusWidget={widgets.find((widget) => widget.line === activeCommentLine)?.element}
-              onComment={props.onCommentsChange ? beginComment : undefined}
-              commentLabel={commentLabel}
-            />
-            {widgets.map((widget) =>
-              createPortal(
-                <>
-                  {comments
-                    .filter((comment) => comment.position.line === widget.line)
-                    .map((comment) =>
-                      editingCommentId === comment.id ? (
-                        <CodeCommentPanel
-                          key={comment.id}
-                          language={props.language}
-                          position={comment.position}
-                          comment={comment}
-                          onCancel={() => setEditingCommentId(null)}
-                          onSave={(body) => saveComment(comment.position, body, comment.id)}
-                          onDelete={() => {
-                            props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id));
-                            setEditingCommentId(null);
-                          }}
-                        />
-                      ) : (
-                        <span key={comment.id} className="session-saved-code-comment">
-                          <strong>{zh ? '本地评论' : 'Local comment'}</strong>
-                          <span>{comment.body}</span>
-                          <span className="session-saved-code-comment-actions">
-                            <button type="button" onClick={() => setEditingCommentId(comment.id)}>
-                              {zh ? '编辑' : 'Edit'}
-                            </button>
-                            <button type="button" onClick={() => props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id))}>
-                              {zh ? '删除' : 'Delete'}
-                            </button>
+      <FileReviewContent
+        key={`${props.preview.resource.id}:${sourcePreview?.location?.line ?? ''}:${sourcePreview?.location?.endLine ?? ''}`}
+        review={sourcePreview ? { ...sourcePreview.review, location: sourcePreview.location } : undefined}
+        zh={zh}
+      >
+        <div className={renderedMarkdown ? 'session-source-markdown-scroll' : `session-source-scroll ${props.preview.kind === 'image' ? 'session-image-preview' : ''}`}>
+          {props.preview.kind === 'image' ? (
+            <PreviewImage key={props.preview.dataUrl} url={props.preview.dataUrl} name={props.preview.resource.displayName} zh={zh} />
+          ) : renderedMarkdown ? (
+            <ConversationMarkdown text={props.preview.content} streamId={`source-preview:${props.preview.resource.id}`} phase="final" language={props.language} />
+          ) : (
+            <Suspense fallback={<div role="status">{zh ? '正在打开源码…' : 'Opening source…'}</div>}>
+              <SourceCodePreview
+                key={props.preview.resource.id}
+                path={displayPath}
+                content={props.preview.content}
+                language={props.preview.language}
+                label={zh ? `${displayPath} 源码` : `${displayPath} source`}
+                projectId={props.preview.resource.kind === 'file' ? props.preview.resource.projectId : undefined}
+                conversationId={props.preview.resource.kind === 'file' ? props.preview.resource.conversationId : undefined}
+                resourceId={props.preview.resource.kind === 'file' ? props.preview.resource.id : undefined}
+                blameLabels={{
+                  locale: props.language,
+                  show: zh ? '显示 Git blame' : 'Show Git blame',
+                  hide: zh ? '隐藏 Git blame' : 'Hide Git blame',
+                  loading: zh ? '正在加载 Git blame…' : 'Loading Git blame…',
+                  unavailable: zh ? 'Git blame 暂不可用' : 'Git blame unavailable',
+                  retry: zh ? '重试' : 'Retry',
+                }}
+                location={props.preview.location}
+                widgets={widgets}
+                focusWidget={widgets.find((widget) => widget.line === activeCommentLine)?.element}
+                onComment={props.onCommentsChange ? beginComment : undefined}
+                commentLabel={commentLabel}
+              />
+              {widgets.map((widget) =>
+                createPortal(
+                  <>
+                    {comments
+                      .filter((comment) => comment.position.line === widget.line)
+                      .map((comment) =>
+                        editingCommentId === comment.id ? (
+                          <CodeCommentPanel
+                            key={comment.id}
+                            language={props.language}
+                            position={comment.position}
+                            comment={comment}
+                            onCancel={() => setEditingCommentId(null)}
+                            onSave={(body) => saveComment(comment.position, body, comment.id)}
+                            onDelete={() => {
+                              props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id));
+                              setEditingCommentId(null);
+                            }}
+                          />
+                        ) : (
+                          <span key={comment.id} className="session-saved-code-comment">
+                            <strong>{zh ? '本地评论' : 'Local comment'}</strong>
+                            <span>{comment.body}</span>
+                            <span className="session-saved-code-comment-actions">
+                              <button type="button" onClick={() => setEditingCommentId(comment.id)}>
+                                {zh ? '编辑' : 'Edit'}
+                              </button>
+                              <button type="button" onClick={() => props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id))}>
+                                {zh ? '删除' : 'Delete'}
+                              </button>
+                            </span>
                           </span>
-                        </span>
-                      ),
-                    )}
-                  {draftPosition?.line === widget.line ? <CodeCommentPanel language={props.language} position={draftPosition} onCancel={() => setDraftPosition(null)} onSave={(body) => saveComment(draftPosition, body)} /> : null}
-                </>,
-                widget.element,
-                String(widget.line),
-              ),
-            )}
-          </Suspense>
-        )}
-      </div>
+                        ),
+                      )}
+                    {draftPosition?.line === widget.line ? <CodeCommentPanel language={props.language} position={draftPosition} onCancel={() => setDraftPosition(null)} onSave={(body) => saveComment(draftPosition, body)} /> : null}
+                  </>,
+                  widget.element,
+                  String(widget.line),
+                ),
+              )}
+            </Suspense>
+          )}
+        </div>
+      </FileReviewContent>
     </section>
   );
 }
@@ -385,6 +408,8 @@ function basename(path: string): string {
 /** 通用文件沿用会话右侧审阅容器，预览组件负责授权读取、格式展示和失败重试。 */
 export function FilePreviewWorkspace(props: {
   request: FilePreviewRequest;
+  /** 本次点击的位置独立于资源首次登记的行号。 */
+  location?: ConversationFileLocation;
   language: SessionUiLanguage;
   toolbarHost?: HTMLElement | null;
   fullWidth: boolean;
@@ -425,7 +450,7 @@ export function FilePreviewWorkspace(props: {
   return (
     <section className="session-context-workspace session-source-workspace" aria-label={zh ? '文件审阅' : 'File review'}>
       {props.toolbarHost ? createPortal(header, props.toolbarHost) : header}
-      <FilePreview request={props.request} zh={zh} />
+      <FilePreview request={props.request} location={props.location} zh={zh} />
     </section>
   );
 }

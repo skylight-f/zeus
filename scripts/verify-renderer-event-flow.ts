@@ -4,6 +4,7 @@ import { createHydratedSessionState, createInitialSessionState, sessionReducer }
 import type { NativePlanImplementationRequest, NativeRealtimeEventEnvelope, NativeQueueSnapshot } from '../apps/desktop/src/renderer/session/sessionTypes.ts';
 import { orderTranscriptItemsWithQueue } from '../apps/desktop/src/renderer/session/conversationQueuePresentation.ts';
 import type { TurnChangeSet } from '../packages/shared/src/conversationResources.ts';
+import type { ConversationTranscriptEnvelope } from '../packages/shared/src/conversationTranscriptWire.ts';
 
 const projectId = 'renderer-event-flow-project';
 const conversationId = 'renderer-event-flow-conversation';
@@ -11,10 +12,19 @@ const threadId = 'renderer-event-flow-thread';
 const occurredAt = '2026-08-21T00:00:00.000Z';
 const queue = { state: { type: 'idle' as const }, submissions: [] };
 
+/** 为既有渲染探针提供与正式接口一致的持久显示凭证。 */
+function transcript(entryId: string, order: number, sourceId = entryId, turnId: string | null = 'turn'): ConversationTranscriptEnvelope {
+  return {
+    placement: { entryId, order, orderEpoch: 1, placementRevision: order, turnId, openingInputId: 'probe-input', displayStageId: null },
+    sources: [{ domain: 'probe', scope: 'segment', sourceId, facet: 'body', revision: order, contentRevision: order }],
+  };
+}
+
 const snapshotV2 = {
   schemaVersion: 2 as const,
-  structureGeneration: '2026-09-03-conversation-stage-identity' as const,
+  structureGeneration: '2026-09-16-transcript-placement' as const,
   conversationSchemaGeneration: '2026-08-16-unified-conversation-segments' as const,
+  orderEpoch: 1,
   throughEventSeq: 0,
   eventStreamGeneration: 'zeus-conversation-sync-v2',
   conversation: {
@@ -59,11 +69,12 @@ const snapshotV2 = {
 
 const historyV2 = {
   schemaVersion: 2 as const,
-  structureGeneration: '2026-09-03-conversation-stage-identity' as const,
+  structureGeneration: '2026-09-16-transcript-placement' as const,
   conversationId,
   kind: 'model_history' as const,
   throughEventSeq: 0,
   throughSequence: 0,
+  orderEpoch: 1,
   items: [],
   hasMore: false,
   nextCursor: null,
@@ -259,6 +270,7 @@ function verifyStableHydrationPages() {
     resources: [],
     startedAt: occurredAt,
     updatedAt: occurredAt,
+    transcript: transcript('loaded-process', 1),
   };
   /** 已完成页的游标和内容必须一起保存。 */
   const page = { loaded: true, loading: false, nextCursor: null, hasMore: false, error: null };
@@ -447,6 +459,7 @@ function verifyTruncatedTaskPushIdentityCoalescing() {
       refreshRequired: false,
     },
     toolResult: null,
+    transcript: transcript('task-push-history', 1, providerItemId, 'task-push-turn'),
   };
   // 活动用户项故意提供无法解析的截断载荷，复现现场身份丢失条件。
   const activeSnapshot = {
@@ -487,6 +500,7 @@ function verifyTruncatedTaskPushIdentityCoalescing() {
           startedAt: occurredAt,
           completedAt: occurredAt,
           updatedAt: occurredAt,
+          transcript: transcript('task-push-history', 1, providerItemId, 'task-push-turn'),
         },
       ],
       activeItemsTruncated: false,
@@ -537,7 +551,15 @@ function verifyTruncatedTaskPushIdentityCoalescing() {
     throughSequence: 2,
     items: [
       openingUserMessage,
-      { ...openingUserMessage, id: 'deliberate-repeat-history', sequence: 2, submissionId: 'deliberate-repeat-submission', clientUserMessageId: 'deliberate-repeat-client', providerItemId: 'deliberate-repeat-provider' },
+      {
+        ...openingUserMessage,
+        id: 'deliberate-repeat-history',
+        sequence: 2,
+        submissionId: 'deliberate-repeat-submission',
+        clientUserMessageId: 'deliberate-repeat-client',
+        providerItemId: 'deliberate-repeat-provider',
+        transcript: transcript('deliberate-repeat-history', 2, 'deliberate-repeat-provider', 'task-push-turn'),
+      },
     ],
     limits: { ...history.limits, returnedItems: 2 },
   };
@@ -588,15 +610,31 @@ function verifyRestoredSubmissionOrder() {
     startedAt: at(second),
     completedAt: at(second),
     updatedAt: at(second),
+    transcript: transcript(`reply-${second}`, second + 1, `reply-${second}`, 'order-turn'),
+  }));
+  /** 接纳事务已经写入用户历史，但 Provider 仍可尚未给出自己的消息身份。 */
+  const acceptedInputs = submissions.slice(0, 3).map((submission, index) => ({
+    id: `accepted-input-${index}`,
+    turnId: 'order-turn',
+    type: 'userMessage',
+    phase: 'prework',
+    status: submission.status,
+    text: submission.content,
+    payload: { submissionId: submission.id, clientId: submission.clientUserMessageId, clientUserMessageId: submission.clientUserMessageId, delivery: submission.delivery },
+    resources: [],
+    startedAt: submission.createdAt,
+    completedAt: submission.updatedAt,
+    updatedAt: submission.updatedAt,
+    transcript: transcript(`accepted-input-${index}`, index * 2 + 1, submission.id, 'order-turn'),
   }));
   /** 每次切回都从同一权威提交重建，不能依赖上一屏的临时条目。 */
-  const snapshot = { ...base, items: replies, submissions, queue: { ...queue, submissions } };
+  const snapshot = { ...base, items: [...replies, ...acceptedInputs], submissions, queue: { ...queue, submissions } };
   /** 回复先到、提交后到时，HTTP 补读和实时队列事件都必须立刻恢复相同顺序。 */
   for (const firstStatus of ['active', 'completed', 'resolved']) {
     /** 活动和已结束的首发均属于已接纳历史，待发消息仍留在最后。 */
     const lateQueue = { ...snapshot.queue, submissions: submissions.map((submission, index) => (index === 0 ? { ...submission, status: firstStatus } : submission)) };
     /** 不先加载提交，复现历史正文已显示而队列信息稍后到达的真实边界。 */
-    const repliesOnly = createHydratedSessionState({ ...snapshot, submissions: [], queue });
+    const repliesOnly = createHydratedSessionState({ ...base, items: replies, submissions: [], queue });
     /** 独立的引导接纳入口也必须复用相同插入规则。 */
     const steered = sessionReducer(repliesOnly, { type: 'steering_submission_hydrated', submission: submissions[1]! });
     assert(
@@ -677,6 +715,7 @@ function verifyInternalPayloadsStayOutOfTranscript() {
           refreshRequired: false,
         },
         toolResult: null,
+        transcript: transcript('tool-call-history', 1),
       },
       {
         id: 'reasoning-history',
@@ -700,6 +739,7 @@ function verifyInternalPayloadsStayOutOfTranscript() {
           refreshRequired: false,
         },
         toolResult: null,
+        transcript: transcript('reasoning-history', 2, 'reasoning-history-provider-item'),
       },
       {
         id: 'assistant-history',
@@ -723,6 +763,7 @@ function verifyInternalPayloadsStayOutOfTranscript() {
           refreshRequired: false,
         },
         toolResult: null,
+        transcript: transcript('assistant-history', 3, 'assistant-history-provider-item'),
       },
     ],
     limits: { ...historyV2.limits, returnedItems: 3 },
@@ -743,11 +784,12 @@ function verifyInternalPayloadsStayOutOfTranscript() {
   assert(adapted.items[1]?.text === '最终回答' && adapted.items[1]?.type === 'agentMessage', 'Internal tool_call projections must never become visible assistant transcript rows.');
   const merged = mergeConversationProcessV2(adapted, 'turn', {
     schemaVersion: 2,
-    structureGeneration: '2026-09-03-conversation-stage-identity',
+    structureGeneration: '2026-09-16-transcript-placement',
     conversationId,
     kind: 'process',
     throughEventSeq: 0,
     throughSequence: 1,
+    orderEpoch: 1,
     items: [
       {
         id: 'command-process',
@@ -770,6 +812,7 @@ function verifyInternalPayloadsStayOutOfTranscript() {
           refreshRequired: false,
         },
         toolResult: null,
+        transcript: transcript('command-process', 4),
       },
     ],
     hasMore: false,
@@ -855,11 +898,12 @@ function verifyProcessPageDoesNotDowngradeLiveTerminalState() {
 
   const staleProcessPage = mergeConversationProcessV2(adapted, providerTurnId, {
     schemaVersion: 2,
-    structureGeneration: '2026-09-03-conversation-stage-identity',
+    structureGeneration: '2026-09-16-transcript-placement',
     conversationId,
     kind: 'process',
     throughEventSeq: 0,
     throughSequence: 1,
+    orderEpoch: 1,
     items: [
       {
         id: 'durable-command-process',
@@ -882,6 +926,7 @@ function verifyProcessPageDoesNotDowngradeLiveTerminalState() {
           refreshRequired: false,
         },
         toolResult: null,
+        transcript: transcript('command-process', 1, 'command-process', localTurnId),
       },
     ],
     hasMore: false,
@@ -1250,6 +1295,50 @@ async function verifyTurnChangeReviewHydration() {
 }
 
 /** 审阅专项可独立运行，避免无关历史探针的既有失败遮蔽结果。 */
+/** 真实控制器必须先取齐全部位置，再一次通知 UI，期间文本事件继续保留。 */
+async function verifyPlacementEpochTakeover() {
+  const harness = createHarness();
+  let reads = 0;
+  harness.client.loadNativeConversationTranscriptPlacements = async (_project, _conversation, ids) => {
+    reads += 1;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { conversationId, orderEpoch: 2, revision: 1000, uncoveredEntryIds: [], removedEntryIds: [], placements: ids.map((id) => ({ ...transcript(id, Number(id.split('-').at(-1)) + 1).placement, orderEpoch: 2 })) };
+  };
+  await harness.controller.start();
+  try {
+    for (let index = 0; index < 260; index += 1)
+      harness.emit(conversationEvent(index + 1, 'conversation.item.started', { turnId: 'turn', itemId: `placement-${index}`, itemType: 'agentMessage', textContent: '正文', transcript: transcript(`placement-${index}`, index + 1) }));
+    let publications = 0;
+    const unsubscribe = harness.controller.subscribe(() => {
+      publications += 1;
+      const epochs = new Set(Object.values(harness.controller.getState().items).flatMap((item) => (item.transcript ? [item.transcript.placement.orderEpoch] : [])));
+      assert(epochs.size <= 1, '位置接管不得发布混合代次。');
+    });
+    harness.emit(conversationEvent(261, 'conversation.transcript.placement.changed', { orderEpoch: 2, revision: 1000 }));
+    harness.emit(
+      conversationEvent(262, 'conversation.item.completed', {
+        turnId: 'turn',
+        itemId: 'placement-259',
+        itemType: 'agentMessage',
+        textContent: '期间完成正文',
+        transcript: { ...transcript('placement-259', 260), placement: { ...transcript('placement-259', 260).placement, orderEpoch: 2 }, sources: [{ ...transcript('placement-259', 260).sources[0]!, revision: 1001, contentRevision: 1001 }] },
+      }),
+    );
+    await waitUntil(() => Object.values(harness.controller.getState().items).every((item) => item.transcript?.placement.orderEpoch === 2), 'placement epoch takeover');
+    assert(reads === 2 && publications === 1, '超过 256 个位置需分批读取且只发布一次。');
+    assert(
+      Object.values(harness.controller.getState().items).some((item) => item.text === '期间完成正文'),
+      '位置接管不能丢失缓冲正文。',
+    );
+    unsubscribe();
+    return { loadedItems: 260, batches: reads, publications };
+  } finally {
+    harness.controller.dispose();
+  }
+}
+const placementTakeover = await verifyPlacementEpochTakeover();
+console.log(JSON.stringify({ placementTakeover }));
+
 const turnChangeReview = await verifyTurnChangeReviewHydration();
 /** 重试专项可单独核验，不受其他既有投影断言影响。 */
 const queuedRetryReconciliation = await verifyQueuedRetryReconciliation();

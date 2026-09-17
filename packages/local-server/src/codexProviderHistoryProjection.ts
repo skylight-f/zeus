@@ -2,6 +2,7 @@ import { assistantMessageMetadata } from '@zeus/shared';
 import { readCodexTurnItems, type CodexThreadSnapshot, type CodexTurnSnapshot } from '@zeus/ai-runtime';
 import type { ConversationResource } from '@zeus/shared';
 import {
+  providerFacet,
   type ConversationTurnStatus,
   projectConversationTurnFailure,
   resolveSnapshotProviderItemId,
@@ -362,10 +363,12 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       if (providerTurn.id === checkpoint.baselineTurnId && !existingTurn && classifySnapshotTurn(providerTurn) !== 'active') continue;
       /** 已确认且状态未变的边界轮次无需反复下载正文。 */
       const classification = classifySnapshotTurn(providerTurn);
+      /** 网络读取前冻结来源水位，返回后逐条拒绝覆盖并发实时写入。 */
+      const requestedRevision = options.transcripts.revision(conversation.id);
       if (!existingTurn || classification === 'active' || existingTurn.status !== classification || repairTurnIds.has(providerTurn.id)) {
         providerTurn.items = await readCodexTurnItems(options.manager, { threadId: providerThreadId, turnId: providerTurn.id, ...input });
       }
-      const projected = await projectProviderSnapshotTurn(conversation, providerThreadId, providerTurn, existingTurn);
+      const projected = await projectProviderSnapshotTurn(conversation, providerThreadId, providerTurn, existingTurn, requestedRevision);
       localTurns.set(providerTurn.id, projected);
     }
     await reconcileRecoveredRequestUserInput(options.conversations.getById(conversation.id) ?? conversation, providerThreadId, eligibleDescending, localTurns);
@@ -427,13 +430,13 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     conversation: ZeusConversationWithMessagesRecord,
     providerThreadId: string,
     providerTurn: CodexTurnSnapshot,
-    existingTurn: ZeusConversationTurnRecord | undefined,
+    existingTurnInput: ZeusConversationTurnRecord | undefined,
+    requestedRevision: number,
   ): Promise<ZeusConversationTurnRecord> {
-    const classification = classifySnapshotTurn(providerTurn);
+    // 读取正文期间可能收到实时结束事件，必须采用此刻已落库的轮次状态。
+    const existingTurn = existingTurnInput ? (options.turns.getById(existingTurnInput.id) ?? existingTurnInput) : undefined;
+    let classification = classifySnapshotTurn(providerTurn);
     if (classification === 'unknown') throw coordinatorError('ZEUS_NATIVE_PROVIDER_TURN_INVALID', `Provider turn has an unknown status: ${providerTurn.id}`);
-    const timestamp = now();
-    const startedAt = providerTimestamp(providerTurn.startedAt, existingTurn?.startedAt ?? timestamp);
-    const completedAt = classification === 'active' ? null : providerTimestamp(providerTurn.completedAt, existingTurn?.completedAt ?? timestamp);
     const submissions = options.submissions.listByConversation(conversation.id);
     if (classification === 'active' && existingTurn && shouldPreserveProviderStopTerminalTurn({ turn: existingTurn, submissions })) {
       options.conversations.bindProvider(conversation.id, { providerId: 'codex', providerThreadId, providerModel: conversation.providerModel, providerState: 'paused' });
@@ -448,6 +451,25 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     const providerClientId = providerTurnUserClientId(providerTurn);
     const providerMatchedSubmission = providerClientId ? submissions.find((candidate) => candidate.clientMessageId === providerClientId) : undefined;
     const existingOwnedSubmission = existingTurn?.clientSubmissionId ? submissions.find((candidate) => candidate.id === existingTurn.clientSubmissionId) : undefined;
+    // 原始日志可能停留在运行中；已接纳并结束的主提交不能被旧历史重新激活。
+    // 停止待确认和交互缺失已在上方单独处理；引导完成不代表它所在的整轮结束。
+    const preservesTerminalSubmission = Boolean(
+      classification === 'active' &&
+      existingOwnedSubmission?.providerTurnId === providerTurn.id &&
+      !isSteeringSubmission(existingOwnedSubmission) &&
+      existingOwnedSubmission.acceptedAt &&
+      existingOwnedSubmission.resolvedAt &&
+      existingOwnedSubmission.submissionOutcome === 'terminal' &&
+      (existingOwnedSubmission.status === 'completed' || existingOwnedSubmission.status === 'failed'),
+    );
+    if (preservesTerminalSubmission && existingOwnedSubmission) {
+      // 保留既有终态；已经被旧投影改回运行中的轮次只收口为中断，不推断成功。
+      classification = existingTurn?.status === 'completed' || existingTurn?.status === 'failed' ? existingTurn.status : 'interrupted';
+      providerTurn = { ...providerTurn, status: classification, completedAt: existingTurn?.completedAt ?? existingOwnedSubmission.resolvedAt };
+    }
+    const timestamp = now();
+    const startedAt = providerTimestamp(providerTurn.startedAt, existingTurn?.startedAt ?? timestamp);
+    const completedAt = classification === 'active' ? null : providerTimestamp(providerTurn.completedAt, existingTurn?.completedAt ?? timestamp);
     const existingOwnerConfirmed = Boolean(existingOwnedSubmission && (existingOwnedSubmission.acceptedAt || existingOwnedSubmission.clientMessageId === providerClientId));
     // provider_turn_id 对 steer 只表示目标轮次，不能反向证明该消息已经被 Provider 接收。
     const matchedSubmission = (existingOwnerConfirmed ? existingOwnedSubmission : undefined) ?? providerMatchedSubmission;
@@ -458,7 +480,8 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
         ? options.requests.listByConversation(conversation.id).find((request) => request.turnId === existingTurn.id && request.status === 'pending' && request.transportGenerationId === options.manager.generationForThread(providerThreadId))
         : undefined;
     const status = classification === 'active' ? (pendingRequest ? 'waiting' : 'running') : classification;
-    const wasTerminal = existingTurn?.status === 'completed' || existingTurn?.status === 'interrupted' || existingTurn?.status === 'failed';
+    // 修复旧终态不是一次新的中断，不能因此暂停随后排队的消息。
+    const wasTerminal = preservesTerminalSubmission || existingTurn?.status === 'completed' || existingTurn?.status === 'interrupted' || existingTurn?.status === 'failed';
     const stateChanged = !existingTurn || existingTurn.status !== status;
     const turnProjectionChanged = !existingTurn || existingTurn.status !== status || existingTurn.clientSubmissionId !== clientSubmissionId || existingTurn.startedAt !== startedAt || existingTurn.completedAt !== completedAt;
     let turn = turnProjectionChanged
@@ -481,7 +504,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     let itemProjectionChanged = false;
     for (const candidate of Array.isArray(providerTurn.items) ? providerTurn.items : []) {
       if (!isRecord(candidate)) continue;
-      if (projectProviderSnapshotItem(conversation, turn, candidate, classification, timestamp, matchedCompatibilityItemIds)) itemProjectionChanged = true;
+      if (projectProviderSnapshotItem(conversation, turn, candidate, classification, timestamp, matchedCompatibilityItemIds, requestedRevision)) itemProjectionChanged = true;
     }
     if (itemProjectionChanged && !turnProjectionChanged) {
       turn = options.turns.upsert({
@@ -587,6 +610,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     turnClassification: ReturnType<typeof classifySnapshotTurn>,
     timestamp: string,
     matchedCompatibilityItemIds: Set<string>,
+    requestedRevision: number,
   ): boolean {
     const providerThreadId = turn.providerThreadId;
     const providerTurnId = requireString(turn.providerTurnId, 'provider turn id');
@@ -596,6 +620,8 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     const existingRaw = options.providerItems.getByProvider(providerThreadId, nativeProviderItemId);
     const providerItemId = resolveSnapshotProviderItemId(providerTurnId, nativeProviderItemId, existingRaw);
     const itemType = itemTypeFromValue(itemPayload.type);
+    const currentSource = options.transcripts.envelopeForSource({ conversationId: conversation.id, sourceDomain: 'provider_item', sourceScope: providerThreadId, sourceId: providerItemId, facet: providerFacet(itemType) });
+    if (currentSource?.sources.some((source) => source.revision > requestedRevision)) return false;
     const identityPayload = compatibilitySnapshotItem ? { ...itemPayload, compatibilitySnapshotItemId: nativeProviderItemId } : itemPayload;
     const presentedItemPayload = sanitizeConversationItemPayload(itemType === 'userMessage' ? { ...identityPayload, ...submissionPresentation(conversation.id, turn, itemPayload) } : identityPayload);
     const existing = providerItemId === nativeProviderItemId ? existingRaw : options.providerItems.getByProvider(providerThreadId, providerItemId);

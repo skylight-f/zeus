@@ -257,6 +257,7 @@ export class ConversationChoiceQueryApplication {
       transportKind: conversation.transportKind,
       providerId: conversation.providerId,
       providerThreadId: conversation.providerThreadId,
+      contextCapacityTokens: conversation.contextCapacityTokens,
       providerModel: conversation.providerModel,
       providerState: conversation.providerState,
       legacySourceConversationId: conversation.legacySourceConversationId,

@@ -82,11 +82,18 @@ export function useAsyncQuestionDock(state: NativeSessionState | null, enabled: 
     if (conversationId) asyncQuestionDockSelections.set(conversationId, created);
     return created;
   }, [conversationId]);
-  /** 完整问题按稳定时间排序；活动表单不依赖消息虚拟列表是否挂载。 */
+  /** 完整问题按持久位置排序；活动表单不依赖消息虚拟列表是否挂载。 */
   const questions = state
     ? Object.values(state.items)
         .filter((item) => item.status === 'completed' && itemRole(item) === 'assistant' && classifyAssistantMessage(item.payload, item.phase) === 'question' && !asyncQuestionStatus(item, state).confirmed)
-        .sort((left, right) => (left.timelineAt ?? left.updatedAt ?? '').localeCompare(right.timelineAt ?? right.updatedAt ?? '') || left.key.localeCompare(right.key))
+        .sort((left, right) => {
+          const leftOrder = left.transcript?.placement.order ?? null;
+          const rightOrder = right.transcript?.placement.order ?? null;
+          if (leftOrder !== null && rightOrder !== null) return leftOrder - rightOrder || left.key.localeCompare(right.key);
+          if (leftOrder !== null) return -1;
+          if (rightOrder !== null) return 1;
+          return left.key.localeCompare(right.key);
+        })
     : [];
   /** 先保留当前题，再处理本窗口接到的队列；旧历史题仍由用户主动打开。 */
   const selected =
@@ -237,7 +244,6 @@ export function AsyncQuestionPanel(props: {
       autoFocus
       busy={status.pending}
       onChooseAttachments={props.onChooseAttachments}
-      confirmSelection={closed}
       retainDraft
       submitLabel={closed ? (zh ? '作为新消息发送' : 'Send as new message') : zh ? '提交回答' : 'Submit answer'}
       onDismiss={props.onDismiss}

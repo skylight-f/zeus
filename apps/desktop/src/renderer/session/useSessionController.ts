@@ -1,9 +1,10 @@
+import { reportApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { attachV2ResourcesToSnapshot } from './conversationResourceProjection.js';
 import { asyncMessageQuestions, formatAsyncQuestionAnswer, validateCanonicalRequestUserInputAnswers, type AsyncQuestionAnswer, type AsyncQuestionResponse } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
-import type { ConversationNavigationSnapshot } from '@zeus/shared';
+import type { ConversationTranscriptEnvelope, ConversationTranscriptPlacementBatch, ConversationNavigationSnapshot } from '@zeus/shared';
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
-import { type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
+import { serializeBrowserComments, type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { createInitialSessionState, sessionReducer } from './sessionReducer.js';
 import {
   type CodexConversationCapabilities,
@@ -180,6 +181,8 @@ export interface SessionControllerClient {
   activateCodexConfig?(): Promise<unknown>;
   /** 首次加载、重连和发送后核对共用同一份结构与消息读取结果。 */
   loadNativeConversationReadableSnapshot(projectId: string, conversationId: string): Promise<NativeConversationReadableSnapshot>;
+  /** 核对全部已加载位置的服务端代次。 */
+  loadNativeConversationTranscriptPlacements?(projectId: string, conversationId: string, entryIds: string[], expectedOrderEpoch?: number): Promise<ConversationTranscriptPlacementBatch>;
   loadNativeConversationSessionMetrics?(projectId: string, conversationId: string): Promise<NativeSessionMetricsSnapshot>;
   /** 有界读取环境事实，不影响正文和队列状态。 */
   loadNativeConversationExecutionContext?(projectId: string, conversationId: string): Promise<NativeConversationExecutionContext>;
@@ -305,6 +308,10 @@ export interface SessionController {
   setDraft(draft: string): void;
   setAttachments(attachments: NativeConversationAttachment[]): void;
   setBrowserSubmission(browserSubmission: ZeusBrowserPreparedSubmission | null): void;
+  /** 新确认的评论按身份加入已有草稿，保留其他网页和输入内容。 */
+  stageBrowserComments(prepared: ZeusBrowserPreparedSubmission): void;
+  /** 网页删除只移除对应评论，不影响其他草稿内容。 */
+  removeBrowserComments(commentIds: string[]): void;
   setContextDraft(contextDraft: ConversationContextDraft): void;
 
   send(delivery: 'queue' | 'steer_now', expectedTurnId?: string, settings?: NativeTurnSettingsSelection): Promise<NativeOperationAcceptance | void>;
@@ -380,6 +387,8 @@ interface PendingSendEnvelope {
   model?: string;
   agentKind?: 'codex' | 'pi';
   effort?: string;
+  /** 本次发送冻结的窗口容量。 */
+  contextCapacityTokens?: number | null;
   serviceTier?: string | null;
   permissionMode?: NativePermissionMode;
   collaborationMode: NativeCollaborationMode;
@@ -643,14 +652,126 @@ export function createSessionController(options: CreateSessionControllerOptions)
     pendingRenderBytes = 0;
   }
 
+  /** 批次内只归约状态，批次结束时统一通知订阅者。 */
+  let renderBatchActive = false;
+  let renderBatchChanged = false;
+
+  /** 位置换代期间保留旧画面，所有动作按原顺序等待一次接管。 */
+  let placementRecovery: Promise<void> | null = null;
+  let placementEpoch = Math.max(1, ...Object.values(state.items).map((item) => item.transcript?.placement.orderEpoch ?? 1));
+  const placementActions: Parameters<typeof sessionReducer>[1][] = [];
+  let placementBufferBytes = 0;
+  /** 作废已失败或已关闭的异步位置请求，避免旧请求接管新一轮状态。 */
+  let placementRecoveryGeneration = 0;
+
+  /** 收集动作中实际出现的持久身份，包含等待接管时新到的条目。 */
+  function actionTranscripts(action: Parameters<typeof sessionReducer>[1]): ConversationTranscriptEnvelope[] {
+    if (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged') return [...action.snapshot.items, ...action.snapshot.requests].flatMap((item) => (item.transcript ? [item.transcript] : []));
+    if (action.type === 'pending_requests_hydrated') return [...action.requests, ...(action.items ?? [])].flatMap((item) => (item.transcript ? [item.transcript] : []));
+    if (action.type === 'event_received') {
+      const payload = action.event.payload;
+      const candidates = [
+        payload,
+        ...('request' in payload && payload.request ? [payload.request] : []),
+        ...('execution' in payload ? [payload.execution] : []),
+        ...('executions' in payload && Array.isArray(payload.executions) ? payload.executions : []),
+      ];
+      return candidates.flatMap((item) => (item && typeof item === 'object' && 'transcript' in item && item.transcript ? [item.transcript as ConversationTranscriptEnvelope] : []));
+    }
+    return [];
+  }
+
+  /** 分批核对同一代次；跨批又发生重编号时丢弃整批证据重新读取。 */
+  async function recoverTranscriptPlacements(generation: number): Promise<void> {
+    if (!options.client.loadNativeConversationTranscriptPlacements) throw new Error('当前客户端缺少位置核对接口。');
+    const placements = new Map<string, ConversationTranscriptPlacementBatch['placements'][number]>();
+    const removed = new Set<string>();
+    let epoch = 0;
+    let revision = 0;
+    let earliestRevision = Number.MAX_SAFE_INTEGER;
+    while (!disposed && generation === placementRecoveryGeneration) {
+      const ids = new Set([...Object.values(state.items), ...state.pendingRequests].flatMap((item) => (item.transcript ? [item.transcript.placement.entryId] : [])));
+      for (const action of placementActions) for (const envelope of actionTranscripts(action)) ids.add(envelope.placement.entryId);
+      const remaining = [...ids].filter((id) => !placements.has(id) && !removed.has(id));
+      if (remaining.length === 0) {
+        const notices = placementActions.flatMap((action) => (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed' ? [action.event.payload] : []));
+        const requestedEpoch = Math.max(placementEpoch, ...notices.map((notice) => notice.orderEpoch), ...placementActions.flatMap(actionTranscripts).map((envelope) => envelope.placement.orderEpoch));
+        if (ids.size && (epoch < requestedEpoch || notices.some((notice) => notice.revision > earliestRevision))) {
+          placements.clear();
+          removed.clear();
+          earliestRevision = Number.MAX_SAFE_INTEGER;
+          continue;
+        }
+        const actions = placementActions.splice(0);
+        placementBufferBytes = 0;
+        placementEpoch = epoch || requestedEpoch;
+        placementRecovery = null;
+        dispatch({
+          type: 'transcript_placements_hydrated',
+          actions,
+          batch: { conversationId: options.conversationId, orderEpoch: placementEpoch, revision, placements: [...placements.values()], removedEntryIds: [...removed], uncoveredEntryIds: [] },
+        });
+        return;
+      }
+      const batch = await options.client.loadNativeConversationTranscriptPlacements(options.projectId, options.conversationId, remaining.slice(0, 256), epoch || undefined);
+      if (disposed || generation !== placementRecoveryGeneration) return;
+      if (batch.uncoveredEntryIds.length > 0 && batch.placements.length === 0 && batch.removedEntryIds.length === 0) throw new Error('已加载消息的位置无法核对，保留原画面等待重新同步。');
+      if (epoch && batch.orderEpoch !== epoch) {
+        placements.clear();
+        removed.clear();
+        earliestRevision = Number.MAX_SAFE_INTEGER;
+      }
+      epoch = batch.orderEpoch;
+      earliestRevision = Math.min(earliestRevision, batch.revision);
+      revision = Math.max(revision, batch.revision);
+      for (const placement of batch.placements) placements.set(placement.entryId, placement);
+      for (const id of batch.removedEntryIds) removed.add(id);
+    }
+  }
+
   function dispatch(action: Parameters<typeof sessionReducer>[1]): void {
+    const incomingEpoch =
+      action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed' ? action.event.payload.orderEpoch : Math.max(0, ...actionTranscripts(action).map((envelope) => envelope.placement.orderEpoch));
+    if (
+      action.type !== 'transcript_placements_hydrated' &&
+      (placementRecovery || (incomingEpoch > 0 && incomingEpoch !== placementEpoch) || (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed'))
+    ) {
+      placementBufferBytes += new TextEncoder().encode(JSON.stringify(action)).byteLength;
+      placementActions.push(action);
+      if (placementActions.length > sessionRealtimeBufferBudget.maxEntries || placementBufferBytes > sessionRealtimeBufferBudget.maxBytes) {
+        placementActions.length = 0;
+        placementBufferBytes = 0;
+        placementRecovery = null;
+        placementRecoveryGeneration += 1;
+        failConversationSync(new Error('位置接管期间的消息缓冲超过预算。'));
+        return;
+      }
+      if (!placementRecovery) {
+        const generation = ++placementRecoveryGeneration;
+        const recovery = Promise.resolve()
+          .then(() => recoverTranscriptPlacements(generation))
+          .catch((error: unknown) => {
+            if (disposed || generation !== placementRecoveryGeneration) return;
+            placementActions.length = 0;
+            placementBufferBytes = 0;
+            placementRecovery = null;
+            failConversationSync(error);
+          })
+          .finally(() => {
+            if (placementRecovery === recovery) placementRecovery = null;
+          });
+        placementRecovery = recovery;
+      }
+      return;
+    }
     const previousThreadId = state.providerThreadId;
     const previousTransportKind = state.snapshot?.transportKind ?? null;
     const next = sessionReducer(state, action);
     if (next === state) return;
     state = next;
     if (state.providerThreadId !== previousThreadId || (state.snapshot?.transportKind ?? null) !== previousTransportKind) identityEpoch += 1;
-    for (const listener of listeners) listener();
+    if (renderBatchActive) renderBatchChanged = true;
+    else for (const listener of listeners) listener();
   }
 
   function persistDraft(): void {
@@ -707,7 +828,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     if (snapshot.conversationSchemaGeneration !== CONVERSATION_SCHEMA_GENERATION || snapshot.syncStreamGeneration !== CONVERSATION_SYNC_STREAM_GENERATION || !Number.isSafeInteger(snapshot.throughEventSeq) || snapshot.throughEventSeq < 0) {
       throw new Error('Zeus Renderer 与本地服务的会话结构代次不匹配，已拒绝猜测旧新字段。');
     }
-    lastAppliedSyncEventSequence = snapshot.throughEventSeq;
+    lastAppliedSyncEventSequence = Math.max(lastAppliedSyncEventSequence, snapshot.throughEventSeq);
     for (const sequence of pendingSyncGapEvents.keys()) {
       if (sequence <= snapshot.throughEventSeq) deletePendingSyncGapEvent(sequence);
     }
@@ -717,6 +838,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       queue: queueWithPendingSteering(settledSnapshot.queue),
     };
     dispatch({ type: 'snapshot_hydrated', snapshot: projectedSnapshot });
+    if (placementRecovery) await placementRecovery;
     void hydrateSessionMetrics(projectedSnapshot.id);
   }
 
@@ -805,7 +927,16 @@ export function createSessionController(options: CreateSessionControllerOptions)
     if (pendingRenderDeltas.size === 0) return;
     const events = [...pendingRenderDeltas.values()];
     clearPendingRenderDeltas();
-    for (const event of events) applyEventImmediately(event);
+    renderBatchActive = true;
+    try {
+      for (const event of events) applyEventImmediately(event);
+    } finally {
+      renderBatchActive = false;
+      if (renderBatchChanged) {
+        renderBatchChanged = false;
+        for (const listener of listeners) listener();
+      }
+    }
   }
 
   function queueRenderDelta(event: NativeConversationEvent): void {
@@ -1932,6 +2063,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
             ...(envelope.model ? { model: envelope.model } : {}),
             ...(envelope.agentKind ? { agentKind: envelope.agentKind } : {}),
             ...(envelope.effort ? { effort: envelope.effort } : {}),
+            ...(envelope.contextCapacityTokens !== undefined ? { contextCapacityTokens: envelope.contextCapacityTokens } : {}),
             ...(Object.prototype.hasOwnProperty.call(envelope, 'serviceTier') ? { serviceTier: envelope.serviceTier } : {}),
             ...(envelope.permissionMode ? { permissionMode: envelope.permissionMode } : {}),
             collaborationMode: envelope.collaborationMode,
@@ -2574,6 +2706,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
     dispose() {
       if (disposed) return;
       disposed = true;
+      placementActions.length = 0;
+      placementBufferBytes = 0;
+      placementRecovery = null;
+      placementRecoveryGeneration += 1;
       if (renderDeltaTimer) clearTimeout(renderDeltaTimer);
       renderDeltaTimer = null;
       clearPendingRenderDeltas();
@@ -2633,6 +2769,35 @@ export function createSessionController(options: CreateSessionControllerOptions)
       });
       persistDraft();
     },
+    removeBrowserComments(commentIds) {
+      /** 会话中未引用这些评论时无需写入草稿。 */
+      const submission = state.browserSubmission;
+      if (!submission || !submission.commentIds.some((id) => commentIds.includes(id))) return;
+      /** 保留其余网页评论与仍被引用的截图。 */
+      const comments = submission.comments.filter((comment) => !commentIds.includes(comment.id));
+      dispatch({
+        type: 'browser_submission_changed',
+        browserSubmission: comments.length
+          ? {
+              ...submission,
+              comments,
+              commentIds: comments.map((comment) => comment.id),
+              content: serializeBrowserComments(comments),
+              attachments: submission.attachments.filter((attachment) => comments.some((comment) => comment.screenshotPath === attachment.localPath)),
+            }
+          : null,
+      });
+      persistDraft();
+    },
+    stageBrowserComments(prepared) {
+      if (browserSubmissionUsesReservedComments(prepared)) throw new Error('These browser comments already belong to a pending or delivered message.');
+      /** 同一评论重复确认只保留最新内容，跨网页评论继续累加。 */
+      const comments = dedupeById([...(state.browserSubmission?.comments ?? []), ...structuredClone(prepared.comments)]);
+      /** 截图按文件身份去重，不污染用户主动上传的附件。 */
+      const attachments = [...new Map([...(state.browserSubmission?.attachments ?? []), ...prepared.attachments].map((attachment) => [attachment.localPath, attachment])).values()];
+      dispatch({ type: 'browser_submission_changed', browserSubmission: { tabId: prepared.tabId, comments, commentIds: comments.map((comment) => comment.id), content: serializeBrowserComments(comments), attachments } });
+      persistDraft();
+    },
     setContextDraft(contextDraft) {
       dispatch({ type: 'context_draft_changed', contextDraft: structuredClone(contextDraft) });
       persistDraft();
@@ -2684,6 +2849,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           pendingSend.agentKind === settings?.agentKind &&
           pendingSend.effort === settings?.effort &&
           pendingSend.serviceTier === settings?.serviceTier &&
+          pendingSend.contextCapacityTokens === settings?.contextCapacityTokens &&
           pendingSend.permissionMode === requestedPermissionMode &&
           pendingSend.collaborationMode === requestedCollaborationMode &&
           samePluginReferences(pendingSend.pluginReferences, settings?.pluginReferences) &&
@@ -2717,6 +2883,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
         ...(appliedSettings?.model ? { model: appliedSettings.model } : {}),
         ...(appliedSettings?.agentKind ? { agentKind: appliedSettings.agentKind } : {}),
         ...(appliedSettings?.effort ? { effort: appliedSettings.effort } : {}),
+        ...(appliedSettings?.contextCapacityTokens !== undefined ? { contextCapacityTokens: appliedSettings.contextCapacityTokens } : {}),
         ...(appliedSettings && Object.prototype.hasOwnProperty.call(appliedSettings, 'serviceTier') ? { serviceTier: appliedSettings.serviceTier } : {}),
         ...(appliedSettings ? { permissionMode: appliedSettings.permissionMode } : {}),
         collaborationMode: requestedCollaborationMode,
@@ -2737,6 +2904,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
         sameContextDraft(pendingSend.contextDraft, contextDraft) &&
         pendingSend.delivery === delivery &&
         pendingSend.expectedTurnId === normalizedExpectedTurnId &&
+        pendingSend.contextCapacityTokens === appliedSettings?.contextCapacityTokens &&
         pendingSend.model === appliedSettings?.model &&
         pendingSend.agentKind === appliedSettings?.agentKind &&
         pendingSend.effort === appliedSettings?.effort &&
@@ -2778,6 +2946,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           ...(appliedSettings?.model ? { model: appliedSettings.model } : {}),
           ...(appliedSettings?.agentKind ? { agentKind: appliedSettings.agentKind } : {}),
           ...(appliedSettings?.effort ? { effort: appliedSettings.effort } : {}),
+          ...(appliedSettings?.contextCapacityTokens !== undefined ? { contextCapacityTokens: appliedSettings.contextCapacityTokens } : {}),
           ...(appliedSettings && Object.prototype.hasOwnProperty.call(appliedSettings, 'serviceTier') ? { serviceTier: appliedSettings.serviceTier } : {}),
           ...(appliedSettings ? { permissionMode: appliedSettings.permissionMode } : {}),
           collaborationMode: requestedCollaborationMode,
@@ -3148,6 +3317,19 @@ export function useSessionControllerInstance(options: CreateSessionControllerOpt
     void controller.start().catch(() => undefined);
     return () => controller.dispose();
   }, [controller, options.enabled]);
+  useEffect(() => {
+    if (options.enabled === false) return;
+    // 控制器持有最新草稿，连续确认无需等待 React 重绘，也不关闭浏览器。
+    return window.zeus?.onBrowserEvent((event) => {
+      if ((event.type !== 'comments_saved' && event.type !== 'comments_removed') || event.conversationId !== options.conversationId) return;
+      try {
+        if (event.type === 'comments_saved') controller.stageBrowserComments(event.prepared);
+        else controller.removeBrowserComments(event.commentIds);
+      } catch (error) {
+        reportApplicationError(error);
+      }
+    });
+  }, [controller, options.enabled, options.conversationId]);
   return controller;
 }
 
@@ -3276,6 +3458,7 @@ function isPendingSendEnvelope(value: unknown): value is PendingSendEnvelope {
     (pending.model === undefined || typeof pending.model === 'string') &&
     (pending.effort === undefined || typeof pending.effort === 'string') &&
     (pending.serviceTier === undefined || pending.serviceTier === null || typeof pending.serviceTier === 'string') &&
+    (pending.contextCapacityTokens === undefined || pending.contextCapacityTokens === null || (Number.isSafeInteger(pending.contextCapacityTokens) && pending.contextCapacityTokens > 0)) &&
     (pending.permissionMode === undefined || pending.permissionMode === 'read-only' || pending.permissionMode === 'auto' || pending.permissionMode === 'auto-review' || pending.permissionMode === 'full-access') &&
     (pending.collaborationMode === undefined || pending.collaborationMode === 'default' || pending.collaborationMode === 'plan') &&
     (pending.pluginReferences === undefined || isPluginSkillReferences(pending.pluginReferences)) &&

@@ -1,3 +1,4 @@
+import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
 import { resolveInteractiveRuntimeShell } from './localServerPlatformSupport.js';
 import { missingTaskRepositories } from './taskRepositoryMembership.js';
@@ -104,7 +105,7 @@ import { registerConversationCommandRoutes } from './conversationCommandRoutes.j
 import { registerConversationDispatchCommandRoutes } from './conversationDispatchCommandRoutes.js';
 import type { NativeConversationAttachmentInput } from './codexNativeConversationContracts.js';
 import { ConversationDispatchCommandApplication, conversationDispatchCommandTypes, conversationDispatchInputSha256 } from './conversationDispatchCommandApplication.js';
-import { isPathInsideRoot, readConversationResourcePreview } from './conversationResourcePreview.js';
+import { isPathInsideRoot, readConversationFileReview, readConversationResourcePreview } from './conversationResourcePreview.js';
 import { type ConversationFileOpenGrant, createConversationFileOpenGrant, toConversationResource, toConversationResourceOpenIntent } from './conversationResources.js';
 import { registerConversationSnapshotV2Api } from './conversationSnapshotV2Api.js';
 import { registerConversationSyncRoutes } from './conversationSyncRoutes.js';
@@ -819,6 +820,16 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   registerCodexSubagentQueryRoutes({ server, application: codexSubagentQueries });
 
   const conversationCapabilityQueries = new ConversationCapabilityQueryApplication({
+    readProjectContextCapacity: (projectId) => readProjectConfig(projectId).contextCapacityTokens,
+    readContextCapacitySupport: (model) => {
+      const state = codexAppServerManager.getState();
+      return resolveContextCapacityPolicy(
+        state.type === 'ready' ? state.capabilities : null,
+        modelConnections.listMetadata().find((connection: import('@zeus/ai-runtime').ModelConnectionRecord) => connection.id === model.sourceId),
+        model.model,
+        model.agentKind,
+      );
+    },
     settings,
     projects,
     tasks,
@@ -1229,6 +1240,16 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     },
     archiveNativeConversation,
     restoreNativeConversation,
+    rememberContextCapacity: (projectId, capacity) => settings.setJson(projectConfigSettingsPrefix + projectId, { ...readProjectConfig(projectId), contextCapacityTokens: capacity }),
+    validateContextCapacity: async (conversation, model) => {
+      if (conversation.contextCapacityTokens === null) return;
+      /** 复用界面的同一能力来源，换模型不能把旧预算静默丢掉。 */
+      const capabilities = await conversationCapabilityQueries.readConversation(conversation.projectId);
+      const identity = model ?? capabilities.preferredModel ?? conversation.modelId ?? conversation.providerModel;
+      const selected = capabilities.models.find((entry) => entry.id === identity || entry.model === identity);
+      if (!selected?.contextCapacity?.choices.includes(conversation.contextCapacityTokens))
+        throw Object.assign(new Error(selected?.contextCapacity?.reason ?? '目标模型不支持会话已冻结预算。'), { code: 'ZEUS_CONTEXT_CAPACITY_UNSUPPORTED', statusCode: 400 });
+    },
     isConversationIdle: (conversation) => inferNativeConversationSnapshotState(conversation).type === 'idle',
     isTaskTerminal: taskManagementStatusIsTerminal,
     goalCapability: conversationGoalCapability,
@@ -1618,7 +1639,10 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       return reply.code(400).send({ error: 'ZEUS_CONVERSATION_RESOURCE_NOT_PREVIEWABLE', message: 'This resource is not a local previewable file' });
     }
     try {
-      return readConversationResourcePreview(resource, toConversationResourceOpenIntent(record));
+      /** 源码与通用文件审阅使用相同的授权和 Git 比较口径。 */
+      const intent = toConversationResourceOpenIntent(record);
+      const preview = readConversationResourcePreview(resource, intent);
+      return preview.kind === 'source' ? { ...preview, review: await readConversationFileReview(resource, intent) } : preview;
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String((error as Error & { code?: unknown }).code ?? '') : '';
       const status = code === 'ZEUS_CONVERSATION_RESOURCE_FORBIDDEN' ? 403 : code === 'ZEUS_CONVERSATION_RESOURCE_TOO_LARGE' ? 413 : 409;
@@ -1984,6 +2008,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         // 普通项目设置保存不拥有模型速度偏好，避免旧界面快照覆盖专用接口写入的显式选择。
         const ordinaryConfigBody: UpdateProjectConfigBody = { ...parsed.input };
         delete ordinaryConfigBody.serviceTierPreferences;
+        // 预算与其他项目字段统一严格校验，让非法输入沿用下方 400 回执，避免被通用异常映射为 500。
         const nextConfig = normalizeProjectConfig(project.id, ordinaryConfigBody, readProjectConfig(project.id));
         if (!nextConfig) return reply.code(400).send({ error: 'ZEUS_INVALID_PROJECT_CONFIG', message: 'Project config must use safe single-line values and supported options' });
         if (hasDatabaseUriPassword(nextConfig.database.connectionName)) {
@@ -2141,8 +2166,11 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         if (!record || record.projectId !== input.projectId || record.conversationId !== input.conversationId) throw new Error('会话资源不属于当前会话。');
         const grant = toConversationResourceOpenIntent(record);
         if (grant.kind === 'website') throw new Error('网站不是文件预览资源。');
+        /** 已登记位置随通用预览返回，不依赖标题中的行号文字。 */
+        const resource = toConversationResource(record);
+        const review = resource && resource.kind !== 'website' ? await readConversationFileReview(resource, grant) : undefined;
         // 预览格式依据真实文件名，正文链接标题可能完全省略扩展名。
-        intent = { sides: [{ name: basename(String(grant.target.absolutePath || '')), label: '会话文件', root: String(grant.authority.allowedRoot || ''), path: String(grant.target.absolutePath || '') }] };
+        intent = { sides: [{ name: basename(String(grant.target.absolutePath || '')), label: '会话文件', root: String(grant.authority.allowedRoot || ''), path: String(grant.target.absolutePath || ''), review }] };
       } else if (input.kind === 'turn') {
         const { file } = resolveTurnChangeFileRecord(input);
         intent = {

@@ -18,10 +18,13 @@ import {
   type ConversationSnapshotV2Page as ConversationSnapshotV2WirePage,
   type ConversationSnapshotV2PageKind,
   type ConversationSnapshotV2ToolResult,
+  type ConversationTranscriptEnvelope,
+  type ConversationTranscriptPlacementBatch,
 } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
 import { type ArtifactRef, type ArtifactStore, artifactStoreGeneration } from './artifactStore.js';
 import { conversationSchemaGeneration, type ConversationSessionMetricsSnapshot, readConversationSessionMetrics } from './conversationExecutionStore.js';
+import { ConversationTranscriptRepository, providerFacet } from './conversationTranscriptStore.js';
 
 export { conversationSnapshotV2StructureGeneration };
 
@@ -298,6 +301,8 @@ export interface ConversationSnapshotV2ActiveItem {
   startedAt: string | null;
   completedAt: string | null;
   updatedAt: string;
+  /** 活动投影与后续确认历史共用的显示身份。 */
+  transcript: ConversationTranscriptEnvelope;
 }
 
 export interface ConversationSnapshotV2TurnPlan {
@@ -311,7 +316,13 @@ export interface ConversationSnapshotV2 {
   conversationSchemaGeneration: typeof conversationSchemaGeneration;
   throughEventSeq: number;
   eventStreamGeneration: string | null;
+  /** 当前会话所有可见条目共用的位置代次。 */
+  orderEpoch: number;
   conversation: {
+    /** 下一轮上下文容量，不作为当前请求的实际用量分母。 */
+    contextCapacityTokens: number | null;
+    /** 最近的预算发送或原生读回证据。 */
+    contextCapacityEvidence: import('@zeus/shared').ContextCapacityEvidence | null;
     id: string;
     projectId: string;
     taskId: string | null;
@@ -375,6 +386,8 @@ export interface ConversationSnapshotV2ProviderSettings {
 }
 
 export interface ConversationSnapshotV2NextTurnSettings {
+  /** 下一轮选择的窗口容量。 */
+  contextCapacityTokens?: number | null;
   model: string;
   effort?: string;
   serviceTier?: string | null;
@@ -425,6 +438,8 @@ export interface ConversationModelHistoryPageItem {
   expertExecutionId: string | null;
   content: BoundedContentProjection;
   toolResult: ConversationToolResultDescriptor | null;
+  /** 跨快照、实时与分页保持不变的显示身份和位置。 */
+  transcript: ConversationTranscriptEnvelope;
 }
 
 export interface ConversationProcessPageItem {
@@ -446,6 +461,8 @@ export interface ConversationProcessPageItem {
   presentation: Record<string, unknown> | null;
   detail: BoundedContentProjection;
   toolResult: ConversationToolResultDescriptor | null;
+  /** 跨快照、实时与分页保持不变的显示身份和位置。 */
+  transcript: ConversationTranscriptEnvelope;
 }
 
 export interface ConversationResourcePageItem {
@@ -466,6 +483,8 @@ export interface ConversationResourcePageItem {
   createdAt: string;
   updatedAt: string;
   accessPolicy: 'authorized_open_intent_or_preview';
+  /** 跨资源分页保持不变的显示身份和位置。 */
+  transcript: ConversationTranscriptEnvelope;
 }
 
 export interface ConversationChangeSetSummary {
@@ -529,6 +548,8 @@ type BoundedContentProjection = ConversationSnapshotV2BoundedContent;
 type ConversationToolResultDescriptor = ConversationSnapshotV2ToolResult;
 
 interface ConversationRow {
+  /** 旧会话经增量迁移后保持空预算。 */
+  context_capacity_tokens: number | null;
   id: string;
   project_id: string;
   task_id: string | null;
@@ -678,10 +699,15 @@ const stableChangeSetStates = new Set(['applied', 'undone', 'conflicted', 'unava
  * 游标携带第一页读取时的高水位，后续追加的数据不会插入当前分页窗口。
  */
 export class ConversationSnapshotV2Repository {
+  /** 读取既有正文时只投影位置索引，不修改正文表。 */
+  private readonly transcript: ConversationTranscriptRepository;
+
   constructor(
     private readonly db: ZeusDatabasePort,
     private readonly artifactStore?: ArtifactStore,
-  ) {}
+  ) {
+    this.transcript = new ConversationTranscriptRepository(db);
+  }
 
   /** 只从当前运行分段的命令事实读取目录，不解析命令文本、模型回复或其他会话。 */
   readRecentCommandCwd(conversationIdValue: string): string | null {
@@ -717,6 +743,7 @@ export class ConversationSnapshotV2Repository {
       provider_turn_id: string | null;
       client_user_message_id: string | null;
       provider_item_id: string | null;
+      segment_id: string;
       role: string;
       confirmed_at: string;
       status: string;
@@ -730,7 +757,7 @@ export class ConversationSnapshotV2Repository {
         conversation_model_history.turn_id, turn.provider_turn_id, turn.status,
         submission.client_message_id AS client_user_message_id,
         ${modelHistoryProviderItemSql} AS provider_item_id,
-        conversation_model_history.role, conversation_model_history.confirmed_at,
+        conversation_model_history.role, conversation_model_history.segment_id, conversation_model_history.confirmed_at,
         ${modelHistoryAssistantPhaseSql} AS assistant_phase,
         ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
         ${modelHistoryFormalPlanSql} AS formal_plan,
@@ -783,6 +810,7 @@ export class ConversationSnapshotV2Repository {
           prompt: questionExcerpt ? redactSensitivePreview(questionExcerpt.prompt).text : conversationNavigationExcerpt(text, 160),
           response: questionExcerpt ? redactSensitivePreview(questionExcerpt.response).text : '',
           status: row.status,
+          placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'model_history', sourceScope: row.segment_id, sourceId: row.id, facet: 'body' }).placement,
         });
     }
     /** 普通发言保持模型历史顺序，答题卡保留自己的答案摘录。 */
@@ -817,9 +845,11 @@ export class ConversationSnapshotV2Repository {
         prompt: redactSensitivePreview(excerpt.prompt).text,
         response: redactSensitivePreview(excerpt.response).text,
         status: 'resolved',
+        placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'request', sourceScope: request.turn_id, sourceId: request.id, facet: 'request_answer' }).placement,
       });
     }
-    return { conversationId, throughEventSeq, entries: directory };
+    directory.sort((left, right) => (left.placement?.order ?? Number.MAX_SAFE_INTEGER) - (right.placement?.order ?? Number.MAX_SAFE_INTEGER) || left.id.localeCompare(right.id));
+    return { conversationId, throughEventSeq, orderEpoch: this.transcript.orderEpoch(conversationId), entries: directory };
   }
 
   readSnapshot(conversationIdValue: string, options: { closedTurnLimit?: number; byteLimit?: number; includeSessionMetrics?: boolean; executionContext?: ConversationSnapshotV2ExecutionContext } = {}): ConversationSnapshotV2 {
@@ -834,7 +864,7 @@ export class ConversationSnapshotV2Repository {
               substr(next_turn_settings_json, 1, 4096) AS next_turn_settings_json,
               permission_mode,
               collaboration_mode,
-              agent_kind, created_at, updated_at
+              agent_kind, context_capacity_tokens, created_at, updated_at
          FROM conversations
         WHERE id = ?`,
       [conversationId],
@@ -879,12 +909,19 @@ export class ConversationSnapshotV2Repository {
     const activeItems = [...activeItemProjection.items];
     let activeItemsTruncated = activeItemProjection.truncated;
     const activeTurnSummary = activeTurn ? this.toTurnSummary(conversationId, activeTurn) : null;
+    /** 只取最新显式预算证据，不加载整段配置历史或向界面暴露原始回执。 */
+    const budgetEvidence = this.db.get<{ layer: string; evidence_json: string; configuration_json: string; observed_at: string }>(
+      `SELECT layer, evidence_json, configuration_json, observed_at FROM conversation_config_evidence WHERE conversation_id = ? AND configuration_json LIKE '%"kind":"context_capacity"%' AND layer IN ('adapter_serialized', 'runtime_acknowledged') ORDER BY observed_at DESC, rowid DESC LIMIT 1`,
+      [conversationId],
+    );
+    const budgetReadback = budgetEvidence ? (parseJsonRecordOrNull(budgetEvidence.evidence_json)?.readback as Record<string, unknown> | undefined) : null;
     const snapshotBase: ConversationSnapshotV2 = {
       schemaVersion: 2,
       structureGeneration: conversationSnapshotV2StructureGeneration,
       conversationSchemaGeneration,
       throughEventSeq: stream?.latest_sequence ?? 0,
       eventStreamGeneration: stream?.generation_id ?? null,
+      orderEpoch: this.transcript.orderEpoch(conversationId),
       conversation: {
         id: conversation.id,
         projectId: conversation.project_id,
@@ -897,9 +934,18 @@ export class ConversationSnapshotV2Repository {
         archived: conversation.archived === 1,
         transportKind: conversation.transport_kind,
         providerState: conversation.provider_state,
+        contextCapacityTokens: conversation.context_capacity_tokens,
+        contextCapacityEvidence: budgetEvidence
+          ? {
+              status: budgetEvidence.layer === 'runtime_acknowledged' ? 'confirmed' : 'sent',
+              observedAt: budgetEvidence.observed_at,
+              contextWindow: typeof budgetReadback?.contextWindow === 'number' ? budgetReadback.contextWindow : null,
+              contextCapacityTokens: (parseJsonRecordOrNull(budgetEvidence.configuration_json)?.contextCapacityTokens as number | null) ?? null,
+            }
+          : null,
         providerModel: conversation.provider_model,
         providerSettings,
-        nextTurnSettings,
+        nextTurnSettings: nextTurnSettings ? { ...nextTurnSettings, contextCapacityTokens: conversation.context_capacity_tokens } : null,
         agentKind: conversation.agent_kind,
         createdAt: conversation.created_at,
         updatedAt: conversation.updated_at,
@@ -980,6 +1026,11 @@ export class ConversationSnapshotV2Repository {
     const activeTurnCandidate = this.latestTurnsByStatus(conversationId, ['running', 'dispatching', 'waiting'], 1)[0];
     const activeTurn = conversation.provider_state === 'active' || conversation.provider_state === 'waiting' || this.hasActiveExpertExecution(conversationId) ? activeTurnCandidate : undefined;
     return readConversationSessionMetrics(this.db, conversationId, activeTurn?.id ?? null);
+  }
+
+  /** 有界核对当前已加载显示身份的位置和显式删除状态。 */
+  readTranscriptPlacements(conversationIdValue: string, entryIds: readonly string[]): ConversationTranscriptPlacementBatch {
+    return this.transcript.readPlacementBatch(requiredIdentity(conversationIdValue, 'conversationId'), entryIds);
   }
 
   listTimelinePage(input: { conversationId: string; cursor?: string; entryLimit?: number; byteLimit?: number }): ConversationSnapshotV2Page<ConversationTimelinePageItem> {
@@ -1126,7 +1177,7 @@ export class ConversationSnapshotV2Repository {
     const throughSequence = cursor?.throughSequence ?? this.maximumSequence('conversation_model_history', 'sequence', conversationId);
     const beforeSequence = cursor?.beforeSequence ?? throughSequence + 1;
     const throughEventSeq = cursor?.throughEventSeq ?? this.throughEventSeq(conversationId);
-    if (throughSequence === 0) return emptyPage(conversationId, 'model_history', throughEventSeq, limits);
+    if (throughSequence === 0) return emptyPage(conversationId, 'model_history', throughEventSeq, this.transcript.orderEpoch(conversationId), limits);
     const rows = this.db.select<ModelHistoryProjectionRow>(
       `SELECT id, sequence, turn_id, submission_id,
               (SELECT client_message_id FROM conversation_submissions WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
@@ -1153,6 +1204,7 @@ export class ConversationSnapshotV2Repository {
       conversationId,
       throughSequence,
       throughEventSeq,
+      orderEpoch: this.transcript.orderEpoch(conversationId),
       limits,
       candidates: this.mapModelHistoryRows(conversationId, rows),
     });
@@ -1205,10 +1257,20 @@ export class ConversationSnapshotV2Repository {
               length(CAST(detail_json AS BLOB)) AS detail_bytes,
               length(detail_json) AS detail_characters,
               CASE WHEN kind = 'waiting' THEN detail_json
-                   WHEN json_extract(detail_json, '$.provider') = 'pi' AND kind IN ('tool', 'command') THEN
-                     json_object('provider', 'pi', 'payload', json_object(
+                   /* 原生工具和 Pi 共用有界身份字段，长结果截断也不能丢失操作来源与终态。 */
+                   WHEN kind IN ('tool', 'command') THEN
+                     json_object('provider', json_extract(detail_json, '$.provider'), 'itemType', json_extract(detail_json, '$.itemType'), 'payload', json_object(
                        'toolName', substr(COALESCE(json_extract(detail_json, '$.payload.toolName'), json_extract(detail_json, '$.block.name')), 1, 256),
+                       'tool', substr(json_extract(detail_json, '$.payload.tool'), 1, 256),
+                       'name', substr(json_extract(detail_json, '$.payload.name'), 1, 256),
+                       'namespace', substr(json_extract(detail_json, '$.payload.namespace'), 1, 256),
+                       'status', substr(json_extract(detail_json, '$.payload.status'), 1, 64),
+                       'success', json(CASE json_extract(detail_json, '$.payload.success') WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END),
+                       'exitCode', COALESCE(json_extract(detail_json, '$.payload.exitCode'), json_extract(detail_json, '$.payload.result.details.exitCode')),
                        'args', json_object(
+                         'app', substr(COALESCE(json_extract(detail_json, '$.payload.arguments.app'), json_extract(detail_json, '$.payload.args.app'), json_extract(detail_json, '$.block.arguments.app')), 1, 1000),
+                         'url', substr(COALESCE(json_extract(detail_json, '$.payload.arguments.url'), json_extract(detail_json, '$.payload.args.url'), json_extract(detail_json, '$.block.arguments.url')), 1, 2000),
+                         'surface', substr(COALESCE(json_extract(detail_json, '$.payload.arguments.surface'), json_extract(detail_json, '$.payload.args.surface'), json_extract(detail_json, '$.block.arguments.surface')), 1, 64),
                          'command', substr(COALESCE(json_extract(detail_json, '$.payload.args.command'), json_extract(detail_json, '$.block.arguments.command'), json_extract(detail_json, '$.block.input.command')), 1, 4000),
                          'path', substr(COALESCE(json_extract(detail_json, '$.payload.args.path'), json_extract(detail_json, '$.block.arguments.path'), json_extract(detail_json, '$.block.input.path')), 1, 2000),
                          'pattern', substr(COALESCE(json_extract(detail_json, '$.payload.args.pattern'), json_extract(detail_json, '$.block.arguments.pattern'), json_extract(detail_json, '$.block.input.pattern')), 1, 1000)
@@ -1259,6 +1321,13 @@ export class ConversationSnapshotV2Repository {
           mutable,
         ),
         toolResult: pairId ? (toolResults.get(pairId) ?? null) : null,
+        transcript: this.requiredTranscriptEnvelope({
+          conversationId: context.conversationId,
+          sourceDomain: 'process',
+          sourceScope: row.segment_id,
+          sourceId: row.id,
+          facet: row.kind === 'reasoning' ? 'reasoning_block' : 'tool_activity',
+        }),
       };
     });
     return buildSequencePage(context, items);
@@ -1282,7 +1351,7 @@ export class ConversationSnapshotV2Repository {
         ),
       );
     const throughEventSeq = cursor?.throughEventSeq ?? this.throughEventSeq(conversationId);
-    if (!through) return emptyPage(conversationId, 'resources', throughEventSeq, limits);
+    if (!through) return emptyPage(conversationId, 'resources', throughEventSeq, this.transcript.orderEpoch(conversationId), limits);
     const after = cursor?.after ?? null;
     const rows = this.db.select<{
       id: string;
@@ -1338,6 +1407,7 @@ export class ConversationSnapshotV2Repository {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       accessPolicy: 'authorized_open_intent_or_preview' as const,
+      transcript: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'resource', sourceScope: row.turn_id, sourceId: row.id, facet: 'resource' }),
     }));
     const upper: ResourceOrderKey = through;
     return buildCompositePage({
@@ -1345,6 +1415,7 @@ export class ConversationSnapshotV2Repository {
       kind: 'resources',
       throughEventSeq,
       throughSequence: 0,
+      orderEpoch: this.transcript.orderEpoch(conversationId),
       limits,
       candidates: items,
       cursorFor: (item) =>
@@ -1430,7 +1501,7 @@ export class ConversationSnapshotV2Repository {
     const through =
       cursor?.through ?? mapChangeFileOrderKey(this.db.get<{ source_index: number; id: string }>(`SELECT source_index, id FROM turn_change_files WHERE change_set_id = ? ORDER BY source_index DESC, id DESC LIMIT 1`, [changeSetId]));
     const throughEventSeq = cursor?.throughEventSeq ?? this.throughEventSeq(conversationId);
-    if (!through) return emptyPage(conversationId, 'change_files', throughEventSeq, limits);
+    if (!through) return emptyPage(conversationId, 'change_files', throughEventSeq, this.transcript.orderEpoch(conversationId), limits);
     const after = cursor?.after ?? null;
     const rows = this.db.select<{
       id: string;
@@ -1509,6 +1580,7 @@ export class ConversationSnapshotV2Repository {
       kind: 'change_files',
       throughEventSeq,
       throughSequence: 0,
+      orderEpoch: this.transcript.orderEpoch(conversationId),
       limits,
       candidates: items,
       cursorFor: (item) =>
@@ -1572,6 +1644,7 @@ export class ConversationSnapshotV2Repository {
   private activeTurnItems(conversationId: string, turnId: string): { items: ConversationSnapshotV2ActiveItem[]; truncated: boolean } {
     const expertRows = this.db.select<{
       id: string;
+      submission_id: string;
       ordinal: number;
       status: string;
       employee_snapshot_json: string;
@@ -1582,7 +1655,7 @@ export class ConversationSnapshotV2Repository {
       started_at: string | null;
       completed_at: string | null;
     }>(
-      `SELECT execution.id, execution.ordinal, execution.status, execution.employee_snapshot_json,
+      `SELECT execution.id, execution.submission_id, execution.ordinal, execution.status, execution.employee_snapshot_json,
               execution.answer, execution.error_json, execution.created_at, execution.updated_at,
               execution.started_at, execution.completed_at
          FROM conversation_expert_executions AS execution
@@ -1613,6 +1686,7 @@ export class ConversationSnapshotV2Repository {
             startedAt: row.started_at ?? row.created_at,
             completedAt: row.completed_at,
             updatedAt: row.updated_at,
+            transcript: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'expert_execution', sourceScope: row.submission_id, sourceId: row.id, facet: 'body' }),
           };
         }),
         truncated: false,
@@ -1620,6 +1694,7 @@ export class ConversationSnapshotV2Repository {
     }
     const rows = this.db.select<{
       id: string;
+      provider_thread_id: string;
       native_item_id: string | null;
       provider_item_id: string;
       item_type: string;
@@ -1638,7 +1713,7 @@ export class ConversationSnapshotV2Repository {
       completed_at: string | null;
       updated_at: string;
     }>(
-      `SELECT id, native_item_id, provider_item_id, item_type, status, phase,
+      `SELECT id, provider_thread_id, native_item_id, provider_item_id, item_type, status, phase,
               substr(text_projection, 1, ?) AS text_preview,
               length(CAST(text_projection AS BLOB)) AS text_bytes,
               substr(payload_projection_json, 1, ?) AS payload_preview,
@@ -1680,6 +1755,13 @@ export class ConversationSnapshotV2Repository {
         startedAt: row.started_at,
         completedAt: row.completed_at,
         updatedAt: row.updated_at,
+        transcript: this.requiredTranscriptEnvelope({
+          conversationId,
+          sourceDomain: 'provider_item',
+          sourceScope: row.provider_thread_id,
+          sourceId: row.provider_item_id,
+          facet: providerFacet(row.item_type),
+        }),
       })),
       truncated: rows.length > activeTurnItemLimit,
     };
@@ -1833,6 +1915,7 @@ export class ConversationSnapshotV2Repository {
       afterSequence: cursor?.afterSequence ?? (direction === 'tail' ? throughSequence + 1 : 0),
       throughSequence,
       throughEventSeq: cursor?.throughEventSeq ?? this.throughEventSeq(conversationId),
+      orderEpoch: this.transcript.orderEpoch(conversationId),
       ...limits,
     };
   }
@@ -1884,7 +1967,21 @@ export class ConversationSnapshotV2Repository {
         false,
       ),
       toolResult: row.tool_pair_id ? (toolResults.get(row.tool_pair_id) ?? null) : null,
+      transcript: this.requiredTranscriptEnvelope({
+        conversationId,
+        sourceDomain: 'model_history',
+        sourceScope: row.segment_id,
+        sourceId: row.id,
+        facet: row.tool_pair_id ? 'tool_activity' : row.reasoning_summary === 1 ? 'reasoning_block' : 'body',
+      }),
     }));
+  }
+
+  /** 缺少位置身份说明写入链路未接入，不能再以时间戳静默猜测顺序。 */
+  private requiredTranscriptEnvelope(input: { conversationId: string; sourceDomain: string; sourceScope: string; sourceId: string; facet: string }): ConversationTranscriptEnvelope {
+    const envelope = this.transcript.envelopeForSource(input);
+    if (!envelope) throw snapshotError('ZEUS_CONVERSATION_SNAPSHOT_V2_CONTENT_CHANGED', '会话显示位置尚未覆盖当前条目，请稍后重试。', 409);
+    return envelope;
   }
 
   /** 旧提交只保存答案身份；按原消息身份补齐题目，不依赖当前历史页或改写旧数据。 */
@@ -2069,6 +2166,8 @@ interface SequencePageContext {
   afterSequence: number;
   throughSequence: number;
   throughEventSeq: number;
+  /** 页面全部条目所属的持久位置代次。 */
+  orderEpoch: number;
   entryLimit: number;
   byteLimit: number;
 }
@@ -2257,6 +2356,7 @@ function buildSequencePage<T extends { sequence: number }>(context: SequencePage
     kind: context.kind,
     throughEventSeq: context.throughEventSeq,
     throughSequence: context.throughSequence,
+    orderEpoch: context.orderEpoch,
     limits: { entryLimit: context.entryLimit, byteLimit: context.byteLimit },
     candidates,
     cursorFor: (item) =>
@@ -2279,6 +2379,7 @@ function buildReverseSequencePage(input: {
   conversationId: string;
   throughSequence: number;
   throughEventSeq: number;
+  orderEpoch: number;
   limits: { entryLimit: number; byteLimit: number };
   /** SQL 已按 sequence DESC 返回；响应会恢复为正序。 */
   candidates: ConversationModelHistoryPageItem[];
@@ -2307,6 +2408,7 @@ function buildReverseSequencePage(input: {
       kind: 'model_history',
       throughEventSeq: input.throughEventSeq,
       throughSequence: input.throughSequence,
+      orderEpoch: input.orderEpoch,
       items: [...selected].reverse(),
       hasMore,
       nextCursor,
@@ -2329,6 +2431,7 @@ function buildCompositePage<T>(input: {
   kind: ConversationPageKind;
   throughEventSeq: number;
   throughSequence: number;
+  orderEpoch: number;
   limits: { entryLimit: number; byteLimit: number };
   candidates: T[];
   cursorFor: (item: T) => string;
@@ -2345,6 +2448,7 @@ function buildCompositePage<T>(input: {
       kind: input.kind,
       throughEventSeq: input.throughEventSeq,
       throughSequence: input.throughSequence,
+      orderEpoch: input.orderEpoch,
       items: [...selected],
       hasMore,
       nextCursor,
@@ -2362,7 +2466,7 @@ function buildCompositePage<T>(input: {
   throw snapshotError('ZEUS_CONVERSATION_SNAPSHOT_V2_BYTE_BUDGET_EXHAUSTED', '单条摘要超过分页响应字节预算。', 413);
 }
 
-function emptyPage<T>(conversationId: string, kind: ConversationPageKind, throughEventSeq: number, limits: { entryLimit: number; byteLimit: number }): ConversationSnapshotV2Page<T> {
+function emptyPage<T>(conversationId: string, kind: ConversationPageKind, throughEventSeq: number, orderEpoch: number, limits: { entryLimit: number; byteLimit: number }): ConversationSnapshotV2Page<T> {
   return stableResponseBytes({
     schemaVersion: 2,
     structureGeneration: conversationSnapshotV2StructureGeneration,
@@ -2370,6 +2474,7 @@ function emptyPage<T>(conversationId: string, kind: ConversationPageKind, throug
     kind,
     throughEventSeq,
     throughSequence: 0,
+    orderEpoch,
     items: [],
     hasMore: false,
     nextCursor: null,
@@ -2616,6 +2721,7 @@ function parseNextTurnSettings(value: string, permissionModeValue: string, colla
   const effort = boundedSettingString(settings.effort, 64);
   const serviceTier = settings.serviceTier === null ? null : boundedSettingString(settings.serviceTier, 64);
   return {
+    ...(settings.contextCapacityTokens === null || typeof settings.contextCapacityTokens === 'number' ? { contextCapacityTokens: settings.contextCapacityTokens } : {}),
     model,
     ...(effort ? { effort } : {}),
     ...(settings.serviceTier === null || serviceTier ? { serviceTier } : {}),
