@@ -112,7 +112,7 @@ Computer Use 的动作和观察可通过 `wait_for` 在同次调用中确认控�
 
 ## 发行配置与发布
 
-应用版本统一由根目录 `package.json` 维护，桌面包同步该版本，发布标签使用 `v<版本>`。更新来源为 `imchenway/zeus`，Homebrew 使用 `imchenway/tap/zeus`。
+Astra 的独立发行版本由 `packages/distribution/src/config.json` 的 `version` 字段维护；两个 `package.json` 的 `version` 保留上游版本，随上游同步，不参与二开发版递增。开发态显示、更新检查、发布标签和产物清单使用独立发行版本；打包时通过 Electron Builder 元数据写入产物，不改写源码包清单。发布标签使用 `skylight-v<版本>`，更新来源为 `skylight-f/zeus`，Homebrew 使用 `skylight-f/tap/astra`。
 
 - `pnpm release:config`：检查发行来源及应用版本一致性。
 - `pnpm release:distribution:prepare`：使用已审阅的发布说明准备版本文件，支持首次发行；默认预览，显式设置 `APPLY_CHANGES=1` 才写入文件。

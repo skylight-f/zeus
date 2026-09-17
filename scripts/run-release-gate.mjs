@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
-import { zeusDistribution, releaseTag, versionFromReleaseTag, releasePackagePaths } from './desktop-distribution.mjs';
+import { zeusDistribution, releaseTag, versionFromReleaseTag, releaseVersionPaths } from './desktop-distribution.mjs';
 /* global console, process */
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -127,7 +127,7 @@ function assertTagDoesNotExist(version) {
 }
 
 function assertPackageVersions(expectedVersion) {
-  for (const relativePath of releasePackagePaths) {
+  for (const relativePath of releaseVersionPaths) {
     const actualVersion = JSON.parse(readFileSync(join(repositoryRoot, relativePath), 'utf8')).version;
     if (actualVersion !== expectedVersion) {
       throw new Error(`${relativePath} 版本与期望不一致：expected=${expectedVersion} actual=${actualVersion ?? 'missing'}`);

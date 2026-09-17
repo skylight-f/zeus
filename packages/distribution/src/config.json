@@ -1,5 +1,6 @@
 {
   "appName": "Astra",
+  "version": "0.1.18",
   "id": "skylight-f.zeus",
   "repository": "skylight-f/zeus",
   "upstreamRepository": "imchenway/zeus",

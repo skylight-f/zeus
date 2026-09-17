@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
-import { zeusDistribution, releaseTag, versionFromReleaseTag, releasePackagePaths } from './desktop-distribution.mjs';
+import { zeusDistribution, releaseTag, versionFromReleaseTag, releaseVersionPaths, assertDistributionVersions } from './desktop-distribution.mjs';
 /* global console, process */
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -30,15 +30,13 @@ function main() {
   assertTagDoesNotExist(releaseVersion);
   validateReleaseNotes(sourceNotes, releaseVersion);
 
-  const rootPackagePath = join(repositoryRoot, 'package.json');
-  const desktopPackagePath = join(repositoryRoot, 'apps', 'desktop', 'package.json');
-  const rootPackage = readPackage(rootPackagePath);
-  const desktopPackage = readPackage(desktopPackagePath);
+  assertDistributionVersions();
+  const versionPath = join(repositoryRoot, releaseVersionPaths[0]);
+  const distributionConfig = readPackage(versionPath);
   const preparationState = resolvePreparationState({
     releaseVersion,
     baseVersion,
-    rootPackage,
-    desktopPackage,
+    distributionConfig,
     targetNotesPath,
     sourceNotes,
   });
@@ -58,11 +56,9 @@ function main() {
       applyCandidateChanges({
         releaseVersion,
         sourceNotes,
-        rootPackagePath,
-        desktopPackagePath,
+        versionPath,
         targetNotesPath,
-        rootPackage,
-        desktopPackage,
+        distributionConfig,
       });
       result = '已写入版本与 Release notes，等待人工审阅 Git 变更';
     }
@@ -118,27 +114,24 @@ function readPackage(path) {
 }
 
 function resolvePreparationState(input) {
-  if (input.rootPackage.version !== input.desktopPackage.version) {
-    throw new Error(`根包与桌面包版本不一致：root=${input.rootPackage.version ?? 'missing'} desktop=${input.desktopPackage.version ?? 'missing'}`);
-  }
-  if (input.rootPackage.version === input.releaseVersion) {
+  if (input.distributionConfig.version === input.releaseVersion) {
     if (!existsSync(input.targetNotesPath) || readFileSync(input.targetNotesPath, 'utf8') !== input.sourceNotes) {
-      throw new Error('包版本已是目标版本，但仓库 Release notes 缺失或与已审阅内容不一致。');
+      throw new Error('发行版本已是目标版本，但仓库 Release notes 缺失或与已审阅内容不一致。');
     }
     return 'prepared';
   }
-  if (input.rootPackage.version !== input.baseVersion) {
-    throw new Error(`当前包版本既不是公开基线 ${input.baseVersion}，也不是目标版本 ${input.releaseVersion}：${input.rootPackage.version ?? 'missing'}`);
+  if (input.distributionConfig.version !== input.baseVersion) {
+    throw new Error(`当前发行版本既不是公开基线 ${input.baseVersion}，也不是目标版本 ${input.releaseVersion}：${input.distributionConfig.version ?? 'missing'}`);
   }
   if (existsSync(input.targetNotesPath)) {
-    throw new Error(`目标 Release notes 已存在但包版本尚未升级，拒绝覆盖：${input.targetNotesPath}`);
+    throw new Error(`目标 Release notes 已存在但发行版本尚未升级，拒绝覆盖：${input.targetNotesPath}`);
   }
   return 'pending';
 }
 
 function assertOnlyPreparedPathsChanged(status, targetNotesPath) {
   if (!status) return;
-  const allowed = new Set([...releasePackagePaths, relativeToRepository(targetNotesPath)]);
+  const allowed = new Set([...releaseVersionPaths, relativeToRepository(targetNotesPath)]);
   const unexpected = status
     .split(/\r?\n/u)
     .map((line) => line.slice(3).split(' -> ').at(-1))
@@ -150,20 +143,17 @@ function assertOnlyPreparedPathsChanged(status, targetNotesPath) {
 
 function applyCandidateChanges(input) {
   const originalFiles = [
-    { path: input.rootPackagePath, existed: true, content: readFileSync(input.rootPackagePath, 'utf8') },
-    { path: input.desktopPackagePath, existed: true, content: readFileSync(input.desktopPackagePath, 'utf8') },
+    { path: input.versionPath, existed: true, content: readFileSync(input.versionPath, 'utf8') },
     { path: input.targetNotesPath, existed: existsSync(input.targetNotesPath), content: existsSync(input.targetNotesPath) ? readFileSync(input.targetNotesPath, 'utf8') : '' },
   ];
-  const nextRootPackage = `${JSON.stringify({ ...input.rootPackage, version: input.releaseVersion }, null, 2)}\n`;
-  const nextDesktopPackage = `${JSON.stringify({ ...input.desktopPackage, version: input.releaseVersion }, null, 2)}\n`;
+  const nextConfig = JSON.stringify({ ...input.distributionConfig, version: input.releaseVersion }, null, 2) + '\n';
 
   try {
     mkdirSync(dirname(input.targetNotesPath), { recursive: true });
-    writeFileSync(input.rootPackagePath, nextRootPackage);
-    writeFileSync(input.desktopPackagePath, nextDesktopPackage);
+    writeFileSync(input.versionPath, nextConfig);
     writeFileSync(input.targetNotesPath, input.sourceNotes);
-    run('pnpm', ['exec', 'prettier', '--check', 'package.json', 'apps/desktop/package.json']);
-    run('git', ['diff', '--check', '--', 'package.json', 'apps/desktop/package.json']);
+    run('pnpm', ['exec', 'prettier', '--check', ...releaseVersionPaths]);
+    run('git', ['diff', '--check', '--', ...releaseVersionPaths]);
   } catch (error) {
     for (const file of originalFiles) {
       if (file.existed) writeFileSync(file.path, file.content);
@@ -189,14 +179,13 @@ function buildPlan(input) {
     '## 结果',
     '',
     `- ${input.result}。`,
-    `- 根包目标版本：${input.releaseVersion}`,
-    `- 桌面包目标版本：${input.releaseVersion}`,
+    `- 独立发行目标版本：${input.releaseVersion}`,
     `- 执行前工作区：${input.worktreeStatusBefore || '干净'}`,
     `- 执行后工作区：${input.worktreeStatusAfter || '干净'}`,
     '',
     '## 边界',
     '',
-    '- 本命令只同步发行包、根包、桌面包版本和目标 Release notes。',
+    '- 本命令只更新独立发行配置版本和目标 Release notes，上游包版本保持不变。',
     '- 本命令不创建分支、提交、PR、标签、GitHub Release 或 Homebrew Tap 变更。',
     '- 写入后必须人工审阅 Git 变更，再进入本地发布门禁。',
     '',

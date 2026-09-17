@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
+import { distributionAppName, distributionArtifactPrefix, readDistributionVersion } from './desktop-distribution.mjs';
 import { releaseTag } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
@@ -136,7 +136,7 @@ export async function generateReleaseManifest({ version, channel = 'stable', rep
 }
 
 async function main() {
-  const version = process.argv[2] ?? JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8')).version;
+  const version = process.argv[2] ?? readDistributionVersion();
   const channel = process.argv[3] ?? 'stable';
   const repository = process.argv[4] ?? defaultRepository;
   const outputPath = process.argv[5] ?? join(rootDir, 'dist', 'zeus-release-manifest.json');

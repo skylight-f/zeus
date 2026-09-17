@@ -42,8 +42,8 @@ if (d.repository === d.upstreamRepository) {
       }
       // 即使 Git 自动合并成功，也不能把上游发行身份或版本带入二开渠道。
       const mergedDistribution = JSON.parse(readFileSync('packages/distribution/src/config.json', 'utf8'));
-      const mergedVersions = ['package.json', 'apps/desktop/package.json'].map((path) => JSON.parse(readFileSync(path, 'utf8')).version);
-      if (Object.keys(d).some((key) => mergedDistribution[key] !== d[key]) || mergedVersions.some((version) => version !== originalVersion)) {
+      const mergedVersion = mergedDistribution.version;
+      if (Object.keys(d).some((key) => mergedDistribution[key] !== d[key]) || mergedVersion !== originalVersion) {
         git('merge', '--abort');
         throw new Error('上游同步改变了二开发行配置或独立版本，请本地审阅合并并保留二开渠道与版本；尚未提交或推送。');
       }

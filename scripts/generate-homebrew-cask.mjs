@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
+import { distributionAppName, distributionArtifactPrefix, readDistributionVersion } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { sha256File } from './release-script-utils.mjs';
@@ -59,7 +59,7 @@ export async function generateHomebrewCask({ version, arch, dmgPath, outputPath 
 }
 
 async function main() {
-  const version = process.argv[2] ?? JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8')).version;
+  const version = process.argv[2] ?? readDistributionVersion();
   const arch = process.argv[3] ?? (process.arch === 'x64' ? 'x64' : 'arm64');
   const dmgPath = process.argv[4] ?? join(rootDir, 'dist', `${distributionArtifactPrefix}-${version}-${arch}.dmg`);
   const outputPath = process.argv[5] ?? join(rootDir, 'dist', 'homebrew', `${zeusDistribution.cask}.rb`);

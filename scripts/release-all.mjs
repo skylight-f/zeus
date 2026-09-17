@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
-import { releaseTag, versionFromReleaseTag, releasePackagePaths, assertDistributionVersions } from './desktop-distribution.mjs';
+import { releaseTag, versionFromReleaseTag, releaseVersionPaths, assertDistributionVersions, readDistributionVersion } from './desktop-distribution.mjs';
 /* global console, process */
 import { zeusDistribution } from './desktop-distribution.mjs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -13,7 +13,7 @@ import { parseBoolean } from './release-script-utils.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
 const repository = zeusDistribution.repository;
-const releaseFiles = releasePackagePaths;
+const releaseFiles = releaseVersionPaths;
 const formatExtensions = new Set(['.ts', '.tsx', '.cts', '.cjs', '.mjs', '.js', '.json', '.yml', '.yaml']);
 // 仓库其他目录中的 Markdown 仍按文档处理；本地任务记录统一由 docs/ 路径识别。
 const documentationWhitespaceExtensions = new Set(['.md', '.mdx', '.markdown']);
@@ -202,7 +202,7 @@ function isRecoverableIsolatedReleaseCommit(isolatedRepository, sourceHead, isol
 }
 
 function seedIsolatedReleaseState(isolatedRepository, sourceHead) {
-  const version = JSON.parse(readFileSync(join(isolatedRepository, 'package.json'), 'utf8')).version;
+  const version = readDistributionVersion(isolatedRepository);
   const sourceState = readState(version);
   if (!sourceState) return;
   const gitDirectoryValue = gitInDirectory(isolatedRepository, ['rev-parse', '--git-common-dir']);
@@ -853,13 +853,7 @@ function buildFinalResult(state) {
 }
 
 function readMatchingPackageVersion() {
-  assertDistributionVersions();
-  const rootVersion = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')).version;
-  const desktopVersion = JSON.parse(readFileSync(join(repositoryRoot, 'apps', 'desktop', 'package.json'), 'utf8')).version;
-  if (rootVersion !== desktopVersion || !/^\d+\.\d+\.\d+$/u.test(rootVersion ?? '')) {
-    throw new Error(`根包与桌面包版本不一致：root=${rootVersion ?? 'missing'} desktop=${desktopVersion ?? 'missing'}`);
-  }
-  return rootVersion;
+  return assertDistributionVersions();
 }
 
 function incrementPatch(version) {

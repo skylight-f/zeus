@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readDistributionVersion } from './desktop-distribution.mjs';
 import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { releaseTag, versionFromReleaseTag } from './desktop-distribution.mjs';
 /* global console, process */
@@ -91,8 +92,9 @@ function buildEvidence() {
     `- 基线标签：${baseTag}`,
     `- 候选提交：${headSha}`,
     `- 当前分支：${branch}`,
-    `- 根包版本：${packageVersion}`,
-    `- 桌面包版本：${desktopVersion}`,
+    `- 独立发行版本：${readDistributionVersion()}`,
+    `- 上游根包版本：${packageVersion}`,
+    `- 上游桌面包版本：${desktopVersion}`,
     `- 最低系统版本配置：${minimumSystemVersion ?? '未读取到'}`,
     `- 包含未提交工作区：${includeWorktree ? '是' : '否'}`,
     '',

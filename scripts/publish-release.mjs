@@ -114,8 +114,7 @@ function collectPreflight(input) {
   const secretsRead = readActionSecretNames();
   const secretNames = secretsRead.names;
   const releaseNotesPath = join(repositoryRoot, 'releases', `${input.tag}.md`);
-  let packageVersion = null;
-  let desktopVersion = null;
+  let distributionVersion = null;
 
   if (branch !== zeusDistribution.releaseBranch) blockers.push(`当前分支必须是配置的发行分支，实际为 ${branch}`);
   if (worktreeStatus) blockers.push('工作区必须干净');
@@ -125,13 +124,12 @@ function collectPreflight(input) {
   if (ghAuth.status !== 0) blockers.push(`GitHub CLI 未完成可用登录：${commandFailureDetail(ghAuth)}`);
 
   try {
-    packageVersion = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')).version;
-    desktopVersion = JSON.parse(readFileSync(join(repositoryRoot, 'apps', 'desktop', 'package.json'), 'utf8')).version;
-    if (packageVersion !== input.releaseVersion || desktopVersion !== input.releaseVersion) {
-      blockers.push(`包版本必须均为 ${input.releaseVersion}：root=${packageVersion ?? 'missing'} desktop=${desktopVersion ?? 'missing'}`);
+    distributionVersion = assertDistributionVersions();
+    if (distributionVersion !== input.releaseVersion) {
+      blockers.push(`发行版本必须为 ${input.releaseVersion}，实际为 ${distributionVersion}`);
     }
   } catch (error) {
-    blockers.push(`无法读取包版本：${error instanceof Error ? error.message : String(error)}`);
+    blockers.push(`无法读取发行版本：${error instanceof Error ? error.message : String(error)}`);
   }
 
   try {
@@ -185,8 +183,7 @@ function collectPreflight(input) {
     secretNames: [...secretNames].sort(),
     releaseNotesPath,
     localGateSummaryPath: input.localGateSummaryPath,
-    packageVersion,
-    desktopVersion,
+    distributionVersion,
   };
 }
 
@@ -200,7 +197,7 @@ function buildPlan(preflight, input) {
     `- 分支：${preflight.branch}`,
     `- 候选提交：${preflight.headSha}`,
     `- origin 的发行分支：${preflight.remoteMainSha || '未读取到'}`,
-    `- 根包／桌面包版本：${preflight.packageVersion ?? '未读取到'} / ${preflight.desktopVersion ?? '未读取到'}`,
+    `- 独立发行版本：${preflight.distributionVersion ?? '未读取到'}`,
     `- Release notes：${preflight.releaseNotesPath}`,
     `- 本地快速检查摘要：${preflight.localGateSummaryPath || '未提供'}`,
     `- 发行分支 CI：${preflight.ciRun ? `${preflight.ciRun.conclusion} ${preflight.ciRun.url}` : '未完成；快速发布不串行等待'}`,

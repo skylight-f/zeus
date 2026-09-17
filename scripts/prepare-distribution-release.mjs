@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { releaseTag, releasePackagePaths, readDistributionVersion } from './desktop-distribution.mjs';
+import { releaseTag, releaseVersionPaths, readDistributionVersion } from './desktop-distribution.mjs';
 /* global process, console */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -9,9 +9,9 @@ import { requiredVersion, assertVersionAfterTag, validateReleaseNotes } from './
 
 // 支持尚无自有 GitHub Release 的首次发布；只准备文件，不提交、推送或发布。
 const version = requiredVersion(process.env.RELEASE_VERSION || readDistributionVersion());
-const paths = releasePackagePaths;
+const paths = releaseVersionPaths;
 const packages = paths.map((path) => JSON.parse(readFileSync(path, 'utf8')));
-if (packages[0].version !== packages[1].version) throw new Error('根包与桌面包版本不一致。');
+
 if (version !== readDistributionVersion()) assertVersionAfterTag(version, releaseTag(readDistributionVersion()));
 const tag = releaseTag(version);
 const tags = execFileSync('git', ['tag', '--list', tag], { encoding: 'utf8' }).trim();

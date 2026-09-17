@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { zeusDistribution as distribution, releasePackagePaths, releaseTag, versionFromReleaseTag } from './desktop-distribution.mjs';
+import { zeusDistribution as distribution, releaseVersionPaths, releaseTag, versionFromReleaseTag } from './desktop-distribution.mjs';
 import { parseBoolean, requiredVersion, validateReleaseNotes } from './release-script-utils.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '..');
@@ -65,8 +65,8 @@ function git(root, ...args) {
 }
 
 function packageVersion(root) {
-  const versions = releasePackagePaths.map((path) => JSON.parse(readFileSync(resolve(root, path), 'utf8')).version);
-  if (versions.some((version) => version !== versions[0])) throw new Error('自动发布要求根包与桌面包的版本一致。');
+  const versions = releaseVersionPaths.map((path) => JSON.parse(readFileSync(resolve(root, path), 'utf8')).version);
+  if (versions.some((version) => version !== versions[0])) throw new Error('自动发布要求发行版本一致。');
   return requiredVersion(versions[0]);
 }
 
@@ -91,9 +91,9 @@ function readAutomaticCandidate(root, commit) {
   const tag = releaseTag(version);
   const notesPath = `releases/${tag}.md`;
   const paths = git(root, 'diff-tree', '--no-commit-id', '--name-only', '-r', commit).split('\n');
-  const allowed = new Set([...releasePackagePaths, notesPath]);
+  const allowed = new Set([...releaseVersionPaths, notesPath]);
   // 手写说明可能已在源提交中，候选只同步两个版本文件也应支持失败重试。
-  if ((!paths.includes(notesPath) && !releasePackagePaths.every((path) => paths.includes(path))) || paths.some((path) => !allowed.has(path))) return null;
+  if ((!paths.includes(notesPath) && !releaseVersionPaths.every((path) => paths.includes(path))) || paths.some((path) => !allowed.has(path))) return null;
   validateReleaseNotes(readFileSync(resolve(root, notesPath), 'utf8'), version);
   return { commit_sha: commit, tag, source };
 }
@@ -125,7 +125,7 @@ export function prepareAutomaticCandidate({ root, sourceSha, releases }) {
   const preparedNotesExist = existsSync(resolve(root, notesPath));
   const notes = preparedNotesExist ? readFileSync(resolve(root, notesPath), 'utf8') : automaticReleaseNotes(version, sourceSha, published[0]?.tag_name);
   validateReleaseNotes(notes, version);
-  for (const path of releasePackagePaths) {
+  for (const path of releaseVersionPaths) {
     const absolute = resolve(root, path);
     writeFileSync(absolute, JSON.stringify({ ...JSON.parse(readFileSync(absolute, 'utf8')), version }, null, 2) + '\n');
   }
@@ -133,7 +133,7 @@ export function prepareAutomaticCandidate({ root, sourceSha, releases }) {
   if (!preparedNotesExist) writeFileSync(resolve(root, notesPath), notes, { flag: 'wx' });
   git(root, 'config', 'user.name', 'Zeus Release Bot');
   git(root, 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com');
-  git(root, 'add', '--', ...releasePackagePaths, notesPath);
+  git(root, 'add', '--', ...releaseVersionPaths, notesPath);
   git(root, 'diff', '--cached', '--check');
   git(root, 'commit', '-m', `chore(release): ${tag}`, '-m', `${sourceTrailer} ${sourceSha}`);
   const commit = git(root, 'rev-parse', 'HEAD');

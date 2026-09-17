@@ -34,7 +34,7 @@ if (manifestIndex >= 0) {
 
 if (process.argv.includes('--check-version')) {
   // 读取待发布版本，保持稳定渠道的三段版本约束。
-  const version = JSON.parse(readFileSync('package.json', 'utf8')).version;
+  const version = distributionVersion;
   if (!/^\d+\.\d+\.\d+$/u.test(version)) throw new Error('稳定渠道只接受三段递增版本号。');
   // 保留全部分页，只输出公开稳定版标签，避免发布正文和附件详情撑满子进程缓冲区。
   const tags = execFileSync('gh', ['api', `repos/${distribution.repository}/releases?per_page=100`, '--paginate', '--jq', '.[] | select(.draft == false and .prerelease == false) | .tag_name'], { encoding: 'utf8' })

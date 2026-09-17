@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 import { verifyPackagedApp } from './verify-packaged-app-health.mjs';
 import { cleanPackageArtifacts } from './clean-package-artifacts.mjs';
-import { distributionArtifactPrefix, distributionPackageIdentity } from './desktop-distribution.mjs';
+import { distributionArtifactPrefix, distributionPackageIdentity, assertDistributionVersions } from './desktop-distribution.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(scriptDir, '..');
@@ -209,6 +209,8 @@ export async function packageMac({ dmg = false } = {}) {
   const identity = distributionPackageIdentity(variant);
   const artifactPrefix = variant === 'test' ? 'Zeus-Test' : distributionArtifactPrefix;
   const brandingArgs = [
+    // 只在打包产物写入发行版本，不改写受版本控制的上游包清单。
+    `--config.extraMetadata.version=${assertDistributionVersions()}`,
     `--config.productName=${identity.name}`,
     `--config.mac.executableName=${identity.executable}`,
     `--config.artifactName=${artifactPrefix}-\${version}-\${arch}.\${ext}`,

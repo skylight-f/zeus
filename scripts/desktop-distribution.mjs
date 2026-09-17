@@ -18,19 +18,19 @@ export function distributionPackageIdentity(variant = 'release') {
   return { name, executable: name, bundleId: variant === 'test' ? 'dev.hypha.zeus.test' : 'dev.hypha.zeus' };
 }
 
-/** 根包是唯一应用版本源，发布时同步桌面包；内部工作区包不参与发行编号。 */
-export const releasePackagePaths = ['package.json', 'apps/desktop/package.json'];
+/** 二开发行号独立维护；两个 package.json 的版本只跟随上游。 */
+export const releaseVersionPaths = ['packages/distribution/src/config.json'];
 
-export function readDistributionVersion() {
-  return JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf8')).version;
+export function readDistributionVersion(root = resolve(import.meta.dirname, '..')) {
+  return JSON.parse(readFileSync(resolve(root, releaseVersionPaths[0]), 'utf8')).version;
 }
 
-export function assertDistributionVersions() {
-  const version = readDistributionVersion();
+export function assertDistributionVersions(root = resolve(import.meta.dirname, '..')) {
+  const version = readDistributionVersion(root);
   if (!/^\d+\.\d+\.\d+$/u.test(version)) throw new Error('发行包必须使用三段稳定版本号。');
-  for (const path of releasePackagePaths) {
-    if (JSON.parse(readFileSync(resolve(import.meta.dirname, '..', path), 'utf8')).version !== version) throw new Error(`${path} 与根包版本 ${version} 不一致，请同步版本后构建。`);
-  }
+  const rootVersion = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')).version;
+  const desktopVersion = JSON.parse(readFileSync(resolve(root, 'apps/desktop/package.json'), 'utf8')).version;
+  if (!/^\d+\.\d+\.\d+$/u.test(rootVersion) || rootVersion !== desktopVersion) throw new Error('根包与桌面包的上游版本必须一致。');
   return version;
 }
 
