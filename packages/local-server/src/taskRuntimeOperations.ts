@@ -122,30 +122,37 @@ export function createTaskRuntimeOperations(dependencies: TaskRuntimeOperationDe
     project: ZeusProjectRecord,
     options: {
       refreshCodexAccount?: boolean;
-      allowPiWhenCodexUnavailable?: boolean;
+      requestedModel?: string | null;
     } = {},
   ) {
+    // 先按项目目录确定目标内核；Pi 会话不应启动 Codex，也不应等待其账户通道。
+    const transport = codexAppServerManager.getState();
+    const existingCodex = codexNativeEnabled && transport.type === 'ready' ? transport.capabilities : null;
+    const unavailableAccount = conversationCapabilityQueries.unavailableCodexAccount();
     try {
-      const codexCapabilities = codexNativeEnabled ? await codexAppServerManager.ensureReady({ commandPath: currentCodexRuntimeCommandPath(), ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) }) : null;
-      let codexAccount: Parameters<typeof conversationCapabilityQueries.buildConversationCapabilities>[2] = conversationCapabilityQueries.unavailableCodexAccount();
-      if (codexCapabilities) {
-        if (options.refreshCodexAccount === true) {
-          codexAccount = await codexAppServerManager.readAccount({ refreshToken: true });
-        } else {
-          try {
-            codexAccount = await codexAppServerManager.readAccount({ cachedOnly: true });
-          } catch (error) {
-            if (!error || typeof error !== 'object' || Reflect.get(error, 'code') !== 'ZEUS_CODEX_ACCOUNT_SNAPSHOT_UNAVAILABLE') throw error;
-          }
+      const capabilities = await conversationCapabilityQueries.buildConversationCapabilities(project, existingCodex, unavailableAccount);
+      const requestedModel = options.requestedModel?.trim() || capabilities.preferredModel;
+      const selected = resolveModelCapability<{ id: string; model: string; agentKind: string }>(capabilities.models, requestedModel);
+      // 冷启动时只有完整连接引用能确认 Pi 身份；短名仍需原生目录消歧，防止同名 Codex 被误选为 Pi。
+      if (selected?.agentKind === 'pi' && (selected.id === requestedModel || existingCodex)) return capabilities;
+    } catch (error) {
+      // 尚无本地目录时仍允许 Codex 初始化；其他目录错误必须保留原始原因。
+      if (!error || typeof error !== 'object' || Reflect.get(error, 'code') !== 'ZEUS_MODEL_UNAVAILABLE') throw error;
+    }
+    const codexCapabilities = codexNativeEnabled ? await codexAppServerManager.ensureReady({ commandPath: currentCodexRuntimeCommandPath(), ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) }) : null;
+    let codexAccount: Parameters<typeof conversationCapabilityQueries.buildConversationCapabilities>[2] = unavailableAccount;
+    if (codexCapabilities) {
+      if (options.refreshCodexAccount === true) {
+        codexAccount = await codexAppServerManager.readAccount({ refreshToken: true });
+      } else {
+        try {
+          codexAccount = await codexAppServerManager.readAccount({ cachedOnly: true });
+        } catch (error) {
+          if (!error || typeof error !== 'object' || Reflect.get(error, 'code') !== 'ZEUS_CODEX_ACCOUNT_SNAPSHOT_UNAVAILABLE') throw error;
         }
       }
-      return conversationCapabilityQueries.buildConversationCapabilities(project, codexCapabilities, codexAccount);
-    } catch (error) {
-      if (!options.allowPiWhenCodexUnavailable) throw error;
-      const capabilities = await conversationCapabilityQueries.buildConversationCapabilities(project, null, conversationCapabilityQueries.unavailableCodexAccount());
-      if (!capabilities.models.some((model: { agentKind: string; available: boolean }) => model.agentKind === 'pi' && model.available !== false)) throw error;
-      return capabilities;
     }
+    return conversationCapabilityQueries.buildConversationCapabilities(project, codexCapabilities, codexAccount);
   }
 
   async function assertCodexAccountReady(modelSourceId: string | null = 'codex', model = ''): Promise<void> {
