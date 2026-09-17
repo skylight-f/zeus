@@ -1,7 +1,7 @@
 import { distributionAppName, distributionVersion, isZeusReleaseUrl } from './desktopDistribution.js';
 
 import { registerFilePreview } from './filePreview.js';
-import { hideMenuBarPopover, showMenuBarPopover, applyMenuBarTray } from './menuBarAppearance.js';
+import { hideMenuBarPopover, showMenuBarPopover, updateMenuBarPopoverAppearance, applyMenuBarTray } from './menuBarAppearance.js';
 import { filePreviewMime, filePreviewKind, filePreviewLimits, type FilePreviewIntent } from '@zeus/shared';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
@@ -1197,8 +1197,9 @@ function sanitizeRendererRuntimeLogDetail(message: unknown): string {
 }
 
 function setupIpc(): void {
-  /** 明暗设置或系统外观变化时，同步已打开差异窗口的原生底色。 */
+  /** 明暗设置或系统外观变化时，同步差异窗口底色和菜单栏原生玻璃。 */
   nativeTheme.on('updated', () => {
+    if (menuBarUsageWindow && !menuBarUsageWindow.isDestroyed()) updateMenuBarPopoverAppearance(menuBarUsageWindow);
     for (const window of projectGitDiffWindows) {
       if (!window.isDestroyed()) window.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#17191d' : '#f7f8fa');
     }

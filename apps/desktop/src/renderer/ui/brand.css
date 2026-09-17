@@ -1,11 +1,11 @@
-/* 所有窗口共用既定紫色品牌色，应用图标替换不改变交互配色。 */
+/* 所有窗口沿用 AT Logo 的鲜紫色，浅紫高光保证深色界面的强调文字清晰。 */
 :root {
-  /* 深紫色用于主操作与交互反馈。 */
-  --zeus-brand-primary: #6155d8;
+  /* Logo 中的紫色用于主操作与交互反馈。 */
+  --zeus-brand-primary: #7638f5;
   /* 普通悬停统一为浅紫色，主窗口与独立窗口保持同样的轻量反馈。 */
   --zeus-brand-hover: color-mix(in srgb, var(--zeus-brand-primary) 5%, transparent);
   /* 亮紫色用于辅助强调。 */
-  --zeus-brand-highlight: #7a6ff0;
+  --zeus-brand-highlight: #a875ff;
   /* 浅色背景上的强调文字使用品牌主色。 */
   --zeus-brand-text: var(--zeus-brand-primary);
 }

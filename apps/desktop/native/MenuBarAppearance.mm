@@ -44,6 +44,10 @@ static NSStatusBarButton *FindStatusButton(NSView *view, NSString *tooltip);
     [self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSMinYEdge];
     NSView *content = self.popover.contentViewController.view;
     NSWindow *background = content.window;
+    // 弹窗连接到状态按钮后，显式同步其背景窗口，避免重新继承菜单栏的浅色外观。
+    content.appearance = host.appearance;
+    background.appearance = host.appearance;
+    NSLog(@"Zeus menu bar appearance: requested=%@ effective=%@", host.appearance.name, background.effectiveAppearance.name);
     background.level = NSPopUpMenuWindowLevel;
     background.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
     NSRect frame = [background convertRectToScreen:[content convertRect:content.bounds toView:nil]];
@@ -111,6 +115,27 @@ static napi_value ShowPopover(napi_env env, napi_callback_info info) {
         napi_throw_error(env, nullptr, exception.reason.UTF8String);
         return nullptr;
     }
+}
+
+// 浮窗跟随应用主题；状态栏按钮仍独立跟随菜单栏背景。
+static napi_value SetPopoverAppearance(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2], result;
+    bool dark = false;
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    NSView *view = argc == 2 ? ViewFromHandle(env, args[0]) : nil;
+    if (!view.window || napi_get_value_bool(env, args[1], &dark) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "菜单栏主题参数无效");
+        return nullptr;
+    }
+    NSAppearance *appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+    view.window.appearance = appearance;
+    ZeusMenuPopover *controller = objc_getAssociatedObject(view, &popoverKey);
+    controller.popover.appearance = appearance;
+    controller.popover.contentViewController.view.appearance = appearance;
+    controller.popover.contentViewController.view.window.appearance = appearance;
+    napi_get_undefined(env, &result);
+    return result;
 }
 
 static napi_value HidePopover(napi_env env, napi_callback_info info) {
@@ -222,9 +247,10 @@ static napi_value Initialize(napi_env env, napi_value exports) {
     napi_property_descriptor properties[] = {
         {"showPopover", nullptr, ShowPopover, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hidePopover", nullptr, HidePopover, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setPopoverAppearance", nullptr, SetPopoverAppearance, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"applyTray", nullptr, ApplyTray, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
-    napi_define_properties(env, exports, 3, properties);
+    napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
     return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Initialize)

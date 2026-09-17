@@ -127,8 +127,8 @@
   --zeus-code-editor-active-line: color-mix(in srgb, var(--agentdesk-accent) 14%, transparent);
   --zeus-code-editor-selection: color-mix(in srgb, var(--agentdesk-accent) 32%, transparent);
   --zeus-scrollbar-thumb: rgb(148 163 184 / 0.28);
-  --zeus-scrollbar-thumb-hover: rgb(123 160 255 / 0.46);
-  --zeus-scrollbar-thumb-active: rgb(123 160 255 / 0.62);
+  --zeus-scrollbar-thumb-hover: color-mix(in srgb, var(--zeus-brand-highlight) 46%, transparent);
+  --zeus-scrollbar-thumb-active: color-mix(in srgb, var(--zeus-brand-highlight) 62%, transparent);
   color-scheme: dark;
   background:
     radial-gradient(circle at 86% -18%, color-mix(in srgb, var(--agentdesk-accent-secondary) 22%, transparent), transparent 34%),
@@ -157,8 +157,8 @@
     --zeus-code-editor-active-line: color-mix(in srgb, var(--agentdesk-accent) 14%, transparent);
     --zeus-code-editor-selection: color-mix(in srgb, var(--agentdesk-accent) 32%, transparent);
     --zeus-scrollbar-thumb: rgb(148 163 184 / 0.28);
-    --zeus-scrollbar-thumb-hover: rgb(123 160 255 / 0.46);
-    --zeus-scrollbar-thumb-active: rgb(123 160 255 / 0.62);
+    --zeus-scrollbar-thumb-hover: color-mix(in srgb, var(--zeus-brand-highlight) 46%, transparent);
+    --zeus-scrollbar-thumb-active: color-mix(in srgb, var(--zeus-brand-highlight) 62%, transparent);
     color-scheme: dark;
     background:
       radial-gradient(circle at 86% -18%, color-mix(in srgb, var(--agentdesk-accent-secondary) 22%, transparent), transparent 34%),
@@ -853,7 +853,7 @@ body:has(.macos-ai-app.zeus-shell) {
   background: var(--agentdesk-accent) !important;
   box-shadow:
     inset 0 0 0 4px var(--zeus-card-background),
-    0 0 0 2px rgb(40 102 247 / 12%);
+    0 0 0 2px color-mix(in srgb, var(--agentdesk-accent) 12%, transparent);
 }
 
 .macos-ai-app.zeus-shell .settings-mode-radio {

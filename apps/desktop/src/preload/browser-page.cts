@@ -111,13 +111,13 @@ function install(): void {
   style.textContent = `
     :host { all: initial; color-scheme: light dark; }
     * { box-sizing: border-box; }
-    .outline { position: fixed; pointer-events: none; border: 2px solid #6155d8; border-radius: 4px; background: rgb(97 85 216 / 14%); display: none; }
-    .region { border-style: dashed; border-radius: 8px; background: rgb(97 85 216 / 12%); }
+    .outline { position: fixed; pointer-events: none; border: 2px solid #7638f5; border-radius: 4px; background: rgb(118 56 245 / 14%); display: none; }
+    .region { border-style: dashed; border-radius: 8px; background: rgb(118 56 245 / 12%); }
     .markers { position: fixed; inset: 0; pointer-events: none; }
-    .marker { position: fixed; width: 23px; height: 23px; border: 2px solid white; border-radius: 999px; background: #6155d8; color: white; display: grid; place-items: center; font: 650 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); pointer-events: auto; cursor: pointer; transition: transform 120ms ease, box-shadow 120ms ease; }
-    .marker:hover,.marker[data-focus="true"] { transform: scale(1.12); box-shadow: 0 4px 16px rgb(97 85 216 / 38%); }
-    .editor-pin { position: fixed; width: 26px; height: 26px; border: 2px solid white; border-radius: 999px; background: #6155d8; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); display: none; pointer-events: none; transform: translate(-50%, -50%); }
-    .editor-pin::after { position: absolute; left: 2px; bottom: -3px; width: 8px; height: 8px; border: 2px solid white; border-top: 0; border-right: 0; border-radius: 0 0 0 6px; background: #6155d8; content: ""; transform: rotate(-18deg); }
+    .marker { position: fixed; width: 23px; height: 23px; border: 2px solid white; border-radius: 999px; background: #7638f5; color: white; display: grid; place-items: center; font: 650 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); pointer-events: auto; cursor: pointer; transition: transform 120ms ease, box-shadow 120ms ease; }
+    .marker:hover,.marker[data-focus="true"] { transform: scale(1.12); box-shadow: 0 4px 16px rgb(118 56 245 / 38%); }
+    .editor-pin { position: fixed; width: 26px; height: 26px; border: 2px solid white; border-radius: 999px; background: #7638f5; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); display: none; pointer-events: none; transform: translate(-50%, -50%); }
+    .editor-pin::after { position: absolute; left: 2px; bottom: -3px; width: 8px; height: 8px; border: 2px solid white; border-top: 0; border-right: 0; border-radius: 0 0 0 6px; background: #7638f5; content: ""; transform: rotate(-18deg); }
     .editor { position: fixed; width: min(296px, calc(100vw - 24px)); padding: 4px 5px; border: 1px solid rgb(23 23 23 / 10%); border-radius: 999px; background: light-dark(#fff, #202124); color: light-dark(#202124, #f1f1f3); box-shadow: 0 8px 28px rgb(15 23 42 / 18%); backdrop-filter: blur(20px); pointer-events: auto; font: 14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     .editor[data-expanded="true"] { width: min(360px, calc(100vw - 24px)); border-radius: 20px; }
     /* 与会话评论共用紧凑尺寸和品牌确认色，多行时收紧圆角。 */
@@ -128,11 +128,11 @@ function install(): void {
     .editor button { appearance: none; align-items: center; background: transparent; border: 0; border-radius: 999px; color: #737373; cursor: pointer; display: inline-flex; flex: 0 0 auto; height: 30px; justify-content: center; padding: 0; width: 30px; }
     .editor button:hover { background: rgb(0 0 0 / 6%); color: #202124; }
     .editor button svg { height: 18px; width: 18px; }
-    .editor button.editor-save { background: #6155d8; color: white; }
-    .editor button.editor-save:hover { background: color-mix(in srgb, #6155d8 90%, black); }
+    .editor button.editor-save { background: #7638f5; color: white; }
+    .editor button.editor-save:hover { background: color-mix(in srgb, #7638f5 90%, black); }
     .editor button[hidden] { display: none; }
-    .editor button[data-listening="true"] { background: rgb(97 85 216 / 12%); color: #6155d8; }
-    .editor button:focus-visible,.editor input:focus-visible,.editor textarea:focus-visible { outline: 2px solid #6155d8; outline-offset: 2px; }
+    .editor button[data-listening="true"] { background: rgb(118 56 245 / 12%); color: #7638f5; }
+    .editor button:focus-visible,.editor input:focus-visible,.editor textarea:focus-visible { outline: 2px solid #7638f5; outline-offset: 2px; }
     .editor textarea:focus-visible { outline: 0; }
     .adjust { margin: 2px 5px 5px; padding: 10px 4px 3px; border-top: 1px solid rgb(32 33 36 / 10%); display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .adjust[hidden] { display: none; }

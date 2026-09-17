@@ -768,21 +768,18 @@ body:has(.menu-bar-usage-root),
   --usage-faint: #88888d;
   --usage-line: rgb(0 0 0 / 7%);
   --usage-edge: rgb(0 0 0 / 22%);
-  --usage-accent: #2866f7;
-  --usage-accent-strong: #1f59ed;
-  --usage-accent-secondary: #8b6dff;
-  --usage-accent-soft: rgb(40 102 247 / 12%);
-  --usage-accent-border: rgb(40 102 247 / 34%);
-  --usage-progress-track: rgb(40 102 247 / 10%);
+  --usage-accent: var(--zeus-brand-primary);
+  --usage-accent-strong: var(--zeus-brand-text);
+  --usage-accent-secondary: var(--zeus-brand-highlight);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
+  --usage-accent-border: color-mix(in srgb, var(--zeus-brand-primary) 34%, transparent);
+  --usage-progress-track: color-mix(in srgb, var(--zeus-brand-primary) 10%, transparent);
   --usage-warning: #a25c00;
   --usage-danger: #ff453a;
   --usage-radius-control: 8px;
   --usage-radius-card: 8px;
   --usage-radius-pill: 999px;
   --usage-radius-tab: 8px;
-  --zeus-brand-primary: #2866f7;
-  --zeus-brand-highlight: #7ba0ff;
-  --zeus-brand-text: #1f59ed;
   position: relative;
   isolation: isolate;
   padding: 14px;
@@ -803,10 +800,8 @@ body:has(.menu-bar-usage-root),
   --usage-faint: #929297;
   --usage-line: rgb(255 255 255 / 10%);
   --usage-edge: rgb(255 255 255 / 20%);
-  --usage-accent-strong: #7ba0ff;
-  --usage-accent-soft: rgb(40 102 247 / 12%);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
   --usage-warning: #ffb340;
-  --zeus-brand-text: #7ba0ff;
 }
 @media (prefers-color-scheme: dark) {
   .menu-bar-usage-root[data-appearance='system'] {
@@ -818,10 +813,8 @@ body:has(.menu-bar-usage-root),
     --usage-faint: #929297;
     --usage-line: rgb(255 255 255 / 10%);
     --usage-edge: rgb(255 255 255 / 20%);
-    --usage-accent-strong: #7ba0ff;
-    --usage-accent-soft: rgb(40 102 247 / 12%);
+    --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
     --usage-warning: #ffb340;
-    --zeus-brand-text: #7ba0ff;
   }
 }
 .menu-bar-usage-surface {
@@ -898,10 +891,10 @@ body:has(.menu-bar-usage-root),
   background: var(--usage-progress-track);
 }
 .menu-bar-usage-progress i {
-  background: linear-gradient(90deg, #7ba0ff, #2866f7);
+  background: linear-gradient(90deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
 }
 .menu-bar-usage-bar-slot i {
-  background: linear-gradient(180deg, #7ba0ff, #2866f7);
+  background: linear-gradient(180deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
 }
 .menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
   background: var(--usage-faint);
