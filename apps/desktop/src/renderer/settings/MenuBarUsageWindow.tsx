@@ -307,12 +307,11 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
     <section className="menu-bar-usage-provider-list" aria-label={text.allProviders}>
       {props.providers.map((provider) => {
         const fullName = providerDisplayName(provider);
+        const quotaCount = menuBarRateLimitWindows(provider).length;
         const providerDetail = provider.deleted
           ? text.deleted
           : provider.kind === 'subscription'
-            ? [provider.planType || text.subscription, provider.rateLimitWindows.length ? (props.language === 'zh-CN' ? `${provider.rateLimitWindows.length} 项官方额度` : `${provider.rateLimitWindows.length} quota windows`) : null]
-                .filter(Boolean)
-                .join(' · ')
+            ? [provider.planType || text.subscription, quotaCount ? (props.language === 'zh-CN' ? `${quotaCount} 项官方额度` : `${quotaCount} quota windows`) : null].filter(Boolean).join(' · ')
             : text.api;
         return (
           <button key={provider.providerId} type="button" title={provider.deleted ? fullName : undefined} onClick={() => props.onSelect(provider.providerId)}>
@@ -365,17 +364,24 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
   );
 }
 
-/** 完整展示官方额度窗口，避免备用额度的较低余额遮住重置后的主额度。 */
+/** 状态栏省略 Codex Spark 独立额度池，原始额度仍保留在用量详情中。 */
+function menuBarRateLimitWindows(provider: UsageProviderSummary): CodexOfficialRateWindow[] {
+  if (provider.providerId !== 'codex') return provider.rateLimitWindows;
+  return provider.rateLimitWindows.filter((window) => !/spark/i.test(`${window.limitId ?? ''} ${window.limitName ?? ''}`));
+}
+
+/** 展示状态栏可见的官方额度窗口。 */
 function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: Language }) {
   const { provider, language } = props;
   const text = copy[language];
   const name = providerDisplayName(provider);
   const todayValue = formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, language);
+  const visibleWindows = menuBarRateLimitWindows(provider);
   /** 无官方额度时保留原有空态；多项额度按官方顺序逐一显示。 */
-  const windows = provider.rateLimitWindows.length ? provider.rateLimitWindows : [undefined];
-  /** 读屏摘要覆盖全部额度，不将某一项伪装成当前模型额度。 */
-  const quotaSummary = provider.rateLimitWindows.map((window) => `${windowRemainingLabel(window, language)} ${formatPercent(window.remainingPercent / 100, language)}`).join('，') || text.noQuota;
-  const source = provider.rateLimitWindows.length ? text.officialAndLocal : provider.officialState === 'signed_out' ? text.localQuotaSignIn : text.localQuotaUnavailable;
+  const windows = visibleWindows.length ? visibleWindows : [undefined];
+  /** 读屏摘要与可见额度保持一致。 */
+  const quotaSummary = visibleWindows.map((window) => `${windowRemainingLabel(window, language)} ${formatPercent(window.remainingPercent / 100, language)}`).join('，') || text.noQuota;
+  const source = visibleWindows.length ? text.officialAndLocal : provider.officialState === 'signed_out' ? text.localQuotaSignIn : text.localQuotaUnavailable;
   return (
     <section className="menu-bar-usage-account-card" aria-label={`${name}，${quotaSummary}，${text.todayToken} ${todayValue}`}>
       <div className="menu-bar-usage-account-body">
