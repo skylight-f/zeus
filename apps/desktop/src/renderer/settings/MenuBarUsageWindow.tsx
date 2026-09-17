@@ -477,13 +477,14 @@ function menuBarRateLimitWindows(provider: UsageProviderSummary): CodexOfficialR
 function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: Language }) {
   /** 保持官方额度与本地用量独立，不为没有额度的供应商制造空态。 */
   const { provider, language } = props;
-  if (provider.rateLimitWindows.length === 0) return null;
+  const visibleWindows = menuBarRateLimitWindows(provider);
+  if (visibleWindows.length === 0) return null;
   /** 当前语言和供应商名称用于分组及辅助阅读摘要。 */
   const text = copy[language];
   const name = providerDisplayName(provider);
   /** 按官方额度池标识分组，避免名称重复，也不合并同名的独立额度池。 */
   const groups = new Map<string, CodexOfficialRateWindow[]>();
-  for (const window of menuBarRateLimitWindows(provider)) {
+  for (const window of visibleWindows) {
     /** 缺少池标识时才用名称归组，保留后台返回的窗口顺序。 */
     const key = window.limitId || window.limitName || '';
     const group = groups.get(key);

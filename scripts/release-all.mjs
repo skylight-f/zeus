@@ -408,7 +408,7 @@ function resolveReleaseState(input) {
     return { type: 'already_published' };
   }
   if (input.packageVersion === input.nextVersion) {
-    if (!currentState) throw new Error(`检测到包版本 ${input.packageVersion} 高于公开稳定版，但缺少一键发布恢复状态，拒绝推断或创建新版本。`);
+    if (!currentState) throw new Error(`检测到发行版本 ${input.packageVersion} 高于公开稳定版，但缺少一键发布恢复状态，拒绝推断或创建新版本。`);
     validateState(currentState, input.stableRelease);
     if (currentState.releaseCommit && currentState.releaseCommit !== input.headSha && !rebindUnpublishedReleaseRepair(currentState, input.headSha)) {
       throw new Error(`本地发行分支已偏离发布提交，且当前阶段不允许自动恢复：expected=${currentState.releaseCommit} actual=${input.headSha}`);
@@ -416,7 +416,7 @@ function resolveReleaseState(input) {
     return { type: 'resume', value: currentState };
   }
   if (input.packageVersion !== input.stableRelease.version) {
-    throw new Error(`当前包版本 ${input.packageVersion} 与公开稳定版 ${input.stableRelease.version} 不一致，也不是可恢复的 ${input.nextVersion}。`);
+    throw new Error(`当前发行版本 ${input.packageVersion} 与公开稳定版 ${input.stableRelease.version} 不一致，也不是可恢复的 ${input.nextVersion}。`);
   }
   const targetState = readState(input.nextVersion);
   if (targetState) {

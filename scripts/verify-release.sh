@@ -10,7 +10,7 @@ fi
 release_output_dir="${ZEUS_RELEASE_OUTPUT_DIR:-.tmp/zeus-release/verify}"
 ZEUS_PACKAGE_OUTPUT_DIR="$release_output_dir" pnpm package:mac:release
 
-version="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync('package.json','utf8')).version)")"
+version="$(node --input-type=module -e "import { assertDistributionVersions } from './scripts/desktop-distribution.mjs'; process.stdout.write(assertDistributionVersions())")"
 app_name="$(node --input-type=module -e "import { distributionAppName } from './scripts/desktop-distribution.mjs'; process.stdout.write(distributionAppName)")"
 artifact_prefix="$(node --input-type=module -e "import { distributionArtifactPrefix } from './scripts/desktop-distribution.mjs'; process.stdout.write(distributionArtifactPrefix)")"
 arch="$(uname -m)"

@@ -26,7 +26,7 @@ export function selectAutomaticVersion(currentVersion, tags, notesExist) {
     const parts = highest.split('.').map(Number);
     version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
   }
-  // 高于当前包版本的手写说明用于下一次候选；当前及历史版本说明不覆盖。
+  // 高于当前发行版本的手写说明用于下一次候选；当前及历史版本说明不覆盖。
   while (compareVersions(version, requiredVersion(currentVersion)) <= 0 && notesExist(releaseTag(version))) {
     const parts = version.split('.').map(Number);
     version = `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
@@ -92,7 +92,7 @@ function readAutomaticCandidate(root, commit) {
   const notesPath = `releases/${tag}.md`;
   const paths = git(root, 'diff-tree', '--no-commit-id', '--name-only', '-r', commit).split('\n');
   const allowed = new Set([...releaseVersionPaths, notesPath]);
-  // 手写说明可能已在源提交中，候选只同步两个版本文件也应支持失败重试。
+  // 手写说明可能已在源提交中，候选只更新独立发行版本文件也应支持失败重试。
   if ((!paths.includes(notesPath) && !releaseVersionPaths.every((path) => paths.includes(path))) || paths.some((path) => !allowed.has(path))) return null;
   validateReleaseNotes(readFileSync(resolve(root, notesPath), 'utf8'), version);
   return { commit_sha: commit, tag, source };

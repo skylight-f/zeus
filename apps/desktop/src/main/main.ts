@@ -2885,6 +2885,9 @@ function applyStartupAppearance(): void {
 async function initializeApplication(): Promise<void> {
   traceApplicationStartup('initialization_started');
   await app.whenReady();
+  // 开发态的源码包保留上游版本，系统“关于”面板使用独立发行版本。
+  const appVersion = app.isPackaged ? app.getVersion() : distributionVersion;
+  app.setAboutPanelOptions({ applicationVersion: appVersion, version: appVersion });
   traceApplicationStartup('electron_ready');
   ensureMacOSDockIconVisible();
   applyDevelopmentVisualIdentity();
@@ -3012,7 +3015,7 @@ async function initializeApplication(): Promise<void> {
       dataLayout,
       projectRoot: mainProjectRoot,
       dataRootIdentity: zeusDataRootHostIdentity(activeDataRootIdentity()),
-      appVersion: app.isPackaged ? app.getVersion() : distributionVersion,
+      appVersion,
       keychainService,
       telegramToken: readOnlyValidationDescriptor ? undefined : process.env.ZEUS_TELEGRAM_BOT_TOKEN,
       telegramAllowedUserIds: readOnlyValidationDescriptor ? undefined : parseTelegramAllowedUserIds(process.env.ZEUS_TELEGRAM_ALLOWED_USER_IDS),
@@ -3056,7 +3059,7 @@ async function initializeApplication(): Promise<void> {
           userDataPath,
           currentAppPath: currentAppBundlePath(),
           currentExecutablePath: process.execPath,
-          currentAppVersion: app.isPackaged ? app.getVersion() : distributionVersion,
+          currentAppVersion: appVersion,
           localServerConfig: () => {
             if (!localServerRuntime) throw new Error('Zeus local server is not ready.');
             return localServerRuntime.config;
@@ -3090,11 +3093,11 @@ async function initializeApplication(): Promise<void> {
           },
           homebrew: createHomebrewUpdateService({
             currentAppPath: currentAppBundlePath(),
-            currentAppVersion: app.isPackaged ? app.getVersion() : distributionVersion,
+            currentAppVersion: appVersion,
             bundleId: isTestDistribution() ? 'dev.hypha.zeus.test' : 'dev.hypha.zeus',
             testMode: isTestDistribution(),
           }),
-          currentVersion: app.isPackaged ? app.getVersion() : distributionVersion,
+          currentVersion: appVersion,
           canInstall: assertUpdateCanInstall,
           onInstallReady: requestUpgradeHandoffQuit,
         });
