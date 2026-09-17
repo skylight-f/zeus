@@ -57,14 +57,16 @@
     .workspace-view-project-sessions,
     .workspace-view-project-settings,
     .workspace-view-settings,
-    .workspace-detail-pane,
-    .settings-detail-pane,
-    .project-detail-pane,
-    .task-management-detail-pane,
     .skills-workspace,
     .automations-workspace
   ) {
   background: var(--zeus-page-background) !important;
+  background-image: none !important;
+}
+
+/* 工作区外层使用页面底色，卡片内的详情面继承卡片表面，避免灰底覆盖内容。 */
+.macos-ai-app.zeus-shell :where(.workspace-detail-pane, .settings-detail-pane, .project-detail-pane, .task-management-detail-pane) {
+  background: var(--zeus-card-background) !important;
   background-image: none !important;
 }
 
@@ -114,7 +116,7 @@
   padding-inline: 2px;
 }
 
-.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .automations-workspace {
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > :is(.automations-workspace, .digital-team-workspace, .digital-team-empty) {
   background: var(--zeus-card-background) !important;
   border: 1px solid var(--zeus-card-border);
   border-radius: 12px;
@@ -123,6 +125,11 @@
   block-size: auto;
   overflow-x: hidden;
   overflow-y: auto;
+}
+
+/* 团队编辑器的画布和侧栏自行滚动，保留外层卡片裁剪。 */
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .digital-team-workspace {
+  overflow: hidden;
 }
 
 .macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .workspace-view.extensions-workspace {

@@ -977,8 +977,8 @@ body:has(.macos-ai-app.zeus-shell) {
 }
 
 /*
- * 中性表面规范：页面与侧栏共用主题表面色，避免各工作区分别残留灰底。
- * 内容边界由组件自身的细边框表达，选中与悬停继续使用独立状态色。
+ * 全局沿用对话页的卡片层次：页面底色衬托侧栏和主工作面。
+ * 各工作区共用底色、卡片色和细边框，选中与悬停继续使用独立状态色。
  * 任务页右侧的多个筛选维度继续各自成组，不把不同语义合并成一个胶囊。
  */
 html:has(.macos-ai-app.zeus-shell),
@@ -988,7 +988,7 @@ body:has(.macos-ai-app.zeus-shell) {
 }
 
 .macos-ai-app.zeus-shell {
-  --zeus-page-background: var(--zeus-card-background);
+  --zeus-page-background: #f7f8fa;
   --zeus-card-background: #fff;
   --zeus-card-border: rgb(17 24 39 / 10%);
   --zeus-card-border-strong: rgb(17 24 39 / 16%);
@@ -1014,6 +1014,7 @@ body:has(.macos-ai-app.zeus-shell) {
 }
 
 .macos-ai-app.zeus-shell.theme-dark {
+  --zeus-page-background: #17191d;
   --zeus-card-background: #24272c;
   --zeus-card-border: rgb(226 232 240 / 14%);
   --zeus-card-border-strong: rgb(226 232 240 / 22%);
@@ -1040,6 +1041,7 @@ body:has(.macos-ai-app.zeus-shell) {
 
 @media (prefers-color-scheme: dark) {
   .macos-ai-app.zeus-shell.theme-system {
+    --zeus-page-background: #17191d;
     --zeus-card-background: #24272c;
     --zeus-card-border: rgb(226 232 240 / 14%);
     --zeus-card-border-strong: rgb(226 232 240 / 22%);
@@ -3725,21 +3727,6 @@ body:has(.macos-ai-app.zeus-shell) {
   min-inline-size: 0;
   overflow: hidden;
   padding: 0 !important;
-}
-
-/* Astra 会话保留原有卡片布局：页面底色衬托侧栏与主工作面，主题只在会话模块内覆盖。 */
-.macos-ai-app.zeus-shell:has(.workspace-view-project-sessions) {
-  --zeus-page-background: #f7f8fa;
-}
-
-.macos-ai-app.zeus-shell.theme-dark:has(.workspace-view-project-sessions) {
-  --zeus-page-background: #17191d;
-}
-
-@media (prefers-color-scheme: dark) {
-  .macos-ai-app.zeus-shell.theme-system:has(.workspace-view-project-sessions) {
-    --zeus-page-background: #17191d;
-  }
 }
 
 /* 主工作面沿用上方公共卡片的 12px 圆角和细边框，内部不重复绘制外框。 */
