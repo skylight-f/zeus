@@ -369,7 +369,7 @@ export class ConversationTranscriptRepository {
         this.db.execute(`UPDATE conversation_transcript_entries SET current_stage_id = COALESCE(current_stage_id, ?) WHERE conversation_id = ? AND id = ?`, [previous.current_stage_id, conversationId, canonicalId]);
       }
       this.db.execute(`UPDATE conversation_transcript_state SET order_epoch = order_epoch + 1 WHERE conversation_id = ?`, [conversationId]);
-      placementChangeWriters.get(this.db)?.(conversationId, this.orderEpoch(conversationId), revision);
+      this.notifyPlacementChanged(conversationId, revision);
     });
   }
 
@@ -430,6 +430,7 @@ export class ConversationTranscriptRepository {
               WHERE conversation_id = ?`,
             [conversationId],
           );
+          this.notifyPlacementChanged(conversationId, this.revision(conversationId));
         });
         return true;
       }
@@ -494,7 +495,7 @@ export class ConversationTranscriptRepository {
         WHERE conversation_id = ? AND id = ? AND removed_revision IS NULL`,
         [revision, revision, input.conversationId, alias.entry_id],
       );
-      placementChangeWriters.get(this.db)?.(input.conversationId, this.orderEpoch(input.conversationId), revision);
+      this.notifyPlacementChanged(input.conversationId, revision);
     });
   }
 
@@ -751,7 +752,14 @@ export class ConversationTranscriptRepository {
       this.db.execute(`UPDATE conversation_transcript_entries SET display_order = ?, placement_revision = ? WHERE conversation_id = ? AND id = ?`, [(index + 1) * conversationTranscriptOrderGap, revision, conversationId, entry.id]),
     );
     this.db.execute(`UPDATE conversation_transcript_state SET order_epoch = order_epoch + 1 WHERE conversation_id = ?`, [conversationId]);
-    placementChangeWriters.get(this.db)?.(conversationId, this.orderEpoch(conversationId), revision);
+    this.notifyPlacementChanged(conversationId, revision);
+  }
+
+  /** 构建中的位置尚不可公开；初始化完成后在同一事务内通知最终代次。 */
+  private notifyPlacementChanged(conversationId: string, revision: number): void {
+    const state = this.state(conversationId);
+    if (state?.initialization_state !== 'ready') return;
+    placementChangeWriters.get(this.db)?.(conversationId, state.order_epoch, revision);
   }
 
   /** 分配会话严格递增修订。 */

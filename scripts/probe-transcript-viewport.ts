@@ -560,6 +560,32 @@ async function verifyTranscriptStorageBoundaries(): Promise<void> {
     /** 旧资料队列应立即返回，并优先推进前台刚请求的会话。 */
     const project = new ProjectRepository(db).create({ id: 'background-project', name: '后台初始化', localPath: directory });
     for (const id of ['background-a', 'background-b']) new ConversationRepository(db).create({ id, projectId: project.id, title: id, transportKind: 'codex_native', providerId: 'codex' });
+    /** 新轮之后连续到达旧轮内容，重建时必然耗尽位置空隙。 */
+    for (let index = 0; index < 24; index += 1) {
+      const timestamp = new Date(Date.parse(at) + index * 1_000).toISOString();
+      provider.upsertCompleted({
+        conversationId: 'background-a',
+        turnId: index === 1 ? 'background-turn-b' : 'background-turn-a',
+        providerThreadId: 'background-thread',
+        providerTurnId: index === 1 ? 'background-turn-b' : 'background-turn-a',
+        providerItemId: `background-item-${index}`,
+        itemType: 'agentMessage',
+        phase: 'final_answer',
+        payload: {},
+        textContent: `重建来源 ${index}`,
+        updatedAt: timestamp,
+        agentKind: 'codex',
+        completedAt: timestamp,
+      });
+    }
+    /** 保留真实来源，模拟升级前尚未建立位置索引的历史会话。 */
+    for (const table of ['conversation_transcript_aliases', 'conversation_transcript_entries', 'conversation_transcript_state']) db.execute(`DELETE FROM ${table} WHERE conversation_id = ?`, ['background-a']);
+    let backgroundPlacementEvents = 0;
+    repo.onPlacementChanged((conversationId, epoch) => {
+      if (conversationId !== 'background-a') return;
+      assertProbe(repo.orderEpoch(conversationId) === epoch, '后台构建中的位置不能提前通知');
+      backgroundPlacementEvents += 1;
+    });
     await initializeConversationTranscriptIndexes(db, true);
     let initializing = false;
     try {
@@ -583,6 +609,8 @@ async function verifyTranscriptStorageBoundaries(): Promise<void> {
       '未请求会话不能抢占前台批次',
     );
     await barrier;
+    assertProbe(repo.orderEpoch('background-a') > 1 && backgroundPlacementEvents === 1, '后台重编号必须完成初始化，并只通知最终代次');
+    assertProbe(db.get<{ count: number }>('SELECT COUNT(*) AS count FROM conversation_transcript_aliases WHERE conversation_id = ?', ['background-a'])?.count === 24, '后台初始化必须保留全部真实来源');
     assertProbe(repo.readPlacementBatch('background-a', []).placements.length === 0, '完整就绪后才能放行摄取屏障');
     stopConversationTranscriptInitialization(db);
     await initializeConversationTranscriptIndexes(db);
@@ -750,12 +778,21 @@ async function probeNavigation() {
     }
     /** 探针故意模拟升级前直写数据，再走正式旧数据初始化建立显示位置。 */
     const initializing = new ConversationTranscriptRepository(db);
+    const initializationEvents: Array<{ epoch: number; revision: number }> = [];
+    initializing.onPlacementChanged((conversationId, epoch, revision) => {
+      assertProbe(conversationId === conversation.id, '初始化通知必须属于当前重建会话');
+      assertProbe(initializing.orderEpoch(conversationId) === epoch, '只有完整就绪的位置才能发送通知');
+      initializationEvents.push({ epoch, revision });
+    });
     assertProbe(initializing.initializeConversation(conversation.id, 1) === false, '首批初始化必须留下可恢复断点');
     assertProbe(db.get<{ initialization_state: string }>('SELECT initialization_state FROM conversation_transcript_state WHERE conversation_id = ?', [conversation.id])?.initialization_state === 'building', '半份索引不能提前标记就绪');
+    assertProbe(initializationEvents.length === 0, '构建期间不得通知尚不可读取的位置');
     new ConversationTranscriptRepository(db).initializeConversation(conversation.id);
     /** 超过十个初始化批次后必须原子就绪，并清理持久暂存事实。 */
     const initialization = db.get<{ initialization_state: string; reconstructed_count: number }>('SELECT initialization_state, reconstructed_count FROM conversation_transcript_state WHERE conversation_id = ?', [conversation.id]);
     assertProbe(initialization?.initialization_state === 'ready' && initialization.reconstructed_count === count * 4 + 1 + processCount, '旧数据必须按 512 条批次完整初始化');
+    assertProbe(initializationEvents.length === 1 && initializationEvents[0]?.revision === initializing.revision(conversation.id), '重建完成必须通知最终位置修订');
+    assertProbe(initializing.initializeConversation(conversation.id) && initializationEvents.length === 1, '已就绪会话不能重复重建或发送初始化通知');
     assertProbe(db.get<{ count: number }>('SELECT COUNT(*) AS count FROM conversation_transcript_initialization_facts WHERE conversation_id = ?', [conversation.id])?.count === 0, '初始化就绪后必须清理暂存事实');
     await db.save();
     /** 查询前后核对写入计数，GET 不改变消息送达。 */
