@@ -27,11 +27,11 @@ body:has(.menu-bar-usage-root),
   inline-size: 100%;
   block-size: 100%;
   /* 缩小浮窗外侧留白，让固定宽度更多用于内容。 */
-  padding: 12px;
+  padding: 12px 10px;
   color: var(--usage-text);
   color-scheme: light;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif;
-  font-size: 14px;
+  font-size: 13px;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   user-select: none;
@@ -101,14 +101,14 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-identity strong {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 730;
 }
 
 .menu-bar-usage-freshness {
   overflow: hidden;
   color: var(--usage-muted);
-  font-size: 12px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -118,7 +118,7 @@ body:has(.menu-bar-usage-root),
   inline-size: 24px;
   block-size: 24px;
   flex: 0 0 24px;
-  background: url('../../../dist/branding/startup-mark.png') center / contain no-repeat;
+  background: url('../../../assets/icon.png') center / contain no-repeat;
 }
 
 /* 时间与刷新按钮作为一组，长文案省略但保留完整悬浮提示。 */
@@ -172,7 +172,7 @@ body:has(.menu-bar-usage-root),
   background: transparent;
   color: var(--usage-muted);
   font: inherit;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 620;
 }
 
@@ -287,16 +287,6 @@ body:has(.menu-bar-usage-root),
   background: var(--usage-panel);
 }
 
-/* 列表只在表头说明统计口径，避免每行重复今日文案。 */
-.menu-bar-usage-provider-heading {
-  display: flex;
-  justify-content: space-between;
-  padding: 12px 22px 8px 4px;
-  color: var(--usage-muted);
-  font-size: 13px;
-  font-weight: 500;
-}
-
 /* 手柄与详情按钮分开，拖动排序不会误打开详情。 */
 .menu-bar-usage-provider-row {
   position: relative;
@@ -304,7 +294,6 @@ body:has(.menu-bar-usage-root),
   align-items: center;
   margin-block: 2px;
   border-radius: 6px;
-  border-block-end: 1px solid var(--usage-line);
 }
 
 .menu-bar-usage-provider-row .menu-bar-usage-provider-open {
@@ -326,7 +315,6 @@ body:has(.menu-bar-usage-root),
 
 .menu-bar-usage-provider-row[data-dragging='true'] {
   opacity: 0.5;
-  background: var(--usage-accent-soft);
 }
 
 /* 落点线表示最终插入位置，拖拽过程中不重排内容。 */
@@ -348,11 +336,10 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-reorder-hint {
-  padding: 12px 2px 4px;
+  padding: 4px 2px 8px;
   color: var(--usage-muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.5;
-  text-align: center;
 }
 
 /* 排序播报只对辅助阅读工具可见，不挤占浮窗空间。 */
@@ -374,8 +361,8 @@ body:has(.menu-bar-usage-root),
   grid-template-columns: minmax(0, 1fr) auto 14px;
   align-items: center;
   gap: 9px;
-  min-block-size: 52px;
-  padding: 8px 4px;
+  min-block-size: 65px;
+  padding: 9px 4px;
   border: 0;
   background: transparent;
   color: var(--usage-text);
@@ -405,8 +392,7 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-provider-copy strong {
-  font-size: 14px;
-  font-weight: 550;
+  font-size: 12px;
 }
 
 .menu-bar-usage-provider-copy small,
@@ -421,7 +407,7 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-provider-value strong {
-  font-size: 15px;
+  font-size: 13px;
 }
 
 .menu-bar-usage-root svg {
@@ -436,73 +422,83 @@ body:has(.menu-bar-usage-root),
 
 .menu-bar-usage-detail {
   display: grid;
-  gap: 0;
+  gap: 8px;
+  padding-block-end: 10px;
 }
 
-/* 每个额度池只出现一次名称，周期、进度和余额共享一行。 */
 .menu-bar-usage-account-card {
   display: grid;
-  gap: 6px;
-  padding: 4px 0 12px;
+  min-block-size: 108px;
+  gap: 8px;
+  padding: 10px 2px;
   border: 0;
-  background: var(--usage-panel);
+  border-radius: var(--usage-radius-card, 12px);
+  background: color-mix(in srgb, var(--usage-accent-soft) 82%, var(--usage-panel-strong));
 }
 
-.menu-bar-usage-account-card h2,
-.menu-bar-usage-quota-group h3 {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
+.menu-bar-usage-account-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 86px;
+  align-items: start;
+  gap: 14px;
 }
 
-.menu-bar-usage-quota-group {
+/* 各额度独立排列，保留余额和重置时间；内容超高时复用浮窗滚动区域。 */
+.menu-bar-usage-account-quotas {
   display: grid;
   min-inline-size: 0;
-  gap: 2px;
+  gap: 10px;
 }
 
-.menu-bar-usage-quota-group h3 {
-  font-weight: 500;
-  line-height: 1.2;
+.menu-bar-usage-account-quota,
+.menu-bar-usage-account-today {
+  display: grid;
+  min-inline-size: 0;
 }
 
 .menu-bar-usage-account-quota {
-  display: grid;
-  grid-template-columns: minmax(44px, auto) minmax(0, 1fr) minmax(42px, auto);
-  align-items: center;
-  gap: 0 8px;
-  min-inline-size: 0;
-  font-size: 13px;
-  line-height: 1.2;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
 }
 
-.menu-bar-usage-quota-duration {
-  max-inline-size: 88px;
+.menu-bar-usage-account-quota > small:first-child,
+.menu-bar-usage-account-today small,
+.menu-bar-usage-account-source,
+.menu-bar-usage-account-quota time,
+.menu-bar-usage-account-quota[data-empty='true'] > small:last-child {
+  overflow: hidden;
   color: var(--usage-muted);
-  overflow-wrap: anywhere;
-}
-
-.menu-bar-usage-account-quota > strong {
-  font-size: 14px;
-  font-weight: 680;
-  text-align: end;
+  font-size: 11px;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  font-variant-numeric: tabular-nums;
 }
 
-/* 日期与进度条对齐，完整换行保留重置时刻。 */
-.menu-bar-usage-account-quota time {
-  grid-column: 2 / -1;
-  color: var(--usage-muted);
-  font-size: 12px;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
+.menu-bar-usage-account-quota > strong,
+.menu-bar-usage-account-today strong {
+  overflow: hidden;
+  font-size: 17px;
+  font-weight: 730;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-account-quota[data-empty='true'] > strong {
+  margin-block: 2px;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.menu-bar-usage-account-today {
+  align-content: start;
+  gap: 4px;
 }
 
 .menu-bar-usage-progress {
   display: block;
   block-size: 4px;
+  margin-block-start: 1px;
   overflow: hidden;
   border-radius: var(--usage-radius-pill, 999px);
   background: color-mix(in srgb, var(--usage-accent) 12%, transparent);
@@ -515,19 +511,25 @@ body:has(.menu-bar-usage-root),
   background: var(--usage-accent);
 }
 
-/* 两列统计让金额与长数字完整可读，四项指标共用相同布局。 */
-.menu-bar-usage-metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 14px;
-  margin: 0;
-  padding: 8px 0;
-  border: 0;
-  background: var(--usage-panel);
+.menu-bar-usage-account-source {
+  align-self: end;
 }
 
-.menu-bar-usage-account-card + .menu-bar-usage-metrics {
-  border-block-start: 1px solid var(--usage-line);
+/* 重置日期和数据来源必须完整可读，英文较长时允许换行。 */
+.menu-bar-usage-account-quota time,
+.menu-bar-usage-account-source {
+  white-space: normal;
+  line-height: 1.4;
+}
+
+.menu-bar-usage-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding: 10px 0;
+  border: 0;
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-panel);
 }
 
 .menu-bar-usage-metrics > div {
@@ -535,7 +537,7 @@ body:has(.menu-bar-usage-root),
   align-content: start;
   min-inline-size: 0;
   gap: 3px;
-  padding-inline: 0;
+  padding-inline: 2px;
 }
 
 .menu-bar-usage-root dt,
@@ -546,22 +548,24 @@ body:has(.menu-bar-usage-root),
 .menu-bar-usage-metrics dt {
   overflow-wrap: anywhere;
   color: var(--usage-muted);
-  font-size: 13px;
+  font-size: 11px;
   line-height: 1.4;
 }
 
 .menu-bar-usage-metrics dd {
-  font-size: 18px;
+  overflow: hidden;
+  font-size: 13px;
   font-weight: 680;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .menu-bar-usage-bars {
   display: grid;
-  gap: 8px;
+  gap: 7px;
   margin: 0;
-  padding: 8px 0 2px;
+  padding: 8px 2px;
+  border-radius: var(--usage-radius-card, 12px);
   background: var(--usage-panel);
 }
 
@@ -570,44 +574,44 @@ body:has(.menu-bar-usage-root),
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
   gap: 8px;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .menu-bar-usage-bars figcaption > span {
+  overflow: hidden;
   color: var(--usage-muted);
   font-weight: 620;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .menu-bar-usage-bars figcaption dl {
   display: grid;
+  grid-template-columns: repeat(2, auto);
   gap: 10px;
   margin: 0;
   text-align: end;
 }
 
 .menu-bar-usage-bars figcaption dl > div {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  justify-content: end;
-  gap: 2px 6px;
+  display: grid;
+  gap: 1px;
 }
 
 .menu-bar-usage-bars figcaption dt {
   color: var(--usage-muted);
-  font-size: 12px;
+  font-size: 10px;
 }
 
 .menu-bar-usage-bars figcaption dd {
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 680;
 }
 
 .menu-bar-usage-bars-plot {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
-  /* 顶部为数值预留高度，最高柱的标签也不会撞到图表标题。 */
+  /* 柱高与两行标签分开，新增每日数值不压缩柱形。 */
   block-size: 100px;
   gap: 4px;
 }
@@ -615,55 +619,50 @@ body:has(.menu-bar-usage-root),
 .menu-bar-usage-bars-plot > span {
   display: grid;
   block-size: 100%;
-  grid-template-rows: minmax(0, 1fr) auto;
-  gap: 4px;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 2px;
   text-align: center;
 }
 
 .menu-bar-usage-bar-slot {
-  display: flex;
+  display: grid;
   min-block-size: 0;
   align-items: end;
-  justify-content: center;
-  padding-block-start: 20px;
-}
-
-/* 数值跟随实际柱顶，零值与缺失值仍保留独立的文字语义。 */
-.menu-bar-usage-bar-column {
-  position: relative;
-  inline-size: min(14px, 100%);
 }
 
 .menu-bar-usage-bar-slot i {
   display: block;
-  block-size: 100%;
-  inline-size: 100%;
+  inline-size: min(14px, 100%);
+  justify-self: center;
   border-radius: 3px 3px 1px 1px;
   background: var(--usage-accent);
   opacity: 0.78;
 }
 
-.menu-bar-usage-bars-plot > span:not([data-state='positive']) .menu-bar-usage-bar-slot i {
+.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
   background: var(--usage-muted);
   opacity: 0.42;
+}
+
+.menu-bar-usage-bar-slot em {
+  align-self: end;
+  color: var(--usage-faint);
+  font-size: 11px;
+  font-style: normal;
 }
 
 .menu-bar-usage-bars-plot small {
   overflow: hidden;
   color: var(--usage-muted);
-  font-size: 12px;
+  font-size: 10px;
   text-overflow: clip;
   white-space: nowrap;
 }
 
 /* 每日数值直接可读；空白日期继续显示破折号，零消耗显示 0。 */
 .menu-bar-usage-bar-value {
-  position: absolute;
-  inset-block-end: calc(100% + 3px);
-  inset-inline-start: 50%;
-  transform: translateX(-50%);
-  font-size: 11.5px;
-  font-weight: 550;
+  font-size: 10.5px;
+  font-weight: 650;
   line-height: 1.4;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -698,7 +697,7 @@ body:has(.menu-bar-usage-root),
   border-radius: var(--usage-radius-control, 8px);
   color: var(--usage-text);
   font: inherit;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 630;
   line-height: 1.4;
   white-space: nowrap;
@@ -759,394 +758,107 @@ body:has(.menu-bar-usage-root),
   }
 }
 
-/*
- * AgentDesk 视觉参考层。
- * 菜单栏浮窗的颜色、材质、边界与账户摘要卡片参考 AgentDesk。
- */
+/* 底层为原生 Liquid Glass，不叠加实色或整窗 opacity。 */
 .menu-bar-usage-root {
-  --usage-bg: #f4f6ff;
-  --usage-panel: rgb(255 255 255 / 74%);
-  --usage-panel-strong: rgb(255 255 255 / 92%);
-  --usage-panel-inset: rgb(238 243 255 / 74%);
-  --usage-text: #111827;
-  --usage-muted: #4b5563;
-  --usage-faint: #6b7280;
-  --usage-line: rgb(148 163 184 / 28%);
-  --usage-edge: rgb(148 163 184 / 42%);
-  --usage-accent: var(--zeus-brand-primary);
-  --usage-accent-strong: var(--zeus-brand-text);
-  --usage-accent-secondary: var(--zeus-brand-highlight);
-  --usage-accent-highlight: #daa3fa;
-  --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 13%, transparent);
-  --usage-accent-border: color-mix(in srgb, var(--usage-accent) 34%, transparent);
+  --usage-bg: transparent;
+  --usage-panel: rgb(255 255 255 / 52%);
+  --usage-panel-strong: rgb(255 255 255 / 68%);
+  --usage-text: #29292c;
+  --usage-muted: #515156;
+  --usage-faint: #88888d;
+  --usage-line: rgb(0 0 0 / 7%);
+  --usage-edge: rgb(0 0 0 / 22%);
+  --usage-accent: #2866f7;
+  --usage-accent-strong: #1f59ed;
+  --usage-accent-secondary: #8b6dff;
+  --usage-accent-soft: rgb(40 102 247 / 12%);
+  --usage-accent-border: rgb(40 102 247 / 34%);
+  --usage-progress-track: rgb(40 102 247 / 10%);
+  --usage-warning: #a25c00;
+  --usage-danger: #ff453a;
   --usage-radius-control: 8px;
-  --usage-radius-card: 12px;
-  --usage-radius-surface: 18px;
+  --usage-radius-card: 8px;
   --usage-radius-pill: 999px;
   --usage-radius-tab: 8px;
-  --usage-progress-track: color-mix(in srgb, var(--usage-accent) 10%, transparent);
-  --usage-warning: #a25c00;
-  --usage-warning-soft: rgb(217 119 6 / 11%);
-  --usage-danger: #b4232d;
-  --usage-danger-soft: rgb(220 38 38 / 10%);
-  /* 菜单栏正常状态与主窗口共用品牌色。 */
-  --usage-ok: var(--zeus-brand-text);
-  --usage-shadow: 0 20px 48px -28px rgb(31 41 55 / 38%);
-  --usage-shadow-soft: 0 12px 30px -24px rgb(31 41 55 / 30%);
-  background:
-    radial-gradient(circle at 88% -20%, color-mix(in srgb, var(--usage-accent-secondary) 16%, transparent), transparent 36%), radial-gradient(circle at 10% 110%, color-mix(in srgb, var(--usage-accent) 10%, transparent), transparent 40%),
-    var(--usage-bg);
+  --zeus-brand-primary: #2866f7;
+  --zeus-brand-highlight: #7ba0ff;
+  --zeus-brand-text: #1f59ed;
+  position: relative;
+  isolation: isolate;
+  padding: 14px;
+  background: transparent;
+  color: var(--usage-text);
 }
-
+/* 原生 NSPopover 在网页外绘制箭头，网页只保留内容内边距。 */
+.menu-bar-usage-root::before,
+.menu-bar-usage-root::after {
+  content: none;
+}
 .menu-bar-usage-root[data-appearance='dark'] {
-  --usage-bg: #111426;
-  --usage-panel: rgb(34 37 56 / 78%);
-  --usage-panel-strong: rgb(43 46 69 / 92%);
-  --usage-panel-inset: rgb(25 29 49 / 76%);
-  --usage-text: #f8fafc;
-  --usage-muted: #cbd5e1;
-  --usage-faint: #94a3b8;
-  --usage-line: rgb(148 163 184 / 25%);
-  --usage-edge: rgb(148 163 184 / 38%);
-  --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 22%, transparent);
-  --usage-accent-border: color-mix(in srgb, var(--usage-accent-secondary) 46%, transparent);
-  --usage-progress-track: color-mix(in srgb, var(--usage-accent) 16%, transparent);
-  --usage-warning: #f5b14c;
-  --usage-warning-soft: rgb(245 158 11 / 16%);
-  --usage-danger: #ff8c88;
-  --usage-danger-soft: rgb(255 69 58 / 15%);
-  --usage-shadow: 0 22px 52px -26px rgb(0 0 0 / 70%);
-  --usage-shadow-soft: 0 14px 34px -24px rgb(0 0 0 / 58%);
-  color-scheme: dark;
-  background:
-    radial-gradient(circle at 86% -18%, color-mix(in srgb, var(--usage-accent-secondary) 22%, transparent), transparent 36%), radial-gradient(circle at 8% 110%, color-mix(in srgb, var(--usage-accent) 18%, transparent), transparent 40%),
-    var(--usage-bg);
+  --usage-bg: transparent;
+  --usage-panel: rgb(255 255 255 / 8%);
+  --usage-panel-strong: rgb(255 255 255 / 10%);
+  --usage-text: #f2f2f7;
+  --usage-muted: #c6c6cb;
+  --usage-faint: #929297;
+  --usage-line: rgb(255 255 255 / 10%);
+  --usage-edge: rgb(255 255 255 / 20%);
+  --usage-accent-strong: #7ba0ff;
+  --usage-accent-soft: rgb(40 102 247 / 12%);
+  --usage-warning: #ffb340;
+  --zeus-brand-text: #7ba0ff;
 }
-
 @media (prefers-color-scheme: dark) {
   .menu-bar-usage-root[data-appearance='system'] {
-    --usage-bg: #111426;
-    --usage-panel: rgb(34 37 56 / 78%);
-    --usage-panel-strong: rgb(43 46 69 / 92%);
-    --usage-panel-inset: rgb(25 29 49 / 76%);
-    --usage-text: #f8fafc;
-    --usage-muted: #cbd5e1;
-    --usage-faint: #94a3b8;
-    --usage-line: rgb(148 163 184 / 25%);
-    --usage-edge: rgb(148 163 184 / 38%);
-    --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 22%, transparent);
-    --usage-accent-border: color-mix(in srgb, var(--usage-accent-secondary) 46%, transparent);
-    --usage-progress-track: color-mix(in srgb, var(--usage-accent) 16%, transparent);
-    --usage-warning: #f5b14c;
-    --usage-warning-soft: rgb(245 158 11 / 16%);
-    --usage-danger: #ff8c88;
-    --usage-danger-soft: rgb(255 69 58 / 15%);
-    --usage-shadow: 0 22px 52px -26px rgb(0 0 0 / 70%);
-    --usage-shadow-soft: 0 14px 34px -24px rgb(0 0 0 / 58%);
-    color-scheme: dark;
-    background:
-      radial-gradient(circle at 86% -18%, color-mix(in srgb, var(--usage-accent-secondary) 22%, transparent), transparent 36%), radial-gradient(circle at 8% 110%, color-mix(in srgb, var(--usage-accent) 18%, transparent), transparent 40%),
-      var(--usage-bg);
+    --usage-bg: transparent;
+    --usage-panel: rgb(255 255 255 / 8%);
+    --usage-panel-strong: rgb(255 255 255 / 10%);
+    --usage-text: #f2f2f7;
+    --usage-muted: #c6c6cb;
+    --usage-faint: #929297;
+    --usage-line: rgb(255 255 255 / 10%);
+    --usage-edge: rgb(255 255 255 / 20%);
+    --usage-accent-strong: #7ba0ff;
+    --usage-accent-soft: rgb(40 102 247 / 12%);
+    --usage-warning: #ffb340;
+    --zeus-brand-text: #7ba0ff;
   }
 }
-
 .menu-bar-usage-surface {
   background: transparent;
-  box-shadow: none;
 }
-
+.menu-bar-usage-header {
+  min-block-size: 30px;
+  padding: 0;
+}
 .menu-bar-usage-identity strong {
   color: var(--usage-text);
   letter-spacing: -0.015em;
 }
-
-.menu-bar-usage-identity small,
-.menu-bar-usage-freshness,
-.menu-bar-usage-empty span,
-.menu-bar-usage-load-failure span,
-.menu-bar-usage-provider-copy small,
-.menu-bar-usage-provider-value small,
-.menu-bar-usage-account-quota time,
-.menu-bar-usage-metrics dt,
-.menu-bar-usage-bars figcaption > span,
-.menu-bar-usage-bars figcaption dt,
-.menu-bar-usage-bars-plot small {
-  color: var(--usage-muted);
+.menu-bar-usage-tabs {
+  gap: 4px;
+  padding-inline: 0;
 }
-
-.menu-bar-usage-freshness[data-stale='true'] {
-  color: var(--usage-warning);
-}
-
-.menu-bar-usage-refresh {
-  transition:
-    background-color 140ms ease,
-    color 140ms ease;
-}
-
-.menu-bar-usage-refresh:hover:not(:disabled),
-.menu-bar-usage-refresh:focus-visible {
-  background: var(--zeus-brand-hover);
-  color: var(--usage-text);
-}
-
-/* 使用品牌色细圆环，沿用全局减少动态效果设置。 */
-.menu-bar-usage-spinner {
-  inline-size: 14px;
-  block-size: 14px;
-  border: 1.5px solid var(--usage-accent-soft);
-  border-block-start-color: var(--zeus-brand-text);
-  border-inline-end-color: var(--zeus-brand-text);
-  border-radius: 50%;
-  animation: menu-bar-usage-spin 800ms linear infinite;
-}
-
 .menu-bar-usage-tabs button {
+  min-block-size: 30px;
+  padding-inline: 8px;
   border: 1px solid transparent;
-  transition:
-    background-color 140ms ease,
-    border-color 140ms ease,
-    color 140ms ease;
+  border-radius: 8px;
 }
-
-.menu-bar-usage-tabs button:hover:not(:disabled):not([aria-disabled='true']) {
-  border-color: var(--usage-accent-border);
-  background: var(--zeus-brand-hover);
-  color: var(--usage-text);
-}
-
 .menu-bar-usage-tabs button[aria-selected='true'] {
   border-color: var(--usage-accent-border);
   background: var(--usage-accent-soft);
-  box-shadow: none;
   color: var(--usage-accent-strong);
 }
-
-.menu-bar-usage-notice {
-  border: 0;
-  background: var(--usage-panel);
-  box-shadow: none;
+.menu-bar-usage-root button:hover:not(:disabled) {
+  background: var(--usage-accent-soft);
 }
-
-.menu-bar-usage-notice[data-tone='warning'] {
-  border-color: color-mix(in srgb, var(--usage-warning) 28%, var(--usage-line));
-  background: var(--usage-warning-soft);
-  color: var(--usage-warning);
-}
-
-.menu-bar-usage-load-failure strong {
-  color: var(--usage-danger);
-}
-
-.menu-bar-usage-load-failure button {
-  border-color: var(--usage-accent-border);
-  background: var(--usage-panel-strong);
-  box-shadow: none;
-  color: var(--usage-accent-strong);
-}
-
-.menu-bar-usage-provider-list {
-  border: 0;
-  background: var(--usage-panel-strong);
-  box-shadow: none;
-  backdrop-filter: blur(18px) saturate(145%);
-  -webkit-backdrop-filter: blur(18px) saturate(145%);
-}
-
-.menu-bar-usage-provider-open {
-  transition:
-    background-color 140ms ease,
-    box-shadow 140ms ease;
-}
-
-.menu-bar-usage-provider-open:hover:not(:disabled):not([aria-disabled='true']),
-.menu-bar-usage-provider-open:focus-visible {
-  background: var(--zeus-brand-hover);
-  box-shadow: none;
-}
-
-.menu-bar-usage-account-card {
-  border: 0;
-  background: var(--usage-panel);
-  box-shadow: none;
-}
-
-.menu-bar-usage-progress {
-  background: var(--usage-progress-track);
-}
-
-.menu-bar-usage-progress i {
-  background: linear-gradient(90deg, var(--zeus-brand-highlight), var(--usage-accent), var(--usage-accent-secondary));
-  box-shadow: 0 0 8px -2px color-mix(in srgb, var(--usage-accent) 70%, transparent);
-}
-
-.menu-bar-usage-metrics {
-  border: 0;
-  background: var(--usage-panel);
-  box-shadow: none;
-}
-
-.menu-bar-usage-bars {
-  border-block-start: 1px solid var(--usage-line);
-  background: var(--usage-panel);
-  box-shadow: none;
-}
-
-.menu-bar-usage-bar-slot i {
-  background: linear-gradient(180deg, var(--usage-accent-secondary), var(--usage-accent));
-  box-shadow: 0 4px 8px -6px color-mix(in srgb, var(--usage-accent) 90%, transparent);
-}
-
-.menu-bar-usage-bars-plot > span:not([data-state='positive']) .menu-bar-usage-bar-slot i {
-  background: var(--usage-faint);
-}
-
-.menu-bar-usage-chart-empty {
-  border: 0;
-  background: var(--usage-panel);
-  box-shadow: none;
-}
-
-.menu-bar-usage-actions {
-  background: transparent;
-}
-
-/* 浮窗操作按钮同样使用纯色，键盘焦点环保持独立。 */
-.menu-bar-usage-actions button {
-  border: 1px solid var(--usage-line);
-  background: var(--usage-panel);
-  box-shadow: none;
-  transition:
-    background-color 140ms ease,
-    border-color 140ms ease,
-    box-shadow 140ms ease,
-    color 140ms ease;
-}
-
-.menu-bar-usage-actions .menu-bar-usage-primary-action {
-  border-color: var(--usage-line);
-  background: var(--usage-panel-strong);
-  color: var(--usage-muted);
-}
-
-.menu-bar-usage-actions button:hover:not(:disabled):not([aria-disabled='true']) {
-  border-color: var(--usage-accent-border);
-  background: var(--zeus-brand-hover);
-  color: var(--usage-text);
-  filter: none;
-}
-
-.menu-bar-usage-actions .menu-bar-usage-primary-action:hover:not(:disabled):not([aria-disabled='true']) {
-  border-color: var(--usage-accent-border);
-  background: var(--zeus-brand-hover);
-  color: var(--usage-text);
-}
-
 .menu-bar-usage-root button:focus-visible {
-  border-color: color-mix(in srgb, var(--usage-accent) 52%, transparent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--usage-accent) 18%, transparent);
-  outline: 0;
+  outline: 2px solid var(--usage-accent);
+  outline-offset: 2px;
 }
-
-.menu-bar-usage-skeleton span {
-  border: 0;
-  background: linear-gradient(90deg, var(--usage-panel) 20%, var(--usage-panel-strong) 50%, var(--usage-panel) 80%);
-  box-shadow: none;
-}
-
-/* 状态栏弹窗与主工作区共享 AgentDesk 的 4 / 8 / 12 / 16 间距阶梯。 */
-.menu-bar-usage-root {
-  --usage-space-1: 4px;
-  --usage-space-2: 8px;
-  --usage-space-3: 12px;
-  --usage-space-4: 16px;
-}
-
-.menu-bar-usage-header {
-  min-block-size: 28px;
-  padding: 0;
-}
-
-.menu-bar-usage-tabs {
-  gap: var(--usage-space-1);
-  padding-inline: 0;
-}
-
-.menu-bar-usage-tabs button {
-  min-block-size: 30px;
-  padding-inline: var(--usage-space-2);
-  border-radius: 8px;
-}
-
-.menu-bar-usage-content {
-  padding-inline: 0;
-}
-
-.menu-bar-usage-notice {
-  margin-inline: 0;
-  padding-inline: var(--usage-space-2);
-  border-radius: 8px;
-}
-
-.menu-bar-usage-actions {
-  gap: var(--usage-space-2);
-  padding: 0;
-}
-
-.menu-bar-usage-actions button {
-  min-block-size: 32px;
-  padding-inline: var(--usage-space-2);
-  border-radius: 8px;
-}
-
-.menu-bar-usage-actions button:not(.menu-bar-usage-primary-action) {
-  background: var(--usage-panel-strong);
-  color: var(--usage-muted);
-}
-
-.menu-bar-usage-actions button:not(.menu-bar-usage-primary-action):hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-brand-hover);
-  color: var(--usage-text);
-}
-
-/* Astra 状态栏弹窗保留原有页面与卡片层次，使用不透明底色隔离系统模糊材质。 */
-.menu-bar-usage-root,
-.menu-bar-usage-root[data-appearance='dark'],
-.menu-bar-usage-root[data-appearance='system'] {
-  background: var(--usage-bg);
-  --usage-bg: #f7f8fa;
-  --usage-panel: #fff;
-  --usage-panel-strong: #fff;
-  --usage-panel-inset: rgb(120 128 140 / 8%);
-  --usage-line: rgb(100 110 125 / 16%);
-  --usage-edge: var(--usage-line);
-}
-.menu-bar-usage-root[data-appearance='dark'] {
-  --usage-bg: #17191d;
-  --usage-panel: #24272c;
-  --usage-panel-strong: #24272c;
-  --usage-panel-inset: rgb(0 0 0 / 10%);
-  --usage-line: rgb(255 255 255 / 12%);
-  --usage-edge: var(--usage-line);
-}
-@media (prefers-color-scheme: dark) {
-  .menu-bar-usage-root[data-appearance='system'] {
-    --usage-bg: #17191d;
-    --usage-panel: #24272c;
-    --usage-panel-strong: #24272c;
-    --usage-panel-inset: rgb(0 0 0 / 10%);
-    --usage-line: rgb(255 255 255 / 12%);
-    --usage-edge: var(--usage-line);
-  }
-}
-
-/* 独立菜单栏窗口的按下、禁用与减少动态效果也遵循同一反馈层级。 */
 .menu-bar-usage-root button:active:not(:disabled) {
-  background: color-mix(in srgb, var(--usage-accent) 16%, transparent);
-}
-.menu-bar-usage-actions .menu-bar-usage-primary-action:active:not(:disabled) {
-  background: color-mix(in srgb, var(--usage-accent) 16%, transparent);
-  color: var(--usage-text);
+  background: var(--usage-accent-border);
 }
 .menu-bar-usage-root button:disabled {
   cursor: not-allowed;
@@ -1154,10 +866,67 @@ body:has(.menu-bar-usage-root),
 .menu-bar-usage-root button[aria-busy='true'] {
   cursor: progress;
 }
-@media (prefers-reduced-motion: reduce) {
-  .menu-bar-usage-root *,
-  .menu-bar-usage-root *::before,
-  .menu-bar-usage-root *::after {
-    transition: none !important;
-  }
+.menu-bar-usage-freshness[data-stale='true'] {
+  color: var(--usage-warning);
+}
+.menu-bar-usage-provider-list,
+.menu-bar-usage-metrics,
+.menu-bar-usage-bars,
+.menu-bar-usage-chart-empty {
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-card);
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+.menu-bar-usage-account-card {
+  padding: 10px;
+  border: 1px solid var(--usage-accent-border);
+  border-radius: var(--usage-radius-card);
+  background: var(--usage-accent-soft);
+  box-shadow: none;
+}
+.menu-bar-usage-account-body {
+  gap: 10px;
+}
+.menu-bar-usage-metrics {
+  padding: 10px 8px;
+}
+.menu-bar-usage-bars {
+  padding: 10px 8px;
+}
+.menu-bar-usage-progress {
+  background: var(--usage-progress-track);
+}
+.menu-bar-usage-progress i {
+  background: linear-gradient(90deg, #7ba0ff, #2866f7);
+}
+.menu-bar-usage-bar-slot i {
+  background: linear-gradient(180deg, #7ba0ff, #2866f7);
+}
+.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
+  background: var(--usage-faint);
+}
+.menu-bar-usage-actions {
+  gap: 8px;
+  padding: 0;
+  background: transparent;
+}
+.menu-bar-usage-actions button,
+.menu-bar-usage-actions .menu-bar-usage-primary-action {
+  min-block-size: 32px;
+  padding-inline: 8px;
+  border: 1px solid var(--usage-line);
+  border-radius: 8px;
+  background: var(--usage-panel);
+  color: var(--usage-muted);
+  box-shadow: none;
+}
+.menu-bar-usage-spinner {
+  inline-size: 14px;
+  block-size: 14px;
+  border: 1.5px solid var(--usage-accent-soft);
+  border-block-start-color: var(--usage-accent);
+  border-inline-end-color: var(--usage-accent);
+  border-radius: 50%;
+  animation: menu-bar-usage-spin 800ms linear infinite;
 }

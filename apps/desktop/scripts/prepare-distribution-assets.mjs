@@ -8,6 +8,6 @@ assertDistributionVersions();
 const source = resolve(import.meta.dirname, '../assets');
 const target = resolve(import.meta.dirname, '../dist/branding');
 await mkdir(target, { recursive: true });
-for (const name of ['icon.png', 'icon.icns', 'icon-dev.png', 'trayTemplate.png', 'startup-mark.png']) {
+for (const name of ['icon.png', 'icon.icns', 'icon-dev.png', 'trayTemplate.png', 'trayTemplate@2x.png', 'startup-mark.png']) {
   await copyFile(resolve(source, name), resolve(target, name));
 }

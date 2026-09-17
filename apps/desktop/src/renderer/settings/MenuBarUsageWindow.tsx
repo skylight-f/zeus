@@ -3,11 +3,15 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKe
 import type { CodexOfficialRateWindow, UsageOverviewSnapshot, UsageProviderSummary } from '@zeus/shared';
 import type { AppShellSettings, DashboardClient } from '../apiClient.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { menuBarRateLimitWindows, renderClassicTray } from './menuBarClassicTray.js';
 import './MenuBarUsageWindow.css';
 
 type Language = AppShellSettings['appLanguage'];
 type Appearance = AppShellSettings['appearance'];
 type UsageClient = Pick<DashboardClient, 'loadUsageOverview' | 'subscribeEvents'>;
+
+// 使用主进程提供的运行名称，让开发、测试和正式应用与状态栏提示保持一致。
+const applicationName = new URLSearchParams(window.location.search).get('applicationName')?.trim() || distributionAppName;
 
 const snapshotStorageKey = 'zeus.menu-bar-usage.snapshot';
 const selectionStorageKey = 'zeus.menu-bar-usage.selection';
@@ -18,37 +22,42 @@ const copy = {
   'zh-CN': {
     all: '全部',
     allProviders: '全部供应源',
-    providers: '供应商',
-    reorderHint: '拖拽调整顺序，顶部同步',
-    reorderHelp: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
+    reorderHint: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
     reorder: '排序',
     loading: '正在读取用量',
     noProviders: '还没有可统计的用量',
     noProvidersDetail: '使用 AI 后，这里会显示各个服务的用量。',
-    quota: '额度剩余',
-    todayToken: '今日 Token',
+    quota: '配额剩余',
+    noQuota: '暂无官方配额数据',
+    todayToken: '今日 token',
     available: '可用',
     localOnly: '本机统计',
     staleStatus: '数据过期',
     signedOut: '未登录',
     unavailableStatus: '配额异常',
     removedStatus: '已移除',
-    today: `今日 ${distributionAppName} Token`,
-    sevenDays: `近 7 日 ${distributionAppName} Token`,
+    officialAndLocal: `官方配额 + ${applicationName} 本地统计`,
+    localQuotaUnavailable: `${applicationName} 本地统计；官方配额暂不可用`,
+    localQuotaSignIn: `${applicationName} 本地统计；登录后可查看官方配额`,
+    today: `今日 ${applicationName} Token`,
+    todayShort: `今日 ${applicationName} Token`,
+    todaySummary: '今日',
+    sevenDays: `近 7 日 ${applicationName} Token`,
+    sevenDaysShort: `近 7 日 ${applicationName}`,
     sevenDaysSummary: '近 7 日',
     cache: '缓存命中率',
     cacheUnsupported: '供应源未提供',
     cost: '近 7 日估算费用',
     costShort: '7 日估算费用',
     noPrice: '暂无价格',
-    recentUsage: `${distributionAppName} 本地 Token`,
+    recentUsage: `${applicationName} 本地 Token`,
     accountRecentUsage: 'Codex 账户 Token',
     officialUsageUnavailable: '官方账户暂未提供日用量',
     insufficientHistory: '用量积累后显示趋势',
     missingDay: '暂无数据',
     fullStatistics: '用量详情',
-    showZeus: `显示 ${distributionAppName}`,
-    quitZeus: `退出 ${distributionAppName}`,
+    showZeus: `显示 ${applicationName}`,
+    quitZeus: `退出 ${applicationName}`,
     retry: '重新读取',
     stale: '上次成功结果',
     failed: '暂时无法更新用量',
@@ -63,14 +72,13 @@ const copy = {
   'en-US': {
     all: 'All',
     allProviders: 'All providers',
-    providers: 'Provider',
-    reorderHint: 'Drag to reorder the list and tabs',
-    reorderHelp: 'Drag to reorder, or focus a handle and press ↑ ↓',
+    reorderHint: 'Drag to reorder, or focus a handle and press ↑ ↓',
     reorder: 'Reorder',
     loading: 'Loading usage',
     noProviders: 'No usage recorded yet',
     noProvidersDetail: 'Usage for each AI service appears here after you use it.',
     quota: 'Quota remaining',
+    noQuota: 'No official quota data',
     todayToken: 'Today tokens',
     available: 'Available',
     localOnly: 'Local stats',
@@ -78,22 +86,28 @@ const copy = {
     signedOut: 'Signed out',
     unavailableStatus: 'Quota error',
     removedStatus: 'Removed',
-    today: `${distributionAppName} tokens today`,
-    sevenDays: `${distributionAppName} tokens in 7 days`,
+    officialAndLocal: `Official quota + ${applicationName} local stats`,
+    localQuotaUnavailable: `${applicationName} local stats; official quota unavailable`,
+    localQuotaSignIn: `${applicationName} local stats; sign in for official quota`,
+    today: `${applicationName} tokens today`,
+    todayShort: `${applicationName} today`,
+    todaySummary: 'Today',
+    sevenDays: `${applicationName} tokens in 7 days`,
+    sevenDaysShort: `${applicationName} · 7 days`,
     sevenDaysSummary: '7 days',
     cache: 'Cache hit rate',
     cacheUnsupported: 'Not provided',
     cost: 'Estimated cost · 7 days',
     costShort: '7-day estimate',
     noPrice: 'No pricing',
-    recentUsage: `${distributionAppName} local tokens`,
+    recentUsage: `${applicationName} local tokens`,
     accountRecentUsage: 'Codex account tokens',
     officialUsageUnavailable: 'Official daily account usage is unavailable',
     insufficientHistory: 'A trend appears after usage is recorded',
     missingDay: 'No data',
     fullStatistics: 'Usage details',
-    showZeus: `Show ${distributionAppName}`,
-    quitZeus: `Quit ${distributionAppName}`,
+    showZeus: `Show ${applicationName}`,
+    quitZeus: `Quit ${applicationName}`,
     retry: 'Reload',
     stale: 'Last successful result',
     failed: 'Usage cannot be updated',
@@ -117,35 +131,12 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const requestRef = useRef<Promise<void> | null>(null);
-  /** 读取实际内容高度，使无额度页和较短的列表自然收起。 */
-  const surfaceRef = useRef<HTMLElement>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   useEffect(() => window.zeus?.onMenuBarUsageSettingsChanged?.(setSurfaceSettings), []);
-
   useEffect(() => {
-    /** 只有原生浮窗调整窗口；浏览器预览继续使用自身视口。 */
-    const resizeWindow = window.zeus?.resizeMenuBarUsage;
-    const surface = surfaceRef.current;
-    const content = surface?.querySelector<HTMLElement>('.menu-bar-usage-content');
-    const body = content?.firstElementChild;
-    if (!resizeWindow || !surface || !content || !body) return;
-    /** 缓存本次布局请求，窗口回传的尺寸变化不重复发送相同高度。 */
-    let requestedHeight = 0;
-    /** 固定操作区与自然内容相加，超高内容仍由原有滚动区承接。 */
-    const updateHeight = () => {
-      const height = Math.ceil(document.documentElement.clientHeight - content.clientHeight + body.getBoundingClientRect().height);
-      if (height === requestedHeight) return;
-      requestedHeight = height;
-      void resizeWindow(height).catch((cause: unknown) => console.warn('菜单栏浮窗高度调整失败。', cause));
-    };
-    /** 同时监听文字换行和窗口大小变化，不依赖固定额度条数估算。 */
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(surface);
-    observer.observe(body);
-    updateHeight();
-    return () => observer.disconnect();
-  }, [snapshot, selection, surfaceSettings.language, error]);
-
+    document.title = surfaceSettings.language === 'zh-CN' ? `${applicationName} 用量` : `${applicationName} Usage`;
+  }, [surfaceSettings.language]);
   const load = useCallback(() => {
     if (requestRef.current) return requestRef.current;
     const request = (async () => {
@@ -153,6 +144,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
       try {
         const next = await props.client.loadUsageOverview();
         setSnapshot(next);
+        setHasLoaded(true);
         storeSnapshot(next);
         setError(null);
       } catch (cause) {
@@ -168,6 +160,8 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
 
   useEffect(() => {
     void load();
+    // 浮窗在后台也持续更新状态栏，用户无需先点击才看到额度。
+    const refreshTimer = window.setInterval(() => void load(), 60_000);
     const unsubscribe = props.client.subscribeEvents(
       (event) => {
         if (event.type === 'usage.changed' || event.type === 'codex.usage.changed') void load();
@@ -183,6 +177,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
     window.addEventListener('focus', refreshWhenShown);
     window.addEventListener('keydown', closeOnEscape);
     return () => {
+      window.clearInterval(refreshTimer);
       unsubscribe();
       window.removeEventListener('focus', refreshWhenShown);
       window.removeEventListener('keydown', closeOnEscape);
@@ -235,6 +230,19 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
     }
   };
   const selectedProvider = providers.find((provider) => provider.providerId === selection) ?? null;
+  const trayProvider = selectedProvider ?? snapshot?.providers.find((provider) => provider.providerId === 'codex') ?? snapshot?.providers[0] ?? null;
+  useEffect(() => {
+    if (!window.zeus?.updateMenuBarUsageTray) return;
+    let cancelled = false;
+    void renderClassicTray(trayProvider, !hasLoaded || Boolean(error), surfaceSettings.language)
+      .then((image) => {
+        if (!cancelled) return window.zeus?.updateMenuBarUsageTray(image);
+      })
+      .catch((cause: unknown) => console.warn('状态栏额度更新失败', cause));
+    return () => {
+      cancelled = true;
+    };
+  }, [trayProvider, hasLoaded, error, surfaceSettings.language]);
   // 顶部时间表示本次用量读取完成时间，供应源数据的新鲜度仍由卡片单独提示。
   const updatedAt = snapshot?.updatedAt;
   const stale = Boolean(selectedProvider?.stale || error);
@@ -245,13 +253,13 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
       className="menu-bar-usage-root"
       data-appearance={surfaceSettings.appearance}
       lang={surfaceSettings.language}
-      aria-label={surfaceSettings.language === 'zh-CN' ? `${distributionAppName} 菜单栏用量浮窗` : `${distributionAppName} menu bar usage`}
+      aria-label={surfaceSettings.language === 'zh-CN' ? `${applicationName} 菜单栏用量浮窗` : `${applicationName} menu bar usage`}
     >
-      <section ref={surfaceRef} className="menu-bar-usage-surface">
+      <section className="menu-bar-usage-surface">
         <header className="menu-bar-usage-header">
           <span className="menu-bar-usage-identity">
             <span className="menu-bar-usage-mark" aria-hidden="true" />
-            <strong>{distributionAppName}</strong>
+            <strong>{applicationName}</strong>
           </span>
           <span className="menu-bar-usage-refresh-status">
             <small className="menu-bar-usage-freshness" data-stale={stale && !loading ? 'true' : 'false'} aria-live="polite" title={freshness}>
@@ -351,21 +359,17 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
   }
   return (
     <section className="menu-bar-usage-provider-list" aria-label={text.allProviders}>
-      <header className="menu-bar-usage-provider-heading" aria-hidden="true">
-        <span>{text.providers}</span>
-        <span>{text.todayToken}</span>
-      </header>
-      <span className="menu-bar-usage-sr-only" id="menu-bar-usage-reorder-help">
-        {text.reorderHelp}
-      </span>
+      {props.providers.length > 1 ? (
+        <small className="menu-bar-usage-reorder-hint" id="menu-bar-usage-reorder-hint">
+          {text.reorderHint}
+        </small>
+      ) : null}
       <span className="menu-bar-usage-sr-only" role="status">
         {announcement}
       </span>
       {props.providers.map((provider, index) => {
         const fullName = providerDisplayName(provider);
         const quotaCount = menuBarRateLimitWindows(provider).length;
-        /** 可见数值与读屏摘要共用格式，省略重复文案后仍能识别今日统计口径。 */
-        const todayValue = formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, props.language);
         const providerDetail = provider.deleted
           ? text.deleted
           : provider.kind === 'subscription'
@@ -400,8 +404,8 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
                 type="button"
                 draggable
                 aria-label={`${text.reorder} ${fullName}`}
-                aria-describedby="menu-bar-usage-reorder-help"
-                title={text.reorderHelp}
+                aria-describedby="menu-bar-usage-reorder-hint"
+                title={text.reorderHint}
                 onDragStart={(event) => {
                   event.dataTransfer.effectAllowed = 'move';
                   event.dataTransfer.setData('text/plain', provider.providerId);
@@ -427,25 +431,24 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
                 </svg>
               </button>
             ) : null}
-            <button className="menu-bar-usage-provider-open" type="button" aria-label={`${fullName} · ${text.today} ${todayValue}`} title={`${fullName} · ${providerDetail}`} onClick={() => props.onSelect(provider.providerId)}>
+            <button className="menu-bar-usage-provider-open" type="button" title={provider.deleted ? fullName : undefined} onClick={() => props.onSelect(provider.providerId)}>
               <span className="menu-bar-usage-provider-copy">
                 <strong title={provider.deleted ? fullName : undefined}>{fullName}</strong>
-                {provider.deleted ? <small>{text.removedStatus}</small> : null}
+                <small>{providerDetail}</small>
               </span>
               <span className="menu-bar-usage-provider-value">
-                <strong>{todayValue}</strong>
+                <strong>{formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, props.language)}</strong>
+                <small>{text.todayShort}</small>
               </span>
               <Chevron />
             </button>
           </div>
         );
       })}
-      {props.providers.length > 1 ? <small className="menu-bar-usage-reorder-hint">{text.reorderHint}</small> : null}
     </section>
   );
 }
 
-/** 统一各供应商的本地指标和趋势布局，官方额度仅在存在时显示。 */
 function ProviderDetail(props: { provider: UsageProviderSummary; language: Language }) {
   const { provider, language } = props;
   const text = copy[language];
@@ -456,8 +459,7 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
       <ProviderSummaryCard provider={provider} language={language} />
 
       <dl className="menu-bar-usage-metrics">
-        <Metric label={text.today} value={formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, language)} />
-        <Metric label={text.sevenDays} value={formatIncompleteTokens(provider.sevenDayLocal.totalTokens, provider.sevenDayLocalComplete, language)} />
+        <Metric label={text.sevenDaysShort} accessibleLabel={text.sevenDays} value={formatIncompleteTokens(provider.sevenDayLocal.totalTokens, provider.sevenDayLocalComplete, language)} />
         <Metric label={text.cache} value={!sevenDayLocalComplete ? '—' : cacheAvailable ? formatPercent(provider.sevenDayLocal.cacheHitRate, language, '—') : text.cacheUnsupported} />
         <Metric label={text.costShort} accessibleLabel={text.cost} value={sevenDayLocalComplete ? formatCost(provider, language, text.noPrice) : '—'} />
       </dl>
@@ -467,57 +469,56 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
   );
 }
 
-/** 状态栏省略 Codex Spark 独立额度池，原始额度仍保留在用量详情中。 */
-function menuBarRateLimitWindows(provider: UsageProviderSummary): CodexOfficialRateWindow[] {
-  if (provider.providerId !== 'codex') return provider.rateLimitWindows;
-  return provider.rateLimitWindows.filter((window) => !/spark/i.test(`${window.limitId ?? ''} ${window.limitName ?? ''}`));
-}
-
 /** 展示状态栏可见的官方额度窗口。 */
 function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: Language }) {
-  /** 保持官方额度与本地用量独立，不为没有额度的供应商制造空态。 */
   const { provider, language } = props;
-  const visibleWindows = menuBarRateLimitWindows(provider);
-  if (visibleWindows.length === 0) return null;
-  /** 当前语言和供应商名称用于分组及辅助阅读摘要。 */
   const text = copy[language];
   const name = providerDisplayName(provider);
-  /** 按官方额度池标识分组，避免名称重复，也不合并同名的独立额度池。 */
-  const groups = new Map<string, CodexOfficialRateWindow[]>();
-  for (const window of visibleWindows) {
-    /** 缺少池标识时才用名称归组，保留后台返回的窗口顺序。 */
-    const key = window.limitId || window.limitName || '';
-    const group = groups.get(key);
-    if (group) group.push(window);
-    else groups.set(key, [window]);
-  }
+  const todayValue = formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, language);
+  const visibleWindows = menuBarRateLimitWindows(provider);
+  /** 无官方额度时保留原有空态；多项额度按官方顺序逐一显示。 */
+  const windows = visibleWindows.length ? visibleWindows : [undefined];
+  /** 读屏摘要与可见额度保持一致。 */
+  const quotaSummary = visibleWindows.map((window) => `${windowRemainingLabel(window, language)} ${formatPercent(window.remainingPercent / 100, language)}`).join('，') || text.noQuota;
+  const source = visibleWindows.length ? text.officialAndLocal : provider.officialState === 'signed_out' ? text.localQuotaSignIn : text.localQuotaUnavailable;
   return (
-    <section className="menu-bar-usage-account-card" aria-label={`${name} · ${text.quota}`}>
-      <h2>{text.quota}</h2>
-      {[...groups].map(([id, windows]) => {
-        /** 同一额度池只显示一次名称，各周期仍独立保留余额与重置日期。 */
-        const groupName = windows[0].limitName || id || name;
-        return (
-          <section key={id} className="menu-bar-usage-quota-group" aria-label={groupName}>
-            <h3>{groupName}</h3>
-            {windows.map((window, index) => {
-              /** 周期显示短名称，读屏进度条保留完整额度池和剩余含义。 */
-              const duration = windowDurationLabel(window, language);
-              const quotaHeading = `${groupName} · ${duration} · ${text.quota}`;
-              return (
-                <div key={`${window.kind}-${index}`} className="menu-bar-usage-account-quota">
-                  <span className="menu-bar-usage-quota-duration">{duration}</span>
-                  <span className="menu-bar-usage-progress" role="progressbar" aria-label={quotaHeading} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
-                    <i style={{ inlineSize: `${Math.max(0, Math.min(100, window.remainingPercent))}%` }} />
-                  </span>
-                  <strong>{formatPercent(window.remainingPercent / 100, language)}</strong>
-                  <time dateTime={window.resetsAt ? new Date(window.resetsAt * 1_000).toISOString() : undefined}>{window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : '—'}</time>
-                </div>
-              );
-            })}
-          </section>
-        );
-      })}
+    <section className="menu-bar-usage-account-card" aria-label={`${name}，${quotaSummary}，${text.todayToken} ${todayValue}`}>
+      <div className="menu-bar-usage-account-body">
+        <div className="menu-bar-usage-account-quotas">
+          {windows.map((window, index) => {
+            /** 名称包含额度池和周期，同名的短期与长期额度也能区分。 */
+            const quotaHeading = window ? windowRemainingLabel(window, language) : text.quota;
+            /** 百分比使用该窗口的官方余额，空态不推算额度。 */
+            const quotaValue = window ? formatPercent(window.remainingPercent / 100, language) : text.noQuota;
+            return (
+              <div key={`${window?.limitId ?? 'default'}-${window?.kind ?? 'empty'}-${index}`} className="menu-bar-usage-account-quota" data-empty={window ? 'false' : 'true'}>
+                <small title={quotaHeading}>{quotaHeading}</small>
+                <strong>{quotaValue}</strong>
+                {window ? (
+                  <>
+                    <span className="menu-bar-usage-progress" role="progressbar" aria-label={quotaHeading} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
+                      <i style={{ inlineSize: `${Math.max(0, Math.min(100, window.remainingPercent))}%` }} />
+                    </span>
+                    <time dateTime={window.resetsAt ? new Date(window.resetsAt * 1_000).toISOString() : undefined} title={window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : undefined}>
+                      {window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : '—'}
+                    </time>
+                  </>
+                ) : provider.officialState === 'signed_out' ? (
+                  <small>{text.signedOut}</small>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+        <div className="menu-bar-usage-account-today">
+          <small>{text.todayToken}</small>
+          <strong>{todayValue}</strong>
+        </div>
+      </div>
+
+      <small className="menu-bar-usage-account-source" title={source}>
+        {source}
+      </small>
     </section>
   );
 }
@@ -544,12 +545,17 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
     );
   const slots = buildDailySlots(props.provider, buckets, accountUsage);
   const maximum = Math.max(...slots.flatMap((slot) => (slot.totalTokens && slot.totalTokens > 0 ? [slot.totalTokens] : [])), 1);
+  const todayValue = accountUsage ? formatOptionalTokens(props.provider.accountTodayTokens, props.language) : formatIncompleteTokens(props.provider.todayLocal.totalTokens, props.provider.todayLocalComplete, props.language);
   const sevenDayValue = accountUsage ? formatOptionalTokens(props.provider.accountSevenDayTokens, props.language) : formatIncompleteTokens(props.provider.sevenDayLocal.totalTokens, props.provider.sevenDayLocalComplete, props.language);
   return (
     <figure className="menu-bar-usage-bars" aria-label={`${providerDisplayName(props.provider)} ${label}`}>
       <figcaption>
         <span>{label}</span>
         <dl>
+          <div>
+            <dt>{text.todaySummary}</dt>
+            <dd>{todayValue}</dd>
+          </div>
           <div>
             <dt>{text.sevenDaysSummary}</dt>
             <dd>{sevenDayValue}</dd>
@@ -560,18 +566,13 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
         {slots.map((slot) => {
           const state = slot.totalTokens === null ? 'missing' : slot.totalTokens === 0 ? 'zero' : 'positive';
           const value = slot.totalTokens === null ? text.missingDay : `${formatTokens(slot.totalTokens, props.language)} Token`;
-          /** 七列共用有限宽度，较长的万级数字去掉小数；悬浮摘要保留原精度。 */
-          const label = formatOptionalTokens(slot.totalTokens, props.language);
-          const chartLabel = label.length > 6 && slot.totalTokens !== null ? formatTokens(slot.totalTokens, props.language, 0) : label;
           return (
             <span key={slot.date} data-state={state} aria-label={`${formatShortDate(slot.date, props.language)} ${value}`} title={`${slot.date} · ${value}`}>
               <span className="menu-bar-usage-bar-slot">
-                <span className="menu-bar-usage-bar-column" style={{ blockSize: slot.totalTokens ? `${Math.max(2, (slot.totalTokens / maximum) * 100)}%` : '2px' }}>
-                  <strong className="menu-bar-usage-bar-value">{chartLabel}</strong>
-                  <i />
-                </span>
+                {slot.totalTokens === null ? <em aria-hidden="true">—</em> : <i style={{ blockSize: slot.totalTokens === 0 ? '2px' : `${Math.max(10, (slot.totalTokens / maximum) * 100)}%` }} />}
               </span>
               <small>{formatShortDate(slot.date, props.language)}</small>
+              <strong className="menu-bar-usage-bar-value">{formatOptionalTokens(slot.totalTokens, props.language)}</strong>
             </span>
           );
         })}
@@ -658,8 +659,10 @@ function localDateKey(value: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-/** 分组标题已标明额度池，行内仅显示周期，避免重复模型名称。 */
-function windowDurationLabel(window: CodexOfficialRateWindow, language: Language): string {
+/** 同时标明额度池和周期，缺少名称时保留官方标识，不猜测对应模型。 */
+function windowRemainingLabel(window: CodexOfficialRateWindow, language: Language): string {
+  /** 官方名称优先，标识只在没有名称时补充。 */
+  const name = window.limitName || window.limitId;
   /** 官方未提供时长时使用窗口类别，避免同一额度池出现无法区分的两行。 */
   const duration = !window.windowDurationMins
     ? window.kind === 'primary'
@@ -676,12 +679,11 @@ function windowDurationLabel(window: CodexOfficialRateWindow, language: Language
       : language === 'zh-CN'
         ? `${window.windowDurationMins / 60} 小时`
         : `${window.windowDurationMins / 60} hour`;
-  return duration;
+  return `${name ? `${name} · ` : ''}${duration}${language === 'zh-CN' ? '剩余' : ' remaining'}`;
 }
 
-/** 数字按当前语言缩写，柱图可降低小数精度以防相邻标签重叠。 */
-function formatTokens(value: number, language: Language, maximumFractionDigits = 1): string {
-  return new Intl.NumberFormat(language, { notation: 'compact', maximumFractionDigits }).format(value);
+function formatTokens(value: number, language: Language): string {
+  return new Intl.NumberFormat(language, { notation: 'compact', maximumFractionDigits: 1 }).format(value);
 }
 
 function formatIncompleteTokens(value: number, complete: boolean | undefined, language: Language): string {

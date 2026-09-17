@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* global process */
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
 const desktopRoot = resolve(import.meta.dirname, '..');
@@ -15,6 +15,38 @@ if (process.platform !== 'darwin') {
 
 await rm(outputDirectory, { recursive: true, force: true });
 await mkdir(outputDirectory, { recursive: true });
+
+// 使用稳定 Node-API，避免与 Electron 的 V8 ABI 绑定；头文件来自构建用 Node。
+await new Promise((resolveBuild, rejectBuild) => {
+  const child = spawn(
+    '/usr/bin/xcrun',
+    [
+      '--sdk',
+      'macosx',
+      'clang++',
+      '-std=c++17',
+      '-fobjc-arc',
+      '-shared',
+      '-undefined',
+      'dynamic_lookup',
+      '-arch',
+      architecture,
+      '-mmacosx-version-min=13.0',
+      '-I',
+      resolve(dirname(process.execPath), '../include/node'),
+      '-framework',
+      'Cocoa',
+      '-framework',
+      'QuartzCore',
+      resolve(desktopRoot, 'native/MenuBarAppearance.mm'),
+      '-o',
+      resolve(outputDirectory, 'ZeusMenuBarAppearance.node'),
+    ],
+    { stdio: 'inherit' },
+  );
+  child.once('error', rejectBuild);
+  child.once('exit', (code) => (code === 0 ? resolveBuild() : rejectBuild(new Error(`菜单栏原生外观构建失败：${code}`))));
+});
 
 await compileSwift({
   source: resolve(desktopRoot, 'native/UpdateProgressPanel.swift'),

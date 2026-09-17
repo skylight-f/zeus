@@ -1,6 +1,7 @@
 import { distributionAppName, distributionVersion, isZeusReleaseUrl } from './desktopDistribution.js';
 
 import { registerFilePreview } from './filePreview.js';
+import { hideMenuBarPopover, showMenuBarPopover, applyMenuBarTray } from './menuBarAppearance.js';
 import { filePreviewMime, filePreviewKind, filePreviewLimits, type FilePreviewIntent } from '@zeus/shared';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
@@ -103,6 +104,7 @@ const windows = new Set<BrowserWindow>();
 let tray: Tray | undefined;
 let menuBarUsageWindow: BrowserWindow | undefined;
 let menuBarUsageWindowBlurTimer: ReturnType<typeof setTimeout> | undefined;
+let menuBarClassicImage: { image: Electron.NativeImage; light: Buffer; dark: Buffer; tooltip: string } | undefined;
 const taskGitDeliveryWindows = new Map<string, BrowserWindow>();
 const projectGitDiffWindows = new Set<BrowserWindow>();
 const taskGitDeliveryTaskByWindowId = new Map<number, string>();
@@ -257,22 +259,9 @@ const execFile = promisify(execFileCallback);
 const savedDisplayAvailabilityTimeoutMs = 2_000;
 const testDistributionName = 'Zeus Test';
 const developmentDistributionName = `${distributionAppName} Dev`;
-/** 浮窗宽度固定，高度按内容收缩；额度较多时最多占用此高度。 */
-const menuBarUsageWindowSize = { width: 360, height: 640 } as const;
-const menuBarUsageWindowGap = 6;
+const menuBarUsageWindowSize = { width: 360, height: 520 } as const;
 const menuBarUsageWindowBlurDelayMs = 150;
 
-type MenuBarUsageClickAnchor = {
-  bounds: Electron.Rectangle;
-  position: Electron.Point;
-};
-
-type MenuBarUsageWindowPlacement = {
-  anchorSource: 'bounds' | 'position';
-  display: Electron.Display;
-  x: number;
-  y: number;
-};
 const taskGitDeliveryMinimumSize = { width: 920, height: 640 } as const;
 const automaticUpdateIntervalMs = 60 * 60_000;
 const automaticUpdateInitialDelayMs = 15_000;
@@ -966,6 +955,9 @@ function setupMenu(): void {
           void startNewConversationFromMenu();
         },
         toggleDevTools: () => mainWindow?.webContents.toggleDevTools(),
+        toggleMenuBarUsage: () => {
+          void toggleMenuBarUsageWindow().catch((error: unknown) => console.warn('Zeus 菜单栏用量浮窗无法打开。', error));
+        },
         openSettings: () => {
           void openSettingsFromMenu();
         },
@@ -1548,17 +1540,26 @@ function setupIpc(): void {
     hideMenuBarUsageWindow();
     return { hidden: true };
   });
-  /** 仅允许菜单栏浮窗调整自身高度，范围受内容上限与当前屏幕约束。 */
-  ipcMain.handle('zeus:menu-bar-usage:resize', (event, requestedHeight: unknown) => {
-    const window = requireMenuBarUsageWindow(event);
-    if (typeof requestedHeight !== 'number' || !Number.isFinite(requestedHeight) || requestedHeight <= 0) throw new TypeError('菜单栏用量浮窗高度无效。');
-    /** 保留当前横向位置；向下展开时不能越过当前屏幕的工作区。 */
-    const bounds = window.getBounds();
-    const { workArea } = screen.getDisplayMatching(bounds);
-    const height = Math.max(1, Math.min(Math.max(200, Math.ceil(requestedHeight)), menuBarUsageWindowSize.height, workArea.height - menuBarUsageWindowGap * 2));
-    const y = Math.max(workArea.y + menuBarUsageWindowGap, Math.min(bounds.y, workArea.y + workArea.height - height - menuBarUsageWindowGap));
-    if (bounds.height !== height || bounds.y !== y) window.setBounds({ ...bounds, height, y }, false);
-    return { height };
+  // 只有自己的用量浮窗能更新托盘，限制资源类型、长度及像素尺寸。
+  ipcMain.handle('zeus:menu-bar-usage:tray', (event, input: unknown) => {
+    requireMenuBarUsageWindow(event);
+    if (!input || typeof input !== 'object') throw new TypeError('状态栏图像无效');
+    const value = input as Record<string, unknown>;
+    if (typeof value.tooltip !== 'string' || value.tooltip.length > 500) throw new TypeError('状态栏说明无效');
+    const decode = (data: unknown): Electron.NativeImage => {
+      if (typeof data !== 'string' || data.length > 100_000 || !data.startsWith('data:image/png;base64,')) throw new TypeError('状态栏图像格式无效');
+      const decoded = nativeImage.createFromDataURL(data);
+      const size = decoded.getSize();
+      if (decoded.isEmpty() || size.height !== 44 || size.width < 48 || size.width > 160) throw new TypeError('状态栏图像尺寸无效');
+      const image = nativeImage.createEmpty();
+      image.addRepresentation({ scaleFactor: 2, buffer: decoded.toPNG() });
+      return image;
+    };
+    const image = decode(value.dataUrl);
+    const darkImage = decode(value.darkDataUrl);
+    if (image.getSize().width !== darkImage.getSize().width) throw new TypeError('状态栏图像尺寸不一致');
+    menuBarClassicImage = { image, light: image.toPNG({ scaleFactor: 2 }), dark: darkImage.toPNG({ scaleFactor: 2 }), tooltip: value.tooltip };
+    updateMenuBarClassicImage();
   });
   ipcMain.handle('zeus:menu-bar-usage:show-main', async (event) => {
     requireMenuBarUsageWindow(event);
@@ -2282,80 +2283,46 @@ function cancelMenuBarUsageWindowBlurHide(): void {
 
 function hideMenuBarUsageWindow(): void {
   cancelMenuBarUsageWindowBlurHide();
-  if (menuBarUsageWindow && !menuBarUsageWindow.isDestroyed()) menuBarUsageWindow.hide();
+  if (menuBarUsageWindow && !menuBarUsageWindow.isDestroyed()) {
+    hideMenuBarPopover(menuBarUsageWindow);
+    menuBarUsageWindow.hide();
+  }
 }
 
 function scheduleMenuBarUsageWindowBlurHide(window: BrowserWindow): void {
   cancelMenuBarUsageWindowBlurHide();
   menuBarUsageWindowBlurTimer = setTimeout(() => {
     menuBarUsageWindowBlurTimer = undefined;
-    if (menuBarUsageWindow === window && !window.isDestroyed()) window.hide();
+    if (menuBarUsageWindow === window && !window.isDestroyed()) hideMenuBarUsageWindow();
   }, menuBarUsageWindowBlurDelayMs);
-}
-
-function isFiniteScreenPoint(point: Electron.Point): boolean {
-  return Number.isFinite(point.x) && Number.isFinite(point.y);
-}
-
-function isUsableTrayBounds(bounds: Electron.Rectangle): boolean {
-  return Number.isFinite(bounds.x) && Number.isFinite(bounds.y) && Number.isFinite(bounds.width) && Number.isFinite(bounds.height) && bounds.width > 0 && bounds.height > 0;
-}
-
-function resolveMenuBarUsageWindowPlacement(anchor: MenuBarUsageClickAnchor): MenuBarUsageWindowPlacement | undefined {
-  /** 再次打开或切换屏幕时使用实际高度，避免按最大高度错误向上定位。 */
-  const size = menuBarUsageWindow?.getBounds() ?? menuBarUsageWindowSize;
-  const useBounds = isUsableTrayBounds(anchor.bounds);
-  if (!useBounds && !isFiniteScreenPoint(anchor.position)) return undefined;
-
-  const anchorX = useBounds ? anchor.bounds.x + anchor.bounds.width / 2 : anchor.position.x;
-  const anchorY = useBounds ? anchor.bounds.y + anchor.bounds.height / 2 : anchor.position.y;
-  const display = screen.getDisplayNearestPoint({ x: Math.round(anchorX), y: Math.round(anchorY) });
-  const { workArea } = display;
-  const preferredX = Math.round(anchorX - size.width / 2);
-  const minX = workArea.x + menuBarUsageWindowGap;
-  const maxX = workArea.x + workArea.width - size.width - menuBarUsageWindowGap;
-  const minY = workArea.y + menuBarUsageWindowGap;
-  const maxY = workArea.y + workArea.height - size.height - menuBarUsageWindowGap;
-  const belowTrayY = useBounds ? Math.round(anchor.bounds.y + anchor.bounds.height + menuBarUsageWindowGap) : minY;
-  const preferredY = belowTrayY <= maxY ? belowTrayY : useBounds ? Math.round(anchor.bounds.y - size.height - menuBarUsageWindowGap) : minY;
-
-  return {
-    anchorSource: useBounds ? 'bounds' : 'position',
-    display,
-    x: Math.min(Math.max(preferredX, minX), Math.max(minX, maxX)),
-    y: Math.min(Math.max(preferredY, minY), Math.max(minY, maxY)),
-  };
-}
-
-function positionMenuBarUsageWindow(window: BrowserWindow, placement: MenuBarUsageWindowPlacement): void {
-  window.setPosition(placement.x, placement.y, false);
 }
 
 async function createMenuBarUsageWindow(): Promise<BrowserWindow> {
   if (menuBarUsageWindow && !menuBarUsageWindow.isDestroyed()) return menuBarUsageWindow;
   /** 菜单栏浮窗与工作窗口使用相同的资源校验。 */
-  const rendererUrl = rendererEntryUrl('menu-bar-usage');
+  const rendererUrl = rendererEntryUrl('menu-bar-usage', { applicationName: desktopDisplayName() });
   const window = new BrowserWindow({
     ...menuBarUsageWindowSize,
     title: appShellSettings.appLanguage === 'zh-CN' ? `${desktopDisplayName()} 用量` : `${desktopDisplayName()} Usage`,
     show: false,
     frame: false,
     transparent: true,
-    // 对应 AgentDesk 的原生 NSPopover，由 macOS 合成窗口背后的磨砂材质。
+    // 原生 NSPopover 承担背景和阴影，透明子窗口只负责网页内容。
     backgroundColor: '#00000000',
-    ...(process.platform === 'darwin' ? { vibrancy: 'popover' as const, visualEffectState: 'active' as const } : {}),
+    roundedCorners: false,
     resizable: false,
     movable: false,
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
     skipTaskbar: true,
-    hasShadow: true,
+    hasShadow: false,
     webPreferences: {
       preload: join(desktopRoot(), 'dist/preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
       webSecurity: true,
       allowRunningInsecureContent: false,
     },
@@ -2363,6 +2330,7 @@ async function createMenuBarUsageWindow(): Promise<BrowserWindow> {
   menuBarUsageWindow = window;
   window.setAlwaysOnTop(true, 'pop-up-menu');
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  window.on('hide', () => hideMenuBarPopover(window));
   window.on('blur', () => scheduleMenuBarUsageWindowBlurHide(window));
   window.on('focus', () => cancelMenuBarUsageWindowBlurHide());
   window.on('closed', () => {
@@ -2383,45 +2351,42 @@ async function createMenuBarUsageWindow(): Promise<BrowserWindow> {
   }
 }
 
-async function toggleMenuBarUsageWindow(anchor: MenuBarUsageClickAnchor): Promise<void> {
+async function toggleMenuBarUsageWindow(): Promise<void> {
   if (fatalStartup) return;
   const window = await createMenuBarUsageWindow();
-  const placement = resolveMenuBarUsageWindowPlacement(anchor);
-  if (!placement) {
-    console.warn('Zeus 菜单栏用量浮窗无法解析本次点击位置。', { bounds: anchor.bounds, position: anchor.position });
+  if (window.isVisible()) {
+    hideMenuBarUsageWindow();
     return;
   }
-  const wasVisible = window.isVisible();
-  if (wasVisible && screen.getDisplayMatching(window.getBounds()).id === placement.display.id) {
-    window.hide();
-    return;
-  }
-  positionMenuBarUsageWindow(window, placement);
+  cancelMenuBarUsageWindowBlurHide();
+  app.focus({ steal: true });
+  showMenuBarPopover(window, menuBarTrayTooltip());
   window.show();
   window.focus();
-  // 菜单栏点击可能发生在其他应用前台；先激活 Zeus，浮窗才能获得焦点并在外部点击时触发失焦收起。
-  app.focus({ steal: true });
-  console.info(
-    'Zeus menu bar usage window placement',
-    JSON.stringify({
-      action: wasVisible ? 'move' : 'show',
-      targetDisplayId: placement.display.id,
-      anchorSource: placement.anchorSource,
-      clickBounds: anchor.bounds,
-      clickPosition: anchor.position,
-      windowBounds: window.getBounds(),
-    }),
-  );
+  console.info('Zeus menu bar native popover', JSON.stringify({ bounds: window.getBounds() }));
 }
 
-/** 创建固定显示尺寸的菜单栏图标，并同步菜单与点击行为。 */
+function menuBarTrayTooltip(): string {
+  return menuBarClassicImage ? `${desktopDisplayName()} · ${menuBarClassicImage.tooltip}` : desktopDisplayName();
+}
+
+/** 经典彩色圆环跟随状态按钮实际外观，额度无需重新读取。 */
+function updateMenuBarClassicImage(): void {
+  if (!tray || tray.isDestroyed() || !menuBarClassicImage) return;
+  tray.setImage(menuBarClassicImage.image);
+  const tooltip = menuBarTrayTooltip();
+  tray.setToolTip(tooltip);
+  applyMenuBarTray(menuBarClassicImage.light, menuBarClassicImage.dark, tooltip);
+}
+
+/** 同步菜单与点击行为，并预载用量以持续更新经典额度圆环。 */
 function setupTray(): void {
   if (!tray) {
     const trayIconPath = join(desktopRoot(), 'assets/trayTemplate.png');
     /** 按路径同时加载 18×18 原图和 36×36 的 @2x 副本，让系统按屏幕密度选择清晰资源。 */
     const trayIcon = nativeImage.createFromPath(trayIconPath);
     if (trayIcon.isEmpty()) throw new Error(`Zeus tray icon is empty: ${trayIconPath}`);
-    trayIcon.setTemplateImage(true);
+    trayIcon.setTemplateImage(false);
     tray = new Tray(trayIcon);
     tray.setToolTip(desktopDisplayName());
     tray.setIgnoreDoubleClickEvents(true);
@@ -2446,18 +2411,16 @@ function setupTray(): void {
   );
   tray.removeAllListeners('click');
   tray.removeAllListeners('right-click');
-  tray.on('click', (_event, bounds, position) => {
+  tray.on('click', () => {
     cancelMenuBarUsageWindowBlurHide();
-    const clickAnchor: MenuBarUsageClickAnchor = {
-      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
-      position: { x: position.x, y: position.y },
-    };
-    void toggleMenuBarUsageWindow(clickAnchor).catch((error: unknown) => console.warn('Zeus 菜单栏用量浮窗无法打开。', error));
+    void toggleMenuBarUsageWindow().catch((error: unknown) => console.warn('Zeus 菜单栏用量浮窗无法打开。', error));
   });
   tray.on('right-click', () => {
     hideMenuBarUsageWindow();
     if (menuBarUsageMenu) tray?.popUpContextMenu(menuBarUsageMenu);
   });
+  updateMenuBarClassicImage();
+  void createMenuBarUsageWindow().catch((error: unknown) => console.warn('状态栏额度初始化失败', error));
 }
 
 function setupTraySafely(): void {

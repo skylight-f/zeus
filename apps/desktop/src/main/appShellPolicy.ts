@@ -13,6 +13,7 @@ export interface AppShellMenuActions {
   settings: MainAppShellSettings;
   createNewConversation: () => void | Promise<void>;
   toggleDevTools: () => void;
+  toggleMenuBarUsage: () => void;
   showMainWindow: () => void;
   openSettings: () => void | Promise<void>;
   checkForUpdates: () => void | Promise<void>;
@@ -98,6 +99,7 @@ export function buildAppShellMenuTemplate(actions: AppShellMenuActions): AppShel
     {
       label: zh ? '显示' : 'View',
       submenu: [
+        { label: zh ? '菜单栏用量' : 'Menu Bar Usage', click: actions.toggleMenuBarUsage },
         { role: 'reload', label: zh ? '重新加载页面' : 'Reload Page' },
         {
           label: zh ? '开发者工具' : 'Toggle Developer Tools',
