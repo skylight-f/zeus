@@ -737,7 +737,7 @@ body:has(.macos-ai-app.zeus-shell) {
   padding: 0;
 }
 
-/* Git 外层由项目页统一卡片承载，这里清掉更早的工作区装饰，避免额外轮廓。 */
+/* Git 外层仅负责布局，导航和右侧工作面分别提供卡片边界。 */
 .macos-ai-app.zeus-shell .workspace-view-project-git {
   border: 0;
   border-radius: 0;
@@ -3879,6 +3879,13 @@ body:has(.macos-ai-app.zeus-shell) {
   .macos-ai-app.zeus-shell.project-navigation-rail-shell > .project-workspace-tool-rail {
     grid-row: 3 / -2;
   }
+}
+
+/* Git 导航与右侧工作面独立成卡，工作区外层保持透明。 */
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .workspace-view-project-git {
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
 }
 
 /* 源码页由目录、更改和编辑区各自成卡，外层仅负责布局，不再包一层大卡片。 */
