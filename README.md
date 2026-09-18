@@ -10,7 +10,7 @@ Zeus 是一款 AI 研发工作台，将项目与任务管理、Coding Agent 会�
 - 在“设置 → 通用”切换经典布局或紧凑布局，选择自动保存；未选择过布局时沿用经典布局，已有选择和会话状态保持不变。
 - 在创建任务中粘贴 GitHub Issue、Jira 工作项或禅道详情链接，读取标题和正文后确认创建；受限内容通过 Zeus 登录，GitHub 与 Jira 附件保留为来源链接。
 - 任务列表可读取当前禅道账号负责的任务和缺陷，确认后导入 Zeus。
-- 浏览和编辑项目源码，搜索文件与代码内容。
+- 浏览和编辑项目源码，搜索文件与代码内容；支持多光标、查找替换、折叠、差异审阅和冲突选入。TypeScript/JavaScript 支持项目补全、定义跳转、引用查找、重命名、诊断和格式化；其他已支持语言提供语法高亮。
 - 接入 Codex、Claude、Gemini 等 Coding Agent，并保存执行日志。
 - 点击 macOS 菜单栏图标，或使用“显示 → 菜单栏用量”打开用量浮窗，Esc 收起；状态栏显示 Codex 配额或所选其他供应商的今日 Token 用量。
 - 使用 Pi 接入的模型时，会话和 Computer Use 不要求安装或登录 Codex；选择 Codex 内核时仍需准备本机 Codex CLI。Computer Use 另需在设置中开启并完成 macOS 系统授权。
@@ -89,10 +89,11 @@ requirement，用于减少升级后因代码身份变化而重复询问“文稿
 
 使用 Node.js 24–25 和 pnpm 10，首次运行 `pnpm install --frozen-lockfile`。
 
-- `pnpm dev`：首次构建运行依赖后启动 Electron + Vite；React/CSS 修改热更新，不生成安装包。主进程、preload 和共享后端包修改后需重启命令。退出开发窗口或按 Ctrl+C 会关闭本次开发服务，不影响已安装应用。
+- `pnpm dev`：首次构建运行依赖后启动 Electron + Vite；React/CSS 修改热更新，编辑器相关源码修改会整页刷新以重新初始化服务；不生成安装包。主进程、preload 和共享后端包修改后需重启命令。退出开发窗口或按 Ctrl+C 会关闭本次开发服务，不影响已安装应用。
 - 开发配置读取根目录 `.env`、`.env.development`，系统环境变量优先；`ZEUS_DEV_MODE=test pnpm dev` 读取 `.env`、`.env.test`。数据默认隔离到 `.tmp/electron-development-data` 或 `.tmp/electron-test-data`，可通过 `ZEUS_USER_DATA_DIR` 指定兼容的开发数据目录。不要指向正式数据目录。修改环境文件后重启开发命令；只有 `VITE_` 前缀变量可供前端读取，勿放入密钥。
 - 首次使用的开发数据目录必须不存在或为空，由启动过程创建身份标记。指定非主外接屏使用 `ZEUS_TEST_DISPLAY_ID=<显示器 ID> pnpm dev`，无需预写 `main-window-state.json`；显示器不可用时停止创建窗口。已有文件但缺少身份标记时，保留原目录并将 `ZEUS_USER_DATA_DIR` 指向新的空目录，已有数据另行确认迁移；反复重启不会补建标记，离线认领工具目前只支持正式版和测试版。
 - `pnpm build`、`pnpm verify:publish` 和所有打包、签名、发布入口保持原有行为，不启动开发服务、不读取上述开发入口配置。
+- 开发运行健康检查使用 `node scripts/verify-packaged-app-health.mjs <本项目 Electron.app 绝对路径> --development --runtime-root <本次开发数据目录> --runtime-pid <界面进程号>`，核对当前工作树入口、隔离身份、宿主端口及推进的真实心跳。开发检查不代表测试包结构或签名通过；省略 `--development` 时仍严格要求完整测试包。
 - `pnpm verify:publish`：本地与 CI 共用的检查入口，执行冲突、格式、Lint、架构边界、类型和构建检查，不发布。
 - `pnpm package:mac`：默认只生成独立身份 `Zeus Test.app`，输出到 `dist/test/mac-arm64/`（Intel 为 `dist/test/mac/`）；运行验收使用独立用户数据目录。
 - `pnpm package:mac:release`：生成正式 DMG；仅在明确需要安装包或发布时执行。
