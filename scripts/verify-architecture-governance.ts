@@ -62,6 +62,8 @@ async function verifyCustomizationBoundaries(): Promise<void> {
   const rendererRoot = 'apps/desktop/src/renderer/';
   const customRoot = `${rendererRoot}tooling/`;
   const publicConsumers = new Map<string, Set<string>>([
+    // 启动失败页在工作区挂载前展示，也需通过发行入口读取应用名称。
+    [`${rendererRoot}main.tsx`, new Set([`${customRoot}distribution.js`])],
     [`${rendererRoot}WorkspacePage.tsx`, new Set([`${customRoot}tools/base.css`, `${customRoot}tools/theme.css`])],
     [`${rendererRoot}features/workspace/WorkspaceView.tsx`, new Set([`${customRoot}index.js`])],
     [`${rendererRoot}features/workspace/useWorkspaceQueryState.tsx`, new Set([`${customRoot}distribution.js`])],
