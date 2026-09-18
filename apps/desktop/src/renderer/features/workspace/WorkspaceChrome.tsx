@@ -1405,21 +1405,13 @@ export function SidebarNav(props: {
             <span className="project-quick-action-label">{zh ? '数字团队' : 'Digital teams'}</span>
           </button>
         </nav>
-      ) : (
-        <nav className="project-quick-actions codex-source-list-quick-actions project-context-actions" aria-label={contextTitle}>
-          {showConversationNavigation ? (
-            <button type="button" className="project-quick-action" onClick={props.onCreateConversation} disabled={props.createProjectBusy}>
-              <span className="project-quick-action-icon" aria-hidden="true">
-                <svg viewBox="0 0 20 20" focusable="false">
-                  <path d="M4.2 14.9 4.8 11 12.6 3.2a2 2 0 0 1 2.8 0l1.4 1.4a2 2 0 0 1 0 2.8L9 15.2l-3.9.6Z" />
-                  <path d="m11.4 4.4 4.2 4.2" />
-                </svg>
-              </span>
-              <span className="project-quick-action-label">{copy.newChat}</span>
-            </button>
-          ) : null}
+      ) : showConversationNavigation && props.projects.length === 0 ? (
+        <nav className="project-context-actions project-empty-conversation-actions" aria-label={contextTitle}>
+          <button type="button" className="project-new-conversation-button" aria-label={copy.newChat} title={copy.newChat} onClick={props.onCreateConversation} disabled={props.createProjectBusy}>
+            <PencilSimple aria-hidden="true" />
+          </button>
         </nav>
-      )}
+      ) : null}
       {/* 尚未添加项目时不渲染搜索与列表；筛选无匹配仍保留搜索入口。 */}
       {props.projects.length > 0 ? (
         <section className="project-sidebar-list zeus-source-list" role="navigation" data-source-list-keyboard="vertical" aria-label={copy.projectListLabel} onKeyDown={handleSourceListKeyboardNavigation}>
@@ -1432,6 +1424,11 @@ export function SidebarNav(props: {
               <input type="search" aria-label={copy.search} placeholder={copy.search} value={projectSearchQuery} onChange={(event) => setProjectSearchQuery(event.currentTarget.value)} />
             </label>
             <span className="project-sidebar-heading-actions">
+              {showConversationNavigation && props.mainLayout !== 'upstream' ? (
+                <button type="button" className="project-new-conversation-button" aria-label={copy.newChat} title={copy.newChat} onClick={props.onCreateConversation} disabled={props.createProjectBusy}>
+                  <PencilSimple aria-hidden="true" />
+                </button>
+              ) : null}
               {showConversationNavigation ? (
                 <ZeusSelect
                   ariaLabel={copy.filterConversationsByTaskStatus}

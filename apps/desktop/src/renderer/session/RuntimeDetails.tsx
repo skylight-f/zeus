@@ -47,11 +47,11 @@ export function RuntimeDetails(props: RuntimeDetailsProps) {
     <details ref={detailsRef} className="session-runtime-details" data-language={props.language} data-severity={warning ? 'warning' : 'ready'} data-scope={props.scope} aria-label={copy.runtimeDetails}>
       <summary>
         <span className="session-runtime-summary-primary">
-          <RuntimeSummaryMetric label={tokenScopeLabel} value={formatTokenFact(props.runtime.usage.totalTokens, props.language, true)} />
-          <RuntimeSummaryMetric label={copy.contextUsage} value={contextUsage} />
-          <RuntimeSummaryMetric label={copy.cacheHitRate} value={formatPercentageFact(props.runtime.usage.cacheHitRate, props.language)} />
+          <RuntimeSummaryMetric label={zh ? '累计 Token' : tokenScopeLabel} value={formatTokenFact(props.runtime.usage.totalTokens, props.language, true)} />
+          <RuntimeSummaryMetric label={zh ? '上下文' : copy.contextUsage} value={contextUsage} />
+          <RuntimeSummaryMetric label={zh ? '命中率' : copy.cacheHitRate} value={formatPercentageFact(props.runtime.usage.cacheHitRate, props.language)} />
           <RuntimeSummaryMetric label={zh ? '最近请求输出速率' : 'Latest output rate'} value={formatOutputRateFact(props.runtime.performance.latestOutputTokensPerSecond, props.language)} />
-          <RuntimeSummaryMetric label={zh ? 'API 等价费用（估算）' : 'API-equivalent cost (est.)'} value={formatCostSummary(props.runtime.usage.apiEquivalentUsd, props.runtime.usage.priceCoverage, costComplete, props.language)} />
+          <RuntimeSummaryMetric label={zh ? '费用' : 'API-equivalent cost (est.)'} value={formatCostSummary(props.runtime.usage.apiEquivalentUsd, props.runtime.usage.priceCoverage, costComplete, props.language)} />
         </span>
       </summary>
       <div className="session-runtime-detail-groups">

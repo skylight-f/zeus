@@ -20890,7 +20890,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   }
 }
 
-/* 项目标题行承载全局会话组织切换与新增项目，两项都保持低噪音小图标。 */
+/* 搜索右侧集中放置新对话、会话筛选与新增项目，统一使用紧凑图标。 */
 .macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-heading {
   grid-template-columns: minmax(0, 1fr) auto;
 }
@@ -20903,7 +20903,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   grid-auto-columns: 28px;
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-add-button) {
+.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-new-conversation-button, .project-add-button) {
   align-items: center;
   appearance: none;
   background: transparent;
@@ -20921,24 +20921,24 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
     color 120ms var(--zeus-motion-ease-out);
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-add-button) svg {
+.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-new-conversation-button, .project-add-button) svg {
   block-size: 18px;
   display: block;
   flex: none;
   inline-size: 18px;
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-add-button):hover:not(:disabled):not([aria-disabled='true']) {
+.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-new-conversation-button, .project-add-button):hover:not(:disabled):not([aria-disabled='true']) {
   background: var(--zeus-native-row-hover);
   color: var(--zeus-product-text);
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-add-button):focus-visible {
+.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-conversation-filter-button, .project-new-conversation-button, .project-add-button):focus-visible {
   box-shadow: var(--zeus-control-focus);
   outline: 0;
 }
 
-.macos-ai-app.zeus-shell .project-first-sidebar .project-add-button:disabled {
+.macos-ai-app.zeus-shell .project-first-sidebar :where(.project-new-conversation-button, .project-add-button):disabled {
   background: transparent;
   border-color: transparent;
   color: var(--zeus-control-disabled-text);

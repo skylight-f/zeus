@@ -3560,33 +3560,27 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   min-inline-size: 0;
 }
 
-/* 宽屏并排展示标题和统计，分栏或窄窗口时在同一标题区自然换行。 */
-.session-codex-parity-v1 .session-thread-title-copy.session-thread-title-overview {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 20px;
+/* 标题与统计在同一顶栏上下排列，复用原有高度，操作按钮对齐标题。 */
+.session-codex-parity-v1 .session-thread-header:has(.session-thread-header-runtime) {
+  box-sizing: border-box;
+  padding-block: 7px;
 }
 
-.session-codex-parity-v1 .session-thread-title-overview > .session-thread-title-row {
-  flex: 1 1 220px;
+.session-codex-parity-v1 .session-thread-title-copy:has(.session-thread-header-runtime) {
+  gap: 2px;
 }
 
 .session-codex-parity-v1 .session-thread-header-runtime {
-  flex: 1 1 720px;
   min-inline-size: 0;
   max-inline-size: 100%;
 }
 
-.session-codex-parity-v1 .session-thread-header-runtime:has(.session-runtime-details[open]) {
-  flex-basis: 100%;
-}
-
 .session-codex-parity-v1 .session-thread-header-runtime .session-runtime-details > summary {
-  padding-inline: 0;
+  min-block-size: 18px;
+  padding: 1px 0;
 }
 
-.session-codex-parity-v1 .session-thread-header:has(.session-thread-header-runtime .session-runtime-details[open]) > .session-context-header-tools {
+.session-codex-parity-v1 .session-thread-header:has(.session-thread-header-runtime) > .session-context-header-tools {
   align-self: start;
 }
 
@@ -3606,10 +3600,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-thread-title-row > :where(strong, .session-thread-task-title) {
   flex: 0 1 auto;
-  font-size: 15px;
-  font-weight: 620;
-  letter-spacing: -0.012em;
-  line-height: 20px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 24px;
   min-inline-size: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3914,6 +3908,42 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   min-block-size: 28px;
   padding: 4px 8px;
   border-radius: 6px;
+}
+
+/* 主会话标题与用量摘要共用起点，分栏时跟随左侧标题的内边距。 */
+.session-codex-parity-v1 .session-conversation-pane > .session-thread-subtitle-row {
+  padding: 0 24px 8px;
+}
+
+.session-codex-parity-v1:has(.session-thread-header[data-context-toolbar='true']) .session-conversation-pane > .session-thread-subtitle-row {
+  padding-inline: 12px;
+}
+
+.session-codex-parity-v1 .session-conversation-pane > .session-thread-subtitle-row .session-runtime-details > summary {
+  padding: 2px 0;
+}
+
+.session-codex-parity-v1 .session-thread-runtime-summary .session-runtime-summary-primary {
+  gap: 4px 0;
+}
+
+.session-codex-parity-v1 .session-thread-runtime-summary .session-runtime-summary-metric {
+  border-inline-start: 1px solid var(--session-line);
+  margin-inline-start: 10px;
+  padding-inline-start: 10px;
+  line-height: 14px;
+}
+
+.session-codex-parity-v1 .session-thread-runtime-summary .session-runtime-summary-metric:first-child {
+  border-inline-start: 0;
+  margin-inline-start: 0;
+  padding-inline-start: 0;
+}
+
+.session-codex-parity-v1 .session-thread-runtime-summary .session-runtime-summary-metric b {
+  color: var(--session-text);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 收起入口固定在详情底部居中，独立于滚动内容且不挤占摘要宽度。 */

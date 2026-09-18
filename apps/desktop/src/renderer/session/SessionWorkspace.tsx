@@ -2638,6 +2638,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   </span>
                 ) : null}
               </span>
+              {!legacy && props.state ? (
+                <div className="session-thread-header-runtime session-thread-runtime-summary">
+                  <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} />
+                </div>
+              ) : null}
             </div>
           ) : null}
           <div className="session-context-header-tools">
@@ -2761,7 +2766,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
               ) : null}
             </div>
           </div>
-          {/* 运行详情归左侧正文；旧会话或未就绪会话仅在标题下保留项目名称。 */}
+          {/* 旧会话或未就绪会话仅在标题下保留项目名称。 */}
           {(legacy || !props.state) && displayedHeader.contextLabel ? (
             <div className="session-thread-subtitle-row">
               <small className="session-thread-project-name" title={displayedHeader.contextLabel}>
@@ -2822,10 +2827,12 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 data-browser-resizing={browserResizing || undefined}
               >
                 <div className="session-conversation-pane">
-                  {/* 固定在左栏内挂载，开关右侧工作区不重建详情，也不改变浏览器高度。 */}
-                  <div key={`runtime:${navigationId ?? props.state.conversationId}`} className="session-thread-subtitle-row">
-                    <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} />
-                  </div>
+                  {/* 任务内隐藏会话标题时，仍在正文顶部保留运行详情入口。 */}
+                  {props.embeddedInTask || !displayedHeader ? (
+                    <div key={`runtime:${navigationId ?? props.state.conversationId}`} className="session-thread-subtitle-row session-thread-runtime-summary">
+                      <SessionRuntimeDetails state={props.state} conversation={props.conversation} language={props.language} capabilities={props.capabilities} />
+                    </div>
+                  ) : null}
                   <SessionTranscriptProjection
                     state={props.state}
                     controller={props.stateController}
