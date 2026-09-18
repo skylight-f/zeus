@@ -449,21 +449,21 @@ function desktopRoot(): string {
   return process.env.ZEUS_DESKTOP_DIR ?? app.getAppPath();
 }
 
-function developmentAppIconPath(): string | undefined {
-  if (app.isPackaged) return undefined;
-  const developmentIcon = join(desktopRoot(), 'dist', 'branding', 'icon-dev.png');
+function applicationIconPath(): string {
+  const iconName = app.isPackaged ? 'icon.png' : 'icon-dev.png';
+  const builtIcon = join(desktopRoot(), 'dist', 'branding', iconName);
   // 开发图标为可选定制资源；干净源码检出使用仓库自带图标，避免阻断启动。
-  return existsSync(developmentIcon) ? developmentIcon : join(desktopRoot(), 'assets', 'icon.png');
+  return existsSync(builtIcon) ? builtIcon : join(desktopRoot(), 'assets', 'icon.png');
 }
 
-/** 开发宿主继续使用独立数据目录，并在 macOS Dock 中显式展示开发图标。 */
-function applyDevelopmentVisualIdentity(): void {
-  const iconPath = developmentAppIconPath();
-  if (!iconPath || process.platform !== 'darwin') return;
+/** 两种运行方式均显式使用透明 PNG，保留 Dock 中原始图形的轮廓与比例。 */
+function applyApplicationDockIcon(): void {
+  if (process.platform !== 'darwin') return;
+  const iconPath = applicationIconPath();
   const icon = nativeImage.createFromPath(iconPath);
-  if (icon.isEmpty()) throw new Error(`Zeus Dev 图标无法读取：${iconPath}`);
+  if (icon.isEmpty()) throw new Error(`应用 Dock 图标无法读取：${iconPath}`);
   const dock = app.dock;
-  if (!dock) throw new Error('Zeus Dev 无法访问 macOS Dock。');
+  if (!dock) throw new Error('应用无法访问 macOS Dock。');
   dock.setIcon(icon);
 }
 
@@ -823,7 +823,7 @@ async function createWindow(): Promise<void> {
     'main-window-state.json',
     {
       ...restoredWindowState.bounds,
-      ...(developmentAppIconPath() ? { icon: developmentAppIconPath() } : {}),
+      icon: applicationIconPath(),
       // ZEUS-0240：询问与授权的输入、目标和操作必须保持同行，640px 是仍可完整操作的主窗口下限。
       minWidth: 640,
       minHeight: 560,
@@ -2868,7 +2868,7 @@ async function initializeApplication(): Promise<void> {
   app.setAboutPanelOptions({ applicationVersion: appVersion, version: appVersion });
   traceApplicationStartup('electron_ready');
   ensureMacOSDockIconVisible();
-  applyDevelopmentVisualIdentity();
+  applyApplicationDockIcon();
   if (readOnlyValidationDescriptor) {
     await verifyDesktopReadOnlyValidationDescriptor(readOnlyValidationDescriptor);
     installReadOnlyValidationIpcFence(ipcMain, readOnlyValidationDescriptor);

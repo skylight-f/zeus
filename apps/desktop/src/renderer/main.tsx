@@ -2,6 +2,7 @@ import { describeUserFacingError } from '@zeus/shared';
 import { Profiler, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RendererErrorBoundary } from './ErrorBoundary.js';
+import { distributionAppName } from './tooling/distribution.js';
 import { createDashboardClient, type DashboardClient, type ExecutionHostTransition, type ReadOnlyValidationIdentity, ZeusApiError } from './apiClient.js';
 import { openSourceInMain, revealProjectInFinderInMain } from './appShellBridge.js';
 import { initializeNativeCloseLayerRouting } from './ui/nativeCloseLayer.js';
@@ -519,7 +520,7 @@ function renderStartupFailure(error: unknown): void {
 
   const title = document.createElement('h1');
   title.id = 'startup-failure-title';
-  title.textContent = zh ? 'Zeus 无法启动' : 'Zeus could not start';
+  title.textContent = zh ? `${distributionAppName} 无法启动` : `${distributionAppName} could not start`;
 
   const details = document.createElement('details');
   const description = document.createElement('p');
@@ -552,7 +553,7 @@ function renderStartupFailure(error: unknown): void {
       restart.textContent = zh ? '重新启动' : 'Restart';
     }
   };
-  const exit = startupFailureButton(zh ? '退出 Zeus' : 'Quit Zeus', false);
+  const exit = startupFailureButton(zh ? `退出 ${distributionAppName}` : `Quit ${distributionAppName}`, false);
   exit.onclick = async () => {
     exit.disabled = true;
     try {
