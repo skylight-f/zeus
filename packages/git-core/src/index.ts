@@ -365,7 +365,7 @@ export type ProjectGitAction =
   | { type: 'stage'; paths: string[] }
   | { type: 'unstage'; paths: string[] }
   | { type: 'apply_patch'; patch: string; reverse?: boolean; target?: 'index' | 'worktree' }
-  | { type: 'commit'; message: string }
+  | { type: 'commit'; message: string; paths?: string[]; expectedHeadSha?: string; expectedBranch?: string }
   | { type: 'push'; remote?: string; sourceBranch?: string; targetBranch?: string; setUpstream?: boolean; forceWithLease?: boolean; pushTags?: boolean; pushAllTags?: boolean }
   | { type: 'pull'; remote?: string; targetBranch?: string; strategy: 'rebase' | 'merge'; commitMerge?: boolean; includeMergeLog?: boolean; noFastForward?: boolean }
   | { type: 'update'; strategy: 'merge' | 'rebase' | 'reset'; smart?: boolean }
@@ -2352,7 +2352,20 @@ export async function getProjectGitRepositorySnapshot(cwd: string): Promise<Proj
     readGitStdout(context.topLevel, ['tag', '--points-at', 'HEAD', '--sort=-creatordate']),
     readGitStdout(context.topLevel, ['reflog', '-n', '120', '--format=%gs']),
     readGitStdout(context.topLevel, ['stash', 'list', '--format=%gd%x1f%H%x1f%s%x1f%an%x1f%aI']),
-    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'log', '--all', '--topo-order', '-n', '200', '--date=iso-strict', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P']),
+    readGitStdout(context.topLevel, [
+      '-c',
+      'core.quotePath=false',
+      'log',
+      '--branches',
+      '--remotes',
+      '--tags',
+      '--topo-order',
+      '-n',
+      '200',
+      '--date=iso-strict',
+      '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P',
+      ...(context.headSha ? [context.headSha] : []),
+    ]),
   ]);
   const upstream = upstreamText || null;
   const divergence = upstream ? await readGitStdout(context.topLevel, ['rev-list', '--left-right', '--count', `${upstream}...HEAD`]) : '';
@@ -2409,7 +2422,8 @@ export async function getProjectGitHistory(cwd: string, offset = 0, ref?: string
   const context = await getGitRepositoryContext(cwd);
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', '仓库不可用。');
   if (!context.headSha && !context.localBranches.length && !context.remoteBranches.length) return { commits: [], hasMore: false };
-  const revisions = ref ? [await resolveCommit(cwd, ref)] : ['--all', ...(context.headSha ? [context.headSha] : [])];
+  // 工作区历史只包含分支、标签与当前 HEAD，贮藏的内部提交在贮藏页查看。
+  const revisions = ref ? [await resolveCommit(cwd, ref)] : ['--branches', '--remotes', '--tags', ...(context.headSha ? [context.headSha] : [])];
   const output = await requireGitStdout(cwd, ['log', '--topo-order', `--skip=${offset}`, '-n', '201', '--date=iso-strict', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P', ...revisions, '--']);
   const commits = parseRecentCommits(output);
   return { commits: commits.slice(0, 200), hasMore: commits.length > 200 };
@@ -2545,9 +2559,36 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
       args = ['apply', ...(action.target === 'worktree' ? [] : ['--cached']), ...(action.reverse ? ['--reverse'] : []), '--whitespace=nowarn', '-'];
       return finishProjectGitAction(repositoryPath, action.type, await runGit(repositoryPath, args, patch));
     }
-    case 'commit':
-      args = ['commit', '-m', requireSafeGitText(action.message, 'commit message')];
+    case 'commit': {
+      const message = requireSafeGitText(action.message, 'commit message');
+      if (action.paths !== undefined) {
+        // 源码侧勾选代表本次提交范围，不改变未勾选文件的暂存状态。
+        if ((action.expectedHeadSha !== undefined && action.expectedHeadSha !== context.headSha) || (action.expectedBranch !== undefined && action.expectedBranch !== context.branch)) {
+          throw gitCoreError('ZEUS_GIT_SELECTION_CHANGED', '当前分支或提交已变化，请刷新更改后重新确认提交范围。');
+        }
+        if (await readIntegrationState(repositoryPath)) throw gitCoreError('ZEUS_GIT_INTEGRATION_ACTIVE', '合并或变基期间请在 Git 工作区解决冲突并继续操作。');
+        const status = await getGitStatus(repositoryPath);
+        if (status.conflictFiles.length) throw gitCoreError('ZEUS_GIT_CONFLICTS_REMAIN', '请先解决仓库中的冲突。');
+        const selected = [...new Set(requireRepositoryPaths(repositoryPath, action.paths))];
+        const files = selected.map((path) => status.fileStatuses.find((file) => file.path === path));
+        if (files.some((file) => !file || file.path.endsWith('/'))) throw gitCoreError('ZEUS_GIT_SELECTION_CHANGED', '所选文件已变化或包含嵌套仓库，请刷新更改后重新选择。');
+        const paths = [...selected];
+        for (const file of files) {
+          if (file?.category !== 'renamed' || !file.originalPath || selected.includes(file.originalPath)) continue;
+          const entry = await lstat(resolve(repositoryPath, file.originalPath)).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (entry) throw gitCoreError('ZEUS_GIT_SELECTION_CHANGED', '重命名来源又出现文件，请同时选择该文件或先处理其更改。');
+          paths.push(file.originalPath);
+        }
+        // 已暂存删除不再属于索引；通过 Git 展开可暂存路径，保留删除与重命名两端的提交范围。
+        const stagePaths = splitNullRecords((await runGit(repositoryPath, ['--literal-pathspecs', 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...paths])).stdout);
+        if (stagePaths.length) await runGit(repositoryPath, ['--literal-pathspecs', 'add', '-A', '--', ...stagePaths]);
+        args = ['--literal-pathspecs', 'commit', '--only', '-m', message, '--', ...paths];
+      } else args = ['commit', '-m', message];
       break;
+    }
     case 'push': {
       if (!action.sourceBranch) requireNamedCurrentBranch(context);
       const sourceBranch = await assertNamedBranchExists(repositoryPath, action.sourceBranch || context.branch);

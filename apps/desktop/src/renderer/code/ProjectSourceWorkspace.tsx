@@ -17,9 +17,9 @@ import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
 import './projectSourceWorkspace.css';
-import type { ProjectGitWorkbenchSnapshot } from '../features/git/gitContracts.js';
 import { ProjectSourceSearch, type SourceSearchFile } from './ProjectSourceSearch.js';
 import { replaceProjectSourceTextMatches } from '@zeus/shared';
+import { SourceGitChanges, fileDiff, type SourceGitClient } from './SourceGitChanges.js';
 import type { GitDiffSummary } from '../features/git/gitContracts.js';
 import { SideBySideDiff } from '../git/ProjectGitDiffViewer.js';
 
@@ -27,112 +27,6 @@ const ProjectSourceEditor = lazy(() => import('./ProjectSourceEditor.js').then((
 const CodeEditor = lazy(() => import('./CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
 // 文件系统事件在这个时间窗内按目录和文件去重，避免批量写入触发重复读取与渲染。
 const sourceEventRefreshDelayMs = 100;
-
-function SourceChanges(props: { projectId: string; zh: boolean; onConflict(path: string): void; onOpen(path: string, diff: GitDiffSummary, staged: boolean, repositoryId: string, repositoryPath: string): void }) {
-  const [snapshot, setSnapshot] = useState<ProjectGitWorkbenchSnapshot | null>(null);
-  const [error, setError] = useState('');
-  const [refreshKey, setRefreshKey] = useState(0);
-  useEffect(() => {
-    let active = true;
-    setSnapshot(null);
-    setError('');
-    const load = window.zeus?.loadProjectGitWorkbench;
-    if (!load) {
-      setError(props.zh ? '当前环境不支持读取 Git 更改。' : 'Git changes are unavailable.');
-      return;
-    }
-    void load(props.projectId)
-      .then((value) => {
-        if (active) setSnapshot(value);
-      })
-      .catch((reason: unknown) => {
-        if (active) setError(reason instanceof Error ? reason.message : String(reason));
-      });
-    return () => {
-      active = false;
-    };
-  }, [props.projectId, props.zh, refreshKey]);
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => setRefreshKey((key) => key + 1), 250);
-    };
-    const unsubscribe = window.zeus?.onProjectSourceEvent((event) => {
-      if (event.projectId === props.projectId) refresh();
-    });
-    window.addEventListener('focus', refresh);
-    return () => {
-      clearTimeout(timer);
-      unsubscribe?.();
-      window.removeEventListener('focus', refresh);
-    };
-  }, [props.projectId]);
-  return (
-    <details className="project-source-module project-source-changes" open>
-      <summary>{props.zh ? '更改' : 'Changes'}</summary>
-      <div className="project-source-changes-body">
-        <button type="button" onClick={() => setRefreshKey((key) => key + 1)}>
-          {props.zh ? '刷新更改' : 'Refresh changes'}
-        </button>
-        {error ? <p role="alert">{error}</p> : !snapshot ? <p>{props.zh ? '正在读取更改…' : 'Loading changes…'}</p> : null}
-        {snapshot?.repositories.length === 0 ? <p>{props.zh ? '此项目没有 Git 仓库。' : 'No Git repository.'}</p> : null}
-        {snapshot?.repositories.map((repository) => (
-          <details key={repository.id} open>
-            <summary>
-              <strong>{repository.name}</strong>
-              <small>{repository.snapshot.branch}</small>
-            </summary>
-            {(
-              [
-                [props.zh ? '合并更改' : 'Merge changes', repository.snapshot.fileStatuses.filter((file) => repository.snapshot.conflictFiles.includes(file.path))],
-                [
-                  props.zh ? '暂存的更改' : 'Staged changes',
-                  repository.snapshot.fileStatuses.filter((file) => !repository.snapshot.conflictFiles.includes(file.path) && file.indexStatus !== ' ' && file.indexStatus !== '?' && file.indexStatus !== '!'),
-                ],
-                [props.zh ? '更改' : 'Changes', repository.snapshot.fileStatuses.filter((file) => !repository.snapshot.conflictFiles.includes(file.path) && file.workingTreeStatus !== ' ' && file.workingTreeStatus !== '!')],
-              ] as const
-            ).map(([label, files]) => (
-              <details key={label} open>
-                <summary>
-                  {label}
-                  <small>{files.length}</small>
-                </summary>
-                {files.map((file) => (
-                  <button
-                    key={file.path}
-                    type="button"
-                    title={file.path}
-                    onClick={() => {
-                      if (repository.snapshot.conflictFiles.includes(file.path)) {
-                        props.onConflict([repository.relativePath === '.' ? '' : repository.relativePath, file.path].filter(Boolean).join('/'));
-                        return;
-                      }
-                      const staged = label === (props.zh ? '暂存的更改' : 'Staged changes');
-                      const source = staged ? repository.snapshot.stagedDiff : repository.snapshot.unstagedDiff;
-                      props.onOpen(
-                        [repository.relativePath === '.' ? '' : repository.relativePath, file.path].filter(Boolean).join('/'),
-                        { ...source, fileDiffs: source.fileDiffs.filter((entry) => entry.newPath === file.path || entry.oldPath === file.path), files: [file.path] },
-                        staged,
-                        repository.id,
-                        file.path,
-                      );
-                    }}
-                  >
-                    <File aria-hidden="true" />
-                    <span>{file.path}</span>
-                    <small>{file.indexStatus.trim() || file.workingTreeStatus.trim()}</small>
-                  </button>
-                ))}
-                {files.length === 0 ? <p>{props.zh ? '暂无更改' : 'No changes'}</p> : null}
-              </details>
-            ))}
-          </details>
-        ))}
-      </div>
-    </details>
-  );
-}
 
 type AppLanguage = 'zh-CN' | 'en-US';
 
@@ -166,6 +60,7 @@ export interface ProjectSourceWorkspaceHandle {
 }
 
 export interface ProjectSourceWorkspaceProps {
+  gitClient?: SourceGitClient;
   project: { id: string; name: string; localPath: string };
   language: AppLanguage;
   preference?: ProjectCodeWorkspacePreference;
@@ -184,7 +79,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set(initialPreference.expandedDirectories));
   const [tabs, setTabs] = useState<SourceTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(initialPreference.activeFile);
-  const [changePreview, setChangePreview] = useState<{ projectId: string; path: string; diff: GitDiffSummary; staged: boolean; request: FilePreviewRequest } | null>(null);
+  const [changePreview, setChangePreview] = useState<{ projectId: string; path: string; diff: GitDiffSummary; revision: string; request: FilePreviewRequest } | null>(null);
   const [treeWidth, setTreeWidth] = useState(initialPreference.treeWidth);
   const [sourceShare, setSourceShare] = useState(55);
   const [treeDrawerOpen, setTreeDrawerOpen] = useState(false);
@@ -900,12 +795,28 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
               setSourceShare((value) => (event.key === 'Home' ? 55 : Math.max(15, Math.min(85, value + (event.key === 'ArrowUp' ? -5 : 5)))));
             }}
           />
-          <SourceChanges
+          <SourceGitChanges
+            key={props.project.id}
             projectId={props.project.id}
+            client={props.gitClient}
             zh={zh}
             onConflict={(path) => void openFile(path)}
-            onOpen={(path, diff, staged, repositoryId, repositoryPath) =>
-              setChangePreview({ projectId: props.project.id, path, diff, staged, request: { kind: 'project-git', projectId: props.project.id, repositoryId, path: repositoryPath, stage: staged ? 'staged' : 'unstaged' } })
+            onOpenFile={(path) => {
+              setChangePreview(null);
+              void openFile(path);
+            }}
+            onBeforeCommit={saveAll}
+            onOpen={({ path, diff, repositoryId, repositoryPath, revision }) =>
+              setChangePreview({ projectId: props.project.id, path, diff, revision, request: { kind: 'project-git', projectId: props.project.id, repositoryId, path: repositoryPath, stage: 'combined' } })
+            }
+            onSnapshot={(snapshot) =>
+              setChangePreview((current) => {
+                if (!current || current.request.kind !== 'project-git') return current;
+                const request = current.request;
+                const repository = snapshot.repositories.find((item) => item.id === request.repositoryId);
+                if (!repository || !repository.snapshot.fileStatuses.some((file) => file.path === request.path)) return null;
+                return { ...current, diff: fileDiff(repository, request.path), revision: snapshot.refreshedAt };
+              })
             }
           />
         </aside>
@@ -970,13 +881,13 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
               <section className="project-source-change-preview">
                 <header>
                   <span>
-                    {changePreview.path} · {changePreview.staged ? (zh ? 'HEAD → 暂存区' : 'HEAD → Index') : zh ? '暂存区 → 工作区' : 'Index → Working tree'}
+                    {changePreview.path} · {zh ? 'HEAD → 工作区' : 'HEAD → Working tree'}
                   </span>
                   <button type="button" onClick={() => setChangePreview(null)}>
                     {zh ? '关闭对比' : 'Close diff'}
                   </button>
                 </header>
-                <SideBySideDiff key={`${changePreview.path}:${changePreview.staged}`} previewRequest={changePreview.request} diff={changePreview.diff} zh={zh} title={changePreview.path} fill />
+                <SideBySideDiff key={changePreview.path} revision={changePreview.revision} previewRequest={changePreview.request} diff={changePreview.diff} zh={zh} title={changePreview.path} fill />
               </section>
             </>
           ) : activeTab ? (
