@@ -207,3 +207,5 @@ export interface PluginMarketplaceCatalog {
   displayName: string;
   entries: Array<{ name: string; description: string; version: string | null; source: PluginDirectSource }>;
 }
+
+export type { McpConfigurationCatalog } from '@zeus/shared';

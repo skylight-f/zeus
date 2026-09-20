@@ -1,4 +1,3 @@
-
 .macos-ai-app .automations-workspace {
   box-sizing: border-box;
   display: grid;
@@ -761,4 +760,69 @@
   .macos-ai-app .extension-path-control {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* MCP 目录沿用插件列表密度，来源与状态在窄窗口内可换行。 */
+.macos-ai-app .extension-mcp-catalog {
+  margin-block-end: 24px;
+}
+.macos-ai-app .extension-mcp-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-block: 12px;
+}
+.macos-ai-app .extension-mcp-filters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.macos-ai-app .extension-mcp-count {
+  color: var(--zeus-product-subtle);
+  font-size: 12px;
+}
+.macos-ai-app .extension-mcp-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.macos-ai-app .extension-mcp-list li {
+  border-block-start: 1px solid var(--zeus-product-line-soft);
+  padding-block: 12px;
+}
+.macos-ai-app .extension-mcp-list li > span:first-child {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.macos-ai-app .extension-mcp-sources {
+  margin-block-start: 12px;
+  font-size: 12px;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app .extension-mcp-sources summary {
+  cursor: pointer;
+}
+.macos-ai-app .extension-mcp-sources dl {
+  display: grid;
+  gap: 10px;
+}
+.macos-ai-app .extension-mcp-sources dd {
+  margin-inline-start: 0;
+  overflow-wrap: anywhere;
+}
+
+.macos-ai-app .extension-mcp-filters > .zeus-select {
+  width: min(240px, 100%);
+  flex: 0 1 240px;
+}
+.macos-ai-app .extension-mcp-source-note {
+  color: var(--zeus-product-subtle);
+  font-size: 12px;
+}
+.macos-ai-app .extension-mcp-list li > span:last-child {
+  font-size: 12px;
+  color: var(--zeus-product-subtle);
 }

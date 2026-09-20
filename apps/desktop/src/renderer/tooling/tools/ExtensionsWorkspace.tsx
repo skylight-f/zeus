@@ -1,8 +1,9 @@
+import { McpServiceCatalog } from './McpServiceCatalog.js';
 import { MotionPresence } from '../toolPageHost.js';
 import { Collapsible } from '../toolPageHost.js';
 import { FormDialog } from '../toolPageHost.js';
 import { reportApplicationError } from '../toolPageHost.js';
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { ShieldCheckIcon as ShieldCheck } from '@phosphor-icons/react/dist/csr/ShieldCheck';
@@ -24,6 +25,7 @@ type ExtensionsClient = Pick<
   | 'installSkill'
   | 'removeSkill'
   | 'loadPlugins'
+  | 'loadMcpConfiguration'
   | 'loadPluginRuntimeStatus'
   | 'installPlugin'
   | 'updatePlugin'
@@ -46,6 +48,7 @@ type Tab = 'plugins' | 'skills' | 'marketplaces';
 export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; language: 'zh-CN' | 'en-US'; projectId?: string | null; onChooseDirectory?: () => Promise<string | null> }) {
   const zh = props.language === 'zh-CN';
   const [tab, setTab] = useState<Tab>('plugins');
+  const [mcpRefreshRevision, setMcpRefreshRevision] = useState(0);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [dangerousHookTrustBypass, setDangerousHookTrustBypass] = useState(false);
   const [marketplaces, setMarketplaces] = useState<PluginMarketplaceCatalog[]>([]);
@@ -56,10 +59,12 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
   const [scope, setScope] = useState<PluginScope>('personal');
   /** 安装插件与添加来源使用同一份表单草稿。 */
   const [source, setSource] = useState<ExtensionSourceDraft>(emptyExtensionSource);
+  const loadRevision = useRef(0);
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!props.client) return;
+    const revision = ++loadRevision.current;
     setBusyKey('load');
     setError(null);
     try {
@@ -68,17 +73,23 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         props.client.loadPluginMarketplaces(props.projectId ?? undefined),
         props.client.loadPluginRuntimeStatus(),
       ]);
+      if (revision !== loadRevision.current) return;
       setPlugins(nextPlugins);
       setMarketplaces(nextMarketplaces);
       setDangerousHookTrustBypass(runtimeStatus.dangerouslyBypassHookTrust);
     } catch (reason) {
-      setError(message(reason, zh ? 'zh-CN' : 'en'));
+      if (revision === loadRevision.current) setError(message(reason, zh ? 'zh-CN' : 'en'));
     } finally {
-      setBusyKey(null);
+      if (revision === loadRevision.current) setBusyKey(null);
     }
   }, [props.client, props.projectId, zh]);
 
-  useEffect(() => void load(), [load]);
+  useEffect(() => {
+    void load();
+    return () => {
+      loadRevision.current += 1;
+    };
+  }, [load]);
 
   async function mutate(key: string, operation: () => Promise<unknown>): Promise<boolean> {
     if (!props.client || busyKey) return false;
@@ -94,6 +105,7 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
       setPlugins(nextPlugins);
       setMarketplaces(nextMarketplaces);
       setDangerousHookTrustBypass(runtimeStatus.dangerouslyBypassHookTrust);
+      setMcpRefreshRevision((value) => value + 1);
       window.dispatchEvent(new Event(skillCatalogChangedEvent));
       return true;
     } catch (reason) {
@@ -159,7 +171,16 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
             <p>{zh ? '管理插件、技能和来源。更改用于新对话，进行中的对话保持原配置。' : 'Install and manage plugins here. Changes apply to conversations created afterward.'}</p>
           </div>
           {tab !== 'skills' ? (
-            <Button variant="secondary" size="regular" busy={busyKey === 'load'} onClick={() => void load()} disabled={!props.client || Boolean(busyKey)}>
+            <Button
+              variant="secondary"
+              size="regular"
+              busy={busyKey === 'load'}
+              onClick={() => {
+                setMcpRefreshRevision((value) => value + 1);
+                void load();
+              }}
+              disabled={!props.client || Boolean(busyKey)}
+            >
               <ArrowClockwise aria-hidden="true" /> {zh ? '刷新' : 'Refresh'}
             </Button>
           ) : null}
@@ -187,7 +208,23 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         </p>
       ) : null}
       {tab === 'skills' ? <SkillsWorkspace client={props.client} language={props.language} onChooseDirectory={props.onChooseDirectory} embedded /> : null}
-      {tab === 'plugins' ? <PluginCatalog plugins={plugins} zh={zh} busyKey={busyKey} expanded={expanded} onExpanded={setExpanded} onInstall={() => setInstallOpen(true)} onMutate={mutate} client={props.client} /> : null}
+      {tab === 'plugins' ? (
+        <>
+          <McpServiceCatalog
+            client={props.client}
+            plugins={plugins}
+            refreshRevision={mcpRefreshRevision}
+            pluginsLoading={busyKey === 'load'}
+            pluginsFailed={Boolean(error)}
+            zh={zh}
+            onManagePlugin={(id) => {
+              setExpanded(id);
+              window.requestAnimationFrame(() => document.getElementById(`extension-plugin-${id}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+            }}
+          />
+          <PluginCatalog plugins={plugins} zh={zh} busyKey={busyKey} expanded={expanded} onExpanded={setExpanded} onInstall={() => setInstallOpen(true)} onMutate={mutate} client={props.client} />
+        </>
+      ) : null}
       {tab === 'marketplaces' ? <MarketplaceCatalog marketplaces={marketplaces} plugins={plugins} zh={zh} busyKey={busyKey} onAdd={() => setMarketplaceOpen(true)} onMutate={mutate} client={props.client} /> : null}
 
       <MotionPresence>
@@ -249,7 +286,7 @@ function PluginCatalog(props: {
           const open = props.expanded === plugin.id;
           const untrusted = descriptor.hooks.filter((hook) => hook.enabled && hook.trustedDefinitionSha256 !== hook.definitionSha256).length;
           return (
-            <article key={plugin.id} className="extension-plugin-row" data-enabled={plugin.enabled ? 'true' : 'false'}>
+            <article key={plugin.id} id={`extension-plugin-${plugin.id}`} className="extension-plugin-row" data-enabled={plugin.enabled ? 'true' : 'false'}>
               <header>
                 <button type="button" className="extension-plugin-summary" aria-expanded={open} onClick={() => props.onExpanded(open ? null : plugin.id)}>
                   <CaretRight className="extension-expand-icon" aria-hidden="true" />

@@ -117,6 +117,7 @@ export interface CodexApiClient {
   installSkill: (source: SkillInstallSource, projectId?: string) => Promise<SkillInstallResult>;
   removeSkill: (skillId: string, projectId?: string) => Promise<{ removed: true; skillId: string; name: string }>;
   loadPlugins: (projectId?: string) => Promise<import('./codexContracts.js').PluginDescriptor[]>;
+  loadMcpConfiguration: () => Promise<import('./codexContracts.js').McpConfigurationCatalog>;
   loadPluginRuntimeStatus: () => Promise<{ available: boolean; dangerouslyBypassHookTrust: boolean }>;
   installPlugin: (input: { scope: import('./codexContracts.js').PluginScope; projectId?: string | null; source: import('./codexContracts.js').PluginInstallSource }) => Promise<import('./codexContracts.js').PluginDescriptor>;
   updatePlugin: (pluginId: string) => Promise<import('./codexContracts.js').PluginDescriptor>;
@@ -430,6 +431,7 @@ export function createCodexApiClient(transport: LocalApiTransport): CodexApiClie
       const result = await transport.request<{ plugins: import('./codexContracts.js').PluginDescriptor[] }>(`/api/plugins${suffix}`);
       return result.plugins;
     },
+    loadMcpConfiguration: () => transport.request<import('./codexContracts.js').McpConfigurationCatalog>('/api/mcp-configuration'),
     loadPluginRuntimeStatus: () => transport.request<{ available: boolean; dangerouslyBypassHookTrust: boolean }>('/api/plugin-runtime-status'),
     installPlugin: (input) => transport.request<import('./codexContracts.js').PluginDescriptor>('/api/plugins/install', { method: 'POST', body: JSON.stringify({ ...input, projectId: input.projectId ?? null }) }),
     updatePlugin: (pluginId) => transport.request<import('./codexContracts.js').PluginDescriptor>(`/api/plugins/${encodeURIComponent(pluginId)}/update`, { method: 'POST' }),

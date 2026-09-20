@@ -1227,6 +1227,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   });
   registerZeusPluginRoutes({
     server,
+    codexHome: dependencies.codexHome,
+    sourceCodexHome: options.codexConfigImportSourceRoot,
     plugins: zeusPluginService,
     runtime: zeusConversationPluginRuntime,
     dangerouslyBypassHookTrust: dangerouslyBypassPluginHookTrust === true,
