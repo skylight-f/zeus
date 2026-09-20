@@ -217,17 +217,18 @@ function developmentRuntimeIdentity(appPath) {
   return { executablePath, desktopRoot, version: readDistributionVersion(), bundleId: 'dev.hypha.zeus.development', profile: 'development' };
 }
 
-/** 只检查调用方已启动的隔离应用，观察真实心跳推进，不启动、停止应用或模拟宿主响应。 */
-export async function verifyRunningTestApp(appPath, userDataPath, pid, development = false) {
+/** 只检查调用方已启动的指定应用，观察真实心跳推进，不启动、停止应用或模拟宿主响应。 */
+export async function verifyRunningTestApp(appPath, userDataPath, pid, development = false, production = false) {
   /** 原完整包检查保持不变；开发模式必须显式选择并验证固定工作树入口。 */
-  const identity = development ? developmentRuntimeIdentity(appPath) : { ...verifyPackagedAppIdentity(resolve(appPath), 'test'), profile: 'test' };
+  if (development && production) throw new Error('开发验收与正式身份验收不能同时启用。');
+  const identity = development ? developmentRuntimeIdentity(appPath) : { ...verifyPackagedAppIdentity(resolve(appPath), production ? 'release' : 'test'), profile: production ? 'production' : 'test' };
   if (!development) verifyPackagedApp(appPath);
   /** 两个进程必须使用同一真实可执行文件。 */
   const executablePath = development ? identity.executablePath : join(resolve(appPath), 'Contents/MacOS', identity.executable);
   assertAppProcess(pid, executablePath);
   /** 复用现有安全发现文件读取和控制协议，不另建模拟接口。 */
   const protocol = await import('../apps/desktop/dist/main/executionHostProtocol.js');
-  /** 复用持久数据根的身份核验，拒绝正式数据和跨根宿主。 */
+  /** 复用持久数据根身份核验；默认拒绝正式数据，显式正式验收仍拒绝跨根宿主。 */
   const { verifyZeusDataRootHostIdentity } = await import('../apps/desktop/dist/main/dataRootIdentity.js');
   /** 数据根由启动本次测试应用时明确指定。 */
   const root = resolve(userDataPath);
@@ -309,19 +310,21 @@ async function main() {
       'runtime-pid': { type: 'string' },
       // 显式检查 pnpm dev，仍要求隔离数据身份及真实进程心跳。
       development: { type: 'boolean', default: false },
+      // 仅供已经明确授权正式身份验收的本地任务；默认仍拒绝正式数据。
+      production: { type: 'boolean', default: false },
     },
   });
   /** 保留原有单个应用包位置参数。 */
   const [appPath] = positionals;
   /** 显式传入空运行参数也必须失败，不能被当成仅检查结构。 */
-  if (values.development && (!values['runtime-root'] || !values['runtime-pid'])) throw new Error('开发验收必须同时提供 runtime-root 和 runtime-pid。');
+  if ((values.development || values.production) && (!values['runtime-root'] || !values['runtime-pid'])) throw new Error('运行验收必须同时提供 runtime-root 和 runtime-pid。');
   const runtimeRequested = values['runtime-root'] !== undefined || values['runtime-pid'] !== undefined;
   if (!appPath || positionals.length !== 1 || (runtimeRequested && (!values['runtime-root']?.trim() || !values['runtime-pid']?.trim()))) {
     throw new Error('用法：node scripts/verify-packaged-app-health.mjs <App绝对路径> [--runtime-root <独立测试数据目录> --runtime-pid <测试界面进程号>]');
   }
   if (runtimeRequested) {
     /** 只有真实进程、宿主身份、端口与推进的心跳均通过才输出运行成功。 */
-    const runtime = await verifyRunningTestApp(appPath, values['runtime-root'], Number(values['runtime-pid']), values.development);
+    const runtime = await verifyRunningTestApp(appPath, values['runtime-root'], Number(values['runtime-pid']), values.development, values.production);
     console.log(`runtime-health=${JSON.stringify(runtime)}`);
     return;
   }
