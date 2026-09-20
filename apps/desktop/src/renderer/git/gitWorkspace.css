@@ -448,7 +448,30 @@
   font-weight: 600;
 }
 
-/* 源码分支菜单按仓库、分支、操作保留三级上下文。 */
+/* 两个工作区共用高度边界，覆盖通用菜单的逻辑尺寸，避免展开后占满窗口。 */
+.macos-ai-app.zeus-shell .project-git-branch-popover {
+  max-block-size: min(560px, calc(100dvh - 80px));
+  overflow: hidden;
+}
+.macos-ai-app .project-git-branch-popover > .project-git-branch-search {
+  flex-shrink: 0;
+}
+.macos-ai-app .project-git-branch-popover > .project-git-branch-popover-scroll {
+  min-block-size: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* 分组首层与标题错开，目录内部继续沿用逐级缩进；只限制整组，避免层层嵌套滚动。 */
+.git-branch-collapsible-group > .git-reference-tree {
+  padding-inline-start: 18px;
+  max-block-size: min(240px, 32dvh);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+/* 源码与 Git 分支菜单按仓库、分支、操作保留三级上下文。 */
 .macos-ai-app .git-repository-branch-submenu {
   width: min(340px, calc(100vw - 16px));
   z-index: 121;
