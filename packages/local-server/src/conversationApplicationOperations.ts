@@ -1829,6 +1829,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
             clientUserMessageId,
             ...(questionAnswer ? { questionAnswer } : {}),
             attachments,
+            allowedAttachmentRoots: trustedConversationAttachmentRoots,
             browserComments,
             ...(browserCommentContent ? { browserCommentContent } : {}),
             ...(conversationContext ? { conversationContext } : {}),

@@ -1485,10 +1485,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
           broadcast = { type: 'conversation.native.error', payload: { conversationId: conversation.id, providerThreadId: threadId, providerTurnId, ...recoveryError } };
         }
       } else if (request.status === 'pending') {
-        const sessionFileEditGrantApplies =
-          requestKind === 'file' &&
-          options.conversations.hasSessionFileEditGrant(conversation.id) &&
-          hasAuditableFileApprovalTarget(params, conversation, contexts.get(conversation.id) ?? contextFromConversation(conversation), options.providerItems);
+        const conversationContext = contexts.get(conversation.id) ?? contextFromConversation(conversation);
+        const sessionFileEditGrantApplies = requestKind === 'file' && options.conversations.hasSessionFileEditGrant(conversation.id) && hasAuditableFileApprovalTarget(params, conversation, conversationContext, options.providerItems);
         let automaticallyApproved = false;
         if (sessionFileEditGrantApplies) {
           try {
@@ -1536,7 +1534,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
               providerTurnId,
               request: nativePendingRequestProjection(request, {
                 conversation,
-                projectRoot: (contexts.get(conversation.id) ?? contextFromConversation(conversation)).projectLocalPath,
+                projectRoot: conversationContext.projectLocalPath,
                 providerItems: options.providerItems,
                 transcripts: options.transcripts,
               }),

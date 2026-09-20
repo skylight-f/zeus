@@ -5341,6 +5341,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   gap: 3px;
 }
 
+.session-codex-parity-v1 .session-request-scope-notice {
+  color: var(--session-text-muted);
+  display: grid;
+  gap: 3px;
+}
+
 .session-codex-parity-v1 .session-pending-request fieldset {
   border: 0;
   margin: 0;

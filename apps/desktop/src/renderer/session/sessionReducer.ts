@@ -1566,14 +1566,38 @@ function reduceTranscriptPlacements(state: NativeSessionState, batch: NativeConv
 /** 实时条目只按持久位置插入；无位置的乐观队列继续保留当前相对顺序。 */
 function sortSessionItemOrder(order: readonly string[], items: Readonly<Record<string, NativeSessionItemBuffer>>): string[] {
   const previousIndex = new Map(order.map((key, index) => [key, index]));
-  return [...order].sort((leftKey, rightKey) => {
-    const left = items[leftKey]?.transcript?.placement.order ?? null;
-    const right = items[rightKey]?.transcript?.placement.order ?? null;
-    if (left !== null && right !== null) return left - right || (items[leftKey]?.transcript?.placement.entryId ?? leftKey).localeCompare(items[rightKey]?.transcript?.placement.entryId ?? rightKey);
-    if (left !== null) return -1;
-    if (right !== null) return 1;
-    return (previousIndex.get(leftKey) ?? 0) - (previousIndex.get(rightKey) ?? 0);
+  const positioned = order
+    .filter((key) => (items[key]?.transcript?.placement.order ?? null) !== null)
+    .sort((leftKey, rightKey) => {
+      const left = items[leftKey]?.transcript?.placement.order ?? null;
+      const right = items[rightKey]?.transcript?.placement.order ?? null;
+      return (left ?? 0) - (right ?? 0) || (items[leftKey]?.transcript?.placement.entryId ?? leftKey).localeCompare(items[rightKey]?.transcript?.placement.entryId ?? rightKey);
+    });
+  const unpositioned = order.filter((key) => (items[key]?.transcript?.placement.order ?? null) === null);
+  const anchoredUserMessages = unpositioned.filter((key) => {
+    const item = items[key];
+    return Boolean(item && isUserMessageItem(item) && !isUnacceptedTranscriptMessage(item) && (item.timelineAt ?? item.updatedAt));
   });
+  const anchoredUserMessageKeys = new Set(anchoredUserMessages);
+  const pending = unpositioned.filter((key) => {
+    const item = items[key];
+    return Boolean(item && isUnacceptedTranscriptMessage(item));
+  });
+  const pendingKeys = new Set(pending);
+  const remaining = unpositioned.filter((key) => !anchoredUserMessageKeys.has(key) && !pendingKeys.has(key));
+  const history = [...positioned];
+  for (const key of anchoredUserMessages.sort((left, right) => (previousIndex.get(left) ?? 0) - (previousIndex.get(right) ?? 0))) {
+    const item = items[key]!;
+    const timestamp = item.timelineAt ?? item.updatedAt!;
+    const insertionIndex = history.findIndex((candidateKey) => {
+      const candidate = items[candidateKey];
+      const candidateTimestamp = candidate?.timelineAt ?? candidate?.updatedAt ?? '';
+      return Boolean(candidateTimestamp && candidateTimestamp > timestamp);
+    });
+    if (insertionIndex < 0) history.push(key);
+    else history.splice(insertionIndex, 0, key);
+  }
+  return [...history, ...remaining, ...pending];
 }
 
 /** 已接纳输入可按持久客户端身份核对原位置；未发送输入不猜位置，也不进入恢复请求。 */

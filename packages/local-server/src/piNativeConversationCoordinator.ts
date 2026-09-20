@@ -1261,6 +1261,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     idempotencyKey: string;
     clientUserMessageId: string;
     attachments?: NativeConversationAttachmentInput[];
+    /** 入队时冻结已由应用校验的附件根，实际派发不得退化为只有项目目录。 */
+    allowedAttachmentRoots?: string[];
     browserComments?: Record<string, unknown>[];
     browserCommentContent?: string;
     conversationContext?: Record<string, unknown>;
@@ -1278,6 +1280,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (options.conversations.getRecordById(input.conversation.id)?.archived) throw piError('ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED', '会话已归档，请先恢复会话再继续。');
     const cwd = input.cwd;
     const createdAt = options.now();
+    const allowedAttachmentRoots = uniquePaths(input.allowedAttachmentRoots ?? []);
     const submission = options.submissions.createOrGet({
       id: input.submissionId,
       conversationId: input.conversation.id,
@@ -1308,6 +1311,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           thinkingLevel: input.thinkingLevel,
           permissionMode: input.permissionMode ?? input.conversation.permissionMode,
           holdDispatch: input.holdDispatch ?? true,
+          ...(allowedAttachmentRoots.length > 0 ? { allowedAttachmentRoots } : {}),
         },
       },
       createdAt,
@@ -1337,6 +1341,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (!next || next.executionSnapshotId) return;
     const persisted = asRecord(JSON.parse(next.inputJson));
     const persistedContext = asRecord(persisted.context);
+    const persistedAttachmentRoots = Array.isArray(persistedContext.allowedAttachmentRoots) ? persistedContext.allowedAttachmentRoots.filter((root): root is string => typeof root === 'string' && Boolean(root.trim())) : [];
     const content = typeof persisted.text === 'string' ? persisted.text : '';
     const settings = options.conversations.getNextTurnSettings(conversationId);
     const selectedModelRef = settings?.model ? parseModelRef(settings.model) : null;
@@ -1353,7 +1358,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       idempotencyKey: next.idempotencyKey,
       clientUserMessageId: next.clientMessageId,
       attachments: Array.isArray(persisted.attachments) ? (persisted.attachments as NativeConversationAttachmentInput[]) : [],
-      allowedAttachmentRoots: typeof persistedContext.projectLocalPath === 'string' ? [persistedContext.projectLocalPath] : [],
+      allowedAttachmentRoots: uniquePaths([...(typeof persistedContext.projectLocalPath === 'string' ? [persistedContext.projectLocalPath] : []), ...persistedAttachmentRoots]),
       browserComments: Array.isArray(persisted.browserComments) ? persisted.browserComments.filter(isRecord) : [],
       ...(typeof persisted.browserCommentContent === 'string' ? { browserCommentContent: persisted.browserCommentContent } : {}),
       ...(isRecord(persisted.conversationContext) ? { conversationContext: persisted.conversationContext } : {}),
@@ -2113,6 +2118,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       write: request.toolName === 'write' || request.toolName === 'edit',
       readableRoots: [...context.attachmentRoots, ...context.pluginSkillRoots],
     });
+    // 项目外目标必须绑定原始工具参数逐次审批；批准只放行当前调用，不扩大后续根目录。
     if (target.requiresApproval && !(await requestApproval(context, request))) throw piError('ZEUS_PI_TOOL_DECLINED', '用户已拒绝访问该路径。');
     const path = target.path;
     const imageMime = resolvePiImageMime('image/*', path);

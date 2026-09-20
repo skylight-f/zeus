@@ -1,5 +1,6 @@
 import { type CSSProperties, type KeyboardEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRightIcon as ArrowRight } from '@phosphor-icons/react/dist/csr/ArrowRight';
+import { BookOpenIcon as BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { InfoIcon as Info } from '@phosphor-icons/react/dist/csr/Info';
@@ -84,25 +85,27 @@ const labels = {
     incompleteApprovalHelp: 'Zeus 无法确认命令或文件目标，因此只提供拒绝或取消操作。',
     fileTargetUnavailable: '文件目标尚未同步',
     fileTargetUnavailableHelp: 'Zeus 暂时无法确认本次修改的文件目标，因此只提供拒绝或取消操作。',
-    fileTargetOutsideProject: '文件不在当前项目内',
-    fileTargetOutsideProjectHelp: 'Zeus 只允许审批当前项目内可审计的文件；以下项目外目标只能拒绝或取消。',
-    fileTargetProviderScope: '无法确认申请访问的范围',
-    fileTargetProviderScopeHelp: '这个请求申请访问整个 AI 工具的工作范围，超出了当前项目的文件权限，因此不能允许。',
+    fileTargetOutsideProject: '文件位于当前项目外',
+    fileTargetOutsideProjectHelp: '这次授权会访问下方项目外目标；请确认路径和操作符合预期。',
+    fileTargetProviderScope: '请求扩展文件访问范围',
+    fileTargetProviderScopeHelp: 'Codex 请求访问下方目录。允许一次只批准当前操作；本会话允许会把该决定交给 Codex 用于本会话。',
     cwd: '工作目录',
     mode: '当前模式',
     required: '必填',
     terminal: '终端',
     fileChange: '文件变更',
     runCommand: '运行命令',
+    readFiles: '读取文件',
     editFiles: '编辑文件',
     commandQuestion: '是否允许 Zeus 运行以下命令？',
+    fileReadQuestion: '是否允许 Zeus 读取以下文件？',
     fileQuestion: '是否允许 Zeus 编辑以下文件？',
     moreFiles: (count: number) => `另有 ${count} 个文件`,
     grantOptions: '授权选项',
     similarCommandRule: '适用规则',
     fullAccess: '允许所有（完全访问）',
     fullAccessScope: '允许本次，完全访问从下一轮生效',
-    allEditScope: '本次对话中，后续只会自动允许已确认属于当前项目的文件访问；项目外文件仍会被拒绝。',
+    allEditScope: '把本次文件授权交给 Codex，并允许它在本会话中沿用。请先核对上方显示的访问范围。',
   },
   'en-US': {
     approval: 'Approval required',
@@ -130,24 +133,26 @@ const labels = {
     fileTargetUnavailable: 'File target not yet available',
     fileTargetUnavailableHelp: 'Zeus cannot yet verify the file target for this change. Only decline or cancel actions are available.',
     fileTargetOutsideProject: 'File is outside the current project',
-    fileTargetOutsideProjectHelp: 'Zeus only permits auditable files inside the current project. The targets below can only be declined or cancelled.',
-    fileTargetProviderScope: 'Cannot verify the requested access',
-    fileTargetProviderScopeHelp: 'This request asks for access across the AI tool’s working area, beyond this project’s file permissions. It cannot be approved.',
+    fileTargetOutsideProjectHelp: 'This approval accesses the target below outside the project. Confirm that the path and operation are expected.',
+    fileTargetProviderScope: 'Expanded file access requested',
+    fileTargetProviderScopeHelp: 'Codex requested access to the directory below. Allow once approves this operation; allow for session lets Codex reuse the decision during this session.',
     cwd: 'Working directory',
     mode: 'Current mode',
     required: 'Required',
     terminal: 'Terminal',
     fileChange: 'File changes',
     runCommand: 'Run command',
+    readFiles: 'Read files',
     editFiles: 'Edit files',
     commandQuestion: 'Allow Zeus to run the following command?',
+    fileReadQuestion: 'Allow Zeus to read the following files?',
     fileQuestion: 'Allow Zeus to edit the following files?',
     moreFiles: (count: number) => `${count} more file${count === 1 ? '' : 's'}`,
     grantOptions: 'Grant options',
     similarCommandRule: 'Applies to',
     fullAccess: 'Allow all (full access)',
     fullAccessScope: 'Allow this request; full access starts next turn',
-    allEditScope: 'During this conversation, only verified file access within the current project will be allowed automatically. Access outside the project will still be denied.',
+    allEditScope: 'Send this file grant to Codex and allow it to reuse the decision during this session. Review the displayed scope first.',
   },
 } as const;
 
@@ -204,7 +209,7 @@ export function PendingRequestSurface(props: PendingRequestSurfaceProps) {
     if (kind === 'command' || kind === 'file') {
       const filePaths = kind === 'file' ? approvalFilePaths(props.request, props.filePaths) : [];
       const approvalIssue = approvalIssueFor(props.request, props.language, filePaths);
-      const compactDecisions = approvalIssue ? decisions.filter(isFailClosedDecision) : decisions;
+      const compactDecisions = approvalIssue?.blocksApproval ? decisions.filter(isFailClosedDecision) : decisions;
       return (
         <CompactApprovalPanel
           request={props.request}
@@ -288,7 +293,7 @@ interface CompactApprovalPanelProps {
   busy: boolean;
   error?: string | null;
   autoFocus: boolean;
-  approvalIssue: { title: string; help: string } | null;
+  approvalIssue: ApprovalIssue | null;
   permissionMode: NativePermissionMode;
   onDecision: (decision: SupportedRequestDecision) => void;
   /** 完全访问属于会话设置，不伪造成引擎支持的审批决定。 */
@@ -311,7 +316,7 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
   /** 只在本次确实可批准且提供持久化入口时展示完全访问。 */
   const menuDecisions: Array<SupportedRequestDecision | 'full-access'> = [
     ...grantDecisions,
-    ...(hasAllowOnce && !props.approvalIssue && props.permissionMode !== 'full-access' && props.onAllowFullAccess ? (['full-access'] as const) : []),
+    ...(hasAllowOnce && !props.approvalIssue?.blocksApproval && props.permissionMode !== 'full-access' && props.onAllowFullAccess ? (['full-access'] as const) : []),
     ...(props.kind === 'command' && props.decisions.includes('cancel') && failClosedDecision !== 'cancel' ? (['cancel'] as const) : []),
   ];
   const extraFailClosedDecision = grantDecisions.length === 0 && failClosedDecision === 'decline' && props.decisions.includes('cancel') ? 'cancel' : null;
@@ -362,7 +367,8 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
 
   const preview = requestPreview(props.request, copy.cwd);
   const mode = permissionModeLabel(props.permissionMode, props.language);
-  const Icon = props.kind === 'command' ? TerminalWindow : PencilSimple;
+  const fileRead = props.kind === 'file' && isReadOnlyFileApprovalRequest(props.request);
+  const Icon = props.kind === 'command' ? TerminalWindow : fileRead ? BookOpen : PencilSimple;
   return (
     <section className="session-pending-request session-approval-request is-compact-approval" aria-busy={props.busy || undefined}>
       <fieldset disabled={props.busy}>
@@ -370,15 +376,15 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
         <header className="session-compact-approval-heading">
           <span className="session-compact-approval-identity">
             <Icon aria-hidden="true" />
-            <span>{props.kind === 'command' ? copy.runCommand : copy.editFiles}</span>
+            <span>{props.kind === 'command' ? copy.runCommand : fileRead ? copy.readFiles : copy.editFiles}</span>
           </span>
           <span className="session-compact-approval-mode" title={`${copy.mode}: ${mode}`}>
             {mode}
           </span>
         </header>
-        <h2 className="session-compact-approval-question zeus-fidelity-text">{props.kind === 'command' ? copy.commandQuestion : copy.fileQuestion}</h2>
+        <h2 className="session-compact-approval-question zeus-fidelity-text">{props.kind === 'command' ? copy.commandQuestion : fileRead ? copy.fileReadQuestion : copy.fileQuestion}</h2>
         {props.approvalIssue ? (
-          <p className="session-request-invalid" role="alert">
+          <p className={props.approvalIssue.blocksApproval ? 'session-request-invalid' : 'session-request-scope-notice'} role={props.approvalIssue.blocksApproval ? 'alert' : 'status'}>
             <strong>{props.approvalIssue.title}</strong>
             <span>{props.approvalIssue.help}</span>
           </p>
@@ -517,19 +523,25 @@ function approvalFilePaths(request: NativePendingRequest, linkedPaths: readonly 
   return [...new Set(candidates.flatMap((value) => (typeof value === 'string' && value.trim() ? [value.trim()] : [])))];
 }
 
-function approvalIssueFor(request: NativePendingRequest, language: SessionUiLanguage, filePaths: readonly string[]): { title: string; help: string } | null {
+interface ApprovalIssue {
+  title: string;
+  help: string;
+  blocksApproval: boolean;
+}
+
+function approvalIssueFor(request: NativePendingRequest, language: SessionUiLanguage, filePaths: readonly string[]): ApprovalIssue | null {
   const copy = labels[language];
   if (requestKind(request) === 'command') {
-    return hasCompleteApprovalDetails(request) ? null : { title: copy.incompleteApproval, help: copy.incompleteApprovalHelp };
+    return hasCompleteApprovalDetails(request) ? null : { title: copy.incompleteApproval, help: copy.incompleteApprovalHelp, blocksApproval: true };
   }
   const audit = fileApprovalAudit(request);
   if (!audit) {
-    return hasCompleteApprovalDetails(request) && filePaths.length > 0 ? null : { title: copy.incompleteApproval, help: copy.incompleteApprovalHelp };
+    return hasCompleteApprovalDetails(request) && filePaths.length > 0 ? null : { title: copy.incompleteApproval, help: copy.incompleteApprovalHelp, blocksApproval: true };
   }
   if (audit.status === 'auditable' && filePaths.length > 0) return null;
-  if (audit.status === 'outside_project') return { title: copy.fileTargetOutsideProject, help: copy.fileTargetOutsideProjectHelp };
-  if (audit.status === 'provider_root_scope') return { title: copy.fileTargetProviderScope, help: copy.fileTargetProviderScopeHelp };
-  return { title: copy.fileTargetUnavailable, help: copy.fileTargetUnavailableHelp };
+  if (audit.status === 'outside_project' && filePaths.length > 0) return { title: copy.fileTargetOutsideProject, help: copy.fileTargetOutsideProjectHelp, blocksApproval: false };
+  if (audit.status === 'provider_root_scope' && filePaths.length > 0) return { title: copy.fileTargetProviderScope, help: copy.fileTargetProviderScopeHelp, blocksApproval: false };
+  return { title: copy.fileTargetUnavailable, help: copy.fileTargetUnavailableHelp, blocksApproval: true };
 }
 
 function fileApprovalAudit(request: NativePendingRequest): NativePendingRequest['fileApproval'] | null {
@@ -1404,10 +1416,7 @@ export function supportedRequestDecisions(request: NativePendingRequest): Suppor
     decisions = decisions.length > 0 ? decisions.filter((decision) => decision !== 'acceptForSession' && (requestValid || decision !== 'accept')) : requestValid ? ['accept', 'decline', 'cancel'] : ['decline', 'cancel'];
     return ensureFailClosedDecisions(decisions);
   }
-  if (kind === 'file') {
-    if (request.payload.grantRoot !== undefined && request.payload.grantRoot !== null) decisions = decisions.filter((decision) => decision !== 'accept' && decision !== 'acceptForSession');
-  }
-  if (kind === 'file' && decisions.length === 0 && advertised.length === 0 && hasCanonicalLinkedFileApprovalDetails(request)) decisions = ['accept', 'acceptForSession', 'decline', 'cancel'];
+  if (kind === 'file' && decisions.length === 0 && advertised.length === 0 && hasCompleteApprovalDetails(request)) decisions = ['accept', 'acceptForSession', 'decline', 'cancel'];
   if (decisions.length === 0) decisions = ['decline', 'cancel'];
   if (!hasCompleteApprovalDetails(request)) return ensureFailClosedDecisions(decisions.filter(isFailClosedDecision));
   return ensureFailClosedDecisions(decisions);
@@ -1481,7 +1490,7 @@ function hasCompleteApprovalDetails(request: NativePendingRequest): boolean {
   }
   if (kind === 'file') {
     const audit = fileApprovalAudit(request);
-    if (audit) return audit.status === 'auditable' && audit.paths.length > 0;
+    if (audit) return audit.status !== 'unavailable' && audit.paths.length > 0;
     return Boolean(stringValue(request.payload.path) ?? stringValue(request.payload.filePath) ?? stringValue(request.payload.grantRoot)) || hasCanonicalLinkedFileApprovalDetails(request);
   }
   return true;
@@ -1506,15 +1515,19 @@ function requestImpact(request: NativePendingRequest, language: SessionUiLanguag
   if (explicit) return explicit;
   const kind = requestKind(request);
   if (language === 'zh-CN') {
-    if (kind === 'file') return '允许本轮修改工作区文件。';
+    if (kind === 'file') return isReadOnlyFileApprovalRequest(request) ? '允许本次读取所列文件。' : '允许本次修改所列文件。';
     if (kind === 'permissions') return 'Zeus 暂不支持这种权限请求，因此不能允许。';
     if (kind === 'mcp') return '向插件服务发送下方所示的 JSON 格式回答。';
     return '允许本轮执行所列命令。';
   }
-  if (kind === 'file') return 'Allows this turn to modify workspace files.';
+  if (kind === 'file') return isReadOnlyFileApprovalRequest(request) ? 'Allows this request to read the listed files.' : 'Allows this request to modify the listed files.';
   if (kind === 'permissions') return 'Zeus does not support this type of permission request, so it cannot be approved.';
   if (kind === 'mcp') return 'Send the JSON response shown below to the plugin service.';
   return 'Allows this turn to execute the listed command.';
+}
+
+function isReadOnlyFileApprovalRequest(request: NativePendingRequest): boolean {
+  return requestKind(request) === 'file' && (request.payload.toolName === 'read' || request.payload.toolName === 'view_image');
 }
 
 function requestPreview(request: NativePendingRequest, cwdLabel: string): string {

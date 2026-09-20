@@ -519,6 +519,12 @@ export function hasAuditableFileApprovalTarget(payload: Record<string, unknown>,
   return inspectFileApprovalTargets(payload, conversation, context.projectLocalPath, providerItems).status === 'auditable';
 }
 
+/** 人工文件审批可以覆盖明确展示的项目外目标；缺失路径时仍必须保守拒绝。 */
+export function hasReviewableFileApprovalTarget(payload: Record<string, unknown>, conversation: ZeusConversationWithMessagesRecord, context: ConversationDispatchContext, providerItems: ConversationProviderItemRepository): boolean {
+  const audit = inspectFileApprovalTargets(payload, conversation, context.projectLocalPath, providerItems);
+  return audit.status !== 'unavailable' && audit.paths.length > 0;
+}
+
 export function inspectFileApprovalTargets(payload: Record<string, unknown>, conversation: ZeusConversationRecord, projectRoot: string | null, providerItems: ConversationProviderItemRepository): FileApprovalTargetAudit {
   if (!projectRoot || !existingDirectoryRealpath(projectRoot)) return { status: 'unavailable', paths: [] };
 

@@ -2,7 +2,10 @@ import type { NativeQueuedSubmission, NativeQueueSnapshot, NativeSessionItemBuff
 
 /** 仅未确认接纳的本地消息进入待发区域；等待原生回显不等于仍在排队。 */
 export function isUnacceptedTranscriptMessage(item: NativeSessionItemBuffer): boolean {
-  if (!item.optimistic || item.providerItemId || item.status === 'active' || item.status === 'completed' || item.status === 'resolved') return false;
+  if (!item.optimistic || item.providerItemId) return false;
+  // 失败或暂停已经形成明确的历史结果，继续把它当作待发消息会在每次新事件排序时
+  // 推到会话末尾，使错误看起来属于最新一条消息。
+  if (item.status !== 'queued' && item.status !== 'dispatching' && item.status !== 'steering') return false;
   // 已交给当前轮次的引导消息沿用发言位置，不能等待原生回显才退出队尾。
   return !(item.payload.delivery === 'steer_now' && item.status === 'steering');
 }

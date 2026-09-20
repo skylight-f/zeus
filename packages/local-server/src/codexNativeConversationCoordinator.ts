@@ -62,7 +62,7 @@ import {
   evaluateCommandApproval,
   existingDirectoryRealpath,
   failedTurnErrorFromRecord,
-  hasAuditableFileApprovalTarget,
+  hasReviewableFileApprovalTarget,
   invalidServerRequestResponse,
   isAdvertisedCommandDecision,
   isExecpolicyAmendmentDecision,
@@ -2226,10 +2226,8 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     }
     if (request.requestKind === 'file') {
       if (response.type !== 'file') throw invalidServerRequestResponse('Response type does not match the pending file approval.');
-      if (isGrantDecision(response.decision) && payload.grantRoot !== undefined && payload.grantRoot !== null) {
-        throw invalidServerRequestResponse('File approvals cannot grant provider-requested root scope.');
-      } else if (isGrantDecision(response.decision) && !hasAuditableFileApprovalTarget(payload, conversation, context, options.providerItems)) {
-        throw invalidServerRequestResponse('The pending file approval does not identify an auditable project-local target.');
+      if (isGrantDecision(response.decision) && !hasReviewableFileApprovalTarget(payload, conversation, context, options.providerItems)) {
+        throw invalidServerRequestResponse('The pending file approval does not identify a reviewable target.');
       }
     }
     if (request.requestKind === 'permissions') {
