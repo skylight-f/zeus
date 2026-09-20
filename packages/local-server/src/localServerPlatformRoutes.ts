@@ -101,6 +101,8 @@ import { registerDigitalTeamWorkflowRoutes } from './digitalTeamWorkflowRoutes.j
 import { registerConversationCapabilityQueryRoutes } from './conversationCapabilityQueryRoutes.js';
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
 import { AttentionQueryApplication } from './attentionQueryApplication.js';
+import { AttentionStateApplication } from './attentionStateApplication.js';
+import { registerAttentionRoutes } from './attentionRoutes.js';
 import { registerConversationChoiceQueryRoutes } from './conversationChoiceQueryRoutes.js';
 import { registerConversationCommandRoutes } from './conversationCommandRoutes.js';
 import { registerConversationDispatchCommandRoutes } from './conversationDispatchCommandRoutes.js';
@@ -3190,7 +3192,13 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     automationTasks,
     redact: (text) => redactSensitiveText(text).text,
   });
-  server.get('/api/attention', async () => attentionQueries.read());
+  registerAttentionRoutes({
+    server,
+    application: new AttentionStateApplication({ queries: attentionQueries, settings, now }),
+    commands: settingsCommands,
+    publish: publishRealtimeEvent,
+    redactSensitiveText,
+  });
 
   server.get('/api/codex/account', async (_request, reply) => {
     try {

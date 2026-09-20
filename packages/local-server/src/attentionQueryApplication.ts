@@ -161,7 +161,8 @@ export class AttentionQueryApplication {
           source: 'digital_team',
           sourceTitle: task.title,
           createdAt: attempt.createdAt,
-          revision: `${run.revision}:${attempt.revision}`,
+          // 同一节点的提醒不因其他节点推进而变成新版本。
+          revision: String(attempt.revision),
           blocking: true,
           bucket: 'pending',
           target: { kind: 'digital_team', runId: run.id, nodeId: attempt.nodeId },
