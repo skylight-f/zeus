@@ -1152,8 +1152,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         setProjectDetail(selectedCreatedProject);
         activeProjectIdRef.current = selectedCreatedProject.id;
         setConversationDraftOpen(false);
-        setActiveNavTarget('projects');
-        setActiveProjectSection('tasks');
+        const defaultSection = appShellSettings.mainLayout === 'current' ? 'sessions' : 'tasks';
+        setActiveNavTarget(defaultSection === 'sessions' ? 'conversations' : 'projects');
+        setActiveProjectSection(defaultSection);
       }
     } catch (error) {
       setProjectCreateError(errorToLocalUiMessage(error, appShellSettings.appLanguage));
