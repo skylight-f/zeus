@@ -1432,7 +1432,14 @@ export function SidebarNav(props: {
       )}
       {/* 尚未添加项目时不渲染搜索与列表；筛选无匹配仍保留搜索入口。 */}
       {props.projects.length > 0 ? (
-        <section className="project-sidebar-list zeus-source-list" role="navigation" data-source-list-keyboard="vertical" aria-label={copy.projectListLabel} onKeyDown={handleSourceListKeyboardNavigation} onScroll={handleSidebarScroll}>
+        <section
+          className={`project-sidebar-list zeus-source-list${props.mainLayout === 'current' ? ' project-sidebar-list-fixed-heading' : ''}`}
+          role="navigation"
+          data-source-list-keyboard="vertical"
+          aria-label={copy.projectListLabel}
+          onKeyDown={handleSourceListKeyboardNavigation}
+          onScroll={props.mainLayout === 'current' ? undefined : handleSidebarScroll}
+        >
           <div className="project-sidebar-heading">
             <label className="project-sidebar-search-field" onKeyDown={handleProjectSearchKeyDown}>
               <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -1520,202 +1527,211 @@ export function SidebarNav(props: {
               ) : null}
             </span>
           </div>
-          {visibleProjects.length === 0 ? (
-            <section className="project-inline-recovery-row project-search-empty-row" aria-label={hasConversationFilter ? copy.noConversationMatches : copy.noProjectMatches}>
-              <span className="project-inline-recovery-copy">
-                <strong>{hasConversationFilter ? copy.noConversationMatches : copy.noProjectMatches}</strong>
-              </span>
-            </section>
-          ) : (
-            visibleProjects.map((project) => {
-              const isActiveProject =
-                project.id === props.activeProjectId && props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
-              const pinned = props.pinnedProjectIds.includes(project.id);
-              const expanded = !props.collapsedProjectIds.includes(project.id);
-              const menuOpen = openProjectMenuIds.has(project.id);
-              const menuClosing = closingProjectMenuIds.has(project.id);
-              const menuVisible = menuOpen || menuClosing;
-              const menuPosition = projectMenuPositions.get(project.id);
-              const conversationGroup = filteredConversationGroups.find((group) => group.projectId === project.id);
-              const projectMatchesSearch = project.name.toLocaleLowerCase().includes(projectSearchQuery.trim().toLocaleLowerCase()) || project.localPath.toLocaleLowerCase().includes(projectSearchQuery.trim().toLocaleLowerCase());
-              const projectMorePopover =
-                menuVisible && menuPosition ? (
-                  <div
-                    id={`project-more-menu-${project.id}`}
-                    className="project-more-popover zeus-quiet-more-menu"
-                    role="menu"
-                    aria-label={`${project.name} ${copy.moreProjectActionsPrefix}`}
-                    data-motion-surface="popover"
-                    data-motion-state={menuClosing ? 'closing' : 'open'}
-                    inert={menuClosing}
-                    aria-hidden={menuClosing}
-                    onTransitionEnd={(event) => {
-                      if (menuClosing && event.target === event.currentTarget && event.propertyName === 'opacity') closeProjectMoreMenu(project.id);
-                    }}
-                    style={{ left: menuPosition.left, top: menuPosition.top }}
-                    onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}
-                  >
-                    {/* 项目菜单提升到应用壳层，位置只由“更多”按钮的视口坐标决定，避免被侧栏滚动容器横向裁剪。 */}
-                    <button
-                      type="button"
-                      role="menuitem"
-                      onClick={() => {
-                        props.onTogglePinnedProject(project.id);
-                        closeProjectMoreMenuWithMotion(project.id);
+          <div className="project-sidebar-list-content" onScroll={props.mainLayout === 'current' ? handleSidebarScroll : undefined}>
+            {visibleProjects.length === 0 ? (
+              <section className="project-inline-recovery-row project-search-empty-row" aria-label={hasConversationFilter ? copy.noConversationMatches : copy.noProjectMatches}>
+                <span className="project-inline-recovery-copy">
+                  <strong>{hasConversationFilter ? copy.noConversationMatches : copy.noProjectMatches}</strong>
+                </span>
+              </section>
+            ) : (
+              visibleProjects.map((project) => {
+                const isActiveProject =
+                  project.id === props.activeProjectId && props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
+                const pinned = props.pinnedProjectIds.includes(project.id);
+                const expanded = Boolean(scopeToCurrentProject) || !props.collapsedProjectIds.includes(project.id);
+                const menuOpen = openProjectMenuIds.has(project.id);
+                const menuClosing = closingProjectMenuIds.has(project.id);
+                const menuVisible = menuOpen || menuClosing;
+                const menuPosition = projectMenuPositions.get(project.id);
+                const conversationGroup = filteredConversationGroups.find((group) => group.projectId === project.id);
+                const projectMatchesSearch = project.name.toLocaleLowerCase().includes(projectSearchQuery.trim().toLocaleLowerCase()) || project.localPath.toLocaleLowerCase().includes(projectSearchQuery.trim().toLocaleLowerCase());
+                const projectMorePopover =
+                  menuVisible && menuPosition ? (
+                    <div
+                      id={`project-more-menu-${project.id}`}
+                      className="project-more-popover zeus-quiet-more-menu"
+                      role="menu"
+                      aria-label={`${project.name} ${copy.moreProjectActionsPrefix}`}
+                      data-motion-surface="popover"
+                      data-motion-state={menuClosing ? 'closing' : 'open'}
+                      inert={menuClosing}
+                      aria-hidden={menuClosing}
+                      onTransitionEnd={(event) => {
+                        if (menuClosing && event.target === event.currentTarget && event.propertyName === 'opacity') closeProjectMoreMenu(project.id);
                       }}
+                      style={{ left: menuPosition.left, top: menuPosition.top }}
+                      onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}
                     >
-                      <span className="project-more-menu-icon" aria-hidden="true">
-                        {pinned ? <PushPinSlash weight="regular" /> : <PushPin weight="regular" />}
-                      </span>
-                      <span>{pinned ? copy.unpinProject : copy.pinProject}</span>
-                    </button>
-                    <button
-                      type="button"
-                      role="menuitem"
-                      onClick={() => {
-                        closeProjectMoreMenuWithMotion(project.id);
-                        void props.onRevealProjectInFinder(project.localPath).catch(() => undefined);
-                      }}
-                    >
-                      <span className="project-more-menu-icon" aria-hidden="true">
-                        <FolderOpen weight="regular" />
-                      </span>
-                      <span>{copy.revealProjectInFinder}</span>
-                    </button>
-                    <button type="button" role="menuitem" onClick={() => openProjectRenameDialog(project)}>
-                      <span className="project-more-menu-icon" aria-hidden="true">
-                        <PencilSimple weight="regular" />
-                      </span>
-                      <span>{copy.renameProject}</span>
-                    </button>
-                    <button type="button" role="menuitem" className="project-menu-remove-action" onClick={() => props.onPrepareProjectDelete(project.id)}>
-                      <span className="project-more-menu-icon" aria-hidden="true">
-                        <X weight="regular" />
-                      </span>
-                      <span>{copy.deleteProject}</span>
-                    </button>
-                    {props.pendingProjectDeleteId === project.id ? (
+                      {/* 项目菜单提升到应用壳层，位置只由“更多”按钮的视口坐标决定，避免被侧栏滚动容器横向裁剪。 */}
                       <button
                         type="button"
                         role="menuitem"
-                        className="danger-action project-menu-confirm-remove-action"
                         onClick={() => {
-                          props.onConfirmProjectDelete(project.id);
+                          props.onTogglePinnedProject(project.id);
                           closeProjectMoreMenuWithMotion(project.id);
                         }}
                       >
                         <span className="project-more-menu-icon" aria-hidden="true">
-                          <X weight="bold" />
+                          {pinned ? <PushPinSlash weight="regular" /> : <PushPin weight="regular" />}
                         </span>
-                        <span>{copy.confirmDeleteProject}</span>
+                        <span>{pinned ? copy.unpinProject : copy.pinProject}</span>
                       </button>
-                    ) : null}
-                  </div>
-                ) : null;
-              return (
-                <section
-                  className="project-sidebar-item"
-                  key={project.id}
-                  aria-label={`${copy.projects}${copy.labelSeparator}${project.name}`}
-                  data-motion-surface="list-item"
-                  data-motion-state={enteringProjectIds.has(project.id) ? 'entering' : undefined}
-                >
-                  <SourceListRow
-                    level="root"
-                    surface="fill"
-                    expanded={showConversationNavigation ? expanded : undefined}
-                    disclosure={
-                      showConversationNavigation ? (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          closeProjectMoreMenuWithMotion(project.id);
+                          void props.onRevealProjectInFinder(project.localPath).catch(() => undefined);
+                        }}
+                      >
+                        <span className="project-more-menu-icon" aria-hidden="true">
+                          <FolderOpen weight="regular" />
+                        </span>
+                        <span>{copy.revealProjectInFinder}</span>
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => openProjectRenameDialog(project)}>
+                        <span className="project-more-menu-icon" aria-hidden="true">
+                          <PencilSimple weight="regular" />
+                        </span>
+                        <span>{copy.renameProject}</span>
+                      </button>
+                      <button type="button" role="menuitem" className="project-menu-remove-action" onClick={() => props.onPrepareProjectDelete(project.id)}>
+                        <span className="project-more-menu-icon" aria-hidden="true">
+                          <X weight="regular" />
+                        </span>
+                        <span>{copy.deleteProject}</span>
+                      </button>
+                      {props.pendingProjectDeleteId === project.id ? (
                         <button
                           type="button"
-                          className="project-disclosure-button"
-                          aria-label={`${expanded ? copy.collapseProjectPrefix : copy.expandProjectPrefix}${copy.labelSeparator}${project.name}`}
-                          aria-expanded={expanded}
-                          onClick={() => toggleProjectCollapsed(project.id, expanded)}
+                          role="menuitem"
+                          className="danger-action project-menu-confirm-remove-action"
+                          onClick={() => {
+                            props.onConfirmProjectDelete(project.id);
+                            closeProjectMoreMenuWithMotion(project.id);
+                          }}
                         >
-                          <span aria-hidden="true">
-                            <CaretRight weight="regular" />
+                          <span className="project-more-menu-icon" aria-hidden="true">
+                            <X weight="bold" />
                           </span>
+                          <span>{copy.confirmDeleteProject}</span>
                         </button>
-                      ) : undefined
-                    }
-                    disclosurePlacement={showConversationNavigation ? 'trailing' : undefined}
-                    icon={
-                      <svg className="native-folder-icon zeus-avatar-token" viewBox="0 0 20 20" focusable="false" aria-hidden="true">
-                        <path d="M2.8 6.4h5.1l1.4 1.5h7.9v7.7a1.4 1.4 0 0 1-1.4 1.4H4.2a1.4 1.4 0 0 1-1.4-1.4Z" />
-                        <path d="M2.8 6.4V5.7a1.4 1.4 0 0 1 1.4-1.4h3.4l1.5 2.1" />
-                      </svg>
-                    }
-                    label={<strong>{project.name}</strong>}
-                    buttonProps={{
-                      type: 'button',
-                      tabIndex: isActiveProject ? 0 : -1,
-                      'data-source-list-item': 'true',
-                      'aria-label':
-                        project.id === temporaryWorkspaceId ? (props.appLanguage === 'zh-CN' ? '临时会话' : 'Temporary conversations') : `${props.appLanguage === 'zh-CN' ? '项目' : 'Project'}${copy.labelSeparator}${project.name}`,
-                      'aria-current': isActiveProject ? 'true' : undefined,
-                      // 侧边栏项目名称固定作为该项目的任务页入口。
-                      onClick: () => props.onOpenProjectSection(project, project.id === temporaryWorkspaceId ? 'sessions' : 'tasks'),
-                    }}
-                    actions={
-                      project.id === temporaryWorkspaceId ? undefined : (
-                        <>
-                          <button type="button" className="project-settings-button" aria-label={`${copy.projectSettingsPrefix}${copy.labelSeparator}${project.name}`} onClick={() => props.onOpenProjectSection(project, 'project-settings')}>
-                            <GearSix aria-hidden="true" weight="regular" />
-                          </button>
-                          <div className={`project-row-actions ${menuOpen ? 'open' : ''} ${menuClosing ? 'closing' : ''}`.trim()} onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}>
+                      ) : null}
+                    </div>
+                  ) : null;
+                return (
+                  <section
+                    className="project-sidebar-item"
+                    key={project.id}
+                    aria-label={`${copy.projects}${copy.labelSeparator}${project.name}`}
+                    data-motion-surface="list-item"
+                    data-motion-state={enteringProjectIds.has(project.id) ? 'entering' : undefined}
+                  >
+                    {!scopeToCurrentProject ? (
+                      <SourceListRow
+                        level="root"
+                        surface="fill"
+                        expanded={showConversationNavigation ? expanded : undefined}
+                        disclosure={
+                          showConversationNavigation ? (
                             <button
                               type="button"
-                              className="project-more-button"
-                              ref={(button) => {
-                                if (button) {
-                                  projectMenuButtonRefs.current.set(project.id, button);
-                                } else {
-                                  projectMenuButtonRefs.current.delete(project.id);
-                                }
-                              }}
-                              aria-label={`${copy.moreProjectActionsPrefix}${copy.labelSeparator}${project.name}`}
-                              aria-haspopup="menu"
-                              aria-expanded={menuOpen}
-                              aria-controls={menuVisible ? `project-more-menu-${project.id}` : undefined}
-                              onClick={(event) => toggleProjectMoreMenu(project.id, event.currentTarget)}
+                              className="project-disclosure-button"
+                              aria-label={`${expanded ? copy.collapseProjectPrefix : copy.expandProjectPrefix}${copy.labelSeparator}${project.name}`}
+                              aria-expanded={expanded}
+                              onClick={() => toggleProjectCollapsed(project.id, expanded)}
                             >
-                              <DotsThreeVertical aria-hidden="true" weight="regular" />
+                              <span aria-hidden="true">
+                                <CaretRight weight="regular" />
+                              </span>
                             </button>
-                          </div>
-                          {projectMorePopover ? (projectMenuPortalHost ? createPortal(projectMorePopover, projectMenuPortalHost) : projectMorePopover) : null}
-                        </>
-                      )
-                    }
-                  />
-                  {showConversationNavigation && conversationGroup && ((conversationGroup.conversations?.length ?? 0) > 0 || conversationGroup.tasks.some((task) => task.conversations.length > 0)) ? (
-                    <Collapsible open={expanded}>
-                      <div className="project-sidebar-conversations">
-                        <ProjectConversationTree
-                          groups={[conversationGroup]}
-                          selectedConversationId={props.selectedConversationId}
-                          conversationStates={props.conversationStates}
-                          onSelectConversation={props.onSelectConversation}
-                          onArchiveConversation={props.onArchiveConversation}
-                          language={props.appLanguage}
-                          compactProjectLabel
-                          showEmptyState={false}
-                          query={projectMatchesSearch ? '' : projectSearchQuery}
-                          visibleConversationCount={visibleConversationCountByProject[project.id] ?? defaultVisibleConversationCount}
-                          onShowMore={() =>
-                            setVisibleConversationCountByProject((current) => ({
-                              ...current,
-                              [project.id]: (current[project.id] ?? defaultVisibleConversationCount) + additionalVisibleConversationCount,
-                            }))
-                          }
-                        />
-                      </div>
-                    </Collapsible>
-                  ) : null}
-                </section>
-              );
-            })
-          )}
+                          ) : undefined
+                        }
+                        disclosurePlacement={showConversationNavigation ? 'trailing' : undefined}
+                        icon={
+                          <svg className="native-folder-icon zeus-avatar-token" viewBox="0 0 20 20" focusable="false" aria-hidden="true">
+                            <path d="M2.8 6.4h5.1l1.4 1.5h7.9v7.7a1.4 1.4 0 0 1-1.4 1.4H4.2a1.4 1.4 0 0 1-1.4-1.4Z" />
+                            <path d="M2.8 6.4V5.7a1.4 1.4 0 0 1 1.4-1.4h3.4l1.5 2.1" />
+                          </svg>
+                        }
+                        label={<strong>{project.name}</strong>}
+                        buttonProps={{
+                          type: 'button',
+                          tabIndex: isActiveProject ? 0 : -1,
+                          'data-source-list-item': 'true',
+                          'aria-label':
+                            project.id === temporaryWorkspaceId ? (props.appLanguage === 'zh-CN' ? '临时会话' : 'Temporary conversations') : `${props.appLanguage === 'zh-CN' ? '项目' : 'Project'}${copy.labelSeparator}${project.name}`,
+                          'aria-current': isActiveProject ? 'true' : undefined,
+                          // 侧边栏项目名称固定作为该项目的任务页入口。
+                          onClick: () => props.onOpenProjectSection(project, project.id === temporaryWorkspaceId ? 'sessions' : 'tasks'),
+                        }}
+                        actions={
+                          project.id === temporaryWorkspaceId ? undefined : (
+                            <>
+                              <button
+                                type="button"
+                                className="project-settings-button"
+                                aria-label={`${copy.projectSettingsPrefix}${copy.labelSeparator}${project.name}`}
+                                onClick={() => props.onOpenProjectSection(project, 'project-settings')}
+                              >
+                                <GearSix aria-hidden="true" weight="regular" />
+                              </button>
+                              <div className={`project-row-actions ${menuOpen ? 'open' : ''} ${menuClosing ? 'closing' : ''}`.trim()} onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}>
+                                <button
+                                  type="button"
+                                  className="project-more-button"
+                                  ref={(button) => {
+                                    if (button) {
+                                      projectMenuButtonRefs.current.set(project.id, button);
+                                    } else {
+                                      projectMenuButtonRefs.current.delete(project.id);
+                                    }
+                                  }}
+                                  aria-label={`${copy.moreProjectActionsPrefix}${copy.labelSeparator}${project.name}`}
+                                  aria-haspopup="menu"
+                                  aria-expanded={menuOpen}
+                                  aria-controls={menuVisible ? `project-more-menu-${project.id}` : undefined}
+                                  onClick={(event) => toggleProjectMoreMenu(project.id, event.currentTarget)}
+                                >
+                                  <DotsThreeVertical aria-hidden="true" weight="regular" />
+                                </button>
+                              </div>
+                              {projectMorePopover ? (projectMenuPortalHost ? createPortal(projectMorePopover, projectMenuPortalHost) : projectMorePopover) : null}
+                            </>
+                          )
+                        }
+                      />
+                    ) : null}
+                    {showConversationNavigation && conversationGroup && ((conversationGroup.conversations?.length ?? 0) > 0 || conversationGroup.tasks.some((task) => task.conversations.length > 0)) ? (
+                      <Collapsible open={expanded}>
+                        <div className={`project-sidebar-conversations${scopeToCurrentProject ? ' project-sidebar-conversations-flat' : ''}`}>
+                          <ProjectConversationTree
+                            groups={[conversationGroup]}
+                            selectedConversationId={props.selectedConversationId}
+                            conversationStates={props.conversationStates}
+                            onSelectConversation={props.onSelectConversation}
+                            onArchiveConversation={props.onArchiveConversation}
+                            language={props.appLanguage}
+                            compactProjectLabel
+                            showEmptyState={false}
+                            query={projectMatchesSearch ? '' : projectSearchQuery}
+                            visibleConversationCount={props.mainLayout === 'current' ? undefined : (visibleConversationCountByProject[project.id] ?? defaultVisibleConversationCount)}
+                            onShowMore={() =>
+                              setVisibleConversationCountByProject((current) => ({
+                                ...current,
+                                [project.id]: (current[project.id] ?? defaultVisibleConversationCount) + additionalVisibleConversationCount,
+                              }))
+                            }
+                          />
+                        </div>
+                      </Collapsible>
+                    ) : null}
+                  </section>
+                );
+              })
+            )}
+          </div>
         </section>
       ) : null}
 

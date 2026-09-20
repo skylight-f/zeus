@@ -1348,12 +1348,14 @@ export function inferInitialMainNavTarget(props: {
     (props.snapshot?.tasks.length ?? 0) > 0
   )
     return 'conversations';
+  if (props.initialAppShellSettings?.mainLayout === 'current') return 'conversations';
   if (props.snapshot?.projects.length) return 'projects';
   return 'projects';
 }
 
 export function inferInitialProjectSection(props: {
   initialMainNavTarget?: LegacyMainNavTarget;
+  initialAppShellSettings?: AppShellSettings;
   initialTaskEvents?: TaskEventRecord[];
   initialTaskTemplates?: TaskTemplateRecord[];
   initialRuntimeStatus?: RuntimeStatusSnapshot;
@@ -1372,6 +1374,8 @@ export function inferInitialProjectSection(props: {
 }): ProjectWorkspaceSection {
   if (props.snapshot?.projects[0]?.id === temporaryWorkspaceId) return 'sessions';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-commands' || window.location.hash.startsWith('#project-code'))) return 'code';
+  if (typeof window !== 'undefined' && (window.location.hash === '#project-tasks' || window.location.hash === '#tasks')) return 'tasks';
+  if (typeof window !== 'undefined' && (window.location.hash === '#project-sessions' || window.location.hash === '#conversations')) return 'sessions';
   if (props.initialProjectConfig || props.initialProjectDatabaseSecret) return 'project-settings';
   if (props.initialMainNavTarget === 'tasks') return 'tasks';
   if (props.initialMainNavTarget === 'git-diff' || props.initialMainNavTarget === 'projects') return 'code';
@@ -1389,7 +1393,8 @@ export function inferInitialProjectSection(props: {
   )
     return 'sessions';
   if (props.initialArchivedProjects?.length) return 'code';
-  return 'tasks';
+  // 紧凑布局默认打开会话，明确指定的工作区入口仍优先。
+  return props.initialAppShellSettings?.mainLayout === 'current' ? 'sessions' : 'tasks';
 }
 
 export function syncRecordFromSnapshot<T extends { id: string }>(current: T | undefined, records: T[]): T | undefined {

@@ -662,11 +662,11 @@ body:has(.macos-ai-app.zeus-shell) {
 }
 
 /* 侧边栏空闲时只隐藏滑块，不改变滚动区域宽度；按住拖动时仍保持可见。 */
-.macos-ai-app.zeus-shell .project-sidebar-list:not([data-scrolling='true']):not(:active) {
+.macos-ai-app.zeus-shell :is(.project-sidebar-list, .project-sidebar-list-content):not([data-scrolling='true']):not(:active) {
   scrollbar-color: transparent transparent;
 }
 
-.macos-ai-app.zeus-shell .project-sidebar-list:not([data-scrolling='true']):not(:active)::-webkit-scrollbar-thumb {
+.macos-ai-app.zeus-shell :is(.project-sidebar-list, .project-sidebar-list-content):not([data-scrolling='true']):not(:active)::-webkit-scrollbar-thumb {
   background: transparent;
 }
 

@@ -3042,6 +3042,9 @@ a {
   min-width: 0;
   position: relative;
 }
+.project-sidebar-conversations-flat {
+  margin: 0;
+}
 .project-sidebar-conversations .session-project-conversation-tree {
   padding: 0;
 }
@@ -3056,6 +3059,9 @@ a {
   box-sizing: border-box;
   min-block-size: 28px;
   padding: 0 6px 0 4px;
+}
+.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-conversations.project-sidebar-conversations-flat .session-conversation-tree-row {
+  padding-inline-start: 8px;
 }
 .project-sidebar-conversations .session-conversation-tree-row .session-conversation-title {
   font-size: 12px;
@@ -10191,6 +10197,32 @@ html[data-zeus-theme='dark'] .startup-failure-shell {
 }
 
 /* 2026-06-18 项目列表参考图密度最终覆盖：项目列表按 macOS source-list 密度收紧，避免项目名和行高继续像老年机大按钮。 */
+.project-sidebar-list-content {
+  display: contents;
+}
+
+.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-list-fixed-heading {
+  overflow: hidden;
+}
+
+.macos-ai-app.zeus-shell .project-sidebar-list-fixed-heading > .project-sidebar-heading {
+  flex: 0 0 auto;
+}
+
+.macos-ai-app.zeus-shell .project-sidebar-list-fixed-heading > .project-sidebar-list-content {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-block-size: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.macos-ai-app.zeus-shell .project-sidebar-list-fixed-heading > .project-sidebar-list-content > * {
+  flex-shrink: 0;
+}
+
 .macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-heading {
   align-items: center;
   color: var(--zeus-product-muted);

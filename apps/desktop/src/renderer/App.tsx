@@ -82,6 +82,7 @@ function initialMainRoute(props: AppProps): MainNavTarget {
   if (props.initialSecuritySecrets || props.initialReleaseStatus || props.initialSecurityAuditLogs?.length || props.initialLocalError) return 'settings';
   if (props.initialProjectConfig || props.initialProjectDatabaseSecret || props.initialArchivedProjects?.length) return 'projects';
   if (props.initialGitDiff || props.initialGitConfirmation) return 'projects';
+  if (props.initialAppShellSettings?.mainLayout === 'current') return 'conversations';
   if ((props.snapshot?.tasks.length ?? 0) > 0) return 'conversations';
   return 'projects';
 }

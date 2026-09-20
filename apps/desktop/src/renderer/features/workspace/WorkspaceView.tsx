@@ -1820,7 +1820,18 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             </aside>
             <section key={settingsCategory} id={settingsPanelId} role="tabpanel" tabIndex={0} className="settings-detail-pane" aria-labelledby={`${settingsPanelId}-${settingsCategory}`}>
               <div className="settings-content-column">
-                {settingsCategory === 'general' ? <GeneralSettingsPane value={appShellSettings} client={props.nativeConversationClient?.settings ?? null} onChange={setAppShellSettings} /> : null}
+                {settingsCategory === 'general' ? (
+                  <GeneralSettingsPane
+                    value={appShellSettings}
+                    client={props.nativeConversationClient?.settings ?? null}
+                    onChange={(update) => {
+                      const next = update(appShellSettings);
+                      setAppShellSettings(next);
+                      // 切换到紧凑布局后，返回工作区默认显示会话；设置页继续保留。
+                      if (next.mainLayout === 'current' && appShellSettings.mainLayout !== 'current') state.setActiveProjectSection('sessions');
+                    }}
+                  />
+                ) : null}
                 {settingsCategory === 'agents' ? (
                   <GlobalAgentSettingsPane
                     ref={globalAgentSettingsRef}
