@@ -850,6 +850,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           project={selectedProject}
           projects={orderedProjects}
           onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          onOpenProjectSettings={(project) => openProjectSection(project, 'project-settings')}
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
           activeNavTarget={activeNavTarget}
