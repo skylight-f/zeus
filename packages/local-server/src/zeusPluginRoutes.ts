@@ -1,11 +1,22 @@
+import { readMcpConfigurationCatalog } from './mcpConfigurationCatalog.js';
 import { PluginStoreError, type PluginApprovalMode, type PluginScope } from '@zeus/storage';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ZeusPluginServiceError, type ZeusPluginInstallSource, type ZeusPluginService } from './zeusPluginService.js';
 import { ZeusPluginSourceError, type ZeusPluginDirectSource } from './zeusPluginSource.js';
 import type { ZeusConversationPluginRuntime } from './zeusConversationPluginRuntime.js';
 
-export function registerZeusPluginRoutes(options: { server: FastifyInstance; plugins?: ZeusPluginService; runtime?: ZeusConversationPluginRuntime; dangerouslyBypassHookTrust?: boolean; hasProject(projectId: string): boolean }): void {
+export function registerZeusPluginRoutes(options: {
+  server: FastifyInstance;
+  codexHome?: string;
+  sourceCodexHome?: string;
+  plugins?: ZeusPluginService;
+  runtime?: ZeusConversationPluginRuntime;
+  dangerouslyBypassHookTrust?: boolean;
+  hasProject(projectId: string): boolean;
+}): void {
   const { server } = options;
+
+  server.get('/api/mcp-configuration', async () => readMcpConfigurationCatalog({ codexHome: options.codexHome, sourceRoot: options.sourceCodexHome }));
 
   server.get('/api/plugins', async (request: FastifyRequest<{ Querystring: { projectId?: string } }>, reply) => {
     if (!options.plugins) return unavailable(reply);

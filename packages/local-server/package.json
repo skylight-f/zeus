@@ -177,6 +177,7 @@
     "@zeus/shared": "workspace:*",
     "@zeus/storage": "workspace:*",
     "fastify": "^5.4.0",
-    "miniprogram-automator": "0.12.1"
+    "miniprogram-automator": "0.12.1",
+    "smol-toml": "^1.8.0"
   }
 }

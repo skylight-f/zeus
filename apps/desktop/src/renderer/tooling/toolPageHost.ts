@@ -7,6 +7,7 @@ export { Button } from '../ui/Button.js';
 export { FormDialog } from '../ui/FormDialog.js';
 export { ZeusSelect } from '../ZeusSelect.js';
 export {
+  type McpConfigurationCatalog,
   type PluginApprovalMode,
   type PluginDescriptor,
   type PluginDirectSource,
