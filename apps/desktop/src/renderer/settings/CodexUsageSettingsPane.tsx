@@ -271,8 +271,15 @@ function LocalProviderOverview(props: { analytics: UsageProviderAnalytics; langu
           ]}
         />
       </div>
-      <div className="codex-usage-official-detail-grid">
-        <OfficialUsageCalendar days={props.analytics.local.daily} label={`${providerName} · ${props.language === 'zh-CN' ? '本地记录' : 'Local records'}`} runtimeName={providerName} local language={props.language} />
+      <div className="codex-usage-detail-grid">
+        <UsageCalendarCard
+          days={props.analytics.local.daily}
+          label={`${providerName} · ${props.language === 'zh-CN' ? '本地记录' : 'Local records'}`}
+          runtimeName={providerName}
+          local
+          range={props.analytics.range}
+          language={props.language}
+        />
         <section className="codex-usage-quota-panel" aria-label={`${providerName} · ${props.language === 'zh-CN' ? '本地用量摘要' : 'Local usage summary'}`}>
           <header>
             <span>
@@ -350,8 +357,8 @@ function OfficialOverview(props: { snapshot: CodexOfficialUsageSnapshot; languag
           ]}
         />
       </div>
-      <div className="codex-usage-official-detail-grid">
-        <OfficialUsageCalendar days={(props.snapshot.dailyUsageBuckets ?? []).map((day) => ({ date: day.startDate, totalTokens: day.tokens }))} label={copy.allClients} language={props.language} />
+      <div className="codex-usage-detail-grid">
+        <UsageCalendarCard days={(props.snapshot.dailyUsageBuckets ?? []).map((day) => ({ date: day.startDate, totalTokens: day.tokens }))} label={copy.allClients} language={props.language} />
         <section className="codex-usage-quota-panel" aria-label={props.language === 'zh-CN' ? '账户用量限制' : 'Account usage limits'}>
           <header>
             <span>
@@ -414,7 +421,7 @@ function LocalUsageTabs(props: { analytics: UsageProviderAnalytics; language: La
       </header>
       <small className="codex-usage-local-help">{copy.localHelp}</small>
       <section id={panelId('overview')} className="codex-usage-local-tab-panel" role="tabpanel" aria-labelledby={tabId('overview')} tabIndex={0} hidden={activeTab !== 'overview'}>
-        <LocalOverview local={props.analytics.local} language={props.language} />
+        <LocalOverview local={props.analytics.local} runtimeName={props.analytics.provider.name} range={props.analytics.range} language={props.language} />
       </section>
       <section id={panelId('models')} className="codex-usage-local-tab-panel" role="tabpanel" aria-labelledby={tabId('models')} tabIndex={0} hidden={activeTab !== 'models'}>
         {props.analytics.local.byModel.length > 0 ? (
@@ -460,7 +467,7 @@ function LocalUsageTabs(props: { analytics: UsageProviderAnalytics; language: La
   );
 }
 
-function LocalOverview(props: { local: UsageProviderAnalytics['local']; language: Language }) {
+function LocalOverview(props: { local: UsageProviderAnalytics['local']; runtimeName: string; range: CodexUsageRange; language: Language }) {
   const copy = text[props.language];
   const totals = props.local.totals;
   return (
@@ -484,7 +491,9 @@ function LocalOverview(props: { local: UsageProviderAnalytics['local']; language
           [props.language === 'zh-CN' ? '费用覆盖率' : 'Price coverage', formatPercent(totals.priceCoverage, props.language)],
         ]}
       />
-      <UsageHeatmap days={props.local.daily} label={copy.onlyZeus} language={props.language} />
+      <div className="codex-usage-detail-grid">
+        <UsageCalendarCard days={props.local.daily} label={copy.onlyZeus} runtimeName={props.runtimeName} local range={props.range} language={props.language} />
+      </div>
       {totals.turnCount === 0 ? <p className="codex-usage-state">{copy.empty}</p> : null}
     </>
   );
@@ -514,9 +523,15 @@ function MetricGrid(props: { items: Array<[string, string]>; language: Language 
   );
 }
 
-function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>> | CodexLocalUsageDay[]; label: string; language: Language; runtimeName?: string; local?: boolean }) {
-  const calendar = useMemo(() => buildUsageCalendar(props.days, props.language), [props.days, props.language]);
-  const [hover, setHover] = useState<{ day: UsageCalendarCell; left: number; top: number } | null>(null);
+type UsageCalendarCardProps = { label: string; language: Language; runtimeName?: string } & (
+  | { days: CodexLocalUsageDay[]; local: true; range: CodexUsageRange }
+  | { days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>; local?: false; range?: never }
+);
+
+/** 官方账户和本地明细共用日历布局，分别保留其数据口径和筛选范围。 */
+function UsageCalendarCard(props: UsageCalendarCardProps) {
+  const calendar = useMemo(() => buildUsageCalendar(props.days, props.language, props.range), [props.days, props.language, props.range]);
+  const [hover, setHover] = useState<{ date: string; left: number; top: number } | null>(null);
   const tooltipId = useId();
   const zh = props.language === 'zh-CN';
   const hide = useCallback(() => setHover(null), []);
@@ -531,21 +546,23 @@ function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'da
   const show = (day: UsageCalendarCell, element: HTMLElement) => {
     if (day.future) return;
     const rect = element.getBoundingClientRect();
-    setHover({ day, left: Math.max(8, Math.min(rect.left, window.innerWidth - 280)), top: Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 310)) });
+    setHover({ date: day.date, left: Math.max(8, Math.min(rect.left, window.innerWidth - 280)), top: Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 310)) });
   };
-  const totals = hover ? props.days.filter((day) => day.date === hover.day.date && Number.isFinite(day.totalTokens)) : [];
+  const hoverDay = hover ? calendar.cells.find((day) => day.date === hover.date) : undefined;
+  const totals = hoverDay && !hoverDay.outsideRange ? props.days.filter((day) => day.date === hoverDay.date && Number.isFinite(day.totalTokens)) : [];
   const missing = zh ? '未提供' : 'Not provided';
   const runtimeName = props.runtimeName ?? 'Codex';
-  const localDay = props.local ? (totals[0] as CodexLocalUsageDay | undefined) : undefined;
-  const rows = hover
+  const localDay = props.local && hoverDay && !hoverDay.outsideRange ? props.days.find((day) => day.date === hoverDay.date && Number.isFinite(day.totalTokens)) : undefined;
+  const noRecord = hoverDay?.outsideRange ? (zh ? '不在所选范围内' : 'Outside selected range') : zh ? '无记录' : 'No record';
+  const rows = hoverDay
     ? props.local
       ? [
           ['Runtime', runtimeName],
-          [zh ? '总量' : 'Total', localDay ? `${formatTokens(localDay.totalTokens, props.language)} Token` : zh ? '无记录' : 'No record'],
+          [zh ? '总量' : 'Total', localDay ? `${formatTokens(localDay.totalTokens, props.language)} Token` : noRecord],
           [zh ? '未缓存' : 'Uncached', localDay ? `${formatTokens(calculateUncachedInputTokens(localDay), props.language)} Token` : missing],
           [zh ? '缓存' : 'Cached', localDay ? `${formatTokens(localDay.cachedInputTokens, props.language)} Token` : missing],
           [zh ? '输出' : 'Output', localDay ? `${formatTokens(localDay.outputTokens, props.language)} Token` : missing],
-          [zh ? '估算' : 'Estimate', formatEstimate(localDay?.apiEquivalentUsd ?? null, 'usd', props.language)],
+          [zh ? '估算' : 'Estimate', localDay ? formatEstimate(localDay.apiEquivalentUsd, 'usd', props.language) : missing],
           [zh ? '口径' : 'Scope', props.label],
         ]
       : [
@@ -557,9 +574,7 @@ function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'da
                   totals.reduce((sum, day) => sum + Math.max(0, day.totalTokens), 0),
                   props.language,
                 )} Token`
-              : zh
-                ? '无记录'
-                : 'No record',
+              : noRecord,
           ],
           [zh ? '未缓存' : 'Uncached', missing],
           [zh ? '缓存' : 'Cached', missing],
@@ -599,9 +614,10 @@ function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'da
                 key={day.date}
                 data-level={day.level}
                 data-future={day.future || undefined}
+                data-outside-range={day.outsideRange || undefined}
                 tabIndex={day.future ? undefined : 0}
                 aria-label={day.title}
-                aria-describedby={hover?.day.date === day.date ? tooltipId : undefined}
+                aria-describedby={hoverDay?.date === day.date ? tooltipId : undefined}
                 onMouseEnter={(event) => show(day, event.currentTarget)}
                 onMouseLeave={hide}
                 onFocus={(event) => show(day, event.currentTarget)}
@@ -621,11 +637,21 @@ function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'da
           </div>
         </div>
       </div>
+      <small className="codex-usage-calendar-scope">
+        {props.local
+          ? zh
+            ? `本地记录 · ${props.range === 'all' ? '全部时间' : `最近 ${props.range.slice(0, -1)} 天`} · 按当前项目和模型筛选`
+            : `Local records · ${props.range === 'all' ? 'All time' : `Last ${props.range.slice(0, -1)} days`} · Current project and model filters`
+          : zh
+            ? '全部 Codex 客户端 · 官方账户按日统计'
+            : 'All Codex clients · Daily official account statistics'}
+      </small>
       {hover &&
+        hoverDay &&
         createPortal(
           <div className="macos-ai-app" style={{ display: 'contents' }}>
             <div id={tooltipId} role="tooltip" className="codex-usage-calendar-tooltip" style={{ left: hover.left, top: hover.top }}>
-              <strong>{formatCalendarDate(new Date(`${hover.day.date}T00:00:00`), props.language)}</strong>
+              <strong>{formatCalendarDate(new Date(`${hoverDay.date}T00:00:00`), props.language)}</strong>
               <dl>
                 {rows.map(([label, value]) => (
                   <div key={label}>
@@ -651,29 +677,11 @@ function OfficialUsageCalendar(props: { days: Array<Pick<CodexLocalUsageDay, 'da
   );
 }
 
-function UsageHeatmap(props: { days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>; label: string; language: Language }) {
-  const cells = useMemo(() => props.days.slice(-365), [props.days]);
-  const max = useMemo(() => cells.reduce((value, day) => Math.max(value, day.totalTokens), 0), [cells]);
-  return (
-    <section className="codex-usage-heatmap" aria-label={props.label}>
-      <header>
-        <strong>{props.label}</strong>
-        <small>{props.language === 'zh-CN' ? '每日 Token 活动' : 'Daily token activity'}</small>
-      </header>
-      <div role="img" aria-label={props.label}>
-        {cells.map((day) => {
-          const level = max > 0 ? Math.max(1, Math.ceil((day.totalTokens / max) * 4)) : 0;
-          return <span key={day.date} data-level={level} title={`${day.date}: ${formatTokens(day.totalTokens, props.language)}`} />;
-        })}
-      </div>
-    </section>
-  );
-}
-
 type UsageCalendarCell = {
   date: string;
   level: number;
   future: boolean;
+  outsideRange: boolean;
   title: string;
 };
 
@@ -685,11 +693,12 @@ type UsageCalendar = {
 };
 
 /** 热力图以周一为首日；半年固定为 26 列，保证月份位置和参考样式稳定。 */
-function buildUsageCalendar(days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>, language: Language, now = new Date()): UsageCalendar {
+function buildUsageCalendar(days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>, language: Language, range?: CodexUsageRange, now = new Date()): UsageCalendar {
   const weekCount = 26;
   const today = startOfLocalDate(now);
   const currentWeekStart = addLocalDays(today, -((today.getDay() + 6) % 7));
   const firstDate = addLocalDays(currentWeekStart, -(weekCount - 1) * 7);
+  const rangeStart = range && range !== 'all' ? addLocalDays(today, -(range === '7d' ? 6 : range === '30d' ? 29 : 89)) : null;
   const totalsByDate = new Map<string, number>();
   for (const day of days) {
     if (!/^\d{4}-\d{2}-\d{2}$/u.test(day.date) || !Number.isFinite(day.totalTokens)) continue;
@@ -699,14 +708,16 @@ function buildUsageCalendar(days: Array<Pick<CodexLocalUsageDay, 'date' | 'total
   const datedCells = Array.from({ length: weekCount * 7 }, (_, index) => {
     const date = addLocalDays(firstDate, index);
     const dateKey = localDateKey(date);
-    return { date, dateKey, totalTokens: totalsByDate.get(dateKey) ?? 0, future: date > today };
+    const outsideRange = rangeStart !== null && date < rangeStart;
+    return { date, dateKey, totalTokens: outsideRange ? 0 : (totalsByDate.get(dateKey) ?? 0), future: date > today, outsideRange };
   });
   const max = datedCells.reduce((value, day) => (day.future ? value : Math.max(value, day.totalTokens)), 0);
   const cells = datedCells.map<UsageCalendarCell>((day) => ({
     date: day.dateKey,
     level: day.future || day.totalTokens <= 0 || max <= 0 ? 0 : Math.max(1, Math.ceil((day.totalTokens / max) * 4)),
     future: day.future,
-    title: day.future ? `${formatCalendarDate(day.date, language)} · ${language === 'zh-CN' ? '未来日期' : 'Future date'}` : `${formatCalendarDate(day.date, language)} · ${formatTokens(day.totalTokens, language)} Token`,
+    outsideRange: day.outsideRange,
+    title: `${formatCalendarDate(day.date, language)} · ${day.future ? (language === 'zh-CN' ? '未来日期' : 'Future date') : day.outsideRange ? (language === 'zh-CN' ? '不在所选范围内' : 'Outside selected range') : `${formatTokens(day.totalTokens, language)} Token`}`,
   }));
   const months = Array.from<string | null>({ length: weekCount }).fill(null);
   for (let weekIndex = 0; weekIndex < weekCount; weekIndex += 1) {

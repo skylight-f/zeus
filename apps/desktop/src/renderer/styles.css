@@ -1199,7 +1199,7 @@ a {
   color: var(--zeus-product-text);
 }
 
-.macos-ai-app .codex-usage-official-detail-grid {
+.macos-ai-app .codex-usage-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: stretch;
@@ -1207,49 +1207,8 @@ a {
   min-inline-size: 0;
 }
 
-.macos-ai-app .codex-usage-official-detail-grid > * {
+.macos-ai-app .codex-usage-detail-grid > * {
   min-inline-size: 0;
-}
-
-.macos-ai-app .codex-usage-heatmap {
-  display: grid;
-  gap: 10px;
-}
-
-.macos-ai-app .codex-usage-heatmap > header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.macos-ai-app .codex-usage-heatmap > div {
-  display: grid;
-  grid-auto-flow: column;
-  grid-template-rows: repeat(7, 10px);
-  grid-auto-columns: 10px;
-  gap: 3px;
-  max-inline-size: 100%;
-  overflow-x: auto;
-  padding-block-end: 3px;
-}
-
-.macos-ai-app .codex-usage-heatmap > div > span {
-  border-radius: 2px;
-  background: var(--zeus-product-panel-muted);
-}
-
-.macos-ai-app .codex-usage-heatmap > div > span[data-level='1'] {
-  background: color-mix(in oklab, var(--zeus-product-accent) 28%, var(--zeus-product-panel));
-}
-.macos-ai-app .codex-usage-heatmap > div > span[data-level='2'] {
-  background: color-mix(in oklab, var(--zeus-product-accent) 48%, var(--zeus-product-panel));
-}
-.macos-ai-app .codex-usage-heatmap > div > span[data-level='3'] {
-  background: color-mix(in oklab, var(--zeus-product-accent) 70%, var(--zeus-product-panel));
-}
-.macos-ai-app .codex-usage-heatmap > div > span[data-level='4'] {
-  background: var(--zeus-product-accent);
 }
 
 .macos-ai-app .codex-usage-calendar-card {
@@ -1260,6 +1219,12 @@ a {
   border: 0;
   border-radius: 16px;
   background: color-mix(in srgb, var(--zeus-product-panel) 88%, var(--zeus-product-canvas));
+}
+
+.macos-ai-app .codex-usage-calendar-scope {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .macos-ai-app .codex-usage-calendar-card > header {
@@ -1385,7 +1350,8 @@ a {
   background: var(--zeus-product-accent);
 }
 
-.macos-ai-app .codex-usage-calendar-cells > span[data-future='true'] {
+.macos-ai-app .codex-usage-calendar-cells > span[data-future='true'],
+.macos-ai-app .codex-usage-calendar-cells > span[data-outside-range='true'] {
   opacity: 0.58;
 }
 
@@ -1502,7 +1468,7 @@ a {
 }
 
 @media (max-width: 980px) {
-  .macos-ai-app .codex-usage-official-detail-grid {
+  .macos-ai-app .codex-usage-detail-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
