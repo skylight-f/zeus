@@ -40,6 +40,7 @@ import { type AppLanguage } from './workspaceCopy.js';
 import { Button } from '../../ui/Button.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { ModalPortal } from '../../ui/ModalPortal.js';
+import { MenuSurface } from '../../ui/MenuSurface.js';
 import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { SourceListRow } from '../../ui/SourceListRow.js';
 import { useNewItemMotionIds } from '../../ui/useNewItemMotion.js';
@@ -666,6 +667,7 @@ export function ProjectWorkspaceNavigation(props: {
   project: ProjectRecord;
   projects: ProjectRecord[];
   onSelectProject: (project: ProjectRecord) => void;
+  onOpenProjectSettings: (project: ProjectRecord) => void;
   canCreateProject: boolean;
   createProjectBusy: boolean;
   activeNavTarget: WorkspaceViewId;
@@ -708,6 +710,9 @@ export function ProjectWorkspaceNavigation(props: {
   const projectSlotSequenceRef = useRef(1);
   const projectStatuses = useMemo(() => summarizeProjectConversationStatuses(props.conversationGroups, props.conversationStates, props.language), [props.conversationGroups, props.conversationStates, props.language]);
   const [projectSlots, setProjectSlots] = useState<Array<{ id: string; projectId: string }>>(() => [{ id: 'project-slot-0', projectId: props.project.id }]);
+  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
+  const contextProject = projectContextMenu && projectSlots.some((slot) => slot.projectId === projectContextMenu.projectId) ? props.projects.find((project) => project.id === projectContextMenu.projectId) : undefined;
+  useEffect(() => setProjectContextMenu(null), [props.project.id]);
   const projectIdsKey = props.projects.map((project) => project.id).join('\u0000');
   useEffect(() => {
     const knownProjectIds = new Set(props.projects.map((project) => project.id));
@@ -761,7 +766,17 @@ export function ProjectWorkspaceNavigation(props: {
               const projectStatus = projectStatuses.get(slot.projectId);
               const selectLabel = slotProject ? (zh ? `选择项目 ${slotProject.name}` : `Select project ${slotProject.name}`) : zh ? '尚未选择项目' : 'No project selected';
               return (
-                <span key={slot.id} className={`project-workspace-project-slot${active ? ' is-active' : ''}`} data-project-slot-id={slot.id}>
+                <span
+                  key={slot.id}
+                  className={`project-workspace-project-slot${active ? ' is-active' : ''}`}
+                  data-project-slot-id={slot.id}
+                  onContextMenu={(event) => {
+                    if (!slotProject || slotProject.id === temporaryWorkspaceId) return;
+                    event.preventDefault();
+                    event.currentTarget.querySelector<HTMLButtonElement>('.project-workspace-project-slot-primary')?.focus({ preventScroll: true });
+                    setProjectContextMenu({ projectId: slotProject.id, x: event.clientX, y: event.clientY });
+                  }}
+                >
                   <button
                     type="button"
                     className="project-workspace-project-slot-primary"
@@ -769,6 +784,13 @@ export function ProjectWorkspaceNavigation(props: {
                     title={projectStatus?.label}
                     aria-pressed={active}
                     aria-disabled={!slotProject || undefined}
+                    aria-haspopup={slotProject && slotProject.id !== temporaryWorkspaceId ? 'menu' : undefined}
+                    onKeyDown={(event) => {
+                      if (!slotProject || slotProject.id === temporaryWorkspaceId || !(event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) return;
+                      event.preventDefault();
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      setProjectContextMenu({ projectId: slotProject.id, x: rect.left, y: rect.bottom });
+                    }}
                     onClick={() => {
                       if (slotProject && slotProject.id !== props.project.id) props.onSelectProject(slotProject);
                     }}
@@ -863,6 +885,30 @@ export function ProjectWorkspaceNavigation(props: {
           onOpenSourceMatch={props.onOpenSourceMatch}
         />
       </header>
+      {projectContextMenu && contextProject
+        ? createPortal(
+            <MenuSurface
+              className="project-more-popover"
+              aria-label={zh ? `${contextProject.name} 项目菜单` : `${contextProject.name} project menu`}
+              style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
+              onClose={() => setProjectContextMenu(null)}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setProjectContextMenu(null);
+                  props.onOpenProjectSettings(contextProject);
+                }}
+              >
+                <GearSix size={18} aria-hidden="true" />
+                <span>{zh ? '项目设置' : 'Project settings'}</span>
+              </button>
+            </MenuSurface>,
+            document.querySelector('.macos-ai-app.zeus-shell') ?? document.body,
+          )
+        : null}
       <nav className="project-workspace-mode-rail" aria-label={zh ? '项目工作区' : 'Project workspace'}>
         <button
           type="button"
