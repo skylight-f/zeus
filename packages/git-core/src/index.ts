@@ -2679,15 +2679,9 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
   if (switchingAction && switchingStatus?.conflictFiles.length) {
     const conflictLog = [
       '$ git status --porcelain --untracked-files=all',
-      ...switchingStatus.fileStatuses
-        .filter((file) => file.category === 'conflict')
-        .map((file) => `${file.indexStatus}${file.workingTreeStatus} ${file.originalPath ? `${file.originalPath} -> ${file.path}` : file.path}`),
+      ...switchingStatus.fileStatuses.filter((file) => file.category === 'conflict').map((file) => `${file.indexStatus}${file.workingTreeStatus} ${file.originalPath ? `${file.originalPath} -> ${file.path}` : file.path}`),
     ].join('\n');
-    throw gitCoreError(
-      'ZEUS_GIT_CHECKOUT_CONFLICTED',
-      `当前仓库存在未解决的冲突，无法切换到${projectGitSwitchTarget(switchingAction)}。请先处理并确认冲突文件；本次切换未执行。`,
-      conflictLog,
-    );
+    throw gitCoreError('ZEUS_GIT_CHECKOUT_CONFLICTED', `当前仓库存在未解决的冲突，无法切换到${projectGitSwitchTarget(switchingAction)}。请先处理并确认冲突文件；本次切换未执行。`, conflictLog);
   }
   // 切换始终使用 Git 的保护性检查，不自动贮藏、恢复或强制覆盖用户修改。
   try {

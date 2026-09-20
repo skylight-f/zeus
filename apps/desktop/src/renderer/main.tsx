@@ -25,9 +25,7 @@ function reviveProjectGitError(cause: UserFacingErrorCause, depth = 0): Error {
   return error;
 }
 
-function unwrapProjectGitActionIpcResult(
-  result: Awaited<ReturnType<NonNullable<Window['zeus']>['executeProjectGitAction']>>,
-): ProjectGitActionResponse {
+function unwrapProjectGitActionIpcResult(result: Awaited<ReturnType<NonNullable<Window['zeus']>['executeProjectGitAction']>>): ProjectGitActionResponse {
   if (result.ok) return result.value;
   throw reviveProjectGitError(result.error);
 }
@@ -489,8 +487,7 @@ async function hydrateRenderer(): Promise<void> {
             loadOperations: (projectId, cursor) => window.zeus!.loadProjectGitOperations({ projectId, cursor }),
             loadCommit: (projectId, repositoryId, commitHash) => window.zeus!.loadProjectGitCommit({ projectId, repositoryId, commitHash }),
             loadComparison: (projectId, repositoryId, ref, mode) => window.zeus!.loadProjectGitComparisonDiff({ projectId, repositoryId, ref, mode }),
-            execute: async (projectId, repositoryId, action) =>
-              unwrapProjectGitActionIpcResult(await window.zeus!.executeProjectGitAction({ projectId, repositoryId, action })),
+            execute: async (projectId, repositoryId, action) => unwrapProjectGitActionIpcResult(await window.zeus!.executeProjectGitAction({ projectId, repositoryId, action })),
           },
         }
       : {}),

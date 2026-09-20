@@ -2610,11 +2610,7 @@ function displayStashSubject(subject: string, zh: boolean): string {
   return cleaned || (zh ? '未命名 Stash' : 'Untitled stash');
 }
 
-function errorMessage(
-  error: unknown,
-  zh: boolean,
-  options: { title?: string; showDetails?: boolean; detailTitle?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {},
-): string {
+function errorMessage(error: unknown, zh: boolean, options: { title?: string; showDetails?: boolean; detailTitle?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {}): string {
   return reportApplicationError(error, { language: zh ? 'zh-CN' : 'en', ...options });
 }
 

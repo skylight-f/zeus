@@ -1435,76 +1435,78 @@ function setupIpc(): void {
   });
   ipcMain.handle('zeus:project-git:execute-action', (event, request: MainCommandRequest) => {
     const workbench = requireProjectGitWorkbench(event, true);
-    return activeMainCommandLedger().execute(request, 'desktop.project_git.execute_action', async (input, command) => {
-      if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('项目 Git 动作请求无效。');
-      const candidate = input as Record<string, unknown>;
-      if (typeof candidate.projectId !== 'string' || typeof candidate.repositoryId !== 'string' || !candidate.action || typeof candidate.action !== 'object' || Array.isArray(candidate.action)) {
-        throw new TypeError('项目 Git 动作请求身份无效。');
-      }
-      const ownerOperations = projectGitOperations.get(event.sender.id) ?? new Map<string, AbortController>();
-      projectGitOperations.set(event.sender.id, ownerOperations);
-      if (ownerOperations.has(candidate.repositoryId)) throw new Error('该仓库已有操作正在执行。');
-      const controller = new AbortController();
-      ownerOperations.set(candidate.repositoryId, controller);
-      const abortOnClose = () => controller.abort();
-      event.sender.once('destroyed', abortOnClose);
-      try {
-        return await workbench.execute(
-          candidate.projectId,
-          candidate.repositoryId,
-          candidate.action,
-          async (repository, action) => {
-            const dangerous =
-              action.type === 'subtree' ||
-              (action.type === 'push' && action.forceWithLease) ||
-              (action.type === 'update' && action.strategy === 'reset') ||
-              action.type === 'drop_stash' ||
-              action.type === 'delete_branch' ||
-              action.type === 'abort_integration';
-            if (dangerous) {
-              const owner = BrowserWindow.fromWebContents(event.sender);
-              if (!owner || owner.isDestroyed()) throw new Error('操作窗口已关闭。');
-              const effect =
-                action.type === 'subtree'
-                  ? `子树 ${action.operation}：${action.path} ↔ ${action.remote}/${action.branch}。添加和拉取会创建本地提交，推送会修改远端分支。`
-                  : action.type === 'push'
-                    ? '强制推送可能改写远端提交历史。'
-                    : action.type === 'update'
-                      ? '重置会移动当前分支；未保护的本地修改会丢失。'
-                      : action.type === 'drop_stash'
-                        ? `删除贮藏 ${action.stashRef} 后无法直接恢复。`
-                        : action.type === 'delete_branch'
-                          ? `将删除本地分支 ${action.branchName}。`
-                          : '终止当前合并或变基，并撤销此次冲突解决过程中的修改。';
-              const confirmation = await dialog.showMessageBox(owner, {
-                type: 'warning',
-                title: '确认 Git 操作',
-                message: effect,
-                detail: `仓库：${repository.localPath}\n当前分支：${repository.branch}`,
-                buttons: ['取消', '确认执行'],
-                defaultId: 0,
-                cancelId: 0,
-                noLink: true,
-              });
-              if (confirmation.response !== 1) throw new Error('已取消 Git 操作，尚未修改仓库。');
-            }
-            requireProjectGitWorkbench(event, true);
-            controller.signal.throwIfAborted();
-            await command.markWriteStarted();
-          },
-          controller.signal,
-          command.recordExecutionCommand,
-        );
-      } finally {
-        event.sender.removeListener('destroyed', abortOnClose);
-        ownerOperations.delete(candidate.repositoryId);
-        if (!ownerOperations.size) projectGitOperations.delete(event.sender.id);
-      }
-    }).then(
-      (value) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: true, value }),
-      // Electron invoke 只可靠传递 Error.message；普通对象保留外层命令状态、Git 原因和已脱敏日志。
-      (error: unknown) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: false, error: userFacingErrorCause(error) }),
-    );
+    return activeMainCommandLedger()
+      .execute(request, 'desktop.project_git.execute_action', async (input, command) => {
+        if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('项目 Git 动作请求无效。');
+        const candidate = input as Record<string, unknown>;
+        if (typeof candidate.projectId !== 'string' || typeof candidate.repositoryId !== 'string' || !candidate.action || typeof candidate.action !== 'object' || Array.isArray(candidate.action)) {
+          throw new TypeError('项目 Git 动作请求身份无效。');
+        }
+        const ownerOperations = projectGitOperations.get(event.sender.id) ?? new Map<string, AbortController>();
+        projectGitOperations.set(event.sender.id, ownerOperations);
+        if (ownerOperations.has(candidate.repositoryId)) throw new Error('该仓库已有操作正在执行。');
+        const controller = new AbortController();
+        ownerOperations.set(candidate.repositoryId, controller);
+        const abortOnClose = () => controller.abort();
+        event.sender.once('destroyed', abortOnClose);
+        try {
+          return await workbench.execute(
+            candidate.projectId,
+            candidate.repositoryId,
+            candidate.action,
+            async (repository, action) => {
+              const dangerous =
+                action.type === 'subtree' ||
+                (action.type === 'push' && action.forceWithLease) ||
+                (action.type === 'update' && action.strategy === 'reset') ||
+                action.type === 'drop_stash' ||
+                action.type === 'delete_branch' ||
+                action.type === 'abort_integration';
+              if (dangerous) {
+                const owner = BrowserWindow.fromWebContents(event.sender);
+                if (!owner || owner.isDestroyed()) throw new Error('操作窗口已关闭。');
+                const effect =
+                  action.type === 'subtree'
+                    ? `子树 ${action.operation}：${action.path} ↔ ${action.remote}/${action.branch}。添加和拉取会创建本地提交，推送会修改远端分支。`
+                    : action.type === 'push'
+                      ? '强制推送可能改写远端提交历史。'
+                      : action.type === 'update'
+                        ? '重置会移动当前分支；未保护的本地修改会丢失。'
+                        : action.type === 'drop_stash'
+                          ? `删除贮藏 ${action.stashRef} 后无法直接恢复。`
+                          : action.type === 'delete_branch'
+                            ? `将删除本地分支 ${action.branchName}。`
+                            : '终止当前合并或变基，并撤销此次冲突解决过程中的修改。';
+                const confirmation = await dialog.showMessageBox(owner, {
+                  type: 'warning',
+                  title: '确认 Git 操作',
+                  message: effect,
+                  detail: `仓库：${repository.localPath}\n当前分支：${repository.branch}`,
+                  buttons: ['取消', '确认执行'],
+                  defaultId: 0,
+                  cancelId: 0,
+                  noLink: true,
+                });
+                if (confirmation.response !== 1) throw new Error('已取消 Git 操作，尚未修改仓库。');
+              }
+              requireProjectGitWorkbench(event, true);
+              controller.signal.throwIfAborted();
+              await command.markWriteStarted();
+            },
+            controller.signal,
+            command.recordExecutionCommand,
+          );
+        } finally {
+          event.sender.removeListener('destroyed', abortOnClose);
+          ownerOperations.delete(candidate.repositoryId);
+          if (!ownerOperations.size) projectGitOperations.delete(event.sender.id);
+        }
+      })
+      .then(
+        (value) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: true, value }),
+        // Electron invoke 只可靠传递 Error.message；普通对象保留外层命令状态、Git 原因和已脱敏日志。
+        (error: unknown) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: false, error: userFacingErrorCause(error) }),
+      );
   });
   ipcMain.handle('zeus:task-git-delivery:close', (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);

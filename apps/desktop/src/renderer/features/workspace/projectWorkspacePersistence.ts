@@ -43,11 +43,7 @@ export function writeProjectWorkspaceTabs(state: ProjectWorkspaceTabsState, stor
 }
 
 /** 按当前项目快照过滤已删除项目，并为首次启动补入当前项目。 */
-export function resolveProjectWorkspaceTabs(
-  projects: ReadonlyArray<{ id: string }>,
-  fallbackActiveProjectId?: string,
-  persisted: ProjectWorkspaceTabsState | null = readProjectWorkspaceTabs(),
-): ProjectWorkspaceTabsState {
+export function resolveProjectWorkspaceTabs(projects: ReadonlyArray<{ id: string }>, fallbackActiveProjectId?: string, persisted: ProjectWorkspaceTabsState | null = readProjectWorkspaceTabs()): ProjectWorkspaceTabsState {
   const knownProjectIds = new Set(projects.map((project) => project.id));
   const projectIds = (persisted?.projectIds ?? []).filter((projectId) => knownProjectIds.has(projectId));
   const activeProjectId =
