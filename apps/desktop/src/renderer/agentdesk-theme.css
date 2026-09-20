@@ -661,6 +661,15 @@ body:has(.macos-ai-app.zeus-shell) {
   gap: 2px;
 }
 
+/* 侧边栏空闲时只隐藏滑块，不改变滚动区域宽度；按住拖动时仍保持可见。 */
+.macos-ai-app.zeus-shell .project-sidebar-list:not([data-scrolling='true']):not(:active) {
+  scrollbar-color: transparent transparent;
+}
+
+.macos-ai-app.zeus-shell .project-sidebar-list:not([data-scrolling='true']):not(:active)::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
 .macos-ai-app.zeus-shell .project-sidebar-item,
 .macos-ai-app.zeus-shell .project-sidebar-conversations {
   gap: 0;
@@ -3801,10 +3810,8 @@ body:has(.macos-ai-app.zeus-shell) {
 /* 工作区只调整两侧留白，正文与输入框沿用共用列宽。 */
 .macos-ai-app.zeus-shell.project-navigation-rail-shell .session-workspace-root {
   --session-gutter: clamp(18px, 2.6vw, 36px);
-}
-
-.macos-ai-app.zeus-shell.project-navigation-rail-shell .session-thread-header:not([data-context-toolbar='true']) {
-  padding-inline-start: var(--session-gutter);
+  /* 主会话和详情共用标题起点，窄栏随现有会话留白收缩。 */
+  --session-header-inset: var(--session-gutter);
 }
 
 @media (max-width: 759px) {
