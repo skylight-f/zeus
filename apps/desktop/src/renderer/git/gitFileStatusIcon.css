@@ -1,0 +1,33 @@
+/* 固定大小保留文件名空间，状态色不随选中行或通用文件图标样式改变。 */
+.macos-ai-app.zeus-shell svg.git-file-status-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+.git-file-status-icon .git-file-status-background {
+  fill: #78838f;
+}
+.git-file-status-icon[data-status='modified'] .git-file-status-background {
+  fill: #e8ad25;
+}
+.git-file-status-icon[data-status='added'] .git-file-status-background {
+  fill: #369766;
+}
+.git-file-status-icon[data-status='deleted'] .git-file-status-background {
+  fill: #ce5257;
+}
+.git-file-status-icon[data-status='untracked'] .git-file-status-background {
+  fill: #8055a6;
+}
+.git-file-status-icon[data-status='renamed'] .git-file-status-background {
+  fill: #438aca;
+}
+.git-file-status-icon[data-status='conflict'] .git-file-status-background {
+  fill: #cb7132;
+}
+.git-file-status-icon[data-status='copied'] .git-file-status-background {
+  fill: #368f99;
+}
+.git-file-status-icon[data-status='typechange'] .git-file-status-background {
+  fill: #696dc0;
+}
