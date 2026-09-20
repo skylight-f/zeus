@@ -21,7 +21,21 @@ export interface AttentionItem {
   revision: string;
   blocking: boolean;
   bucket: 'pending' | 'activity';
+  /** 用户关闭的是当前版本的提醒，不改变原业务请求；新版本重新进入待处理。 */
+  closedAt?: string | null;
   target: AttentionTarget;
+}
+
+export interface SetAttentionItemClosedInput {
+  id: string;
+  revision: string;
+  closed: boolean;
+}
+
+export interface AttentionItemState {
+  id: string;
+  revision: string;
+  closedAt: string | null;
 }
 
 export interface AttentionSnapshot {

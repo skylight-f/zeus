@@ -219,6 +219,11 @@
   border: 1px solid var(--zeus-product-line-soft);
   border-radius: 5px;
 }
+.macos-ai-app.zeus-shell .attention-item-buttons {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
 .macos-ai-app.zeus-shell .attention-empty {
   padding: 26px 8px;
   text-align: center;

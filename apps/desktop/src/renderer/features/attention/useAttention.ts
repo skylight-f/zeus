@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AttentionSnapshot } from '@zeus/shared';
+import type { AttentionItem, AttentionSnapshot } from '@zeus/shared';
 import type { DashboardClient } from '../../dashboardClient.js';
 
 /** 状态推送只触发有界刷新；断线保留最近结果，重连重新读取权威集合。 */
@@ -9,6 +9,8 @@ export function useAttention(client: DashboardClient | null) {
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
   const generation = useRef(0);
+  const clientRef = useRef(client);
+  clientRef.current = client;
   const refresh = useCallback(async (): Promise<AttentionSnapshot | null> => {
     if (!client) return null;
     const revision = ++generation.current;
@@ -27,6 +29,24 @@ export function useAttention(client: DashboardClient | null) {
       if (revision === generation.current) setLoading(false);
     }
   }, [client]);
+
+  const setItemClosed = useCallback(
+    async (item: AttentionItem, closed: boolean): Promise<void> => {
+      if (!client) throw new Error('待处理服务尚未连接，请稍后重试。');
+      try {
+        const state = await client.setAttentionItemClosed({ id: item.id, revision: item.revision, closed });
+        if (clientRef.current !== client) return;
+        // 作废写入前的在途读取；角标与列表同时应用已持久化的结果。
+        generation.current += 1;
+        setSnapshot((current) => (current ? { ...current, items: current.items.map((candidate) => (candidate.id === state.id && candidate.revision === state.revision ? { ...candidate, closedAt: state.closedAt } : candidate)) } : current));
+        await refresh();
+      } catch (cause) {
+        if (clientRef.current === client) await refresh();
+        throw cause;
+      }
+    },
+    [client, refresh],
+  );
 
   useEffect(() => {
     setSnapshot(null);
@@ -63,5 +83,5 @@ export function useAttention(client: DashboardClient | null) {
     };
   }, [client, refresh]);
 
-  return { snapshot, error, connected, loading, refresh };
+  return { snapshot, error, connected, loading, refresh, setItemClosed };
 }

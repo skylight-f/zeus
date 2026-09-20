@@ -21,7 +21,7 @@ const labels: Record<AttentionKind, [string, string]> = {
 };
 
 export function AttentionToggle(props: { open: boolean; state: AttentionState; language: string; onClick(): void; standalone?: boolean }) {
-  const count = props.state.snapshot?.items.filter((item) => item.bucket === 'pending').length;
+  const count = props.state.snapshot?.items.filter((item) => item.bucket === 'pending' && !item.closedAt).length;
   const zh = props.language === 'zh-CN';
   const unavailable = Boolean(props.state.error) || !props.state.connected;
   const label = `${zh ? '待我处理' : 'Needs my attention'}${count === undefined ? '' : ` · ${count}`}${unavailable ? (zh ? ' · 正在同步' : ' · Sync pending') : ''}`;
@@ -43,8 +43,9 @@ export function AttentionToggle(props: { open: boolean; state: AttentionState; l
 export function AttentionSidebar(props: { open: boolean; width: number; language: 'zh-CN' | 'en-US'; state: AttentionState; onClose(): void; onWidthChange(width: number): void; onOpen(item: AttentionItem): Promise<void> }) {
   const zh = props.language === 'zh-CN';
   const [project, setProject] = useState('all');
-  const [tab, setTab] = useState<'pending' | 'activity'>('pending');
+  const [tab, setTab] = useState<'pending' | 'activity' | 'closed'>('pending');
   const [opening, setOpening] = useState<string | null>(null);
+  const [changing, setChanging] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<unknown>(null);
   const panelRef = useRef<HTMLElement>(null);
@@ -72,7 +73,9 @@ export function AttentionSidebar(props: { open: boolean; width: number; language
   const items = props.state.snapshot?.items ?? [];
   const projects = [...new Map(items.map((item) => [item.projectId, item.projectName])).entries()];
   const scoped = project === 'all' ? items : items.filter((item) => item.projectId === project);
-  const visible = scoped.filter((item) => item.bucket === tab);
+  const visible = scoped.filter((item) => (item.closedAt ? 'closed' : item.bucket) === tab);
+  if (tab === 'closed') visible.sort((left, right) => (right.closedAt ?? '').localeCompare(left.closedAt ?? ''));
+  const busy = opening !== null || changing !== null;
   const resize = (width: number) => props.onWidthChange(Math.max(300, Math.min(520, width)));
   const startResize = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -108,6 +111,24 @@ export function AttentionSidebar(props: { open: boolean; width: number; language
     } finally {
       actionInFlight.current = false;
       setOpening(null);
+    }
+  }
+
+  async function setItemClosed(item: AttentionItem, closed: boolean) {
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
+    setChanging(item.id);
+    setActionError(null);
+    setNotice(null);
+    try {
+      await props.state.setItemClosed(item, closed);
+      setNotice(closed ? (zh ? '已关闭，可在“已关闭”中恢复。' : 'Closed. You can restore it from Closed.') : zh ? '已恢复到待处理。' : 'Restored to Pending.');
+      panelRef.current?.querySelector<HTMLButtonElement>('.attention-tabs button[aria-pressed="true"]')?.focus();
+    } catch (cause) {
+      setActionError(cause);
+    } finally {
+      actionInFlight.current = false;
+      setChanging(null);
     }
   }
   return (
@@ -162,9 +183,9 @@ export function AttentionSidebar(props: { open: boolean; width: number; language
           ]}
         />
         <div className="attention-tabs" aria-label={zh ? '待办范围' : 'Attention scope'}>
-          {(['pending', 'activity'] as const).map((value) => (
+          {(['pending', 'activity', 'closed'] as const).map((value) => (
             <button type="button" key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>
-              {value === 'pending' ? (zh ? '待处理' : 'Pending') : zh ? '动态' : 'Activity'} <span>{scoped.filter((item) => item.bucket === value).length}</span>
+              {value === 'pending' ? (zh ? '待处理' : 'Pending') : value === 'closed' ? (zh ? '已关闭' : 'Closed') : zh ? '动态' : 'Activity'} <span>{scoped.filter((item) => (item.closedAt ? 'closed' : item.bucket) === value).length}</span>
             </button>
           ))}
         </div>
@@ -197,7 +218,7 @@ export function AttentionSidebar(props: { open: boolean; width: number; language
                 {formatAge(item.createdAt, zh)}
               </time>
             </div>
-            <button type="button" className="attention-item-open" disabled={opening !== null} onClick={() => void openItem(item)}>
+            <button type="button" className="attention-item-open" disabled={busy} onClick={() => void openItem(item)}>
               <strong>{item.title}</strong>
               <CaretRightIcon size={14} aria-hidden="true" />
             </button>
@@ -207,18 +228,59 @@ export function AttentionSidebar(props: { open: boolean; width: number; language
             </div>
             {item.summary && item.summary !== item.title ? <p>{item.summary}</p> : null}
             <div className="attention-item-action">
-              <span>{item.blocking ? (zh ? '正在等待你继续' : 'Waiting for you') : ''}</span>
-              <button type="button" disabled={opening !== null} onClick={() => void openItem(item)}>
-                {opening === item.id ? (zh ? '正在定位…' : 'Opening…') : item.kind === 'review' ? (zh ? '去验收' : 'Review') : tab === 'activity' ? (zh ? '查看结果' : 'View result') : zh ? '去处理' : 'Open'}
-              </button>
+              <span>{!item.closedAt && item.blocking ? (zh ? '正在等待你继续' : 'Waiting for you') : ''}</span>
+              <div className="attention-item-buttons">
+                {item.bucket === 'pending' ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    aria-label={`${item.closedAt ? (zh ? '恢复待处理' : 'Restore item') : zh ? '关闭待处理' : 'Close item'}：${item.title}`}
+                    title={item.closedAt ? (zh ? '恢复到待处理' : 'Restore to Pending') : zh ? '关闭这次提醒，不会回复、授权或取消任务' : 'Close this reminder without replying, approving, or cancelling the task'}
+                    onClick={() => void setItemClosed(item, !item.closedAt)}
+                  >
+                    {changing === item.id ? (zh ? '保存中…' : 'Saving…') : item.closedAt ? (zh ? '恢复' : 'Restore') : zh ? '关闭' : 'Close'}
+                  </button>
+                ) : null}
+                <button type="button" disabled={busy} onClick={() => void openItem(item)}>
+                  {opening === item.id
+                    ? zh
+                      ? '正在定位…'
+                      : 'Opening…'
+                    : item.closedAt
+                      ? zh
+                        ? '查看原记录'
+                        : 'View original'
+                      : item.kind === 'review'
+                        ? zh
+                          ? '去验收'
+                          : 'Review'
+                        : tab === 'activity'
+                          ? zh
+                            ? '查看结果'
+                            : 'View result'
+                          : zh
+                            ? '去处理'
+                            : 'Open'}
+                </button>
+              </div>
             </div>
           </article>
         ))}
         {!visible.length && props.state.snapshot && !props.state.error && props.state.connected ? (
-          <p className="attention-empty">{tab === 'pending' ? (zh ? '当前没有需要你处理的事项' : 'Nothing needs your attention') : zh ? '暂无新的完成动态' : 'No new completion updates'}</p>
+          <p className="attention-empty">
+            {tab === 'pending' ? (zh ? '当前没有需要你处理的事项' : 'Nothing needs your attention') : tab === 'closed' ? (zh ? '暂无已关闭的事项' : 'No closed items') : zh ? '暂无新的完成动态' : 'No new completion updates'}
+          </p>
         ) : null}
       </div>
-      <footer className="attention-footer">{zh ? '查看不会完成待办；处理后自动更新。' : 'Viewing does not resolve requests. Updates sync after handling.'}</footer>
+      <footer className="attention-footer">
+        {tab === 'closed'
+          ? zh
+            ? '可恢复仍待处理的事项；原事项解决后自动移除。'
+            : 'Restore items that still need attention. Resolved items disappear automatically.'
+          : zh
+            ? '不打算处理可关闭；新事项仍会提醒，关闭不会回复或授权。'
+            : 'Close items you no longer plan to handle. New items still appear; closing does not reply or approve.'}
+      </footer>
     </aside>
   );
 }

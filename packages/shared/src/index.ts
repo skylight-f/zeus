@@ -793,4 +793,4 @@ export * from './conversationCapabilities.js';
 export * from './employeeWorkPlanning.js';
 export * from './digitalTeamWorkflow.js';
 export * from './conversationWorkspace.js';
-export type { AttentionItem, AttentionKind, AttentionSnapshot, AttentionTarget } from './attention.js';
+export type { AttentionItem, AttentionKind, AttentionSnapshot, AttentionTarget, AttentionItemState, SetAttentionItemClosedInput } from './attention.js';
