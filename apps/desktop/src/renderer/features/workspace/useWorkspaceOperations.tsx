@@ -1511,7 +1511,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   /** 任务入口上下文只在数字团队页面使用，不改变任务和项目归属。 */
   const [digitalTeamTask, setDigitalTeamTask] = useState<TaskRecord | undefined>();
 
-  function handleMainNavigate(target: WorkspaceViewId): void {
+  function handleMainNavigate(target: WorkspaceViewId, onNavigated?: () => void): void {
     const navigate = () => {
       setDigitalTeamTask(undefined);
       setActiveNavTarget(target);
@@ -1520,6 +1520,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         window.history.replaceState(null, '', `#${target}`);
       }
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      onNavigated?.();
     };
     if (target === activeNavTarget) {
       navigate();
@@ -1528,7 +1529,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     requestWorkspaceLeave(navigate);
   }
 
-  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = projectCodeWorkspaceMode): void {
+  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = projectCodeWorkspaceMode, onNavigated?: () => void): void {
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
@@ -1543,6 +1544,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       setProjectPanel(undefined);
       if (typeof window !== 'undefined') window.history.replaceState(null, '', section === 'code' ? (codeMode === 'commands' ? '#project-commands' : `#project-code-${codeMode}`) : `#project-${section}`);
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      onNavigated?.();
     };
     if (project.id === activeProjectId && section === activeProjectSection && (section !== 'code' || codeMode === projectCodeWorkspaceMode)) {
       navigate();

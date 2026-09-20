@@ -1354,6 +1354,27 @@ export class ConversationRepository {
     return this.db.select<DbConversationRow>(`SELECT ${selectConversationFields} FROM conversations WHERE archived = 0 AND listing_scope = 'ordinary' ORDER BY updated_at DESC, id DESC`).map(mapConversationRow);
   }
 
+  /** 异步问题按原消息身份关联答复账本，只读取结构化元数据，不读取正文。 */
+  listUnansweredQuestions(): Array<{ conversationId: string; providerTurnId: string; providerItemId: string; metadataJson: string; createdAt: string }> {
+    return this.db.select<{ conversationId: string; providerTurnId: string; providerItemId: string; metadataJson: string; createdAt: string }>(
+      `SELECT message.conversation_id AS conversationId, message.provider_turn_id AS providerTurnId,
+              message.provider_item_id AS providerItemId, message.metadata_json AS metadataJson, message.created_at AS createdAt
+         FROM conversation_messages AS message
+         JOIN conversations AS conversation ON conversation.id = message.conversation_id
+        WHERE conversation.archived = 0 AND conversation.listing_scope = 'ordinary'
+          AND message.role = 'assistant' AND message.provider_turn_id IS NOT NULL AND message.provider_item_id IS NOT NULL
+          AND json_valid(message.metadata_json) AND json_extract(message.metadata_json, '$.delivery') = 'async'
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_submissions AS submission
+             WHERE submission.conversation_id = message.conversation_id AND json_valid(submission.input_json)
+               AND json_extract(submission.input_json, '$.questionAnswer.providerItemId') = message.provider_item_id
+               AND json_extract(submission.input_json, '$.questionAnswer.providerTurnId') = message.provider_turn_id
+               AND submission.status NOT IN ('failed', 'cancelled', 'deleted')
+          )
+        ORDER BY message.created_at, message.id`,
+    );
+  }
+
   /** 会话选择列表只读取主记录，避免为每条会话加载完整消息正文。 */
   listRecordsByProject(projectId: string, options: ConversationRecordListOptions = {}): ZeusConversationRecord[] {
     return this.db
@@ -2676,6 +2697,11 @@ export class ConversationServerRequestRepository {
 
 export class ConversationPlanActionRepository {
   constructor(private readonly db: ZeusDatabasePort) {}
+
+  /** 全局待办直接读取尚未处理的计划确认。 */
+  listPending(): ZeusConversationPlanActionRecord[] {
+    return this.db.select<DbConversationPlanActionRow>("SELECT * FROM conversation_plan_actions WHERE status = 'pending' ORDER BY created_at, id").map(mapConversationPlanActionRow);
+  }
 
   createPending(input: { conversationId: string; turnId: string; planItemId: string; createdAt: string }): ZeusConversationPlanActionRecord {
     const existing = this.db.get<DbConversationPlanActionRow>(`SELECT * FROM conversation_plan_actions WHERE plan_item_id = ?`, [input.planItemId]);

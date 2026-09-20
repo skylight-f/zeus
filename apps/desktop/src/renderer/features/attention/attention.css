@@ -1,0 +1,259 @@
+/* 全局入口与项目搜索同在标题栏；窄窗口采用覆盖式侧栏。 */
+.macos-ai-app.zeus-shell .attention-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--zeus-product-subtle);
+  background: transparent;
+  -webkit-app-region: no-drag;
+  z-index: 5;
+}
+.macos-ai-app.zeus-shell .attention-toggle:hover,
+.macos-ai-app.zeus-shell .attention-toggle[aria-expanded='true'] {
+  background: var(--zeus-product-selected);
+  color: var(--zeus-product-accent);
+}
+.macos-ai-app.zeus-shell .attention-toggle.is-standalone {
+  position: absolute;
+  top: 9px;
+  right: 12px;
+}
+.macos-ai-app.zeus-shell .attention-badge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 15px;
+  padding: 0 3px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 15px;
+  background: var(--zeus-product-accent);
+  color: var(--zeus-card-background);
+}
+.macos-ai-app.zeus-shell .attention-badge[data-stale] {
+  opacity: 0.65;
+}
+.macos-ai-app.zeus-shell .attention-sync-dot {
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell .attention-sidebar {
+  position: absolute;
+  inset: 52px 8px 36px auto;
+  width: min(var(--zeus-attention-width, 360px), calc(100% - 64px));
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--zeus-product-line-soft);
+  border-radius: 12px;
+  background: var(--zeus-card-background);
+  color: var(--zeus-product-text);
+  z-index: 30;
+  -webkit-app-region: no-drag;
+}
+.macos-ai-app.zeus-shell .attention-sidebar[hidden] {
+  display: none;
+}
+.macos-ai-app.zeus-shell .attention-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.macos-ai-app.zeus-shell .attention-resizer:hover {
+  background: color-mix(in srgb, var(--zeus-product-accent) 20%, transparent);
+}
+.macos-ai-app.zeus-shell .attention-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 14px 10px;
+}
+.macos-ai-app.zeus-shell .attention-header strong {
+  font-size: 14px;
+}
+.macos-ai-app.zeus-shell .attention-header-actions {
+  display: flex;
+  gap: 4px;
+}
+.macos-ai-app.zeus-shell .attention-header-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell .attention-header-actions button:hover {
+  background: var(--zeus-control-bg);
+}
+.macos-ai-app.zeus-shell .attention-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 14px;
+}
+.macos-ai-app.zeus-shell .attention-tabs {
+  display: flex;
+  gap: 18px;
+  border-bottom: 1px solid var(--zeus-product-line-soft);
+}
+.macos-ai-app.zeus-shell .attention-tabs button {
+  display: flex;
+  gap: 6px;
+  padding: 7px 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--zeus-product-subtle);
+  background: transparent;
+  font-size: 12px;
+}
+.macos-ai-app.zeus-shell .attention-tabs button[aria-pressed='true'] {
+  border-bottom-color: var(--zeus-product-accent);
+  color: var(--zeus-product-accent);
+}
+.macos-ai-app.zeus-shell .attention-feedback {
+  padding: 0 14px;
+  font-size: 12px;
+  color: var(--zeus-product-subtle);
+  overflow-wrap: anywhere;
+}
+.macos-ai-app.zeus-shell .attention-feedback:not(:empty) {
+  padding-block: 10px;
+}
+.macos-ai-app.zeus-shell .attention-list {
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+  overscroll-behavior: contain;
+  padding: 0 10px 12px;
+}
+.macos-ai-app.zeus-shell .attention-item {
+  padding: 14px 6px;
+  border-bottom: 1px solid var(--zeus-product-line-soft);
+}
+.macos-ai-app.zeus-shell .attention-item-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell .attention-item-meta > span {
+  color: var(--zeus-product-accent);
+}
+.macos-ai-app.zeus-shell .attention-item[data-kind='failure'] .attention-item-meta > span,
+.macos-ai-app.zeus-shell .attention-item[data-kind='unknown'] .attention-item-meta > span {
+  color: var(--status-danger, #c66961);
+}
+.macos-ai-app.zeus-shell .attention-item-open {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 0;
+  border: 0;
+  text-align: left;
+  color: var(--zeus-product-text);
+  background: transparent;
+}
+.macos-ai-app.zeus-shell .attention-item-open strong {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.macos-ai-app.zeus-shell .attention-item-open svg {
+  flex-shrink: 0;
+}
+.macos-ai-app.zeus-shell .attention-item-source {
+  font-size: 11px;
+  color: var(--zeus-product-subtle);
+  overflow-wrap: anywhere;
+}
+.macos-ai-app.zeus-shell .attention-item p {
+  font-size: 12px;
+  margin: 8px 0;
+  color: var(--zeus-product-subtle);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.macos-ai-app.zeus-shell .attention-item-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
+.macos-ai-app.zeus-shell .attention-item-action span {
+  font-size: 11px;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell .attention-item-action button {
+  padding: 3px 8px;
+  font-size: 12px;
+  background: var(--zeus-control-bg);
+  color: var(--zeus-product-text);
+  border: 1px solid var(--zeus-product-line-soft);
+  border-radius: 5px;
+}
+.macos-ai-app.zeus-shell .attention-empty {
+  padding: 26px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell .attention-footer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--zeus-product-line-soft);
+  font-size: 11px;
+  color: var(--zeus-product-subtle);
+}
+.macos-ai-app.zeus-shell[data-attention-open] .session-quick-actions-persistent-host {
+  display: none;
+}
+@media (min-width: 760px) {
+  .macos-ai-app.zeus-shell.project-navigation-rail-shell .project-workspace-project-switcher:has(.attention-toggle) {
+    grid-template-columns: minmax(0, 1fr) minmax(180px, clamp(180px, 24vw, 320px)) 32px;
+    column-gap: 10px;
+    padding-inline-end: 10px;
+  }
+}
+@media (min-width: 1280px) {
+  .macos-ai-app.zeus-shell.project-navigation-rail-shell[data-attention-open] {
+    --zeus-workspace-right-rail-width: calc(var(--zeus-attention-width) + 8px);
+  }
+  .macos-ai-app.zeus-shell[data-attention-open] > .project-workspace-tool-rail {
+    visibility: hidden;
+  }
+  .macos-ai-app.zeus-shell.main-layout-upstream[data-attention-open] > .ai-workspace {
+    margin-right: calc(var(--zeus-attention-width) + 16px);
+  }
+}
+@media (max-width: 1279px) {
+  .macos-ai-app.zeus-shell .attention-sidebar {
+    box-shadow: -8px 0 28px rgb(0 0 0 / 18%);
+  }
+}

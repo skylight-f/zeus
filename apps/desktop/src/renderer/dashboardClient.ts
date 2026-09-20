@@ -1,5 +1,6 @@
 import { createCodexApiClient, type CodexApiClient } from './features/codex/codexApiClient.js';
 import { createAutomationApiClient, type AutomationApiClient } from './features/automations/automationApiClient.js';
+import { createAttentionApiClient, type AttentionApiClient } from './features/attention/attentionApiClient.js';
 import { createCommandCenterApiClient, type CommandCenterApiClient } from './features/command-center/commandCenterApiClient.js';
 import { createConversationApiClient, type ConversationApiClient } from './features/conversations/conversationApiClient.js';
 import { createDashboardApiClient, type DashboardApiClient } from './features/dashboard/dashboardApiClient.js';
@@ -22,6 +23,7 @@ export interface DashboardClient
   extends
     DashboardApiClient,
     AutomationApiClient,
+    AttentionApiClient,
     DigitalEmployeeApiClient,
     DigitalTeamApiClient,
     CodexApiClient,
@@ -81,6 +83,7 @@ export function createDashboardClient(options: DashboardClientOptions): Dashboar
 
   return {
     memory,
+    ...createAttentionApiClient(transport),
     ...automations,
     conversations,
     projects,

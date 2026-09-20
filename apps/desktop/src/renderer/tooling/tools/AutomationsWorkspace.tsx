@@ -1,4 +1,5 @@
 import { MotionPresence } from '../toolPageHost.js';
+import { useAttentionWorkspace } from '../toolPageHost.js';
 import { reportApplicationError, VisibleApplicationError } from '../toolPageHost.js';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ArrowClockwiseIcon as Refresh } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
@@ -24,6 +25,9 @@ const allProjectsValue = '__all_projects__';
 
 /** 自动化目录与收件箱使用全局控件，编辑及删除复用表单弹窗。 */
 export function AutomationsWorkspace(props: { client: DashboardClient | null; projects: ProjectRecord[]; language: 'zh-CN' | 'en-US'; onOpenConversation: (run: AutomationRunRecord) => Promise<void> }) {
+  const { navigation: attentionNavigation } = useAttentionWorkspace();
+  const attentionHandled = useRef<number | null>(null);
+  const attentionRunRef = useRef<HTMLElement | null>(null);
   const zh = props.language === 'zh-CN';
   const [view, setView] = useState<View>('tasks');
   const [tasks, setTasks] = useState<AutomationTaskRecord[]>([]);
@@ -35,6 +39,28 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const target = attentionNavigation?.target;
+    if (!props.client || loading || !attentionNavigation || target?.kind !== 'automation' || attentionHandled.current === attentionNavigation.nonce) return;
+    let active = true;
+    void props.client
+      .loadAutomationRun(target.runId)
+      .then((run) => {
+        if (!active) return;
+        attentionHandled.current = attentionNavigation.nonce;
+        setInbox((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+        setView('inbox');
+      })
+      .catch((cause) => {
+        if (active) setError(reportApplicationError(cause, { language: zh ? 'zh-CN' : 'en' }));
+      });
+    return () => {
+      active = false;
+    };
+  }, [props.client, attentionNavigation, loading, zh]);
+  useEffect(() => {
+    if (view === 'inbox' && attentionRunRef.current) attentionRunRef.current.scrollIntoView({ block: 'nearest' });
+  }, [attentionNavigation, inbox, view]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(props.projects));
   const [fullAccessAcknowledged, setFullAccessAcknowledged] = useState(false);
@@ -381,7 +407,12 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
             inbox.map((run) => {
               const task = tasks.find((candidate) => candidate.id === run.automationId);
               return (
-                <article className="automation-inbox-row" key={run.id} data-unread={run.unread ? 'true' : 'false'}>
+                <article
+                  className="automation-inbox-row"
+                  key={run.id}
+                  data-unread={run.unread ? 'true' : 'false'}
+                  ref={attentionNavigation?.target.kind === 'automation' && attentionNavigation.target.runId === run.id ? attentionRunRef : undefined}
+                >
                   <span className={`automation-run-status status-${run.status}`}>{runStatusLabel(run.status, zh)}</span>
                   <div>
                     <strong>{task?.name ?? run.automationId}</strong>

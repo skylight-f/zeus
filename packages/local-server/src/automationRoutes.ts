@@ -37,6 +37,11 @@ export function registerAutomationRoutes(options: RegisterAutomationRoutesOption
     }
   });
 
+  server.get('/api/automation-runs/:runId', async (request: FastifyRequest<{ Params: { runId: string } }>, reply) => {
+    const run = runs.getById(request.params.runId);
+    return run ?? reply.code(404).send({ error: 'ZEUS_AUTOMATION_RUN_NOT_FOUND', message: '自动化运行不存在。' });
+  });
+
   server.post('/api/automations', async (request: FastifyRequest<{ Body: CreateAutomationTaskInput }>, reply) => {
     return mutate(request, reply, () => {
       const created = tasks.create(request.body);

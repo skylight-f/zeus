@@ -1,3 +1,4 @@
+import { useAttentionWorkspace } from '../attention/attentionContext.js';
 import {
   digitalTeamApprovalPurposes,
   digitalTeamEmployeePurposes,
@@ -97,6 +98,8 @@ export interface DigitalTeamWorkspaceProps {
 
 /** 提供模板编辑、真实角色库和只读运行投影。 */
 export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
+  const { navigation: attentionNavigation } = useAttentionWorkspace();
+  const attentionHandled = useRef<number | null>(null);
   /** 页面交互保持中文产品语义，英文环境提供对应文案。 */
   const zh = props.language === 'zh-CN';
   /** DashboardClient 完成组合后才开放真实操作。 */
@@ -143,6 +146,31 @@ export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
   const compactInspector = useCompactInspector();
   /** 项目切换代次防止迟到读取覆盖当前页面。 */
   const loadRevisionRef = useRef(0);
+  useEffect(() => {
+    const target = attentionNavigation?.target;
+    if (!api || !attentionNavigation || target?.kind !== 'digital_team' || attentionHandled.current === attentionNavigation.nonce || dirty) return;
+    if (projectId !== attentionNavigation.projectId) {
+      setProjectId(attentionNavigation.projectId);
+      return;
+    }
+    if (loading) return;
+    let active = true;
+    void api
+      .loadDigitalTeamRun(target.runId)
+      .then((projection) => {
+        if (!active) return;
+        attentionHandled.current = attentionNavigation.nonce;
+        setSelectedRun(projection);
+        setSelectedNodeId(target.nodeId ?? null);
+        setView('runs');
+      })
+      .catch((cause) => {
+        if (active) setError(applicationError(cause, zh));
+      });
+    return () => {
+      active = false;
+    };
+  }, [api, attentionNavigation, projectId, loading, dirty, zh]);
 
   /** 员工名称索引供画布卡片与检查器复用。 */
   const employeeNames = useMemo(() => new Map(employees.map((employee) => [employee.id, employee.name])), [employees]);

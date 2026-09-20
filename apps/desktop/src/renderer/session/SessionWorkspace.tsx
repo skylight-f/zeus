@@ -1,3 +1,4 @@
+import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
 import { contextCapacitySelectionAllowed, contextCapacitySelectionOptions, contextCapacitySelectionFromValue, contextCapacitySelectionValue } from './contextCapacitySelection.js';
 import { ActivitySkillCatalogContext } from './SessionActivity.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
@@ -1706,6 +1707,9 @@ export function createSessionHeaderSnapshot(conversation: NativeConversationChoi
 }
 
 export function SessionWorkspace(props: SessionWorkspaceProps) {
+  const openedAttentionQuestion = useRef<number | null>(null);
+  const attentionWorkspace = useAttentionWorkspace();
+  const attentionTarget = attentionWorkspace.navigation?.target.kind === 'conversation' && attentionWorkspace.navigation.target.conversationId === props.conversation?.id ? attentionWorkspace.navigation.target : null;
   const copy = labels[props.language];
   const actions = props.actions ?? {};
   const owner: SessionConversationOwner | undefined = props.owner ?? (props.task ? { kind: 'task', projectId: props.task.projectId, projectName: props.task.projectId, taskId: props.task.id, taskTitle: props.task.title } : undefined);
@@ -1860,10 +1864,19 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   }
   const pendingRequests = props.historyOnly ? [] : (props.state?.pendingRequests.filter((request) => request.status === 'pending' && hasPendingRequestDetails(request)) ?? []);
   const pendingPlanImplementationRequests = props.historyOnly ? [] : (props.state?.planImplementationRequests.filter((request) => request.status === 'pending').slice(-1) ?? []);
-  const blockingPendingRequest = pendingRequests[0] ?? null;
+  const blockingPendingRequest =
+    (pendingPlanImplementationRequests.some((request) => request.id === attentionTarget?.planId) ? null : (pendingRequests.find((request) => request.id === attentionTarget?.requestId) ?? pendingRequests[0])) ?? null;
   const blockingPlanImplementationRequest = blockingPendingRequest ? null : (pendingPlanImplementationRequests[0] ?? null);
   /** 异步问题使用同一个底部位置，正式阻塞请求保持原有优先级。 */
   const asyncQuestionDock = useAsyncQuestionDock(props.state, transcriptInteractionsEnabled && !props.suppressComposer && Boolean(actions.onAnswerAsyncQuestion));
+  useEffect(() => {
+    const navigation = attentionWorkspace.navigation;
+    if (!navigation || !attentionTarget?.questionItemId || openedAttentionQuestion.current === navigation.nonce) return;
+    const question = Object.values(props.state?.items ?? {}).find((item) => item.turnId === attentionTarget.turnId && (item.providerItemId ?? item.itemId) === attentionTarget.questionItemId);
+    if (!question) return;
+    openedAttentionQuestion.current = navigation.nonce;
+    asyncQuestionDock.open(question);
+  }, [attentionWorkspace.navigation, attentionTarget, props.state?.items, asyncQuestionDock]);
   /** 底部一次只显示一个交互表单，后台异步执行不转成等待状态。 */
   const dockedAsyncQuestion = blockingPendingRequest || blockingPlanImplementationRequest ? null : asyncQuestionDock.selected;
   const blockingInteractionCount = pendingRequests.length + pendingPlanImplementationRequests.length + Number(Boolean(dockedAsyncQuestion));
@@ -2693,7 +2706,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   task={props.task}
                   persistentHost={quickActionsPersistentHost}
                   dockHost={browserOpen ? browserEnvironmentHost : null}
-                  forceCollapsed={contextOpen}
+                  forceCollapsed={contextOpen || attentionWorkspace.open}
                   suppressed={props.quickActionsSuppressed}
                   capabilities={props.capabilities}
                   serviceTierPreferences={serviceTierPreferences}

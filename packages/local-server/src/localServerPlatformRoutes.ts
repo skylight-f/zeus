@@ -100,6 +100,7 @@ import { DigitalTeamWorkflowCoordinator } from './digitalTeamWorkflowCoordinator
 import { registerDigitalTeamWorkflowRoutes } from './digitalTeamWorkflowRoutes.js';
 import { registerConversationCapabilityQueryRoutes } from './conversationCapabilityQueryRoutes.js';
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
+import { AttentionQueryApplication } from './attentionQueryApplication.js';
 import { registerConversationChoiceQueryRoutes } from './conversationChoiceQueryRoutes.js';
 import { registerConversationCommandRoutes } from './conversationCommandRoutes.js';
 import { registerConversationDispatchCommandRoutes } from './conversationDispatchCommandRoutes.js';
@@ -3173,6 +3174,21 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     server,
     application: conversationChoiceQueries,
   });
+
+  const attentionQueries = new AttentionQueryApplication({
+    projects,
+    tasks,
+    conversations,
+    requests: conversationRequests,
+    plans: conversationPlanActions,
+    decisions: taskWorkDecisions,
+    teamRuns: new DigitalTeamWorkflowRunRepository(db),
+    teamAttempts: new DigitalTeamNodeAttemptRepository(db),
+    automationRuns,
+    automationTasks,
+    redact: (text) => redactSensitiveText(text).text,
+  });
+  server.get('/api/attention', async () => attentionQueries.read());
 
   server.get('/api/codex/account', async (_request, reply) => {
     try {
