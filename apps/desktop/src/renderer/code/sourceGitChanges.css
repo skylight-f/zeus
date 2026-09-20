@@ -240,12 +240,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.source-git-file > button > small {
-  margin-left: auto;
-  padding-left: 4px;
-  color: var(--zeus-product-muted);
-  font-size: 10px;
-}
 .source-git-tree[data-view='flat'] > .source-git-file {
   padding-left: 0;
 }

@@ -1,3 +1,4 @@
+import { GitFileStatusIcon, gitFileStatusCategory, gitFileStatusLabel } from './GitFileStatusIcon.js';
 import { DotsThreeIcon as DotsThree } from '@phosphor-icons/react/dist/csr/DotsThree';
 import { GitCommitIcon as GitCommit } from '@phosphor-icons/react/dist/csr/GitCommit';
 import { GitMergeIcon as GitMerge } from '@phosphor-icons/react/dist/csr/GitMerge';
@@ -2192,6 +2193,7 @@ function ChangeTreeEntry(props: Parameters<typeof ChangeDirectoryTree>[0] & { no
   const selected = props.repository.id === props.selectedRepositoryId && props.node.path === props.selectedFilePath && props.stage === props.selectedFileStage;
   const checked = props.stage === 'staged';
   const status = props.repository.snapshot.fileStatuses.find((file) => file.path === props.node.path);
+  const category = gitFileStatusCategory(status, props.stage);
   return (
     <div data-git-context={JSON.stringify({ kind: 'file', repositoryId: props.repository.id, ref: props.node.path, stage: props.stage })} className={`project-git-change-file-row${selected ? ' is-current' : ''}`}>
       <input
@@ -2210,16 +2212,15 @@ function ChangeTreeEntry(props: Parameters<typeof ChangeDirectoryTree>[0] & { no
       <button
         type="button"
         style={{ marginLeft: `${props.depth * 13}px` }}
-        title={props.node.path}
+        title={`${props.node.path} · ${gitFileStatusLabel(category, props.zh)}`}
         onClick={() => {
           props.onSelectRepository(props.repository.id);
           props.onSelectFile(props.node.path, props.stage);
         }}
         onDoubleClick={() => props.onOpenDiff(props.repository, props.node.path, { stage: props.stage })}
       >
-        <File aria-hidden="true" />
+        <GitFileStatusIcon category={category} zh={props.zh} />
         <span>{props.node.name}</span>
-        {status ? <small className={`project-git-file-status is-${status.category}`}>{gitFileStatusLabel(status.category, props.zh)}</small> : null}
       </button>
     </div>
   );
@@ -2604,19 +2605,6 @@ function CommitDialog(props: {
 function readRememberedTab(projectId: string): GitTab {
   const value = typeof window === 'undefined' ? null : window.localStorage.getItem(`zeus.project-git-tab-v2:${projectId}`);
   return value === 'changes' || value === 'stash' || value === 'console' ? value : 'log';
-}
-
-function gitFileStatusLabel(category: string, zh: boolean): string {
-  const labels: Record<string, [string, string]> = {
-    added: ['新增', 'Added'],
-    modified: ['修改', 'Modified'],
-    deleted: ['删除', 'Deleted'],
-    renamed: ['重命名', 'Renamed'],
-    untracked: ['未跟踪', 'Untracked'],
-    conflict: ['冲突', 'Conflict'],
-    other: ['变更', 'Changed'],
-  };
-  return (labels[category] ?? labels.other)[zh ? 0 : 1];
 }
 
 function displayStashSubject(subject: string, zh: boolean): string {
