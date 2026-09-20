@@ -4061,9 +4061,17 @@ function nullableCacheHitRate(inputTokens: number | null, cachedInputTokens: num
 }
 
 function linkedFileApprovalPaths(state: NativeSessionState | null, request: NativePendingRequest): string[] {
-  const providerItemId = stringField(request.payload.itemId);
+  const providerItemId = stringField(request.payload.itemId) ?? request.itemId;
   if (!state || requestKind(request) !== 'file' || !providerItemId) return [];
-  const linkedItem = Object.values(state.items).find((item) => item.itemId === providerItemId || item.providerItemId === providerItemId);
+  const requestTurnIdentity = stringField(request.payload.turnId) ?? request.turnId;
+  const requestTurnIdentities = new Set([requestTurnIdentity].filter((identity): identity is string => Boolean(identity)));
+  for (const turn of Object.values(state.turnsByProviderId)) {
+    if (!requestTurnIdentities.has(turn.id) && (!turn.providerTurnId || !requestTurnIdentities.has(turn.providerTurnId))) continue;
+    requestTurnIdentities.add(turn.id);
+    if (turn.providerTurnId) requestTurnIdentities.add(turn.providerTurnId);
+  }
+  const candidates = Object.values(state.items).filter((item) => item.itemId === providerItemId || item.providerItemId === providerItemId);
+  const linkedItem = candidates.find((item) => requestTurnIdentities.has(item.turnId)) ?? (requestTurnIdentities.size === 0 && candidates.length === 1 ? candidates[0] : undefined);
   if (!linkedItem || linkedItem.type.replace(/[^a-z]/gi, '').toLowerCase() !== 'filechange' || !Array.isArray(linkedItem.payload.changes)) return [];
   return [
     ...new Set(

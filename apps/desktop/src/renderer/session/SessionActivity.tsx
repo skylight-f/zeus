@@ -218,6 +218,17 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
   /** 技能链接显示完整名称标题，保留原有文件打开入口。 */
   const skillActivity = activitySkillNames([props.item]).length > 0;
   const [open, setOpen] = useState(false);
+  const [loadingCompleteContent, setLoadingCompleteContent] = useState(false);
+  const contentLoadError = props.item.payload.v2ContentLoadError;
+  const contentHandle = typeof props.item.payload.v2ContentHandle === 'string' ? props.item.payload.v2ContentHandle : null;
+  const loadCompleteContent = () => {
+    if (!contentHandle || !props.onLoadContent || loadingCompleteContent) return;
+    setLoadingCompleteContent(true);
+    void props
+      .onLoadContent(contentHandle)
+      .catch(() => undefined)
+      .finally(() => setLoadingCompleteContent(false));
+  };
   const Icon = activityItemIcon(props.item);
   const toolResult = activityToolResult(props.item);
   const titleNode = target ? (
@@ -246,8 +257,8 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
             open={open}
             onToggle={(event) => {
               setOpen(event.currentTarget.open);
-              if (event.currentTarget.open && props.item.payload.v2ContentTruncated === true && typeof props.item.payload.v2ContentHandle === 'string') {
-                void props.onLoadContent?.(props.item.payload.v2ContentHandle).catch(() => undefined);
+              if (event.currentTarget.open && props.item.payload.v2ContentTruncated === true && contentHandle && !contentLoadError) {
+                loadCompleteContent();
               }
             }}
           >
@@ -260,6 +271,16 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
                 {detail.command ? <code>{detail.command}</code> : null}
                 {detail.cwd ? <small>{detail.cwd}</small> : null}
                 {detail.output || toolResult ? <ActivityItemOutput output={detail.output} toolResult={toolResult} language={props.language} onLoadToolResult={props.onLoadToolResult} /> : null}
+                {contentLoadError ? (
+                  <div className="session-message-delivery-error" role="alert">
+                    <VisibleApplicationError error={contentLoadError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+                    <div className="session-message-delivery-actions">
+                      <button type="button" disabled={!props.onLoadContent || loadingCompleteContent} onClick={loadCompleteContent}>
+                        {loadingCompleteContent ? (props.language === 'zh-CN' ? '正在重试…' : 'Retrying…') : props.language === 'zh-CN' ? '重试加载完整内容' : 'Retry full content'}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </details>

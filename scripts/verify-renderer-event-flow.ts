@@ -2,8 +2,17 @@ import { ZeusApiError } from '../apps/desktop/src/renderer/transport/localApiTra
 import { createSessionController, type SessionControllerClient, sessionRealtimeBufferBudget } from '../apps/desktop/src/renderer/session/useSessionController.ts';
 import { adaptConversationSnapshotV2, mergeConversationProcessV2, resumeCachedConversationSnapshot } from '../apps/desktop/src/renderer/session/conversationSnapshotV2Adapter.ts';
 import { createHydratedSessionState, createInitialSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.ts';
-import type { NativePlanImplementationRequest, NativeRealtimeEventEnvelope, NativeQueueSnapshot, NativeSessionState, NativeConversationEvent } from '../apps/desktop/src/renderer/session/sessionTypes.ts';
+import type {
+  NativeConversationEvent,
+  NativeConversationTranscriptPlacementBatch,
+  NativePlanImplementationRequest,
+  NativeQueueSnapshot,
+  NativeRealtimeEventEnvelope,
+  NativeSessionItemBuffer,
+  NativeSessionState,
+} from '../apps/desktop/src/renderer/session/sessionTypes.ts';
 import { orderTranscriptItemsWithQueue } from '../apps/desktop/src/renderer/session/conversationQueuePresentation.ts';
+import { mergeTranscriptItem } from '../apps/desktop/src/renderer/session/transcriptReconciliation.ts';
 import type { TurnChangeSet } from '../packages/shared/src/conversationResources.ts';
 import type { ConversationTranscriptEnvelope } from '../packages/shared/src/conversationTranscriptWire.ts';
 
@@ -1556,6 +1565,400 @@ async function verifyTaskPushPlacement() {
   }
 }
 
+/** 本轮会话缺陷修复的真实 Controller 验证，不连接模型或正式用户数据。 */
+async function verifySessionDefectRecovery() {
+  /** 明确 4xx 拒绝必须恢复输入，并允许修正设置后使用新的命令身份。 */
+  const rejected = createHarness(undefined, 0, true, [], null, new ZeusApiError({ status: 400, error: 'ZEUS_INVALID_CONVERSATION_SETTINGS', message: 'Selected reasoning effort is not supported by the selected Codex model.' }));
+  let replacementRequest: Record<string, unknown> | null = null;
+  try {
+    await rejected.controller.start();
+    rejected.controller.setDraft('保留并重发的输入');
+    const firstError = await rejected.controller.send('queue', undefined, { model: 'probe-model', effort: 'ultra', serviceTier: 'priority', permissionMode: 'read-only', collaborationMode: 'default' }).then(
+      () => null,
+      (error: Error) => error,
+    );
+    assert(firstError instanceof ZeusApiError, '明确的设置拒绝必须返回原服务端错误。');
+    assert(rejected.controller.getState().draft === '保留并重发的输入', '明确未发送后必须恢复原输入。');
+    const failedLedger = JSON.parse(rejected.persistedDraft() ?? '{}').pendingSend;
+    assert(failedLedger?.deliveryState === 'failed' && failedLedger?.deliveryError?.retryable === false, '4xx 拒绝不能被升级为送达未知。');
+    const firstRequest = rejected.sentMessages[0]!;
+    rejected.client.sendNativeMessage = async (_project, _conversation, input) => {
+      replacementRequest = input as unknown as Record<string, unknown>;
+      return { operation: { status: 'accepted' }, conversation: { id: conversationId } };
+    };
+    await rejected.controller.send('queue', undefined, { model: 'probe-model', effort: 'high', serviceTier: null, permissionMode: 'read-only', collaborationMode: 'default' });
+    assert(replacementRequest !== null, '修正设置后必须真正提交新请求。');
+    assert(replacementRequest!.idempotencyKey !== firstRequest.idempotencyKey && replacementRequest!.clientUserMessageId !== firstRequest.clientUserMessageId, '修改请求设置后必须生成新的发送身份。');
+    assert(replacementRequest!.effort === 'high' && replacementRequest!.serviceTier === null, '新发送必须使用修正后的模型设置。');
+  } finally {
+    rejected.controller.dispose();
+  }
+
+  /** 已明确未发送的消息取消只清理本地账本，不能因一次新的读取失败又变成“送达未知”。 */
+  const cancelledRejection = createHarness(undefined, 0, true, [], null, new ZeusApiError({ status: 400, error: 'ZEUS_INVALID_CONVERSATION_SETTINGS', message: 'Selected reasoning effort is not supported.' }));
+  let cancellationSnapshotReads = 0;
+  try {
+    await cancelledRejection.controller.start();
+    cancelledRejection.controller.setDraft('待取消的明确失败消息');
+    await cancelledRejection.controller.send('queue', undefined, { model: 'probe-model', effort: 'ultra', serviceTier: null, permissionMode: 'read-only', collaborationMode: 'default' }).catch(() => undefined);
+    const failedRequest = cancelledRejection.sentMessages[0]!;
+    cancelledRejection.client.loadNativeConversationSnapshotV2 = async () => {
+      cancellationSnapshotReads += 1;
+      throw new Error('取消明确失败消息时不应重新读取快照。');
+    };
+    await cancelledRejection.controller.cancelPendingSend(String(failedRequest.clientUserMessageId));
+    assert(cancellationSnapshotReads === 0, '明确失败消息取消时不能再次执行送达核对。');
+    assert(!Object.values(cancelledRejection.controller.getState().items).some((item) => item.clientUserMessageId === failedRequest.clientUserMessageId), '取消明确失败消息后必须移除原失败气泡。');
+  } finally {
+    cancelledRejection.controller.dispose();
+  }
+
+  /** 较旧读取返回时，已经应用的实时回复和事件身份必须一起保留。 */
+  const stale = createHarness(undefined, 1, true);
+  try {
+    stale.client.updateNativeCollaborationMode = async () => ({ acknowledged: true });
+    await stale.controller.start();
+    stale.emit(
+      conversationEvent(2, 'conversation.item.completed', {
+        turnId: 'turn',
+        itemId: 'fresh-reply',
+        itemType: 'agentMessage',
+        status: 'completed',
+        phase: 'final_answer',
+        textContent: '刚收到的实时回复',
+        transcript: transcript('fresh-reply', 1, 'fresh-reply'),
+      }),
+    );
+    await waitUntil(() => Object.values(stale.controller.getState().items).some((item) => item.itemId === 'fresh-reply'), 'fresh realtime reply');
+    await stale.controller.setCollaborationMode('plan');
+    const afterStaleSnapshot = stale.controller.getState();
+    assert(
+      Object.values(afterStaleSnapshot.items).some((item) => item.itemId === 'fresh-reply'),
+      '较旧快照不能覆盖刚收到的实时回复。',
+    );
+    assert(afterStaleSnapshot.seenEventIds['event-2'] === true, '保留回复时必须保留同一事件的去重身份。');
+  } finally {
+    stale.controller.dispose();
+  }
+
+  /** 位置接管进行中，草稿和本地发送必须立即归约，即使位置读取随后失败。 */
+  const baseSnapshot = adaptConversationSnapshotV2({ snapshot: snapshotV2, history: historyV2, queue, requests: [], planImplementationRequests: [], choice, goal });
+  /** 重连读到旧空闲快照时仍应服从当前活动状态，继续订阅而不是静默断流。 */
+  const aheadState = createHydratedSessionState({
+    ...baseSnapshot,
+    throughEventSeq: 2,
+    queue: { state: { type: 'active', turnId: 'turn', phase: 'prework' }, submissions: [] },
+  });
+  const staleReconnect = createHarness(undefined, 1, false, [], null, undefined, undefined, aheadState);
+  try {
+    await staleReconnect.controller.start();
+    assert(staleReconnect.connectedAfterSequences.length === 1, '旧空闲快照不能让当前活动会话跳过实时订阅。');
+    assert(staleReconnect.controller.getState().conversationState === 'active_prework', '旧空闲快照不能把当前活动状态回滚为空闲。');
+  } finally {
+    staleReconnect.controller.dispose();
+  }
+  /** 旧同步协议的持久缓存不能用不相干的大水位拒绝当前协议快照。 */
+  const legacyGenerationState = createHydratedSessionState({
+    ...baseSnapshot,
+    throughEventSeq: 9_999,
+    syncStreamGeneration: 'zeus-conversation-sync-v1',
+  });
+  const legacyGenerationCache = createHarness(undefined, 1, false, [], null, undefined, undefined, legacyGenerationState);
+  try {
+    await legacyGenerationCache.controller.start();
+    assert(legacyGenerationCache.controller.getState().snapshot?.throughEventSeq === 1, '旧同步协议缓存不能压住当前协议的权威快照。');
+    assert(legacyGenerationCache.controller.getDiagnostics().lastAppliedSyncEventSequence === 1, '当前协议快照必须重新建立事件水位。');
+  } finally {
+    legacyGenerationCache.controller.dispose();
+  }
+  /** Provider 短 ID 跨轮次复用时，旧 messages 投影必须回退到明确客户端身份，不能合并或复制气泡。 */
+  const reusedProviderItemId = 'reused-provider-item';
+  const scopedProviderState = createHydratedSessionState({
+    ...baseSnapshot,
+    items: [
+      {
+        id: 'scoped-provider-a',
+        providerItemId: reusedProviderItemId,
+        turnId: 'turn-a',
+        type: 'userMessage',
+        status: 'completed',
+        phase: 'prework',
+        text: '消息 A',
+        payload: { clientId: 'client-a' },
+        resources: [],
+        startedAt: occurredAt,
+        updatedAt: occurredAt,
+        transcript: transcript('scoped-provider-entry-a', 1, reusedProviderItemId, 'turn-a'),
+      },
+      {
+        id: 'scoped-provider-b',
+        providerItemId: reusedProviderItemId,
+        turnId: 'turn-b',
+        type: 'userMessage',
+        status: 'completed',
+        phase: 'prework',
+        text: '消息 B',
+        payload: { clientId: 'client-b' },
+        resources: [],
+        startedAt: occurredAt,
+        updatedAt: occurredAt,
+        transcript: transcript('scoped-provider-entry-b', 2, reusedProviderItemId, 'turn-b'),
+      },
+    ],
+    messages: [
+      { id: 'legacy-message-a', conversationId, role: 'user', content: '消息 A', source: 'probe', metadata: { clientUserMessageId: 'client-a' }, providerItemId: reusedProviderItemId, createdAt: occurredAt },
+      { id: 'legacy-message-b', conversationId, role: 'user', content: '消息 B', source: 'probe', metadata: { clientUserMessageId: 'client-b' }, providerItemId: reusedProviderItemId, createdAt: occurredAt },
+    ],
+  });
+  const scopedProviderUsers = Object.values(scopedProviderState.items).filter((item) => item.type === 'userMessage');
+  assert(scopedProviderUsers.length === 2, '跨轮次复用 Provider 短 ID 时必须保留两条独立用户消息。');
+  assert(
+    scopedProviderUsers.some((item) => item.clientUserMessageId === 'client-a' && item.text === '消息 A') && scopedProviderUsers.some((item) => item.clientUserMessageId === 'client-b' && item.text === '消息 B'),
+    '歧义 Provider ID 必须按明确客户端身份回填对应消息。',
+  );
+  const scopedProviderEventState = sessionReducer(scopedProviderState, {
+    type: 'event_received',
+    event: conversationEvent(49, 'conversation.item.completed', {
+      turnId: 'turn-b',
+      itemId: reusedProviderItemId,
+      itemType: 'userMessage',
+      status: 'completed',
+      phase: 'prework',
+      textContent: '消息 B（实时确认）',
+    }),
+  });
+  const usersAfterScopedEvent = Object.values(scopedProviderEventState.items).filter((item) => item.type === 'userMessage');
+  assert(usersAfterScopedEvent.length === 2, '缺少 clientId 的同轮 Provider 事件必须接管原消息，不能新增第三个气泡。');
+  assert(
+    usersAfterScopedEvent.some((item) => item.turnId === 'turn-a' && item.text === '消息 A') && usersAfterScopedEvent.some((item) => item.turnId === 'turn-b' && item.text === '消息 B（实时确认）'),
+    '同轮 Provider 接管不能修改复用短 ID 的其他轮消息。',
+  );
+  /** 内容完整性不能绑架状态：活动快照即使正文较短，也必须把条目推进到终态。 */
+  const completeProgress = {
+    text: '完整实时正文',
+    payload: {},
+    status: 'in_progress',
+    transcript: transcript('status-entry', 3, 'status-source'),
+  };
+  const terminalPreview = {
+    text: '截断预览',
+    payload: { v2ContentKind: 'active_item', v2ContentTruncated: true, v2RefreshRequired: true },
+    status: 'completed',
+    transcript: transcript('status-entry', 3, 'status-source'),
+  };
+  const mergedTerminalPreview = mergeTranscriptItem(completeProgress, terminalPreview);
+  assert(mergedTerminalPreview.text === completeProgress.text && mergedTerminalPreview.status === 'completed', '保留完整正文时仍必须接受随后到达的终态。');
+  /** 相同位置对象会出现在同一事件投影被复用的路径，不能触发漏状态的快速返回。 */
+  const sharedTranscript = transcript('shared-status-entry', 4, 'shared-status-source');
+  const mergedSharedPlacement = mergeTranscriptItem({ ...completeProgress, transcript: sharedTranscript }, { ...terminalPreview, status: 'interrupted', transcript: sharedTranscript });
+  assert(mergedSharedPlacement.text === completeProgress.text && mergedSharedPlacement.status === 'interrupted', '复用同一位置对象时仍必须接受 interrupted 终态。');
+  const keptInterrupted = mergeTranscriptItem(mergedSharedPlacement, { ...completeProgress, transcript: sharedTranscript });
+  assert(keptInterrupted.status === 'interrupted', '较晚的进行中预览不能把 interrupted 终态回退。');
+  /** 计划短 ID 跨轮复用时，旧兼容事件只能标记请求所属轮次。 */
+  const reusedPlanProviderItemId = 'reused-plan-provider-item';
+  const planTurns = ['a', 'b'].map((suffix) => ({
+    id: `local-plan-turn-${suffix}`,
+    providerTurnId: `provider-plan-turn-${suffix}`,
+    submissionId: null,
+    status: 'completed',
+    plan: null,
+    startedAt: occurredAt,
+    completedAt: occurredAt,
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+  }));
+  const planItems = planTurns.map((turn, index) => ({
+    id: `local-plan-item-${index}`,
+    providerItemId: reusedPlanProviderItemId,
+    turnId: turn.id,
+    type: 'plan',
+    status: 'completed',
+    phase: 'final_answer',
+    text: `计划 ${index + 1}`,
+    payload: {},
+    resources: [],
+    startedAt: occurredAt,
+    completedAt: occurredAt,
+    updatedAt: occurredAt,
+    transcript: transcript(`plan-entry-${index}`, index + 4, reusedPlanProviderItemId, turn.id),
+  }));
+  let scopedPlanState = createHydratedSessionState({ ...baseSnapshot, turns: planTurns, items: planItems });
+  scopedPlanState = sessionReducer(scopedPlanState, {
+    type: 'event_received',
+    event: conversationEvent(50, 'conversation.plan_implementation_request.changed', {
+      requestId: 'plan-request-b',
+      status: 'pending',
+      turnId: 'local-plan-turn-b',
+      planItemId: 'legacy-missing-local-plan-item',
+      providerPlanItemId: reusedPlanProviderItemId,
+    }),
+  });
+  const formalPlans = Object.values(scopedPlanState.items).filter((item) => item.payload.formalPlan === true);
+  assert(formalPlans.length === 1 && formalPlans[0]?.turnId === 'provider-plan-turn-b', '复用计划短 ID 时只能标记请求所属轮次。');
+  const positionedInput: NativeSessionItemBuffer = {
+    key: 'placement-input',
+    conversationId,
+    threadId,
+    turnId: 'turn',
+    itemId: 'placement-provider-item',
+    providerItemId: 'placement-provider-item',
+    type: 'userMessage',
+    status: 'completed',
+    phase: 'prework',
+    text: '已接纳输入',
+    payload: { clientId: 'placement-client' },
+    resources: [],
+    optimistic: false,
+    clientUserMessageId: 'placement-client',
+    durableClientUserMessageId: 'placement-client',
+    transcript: transcript('user-message:placement-client', 1, 'placement-provider-item'),
+    timelineAt: occurredAt,
+    updatedAt: occurredAt,
+  };
+  const cachedPlacementState = createHydratedSessionState({ ...baseSnapshot, items: [{ ...positionedInput, id: 'placement-local-item' }] });
+  delete cachedPlacementState.items[cachedPlacementState.itemOrder[0]!]!.transcript;
+  const placement = createHarness(undefined, 0, false, [], null, undefined, undefined, cachedPlacementState);
+  let rejectPlacement: ((error: Error) => void) | null = null;
+  let placementReadStarted = false;
+  placement.client.loadNativeConversationTranscriptPlacements = async () => {
+    placementReadStarted = true;
+    return new Promise((_resolve, reject) => {
+      rejectPlacement = reject;
+    });
+  };
+  try {
+    const starting = placement.controller.start().catch(() => undefined);
+    await waitUntil(() => placementReadStarted, 'placement recovery start');
+    placement.controller.setDraft('位置恢复期间的新草稿');
+    assert(placement.controller.getState().draft === '位置恢复期间的新草稿', '位置恢复不能暂停草稿归约。');
+    assert(JSON.parse(placement.persistedDraft() ?? '{}').draft === '位置恢复期间的新草稿', '位置恢复期间的新草稿必须立即持久化。');
+    await placement.controller.send('queue', undefined, { model: 'probe-model', effort: 'high', serviceTier: null, permissionMode: 'read-only', collaborationMode: 'default' });
+    assert(
+      Object.values(placement.controller.getState().items).some((item) => item.optimistic && item.text === '位置恢复期间的新草稿'),
+      '位置恢复不能吞掉本地发送气泡。',
+    );
+    placement.controller.setDraft('发送后继续输入的草稿');
+    rejectPlacement?.(new Error('placement probe failure'));
+    await starting;
+    assert(placement.controller.getState().draft === '发送后继续输入的草稿', '位置恢复失败不能清除发送后继续输入的草稿。');
+    assert(
+      Object.values(placement.controller.getState().items).some((item) => item.optimistic && item.text === '位置恢复期间的新草稿'),
+      '位置恢复失败不能清除已经提交的本地消息。',
+    );
+  } finally {
+    placement.controller.dispose();
+  }
+
+  /** 位置读取成功后先应用旧快照，再重放期间的本地动作，不能让成功接管反而抹掉输入。 */
+  const successfulPlacement = createHarness(undefined, 0, false, [], null, undefined, undefined, cachedPlacementState);
+  let resolvePlacement: ((batch: NativeConversationTranscriptPlacementBatch) => void) | null = null;
+  let requestedPlacementIds: string[] = [];
+  successfulPlacement.client.loadNativeConversationTranscriptPlacements = async (_project, _conversation, ids) => {
+    requestedPlacementIds = [...ids];
+    return new Promise<NativeConversationTranscriptPlacementBatch>((resolve) => {
+      resolvePlacement = resolve;
+    });
+  };
+  try {
+    const starting = successfulPlacement.controller.start();
+    await waitUntil(() => resolvePlacement !== null, 'successful placement recovery start');
+    successfulPlacement.controller.setDraft('成功接管期间的新消息');
+    await successfulPlacement.controller.send('queue', undefined, { model: 'probe-model', effort: 'high', serviceTier: null, permissionMode: 'read-only', collaborationMode: 'default' });
+    successfulPlacement.controller.setDraft('成功接管后的继续输入');
+    resolvePlacement?.({
+      conversationId,
+      orderEpoch: 1,
+      revision: 4_096,
+      uncoveredEntryIds: [],
+      removedEntryIds: [],
+      placements: requestedPlacementIds.map((entryId, index) => (entryId === positionedInput.transcript!.placement.entryId ? positionedInput.transcript!.placement : transcript(entryId, index + 2).placement)),
+    });
+    await starting;
+    assert(successfulPlacement.controller.getState().draft === '成功接管后的继续输入', '位置恢复成功后必须保留发送后继续输入的草稿。');
+    assert(
+      Object.values(successfulPlacement.controller.getState().items).some((item) => item.optimistic && item.text === '成功接管期间的新消息'),
+      '位置恢复成功后必须在旧快照之后重放本地发送气泡。',
+    );
+  } finally {
+    successfulPlacement.controller.dispose();
+  }
+
+  /** 全文永久错误立即停止，瞬时错误也只能在预算内自动重试，并在原条目记录可见错误。 */
+  const contentItem = {
+    id: 'content-item',
+    providerItemId: 'content-provider-item',
+    turnId: 'turn',
+    type: 'agentMessage',
+    status: 'completed',
+    phase: 'final_answer',
+    text: '截断预览',
+    payload: { v2ContentKind: 'model_history', v2Sequence: 1, v2ContentTruncated: true, v2ContentHandle: 'content-handle' },
+    resources: [],
+    startedAt: occurredAt,
+    updatedAt: occurredAt,
+    transcript: transcript('content-item', 1, 'content-provider-item'),
+  };
+  const contentState = createHydratedSessionState({ ...baseSnapshot, items: [contentItem] });
+  const permanent = createHarness(undefined, 0, false, [], null, undefined, undefined, contentState);
+  let permanentReads = 0;
+  permanent.client.loadNativeConversationContentV2 = async () => {
+    permanentReads += 1;
+    throw new ZeusApiError({ status: 400, error: 'ZEUS_CONTENT_HANDLE_INVALID', message: '内容句柄无效。' });
+  };
+  try {
+    await permanent.controller.loadV2Content('content-handle').catch(() => undefined);
+    const item = Object.values(permanent.controller.getState().items).find((candidate) => candidate.payload.v2ContentHandle === 'content-handle');
+    assert(permanentReads === 1, '永久全文错误不能自动重试。');
+    assert((item?.payload.v2ContentLoadError as { code?: string } | undefined)?.code === 'ZEUS_CONTENT_HANDLE_INVALID', '全文错误必须记录在原消息上。');
+    const refreshed = sessionReducer(permanent.controller.getState(), { type: 'snapshot_hydrated', snapshot: contentState.snapshot! });
+    const refreshedItem = Object.values(refreshed.items).find((candidate) => candidate.payload.v2ContentHandle === 'content-handle');
+    assert((refreshedItem?.payload.v2ContentLoadError as { code?: string } | undefined)?.code === 'ZEUS_CONTENT_HANDLE_INVALID', '同一内容句柄的轻量快照不能清除全文错误和手动重试入口。');
+  } finally {
+    permanent.controller.dispose();
+  }
+  const unsupportedContent = createHarness(undefined, 0, false, [], null, undefined, undefined, contentState);
+  try {
+    await unsupportedContent.controller.loadV2Content('content-handle').catch(() => undefined);
+    const item = Object.values(unsupportedContent.controller.getState().items).find((candidate) => candidate.payload.v2ContentHandle === 'content-handle');
+    assert((item?.payload.v2ContentLoadError as { retryable?: boolean } | undefined)?.retryable === false, '客户端缺少全文接口时也必须在原消息显示确定性错误。');
+  } finally {
+    unsupportedContent.controller.dispose();
+  }
+  const transient = createHarness(undefined, 0, false, [], null, undefined, undefined, contentState);
+  let transientReads = 0;
+  transient.client.loadNativeConversationContentV2 = async () => {
+    transientReads += 1;
+    throw new ZeusApiError({ status: 503, error: 'ZEUS_CONTENT_TEMPORARILY_UNAVAILABLE', message: '内容暂时不可用。' });
+  };
+  try {
+    await transient.controller.loadV2Content('content-handle').catch(() => undefined);
+    assert(transientReads === 4, '瞬时全文错误必须遵守四次自动尝试上限。');
+  } finally {
+    transient.controller.dispose();
+  }
+
+  return {
+    explicitRejectionRestoredDraft: true,
+    explicitRejectionCancelledLocally: true,
+    changedSettingsUseNewIdentity: true,
+    staleSnapshotPreservedRealtimeReply: true,
+    staleReconnectKeptRealtime: true,
+    legacyGenerationCacheReplaced: true,
+    scopedProviderMessages: scopedProviderUsers.length,
+    scopedProviderRealtimeTakeover: true,
+    terminalStatusPreservedCompleteText: true,
+    scopedFormalPlan: true,
+    placementFailurePreservedDraft: true,
+    placementFailurePreservedLocalSend: true,
+    placementSuccessPreservedDraft: true,
+    placementSuccessPreservedLocalSend: true,
+    permanentContentReads: permanentReads,
+    permanentContentErrorSurvivedRefresh: true,
+    unsupportedContentErrorVisible: true,
+    transientContentReads: transientReads,
+  };
+}
+
 /** 专项入口复用现有脚本，避免与历史待发送重放断言混淆。 */
 if (process.argv.includes('--task-push-placement-only')) {
   console.log(JSON.stringify({ taskPushPlacement: await verifyTaskPushPlacement(), placementTakeover: await verifyPlacementEpochTakeover() }));
@@ -1565,6 +1968,11 @@ if (process.argv.includes('--task-push-placement-only')) {
 /** 专项入口复用现有脚本，避免与历史待发送重放断言混淆。 */
 if (process.argv.includes('--transcript-initialization-only')) {
   console.log(JSON.stringify({ transcriptInitialization: await verifyTranscriptInitializationRecovery() }));
+  process.exit(0);
+}
+
+if (process.argv.includes('--session-defects-only')) {
+  console.log(JSON.stringify({ sessionDefectRecovery: await verifySessionDefectRecovery() }));
   process.exit(0);
 }
 

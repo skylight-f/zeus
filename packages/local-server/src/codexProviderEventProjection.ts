@@ -242,7 +242,15 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
 
   function broadcastLinkedFileApprovalChanges(providerItemId: string, providerTurnId: string): void {
     if (!conversation) return;
-    const linkedRequests = options.requests.listPendingByConversation(conversation.id).filter((request) => request.requestKind === 'file' && parseJsonRecord(request.payloadJson).itemId === providerItemId);
+    const linkedRequests = options.requests.listPendingByConversation(conversation.id).filter((request) => {
+      if (request.requestKind !== 'file') return false;
+      const payload = parseJsonRecord(request.payloadJson);
+      if (payload.itemId !== providerItemId) return false;
+      // 某些兼容来源只保证 itemId 在 turn 内唯一；有轮次证据时禁止唤醒其他轮次的授权卡片。
+      if (typeof payload.turnId === 'string' && payload.turnId) return payload.turnId === providerTurnId;
+      const requestTurn = request.turnId ? options.turns.getById(request.turnId) : undefined;
+      return !requestTurn?.providerTurnId || requestTurn.providerTurnId === providerTurnId;
+    });
     if (linkedRequests.length === 0) return;
     const approvalContext = contexts.get(conversation.id) ?? contextFromConversation(conversation);
     for (const request of linkedRequests) {

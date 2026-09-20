@@ -73,21 +73,39 @@ type TranscriptContent = Pick<NativeItemSnapshot, 'text' | 'payload' | 'status'>
 export function mergeTranscriptItem<T extends TranscriptContent>(previous: T, incoming: T): T {
   const previousRevision = transcriptContentRevision(previous.transcript);
   const incomingRevision = transcriptContentRevision(incoming.transcript);
-  const previousComplete = previous.payload.v2ContentTruncated !== true;
-  const incomingComplete = incoming.payload.v2ContentTruncated !== true;
+  const previousComplete = transcriptContentComplete(previous.payload);
+  const incomingComplete = transcriptContentComplete(incoming.payload);
+  const previousRecoverable = transcriptContentRecoverable(previous.payload);
+  const incomingRecoverable = transcriptContentRecoverable(incoming.payload);
   const keepContent =
-    incomingRevision < previousRevision || (incomingRevision === previousRevision && ((previousComplete && !incomingComplete) || (previous.payload.v2ContentKind === 'process_detail' && incoming.payload.v2ContentKind !== 'process_detail')));
+    incomingRevision < previousRevision ||
+    (incomingRevision === previousRevision &&
+      ((previousComplete && !incomingComplete) ||
+        (!previousComplete && !incomingComplete && previousRecoverable && !incomingRecoverable) ||
+        (previous.payload.v2ContentKind === 'process_detail' && incoming.payload.v2ContentKind !== 'process_detail')));
   const content = keepContent ? previous : incoming;
   const placement = newestTranscriptPlacement(previous.transcript, incoming.transcript);
   const transcript = content.transcript && placement ? { ...content.transcript, placement } : (content.transcript ?? incoming.transcript);
-  if (content === previous && transcript?.placement === previous.transcript?.placement) return previous;
+  const status = reconcileTranscriptStatus(previous.status, incoming.status, previousRevision, incomingRevision);
+  if (content === previous && transcript?.placement === previous.transcript?.placement && status === previous.status) return previous;
   return {
     ...incoming,
     text: content.text,
     payload: content.payload,
-    status: terminalStatus(previous.status, content.status),
+    // 正文来源和状态来源彼此独立：较完整的旧正文不能把随后确认的 completed/failed 状态留在进行中。
+    status,
     ...(transcript ? { transcript } : {}),
   };
+}
+
+/** 活动首屏和历史分页使用不同截断字段，合并时必须归一为同一个完整性判断。 */
+function transcriptContentComplete(payload: Record<string, unknown>): boolean {
+  return payload.v2ContentTruncated !== true && payload.v2TextTruncated !== true && payload.v2PayloadTruncated !== true && payload.v2RefreshRequired !== true;
+}
+
+/** 同样不完整时优先保留可按稳定句柄恢复全文的副本。 */
+function transcriptContentRecoverable(payload: Record<string, unknown>): boolean {
+  return payload.v2ContentTruncated === true && (payload.v2ContentKind === 'model_history' || payload.v2ContentKind === 'process_detail') && typeof payload.v2ContentHandle === 'string' && payload.v2ContentHandle.length > 0;
 }
 
 /** 正文携带的来源集合只描述实际采用的载荷，不能混入更晚的其他副本。 */
@@ -104,7 +122,13 @@ export function newestTranscriptPlacement(previous: ConversationTranscriptEnvelo
     : previous.placement;
 }
 
-/** 条目完成后不能被较晚到达的进行中投影倒退。 */
-function terminalStatus(previous: string, incoming: string): string {
-  return (previous === 'completed' || previous === 'failed' || previous === 'resolved') && (incoming === 'in_progress' || incoming === 'running') ? previous : incoming;
+/** 条目终态单调推进；终态互相冲突时只接受不旧于当前正文证据的状态。 */
+function reconcileTranscriptStatus(previous: string, incoming: string, previousRevision: number, incomingRevision: number): string {
+  const terminal = (status: string): boolean => status === 'completed' || status === 'failed' || status === 'interrupted' || status === 'resolved';
+  const previousTerminal = terminal(previous);
+  const incomingTerminal = terminal(incoming);
+  if (previousTerminal && !incomingTerminal) return previous;
+  if (!previousTerminal && incomingTerminal) return incoming;
+  if (previousTerminal && incomingTerminal && incomingRevision < previousRevision) return previous;
+  return incoming;
 }

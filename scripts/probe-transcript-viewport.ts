@@ -1049,6 +1049,13 @@ async function probeNavigation() {
           at,
         ]);
     }
+    /** Provider 可能在不同 turn 复用短消息 ID；去掉客户端身份后仍必须保留两条目录记录。 */
+    const reusedNavigationProviderItemId = 'reused-navigation-provider-item';
+    for (const index of [count - 2, count - 1])
+      db.execute('UPDATE conversation_model_history SET submission_id = NULL, content_json = ? WHERE id = ?', [
+        JSON.stringify({ text: `第 ${index + 1} 次发言 ` + '问题'.repeat(100), providerItemId: reusedNavigationProviderItemId }),
+        `history-${index}-0`,
+      ]);
     /** 重复持久投影必须沿相同客户端身份折叠。 */
     db.execute(
       'INSERT INTO conversation_model_history (id, conversation_id, sequence, turn_id, submission_id, segment_id, role, content_json, confirmed_at) SELECT ?, conversation_id, ?, turn_id, submission_id, segment_id, role, content_json, confirmed_at FROM conversation_model_history WHERE id = ?',
@@ -1126,6 +1133,8 @@ async function probeNavigation() {
     /** 使用真实接口返回值检查提问和答复界限。 */
     const snapshot = response.json<ConversationNavigationSnapshot>();
     assertProbe(snapshot.entries.length === count && new Set(snapshot.entries.map(navigationRowKey)).size === count, '完整目录不得截断或重复身份');
+    const reusedProviderEntries = snapshot.entries.filter((entry) => entry.providerItemId === reusedNavigationProviderItemId);
+    assertProbe(reusedProviderEntries.length === 2 && new Set(reusedProviderEntries.map((entry) => entry.providerTurnId)).size === 2, '跨轮复用 Provider 消息 ID 时目录必须按 turn 保留两条记录');
     assertProbe(snapshot.entries[0]?.prompt === '设计稿.png', '纯附件发言必须使用名称');
     assertProbe(
       snapshot.entries.every((entry, index) => entry.sequence === index * 4 + 1 && Array.from(entry.prompt).length <= 160 && Array.from(entry.response).length <= 320 && entry.response.startsWith(`第 ${index + 1} 轮最终答复`)),

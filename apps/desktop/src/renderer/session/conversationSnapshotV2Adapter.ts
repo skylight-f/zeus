@@ -188,6 +188,8 @@ function activeTurnItems(items: readonly NativeConversationActiveItemV2[], provi
         v2TextTruncated: item.text.truncated,
         v2PayloadTruncated: item.payload.truncated,
         v2RefreshRequired: item.text.refreshRequired || item.payload.refreshRequired,
+        // 统一标记供历史与活动投影合并；活动预览本身没有可恢复全文句柄。
+        v2ContentTruncated: item.text.truncated || item.payload.truncated || item.text.refreshRequired || item.payload.refreshRequired,
       },
       resources: [],
       startedAt: item.startedAt,
@@ -201,11 +203,11 @@ function activeTurnItems(items: readonly NativeConversationActiveItemV2[], provi
 /** 历史与活动尾部按同一 Provider 身份和时间线合并，活动投影补齐尚未确认的过程状态。 */
 function mergeActiveTurnItems(history: readonly NativeItemSnapshot[], active: readonly NativeItemSnapshot[]): NativeItemSnapshot[] {
   // 历史项携带稳定客户端身份、问题结构与答复关联；活动预览截断也不能丢失这些信息。
-  const historicalItems = new Map(history.filter((item) => item.providerItemId).map((item) => [item.providerItemId!, item]));
+  const historicalItems = new Map(history.filter((item) => item.providerItemId).map((item) => [`${encodeURIComponent(item.turnId)}:${encodeURIComponent(item.providerItemId!)}`, item]));
   return mergeItemsByProviderIdentity(
     history,
     active.map((item) => {
-      const historical = historicalItems.get(item.providerItemId ?? '');
+      const historical = item.providerItemId ? historicalItems.get(`${encodeURIComponent(item.turnId)}:${encodeURIComponent(item.providerItemId)}`) : undefined;
       return historical ? { ...item, payload: { ...historical.payload, ...item.payload } } : item;
     }),
   );

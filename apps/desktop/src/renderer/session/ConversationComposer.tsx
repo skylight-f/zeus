@@ -172,6 +172,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const modelPresentation = useMemo(() => presentModelOptions(props.capabilities?.models ?? [], selectedModel, props.language, { preserveMissingSelection: true }), [props.capabilities?.models, props.language, selectedModel]);
   const effectiveModel = modelPresentation.selectedId || selectedModel;
   const selectedCapability = resolveModelCapability(modelPresentation.models, effectiveModel);
+  // 能力清单或持久设置更新时 React effect 还未提交也不能发送旧模型的推理强度。
+  const effectiveEffort = selectedCapability?.supportedReasoningEfforts.includes(selectedEffort) ? selectedEffort : (selectedCapability?.defaultReasoningEffort ?? selectedCapability?.supportedReasoningEfforts[0] ?? '');
   const providerLabel = selectedCapability?.sourceName?.trim() || (selectedCapability?.agentKind === 'pi' ? 'Pi' : 'Codex');
   const inputLabel = copy.input(providerLabel);
   const settingsWritable = props.readOnly !== true && props.inputBlocked !== true && Boolean(selectedCapability);
@@ -255,7 +257,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             contextCapacityTokens: selectedCapacity,
             model: effectiveModel,
             agentKind: selectedCapability?.agentKind,
-            ...(selectedEffort ? { effort: selectedEffort } : {}),
+            ...(effectiveEffort ? { effort: effectiveEffort } : {}),
             ...serviceTierWireOverride(selectedServiceTier),
             permissionMode: props.permissionMode,
             collaborationMode: props.collaborationMode,
@@ -349,7 +351,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
         props.onDraftChange('');
         props.onRuntimeSettingsChange({
           model: effectiveModel,
-          effort: selectedEffort,
+          effort: effectiveEffort,
           ...serviceTierWireOverride(selectedServiceTier),
           permissionMode: props.permissionMode,
           collaborationMode: props.collaborationMode === 'plan' ? 'default' : 'plan',
@@ -458,7 +460,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             onPlanMode={() =>
               props.onRuntimeSettingsChange?.({
                 model: effectiveModel,
-                effort: selectedEffort,
+                effort: effectiveEffort,
                 ...serviceTierWireOverride(selectedServiceTier),
                 permissionMode: props.permissionMode,
                 collaborationMode: props.collaborationMode === 'plan' ? 'default' : 'plan',
@@ -516,7 +518,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               onChange={(permissionMode) =>
                 props.onRuntimeSettingsChange?.({
                   model: effectiveModel,
-                  effort: selectedEffort,
+                  effort: effectiveEffort,
                   ...serviceTierWireOverride(selectedServiceTier),
                   permissionMode,
                   collaborationMode: props.collaborationMode,
@@ -530,7 +532,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               onChange={(collaborationMode) =>
                 props.onRuntimeSettingsChange?.({
                   model: effectiveModel,
-                  effort: selectedEffort,
+                  effort: effectiveEffort,
                   ...serviceTierWireOverride(selectedServiceTier),
                   permissionMode: props.permissionMode,
                   collaborationMode,
@@ -572,7 +574,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 onChange={(value) =>
                   props.onRuntimeSettingsChange?.({
                     model: effectiveModel,
-                    effort: selectedEffort,
+                    effort: effectiveEffort,
                     ...serviceTierWireOverride(selectedServiceTier),
                     permissionMode: props.permissionMode,
                     collaborationMode: props.collaborationMode,
@@ -591,7 +593,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                   props.onRuntimeSettingsChange?.({
                     contextCapacityTokens: selectedCapacity,
                     model: effectiveModel,
-                    effort: selectedEffort,
+                    effort: effectiveEffort,
                     ...serviceTierWireOverride(selection),
                     permissionMode: props.permissionMode,
                     collaborationMode: props.collaborationMode,
@@ -632,8 +634,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
               {effortOptions.length > 0 ? (
                 <ComposerDropdown
                   label={copy.effort}
-                  triggerLabel={`${copy.effort}：${selectedEffort}`}
-                  value={selectedEffort}
+                  triggerLabel={`${copy.effort}：${effectiveEffort}`}
+                  value={effectiveEffort}
                   options={effortOptions}
                   disabled={!settingsWritable}
                   onChange={(effort) => {
@@ -739,8 +741,15 @@ export function canSteerActiveTurn(state: NativeSessionState): boolean {
     const messageKind = classifyAssistantMessage(item.payload, item.phase);
     if ((type === 'agentmessage' || type === 'assistantmessage' || type === 'assistant' || type === 'message') && messageKind === 'final') return true;
     if (type !== 'plan') return false;
-    return item.payload.formalPlan === true || state.planImplementationRequests.some((request) => request.planItemId === item.localItemId || request.planItemId === item.itemId || request.planItemId === item.providerItemId);
+    return item.payload.formalPlan === true || state.planImplementationRequests.some((request) => planRequestMatchesItem(request, item, state));
   });
+}
+
+function planRequestMatchesItem(request: NativeSessionState['planImplementationRequests'][number], item: NativeSessionState['items'][string], state: NativeSessionState): boolean {
+  if (request.planItemId === item.localItemId || request.planItemId === item.itemId) return true;
+  if (!item.providerItemId || request.planItemId !== item.providerItemId) return false;
+  if (request.turnId === item.turnId) return true;
+  return Object.values(state.turnsByProviderId).some((turn) => (turn.id === request.turnId || turn.providerTurnId === request.turnId) && (turn.id === item.turnId || turn.providerTurnId === item.turnId));
 }
 
 function resolveComposerModel(capabilities: CodexConversationCapabilities | null | undefined, providerModel: string | undefined): string {

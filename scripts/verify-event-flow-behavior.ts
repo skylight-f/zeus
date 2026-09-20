@@ -386,7 +386,7 @@ function verifyInterruptedQueueTakeoverProjection(): Record<string, unknown> {
     updatedAt: '2026-08-25T10:28:09.615Z',
   });
   const projected = coalesceSupersededInterruptedQueuedUserMessages([interrupted, accepted]);
-  assertBehavior(projected.length === 1 && projected[0]?.key === accepted.key, '旧 interrupted 气泡必须与 5 秒内同正文 Provider 接管项合并。');
+  assertBehavior(projected.length === 2, '缺少共享持久身份的旧 interrupted 气泡必须保留，不能按正文和时间猜测为同一条消息。');
 
   const deliberateRepeat = userItem({
     id: 'deliberate-repeat',
@@ -394,11 +394,11 @@ function verifyInterruptedQueueTakeoverProjection(): Record<string, unknown> {
     optimistic: false,
     status: 'completed',
     providerItemId: 'provider-item-2',
-    timelineAt: '2026-08-25T10:29:00.000Z',
-    updatedAt: '2026-08-25T10:29:00.000Z',
+    timelineAt: '2026-08-25T10:28:09.800Z',
+    updatedAt: '2026-08-25T10:28:09.800Z',
   });
-  assertBehavior(coalesceSupersededInterruptedQueuedUserMessages([accepted, deliberateRepeat]).length === 2, '两条成功且正文相同的用户消息必须保留，不能用正文启发式吞掉真实重复发送。');
-  return { legacyProjectionCount: projected.length, preservedDeliberateRepeats: 2 };
+  assertBehavior(coalesceSupersededInterruptedQueuedUserMessages([accepted, deliberateRepeat]).length === 2, '短时间内两条成功且正文相同的用户消息也必须保留。');
+  return { ambiguousLegacyProjectionCount: projected.length, preservedDeliberateRepeats: 2 };
 }
 
 function verifyRealtimeChangeSetProjection(): Record<string, unknown> {

@@ -14,8 +14,13 @@ export interface TranscriptNavigationEntry extends ConversationNavigationEntry {
 }
 
 /** 从发送到历史恢复沿用客户端身份，缺失时才使用模型或持久身份。 */
-export function navigationRowKey(entry: Pick<ConversationNavigationEntry, 'clientUserMessageId' | 'providerItemId' | 'id'>): string {
-  return `navigation:${encodeURIComponent(entry.clientUserMessageId ? `client:${entry.clientUserMessageId}` : entry.providerItemId ? `provider:${entry.providerItemId}` : `history:${entry.id}`)}`;
+export function navigationRowKey(entry: Pick<ConversationNavigationEntry, 'clientUserMessageId' | 'providerItemId' | 'providerTurnId' | 'turnId' | 'id'>): string {
+  return `navigation:${encodeURIComponent(entry.clientUserMessageId ? `client:${entry.clientUserMessageId}` : entry.providerItemId ? navigationProviderIdentity(entry) : `history:${entry.id}`)}`;
+}
+
+/** Provider item 编号只在所属轮次内唯一，目录与正文必须使用同一复合身份。 */
+export function navigationProviderIdentity(entry: Pick<ConversationNavigationEntry, 'providerItemId' | 'providerTurnId' | 'turnId'>): string {
+  return `provider:${encodeURIComponent(entry.providerTurnId ?? entry.turnId)}:${encodeURIComponent(entry.providerItemId ?? '')}`;
 }
 
 /** 完整目录提供顺序，实时投影只补充相同发言的内容与新发言。 */
@@ -49,7 +54,7 @@ export function mergeNavigationEntries(history: readonly ConversationNavigationE
 
 /** 各身份加前缀，避免不同身份空间碰撞。 */
 function navigationIdentities(entry: ConversationNavigationEntry): string[] {
-  return [`history:${entry.id}`, ...(entry.clientUserMessageId ? [`client:${entry.clientUserMessageId}`] : []), ...(entry.providerItemId ? [`provider:${entry.providerItemId}`] : [])];
+  return [`history:${entry.id}`, ...(entry.clientUserMessageId ? [`client:${entry.clientUserMessageId}`] : []), ...(entry.providerItemId ? [navigationProviderIdentity(entry)] : [])];
 }
 
 /** 目录独立加载，失败不阻断已读取的会话正文。 */

@@ -36,7 +36,7 @@ import { isImageResource } from './ConversationResources.js';
 import { canSteerActiveTurn } from './ConversationComposer.js';
 import { isSubmissionWaitingInQueue, isUnacceptedTranscriptMessage, orderTranscriptItemsWithQueue, visibleQueuedSubmissions } from './conversationQueuePresentation.js';
 import type { McpAppToolCall, McpAppToolResult } from './McpAppFrame.js';
-import { ConversationNavigation, mergeNavigationEntries, navigationRowKey, useConversationNavigation, type TranscriptNavigationEntry } from './ConversationNavigation.js';
+import { ConversationNavigation, mergeNavigationEntries, navigationProviderIdentity, navigationRowKey, useConversationNavigation, type TranscriptNavigationEntry } from './ConversationNavigation.js';
 
 export interface ConversationTranscriptProps {
   /** 主会话读取完整目录，独立子线程不传此入口。 */
@@ -1724,7 +1724,7 @@ function projectNavigationRows(rows: readonly TranscriptTurnRow[], entries: read
   const byIdentity = new Map<string, TranscriptNavigationEntry>();
   for (const entry of entries) {
     byIdentity.set(`history:${entry.id}`, entry);
-    if (entry.providerItemId) byIdentity.set(`provider:${entry.providerItemId}`, entry);
+    if (entry.providerItemId) byIdentity.set(navigationProviderIdentity(entry), entry);
     if (entry.clientUserMessageId) byIdentity.set(`client:${entry.clientUserMessageId}`, entry);
   }
   /** 仅缺失正文的发言需要占位，重复标题的独立发送仍分别保留。 */
@@ -1739,7 +1739,9 @@ function projectNavigationRows(rows: readonly TranscriptTurnRow[], entries: read
     /** 稳定首次时间来自既有投影，不使用流式文本更新时间重排。 */
     const timestamp = transcriptViewportRowTime(row);
     /** 持久消息优先比较会话顺序，批量恢复的相同时间不能把后续占位提前。 */
-    const sequence = first && first.kind !== 'answered_request' ? (first.kind === 'item' ? first.item : first.items[0])?.payload.v2Sequence : undefined;
+    const sequenceItem = first && first.kind !== 'answered_request' ? (first.kind === 'item' ? first.item : first.items[0]) : undefined;
+    // 只有模型历史与目录共享 sequence 空间；过程事件使用自身序号，不能与用户消息目录交叉比较。
+    const sequence = sequenceItem?.payload.v2ContentKind === 'model_history' ? sequenceItem.payload.v2Sequence : undefined;
     while (cursor < pending.length && (!pending[cursor]!.requestId && typeof sequence === 'number' && sequence > 0 ? pending[cursor]!.sequence < sequence : pending[cursor]!.occurredAt <= timestamp)) {
       /** 占位与未来真实行使用相同 key，保持阅读锚点。 */
       const entry = pending[cursor++]!;
@@ -1760,7 +1762,7 @@ function projectNavigationRows(rows: readonly TranscriptTurnRow[], entries: read
           .filter(Boolean)
           .map((id) => byIdentity.get(`client:${id}`))
           .find(Boolean) ??
-        (row.item.providerItemId ? byIdentity.get(`provider:${row.item.providerItemId}`) : undefined) ??
+        (row.item.providerItemId ? byIdentity.get(navigationProviderIdentity({ providerItemId: row.item.providerItemId, providerTurnId: row.item.turnId, turnId: row.item.turnId })) : undefined) ??
         byIdentity.get(`history:${row.item.localItemId ?? row.item.itemId}`);
       result.push(entry ? { ...row, key: entry.rowKey } : row);
     } else result.push(row);
@@ -1866,7 +1868,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
   }
   if (row.item.type === 'plan') {
     return (
-      <TranscriptV2ContentBoundary item={row.item} onLoadContent={options.props.onLoadV2Content}>
+      <TranscriptV2ContentBoundary item={row.item} language={options.props.language} onLoadContent={options.props.onLoadV2Content}>
         <PlanSummary item={row.item} language={options.props.language} motionActive={row.item.key === options.motionFocus?.itemKey} panelOpen={isSamePlanItem(options.props.openPlanItem, row.item)} onOpenPanel={options.props.onOpenPlan} />
       </TranscriptV2ContentBoundary>
     );
@@ -1874,7 +1876,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
   // 持久思考正文沿用下面的共享过程消息；只有短暂运行摘要使用专门的状态行。
   if (normalizeItemType(row.item.type) === 'reasoning' && !isReasoningProcessText(row.item)) {
     return (
-      <TranscriptV2ContentBoundary item={row.item} onLoadContent={options.props.onLoadV2Content}>
+      <TranscriptV2ContentBoundary item={row.item} language={options.props.language} onLoadContent={options.props.onLoadV2Content}>
         <SessionReasoningSummary
           item={row.item}
           language={options.props.language}
@@ -1892,7 +1894,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
   const queuedActionsAvailable = queuedSubmissionId && queuedSubmission?.pausedReason !== 'outcome_unknown' && queuedSubmission?.pausedReason !== 'recovery_required' && !queuedSubmission?.error?.recoveryRequired;
   const queuedSteerDisabledReason = queuedSubmissionId && queuedSubmission?.status === 'queued' ? queuedSteerUnavailableReason(options.props.state, queuedSubmission, options.props.language) : undefined;
   return (
-    <TranscriptV2ContentBoundary item={row.item} onLoadContent={options.props.onLoadV2Content}>
+    <TranscriptV2ContentBoundary item={row.item} language={options.props.language} onLoadContent={options.props.onLoadV2Content}>
       <ThreadItemView
         item={row.item}
         questionAnswer={row.questionAnswer}
@@ -1940,31 +1942,56 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
   );
 }
 
-function TranscriptV2ContentBoundary(props: { item: NativeSessionItemBuffer; onLoadContent?: (handle: string) => Promise<void>; children: ReactNode }): ReactNode {
+function TranscriptV2ContentBoundary(props: { item: NativeSessionItemBuffer; language: SessionUiLanguage; onLoadContent?: (handle: string) => Promise<void>; children: ReactNode }): ReactNode {
   const handle = typeof props.item.payload.v2ContentHandle === 'string' && props.item.payload.v2ContentHandle ? props.item.payload.v2ContentHandle : null;
   // 轮次过程展开后，思考正文和普通阶段说明共用全文加载，不再要求第二次展开。
   const truncated = (props.item.payload.v2ContentKind === 'model_history' || isReasoningProcessText(props.item)) && props.item.payload.v2ContentTruncated === true;
   const canLoad = Boolean(handle && props.onLoadContent);
+  const loadError = nativeSessionErrorFrom(props.item.payload.v2ContentLoadError);
+  const [retrying, setRetrying] = useState(false);
   const attemptedHandleRef = useRef<string | null>(null);
+
+  const load = () => {
+    if (!handle || !props.onLoadContent || retrying) return;
+    attemptedHandleRef.current = handle;
+    setRetrying(true);
+    void props
+      .onLoadContent(handle)
+      .catch(() => undefined)
+      .finally(() => setRetrying(false));
+  };
 
   useEffect(() => {
     if (!truncated) {
       attemptedHandleRef.current = null;
       return;
     }
-    if (!canLoad || !handle || !props.onLoadContent || attemptedHandleRef.current === handle) return;
+    if (!canLoad || !handle || !props.onLoadContent || loadError || attemptedHandleRef.current === handle) return;
     attemptedHandleRef.current = handle;
-    // 完整正文恢复由 Controller 持续收敛；消息组件不把本地读取失败转嫁成用户操作。
     void props.onLoadContent(handle).catch(() => undefined);
-  }, [canLoad, handle, props.onLoadContent, truncated]);
+  }, [canLoad, handle, loadError, props.onLoadContent, truncated]);
 
-  return props.children;
+  return (
+    <>
+      {props.children}
+      {truncated && loadError ? (
+        <ConversationNotice deliveryState="failed" label={props.language === 'zh-CN' ? '完整内容加载失败' : 'Full content failed to load'}>
+          <VisibleApplicationError error={loadError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+          <div className="session-message-delivery-actions">
+            <button type="button" disabled={!canLoad || retrying} onClick={load}>
+              {retrying ? (props.language === 'zh-CN' ? '正在重试…' : 'Retrying…') : props.language === 'zh-CN' ? '重试加载完整内容' : 'Retry full content'}
+            </button>
+          </div>
+        </ConversationNotice>
+      ) : null}
+    </>
+  );
 }
 
 function isSamePlanItem(openItem: NativeSessionItemBuffer | null | undefined, item: NativeSessionItemBuffer): boolean {
   if (!openItem) return false;
   if (openItem.key === item.key) return true;
-  if (openItem.providerItemId && item.providerItemId && openItem.providerItemId === item.providerItemId) return true;
+  if (openItem.providerItemId && item.providerItemId && openItem.turnId === item.turnId && openItem.providerItemId === item.providerItemId) return true;
   if (openItem.localItemId && item.localItemId && openItem.localItemId === item.localItemId) return true;
   return openItem.itemId === item.itemId && openItem.turnId === item.turnId;
 }
@@ -2062,9 +2089,10 @@ export function MessageDeliveryOutcomeFeedback(props: {
   if (!failed && !unconfirmed) return null;
   const feedbackState = failed ? 'failed' : 'unconfirmed';
   /** 确切的未知送达仅开放核对；普通重试也会由现有接口先检查未发送证据。 */
-  const checkOnly = Boolean(props.submissionId) && (props.item.status === 'unconfirmed' || pausedReason === 'outcome_unknown');
+  const checkOnly = props.item.status === 'unconfirmed' || pausedReason === 'outcome_unknown';
   /** 已落库消息沿用提交身份，本地发送失败沿用原客户端消息身份。 */
-  const canAct = props.submissionId ? Boolean(checkOnly ? props.onRecoverQueue : props.onRetryQueuedSubmission) : Boolean(props.clientUserMessageId && props.onRetryPendingSend);
+  const canAct = deliveryError?.retryable !== false && (props.submissionId ? Boolean(checkOnly ? props.onRecoverQueue : props.onRetryQueuedSubmission) : Boolean(props.clientUserMessageId && props.onRetryPendingSend));
+  const canCancel = props.submissionId ? Boolean(props.onCancelQueuedSubmission) : Boolean(props.clientUserMessageId && props.onCancelPendingSend);
   /** 复用现有重试与只读核对，不把失败正文重新作为一条普通新消息提交。 */
   async function retryDelivery(): Promise<void> {
     if (pending || !canAct) return;
@@ -2077,6 +2105,21 @@ export function MessageDeliveryOutcomeFeedback(props: {
       } else if (props.clientUserMessageId) {
         await props.onRetryPendingSend?.(props.clientUserMessageId, checkOnly ? 'check' : 'continue');
       }
+    } catch (error) {
+      setActionError(error);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  /** 取消入口仍由 Controller 先做权威核对，送达未知时不会误删已接收消息。 */
+  async function cancelDelivery(): Promise<void> {
+    if (pending || !canCancel) return;
+    setPending(true);
+    setActionError(null);
+    try {
+      if (props.submissionId) await props.onCancelQueuedSubmission?.(props.submissionId);
+      else if (props.clientUserMessageId) await props.onCancelPendingSend?.(props.clientUserMessageId);
     } catch (error) {
       setActionError(error);
     } finally {
@@ -2099,11 +2142,18 @@ export function MessageDeliveryOutcomeFeedback(props: {
               : 'This message has not been sent.'}
         </span>
       )}
-      {canAct ? (
+      {canAct || canCancel ? (
         <div className="session-message-delivery-actions">
-          <button type="button" disabled={pending} onClick={() => void retryDelivery()}>
-            {pending ? (props.language === 'zh-CN' ? '处理中…' : 'Working…') : checkOnly ? (props.language === 'zh-CN' ? '检查处理状态' : 'Check processing status') : props.language === 'zh-CN' ? '重试' : 'Retry'}
-          </button>
+          {canAct ? (
+            <button type="button" disabled={pending} onClick={() => void retryDelivery()}>
+              {pending ? (props.language === 'zh-CN' ? '处理中…' : 'Working…') : checkOnly ? (props.language === 'zh-CN' ? '检查处理状态' : 'Check processing status') : props.language === 'zh-CN' ? '重试' : 'Retry'}
+            </button>
+          ) : null}
+          {canCancel ? (
+            <button type="button" disabled={pending} onClick={() => void cancelDelivery()}>
+              {props.language === 'zh-CN' ? '取消消息' : 'Cancel message'}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </ConversationNotice>
@@ -2700,7 +2750,13 @@ export function isVisibleTranscriptItem(item: NativeSessionItemBuffer): boolean 
 function isFormalPlanTranscriptItem(item: NativeSessionItemBuffer, state: NativeSessionState): boolean {
   if (normalizeItemType(item.type) !== 'plan') return true;
   if (item.payload.formalPlan === true) return true;
-  return state.planImplementationRequests.some((request) => request.planItemId === item.localItemId || request.planItemId === item.itemId || request.planItemId === item.providerItemId);
+  return state.planImplementationRequests.some((request) => {
+    if (request.planItemId === item.localItemId || request.planItemId === item.itemId) return true;
+    if (!item.providerItemId || request.planItemId !== item.providerItemId) return false;
+    if (request.turnId === item.turnId) return true;
+    const turn = turnByAnyIdentity(state.turnsByProviderId, request.turnId);
+    return Boolean(turn && (turn.id === item.turnId || turn.providerTurnId === item.turnId));
+  });
 }
 
 /** V2 把 PLAN 持久化在轮次快照而不是模型正文中；历史视图必须把它还原为该轮的正式产物。 */
@@ -2765,7 +2821,7 @@ function transcriptUserMessageIdentities(item: NativeSessionItemBuffer): string[
   return [
     ...transcriptUserMessageClientIds(item).map((value) => `client:${value}`),
     ...(transcriptPayloadString(item, 'submissionId') ? [`submission:${transcriptPayloadString(item, 'submissionId')}`] : []),
-    ...(item.providerItemId ? [`provider:${item.providerItemId}`] : []),
+    ...(item.providerItemId ? [`provider:${[item.conversationId, item.threadId, item.turnId, item.providerItemId].map(encodeURIComponent).join(':')}`] : []),
   ];
 }
 
@@ -2812,46 +2868,9 @@ function coalesceTranscriptUserMessages(items: readonly NativeSessionItemBuffer[
   return projected;
 }
 
-/**
- * 旧版队列恢复会把原 submission 标记为 interrupted，随后用新的客户端身份创建
- * Provider 接管项。两条记录都必须保留审计事实，但转录里不能把同一次发送画成两个
- * 用户气泡。这里只接受“无结构化载荷、正文完全相同、旧项更新时间与 Provider 项
- * 相差不超过 5 秒”的强证据；普通重复发送、失败后隔一段时间重发和附件消息均保留。
- */
+/** 没有共享 submission、客户端或 Provider 复合身份时，不按正文与时间猜测两次发送属于同一消息。 */
 export function coalesceSupersededInterruptedQueuedUserMessages(items: readonly NativeSessionItemBuffer[]): NativeSessionItemBuffer[] {
-  const durableByFingerprint = new Map<string, NativeSessionItemBuffer[]>();
-  for (const item of items) {
-    const fingerprint = simpleUserMessageFingerprint(item);
-    if (!fingerprint || item.optimistic || !item.providerItemId) continue;
-    const candidates = durableByFingerprint.get(fingerprint) ?? [];
-    candidates.push(item);
-    durableByFingerprint.set(fingerprint, candidates);
-  }
-  return items.filter((item) => {
-    if (!item.optimistic || item.status !== 'paused' || item.payload.pausedReason !== 'interrupted' || item.payload.delivery !== 'queue') return true;
-    const fingerprint = simpleUserMessageFingerprint(item);
-    const interruptedAt = timestampMillis(item.updatedAt);
-    if (!fingerprint || interruptedAt === null) return true;
-    return !(durableByFingerprint.get(fingerprint) ?? []).some((candidate) => {
-      const acceptedAt = timestampMillis(transcriptTimelineAt(candidate));
-      return acceptedAt !== null && Math.abs(acceptedAt - interruptedAt) <= 5_000;
-    });
-  });
-}
-
-function simpleUserMessageFingerprint(item: NativeSessionItemBuffer): string | null {
-  if (itemRole(item) !== 'user' || item.resources.length > 0) return null;
-  if (Array.isArray(item.payload.attachments) && item.payload.attachments.length > 0) return null;
-  if (Array.isArray(item.payload.browserComments) && item.payload.browserComments.length > 0) return null;
-  if (recordValue(item.payload.conversationContext) || recordValue(item.payload.taskPushLayout)) return null;
-  const text = transcriptItemText(item).trim();
-  return text || null;
-}
-
-function timestampMillis(value: string | undefined): number | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return [...items];
 }
 
 function isUnacceptedQueuedUserItem(item: NativeSessionItemBuffer, queuedClientUserMessageIds: ReadonlySet<string>): boolean {

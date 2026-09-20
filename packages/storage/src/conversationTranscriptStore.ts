@@ -1147,28 +1147,43 @@ export class ConversationTranscriptRepository {
     const rows = this.db.select<{ fact_json: string }>('SELECT fact_json FROM conversation_transcript_initialization_facts WHERE conversation_id = ? AND preferred_entry_id = ?', [fact.conversationId, fact.preferredEntryId]);
     /** 一个显示身份的全部来源只保留短元数据。 */
     const sources = rows.map((row) => JSON.parse(row.fact_json) as ReconstructionFact);
+    if (!sources.length) return;
     if (sources.every((source) => source.relationsNormalized)) return;
     /** 明确关系相互矛盾时保留事实并拒绝本批。 */
-    const uniqueRelation = (field: 'turnId' | 'openingInputId' | 'displayStageId'): string | null => {
-      const values = [...new Set(sources.map((source) => source[field]).filter((value): value is string => Boolean(value)))];
-      if (values.length > 1) throw transcriptError('ZEUS_CONVERSATION_TRANSCRIPT_RELATION_CONFLICT', `同一显示身份的 ${field} 证据冲突：${fact.preferredEntryId}`);
-      return values[0] ?? null;
+    const normalizeSources = (group: ReconstructionFact[], preferredEntryId: string): void => {
+      const uniqueRelation = (field: 'turnId' | 'openingInputId' | 'displayStageId'): string | null => {
+        const values = [...new Set(group.map((source) => source[field]).filter((value): value is string => Boolean(value)))];
+        if (values.length > 1) throw transcriptError('ZEUS_CONVERSATION_TRANSCRIPT_RELATION_CONFLICT', `同一显示身份的 ${field} 证据冲突：${preferredEntryId}`);
+        return values[0] ?? null;
+      };
+      /** 有明确普通输入来源时统一为普通输入，不让 Provider 回显变成正文。 */
+      const kind = group.some((source) => source.kind === 'ordinary_input') ? 'ordinary_input' : group[0]!.kind;
+      /** 同一显示身份只在首次出现处入序，各自原来源序号保持不变。 */
+      const firstSeenAt = group.reduce((earliest, source) => (source.firstSeenAt < earliest ? source.firstSeenAt : earliest), group[0]!.firstSeenAt);
+      /** 所有别名共用明确关系，未知关系留给有序摄取时的原输入/阶段规则。 */
+      const relation = {
+        preferredEntryId,
+        turnId: uniqueRelation('turnId'),
+        openingInputId: uniqueRelation('openingInputId'),
+        displayStageId: uniqueRelation('displayStageId'),
+        kind,
+        firstSeenAt,
+        startsStage: group.some((source) => source.startsStage),
+        relationsNormalized: true,
+      };
+      for (const source of group) this.stageReconstructionFact({ ...source, ...relation });
     };
-    /** 有明确普通输入来源时统一为普通输入，不让 Provider 回显变成正文。 */
-    const kind = sources.some((source) => source.kind === 'ordinary_input') ? 'ordinary_input' : fact.kind;
-    /** 同一显示身份只在首次出现处入序，各自原来源序号保持不变。 */
-    const firstSeenAt = sources.reduce((earliest, source) => (source.firstSeenAt < earliest ? source.firstSeenAt : earliest), fact.firstSeenAt);
-    /** 所有别名共用明确关系，未知关系留给有序摄取时的原输入/阶段规则。 */
-    const relation = {
-      turnId: uniqueRelation('turnId'),
-      openingInputId: uniqueRelation('openingInputId'),
-      displayStageId: uniqueRelation('displayStageId'),
-      kind,
-      firstSeenAt,
-      startsStage: sources.some((source) => source.startsStage),
-      relationsNormalized: true,
-    };
-    for (const source of sources) this.stageReconstructionFact({ ...source, ...relation });
+    const turnIds = [...new Set(sources.map((source) => source.turnId).filter((turnId): turnId is string => Boolean(turnId)))];
+    const providerIdentity = sources.every((source) => (source.originalPreferredEntryId ?? source.preferredEntryId).startsWith('provider:'));
+    if (providerIdentity && turnIds.length > 1 && sources.every((source) => Boolean(source.turnId))) {
+      /** 旧来源可能跨 turn 复用 Provider 短 ID；只在确有冲突时追加 turn 作用域，保持既有单一身份不变。 */
+      for (const turnId of turnIds) {
+        const group = sources.filter((source) => source.turnId === turnId);
+        normalizeSources(group, `provider:${stableIdentity([fact.preferredEntryId, turnId])}`);
+      }
+      return;
+    }
+    normalizeSources(sources, fact.preferredEntryId);
   }
 
   /** 每种来源只推进自身顺序，跨来源确定性合并当前候选而非混用序号。 */

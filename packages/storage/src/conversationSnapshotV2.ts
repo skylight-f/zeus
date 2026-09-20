@@ -796,8 +796,12 @@ export class ConversationSnapshotV2Repository {
       const questionAnswer = row.question_answer_json ? this.questionAnswer(conversationId, row.question_answer_json) : null;
       /** 已回答卡片预览展示用户选择，不以助手最终答复覆盖。 */
       const questionExcerpt = questionAnswer ? conversationQuestionNavigationExcerpt({ questions: questionAnswer.questions }, { answers: questionAnswer.answers }) : null;
-      /** 客户端身份能连接发送前后两份投影，缺失时使用模型身份或历史身份。 */
-      const identity = row.client_user_message_id ? `client:${row.client_user_message_id}` : row.provider_item_id ? `provider:${row.provider_item_id}` : `history:${row.id}`;
+      /** Provider 消息短 ID 只在所属 turn 内稳定；跨轮复用时必须保留两条独立发言。 */
+      const identity = row.client_user_message_id
+        ? `client:${row.client_user_message_id}`
+        : row.provider_item_id
+          ? `provider:${encodeURIComponent(row.provider_turn_id ?? row.turn_id)}:${encodeURIComponent(row.provider_item_id)}`
+          : `history:${row.id}`;
       if (!entries.has(identity))
         entries.set(identity, {
           id: row.id,
