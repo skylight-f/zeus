@@ -287,6 +287,11 @@ export class DigitalTeamWorkflowRunRepository {
     return this.db.select<DigitalTeamWorkflowRunRow>("SELECT * FROM digital_team_workflow_runs WHERE status NOT IN ('completed','failed','cancelled') ORDER BY updated_at, id LIMIT ?", [boundedLimit(limit)]).map(mapRun);
   }
 
+  /** 人工等待不与历史列表共用页数上限。 */
+  listAttention(): DigitalTeamWorkflowRunRecord[] {
+    return this.db.select<DigitalTeamWorkflowRunRow>("SELECT * FROM digital_team_workflow_runs WHERE status IN ('awaiting_plan_approval','awaiting_final_approval','outcome_unknown','failed') ORDER BY updated_at, id").map(mapRun);
+  }
+
   /** 创建运行并一次冻结画布、全部角色、任务事实和逐仓 baseSha。 */
   create(input: CreateDigitalTeamWorkflowRunInput): DigitalTeamWorkflowRunRecord {
     assertDigitalTeamWorkflowReady(input.definition);

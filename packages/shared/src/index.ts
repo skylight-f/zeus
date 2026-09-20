@@ -798,3 +798,4 @@ export * from './digitalTeamWorkflow.js';
 export * from './conversationWorkspace.js';
 export * from './projectSourceLanguage.js';
 export type { McpConfigurationCatalog } from './mcpServiceCatalog.js';
+export type { AttentionItem, AttentionKind, AttentionSnapshot, AttentionTarget } from './attention.js';

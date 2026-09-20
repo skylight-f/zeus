@@ -1,4 +1,5 @@
 import { MotionPresence } from '../../ui/MotionPresence.js';
+import { useAttentionWorkspace } from '../attention/attentionContext.js';
 import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { ArrowsClockwiseIcon as ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
 import { CaretRightIcon } from '@phosphor-icons/react/dist/csr/CaretRight';
@@ -176,6 +177,8 @@ type ManagementTab = 'collaboration' | 'work' | 'deliverables' | 'evidence';
 
 /** 在任务概览与工作管理间切换，不重复堆叠两套详情。 */
 export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
+  const { navigation: attentionNavigation } = useAttentionWorkspace();
+  const attentionHandled = useRef<number | null>(null);
   /** 页签和提示跟随应用语言。 */
   const zh = props.language === 'zh-CN';
   /** 进入详情直接对照任务说明阅读沟通内容。 */
@@ -190,6 +193,15 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
   const tabs = ['collaboration', 'work', 'deliverables', 'evidence'] as const;
   /** 选中的待处理事项继续使用原有确认弹窗。 */
   const [decisionOpen, setDecisionOpen] = useState<TaskWorkDecisionRecord | null>(null);
+  useEffect(() => {
+    const target = attentionNavigation?.target;
+    if (!attentionNavigation || target?.kind !== 'task_decision' || target.taskId !== props.taskId || attentionHandled.current === attentionNavigation.nonce) return;
+    const decision = props.management.projection?.managerDecisions.find((item) => item.id === target.decisionId && item.status === 'pending');
+    if (!decision) return;
+    attentionHandled.current = attentionNavigation.nonce;
+    setTab('work');
+    setDecisionOpen(decision);
+  }, [attentionNavigation, props.taskId, props.management.projection]);
   /** 证据预览只读取用户选中的命令。 */
   const [commandEvidenceRunId, setCommandEvidenceRunId] = useState<string | null>(null);
 

@@ -612,6 +612,11 @@ export class TaskWorkDecisionRepository {
     return this.db.select<TaskWorkDecisionRow>(`SELECT * FROM task_work_decisions WHERE task_id = ? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC`, [identity(taskId, 'taskId')]).map(mapDecision);
   }
 
+  /** 跨项目待办不受当前打开的任务和历史分页限制。 */
+  listPending(): TaskWorkDecisionRecord[] {
+    return this.db.select<TaskWorkDecisionRow>("SELECT * FROM task_work_decisions WHERE status = 'pending' ORDER BY created_at, id").map(mapDecision);
+  }
+
   create(input: Omit<TaskWorkDecisionRecord, 'id' | 'status' | 'responsePayload' | 'revision' | 'createdAt' | 'updatedAt' | 'resolvedAt'> & { id?: string }): TaskWorkDecisionRecord {
     const replay = this.getByOperation(input.operationIdentity);
     if (replay) return replay;

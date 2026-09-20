@@ -1,3 +1,4 @@
+import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
 import { createTranscriptProjection, reuseTranscriptRows, reuseTranscriptTurnRows, updateTranscriptProjection, type TranscriptProjection } from './transcriptProjection.js';
 import { asyncQuestionAnswerHistory, AsyncQuestionMessage } from './AsyncQuestionMessage.js';
 import { classifyAssistantMessage, conversationNavigationExcerpt, conversationQuestionNavigationExcerpt, type ConversationNavigationSnapshot, type AsyncQuestionAnswer } from '@zeus/shared';
@@ -242,6 +243,8 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   /** 导航和预览共用会话外壳，不被正文滚动裁切。 */
   const shellRef = useRef<HTMLDivElement | null>(null);
   /** 显式跳转目标先加入虚拟列表，挂载后再校准。 */
+  const attentionWorkspace = useAttentionWorkspace();
+  const attentionNavigationHandled = useRef<number | null>(null);
   const [navigationTargetKey, setNavigationTargetKey] = useState<string | null>(null);
   /** 仅在阅读位置跨过发言时更新当前刻度。 */
   const [activeNavigationKey, setActiveNavigationKey] = useState<string | null>(null);
@@ -759,6 +762,17 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     },
     [scrollController, clearUserScrollIntent, clearStaticReadingAnchor, props.onLoadNavigationTurn, props.state.conversationId],
   );
+
+  useEffect(() => {
+    const navigation = attentionWorkspace.navigation;
+    const target = navigation?.target;
+    if (!navigation || target?.kind !== 'conversation' || target.conversationId !== props.state.conversationId || !target.turnId || attentionNavigationHandled.current === navigation.nonce) return;
+    // 原生目录补齐后通过既有导航加载目标轮次，兼容正文尚未进入首屏的历史问题。
+    const entry = navigationEntries.find((item) => item.providerTurnId === target.turnId || item.turnId === target.turnId);
+    if (!entry) return;
+    attentionNavigationHandled.current = navigation.nonce;
+    navigateToEntry(entry);
+  }, [attentionWorkspace.navigation, props.state.conversationId, navigationEntries, navigateToEntry]);
 
   useLayoutEffect(() => {
     /** pinnedRowKeys 确保远处目标可以先挂载，再使用实际高度定位。 */

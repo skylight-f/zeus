@@ -664,6 +664,7 @@ function GlobalSearchGroup(props: { title: string; icon: ReactNode; children: Re
 
 /** 项目切换器固定在左上角，五个项目工作区入口独立为最左侧活动栏。 */
 export function ProjectWorkspaceNavigation(props: {
+  attentionAction?: ReactNode;
   project: ProjectRecord;
   projects: ProjectRecord[];
   onSelectProject: (project: ProjectRecord) => void;
@@ -863,6 +864,7 @@ export function ProjectWorkspaceNavigation(props: {
           onOpenConversation={props.onOpenConversation}
           onOpenSourceMatch={props.onOpenSourceMatch}
         />
+        {props.attentionAction}
       </header>
       <nav className="project-workspace-mode-rail" aria-label={zh ? '项目工作区' : 'Project workspace'}>
         <button

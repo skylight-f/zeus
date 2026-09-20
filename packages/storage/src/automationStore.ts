@@ -736,6 +736,17 @@ export class AutomationRunRepository {
     return this.db.select<DbAutomationRunRow>(`SELECT ${runSelect} FROM automation_runs WHERE ${clauses.join(' AND ')} ORDER BY completed_at DESC, created_at DESC LIMIT ?`, params).map(mapRun);
   }
 
+  /** 待处理异常保留完整集合；普通动态只取最近一百条。结果未知不随已读消失。 */
+  listAttention(): AutomationRunRecord[] {
+    return this.db
+      .select<DbAutomationRunRow>(
+        `SELECT ${runSelect} FROM automation_runs WHERE status = 'outcome_unknown' OR (unread = 1 AND status IN ('failed','blocked'))
+      OR id IN (SELECT id FROM automation_runs WHERE unread = 1 AND status = 'succeeded' ORDER BY completed_at DESC, id DESC LIMIT 100)
+      ORDER BY created_at, id`,
+      )
+      .map(mapRun);
+  }
+
   /** 恢复只读取未结束运行，不受历史列表页数限制。 */
   listInFlight(): AutomationRunRecord[] {
     return this.db.select<DbAutomationRunRow>(`SELECT ${runSelect} FROM automation_runs WHERE status IN ('dispatching', 'running') ORDER BY accepted_at, id`).map(mapRun);

@@ -33,3 +33,4 @@ export { Collapsible } from '../ui/Collapsible.js';
 export { type NativeConversationAppClient } from '../features/workspace/workspaceSupport.js';
 export { ZeusApiError } from '../transport/localApiTransport.js';
 export { readSkillWorkflowPreferences, skillWorkflowDefinitions, type SkillWorkflowId, writeSkillWorkflowDefault } from '../features/skills/skillWorkflowPreferences.js';
+export { useAttentionWorkspace } from '../features/attention/attentionContext.js';

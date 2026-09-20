@@ -1,5 +1,11 @@
 import { zeusDistribution, toolPages } from '../../tooling/index.js';
 import { temporaryWorkspaceId } from '@zeus/shared';
+import type { AttentionItem } from '@zeus/shared';
+import type { CSSProperties } from 'react';
+import { AttentionSidebar, AttentionToggle } from '../attention/AttentionSidebar.js';
+import type { AttentionNavigation } from '../attention/attentionContext.js';
+import { AttentionWorkspaceShell } from '../attention/AttentionWorkspaceShell.js';
+import { useAttention } from '../attention/useAttention.js';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
 import { GlobalAgentSettingsPane } from '../../settings/GlobalAgentSettingsPane.js';
@@ -142,8 +148,20 @@ function ProjectSettingsWorkspace(props: { project: ProjectRecord; commandClient
 }
 
 export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions: WorkspaceDomainActions; operations: WorkspaceOperations }) {
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const [attentionWidth, setAttentionWidth] = useState(() => {
+    try {
+      const width = Number(window.localStorage.getItem('zeus.attention.width'));
+      return width >= 300 && width <= 520 ? width : 360;
+    } catch {
+      return 360;
+    }
+  });
+  const [attentionNavigation, setAttentionNavigation] = useState<AttentionNavigation | null>(null);
+  const attentionContext = useMemo(() => ({ open: attentionOpen, navigation: attentionNavigation }), [attentionOpen, attentionNavigation]);
+  const attention = useAttention(input.state.props.commandClient ?? null);
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
-  const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string } | null>(null);
+  const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string; presentation?: 'full_page' } | null>(null);
   const [pendingGlobalSource, setPendingGlobalSource] = useState<{ projectId: string; relativePath: string; line: number } | null>(null);
   /** 一次编辑一个字段，新增字段无需继续拉长页面。 */
   const [taskField, setTaskField] = useState<'status' | 'priority' | 'runStatus'>('status');
@@ -451,12 +469,30 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     }
     openProjectSection(project, section, codeMode);
   };
+  async function openAttentionItem(item: AttentionItem): Promise<void> {
+    const project = snapshot.projects.find((candidate) => candidate.id === item.projectId);
+    if (!project) throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '项目已不可用，请刷新待办。' : 'The project is unavailable. Refresh attention.');
+    if (item.target.kind === 'conversation') {
+      if (!props.nativeConversationClient) throw new Error('Conversation service unavailable');
+      const conversation = await props.nativeConversationClient.loadNativeConversationChoice(item.projectId, item.target.conversationId);
+      if (!(await selectNativeConversation(conversation, 'page', 'interactive'))) return;
+      setAttentionNavigation({ projectId: item.projectId, target: item.target, nonce: Date.now() });
+    } else {
+      const target = item.target;
+      const onNavigated = () => {
+        if (target.kind === 'task_decision') setPendingGlobalTask({ taskId: target.taskId, projectId: item.projectId, presentation: 'full_page' });
+        setAttentionNavigation({ projectId: item.projectId, target, nonce: Date.now() });
+      };
+      if (target.kind === 'task_decision') openProjectSection(project, 'tasks', projectCodeWorkspaceMode, onNavigated);
+      else handleMainNavigate(target.kind === 'digital_team' ? 'digital-teams' : 'automations', onNavigated);
+    }
+  }
   /** 全局搜索允许跨项目跳转；等目标工作区真正挂载后再打开详情或源码文件。 */
   useEffect(() => {
     if (!pendingGlobalTask || pendingGlobalTask.projectId !== activeProjectId || activeProjectSection !== 'tasks') return;
     const target = pendingGlobalTask;
     setPendingGlobalTask(null);
-    void openTaskDetailPane(target.taskId);
+    void openTaskDetailPane(target.taskId, target.presentation);
   }, [activeProjectId, activeProjectSection, openTaskDetailPane, pendingGlobalTask]);
   useEffect(() => {
     if (!pendingGlobalSource || pendingGlobalSource.projectId !== activeProjectId || activeProjectSection !== 'code' || projectCodeWorkspaceMode !== 'source') return;
@@ -602,13 +638,15 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     : projectSessionSourceListVisible;
 
   return (
-    <main
+    <AttentionWorkspaceShell
+      value={attentionContext}
       className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${upstreamMainLayout ? ' main-layout-upstream' : ' main-layout-current'}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'digital-teams' ? ' digital-teams-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${sessionCodexParityVisible ? ' session-codex-parity-v1' : ''}${projectSessionSourceListVisible ? ' project-session-source-list-shell' : ''}${projectWorkspaceNavigationVisible ? ' project-navigation-rail-shell' : ''}`}
       data-theme={appShellSettings.appearance}
       data-language={appShellSettings.appLanguage}
       data-main-layout={appShellSettings.mainLayout}
       data-project-sidebar-resizing={projectSidebarResizing ? 'true' : 'false'}
-      style={projectSidebarShellStyle}
+      data-attention-open={attentionOpen || undefined}
+      style={{ ...projectSidebarShellStyle, '--zeus-attention-width': `${attentionWidth}px` } as CSSProperties}
       lang={uiCopy.documentLang}
       aria-label={uiCopy.shellAriaLabel}
     >
@@ -808,6 +846,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       </MotionPresence>
       {!upstreamMainLayout && projectWorkspaceNavigationVisible && selectedProject ? (
         <ProjectWorkspaceNavigation
+          attentionAction={<AttentionToggle open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} />}
           project={selectedProject}
           projects={orderedProjects}
           onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
@@ -837,6 +876,23 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           }}
         />
       ) : null}
+      {!projectWorkspaceNavigationVisible ? <AttentionToggle standalone open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} /> : null}
+      <AttentionSidebar
+        open={attentionOpen}
+        width={attentionWidth}
+        language={appShellSettings.appLanguage}
+        state={attention}
+        onClose={() => setAttentionOpen(false)}
+        onOpen={openAttentionItem}
+        onWidthChange={(width) => {
+          setAttentionWidth(width);
+          try {
+            window.localStorage.setItem('zeus.attention.width', String(width));
+          } catch {
+            /* 存储不可用时保留本次窗口宽度。 */
+          }
+        }}
+      />
       {!upstreamMainLayout && projectWorkspaceNavigationVisible ? (
         <>
           {/* 空槽位仅预留布局；接入真实工具时再添加导航语义和可访问名称。 */}
@@ -2251,6 +2307,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           </section>
         ) : null}
       </section>
-    </main>
+    </AttentionWorkspaceShell>
   );
 }
