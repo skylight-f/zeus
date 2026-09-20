@@ -2002,44 +2002,47 @@ a {
 .macos-ai-app .zeus-form-dialog {
   box-sizing: border-box;
   background: var(--zeus-solid-surface-bg);
-  border: 1px solid var(--zeus-product-line);
-  border-radius: 16px;
-  box-shadow: var(--zeus-popover-shadow);
+  border: 1px solid var(--zeus-solid-surface-edge, var(--zeus-product-line));
+  border-radius: var(--zeus-dialog-radius);
+  box-shadow: var(--agentdesk-modal-shadow, var(--zeus-popover-shadow));
   color: var(--zeus-product-text);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  inline-size: min(520px, 100%);
-  max-block-size: calc(100dvh - 40px);
+  inline-size: min(540px, 100%);
+  max-block-size: calc(100dvh - var(--zeus-space-8));
   min-inline-size: 0;
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--zeus-type-size-control);
+  line-height: var(--zeus-type-line-default);
 }
 
 .macos-ai-app .zeus-form-dialog > header,
 .macos-ai-app .zeus-form-dialog > footer {
   align-items: center;
   display: flex;
-  gap: 8px;
-  padding: 20px;
+  gap: var(--zeus-space-2);
+  padding: var(--zeus-space-5) var(--zeus-dialog-padding);
 }
 
 .macos-ai-app .zeus-form-dialog > header {
   justify-content: space-between;
-  padding-block-end: 12px;
+  padding-block-end: var(--zeus-space-4);
 }
 
 .macos-ai-app .zeus-form-dialog h2 {
-  font-size: 17px;
-  font-weight: 650;
-  line-height: 1.4;
+  font-size: var(--zeus-type-size-heading);
+  font-weight: var(--zeus-type-weight-semibold);
+  letter-spacing: -0.012em;
+  line-height: var(--zeus-type-line-tight);
   margin: 0;
   overflow-wrap: anywhere;
 }
 
 .macos-ai-app .zeus-form-dialog-close {
   flex: 0 0 auto;
-  inline-size: 32px;
+  inline-size: var(--zeus-control-height);
   padding: 0;
+  border-radius: var(--agentdesk-radius-control, 8px);
 }
 
 .macos-ai-app .zeus-form-dialog svg,
@@ -2051,32 +2054,34 @@ a {
 
 .macos-ai-app .zeus-form-dialog > footer {
   justify-content: flex-end;
-  padding-block-start: 16px;
+  padding-block: var(--zeus-dialog-footer-padding-block);
+  border-block-start: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
+  background: color-mix(in srgb, var(--zeus-product-panel-muted) 60%, transparent);
 }
 
 .macos-ai-app .zeus-form-fields {
   border: 0;
   display: grid;
-  gap: 16px;
+  gap: var(--zeus-dialog-content-gap);
   margin: 0;
   min-block-size: 0;
   min-inline-size: 0;
   overflow-y: auto;
-  padding: 4px 20px;
+  padding: var(--zeus-space-1) var(--zeus-dialog-padding) var(--zeus-dialog-padding);
 }
 
 .macos-ai-app .zeus-form-fields label,
 .macos-ai-app .extension-form-field {
   display: grid;
-  gap: 7px;
+  gap: var(--zeus-space-2);
   min-inline-size: 0;
 }
 
 .macos-ai-app .zeus-form-description,
 .macos-ai-app .zeus-form-fields small {
   color: var(--zeus-product-muted);
-  font-size: 12px;
-  line-height: 1.65;
+  font-size: var(--zeus-type-size-label);
+  line-height: var(--zeus-type-line-relaxed);
   margin: 0;
 }
 
@@ -2086,9 +2091,15 @@ a {
 }
 
 .macos-ai-app .zeus-form-fields textarea {
-  line-height: 1.6;
-  padding-block: 8px;
+  line-height: var(--zeus-type-line-relaxed);
+  padding-block: var(--zeus-space-2);
   resize: vertical;
+}
+
+@media (max-width: 560px) {
+  .macos-ai-app .zeus-form-dialog {
+    --zeus-dialog-padding: var(--zeus-space-4);
+  }
 }
 
 /* 来源切换是两个原生切换按钮，键盘焦点与禁用状态清晰可见。 */
@@ -9646,11 +9657,11 @@ html[data-zeus-theme='dark'] .startup-failure-shell {
   --zeus-product-panel: oklch(99.8% 0.001 255);
   --zeus-product-panel-muted: oklch(98.4% 0.001 255);
   --zeus-solid-surface-bg: var(--zeus-product-panel);
-  --zeus-solid-surface-edge: 20px;
-  --zeus-solid-surface-section-gap: 12px;
-  --zeus-form-action-height: 32px;
-  --zeus-form-action-font-size: 13px;
-  --zeus-form-action-padding-inline: 14px;
+  --zeus-solid-surface-edge: var(--zeus-product-line);
+  --zeus-solid-surface-section-gap: var(--zeus-dialog-section-gap);
+  --zeus-form-action-height: var(--zeus-control-height);
+  --zeus-form-action-font-size: var(--zeus-type-size-control);
+  --zeus-form-action-padding-inline: var(--zeus-space-4);
   --zeus-product-list: oklch(99.2% 0.0005 255);
   --zeus-product-line: oklch(89% 0.002 255);
   --zeus-product-line-soft: oklch(93% 0.001 255);

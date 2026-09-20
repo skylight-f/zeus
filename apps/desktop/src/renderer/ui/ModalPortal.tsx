@@ -4,6 +4,16 @@ import { useNativeCloseLayer } from './nativeCloseLayer.js';
 import { usePresenceSurface } from './MotionPresence.js';
 import { useModalFocus } from './useModalFocus.js';
 
+/** Portal 脱离主工作面后显式复制当前外观，避免弹窗退回无主题的兜底样式。 */
+function modalPortalThemeClassName(): string {
+  if (typeof document === 'undefined') return 'zeus-shell theme-system';
+  const documentAppearance = document.documentElement.dataset.zeusTheme;
+  if (documentAppearance === 'dark' || documentAppearance === 'light' || documentAppearance === 'system') return `zeus-shell theme-${documentAppearance}`;
+  const shell = document.querySelector('.macos-ai-app.zeus-shell');
+  const shellAppearance = shell?.classList.contains('theme-dark') ? 'dark' : shell?.classList.contains('theme-light') ? 'light' : 'system';
+  return `zeus-shell theme-${shellAppearance}`;
+}
+
 /** 弹窗共用遮罩、焦点和关闭规则。 */
 export interface ModalPortalProps {
   /** 模态身份与下拉弹层共享门户根，避免选项落在可访问范围外。 */
@@ -55,7 +65,7 @@ export function ModalPortal(props: ModalPortalProps) {
       aria-label={props['aria-label']}
       aria-labelledby={props['aria-labelledby']}
       aria-describedby={props['aria-describedby']}
-      className={['macos-ai-app', 'zeus-modal-portal-root', props.rootClassName].filter(Boolean).join(' ')}
+      className={['macos-ai-app', 'zeus-modal-portal-root', modalPortalThemeClassName(), props.rootClassName].filter(Boolean).join(' ')}
       data-zeus-primitive="modal"
       data-motion-state={open ? 'open' : 'closing'}
       inert={!open}

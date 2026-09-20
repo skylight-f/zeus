@@ -9347,8 +9347,11 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 /* ZEUS-0117：文件编辑审批对齐参考图，同时保留真实权限模式和安全决策边界。 */
 .session-codex-parity-v1 .session-approval-request.is-compact-approval {
-  border-radius: 18px;
-  padding: 18px 24px 16px;
+  background: color-mix(in srgb, var(--session-sidebar) 94%, transparent);
+  border: 1px solid var(--session-line);
+  border-radius: 16px;
+  box-shadow: 0 14px 34px -28px var(--session-shadow), 0 5px 16px -14px var(--session-shadow-soft);
+  padding: 16px 18px;
 }
 
 .session-codex-parity-v1 .session-approval-request.is-compact-approval > fieldset {
@@ -9358,18 +9361,25 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-compact-approval-heading {
   font-size: 13px;
   justify-content: space-between;
-  min-block-size: 20px;
+  min-block-size: 26px;
 }
 
 .session-codex-parity-v1 .session-compact-approval-identity {
   align-items: center;
+  color: var(--session-text-muted);
   display: inline-flex;
   gap: 9px;
 }
 
 .session-codex-parity-v1 .session-compact-approval-identity svg {
-  block-size: 17px;
-  inline-size: 17px;
+  block-size: 26px;
+  box-sizing: border-box;
+  color: var(--session-text);
+  inline-size: 26px;
+  padding: 5px;
+  border: 1px solid var(--session-line);
+  border-radius: 8px;
+  background: var(--session-canvas);
 }
 
 .session-codex-parity-v1 .session-compact-approval-question {
@@ -9381,15 +9391,38 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-compact-approval-mode {
+  background: var(--session-canvas);
+  border: 1px solid var(--session-line);
+  border-radius: 999px;
   color: var(--session-text-muted);
   font-size: 11px;
   line-height: 18px;
+  padding-inline: 9px;
   white-space: nowrap;
+}
+
+.session-codex-parity-v1 .is-compact-approval :is(.session-request-invalid, .session-request-scope-notice) {
+  border: 1px solid var(--session-line);
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 18px;
+  margin: 0;
+  padding: 9px 11px;
+}
+
+.session-codex-parity-v1 .is-compact-approval .session-request-scope-notice {
+  background: color-mix(in srgb, var(--session-accent) 6%, var(--session-canvas));
+  border-color: color-mix(in srgb, var(--session-accent) 18%, var(--session-line));
+}
+
+.session-codex-parity-v1 .is-compact-approval .session-request-invalid {
+  background: color-mix(in srgb, var(--session-danger) 6%, var(--session-canvas));
+  border-color: color-mix(in srgb, var(--session-danger) 22%, var(--session-line));
 }
 
 .session-codex-parity-v1 .session-file-approval-targets {
   background: var(--session-canvas);
-  border: 0;
+  border: 1px solid var(--session-line);
   border-radius: 10px;
   display: grid;
   gap: 4px;
@@ -9473,13 +9506,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 /* 固定高度只约束行内操作，菜单选项按说明内容自然撑高。 */
 .session-codex-parity-v1 .session-compact-approval-actions > button,
 .session-codex-parity-v1 .session-approval-grant-control > button {
-  block-size: 28px;
+  block-size: 32px;
   box-sizing: border-box;
   font-size: 13px;
   font-weight: 560;
   line-height: 18px;
-  max-block-size: 28px;
-  min-block-size: 28px;
+  max-block-size: 32px;
+  min-block-size: 32px;
+  border-radius: 8px;
 }
 
 .session-codex-parity-v1 .session-compact-approval-actions button:focus-visible {
@@ -9489,14 +9523,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-approval-grant-control {
   align-items: stretch;
-  block-size: 28px;
+  block-size: 32px;
   gap: 0;
 }
 
 .session-codex-parity-v1 .session-approval-grant-control > button {
-  block-size: 28px;
-  max-block-size: 28px;
-  min-block-size: 28px;
+  block-size: 32px;
+  max-block-size: 32px;
+  min-block-size: 32px;
 }
 
 .session-codex-parity-v1 .session-approval-grant-control > .session-request-accept {
@@ -10020,16 +10054,16 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .macos-ai-app .session-permission-dialog {
   background: var(--zeus-solid-surface-bg);
-  border: 1px solid var(--zeus-product-line);
+  border: 1px solid var(--zeus-solid-surface-edge, var(--zeus-product-line));
   border-radius: 18px;
-  box-shadow: 0 28px 70px oklch(24% 0.008 255 / 0.22);
+  box-shadow: var(--agentdesk-modal-shadow, 0 28px 70px oklch(24% 0.008 255 / 0.22));
   color: var(--zeus-product-text);
   display: grid;
-  gap: 18px;
-  inline-size: min(620px, calc(100vw - 32px));
-  max-block-size: min(720px, calc(100vh - 40px));
+  gap: 16px;
+  inline-size: min(560px, calc(100vw - 32px));
+  max-block-size: min(680px, calc(100vh - 32px));
   overflow: auto;
-  padding: 24px;
+  padding: 22px;
   pointer-events: auto;
 }
 
@@ -10040,14 +10074,19 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .macos-ai-app .session-permission-dialog-header > svg {
-  block-size: 27px;
+  block-size: 40px;
+  box-sizing: border-box;
   color: var(--zeus-danger-text);
   flex: 0 0 auto;
-  inline-size: 27px;
+  inline-size: 40px;
+  padding: 9px;
+  border: 1px solid var(--zeus-control-danger-line);
+  border-radius: 12px;
+  background: var(--zeus-control-danger-bg);
 }
 
 .macos-ai-app .session-permission-dialog-header > strong {
-  font-size: 20px;
+  font-size: 19px;
   font-weight: 700;
   letter-spacing: -0.018em;
   line-height: 27px;
@@ -10062,32 +10101,32 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .macos-ai-app .session-permission-dialog-capabilities {
-  background: var(--zeus-product-panel-muted);
-  border: 0;
-  border-radius: 14px;
+  background: color-mix(in srgb, var(--zeus-product-panel-muted) 72%, transparent);
+  border: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
+  border-radius: 12px;
   overflow: hidden;
-  padding-inline: 18px;
+  padding-inline: 15px;
 }
 
 .macos-ai-app .session-permission-dialog-capability {
   align-items: center;
   display: grid;
   gap: 14px;
-  grid-template-columns: 40px minmax(0, 1fr);
-  min-block-size: 72px;
-  padding-block: 10px;
+  grid-template-columns: 38px minmax(0, 1fr);
+  min-block-size: 64px;
+  padding-block: 8px;
 }
 
 .macos-ai-app .session-permission-dialog-capability + .session-permission-dialog-capability {
-  border-block-start: 0;
+  border-block-start: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
 }
 
 .macos-ai-app .session-permission-dialog-capability-icon {
   align-items: center;
-  block-size: 36px;
-  border-radius: 10px;
+  block-size: 34px;
+  border-radius: 9px;
   display: inline-flex;
-  inline-size: 36px;
+  inline-size: 34px;
   justify-content: center;
 }
 
@@ -10103,8 +10142,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .macos-ai-app .session-permission-dialog-capability-icon > svg {
-  block-size: 23px;
-  inline-size: 23px;
+  block-size: 20px;
+  inline-size: 20px;
 }
 
 .macos-ai-app .session-permission-dialog-capability > span:last-child {
@@ -10127,7 +10166,11 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .macos-ai-app .session-permission-dialog-risk {
-  padding-inline: 1px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--zeus-control-danger-line) 72%, transparent);
+  border-radius: 10px;
+  color: var(--zeus-control-danger-text);
+  background: color-mix(in srgb, var(--zeus-control-danger-bg) 72%, transparent);
 }
 
 .macos-ai-app .session-permission-dialog-actions {
@@ -10135,6 +10178,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   display: flex;
   gap: 10px;
   justify-content: flex-end;
+  margin: 2px -22px -22px;
+  padding: 14px 22px;
+  border-block-start: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
+  background: color-mix(in srgb, var(--zeus-product-panel-muted) 60%, transparent);
 }
 
 .macos-ai-app .session-permission-dialog-actions > .zeus-button {
@@ -10175,6 +10222,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   .macos-ai-app .session-permission-dialog-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 0 -18px -18px;
+    padding: 12px 18px;
   }
 
   .macos-ai-app .session-permission-dialog-actions > .zeus-button {

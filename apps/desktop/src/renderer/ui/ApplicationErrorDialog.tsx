@@ -218,6 +218,8 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
   useEffect(() => subscribe(() => forceRender((value) => value + 1)), []);
   useEffect(() => setDetailsOpen(current?.showDetails ?? false), [current?.id, current?.showDetails]);
   const copy = copyByLanguage[current?.language ?? props.language];
+  /** 有明确恢复入口时让关闭保持次要层级，避免同一操作区出现两个主按钮。 */
+  const hasRecoveryAction = Boolean(current?.action || current?.code === 'ZEUS_CODEX_LOGIN_REQUIRED' || current?.code === 'ZEUS_NEW_PROJECT_MODEL_UNAVAILABLE');
   return (
     <MotionPresence>
       {current ? (
@@ -282,7 +284,7 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
                   {current.action.label}
                 </Button>
               ) : null}
-              <Button variant="primary" size="regular" onClick={dismissCurrentError} autoFocus>
+              <Button variant={hasRecoveryAction ? 'secondary' : 'primary'} size="regular" onClick={dismissCurrentError} autoFocus>
                 {copy.close}
               </Button>
             </footer>

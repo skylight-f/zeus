@@ -33,6 +33,8 @@
   --agentdesk-control: rgb(255 255 255 / 0.68);
   --agentdesk-shadow: 0 18px 42px -28px rgb(31 41 55 / 0.34);
   --agentdesk-shadow-soft: 0 10px 28px -22px rgb(31 41 55 / 0.28);
+  --agentdesk-modal-backdrop: rgb(15 23 42 / 0.26);
+  --agentdesk-modal-shadow: 0 32px 88px -28px rgb(15 23 42 / 0.42), 0 10px 30px -22px rgb(15 23 42 / 0.32);
 
   /* 现有 Zeus 语义 token 映射到 AgentDesk 的视觉角色。 */
   --zeus-surface-window: var(--agentdesk-surface-strong);
@@ -122,6 +124,8 @@
   --agentdesk-selection-strong: color-mix(in srgb, var(--agentdesk-accent) 32%, transparent);
   --agentdesk-shadow: 0 20px 48px -26px rgb(0 0 0 / 0.64);
   --agentdesk-shadow-soft: 0 12px 32px -22px rgb(0 0 0 / 0.56);
+  --agentdesk-modal-backdrop: rgb(3 6 18 / 0.48);
+  --agentdesk-modal-shadow: 0 34px 96px -26px rgb(0 0 0 / 0.78), 0 12px 34px -24px rgb(0 0 0 / 0.68);
   --zeus-code-editor-bg: rgb(24 28 47 / 0.94);
   --zeus-code-editor-gutter: rgb(18 22 39 / 0.9);
   --zeus-code-editor-active-line: color-mix(in srgb, var(--agentdesk-accent) 14%, transparent);
@@ -152,6 +156,8 @@
     --agentdesk-selection-strong: color-mix(in srgb, var(--agentdesk-accent) 32%, transparent);
     --agentdesk-shadow: 0 20px 48px -26px rgb(0 0 0 / 0.64);
     --agentdesk-shadow-soft: 0 12px 32px -22px rgb(0 0 0 / 0.56);
+    --agentdesk-modal-backdrop: rgb(3 6 18 / 0.48);
+    --agentdesk-modal-shadow: 0 34px 96px -26px rgb(0 0 0 / 0.78), 0 12px 34px -24px rgb(0 0 0 / 0.68);
     --zeus-code-editor-bg: rgb(24 28 47 / 0.94);
     --zeus-code-editor-gutter: rgb(18 22 39 / 0.9);
     --zeus-code-editor-active-line: color-mix(in srgb, var(--agentdesk-accent) 14%, transparent);
@@ -219,9 +225,15 @@
 }
 
 .macos-ai-app.zeus-shell :where(.zeus-modal-backdrop, .workspace-drawer-backdrop) {
-  background: rgb(26 12 72 / 0.2);
-  -webkit-backdrop-filter: blur(7px) saturate(125%);
-  backdrop-filter: blur(7px) saturate(125%);
+  background: var(--agentdesk-modal-backdrop);
+  -webkit-backdrop-filter: blur(10px) saturate(112%);
+  backdrop-filter: blur(10px) saturate(112%);
+}
+
+/* 模态只在最外层绘制边界和投影，内部卡片继续使用各自的轻量分组。 */
+.macos-ai-app.zeus-shell .zeus-modal-backdrop > [data-modal-surface] {
+  border-color: var(--agentdesk-border-strong);
+  box-shadow: var(--agentdesk-modal-shadow);
 }
 
 /* Source list、项目列表和会话列表统一使用 Zeus 图标的紫色选择语义。 */
@@ -630,19 +642,14 @@ body:has(.macos-ai-app.zeus-shell) {
   background: rgb(213 230 246 / 58%);
 }
 
-/* AgentDesk 间距阶梯：页面只使用 4 / 8 / 12 / 16 / 24，避免相邻区域出现无规律的缝隙。 */
+/* AgentDesk 只映射全局间距阶梯，用户密度设置覆盖 Zeus token 后会同步影响页面与弹窗。 */
 .macos-ai-app.zeus-shell {
-  --agentdesk-space-1: 4px;
-  --agentdesk-space-2: 8px;
-  --agentdesk-space-3: 12px;
-  --agentdesk-space-4: 16px;
-  --agentdesk-space-5: 20px;
-  --agentdesk-space-6: 24px;
-  --zeus-space-1: var(--agentdesk-space-1);
-  --zeus-space-2: var(--agentdesk-space-2);
-  --zeus-space-3: var(--agentdesk-space-3);
-  --zeus-space-4: var(--agentdesk-space-4);
-  --zeus-control-height: 32px;
+  --agentdesk-space-1: var(--zeus-space-1);
+  --agentdesk-space-2: var(--zeus-space-2);
+  --agentdesk-space-3: var(--zeus-space-3);
+  --agentdesk-space-4: var(--zeus-space-4);
+  --agentdesk-space-5: var(--zeus-space-5);
+  --agentdesk-space-6: var(--zeus-space-6);
   --zeus-control-radius: var(--agentdesk-radius-control);
 }
 

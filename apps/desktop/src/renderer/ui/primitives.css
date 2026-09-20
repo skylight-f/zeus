@@ -1,3 +1,41 @@
+/*
+ * 可定制的排版与间距基线。页面和弹窗只消费这些 token；后续密度或字号设置只需覆盖根变量。
+ * 字号使用语义级别，行高保持无单位，单独调整字号时仍能同步缩放。
+ */
+:root {
+  --zeus-font-family-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --zeus-font-family-mono: 'SFMono-Regular', 'SF Mono', Consolas, ui-monospace, monospace;
+  --zeus-font-mono: var(--zeus-font-family-mono);
+  --zeus-code-font-family: var(--zeus-font-family-mono);
+  --zeus-type-size-micro: 10px;
+  --zeus-type-size-caption: 11px;
+  --zeus-type-size-label: 12px;
+  --zeus-type-size-control: 13px;
+  --zeus-type-size-body: 14px;
+  --zeus-type-size-heading: 16px;
+  --zeus-type-size-dialog-title: 19px;
+  --zeus-type-line-tight: 1.35;
+  --zeus-type-line-default: 1.5;
+  --zeus-type-line-relaxed: 1.6;
+  --zeus-type-weight-medium: 560;
+  --zeus-type-weight-semibold: 650;
+  --zeus-type-weight-bold: 700;
+  --zeus-space-1: 4px;
+  --zeus-space-2: 8px;
+  --zeus-space-3: 12px;
+  --zeus-space-4: 16px;
+  --zeus-space-5: 20px;
+  --zeus-space-6: 24px;
+  --zeus-space-7: 28px;
+  --zeus-space-8: 32px;
+  --zeus-control-height: 32px;
+  --zeus-dialog-padding: var(--zeus-space-6);
+  --zeus-dialog-content-gap: var(--zeus-space-4);
+  --zeus-dialog-section-gap: var(--zeus-space-3);
+  --zeus-dialog-footer-padding-block: var(--zeus-space-3);
+  --zeus-dialog-radius: 18px;
+}
+
 /* Zeus 交互原语层最后加载。业务页面可以选择显式变体，但不能重新定义核心状态。 */
 .macos-ai-app {
   /* 文本输入只加深原有边界，不叠加第二层焦点圈或改变尺寸。 */
@@ -32,6 +70,7 @@
   --zeus-source-list-root-row-radius: 10px;
   --zeus-source-list-row-radius: 8px;
   --zeus-source-list-row-motion: 140ms var(--zeus-motion-ease-out);
+  font-family: var(--zeus-font-family-ui);
   user-select: none;
 }
 
@@ -1114,82 +1153,91 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 
 .macos-ai-app .application-error-dialog {
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr);
-  gap: 16px;
-  inline-size: min(520px, calc(100vw - 32px));
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: var(--zeus-dialog-section-gap);
+  inline-size: min(500px, calc(100vw - 32px));
   max-block-size: min(680px, calc(100vh - 32px));
   overflow: hidden;
-  padding: 20px;
+  padding: var(--zeus-dialog-padding);
   border: 1px solid var(--zeus-solid-surface-edge, var(--zeus-product-border));
-  border-radius: 14px;
+  border-radius: var(--zeus-dialog-radius);
   background: var(--zeus-solid-surface-bg, var(--zeus-product-panel));
-  box-shadow: 0 24px 70px oklch(15% 0.01 255 / 0.22);
+  box-shadow: var(--agentdesk-modal-shadow, 0 24px 70px oklch(15% 0.01 255 / 0.22));
 }
 
 .macos-ai-app .application-error-dialog-icon {
   display: grid;
   place-items: center;
   align-self: start;
-  inline-size: 40px;
-  block-size: 40px;
-  border-radius: 50%;
+  inline-size: 38px;
+  block-size: 38px;
+  border-radius: 12px;
   color: var(--zeus-control-danger-text);
   background: var(--zeus-control-danger-bg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--zeus-control-danger-line) 70%, transparent);
 }
 
 .macos-ai-app .application-error-dialog-icon svg {
-  inline-size: 22px;
-  block-size: 22px;
+  inline-size: 20px;
+  block-size: 20px;
 }
 
 .macos-ai-app .application-error-dialog-content {
   display: grid;
   min-inline-size: 0;
   min-block-size: 0;
-  gap: 14px;
+  gap: var(--zeus-dialog-content-gap);
   overflow: auto;
 }
 
 .macos-ai-app .application-error-dialog-content header {
   display: grid;
-  gap: 6px;
+  gap: var(--zeus-space-2);
 }
 
 .macos-ai-app .application-error-dialog-content header > strong {
   color: var(--zeus-product-text);
-  font-size: 15px;
-  line-height: 22px;
+  font-size: var(--zeus-type-size-heading);
+  font-weight: var(--zeus-type-weight-semibold);
+  letter-spacing: -0.012em;
+  line-height: var(--zeus-type-line-tight);
 }
 
 .macos-ai-app .application-error-dialog-content header > p {
   margin: 0;
   color: var(--zeus-product-text-muted);
-  font-size: 13px;
-  line-height: 19px;
+  font-size: var(--zeus-type-size-body);
+  line-height: var(--zeus-type-line-default);
 }
 
 .macos-ai-app .application-error-dialog-details {
   display: grid;
-  gap: 8px;
+  gap: 0;
   min-inline-size: 0;
+  overflow: hidden;
+  border: 1px solid var(--zeus-product-border-soft, var(--zeus-product-border));
+  border-radius: var(--agentdesk-radius-tab-rail, 10px);
+  background: var(--zeus-product-panel-muted);
 }
 
 .macos-ai-app .application-error-dialog-details > strong {
   color: var(--zeus-product-text);
-  font-size: 12px;
-  line-height: 16px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
+  border-block-end: 1px solid var(--zeus-product-border-soft, var(--zeus-product-border));
+  font-size: var(--zeus-type-size-label);
+  line-height: var(--zeus-type-line-default);
 }
 
 .macos-ai-app .application-error-dialog-details > pre {
   max-block-size: 260px;
   margin: 0;
   overflow: auto;
-  padding: 10px 12px;
-  border: 1px solid var(--zeus-product-border-soft, var(--zeus-product-border));
-  border-radius: 8px;
+  padding: var(--zeus-space-3);
+  border: 0;
+  border-radius: 0;
   color: var(--zeus-product-text-muted);
-  background: var(--zeus-product-panel-muted);
-  font: 400 12px/18px var(--zeus-font-mono, 'SFMono-Regular', Consolas, monospace);
+  background: transparent;
+  font: 400 var(--zeus-type-size-label) / var(--zeus-type-line-default) var(--zeus-font-family-mono);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -1198,8 +1246,15 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   grid-column: 1 / -1;
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  padding-block-start: 2px;
+  gap: var(--zeus-space-2);
+  margin: var(--zeus-space-1) calc(0px - var(--zeus-dialog-padding)) calc(0px - var(--zeus-dialog-padding));
+  padding: var(--zeus-dialog-footer-padding-block) var(--zeus-dialog-padding);
+  border-block-start: 1px solid var(--zeus-product-border-soft, var(--zeus-product-border));
+  background: color-mix(in srgb, var(--zeus-product-panel-muted) 62%, transparent);
+}
+
+.macos-ai-app .application-error-dialog > footer > :first-child {
+  margin-inline-end: auto;
 }
 
 @media (max-width: 560px) {
@@ -1213,9 +1268,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   }
 
   .macos-ai-app .application-error-dialog {
+    --zeus-dialog-padding: var(--zeus-space-4);
     grid-template-columns: 32px minmax(0, 1fr);
-    gap: 12px;
-    padding: 16px;
+    gap: var(--zeus-space-3);
   }
 
   .macos-ai-app .application-error-dialog-icon {
