@@ -132,7 +132,10 @@ declare global {
       loadProjectGitCommit: (input: { projectId: string; repositoryId: string; commitHash: string }) => Promise<import('./apiClient.js').ProjectGitCommitDetail>;
       loadProjectGitComparisonDiff: (input: { projectId: string; repositoryId: string; ref: string; mode: 'current' | 'working-tree' }) => Promise<import('./apiClient.js').GitDiffSummary>;
       cancelProjectGitAction: (repositoryId: string) => Promise<{ cancelled: boolean }>;
-      executeProjectGitAction: (input: { projectId: string; repositoryId: string; action: import('./apiClient.js').ProjectGitAction }) => Promise<import('./apiClient.js').ProjectGitActionResponse>;
+      executeProjectGitAction: (input: { projectId: string; repositoryId: string; action: import('./apiClient.js').ProjectGitAction }) => Promise<
+        | { schema: 'zeus-project-git-action-ipc-v1'; ok: true; value: import('./apiClient.js').ProjectGitActionResponse }
+        | { schema: 'zeus-project-git-action-ipc-v1'; ok: false; error: import('@zeus/shared').UserFacingErrorCause }
+      >;
       onTaskGitDeliveryCurrentContext: (listener: (context: { taskId: string | null; workspaceId: string | null }) => void) => () => void;
       onTaskGitDeliveryAppearance: (listener: (settings: { language: 'zh-CN' | 'en-US'; appearance: 'light' | 'dark' | 'system' }) => void) => () => void;
       /** 独立仓库差异窗口沿用应用主题，返回取消订阅函数。 */

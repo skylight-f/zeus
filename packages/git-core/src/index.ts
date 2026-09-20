@@ -2675,15 +2675,26 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
     action.type === 'cherry_pick';
   const operation = () => (conflictCapable ? runGitPreservingConflict(repositoryPath, args) : runGit(repositoryPath, args));
   const switchingAction = action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch' ? action : null;
-  if (switchingAction && (await getGitStatus(repositoryPath)).conflictFiles.length > 0) {
-    throw gitCoreError('ZEUS_GIT_CHECKOUT_CONFLICTED', `当前仓库存在未解决的冲突，无法切换到${projectGitSwitchTarget(switchingAction)}。请先处理并确认冲突文件；本次切换未执行。`);
+  const switchingStatus = switchingAction ? await getGitStatus(repositoryPath) : null;
+  if (switchingAction && switchingStatus?.conflictFiles.length) {
+    const conflictLog = [
+      '$ git status --porcelain --untracked-files=all',
+      ...switchingStatus.fileStatuses
+        .filter((file) => file.category === 'conflict')
+        .map((file) => `${file.indexStatus}${file.workingTreeStatus} ${file.originalPath ? `${file.originalPath} -> ${file.path}` : file.path}`),
+    ].join('\n');
+    throw gitCoreError(
+      'ZEUS_GIT_CHECKOUT_CONFLICTED',
+      `当前仓库存在未解决的冲突，无法切换到${projectGitSwitchTarget(switchingAction)}。请先处理并确认冲突文件；本次切换未执行。`,
+      conflictLog,
+    );
   }
   // 切换始终使用 Git 的保护性检查，不自动贮藏、恢复或强制覆盖用户修改。
   try {
     const output = await operation();
     return finishProjectGitAction(repositoryPath, action.type, output);
   } catch (error) {
-    if (switchingAction) throw classifyGitSwitchFailure(switchingAction, error);
+    if (switchingAction) throw classifyGitSwitchFailure(switchingAction, args, error);
     throw error;
   }
 }
@@ -2697,11 +2708,12 @@ function projectGitSwitchTarget(action: ProjectGitSwitchAction): string {
 }
 
 /** 把 Git 的保护性拒绝转换为可执行的用户提示；原始输出只进入详情，不作为摘要。 */
-function classifyGitSwitchFailure(action: ProjectGitSwitchAction, error: unknown): Error & { code: string; details?: string } {
+function classifyGitSwitchFailure(action: ProjectGitSwitchAction, args: string[], error: unknown): Error & { code: string; details?: string } {
   const output = gitErrorOutput(error);
+  const details = [`$ ${formatGitCommand(args, false)}`, output].join('\n');
   const target = projectGitSwitchTarget(action);
   if (/(?:already (?:used by|checked out(?: in| at)?|in use).*worktree|is already used by worktree|is already checked out)/iu.test(output)) {
-    return gitCoreError('ZEUS_GIT_CHECKOUT_BRANCH_IN_USE', `无法切换到${target}：该分支已在其他工作区中使用。请先在其他工作区切换到别的分支，或在对应工作区继续操作；本次切换未执行。`, output);
+    return gitCoreError('ZEUS_GIT_CHECKOUT_BRANCH_IN_USE', `无法切换到${target}：该分支已在其他工作区中使用。请先在其他工作区切换到别的分支，或在对应工作区继续操作；本次切换未执行。`, details);
   }
   const trackedChanges =
     /(?:local changes to the following files would be overwritten by (?:checkout|switch)|your local changes[\s\S]*would be overwritten by (?:checkout|switch)|please commit your changes or stash them before you switch branches)/iu.test(
@@ -2710,9 +2722,9 @@ function classifyGitSwitchFailure(action: ProjectGitSwitchAction, error: unknown
   const untrackedFiles = /(?:following )?untracked working tree files would be overwritten by (?:checkout|switch)/iu.test(output);
   if (trackedChanges || untrackedFiles) {
     const kind = trackedChanges && untrackedFiles ? '未提交修改和未跟踪文件' : trackedChanges ? '未提交修改' : '未跟踪文件';
-    return gitCoreError('ZEUS_GIT_CHECKOUT_BLOCKED', `无法切换到${target}：当前工作区的${kind}会被目标内容覆盖。切换未执行；请先提交、贮藏，或检查后放弃/移开相关文件。`, output);
+    return gitCoreError('ZEUS_GIT_CHECKOUT_BLOCKED', `无法切换到${target}：当前工作区的${kind}会被目标内容覆盖。切换未执行；请先提交、贮藏，或检查后放弃/移开相关文件。`, details);
   }
-  return gitCoreError('ZEUS_GIT_SWITCH_FAILED', `切换到${target}未完成，Git 未确认是否修改了工作区。请刷新仓库状态并查看错误详情后再继续。`, output);
+  return gitCoreError('ZEUS_GIT_SWITCH_FAILED', `切换到${target}未完成，Git 未确认是否修改了工作区。请刷新仓库状态并查看错误详情后再继续。`, details);
 }
 
 function gitErrorOutput(error: unknown): string {

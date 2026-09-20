@@ -5,7 +5,7 @@
   color-scheme: light dark;
   color: light-dark(#202124, #ebedf0);
   background: light-dark(#fff, #24272c);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--zeus-font-family-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -2030,8 +2030,8 @@ a {
 }
 
 .macos-ai-app .zeus-form-dialog h2 {
-  font-size: var(--zeus-type-size-heading);
-  font-weight: var(--zeus-type-weight-semibold);
+  font-size: var(--zeus-type-size-dialog-title);
+  font-weight: var(--zeus-type-weight-bold);
   letter-spacing: -0.012em;
   line-height: var(--zeus-type-line-tight);
   margin: 0;
@@ -6397,11 +6397,6 @@ body[data-surface='project-git-diff'] .macos-ai-app.zeus-shell.project-git-diff-
 
 /* 2026-06-17 全控件产品控件最终覆盖：逐个收口按钮、输入框、下拉框、文本域与链接的状态。 */
 .macos-ai-app {
-  --zeus-space-1: 4px;
-  --zeus-space-2: 6px;
-  --zeus-space-3: 8px;
-  --zeus-space-4: 10px;
-  --zeus-control-height: 28px;
   --zeus-control-radius: 7px;
   --zeus-control-bg: var(--zeus-product-panel);
   --zeus-control-bg-hover: var(--zeus-interaction-hover);
@@ -9210,7 +9205,7 @@ body[data-surface='project-git-diff'] .macos-ai-app.zeus-shell.project-git-diff-
   background: var(--zeus-crash-canvas);
   color: var(--zeus-crash-text);
   display: grid;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--zeus-font-family-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif);
   min-block-size: 100vh;
   place-items: center;
 }
@@ -9225,7 +9220,7 @@ body[data-surface='project-git-diff'] .macos-ai-app.zeus-shell.project-git-diff-
   color: light-dark(#24252b, #f0f0f4);
   color-scheme: light dark;
   display: grid;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--zeus-font-family-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif);
   overflow: auto;
   padding: 64px 24px 88px;
   place-items: center;

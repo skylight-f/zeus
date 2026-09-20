@@ -1,9 +1,9 @@
-import { describeUserFacingError } from '@zeus/shared';
+import { describeUserFacingError, type UserFacingErrorCause } from '@zeus/shared';
 import { Profiler, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RendererErrorBoundary } from './ErrorBoundary.js';
 import { distributionAppName } from './tooling/distribution.js';
-import { createDashboardClient, type DashboardClient, type ExecutionHostTransition, type ReadOnlyValidationIdentity, ZeusApiError } from './apiClient.js';
+import { createDashboardClient, type DashboardClient, type ExecutionHostTransition, type ProjectGitActionResponse, type ReadOnlyValidationIdentity, ZeusApiError } from './apiClient.js';
 import { openSourceInMain, revealProjectInFinderInMain } from './appShellBridge.js';
 import { initializeNativeCloseLayerRouting } from './ui/nativeCloseLayer.js';
 import { ApplicationErrorDialogHost, reportApplicationError } from './ui/ApplicationErrorDialog.js';
@@ -14,6 +14,23 @@ import './styles.css';
 
 /** 启动阶段尚未加载设置时采用中文；设置就绪后沿用用户选择。 */
 let startupLanguage: 'zh-CN' | 'en-US' = 'zh-CN';
+
+/** contextBridge 只传递纯数据；进入 Renderer 后再恢复 Error，供统一错误弹窗读取完整原因链。 */
+function reviveProjectGitError(cause: UserFacingErrorCause, depth = 0): Error {
+  const error = Object.assign(new Error(cause.message || '项目 Git 操作失败。'), {
+    ...(cause.code ? { code: cause.code } : {}),
+    ...(cause.details ? { details: cause.details } : {}),
+  });
+  if (depth < 3 && cause.cause) Object.assign(error, { cause: reviveProjectGitError(cause.cause, depth + 1) });
+  return error;
+}
+
+function unwrapProjectGitActionIpcResult(
+  result: Awaited<ReturnType<NonNullable<Window['zeus']>['executeProjectGitAction']>>,
+): ProjectGitActionResponse {
+  if (result.ok) return result.value;
+  throw reviveProjectGitError(result.error);
+}
 
 initializeNativeCloseLayerRouting();
 const rendererPerformance = new RendererPerformanceCollector();
@@ -472,7 +489,8 @@ async function hydrateRenderer(): Promise<void> {
             loadOperations: (projectId, cursor) => window.zeus!.loadProjectGitOperations({ projectId, cursor }),
             loadCommit: (projectId, repositoryId, commitHash) => window.zeus!.loadProjectGitCommit({ projectId, repositoryId, commitHash }),
             loadComparison: (projectId, repositoryId, ref, mode) => window.zeus!.loadProjectGitComparisonDiff({ projectId, repositoryId, ref, mode }),
-            execute: (projectId, repositoryId, action) => window.zeus!.executeProjectGitAction({ projectId, repositoryId, action }),
+            execute: async (projectId, repositoryId, action) =>
+              unwrapProjectGitActionIpcResult(await window.zeus!.executeProjectGitAction({ projectId, repositoryId, action })),
           },
         }
       : {}),

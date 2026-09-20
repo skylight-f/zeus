@@ -61,6 +61,7 @@ import {
   type RuntimeConfirmationStatusState,
   type WorkspaceViewId,
 } from './workspaceSupport.js';
+import { resolveProjectWorkspaceTabs, writeProjectWorkspaceTabs } from './projectWorkspacePersistence.js';
 
 /** 项目普通会话首屏数量，进行中的会话始终展示且不占额度。 */
 const defaultVisibleConversationCount = 6;
@@ -708,10 +709,11 @@ export function ProjectWorkspaceNavigation(props: {
   };
   /** 全局工作区激活时不保留上一个项目工作区的伪选中态。 */
   const projectWorkspaceActive = props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
-  /** 顶部允许并列打开多个项目槽位；每个槽位保留独立的项目下拉。 */
-  const projectSlotSequenceRef = useRef(1);
+  /** 顶部允许并列打开多个项目槽位；恢复上次退出时的顺序与打开集合。 */
+  const [initialProjectWorkspace] = useState(() => resolveProjectWorkspaceTabs(props.projects, props.project.id));
   const projectStatuses = useMemo(() => summarizeProjectConversationStatuses(props.conversationGroups, props.conversationStates, props.language), [props.conversationGroups, props.conversationStates, props.language]);
-  const [projectSlots, setProjectSlots] = useState<Array<{ id: string; projectId: string }>>(() => [{ id: 'project-slot-0', projectId: props.project.id }]);
+  const [projectSlots, setProjectSlots] = useState<Array<{ id: string; projectId: string }>>(() => initialProjectWorkspace.projectIds.map((projectId, index) => ({ id: `project-slot-${index}`, projectId })));
+  const projectSlotSequenceRef = useRef(projectSlots.length);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const contextProject = projectContextMenu && projectSlots.some((slot) => slot.projectId === projectContextMenu.projectId) ? props.projects.find((project) => project.id === projectContextMenu.projectId) : undefined;
   useEffect(() => setProjectContextMenu(null), [props.project.id]);
@@ -728,6 +730,13 @@ export function ProjectWorkspaceNavigation(props: {
       return next.length === current.length && next.every((slot, index) => slot.id === current[index]?.id && slot.projectId === current[index]?.projectId) ? current : next;
     });
   }, [projectIdsKey, props.project.id, props.projects]);
+  useEffect(() => {
+    const knownProjectIds = new Set(props.projects.map((project) => project.id));
+    writeProjectWorkspaceTabs({
+      projectIds: projectSlots.map((slot) => slot.projectId).filter((projectId) => knownProjectIds.has(projectId)),
+      activeProjectId: knownProjectIds.has(props.project.id) ? props.project.id : null,
+    });
+  }, [projectIdsKey, projectSlots, props.project.id, props.projects]);
   const openedProjectIds = new Set(projectSlots.map((slot) => slot.projectId).filter(Boolean));
   /** 加号也打开项目选择菜单：已打开项目直接激活，未打开项目新增槽位。 */
   const selectProjectFromAddMenu = (id: string) => {

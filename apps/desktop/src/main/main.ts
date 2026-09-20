@@ -2,7 +2,7 @@ import { distributionAppName, distributionVersion, isZeusReleaseUrl } from './de
 
 import { registerFilePreview } from './filePreview.js';
 import { hideMenuBarPopover, showMenuBarPopover, updateMenuBarPopoverAppearance, applyMenuBarTray } from './menuBarAppearance.js';
-import { filePreviewMime, filePreviewKind, filePreviewLimits, type FilePreviewIntent } from '@zeus/shared';
+import { filePreviewMime, filePreviewKind, filePreviewLimits, userFacingErrorCause, type FilePreviewIntent } from '@zeus/shared';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, type FSWatcher, mkdtempSync } from 'node:fs';
@@ -1500,7 +1500,11 @@ function setupIpc(): void {
         ownerOperations.delete(candidate.repositoryId);
         if (!ownerOperations.size) projectGitOperations.delete(event.sender.id);
       }
-    });
+    }).then(
+      (value) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: true, value }),
+      // Electron invoke 只可靠传递 Error.message；普通对象保留外层命令状态、Git 原因和已脱敏日志。
+      (error: unknown) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: false, error: userFacingErrorCause(error) }),
+    );
   });
   ipcMain.handle('zeus:task-git-delivery:close', (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);

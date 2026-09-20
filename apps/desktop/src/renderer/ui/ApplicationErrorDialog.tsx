@@ -15,6 +15,8 @@ export interface ApplicationErrorOptions {
   language?: ApplicationErrorLanguage;
   /** 用户主动查看详情时直接展开，避免再次寻找入口。 */
   showDetails?: boolean;
+  /** 业务可以为诊断区提供更准确的名称，例如 Git 日志。 */
+  detailTitle?: string;
   /** 显示本次失败的操作与对象，避免用户混淆会话。 */
   title?: string;
   /** 由业务场景提供真实处理入口，错误窗口不猜测恢复操作。 */
@@ -32,6 +34,8 @@ interface ApplicationErrorEntry {
   code: string | null;
   /** 当前条目是否由查看详情按钮打开。 */
   showDetails: boolean;
+  /** 诊断区标题跟随当前错误类型，避免所有输出都被笼统称为错误日志。 */
+  detailTitle?: string;
   /** 保留当前错误对应的处理动作。 */
   action?: ApplicationErrorOptions['action'];
 }
@@ -165,6 +169,7 @@ export function reportApplicationError(error: unknown, options: ApplicationError
     title: options.title ?? copy.title,
     summary: explanation.message,
     showDetails: options.showDetails === true,
+    detailTitle: options.detailTitle,
     details,
     dedupeKey: `${options.title ?? copy.title}\n${detailsBody}`,
     code,
@@ -246,7 +251,7 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
               </header>
               <Collapsible open={detailsOpen}>
                 <section className="application-error-dialog-details" aria-labelledby="application-error-dialog-details-title">
-                  <strong id="application-error-dialog-details-title">{copy.detailTitle}</strong>
+                  <strong id="application-error-dialog-details-title">{current.detailTitle ?? copy.detailTitle}</strong>
                   <pre data-zeus-selectable="text">{current.details}</pre>
                 </section>
               </Collapsible>

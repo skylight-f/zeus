@@ -179,21 +179,6 @@
   outline: 1px solid var(--zeus-control-focus);
   border-radius: 3px;
 }
-.macos-ai-app.zeus-shell .project-git-workbench .git-stage-all {
-  background: transparent;
-  color: var(--zeus-control-accent);
-  margin-left: auto;
-  padding: 2px 5px;
-  border: 1px solid var(--zeus-control-border);
-  border-radius: 4px;
-  font: inherit;
-  font-size: 10px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.git-stage-all:disabled {
-  opacity: 0.45;
-}
 .git-branch-repositories {
   display: flex;
   flex-direction: column;

@@ -169,6 +169,7 @@ contextBridge.exposeInMainWorld('zeus', {
   cancelProjectGitAction: (repositoryId: string) => ipcRenderer.invoke('zeus:project-git:cancel-action', repositoryId),
   executeProjectGitAction: (input: unknown) => {
     const candidate = input && typeof input === 'object' && !Array.isArray(input) ? (input as { repositoryId?: unknown }) : {};
+    // 保持纯数据到 Renderer；在这里抛出 Error 会再次被 contextBridge 移除 code/details/cause。
     return invokeMainCommand('zeus:project-git:execute-action', 'desktop.project_git.execute_action', 'git_repository', mainCommandScopeId(candidate.repositoryId, 'project-git'), input);
   },
   onTaskGitDeliveryCurrentContext: (listener: (context: unknown) => void) => {

@@ -361,9 +361,16 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       if (response.result.outcome === 'conflict') setTab('changes');
       return response.result.outcome;
     } catch (reason) {
-      const message = errorMessage(reason, zh, {
+      const switchingBranch = action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch';
+      const message = errorMessage(switchingBranch ? gitSwitchFailureCause(reason) : reason, zh, {
         title: label,
-        ...((action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch') && errorHasCode(reason, 'ZEUS_GIT_CHECKOUT_BLOCKED')
+        ...(switchingBranch
+          ? {
+              showDetails: true,
+              detailTitle: zh ? 'Git 日志' : 'Git log',
+            }
+          : {}),
+        ...(switchingBranch && errorHasCode(reason, 'ZEUS_GIT_CHECKOUT_BLOCKED')
           ? {
               action: {
                 label: zh ? '打开贮藏入口' : 'Open stash action',
@@ -1922,16 +1929,6 @@ function LocalChangesSurface(props: {
                         <strong>{title}</strong>
                       </label>
                       <span>{files.length}</span>
-                      <button
-                        type="button"
-                        className="git-stage-all"
-                        disabled={!repository || !files.length || props.busy !== null}
-                        onClick={() => {
-                          if (repository) void props.onExecute(repository, { type: stage === 'staged' ? 'unstage' : 'stage', paths: files }, stage === 'staged' ? (props.zh ? '取消暂存' : 'Unstage') : props.zh ? '暂存' : 'Stage');
-                        }}
-                      >
-                        {stage === 'staged' ? (props.zh ? '取消暂存全部' : 'Unstage all') : props.zh ? '暂存全部' : 'Stage all'}
-                      </button>
                     </header>
                     <div className="project-git-stage-scroll">
                       {repository && files.length > 0 ? (
@@ -2613,7 +2610,11 @@ function displayStashSubject(subject: string, zh: boolean): string {
   return cleaned || (zh ? '未命名 Stash' : 'Untitled stash');
 }
 
-function errorMessage(error: unknown, zh: boolean, options: { title?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {}): string {
+function errorMessage(
+  error: unknown,
+  zh: boolean,
+  options: { title?: string; showDetails?: boolean; detailTitle?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {},
+): string {
   return reportApplicationError(error, { language: zh ? 'zh-CN' : 'en', ...options });
 }
 
@@ -2627,6 +2628,18 @@ function errorHasCode(error: unknown, expected: string): boolean {
     current = candidate.cause;
   }
   return false;
+}
+
+/** 分支切换弹窗以 Git 原因作为正文，避免命令账本包装信息把实际 Git 输出挤到滚动区末尾。 */
+function gitSwitchFailureCause(error: unknown): unknown {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (typeof current !== 'object' || Array.isArray(current)) return error;
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (typeof candidate.code === 'string' && /^ZEUS_GIT_(?:CHECKOUT|SWITCH)_/u.test(candidate.code)) return current;
+    current = candidate.cause;
+  }
+  return error;
 }
 
 function formatRelativeTime(value: string, zh: boolean): string {

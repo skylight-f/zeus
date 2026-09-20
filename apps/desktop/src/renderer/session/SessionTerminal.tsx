@@ -30,8 +30,9 @@ const defaultTerminalHeight = 284;
 const defaultTerminalWidth = 480;
 /** 保留终端基本可读宽度；窄窗口最多占用一半空间。 */
 const minimumTerminalWidth = 240;
-/** 位置偏好按项目隔离，未选择时从右侧打开。 */
 type TerminalPosition = 'right' | 'bottom';
+/** 位置偏好按项目隔离；新项目和没有保存偏好的项目默认从底部展开。 */
+const defaultTerminalPosition: TerminalPosition = 'bottom';
 const minimumTerminalHeight = 160;
 const maximumTerminalTabs = 8;
 const maximumTerminalInputChunk = 32 * 1024;
@@ -866,12 +867,13 @@ function normalizeComparablePath(value: string): string {
   return value.trim().replaceAll('\\', '/').replace(/\/+$/u, '');
 }
 
-/** 只接受明确保存的底部选择；缺失、损坏或不可读取时默认右侧。 */
+/** 恢复明确保存的位置；缺失、损坏或不可读取时使用底部默认值。 */
 function readStoredTerminalPosition(storageKey: string): TerminalPosition {
   try {
-    return window.localStorage.getItem(storageKey) === 'bottom' ? 'bottom' : 'right';
+    const stored = window.localStorage.getItem(storageKey);
+    return stored === 'right' || stored === 'bottom' ? stored : defaultTerminalPosition;
   } catch {
-    return 'right';
+    return defaultTerminalPosition;
   }
 }
 

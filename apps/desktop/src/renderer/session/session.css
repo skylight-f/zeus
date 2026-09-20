@@ -3373,8 +3373,8 @@
 
 .session-codex-parity-v1 :where(.ai-workspace, .session-workspace-root) {
   color: var(--session-text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  font-size: 14px;
+  font-family: var(--zeus-font-family-ui);
+  font-size: var(--zeus-type-size-body);
 }
 
 /* 会话正文、标题和浏览器外壳与导航侧栏共用主题底色。 */
@@ -4614,7 +4614,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   background: var(--session-selected);
   border: 1px solid var(--session-line);
   border-radius: 8px;
-  font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
+  font-family: var(--zeus-font-family-mono);
   font-size: 12px;
   line-height: 1.55;
   overflow: auto;
@@ -5332,7 +5332,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-pending-request {
   inline-size: min(var(--session-thread-max), 100%);
   margin-inline: auto;
-  padding: 14px;
+  padding: var(--zeus-space-4);
 }
 
 .session-codex-parity-v1 .session-request-invalid {
@@ -5356,42 +5356,42 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-pending-request > fieldset > legend,
 .session-codex-parity-v1 .session-pending-request > fieldset > fieldset:first-of-type > legend {
-  font-size: 14px;
-  font-weight: 650;
-  line-height: 20px;
+  font-size: var(--zeus-type-size-body);
+  font-weight: var(--zeus-type-weight-semibold);
+  line-height: var(--zeus-type-line-default);
   padding: 0;
 }
 
 .session-codex-parity-v1 .session-request-impact {
   display: grid;
-  gap: 2px;
+  gap: var(--zeus-space-1);
 }
 
 .session-codex-parity-v1 .session-request-impact strong,
 .session-codex-parity-v1 .session-secret-hint {
   color: var(--session-text-muted);
-  font-size: 11px;
+  font-size: var(--zeus-type-size-caption);
 }
 
 .session-codex-parity-v1 .session-request-preview {
   background: var(--session-canvas);
-  border-radius: 7px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--zeus-type-size-label);
   overflow-wrap: anywhere;
-  padding: 9px;
+  padding: var(--zeus-space-2);
   white-space: pre-wrap;
 }
 
 .session-codex-parity-v1 .session-mcp-response {
   display: grid;
-  gap: 6px;
+  gap: var(--zeus-space-2);
 }
 
 .session-codex-parity-v1 .session-mcp-response > span,
 .session-codex-parity-v1 .session-mcp-url {
   color: var(--session-text-muted);
-  font-size: 12px;
+  font-size: var(--zeus-type-size-label);
 }
 
 .session-codex-parity-v1 .session-mcp-url {
@@ -5418,17 +5418,17 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-request-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--zeus-space-2);
   justify-content: flex-end;
-  margin-block-start: 12px;
+  margin-block-start: var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-request-actions button {
   background: var(--session-text);
   border: 1px solid var(--session-text);
-  border-radius: 7px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   color: var(--session-canvas);
-  padding-inline: 12px;
+  padding-inline: var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-request-actions .session-request-decline {
@@ -5438,27 +5438,27 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-approval-request.is-compact-approval {
-  border-radius: 18px;
-  padding: 16px 20px 18px;
+  border-radius: var(--zeus-dialog-radius);
+  padding: var(--zeus-space-4);
 }
 
 .session-codex-parity-v1 .session-approval-request.is-compact-approval > fieldset {
   display: grid;
-  gap: 8px;
+  gap: var(--zeus-space-2);
 }
 
 .session-codex-parity-v1 .session-compact-approval-heading {
   align-items: center;
   color: var(--session-text-muted);
   display: flex;
-  font-size: 12px;
-  gap: 8px;
-  line-height: 18px;
+  font-size: var(--zeus-type-size-label);
+  gap: var(--zeus-space-2);
+  line-height: var(--zeus-type-line-default);
 }
 
 .session-codex-parity-v1 .session-compact-approval-heading svg {
-  block-size: 16px;
-  inline-size: 16px;
+  block-size: var(--zeus-space-4);
+  inline-size: var(--zeus-space-4);
 }
 
 .session-codex-parity-v1 .session-compact-approval-impact,
@@ -5468,14 +5468,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-compact-approval-impact {
   color: var(--session-text);
-  font-size: 14px;
-  font-weight: 560;
-  line-height: 20px;
+  font-size: var(--zeus-type-size-body);
+  font-weight: var(--zeus-type-weight-medium);
+  line-height: var(--zeus-type-line-default);
 }
 
 .session-codex-parity-v1 .session-compact-approval-mode {
   color: var(--session-text-muted);
-  font-size: 11px;
+  font-size: var(--zeus-type-size-caption);
 }
 
 .session-codex-parity-v1 .is-compact-approval .session-request-preview {
@@ -5483,13 +5483,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   background: var(--session-canvas);
   box-sizing: border-box;
   color: var(--session-text);
-  font-size: 12px;
-  line-height: 1.5;
-  margin: 4px 0 0;
+  font-size: var(--zeus-type-size-label);
+  line-height: var(--zeus-type-line-default);
+  margin: var(--zeus-space-1) 0 0;
   max-block-size: 120px;
   overflow: auto;
   overflow-wrap: normal;
-  padding: 8px 10px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
   white-space: pre;
   word-break: normal;
 }
@@ -5503,9 +5503,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-compact-approval-actions {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: var(--zeus-space-2);
   justify-content: flex-end;
-  margin-block-start: 4px;
+  margin-block-start: var(--zeus-space-1);
   position: relative;
 }
 
@@ -5513,13 +5513,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   align-items: center;
   appearance: none;
   border: 1px solid var(--session-line);
-  border-radius: 999px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   cursor: pointer;
   display: inline-flex;
   font: inherit;
   justify-content: center;
-  min-block-size: 28px;
-  padding-inline: 12px;
+  min-block-size: var(--zeus-control-height);
+  padding-inline: var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-compact-approval-actions button:disabled {
@@ -5553,7 +5553,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   border-end-start-radius: 0;
   border-inline-start-color: color-mix(in srgb, var(--session-canvas) 22%, transparent);
   border-start-start-radius: 0;
-  inline-size: 28px;
+  inline-size: var(--zeus-space-7);
   padding: 0;
 }
 
@@ -5571,8 +5571,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-approval-grant-menu {
   background: var(--session-sidebar);
   border: 1px solid var(--session-line);
-  border-radius: 12px;
-  bottom: calc(100% + 8px);
+  border-radius: var(--agentdesk-radius-card, 12px);
+  bottom: calc(100% + var(--zeus-space-2));
   box-shadow: 0 8px 24px var(--session-shadow-soft);
   box-sizing: border-box;
   display: grid;
@@ -5580,7 +5580,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   max-inline-size: min(420px, 100cqi, calc(100vw - 32px));
   min-inline-size: 190px;
   overflow: hidden;
-  padding: 5px;
+  padding: var(--zeus-space-1);
   position: absolute;
   right: 0;
   /* 菜单说明允许换行，不继承操作按钮栏的不换行约束。 */
@@ -5596,16 +5596,16 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   align-items: flex-start;
   background: transparent;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   color: var(--session-text);
   display: grid;
   gap: 3px;
-  font-size: 13px;
-  font-weight: 560;
+  font-size: var(--zeus-type-size-control);
+  font-weight: var(--zeus-type-weight-medium);
   justify-content: stretch;
-  line-height: 18px;
+  line-height: var(--zeus-type-line-default);
   min-inline-size: 0;
-  padding: 8px 10px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
   text-align: start;
 }
 
@@ -5623,8 +5623,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   align-items: start;
   color: var(--session-text-muted);
   display: grid;
-  font-size: 10px;
-  gap: 4px;
+  font-size: var(--zeus-type-size-micro);
+  gap: var(--zeus-space-1);
   grid-template-columns: 12px minmax(0, 1fr);
   min-inline-size: 0;
   overflow-wrap: anywhere;
@@ -9349,44 +9349,44 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-approval-request.is-compact-approval {
   background: color-mix(in srgb, var(--session-sidebar) 94%, transparent);
   border: 1px solid var(--session-line);
-  border-radius: 16px;
+  border-radius: var(--agentdesk-radius-surface, 16px);
   box-shadow: 0 14px 34px -28px var(--session-shadow), 0 5px 16px -14px var(--session-shadow-soft);
-  padding: 16px 18px;
+  padding: var(--zeus-space-4);
 }
 
 .session-codex-parity-v1 .session-approval-request.is-compact-approval > fieldset {
-  gap: 12px;
+  gap: var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-compact-approval-heading {
-  font-size: 13px;
+  font-size: var(--zeus-type-size-control);
   justify-content: space-between;
-  min-block-size: 26px;
+  min-block-size: var(--zeus-control-height);
 }
 
 .session-codex-parity-v1 .session-compact-approval-identity {
   align-items: center;
   color: var(--session-text-muted);
   display: inline-flex;
-  gap: 9px;
+  gap: var(--zeus-space-2);
 }
 
 .session-codex-parity-v1 .session-compact-approval-identity svg {
-  block-size: 26px;
+  block-size: calc(var(--zeus-control-height) - var(--zeus-space-2));
   box-sizing: border-box;
   color: var(--session-text);
-  inline-size: 26px;
-  padding: 5px;
+  inline-size: calc(var(--zeus-control-height) - var(--zeus-space-2));
+  padding: var(--zeus-space-1);
   border: 1px solid var(--session-line);
-  border-radius: 8px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   background: var(--session-canvas);
 }
 
 .session-codex-parity-v1 .session-compact-approval-question {
   color: var(--session-text);
-  font-size: 15px;
-  font-weight: 650;
-  line-height: 21px;
+  font-size: var(--zeus-type-size-heading);
+  font-weight: var(--zeus-type-weight-semibold);
+  line-height: var(--zeus-type-line-tight);
   margin: 0;
 }
 
@@ -9395,19 +9395,19 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   border: 1px solid var(--session-line);
   border-radius: 999px;
   color: var(--session-text-muted);
-  font-size: 11px;
-  line-height: 18px;
-  padding-inline: 9px;
+  font-size: var(--zeus-type-size-caption);
+  line-height: var(--zeus-type-line-default);
+  padding-inline: var(--zeus-space-2);
   white-space: nowrap;
 }
 
 .session-codex-parity-v1 .is-compact-approval :is(.session-request-invalid, .session-request-scope-notice) {
   border: 1px solid var(--session-line);
-  border-radius: 10px;
-  font-size: 12px;
-  line-height: 18px;
+  border-radius: var(--agentdesk-radius-tab-rail, 10px);
+  font-size: var(--zeus-type-size-label);
+  line-height: var(--zeus-type-line-default);
   margin: 0;
-  padding: 9px 11px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .is-compact-approval .session-request-scope-notice {
@@ -9423,16 +9423,16 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .session-codex-parity-v1 .session-file-approval-targets {
   background: var(--session-canvas);
   border: 1px solid var(--session-line);
-  border-radius: 10px;
+  border-radius: var(--agentdesk-radius-tab-rail, 10px);
   display: grid;
-  gap: 4px;
+  gap: var(--zeus-space-1);
   min-inline-size: 0;
-  padding: 9px 12px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-file-approval-targets ul {
   display: grid;
-  gap: 5px;
+  gap: var(--zeus-space-1);
   list-style: none;
   margin: 0;
   min-inline-size: 0;
@@ -9445,9 +9445,9 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-file-approval-targets code {
   display: block;
-  font-family: 'SFMono-Regular', 'SF Mono', Consolas, monospace;
-  font-size: 13px;
-  line-height: 18px;
+  font-family: var(--zeus-font-family-mono);
+  font-size: var(--zeus-type-size-control);
+  line-height: var(--zeus-type-line-default);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9460,12 +9460,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-file-approval-name {
   color: var(--session-text);
-  font-weight: 620;
+  font-weight: var(--zeus-type-weight-semibold);
 }
 
 .session-codex-parity-v1 .session-file-approval-targets > small {
-  font-size: 10px;
-  line-height: 14px;
+  font-size: var(--zeus-type-size-micro);
+  line-height: var(--zeus-type-line-default);
 }
 
 .session-codex-parity-v1 .session-compact-approval-actions {
@@ -9480,7 +9480,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   /* 菜单以审批区域为宽度上限，窄侧栏中也不会伸出左边界。 */
   container-type: inline-size;
   display: grid;
-  gap: 12px;
+  gap: var(--zeus-space-3);
   grid-template-columns: minmax(0, 1fr) auto;
   min-inline-size: 0;
 }
@@ -9506,14 +9506,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 /* 固定高度只约束行内操作，菜单选项按说明内容自然撑高。 */
 .session-codex-parity-v1 .session-compact-approval-actions > button,
 .session-codex-parity-v1 .session-approval-grant-control > button {
-  block-size: 32px;
+  block-size: var(--zeus-control-height);
   box-sizing: border-box;
-  font-size: 13px;
-  font-weight: 560;
-  line-height: 18px;
-  max-block-size: 32px;
-  min-block-size: 32px;
-  border-radius: 8px;
+  font-size: var(--zeus-type-size-control);
+  font-weight: var(--zeus-type-weight-medium);
+  line-height: var(--zeus-type-line-default);
+  max-block-size: var(--zeus-control-height);
+  min-block-size: var(--zeus-control-height);
+  border-radius: var(--agentdesk-radius-control, 8px);
 }
 
 .session-codex-parity-v1 .session-compact-approval-actions button:focus-visible {
@@ -9523,14 +9523,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-approval-grant-control {
   align-items: stretch;
-  block-size: 32px;
+  block-size: var(--zeus-control-height);
   gap: 0;
 }
 
 .session-codex-parity-v1 .session-approval-grant-control > button {
-  block-size: 32px;
-  max-block-size: 32px;
-  min-block-size: 32px;
+  block-size: var(--zeus-control-height);
+  max-block-size: var(--zeus-control-height);
+  min-block-size: var(--zeus-control-height);
 }
 
 .session-codex-parity-v1 .session-approval-grant-control > .session-request-accept {
@@ -9539,8 +9539,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .session-codex-parity-v1 .session-approval-grant-control > .session-request-grant-chevron {
-  flex: 0 0 28px;
-  inline-size: 28px;
+  flex: 0 0 var(--zeus-space-7);
+  inline-size: var(--zeus-space-7);
   padding: 0;
   border-end-start-radius: 0 !important;
   border-start-start-radius: 0 !important;
@@ -9556,18 +9556,18 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .session-codex-parity-v1 .session-approval-grant-menu {
   min-inline-size: 170px;
-  padding: 5px;
+  padding: var(--zeus-space-1);
 }
 
 .session-codex-parity-v1 .session-approval-grant-menu button {
-  min-block-size: 34px;
-  padding: 7px 9px;
+  min-block-size: var(--zeus-control-height);
+  padding: var(--zeus-space-2) var(--zeus-space-3);
 }
 
 .session-codex-parity-v1 .session-approval-grant-menu-label {
   align-items: center;
   display: flex;
-  gap: 16px;
+  gap: var(--zeus-space-4);
   inline-size: 100%;
   justify-content: space-between;
 }
@@ -9586,7 +9586,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 @media (max-width: 559px) {
   .session-codex-parity-v1 .session-approval-request.is-compact-approval {
-    padding: 14px;
+    padding: var(--zeus-space-3);
   }
 
   .session-codex-parity-v1 .session-compact-approval-actions {
@@ -10055,22 +10055,22 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .macos-ai-app .session-permission-dialog {
   background: var(--zeus-solid-surface-bg);
   border: 1px solid var(--zeus-solid-surface-edge, var(--zeus-product-line));
-  border-radius: 18px;
+  border-radius: var(--zeus-dialog-radius);
   box-shadow: var(--agentdesk-modal-shadow, 0 28px 70px oklch(24% 0.008 255 / 0.22));
   color: var(--zeus-product-text);
   display: grid;
-  gap: 16px;
+  gap: var(--zeus-dialog-content-gap);
   inline-size: min(560px, calc(100vw - 32px));
-  max-block-size: min(680px, calc(100vh - 32px));
+  max-block-size: min(680px, calc(100vh - var(--zeus-space-8)));
   overflow: auto;
-  padding: 22px;
+  padding: var(--zeus-dialog-padding);
   pointer-events: auto;
 }
 
 .macos-ai-app .session-permission-dialog-header {
   align-items: center;
   display: flex;
-  gap: 12px;
+  gap: var(--zeus-dialog-section-gap);
 }
 
 .macos-ai-app .session-permission-dialog-header > svg {
@@ -10086,35 +10086,35 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 }
 
 .macos-ai-app .session-permission-dialog-header > strong {
-  font-size: 19px;
-  font-weight: 700;
+  font-size: var(--zeus-type-size-dialog-title);
+  font-weight: var(--zeus-type-weight-bold);
   letter-spacing: -0.018em;
-  line-height: 27px;
+  line-height: var(--zeus-type-line-tight);
 }
 
 .macos-ai-app .session-permission-dialog-introduction,
 .macos-ai-app .session-permission-dialog-risk {
   color: var(--zeus-product-muted);
-  font-size: 14px;
-  line-height: 21px;
+  font-size: var(--zeus-type-size-body);
+  line-height: var(--zeus-type-line-default);
   margin: 0;
 }
 
 .macos-ai-app .session-permission-dialog-capabilities {
   background: color-mix(in srgb, var(--zeus-product-panel-muted) 72%, transparent);
   border: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
-  border-radius: 12px;
+  border-radius: var(--agentdesk-radius-card, 12px);
   overflow: hidden;
-  padding-inline: 15px;
+  padding-inline: var(--zeus-space-3);
 }
 
 .macos-ai-app .session-permission-dialog-capability {
   align-items: center;
   display: grid;
-  gap: 14px;
+  gap: var(--zeus-space-3);
   grid-template-columns: 38px minmax(0, 1fr);
-  min-block-size: 64px;
-  padding-block: 8px;
+  min-block-size: calc(var(--zeus-space-8) + var(--zeus-space-8));
+  padding-block: var(--zeus-space-2);
 }
 
 .macos-ai-app .session-permission-dialog-capability + .session-permission-dialog-capability {
@@ -10148,27 +10148,27 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 .macos-ai-app .session-permission-dialog-capability > span:last-child {
   display: grid;
-  gap: 2px;
+  gap: var(--zeus-space-1);
   min-inline-size: 0;
 }
 
 .macos-ai-app .session-permission-dialog-capability strong {
-  font-size: 14px;
-  font-weight: 680;
-  line-height: 20px;
+  font-size: var(--zeus-type-size-body);
+  font-weight: var(--zeus-type-weight-semibold);
+  line-height: var(--zeus-type-line-default);
 }
 
 .macos-ai-app .session-permission-dialog-capability small {
   color: var(--zeus-product-muted);
-  font-size: 13px;
-  line-height: 19px;
+  font-size: var(--zeus-type-size-control);
+  line-height: var(--zeus-type-line-default);
   overflow-wrap: anywhere;
 }
 
 .macos-ai-app .session-permission-dialog-risk {
-  padding: 10px 12px;
+  padding: var(--zeus-space-2) var(--zeus-space-3);
   border: 1px solid color-mix(in srgb, var(--zeus-control-danger-line) 72%, transparent);
-  border-radius: 10px;
+  border-radius: var(--agentdesk-radius-tab-rail, 10px);
   color: var(--zeus-control-danger-text);
   background: color-mix(in srgb, var(--zeus-control-danger-bg) 72%, transparent);
 }
@@ -10176,10 +10176,10 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 .macos-ai-app .session-permission-dialog-actions {
   align-items: center;
   display: flex;
-  gap: 10px;
+  gap: var(--zeus-space-2);
   justify-content: flex-end;
-  margin: 2px -22px -22px;
-  padding: 14px 22px;
+  margin: var(--zeus-space-1) calc(0px - var(--zeus-dialog-padding)) calc(0px - var(--zeus-dialog-padding));
+  padding: var(--zeus-dialog-footer-padding-block) var(--zeus-dialog-padding);
   border-block-start: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
   background: color-mix(in srgb, var(--zeus-product-panel-muted) 60%, transparent);
 }
@@ -10199,31 +10199,24 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
 
 @media (max-width: 560px) {
   .macos-ai-app .session-permission-dialog {
+    --zeus-dialog-padding: var(--zeus-space-4);
+    --zeus-dialog-content-gap: var(--zeus-space-3);
     border-radius: 16px;
-    gap: 15px;
-    padding: 18px;
-  }
-
-  .macos-ai-app .session-permission-dialog-header > strong {
-    font-size: 18px;
-    line-height: 25px;
   }
 
   .macos-ai-app .session-permission-dialog-capabilities {
-    padding-inline: 14px;
+    padding-inline: var(--zeus-space-3);
   }
 
   .macos-ai-app .session-permission-dialog-capability {
-    gap: 11px;
+    gap: var(--zeus-space-3);
     grid-template-columns: 36px minmax(0, 1fr);
-    min-block-size: 66px;
+    min-block-size: calc(var(--zeus-space-8) + var(--zeus-space-8));
   }
 
   .macos-ai-app .session-permission-dialog-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    margin: 0 -18px -18px;
-    padding: 12px 18px;
   }
 
   .macos-ai-app .session-permission-dialog-actions > .zeus-button {

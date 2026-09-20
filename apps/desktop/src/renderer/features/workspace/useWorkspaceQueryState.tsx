@@ -125,6 +125,7 @@ import {
   taskTableColumnPreferencesEqual,
   type TrackedTaskModelPushState,
 } from './workspaceSupport.js';
+import { resolveProjectWorkspaceTabs } from './projectWorkspacePersistence.js';
 import type { WorkspacePageProps } from './workspaceContracts.js';
 
 export function useWorkspaceQueryState(props: WorkspacePageProps) {
@@ -282,7 +283,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [taskTemplates, setTaskTemplates] = useState<TaskTemplateRecord[]>(() => props.initialTaskTemplates ?? []);
   const [archivedProjects, setArchivedProjects] = useState<ProjectRecord[]>(() => props.initialArchivedProjects ?? []);
   const [conversationDraftOpen, setConversationDraftOpen] = useState(false);
-  const [projectDetail, setProjectDetail] = useState<ProjectRecord | undefined>(() => props.snapshot?.projects[0]);
+  const [projectDetail, setProjectDetail] = useState<ProjectRecord | undefined>(() => {
+    const projects = props.snapshot?.projects ?? [];
+    const restoredProjectId = resolveProjectWorkspaceTabs(projects, projects[0]?.id).activeProjectId;
+    return projects.find((project) => project.id === restoredProjectId) ?? projects[0];
+  });
   const [taskDetail, setTaskDetail] = useState<TaskRecord | undefined>(() => props.snapshot?.tasks[0]);
   const [taskDetailPaneTaskId, setTaskDetailPaneTaskId] = useState<string | undefined>();
   const [taskDetailPresentation, setTaskDetailPresentation] = useState<TaskBoardOpenMode>('side_peek');
@@ -346,7 +351,9 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     if (!props.snapshot) return;
     // 同步 Electron hydration 后传入的真实 snapshot，避免首屏 connecting 空状态锁死后续真实项目与任务。
     setSnapshot(props.snapshot);
-    const nextProject = syncRecordFromSnapshot(projectDetail, props.snapshot.projects);
+    const restoredProjectId = resolveProjectWorkspaceTabs(props.snapshot.projects, props.snapshot.projects[0]?.id).activeProjectId;
+    const restoredProject = props.snapshot.projects.find((project) => project.id === restoredProjectId);
+    const nextProject = syncRecordFromSnapshot(projectDetail ?? restoredProject, props.snapshot.projects);
     const nextTask = syncRecordFromSnapshot(taskDetail, props.snapshot.tasks);
     setProjectDetail(nextProject);
     setTaskDetail(nextTask);

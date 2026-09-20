@@ -71,6 +71,8 @@
   --zeus-source-list-row-radius: 8px;
   --zeus-source-list-row-motion: 140ms var(--zeus-motion-ease-out);
   font-family: var(--zeus-font-family-ui);
+  font-size: var(--zeus-type-size-body);
+  line-height: var(--zeus-type-line-default);
   user-select: none;
 }
 
@@ -553,16 +555,16 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   appearance: none;
   background: var(--zeus-control-bg);
   border: 1px solid var(--zeus-control-border);
-  border-radius: 8px;
+  border-radius: var(--agentdesk-radius-control, 8px);
   box-shadow: none;
   color: var(--zeus-control-text);
   display: inline-flex;
   font: inherit;
   font-size: var(--zeus-form-action-font-size);
-  font-weight: 650;
-  gap: 8px;
+  font-weight: var(--zeus-type-weight-semibold);
+  gap: var(--zeus-space-2);
   justify-content: center;
-  line-height: 1.4;
+  line-height: var(--zeus-type-line-tight);
   max-inline-size: 100%;
   padding-block: 0;
   padding-inline: var(--zeus-form-action-padding-inline);
@@ -578,13 +580,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 .macos-ai-app .zeus-button[data-zeus-primitive='button'] > svg {
   display: block;
   flex: 0 0 auto;
-  inline-size: 16px;
-  block-size: 16px;
+  inline-size: var(--zeus-space-4);
+  block-size: var(--zeus-space-4);
 }
 
 .macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-size='compact'] {
   min-block-size: var(--zeus-control-height);
-  padding-inline: 12px;
+  padding-inline: var(--zeus-space-3);
 }
 
 .macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-size='regular'] {
@@ -1111,6 +1113,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   position: absolute;
 }
 
+/* 所有模态先继承同一排版基线；业务层只选择标题、正文或说明文字的语义级别。 */
+.zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop > [data-modal-surface] {
+  font-family: var(--zeus-font-family-ui);
+  font-size: var(--zeus-type-size-control);
+  line-height: var(--zeus-type-line-default);
+}
+
 .zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop > :is([role='dialog'], [data-modal-surface='dialog']) {
   animation: none;
   transform: translateY(0);
@@ -1197,8 +1206,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 
 .macos-ai-app .application-error-dialog-content header > strong {
   color: var(--zeus-product-text);
-  font-size: var(--zeus-type-size-heading);
-  font-weight: var(--zeus-type-weight-semibold);
+  font-size: var(--zeus-type-size-dialog-title);
+  font-weight: var(--zeus-type-weight-bold);
   letter-spacing: -0.012em;
   line-height: var(--zeus-type-line-tight);
 }

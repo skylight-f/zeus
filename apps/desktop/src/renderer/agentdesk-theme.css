@@ -644,12 +644,12 @@ body:has(.macos-ai-app.zeus-shell) {
 
 /* AgentDesk 只映射全局间距阶梯，用户密度设置覆盖 Zeus token 后会同步影响页面与弹窗。 */
 .macos-ai-app.zeus-shell {
-  --agentdesk-space-1: var(--zeus-space-1);
-  --agentdesk-space-2: var(--zeus-space-2);
-  --agentdesk-space-3: var(--zeus-space-3);
-  --agentdesk-space-4: var(--zeus-space-4);
-  --agentdesk-space-5: var(--zeus-space-5);
-  --agentdesk-space-6: var(--zeus-space-6);
+  --agentdesk-space-1: var(--zeus-space-1, 4px);
+  --agentdesk-space-2: var(--zeus-space-2, 8px);
+  --agentdesk-space-3: var(--zeus-space-3, 12px);
+  --agentdesk-space-4: var(--zeus-space-4, 16px);
+  --agentdesk-space-5: var(--zeus-space-5, 20px);
+  --agentdesk-space-6: var(--zeus-space-6, 24px);
   --zeus-control-radius: var(--agentdesk-radius-control);
 }
 
