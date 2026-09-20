@@ -77,7 +77,10 @@ export function MenuSurface({ onClose, ref: forwardedRef, submenuAnchor, ...prop
         const options = items();
         const current = options.indexOf(document.activeElement as HTMLElement);
         const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : (current + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length;
-        options[next]?.focus({ preventScroll: true });
+        const nextItem = options[next];
+        nextItem?.focus({ preventScroll: true });
+        // 分组有独立滚动区域，键盘导航时只将目标项滚入最近的可视范围。
+        nextItem?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       }
     };
     document.addEventListener('pointerdown', outside, true);
