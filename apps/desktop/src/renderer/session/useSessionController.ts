@@ -753,6 +753,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
     return [];
   }
 
+  /** 只有可能携带持久转录位置的动作需要等待位置核对；本地发送、取消和表单状态必须立即落盘。 */
+  function actionRequiresPlacementRecovery(action: Parameters<typeof sessionReducer>[1]): boolean {
+    return action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged' || action.type === 'pending_requests_hydrated' || action.type === 'event_received';
+  }
+
   /** 分批核对同一代次；跨批又发生重编号时丢弃整批证据重新读取。 */
   async function recoverTranscriptPlacements(generation: number): Promise<void> {
     if (!options.client.loadNativeConversationTranscriptPlacements) throw new Error('当前客户端缺少位置核对接口。');
@@ -817,14 +822,18 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const incomingMissingPlacement = (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged') && actionTranscripts(action).some((envelope) => envelope.placement.order === null);
     const incomingEpoch =
       action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed' ? action.event.payload.orderEpoch : Math.max(0, ...actionTranscripts(action).map((envelope) => envelope.placement.orderEpoch));
-    if (
+    // 本地发送、取消、队列响应和表单状态立即归约，同时记入接管动作序列；
+    // 位置核对完成后先重放较旧的服务端动作，再重放这些本地动作，避免旧快照抹掉期间输入。
+    const placementSensitive = actionRequiresPlacementRecovery(action);
+    const placementTakeoverRequired =
       action.type !== 'transcript_placements_hydrated' &&
-      (placementRecovery ||
-        missingInputPlacement ||
-        incomingMissingPlacement ||
-        (incomingEpoch > 0 && incomingEpoch !== placementEpoch) ||
-        (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed'))
-    ) {
+      (Boolean(placementRecovery) ||
+        (placementSensitive &&
+          (missingInputPlacement ||
+            incomingMissingPlacement ||
+            (incomingEpoch > 0 && incomingEpoch !== placementEpoch) ||
+            (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed'))));
+    if (placementTakeoverRequired) {
       placementBufferBytes += new TextEncoder().encode(JSON.stringify(action)).byteLength;
       placementActions.push(action);
       if (placementActions.length > sessionRealtimeBufferBudget.maxEntries || placementBufferBytes > sessionRealtimeBufferBudget.maxBytes) {
@@ -833,9 +842,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
         placementRecovery = null;
         placementRecoveryGeneration += 1;
         failConversationSync(new Error('位置接管期间的消息缓冲超过预算。'));
-        return;
-      }
-      if (!placementRecovery) {
+        // 本地动作仍可安全落盘；携带服务端转录的动作等待重新同步。
+        if (placementSensitive) return;
+      } else if (!placementRecovery) {
         const generation = ++placementRecoveryGeneration;
         const recovery = Promise.resolve()
           .then(() => recoverTranscriptPlacements(generation))
@@ -851,7 +860,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           });
         placementRecovery = recovery;
       }
-      return;
+      if (placementSensitive) return;
     }
     const previousThreadId = state.providerThreadId;
     const previousTransportKind = state.snapshot?.transportKind ?? null;

@@ -32,7 +32,7 @@ import type { ZeusBrowserComment, ZeusBrowserPreparedSubmission } from '@zeus/sh
 import { type ConversationContextDraft, emptyConversationContextDraft, type TaskPushMessageLayout } from '@zeus/shared';
 import { mergeConversationContentV2, reconcileConversationHistoryCache } from './conversationSnapshotV2Adapter.js';
 import { isTranscriptContentUpdate } from './transcriptProjection.js';
-import { mergeTranscriptItem, newestTranscriptPlacement, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
+import { mergeTranscriptItem, newestTranscriptPlacement, orderTranscriptCandidates, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
 import { isUnacceptedTranscriptMessage } from './conversationQueuePresentation.js';
 
 export type NativeSessionAction =
@@ -647,11 +647,15 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     const placement = newestTranscriptPlacement(previousRequests.get(request.id)?.transcript, request.transcript);
     return request.transcript && placement ? { ...request, transcript: { ...request.transcript, placement } } : request;
   });
-  const projectedItemOrder = orderedItems
-    .sort((left, right) => {
-      if (left.order !== null && right.order !== null) return left.order - right.order;
-      return left.stableIndex - right.stableIndex;
-    })
+  /** 先建立可回退的候选顺序，再只在有持久位置的槽位之间重排。 */
+  const candidateItems = orderedItems
+    .map((entry, candidateIndex) => ({ entry, candidateIndex }))
+    .sort((left, right) => left.entry.stableIndex - right.entry.stableIndex || left.candidateIndex - right.candidateIndex)
+    .map(({ entry }) => entry);
+  const projectedItemOrder = orderTranscriptCandidates(candidateItems, (entry) => ({
+    order: entry.order,
+    entryId: items[entry.key]?.transcript?.placement.entryId ?? entry.key,
+  }))
     .map((entry) => entry.key);
   const stableItems = reuseEquivalentSessionItems(state.items, items);
   /** 只为仍在页面缓存中的条目保留额外摘要，避免轮次缓存无界增长。 */
@@ -825,26 +829,14 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
   }
 
   const canonicalOrderKey = (key: string): string => canonicalKeyByAlias.get(key) ?? key;
-  const previousOrder = new Map<string, number>();
-  state.itemOrder.forEach((key, index) => {
-    const canonicalKey = canonicalOrderKey(key);
-    if (!previousOrder.has(canonicalKey)) previousOrder.set(canonicalKey, index);
-  });
   const stableOrder = [...new Set([...state.itemOrder, ...hydrated.itemOrder].map(canonicalOrderKey))];
-  const stableOrderIndex = new Map(stableOrder.map((key, index) => [key, index]));
-  const itemOrder = stableOrder
-    .filter((key) => Boolean(items[key]))
-    .sort((leftKey, rightKey) => {
-      const left = items[leftKey];
-      const right = items[rightKey];
-      if (!left || !right) return left ? -1 : right ? 1 : 0;
-      const leftPlacement = left.transcript?.placement;
-      const rightPlacement = right.transcript?.placement;
-      if (leftPlacement?.order !== null && leftPlacement?.order !== undefined && rightPlacement?.order !== null && rightPlacement?.order !== undefined) {
-        return leftPlacement.order - rightPlacement.order || leftPlacement.entryId.localeCompare(rightPlacement.entryId);
-      }
-      return (previousOrder.get(leftKey) ?? stableOrderIndex.get(leftKey) ?? Number.MAX_SAFE_INTEGER) - (previousOrder.get(rightKey) ?? stableOrderIndex.get(rightKey) ?? Number.MAX_SAFE_INTEGER);
-    });
+  const itemOrder = orderTranscriptCandidates(
+    stableOrder.filter((key) => Boolean(items[key])),
+    (key) => ({
+      order: items[key]?.transcript?.placement.order,
+      entryId: items[key]?.transcript?.placement.entryId ?? key,
+    }),
+  );
 
   const turnsByProviderId = { ...hydrated.turnsByProviderId };
   for (const [turnId, previous] of Object.entries(state.turnsByProviderId)) {
@@ -1503,13 +1495,10 @@ function reduceTranscriptPlacements(state: NativeSessionState, batch: NativeConv
 
 /** 实时条目只按持久位置插入；无位置的乐观队列继续保留当前相对顺序。 */
 function sortSessionItemOrder(order: readonly string[], items: Readonly<Record<string, NativeSessionItemBuffer>>): string[] {
-  const previousIndex = new Map(order.map((key, index) => [key, index]));
-  return [...order].sort((leftKey, rightKey) => {
-    const left = items[leftKey]?.transcript?.placement.order ?? null;
-    const right = items[rightKey]?.transcript?.placement.order ?? null;
-    if (left !== null && right !== null) return left - right || (items[leftKey]?.transcript?.placement.entryId ?? leftKey).localeCompare(items[rightKey]?.transcript?.placement.entryId ?? rightKey);
-    return (previousIndex.get(leftKey) ?? 0) - (previousIndex.get(rightKey) ?? 0);
-  });
+  return orderTranscriptCandidates(order, (key) => ({
+    order: items[key]?.transcript?.placement.order,
+    entryId: items[key]?.transcript?.placement.entryId ?? key,
+  }));
 }
 
 /** 已接纳输入可按持久客户端身份核对原位置；未发送输入不猜位置，也不进入恢复请求。 */

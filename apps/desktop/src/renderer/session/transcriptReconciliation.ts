@@ -41,12 +41,12 @@ export function reconcileTranscriptItems(current: readonly NativeItemSnapshot[],
       const next = byEntryId.get(transcriptEntryId(item))!;
       return next.transcript.placement.order !== item.transcript.placement.order;
     });
-  const items = changedEntryIds.size === 0 ? (current as NativeItemSnapshot[]) : [...byEntryId.values()];
-  if (structuralChange) {
-    /** 排序前记录候选顺序；位置未规划时沿用该顺序，不能把开场输入沉底。 */
-    const candidateIndex = new Map(items.map((item, index) => [transcriptEntryId(item), index]));
-    items.sort(compareTranscriptItemsByCandidate(candidateIndex));
-  }
+  let items = changedEntryIds.size === 0 ? (current as NativeItemSnapshot[]) : [...byEntryId.values()];
+  if (structuralChange)
+    items = orderTranscriptCandidates(items, (item) => ({
+      order: item.transcript.placement.order,
+      entryId: transcriptEntryId(item),
+    }));
   const movedEntryIds = items.flatMap((item, index) => {
     const entryId = transcriptEntryId(item);
     const before = previousOrder.get(entryId);
@@ -55,14 +55,29 @@ export function reconcileTranscriptItems(current: readonly NativeItemSnapshot[],
   return { items, changedEntryIds: [...changedEntryIds], movedEntryIds };
 }
 
-/** 只有双方都有整数位置时才比较 order；缺位置的条目按候选顺序保留原位。 */
-function compareTranscriptItemsByCandidate(candidateIndex: ReadonlyMap<string, number>): (left: NativeItemSnapshot, right: NativeItemSnapshot) => number {
-  return (left, right) => {
-    const leftOrder = left.transcript.placement.order;
-    const rightOrder = right.transcript.placement.order;
-    if (leftOrder !== null && rightOrder !== null) return leftOrder - rightOrder || transcriptEntryId(left).localeCompare(transcriptEntryId(right));
-    return (candidateIndex.get(transcriptEntryId(left)) ?? 0) - (candidateIndex.get(transcriptEntryId(right)) ?? 0);
-  };
+/**
+ * 只在已有持久位置的槽位之间重排；缺少位置的条目保留候选槽位和相对顺序。
+ *
+ * 不能用“双方都有 order 时比较 order，否则比较候选下标”的混合比较器：
+ * positioned(3) < missing、missing < positioned(1)，同时 positioned(1) < positioned(3)，
+ * 会形成不满足传递性的比较环，使结果依赖排序实现和输入排列。
+ */
+export function orderTranscriptCandidates<T>(
+  candidates: readonly T[],
+  evidenceFor: (candidate: T) => { order: number | null | undefined; entryId: string },
+): T[] {
+  const described = candidates.map((candidate, candidateIndex) => {
+    const evidence = evidenceFor(candidate);
+    return { candidate, candidateIndex, entryId: evidence.entryId, order: evidence.order ?? null };
+  });
+  const positioned = described
+    .filter((candidate) => candidate.order !== null)
+    .sort(
+      (left, right) =>
+        (left.order ?? 0) - (right.order ?? 0) || left.entryId.localeCompare(right.entryId) || left.candidateIndex - right.candidateIndex,
+    );
+  let positionedIndex = 0;
+  return described.map((candidate) => (candidate.order === null ? candidate.candidate : positioned[positionedIndex++]!.candidate));
 }
 
 /** 读取条目的产品级稳定身份。 */
