@@ -119,6 +119,7 @@ import { createCodexConfigImportService } from './codexConfigImportService.js';
 import { createZeusSkillService } from './zeusSkillService.js';
 import { createZeusPluginService } from './zeusPluginService.js';
 import { createZeusConversationPluginRuntime } from './zeusConversationPluginRuntime.js';
+import { createZeusConfiguredMcpRuntime } from './zeusConfiguredMcpRuntime.js';
 import { type CodexLegacyImportService, createCodexLegacyImportService } from './codexLegacyImportService.js';
 import { createCodexNativeConversationCoordinator } from './codexNativeConversationCoordinator.js';
 import { CodexPublicCommandApplicationService } from './codexPublicCommandApplication.js';
@@ -1105,6 +1106,12 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         },
       })
     : undefined;
+  const zeusConfiguredMcpRuntime = readOnlyValidation
+    ? undefined
+    : createZeusConfiguredMcpRuntime({
+        codexHome: options.codexHome ?? dataLayout.codexHome,
+        publish: publishNativeConversationEvent,
+      });
   const modelConnections = createModelConnectionService({
     settings,
     secretStore,
@@ -1367,6 +1374,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         execution: conversationExecution,
         toolResults: conversationToolResults,
         plugins: zeusConversationPluginRuntime,
+        configuredMcp: zeusConfiguredMcpRuntime,
         browserAutomation: options.browserAutomation,
         workTools: nativeWorkTools,
         auditNativeTool: async (event) => {

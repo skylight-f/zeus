@@ -65,6 +65,7 @@ import type { ContextDispatchEnvelope, ProviderDispatchContextCompiler } from '.
 import { PiProviderCommandApplicationService, type PiProviderCommandAttempt } from './piProviderCommandDelivery.js';
 import { projectLocallyAcceptedUserMessage } from './localUserSubmissionProjection.js';
 import type { ZeusConversationPluginRuntime, ZeusPluginConversationPreparation } from './zeusConversationPluginRuntime.js';
+import type { ZeusConfiguredMcpPreparation, ZeusConfiguredMcpRuntime, ZeusConfiguredMcpTool } from './zeusConfiguredMcpRuntime.js';
 import { emitPluginCompactionHook } from './codexConversationDispatchContext.js';
 import type { ZeusPluginDynamicTool } from './zeusPluginMcpBroker.js';
 import { createZeusToolBroker, isZeusNativeToolMutation, type ZeusToolAuditEvent } from './zeusToolRegistry.js';
@@ -147,6 +148,8 @@ export interface CreatePiNativeConversationCoordinatorOptions {
   execution: ConversationExecutionRepository;
   toolResults: ManagedConversationToolResultStore;
   plugins?: ZeusConversationPluginRuntime;
+  /** 把 Zeus Codex Home 中的普通 MCP 配置投影给 Pi；Codex 仍使用其原生 MCP 链路。 */
+  configuredMcp?: ZeusConfiguredMcpRuntime;
   /** 与界面、app-server 共用的本地 Skill 目录。 */
   loadSkills?(cwd: string, identity: string): Promise<NativeConversationSkillInput[]>;
   /** 宿主管理的长命令通道，不随 SDK 回合或界面关闭而丢失。 */
@@ -517,6 +520,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     const providerCommandIssuedAt = submission.createdAt;
     let compiledDispatchContext: ContextDispatchEnvelope | null = null;
     let pluginPreparation: ZeusPluginConversationPreparation | null = null;
+    let configuredMcpPreparation: ZeusConfiguredMcpPreparation | null = null;
     let skillCatalog: NativeConversationSkillInput[] = [];
     let providerMetadata: Record<string, unknown> = {};
     try {
@@ -546,7 +550,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           permissionMode: input.permissionMode,
         });
       }
-      providerMetadata = { ...piPluginMetadata(pluginPreparation, input.segmentLifecycle?.portableContext), zeusSkills: skillCatalog };
+      configuredMcpPreparation = (await options.configuredMcp?.prepare(input.conversationId)) ?? null;
+      providerMetadata = { ...piRuntimeMetadata(pluginPreparation, configuredMcpPreparation, input.segmentLifecycle?.portableContext), zeusSkills: skillCatalog };
       compiledDispatchContext = options.compileDispatchContext
         ? await options.compileDispatchContext({
             provider: 'pi',
@@ -565,6 +570,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           })
         : null;
     } catch (error) {
+      await options.configuredMcp?.closeConversation(input.conversationId);
       const failure = asRecord(error);
       options.submissions.updateStatus(submission.id, 'paused', {
         pausedReason: 'preflight_failed',
@@ -603,6 +609,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       });
     } catch (error) {
       sessionCommand.recordFailure(error, { explicitlyRejected: false });
+      await options.configuredMcp?.closeConversation(input.conversationId);
       throw error;
     }
     const createdAt = options.now();
@@ -650,6 +657,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       );
     } catch (error) {
       const settlementErrors: unknown[] = [];
+      await options.configuredMcp?.closeConversation(input.conversationId);
       try {
         sessionCommand.recordFailure(error, { explicitlyRejected: false, nativeSessionId: session.nativeSessionId });
       } catch (receiptError) {
@@ -975,7 +983,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           source: 'resume',
         })
       : null;
-    const providerMetadata = { ...piPluginMetadata(pluginPreparation), zeusSkills: skillCatalog };
+    const configuredMcpPreparation = (await options.configuredMcp?.prepare(input.conversation.id)) ?? null;
+    const providerMetadata = { ...piRuntimeMetadata(pluginPreparation, configuredMcpPreparation), zeusSkills: skillCatalog };
     if (!context) {
       if (!input.conversation.nativeSessionId || !input.conversation.nativeSessionPath) throw piError('ZEUS_PI_SESSION_UNAVAILABLE', 'Pi 会话缺少可恢复的会话文件。');
       const session = await driver.resumeSession({
@@ -2038,6 +2047,11 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       const pluginTool = catalog.tools.find((candidate) => candidate.name === request.toolName);
       if (pluginTool) return executePluginTool(context, request, pluginTool);
     }
+    if (options.configuredMcp) {
+      const catalog = await options.configuredMcp.getCatalog(context.conversationId);
+      const configuredTool = catalog.tools.find((candidate) => candidate.name === request.toolName);
+      if (configuredTool) return executeConfiguredMcpTool(context, request, configuredTool);
+    }
     const nativeTool = zeusToolBroker?.registry.resolvePiTool(request.toolName) ?? null;
     if (nativeTool) {
       const activeRun = [...runs.values()].reverse().find((candidate) => candidate.providerThreadId === request.session.nativeSessionId);
@@ -2206,6 +2220,25 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     };
   }
 
+  async function executeConfiguredMcpTool(context: PiConversationContext, request: PiZeusToolRequest, tool: ZeusConfiguredMcpTool): Promise<PiZeusToolResult> {
+    if (!options.configuredMcp) throw piError('ZEUS_CONFIGURED_MCP_HOST_UNAVAILABLE', '普通 MCP 宿主当前不可用。');
+    if (effectiveToolPermission(context.permissionMode, context.workMode) === 'read-only' && !tool.readOnly) {
+      throw piError('ZEUS_PI_TOOL_READ_ONLY', '只读或计划模式仅允许 MCP 明确声明为只读的工具。');
+    }
+    const result = await options.configuredMcp.invoke({
+      conversationId: context.conversationId,
+      toolName: tool.name,
+      args: request.args,
+      ...(request.signal ? { signal: request.signal } : {}),
+    });
+    return {
+      text: result.text,
+      contentItems: [{ type: 'text', text: result.text }, ...(result.images ?? []).map((image) => ({ type: 'image' as const, ...image }))],
+      isError: result.isError,
+      details: { source: 'configured_mcp', serverId: tool.serverId, toolName: tool.originalToolName, structuredContent: result.structuredContent },
+    };
+  }
+
   function parseImageDataUrl(value: string): { mimeType: string; data: string } | null {
     const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/iu.exec(value);
     return match ? { mimeType: match[1]!, data: match[2]! } : null;
@@ -2304,8 +2337,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
 
   /** 审批只绑定本次操作参数；允许之后只执行原调用一次。 */
   async function requestApproval(context: PiConversationContext, request: PiZeusToolRequest): Promise<boolean> {
-    const pluginTool = request.toolName.startsWith('zeus_mcp_');
-    const kind = request.toolName === 'bash' || pluginTool ? 'command' : 'file';
+    const mcpTool = request.toolName.startsWith('zeus_mcp_') || request.toolName.startsWith('mcp__');
+    const kind = request.toolName === 'bash' || mcpTool ? 'command' : 'file';
     return readApprovalDecision(
       await requestInteraction(context, request, kind, {
         toolName: request.toolName,
@@ -2313,7 +2346,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         operationDigest: createHash('sha256')
           .update(JSON.stringify({ tool: request.toolName, args: request.args, cwd: context.cwd, permission: context.permissionMode, workMode: context.workMode }))
           .digest('hex'),
-        ...(kind === 'command' ? { command: pluginTool ? `MCP ${request.toolName}` : stringArg(request.args.command, '命令') } : { path: stringArg(request.args.path, '文件路径') }),
+        ...(kind === 'command' ? { command: mcpTool ? `MCP ${request.toolName}` : stringArg(request.args.command, '命令') } : { path: stringArg(request.args.path, '文件路径') }),
         reason: typeof request.args.justification === 'string' ? request.args.justification : '此操作超出当前自动授权范围，需要审批。',
         availableDecisions: ['accept', 'decline', 'cancel'],
       }),
@@ -2449,9 +2482,12 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     assertConversationCanBeArchived(conversation);
     options.processes.stopOwned(conversation.id);
     const runtimeContext = conversation.nativeSessionId ? contexts.get(conversation.nativeSessionId) : undefined;
-    if (runtimeContext && options.plugins) {
+    if ((runtimeContext && options.plugins) || options.configuredMcp) {
       input.beforeExternalWrite?.();
-      await options.plugins.closeConversation({ conversationId: conversation.id, cwd: runtimeContext.cwd, model: runtimeContext.model, reason: 'archive' });
+      await Promise.all([
+        ...(runtimeContext && options.plugins ? [options.plugins.closeConversation({ conversationId: conversation.id, cwd: runtimeContext.cwd, model: runtimeContext.model, reason: 'archive' })] : []),
+        ...(options.configuredMcp ? [options.configuredMcp.closeConversation(conversation.id)] : []),
+      ]);
     }
     options.conversations.archive(conversation.id);
     if (conversation.nativeSessionId) contexts.delete(conversation.nativeSessionId);
@@ -2800,7 +2836,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       unsubscribe();
       for (const pending of pendingApprovals.values()) pending.resolve(false);
       pendingApprovals.clear();
-      await driver.close({ mode: 'final' });
+      await Promise.all([driver.close({ mode: 'final' }), options.configuredMcp?.close()]);
       await Promise.all(eventTails.values());
     },
   };
@@ -2826,16 +2862,19 @@ function readPiUsage(value: unknown): TokenUsageBreakdown | null {
   };
 }
 
-function piPluginMetadata(preparation: ZeusPluginConversationPreparation | null, portableConversationContext?: unknown): Record<string, unknown> {
+function piRuntimeMetadata(pluginPreparation: ZeusPluginConversationPreparation | null, configuredMcpPreparation: ZeusConfiguredMcpPreparation | null, portableConversationContext?: unknown): Record<string, unknown> {
+  const dynamicTools = [...(pluginPreparation?.piDynamicTools ?? []), ...(configuredMcpPreparation?.piDynamicTools ?? [])];
+  const developerInstructions = [pluginPreparation?.developerInstructions ?? '', configuredMcpPreparation?.developerInstructions ?? ''].filter(Boolean).join('\n');
   return {
     ...(portableConversationContext ? { portableConversationContext } : {}),
-    ...(preparation
+    ...(dynamicTools.length > 0 ? { zeusPluginTools: dynamicTools } : {}),
+    ...(developerInstructions ? { zeusPluginDeveloperInstructions: developerInstructions } : {}),
+    ...(configuredMcpPreparation ? { zeusConfiguredMcpSnapshotSha256: configuredMcpPreparation.catalog.snapshotSha256 } : {}),
+    ...(pluginPreparation
       ? {
-          zeusPluginTools: preparation.piDynamicTools,
-          zeusPluginSkills: preparation.skills,
-          zeusPluginDeveloperInstructions: preparation.developerInstructions,
+          zeusPluginSkills: pluginPreparation.skills,
           zeusPluginActivationSha256: createHash('sha256')
-            .update(JSON.stringify(preparation.activations.map((activation) => [activation.pluginRevisionId, activation.contentSha256])))
+            .update(JSON.stringify(pluginPreparation.activations.map((activation) => [activation.pluginRevisionId, activation.contentSha256])))
             .digest('hex'),
         }
       : {}),
