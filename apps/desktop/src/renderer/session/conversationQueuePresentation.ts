@@ -10,7 +10,47 @@ export function isUnacceptedTranscriptMessage(item: NativeSessionItemBuffer): bo
   return !(item.payload.delivery === 'steer_now' && item.status === 'steering');
 }
 
-/** 待发送消息按权威队列顺序放在记录末尾，恢复时不会被提交时间插回旧回复之前。 */
+const anchoredPausedReasons = new Set([
+  'configuration_mismatch',
+  'conflict_preparation_failed',
+  'interrupted',
+  'outcome_unknown',
+  'preflight_failed',
+  'recovered_unsent',
+  'recovery_required',
+  'runtime_rejected',
+  'semantic_route_changed',
+  'upgrade_interrupted',
+  'user_confirmation',
+]);
+
+/** 只有仍会继续交接 Provider 的消息留在队尾；已有失败结论的消息属于发生时的历史。 */
+export function isPendingQueueTranscriptMessage(item: NativeSessionItemBuffer): boolean {
+  if (!isUnacceptedTranscriptMessage(item)) return false;
+  const status = item.status.toLocaleLowerCase();
+  if (status === 'failed' || status === 'unconfirmed') return false;
+  if (status !== 'paused') return true;
+  if (item.payload.deliveryError || item.payload.error) return false;
+  const pausedReason = typeof item.payload.pausedReason === 'string' ? item.payload.pausedReason : null;
+  return !pausedReason || !anchoredPausedReasons.has(pausedReason);
+}
+
+/** 首次发送时间只用于把已停止推进的本地消息插回历史，不重排已有持久正文。 */
+function insertAnchoredTranscriptMessage(items: NativeSessionItemBuffer[], item: NativeSessionItemBuffer): void {
+  const timestamp = item.timelineAt ?? item.updatedAt;
+  if (!timestamp) {
+    items.push(item);
+    return;
+  }
+  const index = items.findIndex((candidate) => {
+    const candidateTimestamp = candidate.timelineAt ?? candidate.updatedAt;
+    return Boolean(candidateTimestamp && candidateTimestamp > timestamp);
+  });
+  if (index < 0) items.push(item);
+  else items.splice(index, 0, item);
+}
+
+/** 待发送消息按权威队列顺序留在记录末尾；失败或需处理的旧消息固定在首次发送位置。 */
 export function orderTranscriptItemsWithQueue(items: readonly NativeSessionItemBuffer[], queue: NativeQueueSnapshot | null): NativeSessionItemBuffer[] {
   /** 提交与客户端消息身份共同覆盖本地气泡和冷开队列投影。 */
   const positions = new Map<string, number>();
@@ -20,29 +60,34 @@ export function orderTranscriptItemsWithQueue(items: readonly NativeSessionItemB
     positions.set(submission.id, index);
     if (submission.clientUserMessageId) positions.set(submission.clientUserMessageId, index);
   });
-  /** 排序与失败记录插入共用接纳判断，避免两种展示各自把旧输入推向队尾。 */
+  /** 队尾只包含仍在推进的消息，失败记录不能被后续发言反复推成最新一条。 */
   const queuePosition = (item: NativeSessionItemBuffer): number | undefined => {
-    if (!isUnacceptedTranscriptMessage(item)) return undefined;
+    if (!isPendingQueueTranscriptMessage(item)) return undefined;
     for (const id of [item.payload.submissionId, item.clientUserMessageId, item.durableClientUserMessageId]) {
       if (typeof id === 'string' && positions.has(id)) return positions.get(id);
     }
     // 本地消息尚无队列回执时，也必须排在既有待发消息之后。
     return submissions.length;
   };
-  return [...items].sort((left, right) => {
-    /** 已有队列身份和等待本地回执的消息统一在历史末尾排序。 */
-    const leftPosition = queuePosition(left);
-    /** 同时比较两端，保证已确认历史位于待发队列之前。 */
-    const rightPosition = queuePosition(right);
-    if (leftPosition === undefined && rightPosition === undefined) {
-      // 已接纳历史已经由持久显示位置排好，队列层不得跨来源再次排序。
-      return 0;
-    }
-    if (leftPosition === undefined) return -1;
-    if (rightPosition === undefined) return 1;
+  const historicalItems: NativeSessionItemBuffer[] = [];
+  const anchoredItems: NativeSessionItemBuffer[] = [];
+  const pendingItems: NativeSessionItemBuffer[] = [];
+  for (const item of items) {
+    if (queuePosition(item) !== undefined) pendingItems.push(item);
+    else if (isUnacceptedTranscriptMessage(item)) anchoredItems.push(item);
+    else historicalItems.push(item);
+  }
+  /** 本地失败项可能来自冷开队列投影，先移出队尾，再按首次发送时间逐条归位。 */
+  anchoredItems
+    .sort((left, right) => (left.timelineAt ?? left.updatedAt ?? '').localeCompare(right.timelineAt ?? right.updatedAt ?? ''))
+    .forEach((item) => insertAnchoredTranscriptMessage(historicalItems, item));
+  pendingItems.sort((left, right) => {
+    const leftPosition = queuePosition(left)!;
+    const rightPosition = queuePosition(right)!;
     /** 同时等待本地回执时按首次显示时间排序，状态更新时间不能移动气泡。 */
     return leftPosition - rightPosition || (left.timelineAt ?? '').localeCompare(right.timelineAt ?? '');
   });
+  return [...historicalItems, ...pendingItems];
 }
 
 /** 沿用提交的稳定队列顺序，保留模型接手前的消息及发送失败后的重试入口。 */

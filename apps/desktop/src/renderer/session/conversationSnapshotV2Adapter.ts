@@ -420,7 +420,7 @@ export function mergeConversationProcessV2(snapshot: NativeConversationSnapshot,
     (page.kind !== 'process' && page.kind !== 'commands')
   )
     throw new Error('会话 V2 过程页与当前快照不匹配。');
-  const items = mergeItemsByProviderIdentity(snapshot.items, processItems(page.items, providerTurnIdentityMap(snapshot.turns)));
+  const items = mergeItemsByProviderIdentity(snapshot.items, processItems(page.items, turnPageProviderIdentityMap(snapshot.turns, turnId, page.items)));
   return {
     ...snapshot,
     items,
@@ -439,7 +439,7 @@ export function mergeConversationTurnHistoryV2(snapshot: NativeConversationSnaps
   if (!snapshot.snapshotV2 || !snapshot.v2Paging || page.schemaVersion !== 2 || page.structureGeneration !== snapshot.snapshotV2.structureGeneration || page.conversationId !== snapshot.id || page.kind !== 'model_history') {
     throw new Error('会话 V2 轮次正文页与当前快照不匹配。');
   }
-  const items = mergeItemsByProviderIdentity(snapshot.items, historyItems(page.items, providerTurnIdentityMap(snapshot.turns)));
+  const items = mergeItemsByProviderIdentity(snapshot.items, historyItems(page.items, turnPageProviderIdentityMap(snapshot.turns, turnId, page.items)));
   return {
     ...snapshot,
     items,
@@ -656,6 +656,23 @@ function processItems(items: NativeConversationProcessV2Item[], providerTurnByLo
  */
 function providerTurnIdentityMap(turns: readonly NativeTurnSnapshot[]): ReadonlyMap<string, string> {
   return new Map(turns.map((turn) => [turn.id, turn.providerTurnId ?? turn.id]));
+}
+
+/**
+ * 实时 turn.started 可能先于下一份结构快照到达。此时按轮次分页已经通过
+ * Provider 身份成功读取，但页内仍携带存储层本地 turnId；请求身份就是该页
+ * 唯一轮次的临时权威映射，不能让过程条目因此逃出当前状态组。
+ */
+function turnPageProviderIdentityMap(
+  turns: readonly NativeTurnSnapshot[],
+  requestedTurnIdentity: string,
+  items: ReadonlyArray<{ turnId: string }>,
+): ReadonlyMap<string, string> {
+  const identities = new Map(providerTurnIdentityMap(turns));
+  for (const item of items) {
+    if (!identities.has(item.turnId)) identities.set(item.turnId, requestedTurnIdentity);
+  }
+  return identities;
 }
 
 function startsWithToolCallProjection(preview: string): boolean {
