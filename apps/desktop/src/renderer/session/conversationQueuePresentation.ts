@@ -78,9 +78,7 @@ export function orderTranscriptItemsWithQueue(items: readonly NativeSessionItemB
     else historicalItems.push(item);
   }
   /** 本地失败项可能来自冷开队列投影，先移出队尾，再按首次发送时间逐条归位。 */
-  anchoredItems
-    .sort((left, right) => (left.timelineAt ?? left.updatedAt ?? '').localeCompare(right.timelineAt ?? right.updatedAt ?? ''))
-    .forEach((item) => insertAnchoredTranscriptMessage(historicalItems, item));
+  anchoredItems.sort((left, right) => (left.timelineAt ?? left.updatedAt ?? '').localeCompare(right.timelineAt ?? right.updatedAt ?? '')).forEach((item) => insertAnchoredTranscriptMessage(historicalItems, item));
   pendingItems.sort((left, right) => {
     const leftPosition = queuePosition(left)!;
     const rightPosition = queuePosition(right)!;

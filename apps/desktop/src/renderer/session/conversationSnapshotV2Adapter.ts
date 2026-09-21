@@ -663,11 +663,7 @@ function providerTurnIdentityMap(turns: readonly NativeTurnSnapshot[]): Readonly
  * Provider 身份成功读取，但页内仍携带存储层本地 turnId；请求身份就是该页
  * 唯一轮次的临时权威映射，不能让过程条目因此逃出当前状态组。
  */
-function turnPageProviderIdentityMap(
-  turns: readonly NativeTurnSnapshot[],
-  requestedTurnIdentity: string,
-  items: ReadonlyArray<{ turnId: string }>,
-): ReadonlyMap<string, string> {
+function turnPageProviderIdentityMap(turns: readonly NativeTurnSnapshot[], requestedTurnIdentity: string, items: ReadonlyArray<{ turnId: string }>): ReadonlyMap<string, string> {
   const identities = new Map(providerTurnIdentityMap(turns));
   for (const item of items) {
     if (!identities.has(item.turnId)) identities.set(item.turnId, requestedTurnIdentity);

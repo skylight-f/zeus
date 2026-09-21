@@ -344,10 +344,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const updateHistorySentinelIntersection = useCallback((intersecting: boolean) => setHistorySentinelIntersection({ conversationId: props.state.conversationId, intersecting }), [props.state.conversationId]);
   const activeTurnId = props.historyOnly ? null : props.state.activeTurnId;
   /** 实时事件和 V2 快照可能在同一帧分别携带 Provider 与本地轮次身份，展示层必须把它们视为同一活动轮次。 */
-  const activeTurnIdentities = useMemo(
-    () => turnIdentitySet(props.state, activeTurnId),
-    [activeTurnId, props.state.items, props.state.snapshot?.snapshotV2?.activeTurn, props.state.snapshot?.turns, props.state.turnsByProviderId],
-  );
+  const activeTurnIdentities = useMemo(() => turnIdentitySet(props.state, activeTurnId), [activeTurnId, props.state.items, props.state.snapshot?.snapshotV2?.activeTurn, props.state.snapshot?.turns, props.state.turnsByProviderId]);
   const queuedSubmissions = useMemo(() => visibleQueuedSubmissions(props.state.queue), [props.state.queue]);
   const queuedClientUserMessageIds = useMemo(() => new Set(queuedSubmissions.map((submission) => submission.clientUserMessageId).filter((value): value is string => Boolean(value))), [queuedSubmissions]);
   /** 内容批次复用已建立的输入、阶段和父组索引。 */
@@ -457,8 +454,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const closedTurnChangeSetIds = useMemo(() => availableClosedTurnChangeSetIds(props.state.snapshot), [props.state.snapshot?.snapshotV2]);
   const baseTurnRows = useMemo(
     () =>
-      contentProjection?.turnRows ??
-      reuseTranscriptTurnRows(previousProjection.current?.turnRows ?? [], projectTranscriptTurnRows(transcriptRows, activeTurnId, props.state.terminalTurnIds, processAvailableTurnIds, activeTurnIdentities)),
+      contentProjection?.turnRows ?? reuseTranscriptTurnRows(previousProjection.current?.turnRows ?? [], projectTranscriptTurnRows(transcriptRows, activeTurnId, props.state.terminalTurnIds, processAvailableTurnIds, activeTurnIdentities)),
     [activeTurnId, activeTurnIdentities, processAvailableTurnIds, props.state.terminalTurnIds, transcriptRows],
   );
   /** 具体实时过程已经位于时间线末尾时，不再追加含义相同的“正在执行”。 */
@@ -1667,11 +1663,7 @@ export function projectLiveTurnWorkRowsToTail(rows: readonly TranscriptViewportR
 }
 
 /** 具体执行过程已经承担实时状态时，不再在底部重复展示笼统状态。 */
-export function shouldRenderStandaloneActiveStatus(
-  canShow: boolean,
-  activeStatusKind: ReturnType<typeof transcriptRunStatus>,
-  hasLiveTurnWork: boolean,
-): boolean {
+export function shouldRenderStandaloneActiveStatus(canShow: boolean, activeStatusKind: ReturnType<typeof transcriptRunStatus>, hasLiveTurnWork: boolean): boolean {
   return canShow && (activeStatusKind !== 'executing' || !hasLiveTurnWork);
 }
 
