@@ -4,17 +4,17 @@ import {
   buildModelsUrl,
   createTemplateConfiguredModelDefinition,
   listSelectableConnectionModels,
-  mergeDiscoveredModels,
   modelConnectionSecretAccount,
   modelConnectionTemplates,
   modelRef,
   normalizeModelConnection,
-  normalizeProjectModelSelection,
   normalizeStoredModelConnections,
+  probeConfiguredModel,
+  syncDiscoveredModels,
   type ConfiguredModelDefinition,
   type ModelConnectionRecord,
   type ModelConnectionTemplateId,
-  type ProjectModelSelection,
+  type ModelProbeResult,
   type SaveModelConnectionInput,
   type SelectableConnectionModel,
 } from '@zeus/ai-runtime';
@@ -30,6 +30,16 @@ export interface ModelCatalogRefreshResult {
   connection: ModelConnectionRecord;
   discoveredModelIds: string[];
   addedModelIds: string[];
+  removedModelIds: string[];
+  checkedAt: string;
+}
+
+/** 能力探测回执：每个模型一条结论，未探测的模型单独列出原因。 */
+export interface ModelCapabilityProbeSummary {
+  connection: ModelConnectionRecord;
+  results: ModelProbeResult[];
+  /** 本次没有探测的已启用模型，界面需要如实说明，不能假装全部探测过。 */
+  skippedModelIds: string[];
   checkedAt: string;
 }
 
@@ -54,20 +64,22 @@ export interface ModelConnectionService {
   remove(id: string): Promise<void>;
   clearApiKey(id: string): Promise<ModelConnectionRecord>;
   refreshModels(id: string): Promise<ModelCatalogRefreshResult>;
+  /** 对已启用模型真实探测一次，用观测结果替换静态能力声明。 */
+  probeModels(id: string): Promise<ModelCapabilityProbeSummary>;
   diagnose(id: string): Promise<ModelConnectionDiagnostic>;
   listSelectableModels(): Promise<SelectableConnectionModel[]>;
-  getProjectSelection(projectId: string): Promise<ProjectModelSelection>;
-  prepareProjectSelection(projectId: string, value: unknown): Promise<ProjectModelSelection>;
-  savePreparedProjectSelectionInCurrentTransaction(selection: ProjectModelSelection): ProjectModelSelection;
-  saveProjectSelection(projectId: string, value: unknown): Promise<ProjectModelSelection>;
   loadRuntimeConnections(): Promise<Array<ModelConnectionRecord & { apiKey?: string }>>;
 }
 
 const modelConnectionsSettingKey = 'models.connections';
-const projectModelsSettingPrefix = 'project.models.';
+
+/** 单次能力探测的模型上限；探测会产生真实用量，必须有明确上限。 */
+const maximumProbeModelCount = 12;
+/** 探测并发上限：兼顾墙钟时间与供应商限流，避免一次点击把并发全部打满。 */
+const probeConcurrency = 3;
 
 /** 模型连接元数据进 SQLite settings，API Key 只进 SecretStore。 */
-export function createModelConnectionService(options: { settings: SettingRepository; secretStore: SecretStore; save: () => Promise<void>; listProjectIds: () => string[]; now?: () => string; fetch?: typeof fetch }): ModelConnectionService {
+export function createModelConnectionService(options: { settings: SettingRepository; secretStore: SecretStore; save: () => Promise<void>; now?: () => string; fetch?: typeof fetch }): ModelConnectionService {
   const now = options.now ?? (() => new Date().toISOString());
   const fetcher = options.fetch ?? fetch;
 
@@ -179,12 +191,6 @@ export function createModelConnectionService(options: { settings: SettingReposit
     },
     async remove(id) {
       await requireConnection(id);
-      const references = [];
-      for (const projectId of options.listProjectIds()) {
-        const selection = await this.getProjectSelection(projectId);
-        if (selection.allowedModelRefs.some((reference) => reference.startsWith(`${encodeURIComponent(id)}:`))) references.push(projectId);
-      }
-      if (references.length > 0) throw serviceError('ZEUS_MODEL_CONNECTION_IN_USE', `该连接仍被 ${references.length} 个项目使用，请先移除项目模型。`, 409);
       await options.secretStore.deleteSecret(modelConnectionSecretAccount(id));
       await write(readStored().filter((candidate) => candidate.id !== id));
     },
@@ -196,16 +202,44 @@ export function createModelConnectionService(options: { settings: SettingReposit
     async refreshModels(id) {
       const connection = await requireConnection(id);
       const modelIds = await fetchModelIds(connection);
-      const previousIds = new Set(connection.models.map((model) => model.id));
       const thinkingFormat = connection.templateId === 'custom' ? 'openai' : modelConnectionTemplates[connection.templateId].thinkingFormat;
-      const models = mergeDiscoveredModels(connection.models, modelIds, thinkingFormat, connection.templateId);
-      const updated = await saveConnection(connection.id, { ...connection, models }, connection);
+      const sync = syncDiscoveredModels(connection.models, modelIds, thinkingFormat, connection.templateId);
+      const updated = await saveConnection(connection.id, { ...connection, models: sync.models }, connection);
       return {
         connection: updated,
         discoveredModelIds: modelIds,
-        addedModelIds: modelIds.filter((modelId) => !previousIds.has(modelId)),
+        addedModelIds: sync.addedModelIds,
+        removedModelIds: sync.removedModelIds,
         checkedAt: now(),
       };
+    },
+    async probeModels(id) {
+      const connection = await requireConnection(id);
+      const apiKey = await options.secretStore.getSecret(modelConnectionSecretAccount(id));
+      if (!apiKey) throw serviceError('ZEUS_MODEL_API_KEY_REQUIRED', '请先为该连接配置 API Key。', 409);
+      const enabledModels = connection.models.filter((model) => model.enabled);
+      // ponytail: 单次点击最多探测前 12 个已启用模型、最多 3 路并发，避免几十个模型时一次点击打爆
+      // 额度和连接；需要更多就再点一次，或只启用要用的模型。
+      const targets = enabledModels.slice(0, maximumProbeModelCount);
+      const results: ModelProbeResult[] = [];
+      /** 探测游标与并行度；单模型要发 1～2 次真实请求，纯串行会让十几个模型跑到分钟级。 */
+      let cursor = 0;
+      const runWorker = async (): Promise<void> => {
+        while (cursor < targets.length) {
+          const model = targets[cursor];
+          cursor += 1;
+          if (!model) return;
+          results.push(await probeConfiguredModel({ connection, model, apiKey, ...(options.fetch ? { fetch: options.fetch } : {}) }));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.max(1, Math.min(probeConcurrency, targets.length)) }, runWorker));
+      const probedById = new Map(results.map((result) => [result.modelId, result]));
+      const models = connection.models.map((model) => {
+        const result = probedById.get(model.id);
+        return result ? { ...model, servedModelId: result.servedModelId, capability: result.capability } : model;
+      });
+      const updated = await saveConnection(connection.id, { ...connection, models }, connection);
+      return { connection: updated, results, skippedModelIds: enabledModels.slice(maximumProbeModelCount).map((model) => model.id), checkedAt: now() };
     },
     async diagnose(id) {
       const checkedAt = now();
@@ -225,30 +259,6 @@ export function createModelConnectionService(options: { settings: SettingReposit
     },
     async listSelectableModels() {
       return listSelectableConnectionModels(await hydrate());
-    },
-    async getProjectSelection(projectId) {
-      // 读取保留失效引用，推送时由用户重新选择。
-      return normalizeProjectModelSelection(projectId, options.settings.getJson<unknown>(projectModelsSettingPrefix + projectId));
-    },
-    async prepareProjectSelection(projectId, value) {
-      const models = await this.listSelectableModels();
-      // 保留原来已启用但已失效的引用；新增引用仍须在本地目录中存在。
-      const previous = normalizeProjectModelSelection(projectId, options.settings.getJson<unknown>(projectModelsSettingPrefix + projectId));
-      const availableRefs = new Set([...models.map((model) => model.id), ...previous.allowedModelRefs]);
-      const selection = normalizeProjectModelSelection(projectId, value, availableRefs);
-      const requested = isRecord(value) && Array.isArray(value.allowedModelRefs) ? value.allowedModelRefs : [];
-      if (requested.some((reference) => typeof reference !== 'string' || !availableRefs.has(reference))) throw serviceError('ZEUS_PROJECT_MODEL_SELECTION_INVALID', '项目选择包含不存在的模型。', 400);
-      return selection;
-    },
-    savePreparedProjectSelectionInCurrentTransaction(selection) {
-      options.settings.setJson(projectModelsSettingPrefix + selection.projectId, selection);
-      return selection;
-    },
-    async saveProjectSelection(projectId, value) {
-      const selection = await this.prepareProjectSelection(projectId, value);
-      this.savePreparedProjectSelectionInCurrentTransaction(selection);
-      await options.save();
-      return selection;
     },
     async loadRuntimeConnections() {
       const connections = await hydrate();

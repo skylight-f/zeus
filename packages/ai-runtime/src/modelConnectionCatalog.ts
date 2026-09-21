@@ -4,6 +4,7 @@ import { MOONSHOTAI_MODELS } from '@earendil-works/pi-ai/providers/moonshotai.mo
 import { OPENCODE_MODELS } from '@earendil-works/pi-ai/providers/opencode.models';
 import { QWEN_TOKEN_PLAN_CN_MODELS } from '@earendil-works/pi-ai/providers/qwen-token-plan-cn.models';
 import { ZAI_MODELS } from '@earendil-works/pi-ai/providers/zai.models';
+import { readOfficialModelVersion } from './modelVersionNames.js';
 
 export type ModelConnectionTemplateId = 'custom' | 'deepseek' | 'bailian' | 'kimi' | 'zai';
 
@@ -44,6 +45,16 @@ export interface ConfiguredModelCapability {
 export interface ConfiguredModelDefinition {
   id: string;
   displayName: string;
+  /**
+   * 能力探测时服务端在响应里回报的实际服务模型标识，可能带版本日期。
+   * 只记录真机观测结果；没探测过或服务端不回报时为空，不用供应商文档猜测。
+   */
+  servedModelId?: string | null;
+  /**
+   * 厂商官方文档里登记的版本名（人工维护表），只用于展示，不参与请求。
+   * 未登记时为 null，界面退回显示目录名或模型 ID。
+   */
+  officialVersion?: string | null;
   enabled: boolean;
   supports1MContext: boolean;
   contextWindow: number;
@@ -78,12 +89,6 @@ export interface SaveModelConnectionInput {
   modelsPath?: string;
   enabled?: boolean;
   models?: ConfiguredModelDefinition[];
-}
-
-export interface ProjectModelSelection {
-  projectId: string;
-  allowedModelRefs: string[];
-  defaultModelRef: string | null;
 }
 
 export interface SelectableConnectionModel {
@@ -214,21 +219,6 @@ export function normalizeStoredModelConnections(value: unknown): ModelConnection
   return records;
 }
 
-export function normalizeProjectModelSelection(projectId: string, value: unknown, availableRefs?: ReadonlySet<string>): ProjectModelSelection {
-  const source = isRecord(value) ? value : {};
-  const allowedModelRefs = Array.isArray(source.allowedModelRefs)
-    ? [...new Set(source.allowedModelRefs.filter((item): item is string => typeof item === 'string' && parseModelRef(item) !== null))].filter((item) => !availableRefs || availableRefs.has(item))
-    : [];
-  const requestedDefault = typeof source.defaultModelRef === 'string' ? source.defaultModelRef : null;
-  return {
-    projectId,
-    allowedModelRefs,
-    defaultModelRef: requestedDefault && allowedModelRefs.includes(requestedDefault) ? requestedDefault : (allowedModelRefs[0] ?? null),
-  };
-}
-
-const officialDeepSeekResponsesModelIds = new Set(['deepseek-v4-flash', 'deepseek-v4-pro']);
-
 /** DeepSeek 模板只有指向官方 HTTPS 端点时，才能使用官方价格和能力证据。 */
 export function isOfficialDeepSeekApiConnection(connection: Pick<ModelConnectionRecord, 'templateId' | 'baseUrl'>): boolean {
   if (connection.templateId !== 'deepseek') return false;
@@ -241,9 +231,12 @@ export function isOfficialDeepSeekApiConnection(connection: Pick<ModelConnection
   }
 }
 
-/** 只有 DeepSeek 官方域名上的 V4 模型可以继承官方 Responses 兼容证据。 */
+/**
+ * 官方 DeepSeek 端点整体提供 Responses 兼容接口：这是端点的能力，不是逐个模型的能力。
+ * 因此只判定端点身份，不再按模型 ID 枚举白名单——官方上线新模型不需要改代码。
+ */
 export function isOfficialDeepSeekResponsesModel(connection: Pick<ModelConnectionRecord, 'templateId' | 'baseUrl'>, modelId: string): boolean {
-  return isOfficialDeepSeekApiConnection(connection) && officialDeepSeekResponsesModelIds.has(modelId.trim().toLowerCase());
+  return modelId.trim().length > 0 && isOfficialDeepSeekApiConnection(connection);
 }
 
 export function modelConnectionRoute(
@@ -251,6 +244,7 @@ export function modelConnectionRoute(
   modelId: string,
   configuredProtocol: ModelProtocolFamily = 'openai_completions',
 ): Pick<ConfiguredModelDefinition, 'runtimeAdapter' | 'protocolFamily'> {
+  // 官方 DeepSeek 端点走 Responses 兼容的 Codex App Server；其余端点按声明的协议族走 Pi。
   if (isOfficialDeepSeekResponsesModel(connection, modelId)) return { runtimeAdapter: 'codex_app_server', protocolFamily: 'openai_responses' };
   return {
     runtimeAdapter: 'pi_sdk',
@@ -274,7 +268,7 @@ export function listSelectableConnectionModels(connections: readonly ModelConnec
             : tools === 'unsupported'
               ? '模型明确不支持工具调用，只能保存在诊断目录中。'
               : agentKind === 'codex'
-                ? 'Zeus 已完成该 DeepSeek 官方 V4 模型的 Responses 兼容验收；新会话使用 Codex App Server。'
+                ? '官方 DeepSeek 端点提供 Responses 兼容接口；新会话使用 Codex App Server。'
                 : '模型已配置；真实外部能力仍以运行探针结果为准。';
       return {
         id: modelRef(connection.id, model.id),
@@ -309,6 +303,7 @@ export function createConfiguredModelDefinition(id: string, input: Partial<Confi
     {
       id: normalizedId,
       displayName: input.displayName ?? normalizedId,
+      servedModelId: input.servedModelId ?? null,
       enabled: input.enabled ?? true,
       supports1MContext: input.supports1MContext ?? false,
       contextWindow: input.contextWindow ?? 256_000,
@@ -340,14 +335,32 @@ export function createConfiguredModelDefinition(id: string, input: Partial<Confi
   );
 }
 
-export function mergeDiscoveredModels(existing: readonly ConfiguredModelDefinition[], modelIds: readonly string[], thinkingFormat: OpenAiThinkingFormat, templateId: ModelConnectionTemplateId = 'custom'): ConfiguredModelDefinition[] {
-  const byId = new Map(existing.map((model) => [model.id, model]));
-  for (const rawId of modelIds) {
-    const id = rawId.trim();
-    if (!id || byId.has(id)) continue;
-    byId.set(id, applyAutomaticCapabilityProfile(createConfiguredModelDefinition(id, {}, thinkingFormat), templateId));
-  }
-  return [...byId.values()].map((model) => applyAutomaticCapabilityProfile(model, templateId));
+/** 模型目录同步结果：候选池以接口返回为准，同时回传新增与移除的模型 ID 供界面和审计展示。 */
+export interface DiscoveredModelSyncResult {
+  models: ConfiguredModelDefinition[];
+  addedModelIds: string[];
+  removedModelIds: string[];
+}
+
+/**
+ * 以接口返回的模型 ID 同步候选池，不再只增不删。
+ *
+ * 已存在的模型保留原有启用状态与手动配置；新发现的模型只进入候选池、默认停用，
+ * 等待用户在分组下拉中显式勾选启用；接口不再返回的模型从候选池移除。
+ */
+export function syncDiscoveredModels(existing: readonly ConfiguredModelDefinition[], modelIds: readonly string[], thinkingFormat: OpenAiThinkingFormat, templateId: ModelConnectionTemplateId = 'custom'): DiscoveredModelSyncResult {
+  const previousById = new Map(existing.map((model) => [model.id, model]));
+  const normalizedIds = [...new Set(modelIds.map((rawId) => rawId.trim()).filter((id) => id.length > 0))].slice(0, 200);
+  const nextIds = new Set(normalizedIds);
+  const addedModelIds: string[] = [];
+  const models = normalizedIds.map((id) => {
+    const previous = previousById.get(id);
+    if (previous) return applyAutomaticCapabilityProfile(previous, templateId);
+    addedModelIds.push(id);
+    return applyAutomaticCapabilityProfile(createConfiguredModelDefinition(id, { enabled: false }, thinkingFormat), templateId);
+  });
+  const removedModelIds = existing.filter((model) => !nextIds.has(model.id)).map((model) => model.id);
+  return { models, addedModelIds, removedModelIds };
 }
 
 export function createTemplateConfiguredModelDefinition(id: string, templateId: ModelConnectionTemplateId): ConfiguredModelDefinition {
@@ -404,6 +417,10 @@ function normalizeConfiguredModel(value: ConfiguredModelDefinition, fallbackThin
   if (!isRecord(value)) throw new Error('模型配置必须是对象。');
   const id = normalizeSingleLine(value.id, '模型 ID', 200);
   const displayName = normalizeSingleLine(value.displayName || id, '模型名称', 200);
+  // 服务端回报的模型标识按原样保留；为空即为“未观测到”，不猜测。
+  const servedModelId = typeof value.servedModelId === 'string' ? value.servedModelId.trim().slice(0, 200) || null : null;
+  // 官方版本名由人工表决定，保存时重算，避免界面把过期值写回配置。
+  const officialVersion = readOfficialModelVersion(id);
   const supports1MContext = value.supports1MContext === true;
   const contextWindow = normalizePositiveInteger(value.contextWindow, '上下文容量', 1, 10_000_000);
   // 有效窗口是权威值：历史配置可能保留超过 256K 的 maxTokens，取消 1M 后不应让整条连接不可保存。
@@ -415,7 +432,7 @@ function normalizeConfiguredModel(value: ConfiguredModelDefinition, fallbackThin
   const protocolFamily: ModelProtocolFamily = value.protocolFamily === 'openai_responses' ? 'openai_responses' : value.protocolFamily === 'anthropic_messages' ? 'anthropic_messages' : 'openai_completions';
   const requestedAuthenticationScheme: ModelAuthenticationScheme = value.authenticationScheme === 'bearer' ? 'bearer' : value.authenticationScheme === 'x_api_key' ? 'x_api_key' : 'protocol_default';
   const authenticationScheme: ModelAuthenticationScheme = protocolFamily === 'anthropic_messages' || requestedAuthenticationScheme !== 'x_api_key' ? requestedAuthenticationScheme : 'protocol_default';
-  return { id, displayName, enabled: value.enabled !== false, supports1MContext, contextWindow, maxTokens, speedLabel, runtimeAdapter, protocolFamily, authenticationScheme, capability };
+  return { id, displayName, servedModelId, officialVersion, enabled: value.enabled !== false, supports1MContext, contextWindow, maxTokens, speedLabel, runtimeAdapter, protocolFamily, authenticationScheme, capability };
 }
 
 function applyModelRoute(model: ConfiguredModelDefinition, connection: Pick<ModelConnectionRecord, 'templateId' | 'baseUrl'>): ConfiguredModelDefinition {

@@ -1542,6 +1542,43 @@ async function verifyTaskPushPlacement() {
     items: [{ ...reply, id: inputTranscript.placement.entryId, providerItemId: 'provider-input', type: 'userMessage', text: '首条任务提示词', payload: { clientId: 'task-first' }, transcript: inputTranscript }, reply],
   });
   assert(cold.items[cold.itemOrder[0]!]!.transcript?.placement.order === 1024, '重新打开不能改变首条输入位置。');
+  /** 部分条目缺少位置时，混合比较器会形成比较环；缺位条目必须保留槽位，其他条目只在已有位置槽中重排。 */
+  const late = { ...reply, id: 'partial-late', providerItemId: 'partial-late', text: '较晚持久条目', transcript: transcript('partial-late', 30) };
+  const missingEnvelope = transcript('partial-missing', 20);
+  const missing = {
+    ...reply,
+    id: 'partial-missing',
+    providerItemId: 'partial-missing',
+    text: '待恢复位置条目',
+    transcript: { ...missingEnvelope, placement: { ...missingEnvelope.placement, order: null } },
+  };
+  const early = { ...reply, id: 'partial-early', providerItemId: 'partial-early', text: '较早持久条目', transcript: transcript('partial-early', 10) };
+  const partialSnapshot = { ...snapshot, items: [late, missing, early], messages: [], submissions: [], requests: [] };
+  const transcriptIds = (candidate: NativeSessionState): string[] => candidate.itemOrder.map((key) => candidate.items[key]?.transcript?.placement.entryId ?? key);
+  const expectedPartialOrder = ['partial-early', 'partial-missing', 'partial-late'];
+  const partialHydration = createHydratedSessionState(partialSnapshot);
+  assert(JSON.stringify(transcriptIds(partialHydration)) === JSON.stringify(expectedPartialOrder), '冷开快照必须以稳定槽位处理部分缺失的位置。');
+  const partialPageBase = createHydratedSessionState({ ...partialSnapshot, items: [late, missing] });
+  const partialPage = sessionReducer(partialPageBase, { type: 'snapshot_v2_page_merged', snapshot: { ...partialSnapshot, items: [early] } });
+  assert(JSON.stringify(transcriptIds(partialPage)) === JSON.stringify(expectedPartialOrder), '历史分页必须与冷开快照使用同一稳定槽位顺序。');
+  const unpositionedItems = [late, missing, early].map((item) => ({
+    ...item,
+    transcript: { ...item.transcript, placement: { ...item.transcript.placement, order: null } },
+  }));
+  let partialLive = createHydratedSessionState({ ...partialSnapshot, items: unpositionedItems });
+  partialLive = sessionReducer(partialLive, {
+    type: 'transcript_placements_hydrated',
+    actions: [],
+    batch: {
+      conversationId,
+      orderEpoch: 1,
+      revision: 64,
+      placements: [late.transcript.placement, early.transcript.placement],
+      removedEntryIds: [],
+      uncoveredEntryIds: [missing.transcript.placement.entryId],
+    },
+  });
+  assert(JSON.stringify(transcriptIds(partialLive)) === JSON.stringify(expectedPartialOrder), '实时位置回填必须与快照和分页使用同一稳定槽位顺序。');
   /** 模拟修复前缓存的真实缺陷：身份字段在实时入口丢失，但提交身份仍保留。 */
   const cached = structuredClone(cold);
   delete cached.items[cached.itemOrder[0]!]!.transcript;
@@ -1559,10 +1596,54 @@ async function verifyTaskPushPlacement() {
     /** 没有正式位置的后续事件必须进入恢复，不能再污染消息列表。 */
     recovered.emit(conversationEvent(1, 'conversation.item.started', { turnId: 'turn', itemId: 'missing-position', itemType: 'agentMessage', textContent: '不得投影' }));
     assert(!Object.values(recovered.controller.getState().items).some((item) => item.itemId === 'missing-position'), '缺少位置的实时消息不得进入列表。');
-    return { taskPromptFirst: true, queuePreserved: true, steeringPreserved: true, removalPreserved: true, coldOpenPreserved: true, recoveredInputReads: reads, missingLivePositionRejected: true };
   } finally {
     recovered.controller.dispose();
   }
+
+  /** 已有信封但 order 为 null 同样需要恢复；恢复期间本地草稿不能被服务端位置接管冻结。 */
+  const nullOrderCached = structuredClone(cold);
+  nullOrderCached.items[nullOrderCached.itemOrder[0]!]!.transcript!.placement.order = null;
+  const nullOrderRecovery = createHarness(undefined, 0, false, [], null, undefined, undefined, nullOrderCached);
+  let resolveNullOrder: ((batch: NativeConversationTranscriptPlacementBatch) => void) | null = null;
+  let nullOrderIds: string[] = [];
+  nullOrderRecovery.client.loadNativeConversationTranscriptPlacements = async (_project, _conversation, ids) => {
+    nullOrderIds = [...ids];
+    return new Promise<NativeConversationTranscriptPlacementBatch>((resolve) => {
+      resolveNullOrder = resolve;
+    });
+  };
+  try {
+    const starting = nullOrderRecovery.controller.start();
+    await waitUntil(() => resolveNullOrder !== null, 'null order placement recovery');
+    nullOrderRecovery.controller.setDraft('位置恢复期间仍可编辑');
+    assert(nullOrderRecovery.controller.getState().draft === '位置恢复期间仍可编辑', '位置恢复不能冻结本地草稿。');
+    resolveNullOrder?.({
+      conversationId,
+      orderEpoch: 1,
+      revision: 4_096,
+      placements: nullOrderIds.map((entryId, index) => (entryId === inputTranscript.placement.entryId ? inputTranscript.placement : transcript(entryId, 2_048 + index).placement)),
+      removedEntryIds: [],
+      uncoveredEntryIds: [],
+    });
+    await starting;
+    assert(nullOrderRecovery.controller.getState().draft === '位置恢复期间仍可编辑', '位置恢复完成后必须保留期间编辑的草稿。');
+  } finally {
+    nullOrderRecovery.controller.dispose();
+  }
+
+  return {
+    taskPromptFirst: true,
+    queuePreserved: true,
+    steeringPreserved: true,
+    removalPreserved: true,
+    coldOpenPreserved: true,
+    stablePartialHydration: true,
+    stablePartialPage: true,
+    stablePartialLivePlacement: true,
+    recoveredInputReads: reads,
+    missingLivePositionRejected: true,
+    nullOrderRecoveredWithoutFreezingDraft: true,
+  };
 }
 
 /** 本轮会话缺陷修复的真实 Controller 验证，不连接模型或正式用户数据。 */

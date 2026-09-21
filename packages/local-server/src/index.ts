@@ -112,7 +112,7 @@ import { type TelegramMessageSender, type TelegramPollingService, type TelegramU
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
 import { accessSync, appendFileSync, closeSync, existsSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { BrowserAutomationPort } from './browserAutomation.js';
 import { createCodexConfigImportService } from './codexConfigImportService.js';
@@ -1116,7 +1116,6 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     settings,
     secretStore,
     save: () => db.save(),
-    listProjectIds: () => projects.list().map((project) => project.id),
     now: () => now().toISOString(),
   });
   const contextDispatchAudit = createContextDispatchAuditPort({
@@ -1424,7 +1423,13 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   };
   const aiRuntimeManager = createAiRuntimeSessionManager({
     allowedRoot: projectRoot,
-    allowedRoots: () => projects.list().map((project) => project.localPath),
+    // 任务与会话工作树固定在项目同级目录下（与 resolveNativeConversationExecutionRoot 同一判定）。
+    // 只允许项目目录本身会让工作树里的全部命令被拒，会话一开就报“工作目录必须位于允许的项目目录内”。
+    allowedRoots: () =>
+      projects.list().flatMap((project) => {
+        const localPath = resolve(project.localPath);
+        return [localPath, join(dirname(localPath), '.zeus-worktrees')];
+      }),
     spawn: optionalNodePty.spawn,
     onSessionChange: persistRuntimeSession,
     onProcessIdentity: async ({ sessionId, token }) => {
@@ -2954,7 +2959,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     readTelegramToken: (...args: Parameters<ReturnType<typeof createLocalServerSupportOperations>['readTelegramToken']>) => supportOperations.readTelegramToken(...args),
     recordTaskEvent,
     redactSensitiveText,
-    resolveCodexModel: (project: ZeusProjectRecord) => conversationOperations.resolveCodexModel(project),
+    resolveCodexModel: () => conversationOperations.resolveCodexModel(),
     resolveResponsesRuntime,
     resolveTaskManagementStatusConfigForProject,
     runtimeSessions,

@@ -41,6 +41,10 @@ export interface ModelCapabilityEvidence {
 export interface ModelConnectionModel {
   id: string;
   displayName: string;
+  /** 能力探测时服务端回报的实际服务模型标识；未探测或未回报时为空。 */
+  servedModelId?: string | null;
+  /** 厂商官方文档登记的版本名（人工维护表）；未登记时为空。 */
+  officialVersion?: string | null;
   enabled: boolean;
   supports1MContext: boolean;
   contextWindow: number;
@@ -93,6 +97,23 @@ export interface SaveModelConnectionRequest {
   allowInsecureHttp?: boolean;
 }
 
+/** 单个模型的探测结论，字段与后端回执一致。 */
+export interface ModelCapabilityProbeItem {
+  modelId: string;
+  ok: boolean;
+  servedModelId: string | null;
+  capability: ModelConnectionModel['capability'];
+  message: string;
+}
+
+/** 一次能力探测的回执；未探测的模型单独列出，界面必须如实说明。 */
+export interface ModelCapabilityProbeSummary {
+  connection: ModelConnectionRecord;
+  results: ModelCapabilityProbeItem[];
+  skippedModelIds: string[];
+  checkedAt: string;
+}
+
 export interface ModelConnectionDiagnostic {
   /** 保留连接检查的底层原因，供中英文错误摘要与详情使用。 */
   cause?: UserFacingErrorCause;
@@ -125,12 +146,6 @@ export interface SelectablePiModel {
   runtimeAdapter: 'codex_app_server' | 'pi_sdk';
   protocolFamily: ModelProtocolFamily;
   authenticationScheme: ModelAuthenticationScheme;
-}
-
-export interface ProjectModelSelection {
-  projectId: string;
-  allowedModelRefs: string[];
-  defaultModelRef: string | null;
 }
 
 export interface SecurityAuditLogEntry {

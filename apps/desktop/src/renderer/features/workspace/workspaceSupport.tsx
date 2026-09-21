@@ -257,6 +257,7 @@ export type NativeConversationAppClient = SessionControllerClient &
     | 'deleteModelConnection'
     | 'clearModelConnectionApiKey'
     | 'refreshModelConnectionModels'
+    | 'probeModelConnectionModels'
     | 'diagnoseModelConnection'
     | 'loadZentaoInstances'
     | 'createZentaoInstance'
@@ -266,8 +267,6 @@ export type NativeConversationAppClient = SessionControllerClient &
     | 'revealZentaoInstancePassword'
     | 'verifyZentaoInstance'
     | 'loadSelectablePiModels'
-    | 'loadProjectModelSelection'
-    | 'saveProjectModelSelection'
     | 'loadProjectWorkspaceConfig'
     | 'saveProjectWorkspaceConfig'
     | 'loadTaskBoard'
@@ -1045,7 +1044,6 @@ export function mergeAppShellSettingsSaveResponse(input: { currentSettings: AppS
     // 漏斗单独排队保存；其他设置的较早响应不能回滚用户刚改的筛选。
     sidebarConversationFilters: currentSettings.sidebarConversationFilters,
     modelSetupStatus: currentSettings.modelSetupStatus,
-    newProjectDefaultModelRef: currentSettings.newProjectDefaultModelRef,
     taskTableColumns: currentSettings.taskTableColumns,
     taskTableColumnsByProject: currentSettings.taskTableColumnsByProject,
     taskTableEnumSortOrders: currentSettings.taskTableEnumSortOrders,

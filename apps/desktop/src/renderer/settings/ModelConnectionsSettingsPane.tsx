@@ -6,6 +6,8 @@ import { CaretDownIcon } from '@phosphor-icons/react/dist/csr/CaretDown';
 import type {
   DashboardClient,
   ModelAuthenticationScheme,
+  ModelCapabilityEvidence,
+  ModelCapabilityProbeSummary,
   ModelConnectionDiagnostic,
   ModelConnectionModel,
   ModelConnectionRecord,
@@ -18,6 +20,7 @@ import type {
 import { ZeusSelect } from '../ZeusSelect.js';
 import { Button } from '../ui/Button.js';
 import { Collapsible } from '../ui/Collapsible.js';
+import { presentModelOptions, type ModelOptionSource } from '../modelOptionPresentation.js';
 import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { SettingsPagination, settingsPage, settingsPageSize } from './SettingsPagination.js';
@@ -40,7 +43,15 @@ const templateDefaults: Record<ModelConnectionTemplateId, { name: string; baseUr
 /** 共享编辑器使用现有模型读写接口。 */
 type ModelConnectionClient = Pick<
   DashboardClient,
-  'loadSelectablePiModels' | 'loadModelConnections' | 'createModelConnection' | 'updateModelConnection' | 'deleteModelConnection' | 'clearModelConnectionApiKey' | 'refreshModelConnectionModels' | 'diagnoseModelConnection'
+  | 'loadSelectablePiModels'
+  | 'loadModelConnections'
+  | 'createModelConnection'
+  | 'updateModelConnection'
+  | 'deleteModelConnection'
+  | 'clearModelConnectionApiKey'
+  | 'refreshModelConnectionModels'
+  | 'probeModelConnectionModels'
+  | 'diagnoseModelConnection'
 >;
 
 /** 设置与首次引导共享供应商编辑器，完成回调只接受已落库且可选的模型。 */
@@ -80,7 +91,7 @@ export function ModelConnectionsSettingsPane(props: {
   const [requestedModelPage, setRequestedModelPage] = useState(1);
   /** 展开只属于当前编辑器，跨搜索和分页保留，不写入模型配置。 */
   const [expandedModelIds, setExpandedModelIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [status, setStatus] = useState<'idle' | 'loading' | 'saving' | 'refreshing' | 'deleting'>('loading');
+  const [status, setStatus] = useState<'idle' | 'loading' | 'saving' | 'refreshing' | 'probing' | 'deleting'>('loading');
   const [message, setMessage] = useState<string | null>(null);
   /** 保存反馈与模型诊断消息分开。 */
   const [saveState, setSaveState] = useState<SettingsSaveState>('idle');
@@ -133,12 +144,27 @@ export function ModelConnectionsSettingsPane(props: {
     setPendingInsecureHttpSave(null);
   }, [props.active]);
   const current = draft.id ? (connections.find((connection) => connection.id === draft.id) ?? null) : null;
+  /** 界面列表只展示已启用模型：没勾选的候选只留在大纲下拉里，避免几十个候选刷屏。 */
+  const enabledModels = draft.models.filter((model) => model.enabled);
   /** 本地筛选保留全部草稿，翻页不会遗失模型修改。 */
-  const filteredModels = draft.models.filter((model) => model.id.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase()));
+  const filteredModels = enabledModels.filter((model) => model.id.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase()));
   /** 实际页随模型删除夹紧。 */
   const modelPage = settingsPage(filteredModels.length, requestedModelPage);
   /** 全部操作以当前搜索结果为范围，包含尚未翻到的页面。 */
   const allModelsExpanded = filteredModels.length > 0 && filteredModels.every((model) => expandedModelIds.has(model.id));
+  /** 候选池里的模型全部进入分组下拉，勾选状态单独映射到模型的 enabled。 */
+  const candidateModelOptions: ModelOptionSource[] = draft.models.map((model) => ({
+    id: model.id,
+    model: model.id,
+    displayName: model.displayName,
+    sourceName: current?.name || draft.name,
+    available: true,
+    supports1MContext: model.supports1MContext,
+    speedLabel: model.speedLabel,
+  }));
+  const enablePresentation = presentModelOptions(candidateModelOptions, '', props.language);
+  const enabledModelIds = enabledModels.map((model) => model.id);
+  const enabledModelCount = enabledModelIds.length;
 
   /** 批量和单项展开共用同一状态，保留搜索范围之外的展开选择。 */
   function setModelsExpanded(ids: string[], expanded: boolean): void {
@@ -151,6 +177,12 @@ export function ModelConnectionsSettingsPane(props: {
       }
       return nextIds;
     });
+  }
+
+  /** 分组下拉勾选只翻转启用状态，协议、认证和容量仍由模型卡片维护。 */
+  function toggleModelEnabled(modelId: string): void {
+    const enabled = draft.models.some((model) => model.id === modelId && model.enabled);
+    changeDraft({ ...draft, models: draft.models.map((model) => (model.id === modelId ? { ...model, enabled: !enabled } : model)) });
   }
 
   function selectConnection(connection: ModelConnectionRecord): void {
@@ -206,7 +238,8 @@ export function ModelConnectionsSettingsPane(props: {
     setModelsExpanded([id], true);
     setNewModelId('');
     setModelQuery('');
-    setRequestedModelPage(Math.ceil((draft.models.length + 1) / settingsPageSize));
+    // 手工添加的模型默认启用，因此它出现在已启用列表末尾。
+    setRequestedModelPage(Math.ceil((enabledModelCount + 1) / settingsPageSize));
   }
 
   function updateModel(modelId: string, update: (model: ModelConnectionModel) => ModelConnectionModel): void {
@@ -298,7 +331,28 @@ export function ModelConnectionsSettingsPane(props: {
       const result = await props.client.refreshModelConnectionModels(draft.id);
       await reloadConnections(draft.id);
       if (props.onComplete) await refreshDefaultModels(draft.id);
-      setMessage(zh ? `发现 ${result.discoveredModelIds.length} 个模型，新增 ${result.addedModelIds.length} 个。` : `Discovered ${result.discoveredModelIds.length} models and added ${result.addedModelIds.length}.`);
+      setMessage(
+        zh
+          ? `候选池已同步：共 ${result.discoveredModelIds.length} 个模型，新增 ${result.addedModelIds.length} 个，移除 ${result.removedModelIds.length} 个。新模型默认未启用，请在“启用模型”中勾选。`
+          : `Candidate pool synced: ${result.discoveredModelIds.length} discovered, ${result.addedModelIds.length} added, ${result.removedModelIds.length} removed. New models stay disabled until selected.`,
+      );
+    } catch (error) {
+      setMessage(formatVisibleApplicationError(error, zh ? 'zh-CN' : 'en'));
+    } finally {
+      setStatus('idle');
+    }
+  }
+
+  /** 对已启用模型真实探测一次；探测结果由后端落库，界面只负责刷新与回执。 */
+  async function probeModels(): Promise<void> {
+    if (!props.client || !draft.id || busy) return;
+    setStatus('probing');
+    setMessage(null);
+    try {
+      const summary = await props.client.probeModelConnectionModels(draft.id);
+      await reloadConnections(draft.id);
+      if (props.onComplete) await refreshDefaultModels(draft.id);
+      setMessage(describeProbeResult(summary, zh));
     } catch (error) {
       setMessage(formatVisibleApplicationError(error, zh ? 'zh-CN' : 'en'));
     } finally {
@@ -547,12 +601,12 @@ export function ModelConnectionsSettingsPane(props: {
             <header>
               <span>
                 <strong>
-                  {zh ? '可用模型' : 'Available models'} <small>{draft.models.length}</small>
+                  {zh ? '已启用模型' : 'Enabled models'} <small>{enabledModelCount}</small>
                 </strong>
                 <small>
                   {zh
-                    ? '为每个模型选择服务支持的请求格式和登录方式。功能是否可用以检测结果为准。'
-                    : 'Choose the request format and authentication supported by the service for each model. Feature availability is based on checks of that connection.'}
+                    ? `获取模型只更新候选池（共 ${draft.models.length} 个）；下面只配置已勾选的模型，未勾选的候选不显示。`
+                    : `Fetching only refreshes the candidate pool (${draft.models.length} in total). Only checked models are configured below; unchecked candidates stay hidden.`}
                 </small>
               </span>
               <Button
@@ -571,6 +625,23 @@ export function ModelConnectionsSettingsPane(props: {
                 {allModelsExpanded ? (zh ? '全部收起' : 'Collapse all') : zh ? '全部展开' : 'Expand all'}
               </Button>
             </header>
+            {draft.models.length > 0 ? (
+              <label className="model-enable-picker">
+                <span>{zh ? '启用模型' : 'Enable models'}</span>
+                <ZeusSelect
+                  size="regular"
+                  ariaLabel={zh ? '勾选要启用的模型' : 'Choose models to enable'}
+                  value={enabledModelIds[0] ?? ''}
+                  selectedValues={enabledModelIds}
+                  triggerLabel={zh ? `已启用 ${enabledModelCount} 个模型` : `${enabledModelCount} enabled`}
+                  options={enablePresentation.options}
+                  searchable
+                  searchPlaceholder={zh ? '搜索候选模型' : 'Search candidate models'}
+                  onChange={toggleModelEnabled}
+                />
+                <small>{zh ? '下拉中勾选即启用，取消勾选即停用；候选模型不会自动启用。' : 'Check to enable and uncheck to disable; candidates are never enabled automatically.'}</small>
+              </label>
+            ) : null}
             <div className="model-definition-toolbar">
               {draft.models.length > 0 ? (
                 <input
@@ -594,7 +665,12 @@ export function ModelConnectionsSettingsPane(props: {
                 </span>
               ) : null}
             </div>
-            {draft.models.length > 0 && filteredModels.length === 0 ? <p role="status">{zh ? '没有匹配的模型。' : 'No matching models.'}</p> : null}
+            {enabledModelCount > 0 && filteredModels.length === 0 ? <p role="status">{zh ? '没有匹配的模型。' : 'No matching models.'}</p> : null}
+            {enabledModelCount === 0 && draft.models.length > 0 ? (
+              <p role="status">
+                {zh ? '还没有启用模型。在上方“启用模型”下拉里勾选后，这里才会出现该模型的请求格式与登录方式。' : 'No models enabled yet. Check a model in the dropdown above to configure its request format and authentication here.'}
+              </p>
+            ) : null}
             {draft.models.length === 0 ? (
               <p>
                 {draft.templateId === 'custom'
@@ -674,6 +750,16 @@ export function ModelConnectionsSettingsPane(props: {
             <Button variant="secondary" size="compact" onClick={() => void diagnose()} disabled={busy || !draft.id}>
               {zh ? '服务诊断' : 'Diagnose service'}
             </Button>
+            <Button
+              variant="secondary"
+              size="compact"
+              title={zh ? '对已启用模型真实发送一次请求，按观测结果更新工具、图片、流式、用量和推理档位' : 'Send one real request per enabled model and update tools, image, streaming, usage, and reasoning evidence'}
+              onClick={() => void probeModels()}
+              disabled={busy || !draft.id || !current?.apiKeyConfigured || enabledModelCount === 0}
+              busy={status === 'probing'}
+            >
+              {zh ? '能力探测' : 'Probe capabilities'}
+            </Button>
             {props.onComplete ? (
               <Button
                 variant="primary"
@@ -726,6 +812,92 @@ export function ModelConnectionsSettingsPane(props: {
   );
 }
 
+/** 探测回执只陈述本次观测：未探测的模型必须写明，不能让人以为全都探测过了。 */
+function describeProbeResult(summary: ModelCapabilityProbeSummary, zh: boolean): string {
+  const succeeded = summary.results.filter((item) => item.ok).length;
+  const failed = summary.results.length - succeeded;
+  const skipped = summary.skippedModelIds.length > 0 ? (zh ? ` 本次未探测（单次上限 12 个）：${summary.skippedModelIds.join('、')}。` : ` Not probed (limit 12 per run): ${summary.skippedModelIds.join(', ')}.`) : '';
+  if (summary.results.length === 0) return zh ? '没有已启用模型，未发起探测。请先在上方勾选要启用的模型。' : 'No enabled models, nothing was probed. Check the models you want to use first.';
+  return (
+    (zh
+      ? `能力探测完成：${succeeded} 个模型成功完成真实请求，${failed} 个失败；逐模型结论见各卡片展开后的“能力探测”。`
+      : `Capability probe finished: ${succeeded} models answered a real request, ${failed} failed. Per-model findings are in each card.`) + skipped
+  );
+}
+
+/** 能力证据只展示真实观测过的内容；没探测过的模型不显示空话。 */
+function ModelCapabilityFacts(props: { language: 'zh-CN' | 'en-US'; model: ModelConnectionModel }) {
+  const zh = props.language === 'zh-CN';
+  const capability = props.model.capability;
+  /** 四项独立探测结论，供合并展示与逐项展示共用。 */
+  const rows: Array<{ label: string; evidence: ModelCapabilityEvidence }> = [
+    { label: zh ? '工具调用' : 'Tool calling', evidence: capability.tools },
+    { label: zh ? '图片输入' : 'Image input', evidence: capability.imageInput },
+    { label: zh ? '流式输出' : 'Streaming', evidence: capability.streaming },
+    { label: zh ? '用量字段' : 'Usage fields', evidence: capability.usage },
+  ];
+  const probed = rows.some((row) => row.evidence.source === 'probe') || capability.reasoning.source === 'probe';
+  /** 版本优先级：真机观测 > 人工官方表 > 目录名/模型 ID；表会过期，所以真实观测永远赢。 */
+  const observedVersion = props.model.servedModelId && props.model.servedModelId !== props.model.id ? props.model.servedModelId : null;
+  const versionValue = observedVersion ?? props.model.officialVersion ?? props.model.displayName;
+  const versionSource = observedVersion
+    ? zh
+      ? '服务端实际返回'
+      : 'reported by the server'
+    : props.model.officialVersion
+      ? zh
+        ? '官方文档登记，未真机验证'
+        : 'from the official doc table, not machine-verified'
+      : zh
+        ? '上游目录名或模型 ID'
+        : 'catalog name or model id';
+  if (!probed && !props.model.officialVersion && !observedVersion) return null;
+  /** 探测整体失败时多项会共享同一原因，合并成一行，避免同一句话重复多遍；图片声明等独立证据仍单独列出。 */
+  const firstProbeRow = rows.find((row) => row.evidence.source === 'probe');
+  const probeRows = rows.filter((row) => row.evidence.source === 'probe');
+  const sharedReason = firstProbeRow && probeRows.length > 1 && probeRows.every((row) => row.evidence.reason === firstProbeRow.evidence.reason) ? firstProbeRow.evidence.reason : null;
+  return (
+    <dl className="model-route-facts">
+      <div>
+        <dt>{zh ? '模型版本' : 'Model version'}</dt>
+        <dd>
+          {versionValue}
+          <small>{zh ? `（${versionSource}）` : ` (${versionSource})`}</small>
+        </dd>
+      </div>
+      {sharedReason ? (
+        <div>
+          <dt>{zh ? '能力探测' : 'Capability probe'}</dt>
+          <dd>{sharedReason}</dd>
+        </div>
+      ) : null}
+      {rows
+        .filter((row) => !sharedReason || row.evidence.source !== 'probe')
+        .map((row) => (
+          <div key={row.label}>
+            <dt>{row.label}</dt>
+            <dd>{capabilityEvidenceLabel(row.evidence, zh)}</dd>
+          </div>
+        ))}
+      <div>
+        <dt>{zh ? '推理档位' : 'Reasoning levels'}</dt>
+        <dd>
+          {capability.reasoning.state === 'supported' ? capability.reasoning.levels.join(' / ') : zh ? '未确认' : 'Unconfirmed'}
+          {capability.reasoning.state === 'supported' && capability.reasoning.source === 'catalog' ? (zh ? '（来自上游目录，未逐档真机验证）' : ' (from upstream catalog, not verified level by level)') : ''}
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
+/** 目录声明不是真机结论，措辞必须和探测结果区分开。 */
+function capabilityEvidenceLabel(evidence: ModelCapabilityEvidence, zh: boolean): string {
+  const fromProbe = evidence.source === 'probe';
+  if (evidence.state === 'supported') return fromProbe ? (zh ? '已确认支持' : 'Confirmed supported') : zh ? '目录声明支持' : 'Declared by catalog';
+  if (evidence.state === 'unsupported') return fromProbe ? (zh ? '已确认不支持' : 'Confirmed unsupported') : zh ? '目录声明不支持' : 'Not in catalog support';
+  return fromProbe ? evidence.reason : zh ? '未验证' : 'Unverified';
+}
+
 function requiresInsecureHttpConfirmation(baseUrl: string, existingBaseUrl?: string): boolean {
   try {
     const normalized = new URL(baseUrl.trim()).toString().replace(/\/+$/u, '');
@@ -767,11 +939,13 @@ function ModelDefinitionEditor(props: { language: 'zh-CN' | 'en-US'; model: Mode
   return (
     <article className="model-definition-card" data-enabled={model.enabled ? 'true' : 'false'}>
       <header className="model-definition-header">
-        <input type="checkbox" aria-label={zh ? `启用模型 ${model.id}` : `Enable model ${model.id}`} checked={model.enabled} onChange={(event) => props.onChange({ ...model, enabled: event.currentTarget.checked })} />
+        <span className="model-definition-enabled-state" data-enabled={model.enabled ? 'true' : 'false'}>
+          {model.enabled ? (zh ? '已启用' : 'Enabled') : zh ? '候选' : 'Candidate'}
+        </span>
         <button type="button" className="model-definition-identity" onClick={props.onToggle} aria-expanded={props.expanded} aria-controls={detailsId}>
           <span>
-            <strong title={model.id}>{model.id}</strong>
-            <small>{modelRouteLabel(model, zh)}</small>
+            <strong title={model.displayName || model.id}>{model.displayName || model.id}</strong>
+            <small>{model.displayName && model.displayName !== model.id ? `${model.id} · ${modelRouteLabel(model, zh)}` : modelRouteLabel(model, zh)}</small>
           </span>
           <CaretDownIcon className="model-definition-chevron" aria-hidden="true" />
         </button>
@@ -847,6 +1021,7 @@ function ModelDefinitionEditor(props: { language: 'zh-CN' | 'en-US'; model: Mode
               </label>
             </div>
           )}
+          <ModelCapabilityFacts language={props.language} model={model} />
         </div>
       </Collapsible>
     </article>

@@ -2001,7 +2001,6 @@ export function formatRuntimeTerminalEnv(env: RuntimeSettings['terminalEnv']): s
 }
 
 export interface ProjectConfigFormState {
-  defaultModel: string;
   defaultWorkMode: ProjectConfig['defaultWorkMode'];
   languagePrimary: string;
   languageAdditional: string;
@@ -2019,7 +2018,6 @@ export function normalizeProjectConfig(config?: Partial<ProjectConfig>, projectI
   return {
     projectId: resolvedProjectId,
     serviceTierPreferences: config?.serviceTierPreferences ?? [],
-    defaultModel: config?.defaultModel ?? null,
     defaultWorkMode: config?.defaultWorkMode ?? 'plan',
     language: {
       primary: config?.language?.primary ?? 'typescript',
@@ -2049,7 +2047,6 @@ export function normalizeProjectConfig(config?: Partial<ProjectConfig>, projectI
 export function toProjectConfigForm(config?: ProjectConfig): ProjectConfigFormState {
   const normalized = normalizeProjectConfig(config, config?.projectId) ?? {
     projectId: '',
-    defaultModel: null,
     defaultWorkMode: 'plan',
     language: { primary: 'typescript', additional: [] },
     dependencies: { packageManagers: [], manifestPaths: [] },
@@ -2059,7 +2056,6 @@ export function toProjectConfigForm(config?: ProjectConfig): ProjectConfigFormSt
     security: { allowShell: false, allowGitWrite: false },
   };
   return {
-    defaultModel: normalized.defaultModel ?? '',
     defaultWorkMode: normalized.defaultWorkMode,
     languagePrimary: normalized.language.primary,
     languageAdditional: normalized.language.additional.join(', '),
