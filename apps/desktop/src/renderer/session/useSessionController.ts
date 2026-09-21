@@ -5,7 +5,7 @@ import { userFacingErrorCause } from '@zeus/shared';
 import type { ConversationTranscriptEnvelope, ConversationTranscriptPlacementBatch, ConversationNavigationSnapshot } from '@zeus/shared';
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { serializeBrowserComments, type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
-import { createInitialSessionState, sessionReducer, sessionTranscriptEntryId } from './sessionReducer.js';
+import { createInitialSessionState, durableUserMessageIdentity, sessionReducer, sessionTranscriptEntryId } from './sessionReducer.js';
 import {
   type CodexConversationCapabilities,
   type ConversationResourcePreview,
@@ -53,6 +53,10 @@ import { adaptConversationSnapshotV2, mergeConversationHistoryV2, mergeConversat
 import { markConversationNavigationRenderReady } from '../performanceTraceContext.js';
 
 export const reconnectBackoffMs = [250, 500, 1_000, 2_000, 5_000] as const;
+/** 发送结果待核对的静默重试：指数退避、最多五次，全程只读权威状态，不重放消息。 */
+export const pendingSendReconcileAttempts = 5 as const;
+export const pendingSendReconcileBaseDelayMs = 1_000 as const;
+export const pendingSendReconcileMaxDelayMs = 16_000 as const;
 // 同一个会话项的增量按一帧窗口合并，兼顾 Markdown 成本与首字可见延迟。
 const RENDER_DELTA_COALESCE_MS = 16;
 const CONVERSATION_SCHEMA_GENERATION = '2026-08-16-unified-conversation-segments' as const;
@@ -531,10 +535,24 @@ export function createSessionController(options: CreateSessionControllerOptions)
         snapshot: resumeCachedConversationSnapshot(cachedStateCandidate.snapshot),
       }
     : undefined;
+  const cachedItems = initialCachedState?.items ?? {};
+  /**
+   * 缓存里已经有同一条消息的持久条目时，本地乐观副本必须直接退休。
+   * 否则同一句话会被画成两个气泡，而没有位置的那个会被排队规则钉在记录末尾。
+   */
+  const durableCachedIdentities = new Set(
+    Object.values(cachedItems)
+      .filter((item) => !item.optimistic)
+      .map((item) => durableUserMessageIdentity(item))
+      .filter((identity): identity is string => identity !== null),
+  );
   const initialOptimisticItems = (options.initialOptimisticState?.itemOrder ?? [])
     .map((key) => options.initialOptimisticState?.items[key])
-    .filter((item): item is NonNullable<typeof item> => Boolean(item?.optimistic && item.conversationId === options.conversationId));
-  const cachedItems = initialCachedState?.items ?? {};
+    .filter((item): item is NonNullable<typeof item> => Boolean(item?.optimistic && item.conversationId === options.conversationId))
+    .filter((item) => {
+      const identity = durableUserMessageIdentity(item);
+      return identity === null || !durableCachedIdentities.has(identity);
+    });
   const optimisticItems = Object.fromEntries(initialOptimisticItems.map((item) => [item.key, { ...item }]));
   const itemOrder = [...new Set([...(initialCachedState?.itemOrder ?? []), ...initialOptimisticItems.map((item) => item.key)])];
   let state: NativeSessionState = {
@@ -557,11 +575,14 @@ export function createSessionController(options: CreateSessionControllerOptions)
     busyOperation: null,
     error: initialCachedState?.error?.recoveryRequired ? null : (initialCachedState?.error ?? null),
   };
-  // 退出时仍在发送中的消息按未知结果展示，重启不会触发额外发送。
-  if (pendingSend && (!pendingSend.deliveryState || pendingSend.deliveryState === 'pending')) {
-    pendingSend = { ...pendingSend, deliveryState: 'uncertain', deliveryError: { code: 'ZEUS_NATIVE_ACCEPTANCE_HYDRATION_PENDING', message: 'Message status needs confirmation.', recoveryRequired: true, retryable: true } };
+  // 退出时仍在发送中的消息只标记为结果待核对；重启不会触发额外发送，也不向用户报错。
+  // 旧账本把同一状态写成了错误，升级后一并静默处理，不把已经不该出现的文案再抛给用户。
+  if (pendingSend && (!pendingSend.deliveryState || pendingSend.deliveryState === 'pending' || pendingSend.deliveryError?.code === 'ZEUS_NATIVE_ACCEPTANCE_HYDRATION_PENDING')) {
+    const restored: PendingSendEnvelope = { ...pendingSend, deliveryState: 'uncertain' };
+    delete restored.deliveryError;
+    pendingSend = restored;
   }
-  if ((pendingSend?.deliveryState === 'failed' || pendingSend?.deliveryState === 'uncertain') && pendingSend.deliveryError) {
+  if (pendingSend?.deliveryState === 'failed' || pendingSend?.deliveryState === 'uncertain') {
     const previousConversationState = state.conversationState;
     const startedAt = pendingSend.startedAt ?? new Date().toISOString();
     const deliveryError = pendingSend.deliveryError;
@@ -582,12 +603,19 @@ export function createSessionController(options: CreateSessionControllerOptions)
       startedAt,
       preserveComposer: true,
     });
-    state = sessionReducer(state, {
-      type: pendingSend.deliveryState === 'failed' ? 'send_failed' : 'send_uncertain',
-      clientUserMessageId: pendingSend.clientUserMessageId,
-      previousConversationState,
-      error: deliveryError,
-    });
+    // 只有带原因的失败才按失败展示；结果待核对即使没有错误也保留原消息与重试入口。
+    state = deliveryError
+      ? sessionReducer(state, {
+          type: pendingSend.deliveryState === 'failed' ? 'send_failed' : 'send_uncertain',
+          clientUserMessageId: pendingSend.clientUserMessageId,
+          previousConversationState,
+          error: deliveryError,
+        })
+      : sessionReducer(state, {
+          type: 'send_uncertain',
+          clientUserMessageId: pendingSend.clientUserMessageId,
+          previousConversationState,
+        });
   }
   if (deferredSends.length > 0) {
     const currentDraft = state.draft;
@@ -637,6 +665,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let requestRefreshAgain = false;
   let requestRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let requestRefreshRetryAttempt = 0;
+  /** 发送结果待核对的静默重试任务；同一时刻只允许一条。 */
+  let pendingSendReconcileRun: Promise<void> | null = null;
+  let pendingSendReconcileEnvelope: PendingSendEnvelope | null = null;
   const requestsAwaitingDetails = new Set<string>();
   const resolvedRequestIds = new Set<string>();
   let targetedHydrationBuffer: BufferedRealtimeEvents | null = null;
@@ -1507,6 +1538,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
       finalizeDurableEnvelope(envelope);
       return;
     }
+    if (envelope.deliveryState === 'uncertain') {
+      schedulePendingSendReconcile(envelope);
+      return;
+    }
     if (envelope.deliveryState !== 'accepted' || !envelope.acceptance) return;
     if (await reconcileSubmissionReceipt(envelope)) return;
     if (!hasNativeOptimisticItem(state, envelope.clientUserMessageId)) projectAcceptedEnvelope(envelope);
@@ -1533,51 +1568,36 @@ export function createSessionController(options: CreateSessionControllerOptions)
     return false;
   }
 
-  async function reconcileAcceptedSend(): Promise<void> {
+  /** 已接收消息只核对回执与权威快照；销账成功返回 true，仍未收敛返回 false 交给静默重试。 */
+  async function reconcileAcceptedSend(): Promise<boolean> {
     const envelope = pendingSend;
-    if (!envelope || envelope.deliveryState !== 'accepted' || !envelope.acceptance || disposed) return;
+    if (!envelope || envelope.deliveryState !== 'accepted' || !envelope.acceptance || disposed) return true;
     const buffered = createRealtimeEventBuffer('targeted-hydration');
     targetedHydrationBuffer = buffered;
     try {
-      if (await reconcileSubmissionReceipt(envelope)) return;
+      if (await reconcileSubmissionReceipt(envelope)) return true;
       const snapshot = await withSessionTimeout(loadConversationForHydration(), conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
-      if (disposed || pendingSend !== envelope) return;
+      if (disposed || pendingSend !== envelope) return true;
       if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) throw new Error('会话快照早于已接收的实时事件，等待下一次权威核对。');
       await applyAuthoritativeSnapshot(snapshot);
       if (envelopeWasTerminalWithoutProviderFact(snapshot, envelope)) {
         finalizeTerminalEnvelope(envelope);
-        return;
+        return true;
       }
       if (acceptedEnvelopeIsDurable(snapshot, envelope)) {
         finalizeDurableEnvelope(envelope);
-      } else {
-        dispatch({
-          type: 'send_reconciliation_failed',
-          error: {
-            message: 'The accepted message is waiting for a durable conversation snapshot.',
-            code: 'ZEUS_NATIVE_ACCEPTANCE_HYDRATION_PENDING',
-            recoveryRequired: false,
-            retryable: true,
-          },
-        });
+        return true;
       }
       persistDraft();
-    } catch (error) {
+      // 权威快照还没包含这条已接收消息；后台静默退避核对，不把内部状态当成用户可见错误。
+      schedulePendingSendReconcile(envelope);
+      return false;
+    } catch {
       if (!disposed && pendingSend === envelope) {
-        dispatch({
-          type: 'send_reconciliation_failed',
-          error: {
-            ...toSessionError(error, true),
-            // 保留读取失败原因；外层仍表示发送结果等待核对，不因此允许重新发送。
-            cause: userFacingErrorCause(error),
-            message: 'The message was accepted, but its durable conversation snapshot is temporarily unavailable.',
-            code: 'ZEUS_NATIVE_ACCEPTANCE_HYDRATION_PENDING',
-            recoveryRequired: false,
-            retryable: true,
-          },
-        });
         persistDraft();
+        schedulePendingSendReconcile(envelope);
       }
+      return false;
     } finally {
       if (targetedHydrationBuffer === buffered) targetedHydrationBuffer = null;
       if (!buffered.overflowed) {
@@ -1587,6 +1607,53 @@ export function createSessionController(options: CreateSessionControllerOptions)
       buffered.bytes = 0;
       flushRenderDeltas();
     }
+  }
+
+  /**
+   * 发送结果待核对的静默重试入口：指数退避、最多五次，全程只读取权威状态，绝不重放消息。
+   * 同一时刻只跑一条核对任务，界面上不出现任何错误提示。
+   */
+  function schedulePendingSendReconcile(envelope: PendingSendEnvelope): void {
+    if (disposed || envelope.deliveryState === 'failed') return;
+    if (pendingSendReconcileRun) {
+      // 同一信封只保留一条任务；换信封时等当前核对结束再补上，避免并发读写同一会话。
+      if (pendingSendReconcileEnvelope === envelope) return;
+      void pendingSendReconcileRun.finally(() => schedulePendingSendReconcile(envelope));
+      return;
+    }
+    pendingSendReconcileEnvelope = envelope;
+    pendingSendReconcileRun = (async () => {
+      for (let attempt = 0; attempt < pendingSendReconcileAttempts; attempt += 1) {
+        await waitForPendingSendReconcile(attempt);
+        if (disposed || pendingSend !== envelope) return;
+        // 用户正在重试或提交时让位，避免两条核对同时读写同一会话。
+        if (activeOperation) continue;
+        if (await reconcilePendingSendOnce(envelope)) return;
+      }
+      // 静默重试用尽仍不打扰用户，只把结论写进本地运行日志，界面上保留原消息与重试入口。
+      window.zeus?.reportRendererRuntimeError?.(`待核对消息连续 ${pendingSendReconcileAttempts} 次未取得权威状态，已保留原消息与手动重试入口。`);
+    })().finally(() => {
+      pendingSendReconcileRun = null;
+      pendingSendReconcileEnvelope = null;
+    });
+  }
+
+  /** 第 n 次核对前的等待时间：1、2、4、8、16 秒。 */
+  function waitForPendingSendReconcile(attempt: number): Promise<void> {
+    const delay = Math.min(pendingSendReconcileMaxDelayMs, pendingSendReconcileBaseDelayMs * 2 ** attempt);
+    return new Promise((resolve) => {
+      setTimeout(resolve, delay);
+    });
+  }
+
+  /** 单次只读核对：拿到权威结论返回 true；仍未收敛返回 false，交给下一次退避重试。 */
+  async function reconcilePendingSendOnce(envelope: PendingSendEnvelope): Promise<boolean> {
+    if (envelope.deliveryState === 'accepted') return reconcileAcceptedSend();
+    const reconciliation = await reconcileFailedSend(envelope);
+    if (reconciliation.kind === 'unknown') return false;
+    if (reconciliation.kind === 'durable') await reconcileAcceptedSend();
+    // terminal 与 absent 都是权威结论：前者已销账，后者证明未写入，是否重发由用户决定。
+    return true;
   }
 
   function acceptanceFromDurableSnapshot(snapshot: NativeConversationSnapshot, envelope: PendingSendEnvelope): NativeOperationAcceptance {
@@ -2313,6 +2380,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
           );
           if (reconciliation.kind === 'absent') restoreFailedEnvelopeComposer(envelope);
           persistDraft();
+          // 结果不确定的提交继续在后台静默核对，能自动销账就不必等用户点重试。
+          if (reconciliation.kind === 'unknown' && pendingSend) schedulePendingSendReconcile(pendingSend);
           throw error;
         }
       },
@@ -2322,7 +2391,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           void reconcileAcceptedSend();
           return;
         }
-        return reconcileAcceptedSend();
+        return reconcileAcceptedSend().then(() => undefined);
       },
       false,
     );

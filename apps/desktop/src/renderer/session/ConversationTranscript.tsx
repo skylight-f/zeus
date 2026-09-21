@@ -29,7 +29,7 @@ import { useThreadScrollController } from './useThreadScrollController.js';
 import { TurnChangeCard } from './TurnChanges.js';
 import { latestReasoningSummaryText, reasoningSummaryStatus, SessionReasoningSummary, SessionSweepText } from './SessionReasoningSummary.js';
 import { AnsweredRequestHistory, isAnsweredUserInputRequest, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
-import { useNewItemMotionIds } from '../ui/useNewItemMotion.js';
+import { newItemMotionDurationMs, useNewItemMotionIds } from '../ui/useNewItemMotion.js';
 import { captureTranscriptViewportAnchor, compensateTranscriptViewportAnchor, type TranscriptViewportAnchor, useTranscriptViewportVirtualizer } from './transcriptViewportVirtualizer.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { isImageResource } from './ConversationResources.js';
@@ -414,7 +414,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const historyHydrated = props.transcriptHydrated ?? props.state.snapshot !== null;
   const enteringItemIds = useNewItemMotionIds(
     items.map((item) => item.key),
-    220,
+    newItemMotionDurationMs,
     historyHydrated,
     props.state.transcriptLiveItemKeys ?? [],
   );
