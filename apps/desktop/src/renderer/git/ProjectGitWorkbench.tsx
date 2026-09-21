@@ -355,13 +355,10 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     } catch (reason) {
       const switchingBranch = action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch';
       const message = errorMessage(switchingBranch ? gitSwitchFailureCause(reason) : reason, zh, {
-        title: label,
-        ...(switchingBranch
-          ? {
-              showDetails: true,
-              detailTitle: zh ? 'Git 日志' : 'Git log',
-            }
-          : {}),
+        title: gitOperationErrorTitle(action, label, zh),
+        // Git 的 stderr 才是用户处理合并、变基和远端拒绝的依据；失败时直接展开，避免把原因藏在二级入口中。
+        showDetails: true,
+        detailTitle: zh ? 'Git 日志' : 'Git log',
         ...(switchingBranch && errorHasCode(reason, 'ZEUS_GIT_CHECKOUT_BLOCKED')
           ? {
               action: {
@@ -2604,6 +2601,41 @@ function displayStashSubject(subject: string, zh: boolean): string {
 
 function errorMessage(error: unknown, zh: boolean, options: { title?: string; showDetails?: boolean; detailTitle?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {}): string {
   return reportApplicationError(error, { language: zh ? 'zh-CN' : 'en', ...options });
+}
+
+/** Git 写操作失败时标题说明动作本身，合并失败与普通应用错误区分开。 */
+function gitOperationErrorTitle(action: ProjectGitAction, fallback: string, zh: boolean): string {
+  const operationLabels: Partial<Record<ProjectGitAction['type'], string>> = zh
+    ? {
+        merge: '合并',
+        rebase: '变基',
+        pull: '拉取',
+        push: '推送',
+        commit: '提交',
+        stash: '贮藏',
+        apply_stash: '应用贮藏',
+        fetch: '获取远端',
+        checkout: '切换分支',
+        checkout_revision: '切换到提交',
+        create_branch: '新建分支',
+        update: '更新项目',
+      }
+    : {
+        merge: 'Merge',
+        rebase: 'Rebase',
+        pull: 'Pull',
+        push: 'Push',
+        commit: 'Commit',
+        stash: 'Stash',
+        apply_stash: 'Apply stash',
+        fetch: 'Fetch',
+        checkout: 'Checkout',
+        checkout_revision: 'Checkout revision',
+        create_branch: 'Create branch',
+        update: 'Update project',
+      };
+  const operation = operationLabels[action.type];
+  return operation ? (zh ? `${operation}时发生错误` : `${operation} failed`) : fallback;
 }
 
 function errorHasCode(error: unknown, expected: string): boolean {

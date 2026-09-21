@@ -1842,6 +1842,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         }
         return piNativeCoordinator.steerMessage({
           attachments,
+          allowedAttachmentRoots: trustedConversationAttachmentRoots,
           skills: resolvedSkills,
           browserComments,
           browserCommentContent,
@@ -2493,6 +2494,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
             },
             ...(effectiveEffort ? { thinkingLevel: effectiveEffort } : {}),
             attachments,
+            allowedAttachmentRoots: trustedConversationAttachmentRoots,
             permissionMode,
             workMode: collaborationMode,
             idempotencyKey,
@@ -2776,6 +2778,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
     if (plan.pluginReferences) {
       zeusConversationPluginRuntime?.bindExplicitReferences({ conversationId: plan.conversationId, projectId: plan.projectId, references: plan.pluginReferences });
     }
+    const allowedAttachmentRoots = [...new Set([...(plan.allowedAttachmentRoots ?? []), ...trustedConversationAttachmentRoots])];
     if (plan.agentKind === 'pi') {
       const operation = await piNativeCoordinator.startConversation({
         conversationId: plan.conversationId,
@@ -2792,7 +2795,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         model: plan.model,
         ...(plan.effort ? { thinkingLevel: plan.effort } : {}),
         ...(plan.attachments ? { attachments: plan.attachments } : {}),
-        ...(plan.allowedAttachmentRoots ? { allowedAttachmentRoots: plan.allowedAttachmentRoots } : {}),
+        ...(allowedAttachmentRoots.length ? { allowedAttachmentRoots } : {}),
         ...(plan.taskPushLayout ? { taskPushLayout: plan.taskPushLayout } : {}),
         ...((plan.skills ?? (plan.skill ? [plan.skill] : undefined)) ? { skills: plan.skills ?? [plan.skill!] } : {}),
         ...(plan.computerUseRequested ? { computerUseRequested: true } : {}),

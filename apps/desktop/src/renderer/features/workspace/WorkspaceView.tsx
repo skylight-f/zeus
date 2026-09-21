@@ -14,6 +14,7 @@ import type { UpdateAppShellSettingsRequest } from '../settings/settingsContract
 import type { ProjectSourceContentMatch, SidebarConversationFilters } from '@zeus/shared';
 import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { RuntimeXtermPane } from '../runtime/RuntimeXtermPane.js';
+import { terminateProjectTerminalSessions } from '../runtime/projectTerminalCleanup.js';
 import { handleInlineRailKeyboardNavigation } from './workspaceSupport.js';
 import { useModelSetup, ModelSetupDialog, CodexAccountSettings, type TaskModelSetupContext } from '../../settings/ModelSetup.js';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
@@ -859,6 +860,9 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           project={selectedProject}
           projects={orderedProjects}
           onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          onCloseProject={async (project) => {
+            await terminateProjectTerminalSessions(props.commandClient ?? null, project.id);
+          }}
           onOpenProjectSettings={(project) => openProjectSection(project, 'project-settings')}
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}

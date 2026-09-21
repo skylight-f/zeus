@@ -3096,6 +3096,43 @@ body:has(.macos-ai-app.zeus-shell) {
   position: relative;
 }
 
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true'] {
+  cursor: grab;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true']:active {
+  cursor: grabbing;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true'] .project-workspace-project-slot-primary,
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true'] .project-workspace-project-slot-trigger {
+  cursor: grab;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true']:active .project-workspace-project-slot-primary,
+.macos-ai-app.zeus-shell .project-workspace-project-slot[draggable='true']:active .project-workspace-project-slot-trigger {
+  cursor: grabbing;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot.is-project-slot-dragging {
+  opacity: 0.52;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot.is-project-slot-drag-over {
+  border-color: color-mix(in srgb, var(--agentdesk-accent) 34%, transparent);
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot.is-project-slot-drag-over::before {
+  background: var(--agentdesk-accent);
+  border-radius: 999px;
+  content: '';
+  inset-block: 5px;
+  inset-inline-start: -4px;
+  position: absolute;
+  width: 2px;
+  z-index: 4;
+}
+
 .macos-ai-app.zeus-shell .project-workspace-project-slot > .zeus-select,
 .macos-ai-app.zeus-shell .project-workspace-project-slot-trigger {
   inline-size: fit-content;
@@ -3197,6 +3234,27 @@ body:has(.macos-ai-app.zeus-shell) {
 .macos-ai-app.zeus-shell .project-workspace-project-slot-close:disabled {
   cursor: default;
   opacity: 0.4;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot-close[data-closing='true']:disabled {
+  opacity: 1;
+}
+
+.macos-ai-app.zeus-shell .project-workspace-project-slot-close-spinner {
+  animation: project-workspace-project-close-spin 800ms linear infinite;
+  display: inline-flex;
+}
+
+@keyframes project-workspace-project-close-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .macos-ai-app.zeus-shell .project-workspace-project-slot-close-spinner {
+    animation: none;
+  }
 }
 
 .macos-ai-app.zeus-shell .project-workspace-project-slot-close:focus-visible {

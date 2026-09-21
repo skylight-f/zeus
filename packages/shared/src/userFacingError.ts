@@ -454,6 +454,10 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['任务所需的独立工作目录不可用。请检查目录是否存在及访问权限。', 'The task’s separate working folder is unavailable. Check that it exists and that access is allowed.'],
   ],
   [['ZEUS_TASK_RUNTIME_CLEANUP_BUSY'], ['正在停止此任务的运行程序，暂时不能更改任务状态。请等待停止完成。', 'Programs running for this task are being stopped. Wait for them to stop before changing the task status.']],
+  [
+    ['ZEUS_PROJECT_TERMINAL_CLEANUP_FAILED'],
+    ['项目终端尚未确认全部退出，因此项目标签已保留。请查看详情后重试。', 'The project tab was kept open because its terminals have not all been confirmed stopped. Review the details and try again.'],
+  ],
   [['ZEUS_TASK_INTEGRATION_NOT_MERGED'], ['任务分支还没有合入来源分支，请先完成合入再推送。', 'The task branch has not been merged into its source branch. Merge it before pushing.']],
   [['ZEUS_TASK_PUSH_ATTACHMENT_UNAVAILABLE'], ['部分附件无法读取，因此没有创建对话。请检查或移除这些附件。', 'Some attachments cannot be read, so the conversation was not created. Check or remove those attachments.']],
   [['ZEUS_TASK_WORK_DELIVERABLE_CORRUPT'], ['交付物内容未通过完整性检查，暂时不能使用。请查看详情并重新生成交付物。', 'The deliverable failed its integrity check and cannot be used. See the details and generate it again.']],

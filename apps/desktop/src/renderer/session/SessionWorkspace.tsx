@@ -3791,13 +3791,13 @@ export function NewConversationComposer(props: {
           <span className="session-composer-trailing-actions">
             {selectedModel ? (
               <span className="session-composer-runtime-settings">
-                <ZeusSelect
-                  size="compact"
-                  ariaLabel={props.language === 'zh-CN' ? '上下文容量' : 'Context capacity'}
+                <ComposerDropdown
+                  className="session-composer-capacity-dropdown"
+                  label={props.language === 'zh-CN' ? '上下文容量' : 'Context capacity'}
                   value={contextCapacitySelectionValue(contextCapacityTokens, capabilities?.projectContextCapacityTokens)}
                   disabled={submitting || !props.owner}
                   options={contextCapacitySelectionOptions(selectedModel.contextCapacity, props.language === 'zh-CN')}
-                  triggerTitle={selectedModel.contextCapacity?.reason}
+                  title={selectedModel.contextCapacity?.reason}
                   onChange={(value) => setContextCapacityTokens(contextCapacitySelectionFromValue(value))}
                 />
                 <ContextUsageIndicator contextCapacityTokens={contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens} unifiedUsage={null} language={props.language} />

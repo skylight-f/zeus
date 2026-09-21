@@ -3,7 +3,7 @@ import { MotionPresence } from '../../ui/MotionPresence.js';
 import { temporaryWorkspaceId, normalizeSidebarConversationFilters, sidebarConversationRunStatusGroup, sidebarConversationRunStatusGroups, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
 import { Collapsible } from '../../ui/Collapsible.js';
 import { handleSourceListKeyboardNavigation } from './workspaceSupport.js';
-import { type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type UIEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type UIEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 import { FolderPlusIcon as FolderPlus } from '@phosphor-icons/react/dist/csr/FolderPlus';
@@ -670,6 +670,8 @@ export function ProjectWorkspaceNavigation(props: {
   project: ProjectRecord;
   projects: ProjectRecord[];
   onSelectProject: (project: ProjectRecord) => void;
+  /** 关闭槽位前先收口该项目持有的后台终端。 */
+  onCloseProject: (project: ProjectRecord) => Promise<void>;
   onOpenProjectSettings: (project: ProjectRecord) => void;
   canCreateProject: boolean;
   createProjectBusy: boolean;
@@ -713,7 +715,18 @@ export function ProjectWorkspaceNavigation(props: {
   const [initialProjectWorkspace] = useState(() => resolveProjectWorkspaceTabs(props.projects, props.project.id));
   const projectStatuses = useMemo(() => summarizeProjectConversationStatuses(props.conversationGroups, props.conversationStates, props.language), [props.conversationGroups, props.conversationStates, props.language]);
   const [projectSlots, setProjectSlots] = useState<Array<{ id: string; projectId: string }>>(() => initialProjectWorkspace.projectIds.map((projectId, index) => ({ id: `project-slot-${index}`, projectId })));
+  /** 异步终端清理期间保留最新槽位与当前项目，避免完成回调使用旧闭包。 */
+  const projectSlotsRef = useRef(projectSlots);
+  projectSlotsRef.current = projectSlots;
+  const activeProjectIdRef = useRef(props.project.id);
+  activeProjectIdRef.current = props.project.id;
   const projectSlotSequenceRef = useRef(projectSlots.length);
+  /** 状态提交前也要挡住同一事件循环中的重复点击。 */
+  const closingProjectSlotIdRef = useRef<string | null>(null);
+  const [closingProjectSlotId, setClosingProjectSlotId] = useState<string | null>(null);
+  const projectCloseBusy = closingProjectSlotId !== null;
+  const [draggingProjectSlotId, setDraggingProjectSlotId] = useState<string | null>(null);
+  const [dragOverProjectSlotId, setDragOverProjectSlotId] = useState<string | null>(null);
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const contextProject = projectContextMenu && projectSlots.some((slot) => slot.projectId === projectContextMenu.projectId) ? props.projects.find((project) => project.id === projectContextMenu.projectId) : undefined;
   useEffect(() => setProjectContextMenu(null), [props.project.id]);
@@ -752,18 +765,80 @@ export function ProjectWorkspaceNavigation(props: {
     }
     if (project.id !== props.project.id) props.onSelectProject(project);
   };
-  /** 关闭项目槽位；关闭当前项目时切换到相邻的已打开项目。 */
-  const closeProjectSlot = (slotId: string) => {
-    if (projectSlots.length <= 1) return;
-    const closingIndex = projectSlots.findIndex((slot) => slot.id === slotId);
-    const closingSlot = closingIndex >= 0 ? projectSlots[closingIndex] : undefined;
+  /** 先确认项目终端全部退出，再移除槽位；失败时保留入口供用户重试。 */
+  const closeProjectSlot = async (slotId: string): Promise<void> => {
+    const currentSlots = projectSlotsRef.current;
+    if (currentSlots.length <= 1 || closingProjectSlotIdRef.current) return;
+    const closingIndex = currentSlots.findIndex((slot) => slot.id === slotId);
+    const closingSlot = closingIndex >= 0 ? currentSlots[closingIndex] : undefined;
     if (!closingSlot) return;
-    const nextSlots = projectSlots.filter((slot) => slot.id !== slotId);
+    const closingProject = props.projects.find((project) => project.id === closingSlot.projectId);
+    closingProjectSlotIdRef.current = slotId;
+    setClosingProjectSlotId(slotId);
+    try {
+      if (closingProject) await props.onCloseProject(closingProject);
+      const latestSlots = projectSlotsRef.current;
+      const latestClosingIndex = latestSlots.findIndex((slot) => slot.id === slotId);
+      if (latestClosingIndex < 0 || latestSlots.length <= 1) return;
+      const nextSlots = latestSlots.filter((slot) => slot.id !== slotId);
+      projectSlotsRef.current = nextSlots;
+      setProjectSlots(nextSlots);
+      if (closingSlot.projectId !== activeProjectIdRef.current) return;
+      const replacementSlot = nextSlots[latestClosingIndex] ?? nextSlots[latestClosingIndex - 1];
+      const replacementProject = replacementSlot ? props.projects.find((project) => project.id === replacementSlot.projectId) : undefined;
+      if (replacementProject) props.onSelectProject(replacementProject);
+    } catch (error) {
+      reportApplicationError(error, {
+        language: zh ? 'zh-CN' : 'en',
+        title: closingProject ? (zh ? `无法关闭项目“${closingProject.name}”` : `Unable to close “${closingProject.name}”`) : undefined,
+      });
+    } finally {
+      closingProjectSlotIdRef.current = null;
+      setClosingProjectSlotId(null);
+    }
+  };
+  const reorderProjectSlots = (sourceSlotId: string, targetSlotId: string): void => {
+    if (sourceSlotId === targetSlotId || projectCloseBusy) return;
+    const currentSlots = projectSlotsRef.current;
+    const sourceIndex = currentSlots.findIndex((slot) => slot.id === sourceSlotId);
+    const targetIndex = currentSlots.findIndex((slot) => slot.id === targetSlotId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
+    const nextSlots = [...currentSlots];
+    const [movedSlot] = nextSlots.splice(sourceIndex, 1);
+    if (!movedSlot) return;
+    const nextTargetIndex = nextSlots.findIndex((slot) => slot.id === targetSlotId);
+    if (nextTargetIndex < 0) return;
+    nextSlots.splice(nextTargetIndex, 0, movedSlot);
+    projectSlotsRef.current = nextSlots;
     setProjectSlots(nextSlots);
-    if (closingSlot.projectId !== props.project.id) return;
-    const replacementSlot = nextSlots[closingIndex] ?? nextSlots[closingIndex - 1];
-    const replacementProject = replacementSlot ? props.projects.find((project) => project.id === replacementSlot.projectId) : undefined;
-    if (replacementProject) props.onSelectProject(replacementProject);
+  };
+  const handleProjectSlotDragStart = (event: ReactDragEvent<HTMLElement>, slotId: string): void => {
+    if (projectCloseBusy || (event.target instanceof Element && event.target.closest('.project-workspace-project-slot-close'))) {
+      event.preventDefault();
+      return;
+    }
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', slotId);
+    setDraggingProjectSlotId(slotId);
+    setDragOverProjectSlotId(null);
+  };
+  const handleProjectSlotDragOver = (event: ReactDragEvent<HTMLElement>, slotId: string): void => {
+    if (!draggingProjectSlotId || draggingProjectSlotId === slotId || projectCloseBusy) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    if (dragOverProjectSlotId !== slotId) setDragOverProjectSlotId(slotId);
+  };
+  const handleProjectSlotDrop = (event: ReactDragEvent<HTMLElement>, targetSlotId: string): void => {
+    event.preventDefault();
+    const sourceSlotId = event.dataTransfer.getData('text/plain') || draggingProjectSlotId;
+    setDraggingProjectSlotId(null);
+    setDragOverProjectSlotId(null);
+    if (!sourceSlotId || sourceSlotId === targetSlotId || projectCloseBusy) return;
+    reorderProjectSlots(sourceSlotId, targetSlotId);
+  };
+  const handleProjectSlotDragEnd = (): void => {
+    setDraggingProjectSlotId(null);
+    setDragOverProjectSlotId(null);
   };
   return (
     <>
@@ -773,16 +848,23 @@ export function ProjectWorkspaceNavigation(props: {
             {projectSlots.map((slot, index) => {
               const slotProject = props.projects.find((project) => project.id === slot.projectId);
               const active = slotProject?.id === props.project.id;
+              const closing = closingProjectSlotId === slot.id;
               const emptyValue = `__empty_project_slot_${slot.id}`;
               const projectStatus = projectStatuses.get(slot.projectId);
               const selectLabel = slotProject ? (zh ? `选择项目 ${slotProject.name}` : `Select project ${slotProject.name}`) : zh ? '尚未选择项目' : 'No project selected';
               return (
                 <span
                   key={slot.id}
-                  className={`project-workspace-project-slot${active ? ' is-active' : ''}`}
+                  className={`project-workspace-project-slot${active ? ' is-active' : ''}${draggingProjectSlotId === slot.id ? ' is-project-slot-dragging' : ''}${dragOverProjectSlotId === slot.id ? ' is-project-slot-drag-over' : ''}`}
                   data-project-slot-id={slot.id}
+                  aria-roledescription={zh ? '可拖动项目目录' : 'Draggable project directory'}
+                  draggable={!projectCloseBusy}
+                  onDragStart={(event) => handleProjectSlotDragStart(event, slot.id)}
+                  onDragOver={(event) => handleProjectSlotDragOver(event, slot.id)}
+                  onDrop={(event) => handleProjectSlotDrop(event, slot.id)}
+                  onDragEnd={handleProjectSlotDragEnd}
                   onContextMenu={(event) => {
-                    if (!slotProject || slotProject.id === temporaryWorkspaceId) return;
+                    if (projectCloseBusy || !slotProject || slotProject.id === temporaryWorkspaceId) return;
                     event.preventDefault();
                     event.currentTarget.querySelector<HTMLButtonElement>('.project-workspace-project-slot-primary')?.focus({ preventScroll: true });
                     setProjectContextMenu({ projectId: slotProject.id, x: event.clientX, y: event.clientY });
@@ -794,16 +876,16 @@ export function ProjectWorkspaceNavigation(props: {
                     aria-label={projectStatus ? `${selectLabel}，${projectStatus.label}` : selectLabel}
                     title={projectStatus?.label}
                     aria-pressed={active}
-                    aria-disabled={!slotProject || undefined}
+                    aria-disabled={!slotProject || projectCloseBusy || undefined}
                     aria-haspopup={slotProject && slotProject.id !== temporaryWorkspaceId ? 'menu' : undefined}
                     onKeyDown={(event) => {
-                      if (!slotProject || slotProject.id === temporaryWorkspaceId || !(event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) return;
+                      if (projectCloseBusy || !slotProject || slotProject.id === temporaryWorkspaceId || !(event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) return;
                       event.preventDefault();
                       const rect = event.currentTarget.getBoundingClientRect();
                       setProjectContextMenu({ projectId: slotProject.id, x: rect.left, y: rect.bottom });
                     }}
                     onClick={() => {
-                      if (slotProject && slotProject.id !== props.project.id) props.onSelectProject(slotProject);
+                      if (!projectCloseBusy && slotProject && slotProject.id !== props.project.id) props.onSelectProject(slotProject);
                     }}
                   />
                   <ZeusSelect
@@ -841,20 +923,29 @@ export function ProjectWorkspaceNavigation(props: {
                     emptyLabel={zh ? '没有可选择的项目' : 'No projects available'}
                     popoverMinWidth={260}
                     popoverArrowAlignment="start"
+                    disabled={projectCloseBusy}
                     size="compact"
                   />
                   <button
                     type="button"
                     className="project-workspace-project-slot-close"
-                    disabled={projectSlots.length <= 1}
-                    aria-label={slotProject ? (zh ? `关闭项目 ${slotProject.name}` : `Close project ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
-                    title={projectSlots.length <= 1 ? (zh ? '至少保留一个项目' : 'Keep at least one project open') : slotProject ? (zh ? `关闭 ${slotProject.name}` : `Close ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
+                    disabled={projectSlots.length <= 1 || projectCloseBusy}
+                    aria-busy={closing || undefined}
+                    data-closing={closing || undefined}
+                    aria-label={closing ? (zh ? `正在关闭项目 ${slotProject?.name ?? ''}` : `Closing project ${slotProject?.name ?? ''}`) : slotProject ? (zh ? `关闭项目 ${slotProject.name}` : `Close project ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
+                    title={closing ? (zh ? '正在终止项目终端…' : 'Stopping project terminals…') : projectSlots.length <= 1 ? (zh ? '至少保留一个项目' : 'Keep at least one project open') : slotProject ? (zh ? `关闭 ${slotProject.name}` : `Close ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
                     onClick={(event) => {
                       event.stopPropagation();
-                      closeProjectSlot(slot.id);
+                      void closeProjectSlot(slot.id);
                     }}
                   >
-                    <X size={15} weight="regular" aria-hidden="true" />
+                    {closing ? (
+                      <span className="project-workspace-project-slot-close-spinner" aria-hidden="true">
+                        <SpinnerGap size={15} weight="regular" />
+                      </span>
+                    ) : (
+                      <X size={15} weight="regular" aria-hidden="true" />
+                    )}
                   </button>
                 </span>
               );
@@ -882,7 +973,7 @@ export function ProjectWorkspaceNavigation(props: {
             emptyLabel={zh ? '没有可选择的项目' : 'No projects available'}
             popoverMinWidth={260}
             popoverArrowAlignment="center"
-            disabled={props.createProjectBusy}
+            disabled={props.createProjectBusy || projectCloseBusy}
             size="compact"
           />
         </div>

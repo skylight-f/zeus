@@ -1395,6 +1395,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     clientUserMessageId: string;
     /** 插话资源在接纳前校验，随下一次模型调用整体交付。 */
     attachments?: NativeConversationAttachmentInput[];
+    /** 恢复后的运行上下文可能尚未见过附件，插话仍须沿用服务端可信附件根。 */
+    allowedAttachmentRoots?: string[];
     /** 只冻结本次显式 Skill 内容，不重载忙碌中的 SDK。 */
     skills?: NativeConversationSkillInput[];
     /** 原批注与结构化上下文继续挂在同一提交。 */
@@ -1408,7 +1410,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (!run || run.conversationId !== input.conversation.id) throw piError('ZEUS_PI_RUN_NOT_ACTIVE', 'Pi 插话目标不是当前执行轮次。');
     const context = input.conversation.nativeSessionId ? contexts.get(input.conversation.nativeSessionId) : undefined;
     if (!context) throw piError('ZEUS_PI_SESSION_NOT_LOADED', 'Pi 会话当前未载入运行内核。');
-    const attachmentInput = await resolvePiAttachmentInput(input.attachments ?? [], context.attachmentRoots, context.cwd);
+    const attachmentInput = await resolvePiAttachmentInput(input.attachments ?? [], uniquePaths([...context.attachmentRoots, ...(input.allowedAttachmentRoots ?? [])]), context.cwd);
     const selectedCatalog = input.skills?.length ? ((await options.loadSkills?.(context.cwd, input.submissionId)) ?? []) : [];
     const selectedSkills = (input.skills ?? []).map((skill) => selectedCatalog.find((frozen) => frozen.id === skill.id) ?? skill);
     const skillRoots = selectedSkills.map(resolveSkillResourceRoot);

@@ -446,14 +446,9 @@
   overflow-y: auto;
   overscroll-behavior: contain;
 }
-/* 分组首层与标题错开，目录内部继续沿用逐级缩进；只限制整组，避免层层嵌套滚动。 */
+/* 分组首层与标题错开，目录内部继续沿用逐级缩进；滚动统一交给菜单内容容器。 */
 .git-branch-collapsible-group > .git-reference-tree {
   padding-inline-start: 18px;
-  max-block-size: min(240px, 32dvh);
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
 }
 
 /* 源码与 Git 分支菜单按仓库、分支、操作保留三级上下文。 */
