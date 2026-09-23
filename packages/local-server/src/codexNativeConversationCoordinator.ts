@@ -95,7 +95,14 @@ import { mergeCodexAdditionalContext } from './codexNativeContextProtocol.js';
 import { contextFromPersistedConversation, contextFromPersistedSubmission, prepareRecoveredCodexPlugins } from './codexConversationDispatchContext.js';
 import { createCodexNativeConversationAccess } from './codexNativeConversationAccess.js';
 import { createCodexNativeDispatchPipeline } from './codexNativeDispatchPipeline.js';
-import { appendConversationResourceContext, type PersistedSubmissionInput, readNativeSubmissionRecoveryKind, readNativeSubmissionSkills, readNativeSubmissionTaskPushLayout } from './nativeConversationSubmissionInputs.js';
+import {
+  appendConversationResourceContext,
+  frozenNativeSkillCatalogPrompt,
+  resolveFrozenNativeSubmissionSkills,
+  type PersistedSubmissionInput,
+  readNativeSubmissionRecoveryKind,
+  readNativeSubmissionTaskPushLayout,
+} from './nativeConversationSubmissionInputs.js';
 import { inferNativeConversationRunState } from './codexNativeRunStateProjection.js';
 import { chooseNativeUserMessageContent, type NativeUserMessageProjection, reconcileNativeUserMessageAcceptance, resolveNativeUserMessageSubmission } from './codexNativeUserMessageProjection.js';
 import { CodexProviderCommandApplicationService } from './codexProviderCommandApplication.js';
@@ -497,7 +504,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     return value;
   }
 
-  function submissionProviderInput(submission: ZeusConversationSubmissionRecord, context: ConversationDispatchContext): Array<Record<string, unknown>> {
+  function submissionProviderInput(submission: ZeusConversationSubmissionRecord, context: ConversationDispatchContext, skillCatalog?: readonly NativeConversationSkillInput[]): Array<Record<string, unknown>> {
     const text = volatileSubmissionText.get(submission.id) ?? submissionText(submission);
     const attachments = submissionAttachments(submission);
     const allowedRoots = [...(context.allowedAttachmentRoots?.length ? context.allowedAttachmentRoots : [context.projectLocalPath]), ...options.trustedAttachmentRoots]
@@ -535,7 +542,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       ];
     };
     const taskPushLayout = readNativeSubmissionTaskPushLayout(submission);
-    const skills = readNativeSubmissionSkills(submission);
+    const skills = resolveFrozenNativeSubmissionSkills(submission, skillCatalog ?? []);
     const inputs: Array<Record<string, unknown>> = skills.map((skill) => ({ type: 'skill', name: skill.name, path: skill.path }));
     if (taskPushLayout) {
       const attachmentsByKey = new Map(attachments.flatMap((attachment) => (attachment.taskPushAttachmentKey ? [[attachment.taskPushAttachmentKey, attachment] as const] : [])));
@@ -1215,6 +1222,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       ...(input.browserComments?.length ? { browserComments: input.browserComments } : {}),
       ...(input.browserCommentContent ? { browserCommentContent: input.browserCommentContent } : {}),
       ...(input.conversationContext ? { conversationContext: input.conversationContext } : {}),
+      ...((input.skills ?? undefined) ? { skills: input.skills } : {}),
       context,
       ...(input.displayText ? { displayText: input.displayText } : {}),
       delivery: 'steer_now',
@@ -1262,7 +1270,10 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     /** 正文与附件继续来自同一原始提交，禁止把队列引导重建成第二条消息。 */
     const context = { ...contextFromSubmission(submission), permissionMode: conversation.permissionMode };
     /** 资源组装先于外部写入标记，失败不能误报已发送。 */
-    const providerInput = submissionProviderInput(submission, context);
+    const skillCatalog = (await options.loadSkills?.(context.projectLocalPath, submission.id)) ?? [];
+    const providerInput = submissionProviderInput(submission, context, skillCatalog);
+    const skillCatalogPrompt = frozenNativeSkillCatalogPrompt(skillCatalog);
+    if (skillCatalogPrompt) providerInput.push({ type: 'text', text: skillCatalogPrompt });
     /** 中途问题回答不能在原轮次结束后自动转入下一轮。 */
     const questionAnswer = parseJsonRecord(submission.inputJson).questionAnswer;
     // 同步占住原队首后才允许异步等待；资源校验失败时原消息仍留在队列。

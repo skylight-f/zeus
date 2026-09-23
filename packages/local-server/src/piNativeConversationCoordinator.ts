@@ -56,7 +56,7 @@ import { projectConversationTurnFailure } from '@zeus/storage';
 import type { ModelConnectionService } from './modelConnectionService.js';
 import type { BrowserAutomationPort } from './browserAutomation.js';
 import type { CreateCodexNativeConversationCoordinatorOptions, NativeConversationAttachmentInput, NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { appendConversationResourceContext, readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
+import { appendConversationResourceContext, readNativeSubmissionSkillReferences, resolveFrozenNativeSkills } from './nativeConversationSubmissionInputs.js';
 import { hasUnwrittenSubmissionEvidence } from './unboundConversationArchiveApplication.js';
 import type { ConversationSegmentLifecycle } from './conversationExecutionCoordinator.js';
 import type { ManagedConversationToolResultStore } from './conversationPortableContext.js';
@@ -372,8 +372,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     const orderedAttachments = input.taskPushLayout ? orderPiTaskPushAttachments(input.taskPushLayout, input.attachments ?? []) : (input.attachments ?? []);
     const rawPathReferences = orderedAttachments.flatMap((attachment) => (attachment.localPath ? [{ name: attachment.name, path: attachment.localPath }] : []));
     let selectedSkills = input.skills ?? (input.skill ? [input.skill] : []);
-    const skillRoots = selectedSkills.map(resolveSkillResourceRoot);
-    const allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? []), ...skillRoots]);
+    let allowedResourceRoots = uniquePaths(input.allowedAttachmentRoots ?? []);
     let providerPrompt = appendConversationResourceContext(
       input.taskPushLayout ? renderPiTaskPushPrompt(input.taskPushLayout, orderedAttachments) : appendPiAttachmentReferences(input.prompt, rawPathReferences),
       input.browserCommentContent,
@@ -538,6 +537,9 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     /** 需要真实压缩的导入历史必须分批写入并逐批压缩，不能在创建会话时一次播种。 */
     const historyCompaction = input.segmentLifecycle?.contextCompactionPlan ? { lifecycle: input.segmentLifecycle, plan: input.segmentLifecycle.contextCompactionPlan } : null;
     try {
+      skillCatalog = (await options.loadSkills?.(input.cwd, input.submissionId)) ?? [];
+      selectedSkills = resolveFrozenNativeSkills(selectedSkills, skillCatalog);
+      allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? []), ...selectedSkills.map(resolveSkillResourceRoot)]);
       attachmentInput = await resolvePiAttachmentInput(orderedAttachments, allowedResourceRoots, input.cwd);
       providerPrompt = appendConversationResourceContext(
         input.taskPushLayout ? renderPiTaskPushPrompt(input.taskPushLayout, attachmentInput.attachments) : appendPiAttachmentReferences(input.prompt, attachmentInput.pathReferences),
@@ -545,8 +547,6 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         input.browserComments,
         input.conversationContext,
       );
-      skillCatalog = (await options.loadSkills?.(input.cwd, input.submissionId)) ?? [];
-      selectedSkills = selectedSkills.map((skill) => skillCatalog.find((frozen) => frozen.id === skill.id) ?? skill);
       if (options.plugins) {
         pluginPreparation = await options.plugins.prepare({
           conversationId: input.conversationId,
@@ -956,8 +956,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       throw piError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '当前模型会话的工作目录与任务记录不一致。');
     }
     let selectedSkills = input.skills ?? (input.skill ? [input.skill] : []);
-    const skillRoots = selectedSkills.map(resolveSkillResourceRoot);
-    const allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? context?.attachmentRoots ?? [cwd]), ...skillRoots]);
+    let allowedResourceRoots = uniquePaths(input.allowedAttachmentRoots ?? context?.attachmentRoots ?? [cwd]);
     let attachmentInput: PiAttachmentResolution = { attachments: input.attachments ?? [], images: [], pathReferences: [], allowedRoots: allowedResourceRoots };
     let providerContent = input.content;
     /** 已接纳的队列输入沿用原请求摘要，恢复问题的回答不能被重新计算为另一请求。 */
@@ -989,7 +988,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     await options.db.save();
     await input.providerWriteLifecycle?.markPrepared(submission.id);
     const skillCatalog = (await options.loadSkills?.(cwd, submission.id)) ?? [];
-    selectedSkills = selectedSkills.map((skill) => skillCatalog.find((frozen) => frozen.id === skill.id) ?? skill);
+    selectedSkills = resolveFrozenNativeSkills(selectedSkills, skillCatalog);
+    allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? context?.attachmentRoots ?? [cwd]), ...selectedSkills.map(resolveSkillResourceRoot)]);
     const pluginPreparation = options.plugins
       ? await options.plugins.prepare({
           conversationId: input.conversation.id,
@@ -1373,7 +1373,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     const selectedModel = selectedModelRef
       ? { sourceId: selectedModelRef.sourceId, modelId: selectedModelRef.modelId, displayName: null }
       : { sourceId: conversation.modelSourceId, modelId: settings?.model ?? conversation.modelId ?? conversation.providerModel ?? '', displayName: null };
-    const skills = readNativeSubmissionSkills(next);
+    const skills = readNativeSubmissionSkillReferences(next);
     await submitMessage({
       conversation,
       submissionId: next.id,
@@ -1421,7 +1421,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (!context) throw piError('ZEUS_PI_SESSION_NOT_LOADED', 'Pi 会话当前未载入运行内核。');
     const attachmentInput = await resolvePiAttachmentInput(input.attachments ?? [], uniquePaths([...context.attachmentRoots, ...(input.allowedAttachmentRoots ?? [])]), context.cwd);
     const selectedCatalog = input.skills?.length ? ((await options.loadSkills?.(context.cwd, input.submissionId)) ?? []) : [];
-    const selectedSkills = (input.skills ?? []).map((skill) => selectedCatalog.find((frozen) => frozen.id === skill.id) ?? skill);
+    const selectedSkills = resolveFrozenNativeSkills(input.skills ?? [], selectedCatalog);
     const skillRoots = selectedSkills.map(resolveSkillResourceRoot);
     const skillContents = await Promise.all(selectedSkills.map(async (skill) => `本次显式 Skill ${JSON.stringify({ name: skill.name, path: skill.path })}：\n${await readFile(skill.path, 'utf8')}`));
     const providerContent = [
@@ -2661,7 +2661,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (!hasUnwrittenSubmissionEvidence(options.commandDeliveries, submission)) throw piError('ZEUS_NATIVE_SUBMISSION_DELIVERY_UNCONFIRMED', '消息是否送达尚未确认，请先检查处理状态。');
     return steerMessage({
       attachments: Array.isArray(persisted.attachments) ? (persisted.attachments as NativeConversationAttachmentInput[]) : [],
-      skills: readNativeSubmissionSkills(submission),
+      skills: readNativeSubmissionSkillReferences(submission),
       browserComments: Array.isArray(persisted.browserComments) ? persisted.browserComments.filter(isRecord) : [],
       ...(typeof persisted.browserCommentContent === 'string' ? { browserCommentContent: persisted.browserCommentContent } : {}),
       ...(isRecord(persisted.conversationContext) ? { conversationContext: persisted.conversationContext } : {}),

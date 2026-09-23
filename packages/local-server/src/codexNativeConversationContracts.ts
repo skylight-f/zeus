@@ -429,6 +429,8 @@ export interface SteerNativeMessageInput {
   browserComments?: Record<string, unknown>[];
   browserCommentContent?: string;
   conversationContext?: Record<string, unknown>;
+  /** 当前即时补充消息的完整显式 Skill 选择；由派发前冻结目录重写路径。 */
+  skills?: NativeConversationSkillInput[];
   expectedTurnId: string;
   idempotencyKey: string;
   clientUserMessageId: string;

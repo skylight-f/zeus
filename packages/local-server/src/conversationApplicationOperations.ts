@@ -74,7 +74,7 @@ import { type ConversationCapabilitiesSnapshot, ConversationCapabilityQueryAppli
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
 import { ConversationExecutionCoordinator, type ConversationExecutionRoute } from './conversationExecutionCoordinator.js';
 import type { NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { readNativeConversationSkills, readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
+import { readNativeConversationSkillReferences, readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
 import type { CreateConversationMessageBody, NativeConversationAttachment, ProjectConversationAcceptanceReservation, StartProjectConversationBody, StartTaskConversationBody, TaskConversationAcceptanceReservation } from './index.js';
 import { createModelConnectionService } from './modelConnectionService.js';
 import { resolveWritableNonCodexLegacyConversation, type WritableNonCodexLegacyConversationContext } from './nonCodexLegacyRuntime.js';
@@ -850,7 +850,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         snapshot,
         resourceSnapshotIdentity: submission!.id,
         history: conversationExecution.confirmedModelHistory(parent.id),
-        skills: submission ? readNativeSubmissionSkills(submission) : [],
+        skills: submission ? readNativeSubmissionSkillReferences(submission) : [],
         attachments: sourceInput.attachments ?? [],
         instruction: message,
         model,
@@ -1813,7 +1813,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
             },
           })
         : null;
-    const conversationSkills = segmentLifecycle?.requiresNewSegment ? readNativeConversationSkills(conversationSubmissions.listByConversation(conversation.id)) : [];
+    const conversationSkills = segmentLifecycle?.requiresNewSegment ? readNativeConversationSkillReferences(conversationSubmissions.listByConversation(conversation.id)) : [];
     const conflictAttempt = taskIntegrationAttempts.getByConversationId(conversation.id);
     const conflictPreparationHeld = conflictAttempt?.state === 'preparing' || conflictAttempt?.state === 'failed';
     if (conflictPreparationHeld && delivery === 'steer_now') {
@@ -1874,6 +1874,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
           browserComments,
           ...(browserCommentContent ? { browserCommentContent } : {}),
           ...(conversationContext ? { conversationContext } : {}),
+          ...(resolvedSkills.length ? { skills: resolvedSkills } : {}),
           expectedTurnId: expectedTurnId!,
           idempotencyKey,
           clientUserMessageId,

@@ -68,7 +68,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseJsonObject } from './localServerPlatformSupport.js';
 import { createCodexNativeConversationCoordinator } from './codexNativeConversationCoordinator.js';
 import type { NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
+import { readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
 import { isNativeApiRecord, nativeApiError } from './conversationApplicationOperations.js';
 import { isPathInsideRoot } from './conversationResourcePreview.js';
 import type { BatchTaskWorkspaceResult, WorkspaceGitExplicitRejection, WorkspaceGitPreparedOpaque } from './index.js';
@@ -2048,7 +2048,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     const conflictPath = required('conflictPath');
     const conflictContent = required('conflictContent');
     const conflictFingerprint = required('conflictFingerprint');
-    const skills = readNativeSubmissionSkills(submission);
+    const skills = readNativeSubmissionSkillReferences(submission);
     if (integrationId !== attempt.integrationId) throw nativeApiError('ZEUS_NATIVE_RESERVED_RESOURCE_CONFLICT', '冲突处理准备信封与业务操作身份不一致。');
     taskIntegrationAttempts.update(attempt.id, { state: 'preparing', lastError: null });
     taskConflictAiOperations.set(attempt.id, { conversationId: conversation.id, submissionId: submission.id, running: false, finalizing: false });

@@ -1,4 +1,4 @@
-import { readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
+import { frozenNativeSkillCatalogPrompt } from './nativeConversationSubmissionInputs.js';
 import { type CodexThreadGoal, toCodexWireReasoningEffort } from '@zeus/ai-runtime';
 import type { ConversationCollaborationMode, ConversationNextTurnSettings, ConversationRepository, ZeusConversationGoalRecord, ZeusConversationSubmissionRecord, ZeusConversationWithMessagesRecord } from '@zeus/storage';
 import { ensureInitialCodexGoal } from './codexGoalApplication.js';
@@ -7,6 +7,7 @@ import type {
   CreateCodexNativeConversationCoordinatorOptions,
   NativeAcceptedOperation,
   NativeConversationRunState,
+  NativeConversationSkillInput,
   NativeOperationStatus,
   NativeProviderWriteLifecycle,
   NativeQueueSnapshot,
@@ -96,7 +97,7 @@ interface CodexNativeDispatchPipelineDependencies {
 
   submissionGoalObjective(submission: ZeusConversationSubmissionRecord): string | null;
 
-  submissionProviderInput(submission: ZeusConversationSubmissionRecord, context: ConversationDispatchContext): Record<string, unknown>[];
+  submissionProviderInput(submission: ZeusConversationSubmissionRecord, context: ConversationDispatchContext, skillCatalog?: readonly NativeConversationSkillInput[]): Record<string, unknown>[];
 
   submissionText(submission: ZeusConversationSubmissionRecord): string;
 }
@@ -410,17 +411,9 @@ export function createCodexNativeDispatchPipeline(dependencies: CodexNativeDispa
         });
       }
       const skillCatalog = (await options.loadSkills?.(context.projectLocalPath, submission.id)) ?? [];
-      const providerInput = submissionProviderInput(submission, context).map((item) => {
-        if (item.type !== 'skill') return item;
-        const selected = readNativeSubmissionSkills(submission).find((skill) => skill.path === item.path && skill.name === item.name);
-        const frozen = skillCatalog.find((skill) => skill.id === selected?.id);
-        return frozen ? { ...item, path: frozen.path } : item;
-      });
-      if (skillCatalog.length)
-        providerInput.push({
-          type: 'text',
-          text: `本轮普通 Skill 已冻结；自动选择和显式选择均读取以下路径，参考文件和脚本相对于同一目录解析：\n${JSON.stringify(skillCatalog.map(({ id, name, description, path }) => ({ id, name, description, path })))}`,
-        });
+      const providerInput = submissionProviderInput(submission, context, skillCatalog);
+      const skillCatalogPrompt = frozenNativeSkillCatalogPrompt(skillCatalog);
+      if (skillCatalogPrompt) providerInput.push({ type: 'text', text: skillCatalogPrompt });
       const pluginPromptContext = await options.plugins?.beforeUserPrompt({
         conversationId: conversation.id,
         prompt: providerInput,
