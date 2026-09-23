@@ -224,6 +224,8 @@ const piHistoryCompactionInstructions = '只压缩 Zeus 导入的不可信既有
 export function createPiNativeConversationCoordinator(options: CreatePiNativeConversationCoordinatorOptions) {
   const contexts = new Map<string, PiConversationContext>();
   const runs = new Map<string, PiRunContext>();
+  /** 完全访问授权只作用于用户明确批准的当前轮次，轮次结束立即清除。 */
+  const fullAccessTurnIds = new Set<string>();
   const interruptedRuns = new Set<string>();
   const processProjector = new TurnProcessProjector(options.execution);
   const providerCommands = new PiProviderCommandApplicationService(options.commandDeliveries, options.now, options.redactSensitiveText);
@@ -345,6 +347,13 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       providerState: blocksResume ? 'paused' : 'ready',
       status: 'open',
     });
+  }
+
+  /** 当前轮次授权只改变后续新工具调用；计划模式和只读模式仍保持只读。 */
+  function contextForPiTool(context: PiConversationContext, run: PiRunContext | undefined): PiConversationContext {
+    if (!run || context.workMode === 'plan' || !fullAccessTurnIds.has(run.turnId)) return context;
+    if (effectiveToolPermission(context.permissionMode, context.workMode) === 'read-only') return context;
+    return { ...context, permissionMode: 'full-access' };
   }
 
   async function startConversation(input: StartPiConversationInput) {
@@ -1806,6 +1815,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         });
         options.conversations.upsertProviderTokenUsageSnapshot(run.conversationId, usageSnapshot);
       }
+      fullAccessTurnIds.delete(run.turnId);
       runs.delete(event.nativeRunId);
       /** 与原生链一致，在轮次终态前发布确认项，避免前端提前释放实时订阅。 */
       let createdPlan: ReturnType<ConversationPlanActionRepository['createPending']> | undefined;
@@ -1977,8 +1987,10 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   }
 
   async function executeToolRaw(request: PiZeusToolRequest): Promise<PiZeusToolResult> {
-    const context = contexts.get(request.session.nativeSessionId);
-    if (!context) throw piError('ZEUS_PI_TOOL_SESSION_UNBOUND', 'Pi 工具请求没有对应的 Zeus 会话。');
+    const baseContext = contexts.get(request.session.nativeSessionId);
+    if (!baseContext) throw piError('ZEUS_PI_TOOL_SESSION_UNBOUND', 'Pi 工具请求没有对应的 Zeus 会话。');
+    const activeRun = [...runs.values()].reverse().find((candidate) => candidate.providerThreadId === request.session.nativeSessionId);
+    const context = contextForPiTool(baseContext, activeRun);
     if (['spawn_agent', 'followup_task', 'list_agents', 'wait_agent', 'stop_agent'].includes(request.toolName)) {
       const run = [...runs.values()].find((candidate) => candidate.conversationId === context.conversationId);
       if (!run) throw piError('ZEUS_PI_RUN_NOT_ACTIVE', '子代理操作没有对应的活动轮次。');
@@ -2063,7 +2075,6 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     }
     const nativeTool = zeusToolBroker?.registry.resolvePiTool(request.toolName) ?? null;
     if (nativeTool) {
-      const activeRun = [...runs.values()].reverse().find((candidate) => candidate.providerThreadId === request.session.nativeSessionId);
       if (!activeRun) throw piError('ZEUS_PI_RUN_NOT_ACTIVE', 'Pi 原生工具没有对应的活动轮次。');
       if (
         (nativeTool.namespace !== 'zeus_work' || context.workMode === 'plan') &&
@@ -2103,7 +2114,6 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       const escalated = request.args.sandbox_permissions === 'require_escalated';
       if (escalated && effectiveToolPermission(context.permissionMode, context.workMode) === 'read-only') throw piError('ZEUS_PI_TOOL_READ_ONLY', '只读或计划模式不能升级到可写执行权限。');
       if (escalated && context.permissionMode !== 'full-access' && !(await requestApproval(context, request))) throw piError('ZEUS_PI_TOOL_DECLINED', '用户已拒绝命令权限升级。');
-      const activeRun = [...runs.values()].reverse().find((candidate) => candidate.conversationId === context.conversationId);
       if (!activeRun) throw piError('ZEUS_PI_RUN_NOT_ACTIVE', '命令没有对应的活动轮次。');
       /** 短等待只返回进程句柄，实际非零退出仍作为失败工具结果交给模型和界面。 */
       const result = await options.processes.start(
@@ -2772,6 +2782,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           });
           throw error;
         }
+        fullAccessTurnIds.delete(run.turnId);
         runs.delete(input.providerTurnId);
         interruptedRuns.delete(input.providerTurnId);
         publish('conversation.turn.completed', run.conversationId, { turnId: run.providerTurnId, submissionId: run.submissionId, status: 'interrupted', completedAt: timestamp, notificationEligible: true });
@@ -2788,9 +2799,12 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       if (computerStopFailure) throw computerStopFailure.error;
       return { submissionId: run.submissionId };
     },
-    async respondToRequest(input: { requestId: string; response: unknown }): Promise<void> {
+    async respondToRequest(input: { requestId: string; response: unknown; grantFullAccess?: boolean }): Promise<void> {
       const request = options.requests.getById(input.requestId);
       if (!request || request.status !== 'pending') throw piError('ZEUS_PI_APPROVAL_NOT_PENDING', 'Pi 工具审批已不在等待。');
+      if (input.grantFullAccess && request.requestKind !== 'command' && request.requestKind !== 'file') {
+        throw piError('ZEUS_INVALID_SERVER_REQUEST_RESPONSE', '完全访问只能用于命令或文件审批。');
+      }
       const pending = pendingApprovals.get(request.id);
       const activeRun = [...runs.values()].reverse().find((candidate) => candidate.conversationId === request.conversationId);
       if (request.requestKind === 'request_user_input') {
@@ -2832,6 +2846,14 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       }
       if (!pending) throw piError('ZEUS_PI_APPROVAL_CHANNEL_UNAVAILABLE', '原工具审批通道已断开；不能自动重放可能已执行的操作。');
       if (!activeRun || activeRun.turnId !== request.turnId) throw piError('ZEUS_PI_QUESTION_TURN_CHANGED', '原问题所属轮次已结束，不能向其他轮次提交回答。');
+      if (input.grantFullAccess) {
+        const context = contexts.get(activeRun.providerThreadId);
+        if (!context || context.workMode === 'plan' || effectiveToolPermission(context.permissionMode, context.workMode) === 'read-only') {
+          throw piError('ZEUS_PI_TOOL_READ_ONLY', '只读或计划模式不能授予当前轮次完全访问。');
+        }
+        if (!readApprovalDecision(input.response)) throw piError('ZEUS_INVALID_SERVER_REQUEST_RESPONSE', '完全访问必须伴随批准决定。');
+        fullAccessTurnIds.add(activeRun.turnId);
+      }
       const activeTurn = activeRun ? options.turns.getById(activeRun.turnId) : undefined;
       const timestamp = options.now();
       if (activeTurn) options.turns.upsert({ ...activeTurn, status: 'running', completedAt: null, updatedAt: timestamp, agentKind: 'pi', nativeRunId: activeRun?.providerTurnId ?? null });
@@ -2845,6 +2867,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       unsubscribe();
       for (const pending of pendingApprovals.values()) pending.resolve(false);
       pendingApprovals.clear();
+      fullAccessTurnIds.clear();
       await Promise.all([driver.close({ mode: 'final' }), options.configuredMcp?.close()]);
       await Promise.all(eventTails.values());
     },

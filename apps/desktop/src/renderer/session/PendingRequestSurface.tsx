@@ -45,8 +45,9 @@ export interface PendingRequestSurfaceProps {
   error?: string | null;
   autoFocus?: boolean;
   onRespond: (requestId: string, response: Record<string, unknown>) => void | Promise<void>;
-  /** 先保存后续轮次的完全访问模式，再批准当前请求。 */
+  /** 先保存后续轮次的完全访问模式，再批准当前请求并授权当前 Pi 轮次的新工具调用。 */
   onRespondWithFullAccess?: (requestId: string, response: Record<string, unknown>) => void | Promise<void>;
+  agentKind?: 'codex' | 'pi';
   permissionMode?: NativePermissionMode;
   filePaths?: readonly string[];
   onSnooze?: () => void | Promise<void>;
@@ -105,6 +106,7 @@ const labels = {
     similarCommandRule: '适用规则',
     fullAccess: '允许所有（完全访问）',
     fullAccessScope: '允许本次，完全访问从下一轮生效',
+    fullAccessScopePi: '允许本次及当前轮次后续新工具调用，后续轮次继续完全访问',
     allEditScope: '把本次文件授权交给 Codex，并允许它在本会话中沿用。请先核对上方显示的访问范围。',
   },
   'en-US': {
@@ -152,6 +154,7 @@ const labels = {
     similarCommandRule: 'Applies to',
     fullAccess: 'Allow all (full access)',
     fullAccessScope: 'Allow this request; full access starts next turn',
+    fullAccessScopePi: 'Allow this request and new tool calls in this turn; full access continues next turn',
     allEditScope: 'Send this file grant to Codex and allow it to reuse the decision during this session. Review the displayed scope first.',
   },
 } as const;
@@ -215,6 +218,7 @@ export function PendingRequestSurface(props: PendingRequestSurfaceProps) {
           request={props.request}
           kind={kind}
           language={props.language}
+          agentKind={props.agentKind}
           decisions={compactDecisions}
           filePaths={filePaths}
           busy={props.busy === true}
@@ -288,6 +292,7 @@ interface CompactApprovalPanelProps {
   request: NativePendingRequest;
   kind: 'command' | 'file';
   language: SessionUiLanguage;
+  agentKind?: 'codex' | 'pi';
   decisions: SupportedRequestDecision[];
   filePaths: readonly string[];
   busy: boolean;
@@ -296,7 +301,7 @@ interface CompactApprovalPanelProps {
   approvalIssue: ApprovalIssue | null;
   permissionMode: NativePermissionMode;
   onDecision: (decision: SupportedRequestDecision) => void;
-  /** 完全访问属于会话设置，不伪造成引擎支持的审批决定。 */
+  /** 完全访问入口属于会话设置；Pi 额外把专用标记带给当前轮次，Codex 仍按原引擎审批协议处理。 */
   onAllowFullAccess?: () => void;
 }
 
@@ -458,7 +463,7 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
                       {decision === 'full-access' ? (
                         <small>
                           <Info aria-hidden="true" />
-                          {copy.fullAccessScope}
+                          {props.agentKind === 'pi' ? copy.fullAccessScopePi : copy.fullAccessScope}
                         </small>
                       ) : null}
                     </button>
