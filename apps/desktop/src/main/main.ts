@@ -2421,7 +2421,7 @@ function setupTray(): void {
     /** 按路径同时加载 18×18 原图和 36×36 的 @2x 副本，让系统按屏幕密度选择清晰资源。 */
     const trayIcon = nativeImage.createFromPath(trayIconPath);
     if (trayIcon.isEmpty()) throw new Error(`Zeus tray icon is empty: ${trayIconPath}`);
-    trayIcon.setTemplateImage(true);
+    trayIcon.setTemplateImage(false);
     tray = new Tray(trayIcon);
     tray.setToolTip(desktopDisplayName());
     tray.setIgnoreDoubleClickEvents(true);
