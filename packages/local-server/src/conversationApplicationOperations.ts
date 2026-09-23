@@ -1534,13 +1534,19 @@ export function createConversationApplicationOperations(dependencies: Conversati
     const participant = conversationExperts.getParticipantByChildConversation(providerRequest.conversationId);
     const runtimeConversation = providerRequest.conversationId === conversation.id ? conversation : participant?.conversationId === conversation.id ? conversations.getById(providerRequest.conversationId) : undefined;
     if (!runtimeConversation) throw Object.assign(nativeApiError('ZEUS_CODEX_SERVER_REQUEST_NOT_FOUND', 'Codex server request not found'), { statusCode: 404 });
-    const response = normalizeNativeServerRequestResponse(providerRequest.requestKind, input.response);
+    const requestedFullAccess = input.response.zeusGrantFullAccess;
+    if (requestedFullAccess !== undefined && typeof requestedFullAccess !== 'boolean') {
+      throw nativeApiError('ZEUS_INVALID_SERVER_REQUEST_RESPONSE', 'zeusGrantFullAccess must be a boolean.');
+    }
+    const providerResponse = { ...input.response };
+    delete providerResponse.zeusGrantFullAccess;
+    const response = normalizeNativeServerRequestResponse(providerRequest.requestKind, providerResponse);
     const project = projects.getById(conversation.projectId);
     if (!project) throw Object.assign(nativeApiError('ZEUS_PROJECT_NOT_FOUND', 'Conversation project not found.'), { statusCode: 404 });
-    const answerAttachmentInput = normalizeRequestUserInputAnswerAttachments(providerRequest, input.response, project.localPath);
+    const answerAttachmentInput = normalizeRequestUserInputAnswerAttachments(providerRequest, providerResponse, project.localPath);
     if (runtimeConversation.agentKind === 'pi') {
       if (answerAttachmentInput.groups.length > 0) throw nativeApiError('ZEUS_REQUEST_ANSWER_ATTACHMENTS_UNSUPPORTED', 'Pi request answers do not support structured attachments.');
-      await piNativeCoordinator.respondToRequest({ requestId: providerRequest.id, response });
+      await piNativeCoordinator.respondToRequest({ requestId: providerRequest.id, response, ...(requestedFullAccess === true ? { grantFullAccess: true } : {}) });
     } else {
       await codexNativeCoordinator.respondToRequest({
         requestId: providerRequest.id,

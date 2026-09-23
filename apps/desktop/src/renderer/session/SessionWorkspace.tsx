@@ -2171,7 +2171,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     }
   }
 
-  /** 完全访问先持久化后续轮次设置；失败时保留待审批请求，避免仅批准本次。 */
+  /** 完全访问先持久化后续轮次设置，再把当前 Pi 轮次的新工具调用切换为完全访问。 */
   async function respond(request: NativePendingRequest, response: Record<string, unknown>, fullAccess = false): Promise<void> {
     if (!actions.onRespondToRequest || !responseGuard.begin(request.id)) return;
     const conversationId = workspaceIdentityRef.current;
@@ -2183,13 +2183,13 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     try {
       if (fullAccess) {
         if (!composerRuntimeSettings || !actions.onNextTurnSettingsChange) throw new Error('完全访问设置暂不可用，请刷新后重试。');
-        /** 正在执行的轮次保留冻结权限，只更改后续轮次的设置。 */
+        /** 后续轮次沿用完全访问；当前轮次通过专用响应标记获得同等授权。 */
         const settings = { ...composerRuntimeSettings, permissionMode: 'full-access' as const };
         await actions.onNextTurnSettingsChange(settings);
         if (workspaceIdentityRef.current !== conversationId) return;
         updateComposerRuntimeSettings(settings);
       }
-      await actions.onRespondToRequest(request.id, response);
+      await actions.onRespondToRequest(request.id, fullAccess ? { ...response, zeusGrantFullAccess: true } : response);
     } catch (error) {
       if (workspaceIdentityRef.current !== conversationId) return;
       setRequestErrors((current) => ({ ...current, [request.id]: reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }) }));
@@ -2544,6 +2544,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
             key={blockingPendingRequest.id}
             request={blockingPendingRequest}
             language={props.language}
+            agentKind={props.state?.snapshot?.agent?.kind === 'pi' || props.conversation?.agent?.kind === 'pi' ? 'pi' : 'codex'}
             permissionMode={props.state?.snapshot?.permissionMode ?? 'read-only'}
             filePaths={linkedFileApprovalPaths(props.state, blockingPendingRequest)}
             autoFocus
