@@ -3,9 +3,22 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ZeusPluginServiceError, type ZeusPluginInstallSource, type ZeusPluginService } from './zeusPluginService.js';
 import { ZeusPluginSourceError, type ZeusPluginDirectSource } from './zeusPluginSource.js';
 import type { ZeusConversationPluginRuntime } from './zeusConversationPluginRuntime.js';
+import type { CodexMcpCatalog } from '@zeus/shared';
 
-export function registerZeusPluginRoutes(options: { server: FastifyInstance; plugins?: ZeusPluginService; runtime?: ZeusConversationPluginRuntime; dangerouslyBypassHookTrust?: boolean; hasProject(projectId: string): boolean }): void {
+export function registerZeusPluginRoutes(options: {
+  server: FastifyInstance;
+  plugins?: ZeusPluginService;
+  runtime?: ZeusConversationPluginRuntime;
+  inspectCodexMcp?: () => Promise<CodexMcpCatalog>;
+  dangerouslyBypassHookTrust?: boolean;
+  hasProject(projectId: string): boolean;
+}): void {
   const { server } = options;
+
+  server.get('/api/codex/mcp-servers', async (_request, reply) => {
+    if (!options.inspectCodexMcp) return unavailable(reply);
+    return options.inspectCodexMcp();
+  });
 
   server.get('/api/plugins', async (request: FastifyRequest<{ Querystring: { projectId?: string } }>, reply) => {
     if (!options.plugins) return unavailable(reply);

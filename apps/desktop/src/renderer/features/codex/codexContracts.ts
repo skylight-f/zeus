@@ -1,3 +1,4 @@
+export type { CodexMcpCatalog } from '@zeus/shared';
 export type CodexLegacyImportRunStatus = 'prepared' | 'waiting' | 'completed' | 'failed';
 
 export interface CodexLegacyImportEligibleSession {

@@ -601,6 +601,23 @@
   margin: 0;
 }
 
+.macos-ai-app .extension-mcp-sources {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.macos-ai-app .extension-mcp-sources dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.macos-ai-app .extension-mcp-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
 .macos-ai-app .extension-component-row {
   align-items: center;
   display: flex;

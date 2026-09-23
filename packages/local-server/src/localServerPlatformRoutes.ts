@@ -293,6 +293,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     closeTaskResourcesForTerminalStatus,
     codexAppServerManager,
     codexConfigImportService,
+    codexMcpConfiguration,
     zeusSkillDefaultCwd,
     zeusSkillService,
     zeusPluginService,
@@ -1162,6 +1163,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   });
   registerZeusPluginRoutes({
     server,
+    inspectCodexMcp: codexMcpConfiguration?.inspect,
     plugins: zeusPluginService,
     runtime: zeusConversationPluginRuntime,
     dangerouslyBypassHookTrust: dangerouslyBypassPluginHookTrust === true,

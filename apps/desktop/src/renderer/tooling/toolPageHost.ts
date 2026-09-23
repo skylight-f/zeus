@@ -9,6 +9,7 @@ export { ZeusSelect } from '../ZeusSelect.js';
 export {
   type PluginApprovalMode,
   type PluginDescriptor,
+  type CodexMcpCatalog,
   type PluginDirectSource,
   type PluginInstallSource,
   type PluginMarketplaceCatalog,

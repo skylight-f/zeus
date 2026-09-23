@@ -15,6 +15,7 @@ import {
   type CodexResponsesRuntime,
   createAiRuntimeSessionManager,
   createCodexRuntimeGenerationManager,
+  createCodexMcpConfiguration,
   createOptionalNodePtyRuntimeSpawn,
   isOfficialDeepSeekResponsesModel,
   listAiCliAdapters,
@@ -1490,6 +1491,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           now,
         })
       : undefined;
+  const codexMcpConfiguration = codexHome ? createCodexMcpConfiguration({ sourceRoot: options.codexConfigImportSourceRoot, codexHome, toolRuntimeCodexHome: dataLayout.codexToolRuntimeHome }) : undefined;
   const browserAttachmentRoot = readOnlyValidation ? undefined : prepareTaskAttachmentRoot(options.browserAttachmentRoot ?? dataLayout.browserComments);
   const conversationAttachmentRoot = readOnlyValidation ? undefined : prepareTaskAttachmentRoot(options.conversationAttachmentRoot ?? dataLayout.conversationAttachments);
   const trustedConversationAttachmentRoots = [taskAttachmentRoot, browserAttachmentRoot, conversationAttachmentRoot].filter((root): root is string => Boolean(root));
@@ -1643,6 +1645,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       accountFingerprintSalt: codexAccountFingerprintSalt,
       ...(codexHome ? { codexHome } : {}),
       toolRuntimeCodexHome: dataLayout.codexToolRuntimeHome,
+      readMcpThreadConfig: codexMcpConfiguration?.threadConfig,
     });
   const codexPublicCommands = new CodexPublicCommandApplicationService({
     db,
@@ -3474,6 +3477,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     closeTaskResourcesForTerminalStatus,
     codexAppServerManager,
     codexConfigImportService,
+    codexMcpConfiguration,
     codexHome,
     zeusSkillDefaultCwd: codexHome ?? dataLayout.codexHome,
     zeusSkillService,
