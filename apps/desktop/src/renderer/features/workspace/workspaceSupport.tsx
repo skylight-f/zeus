@@ -237,6 +237,7 @@ export type NativeConversationAppClient = SessionControllerClient &
     | 'loadPlugins'
     | 'loadPluginRuntimeStatus'
     | 'loadMcpConfiguration'
+    | 'loadCodexMcpServers'
     | 'installPlugin'
     | 'updatePlugin'
     | 'setPluginEnabled'

@@ -12,6 +12,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { resolveCliSearchPath } from './cliSearchPath.js';
+import type { createCodexMcpConfiguration } from './codexMcpConfiguration.js';
 
 interface RuntimeEntry {
   manager: CodexAppServerManager;
@@ -104,6 +105,7 @@ export function createCodexRuntimeGenerationManager(
     accountFingerprintSalt?: string;
     codexHome?: string;
     toolRuntimeCodexHome?: string;
+    readMcpThreadConfig?: ReturnType<typeof createCodexMcpConfiguration>['threadConfig'];
     runtimeEnvironment?: Record<string, string>;
     providerVersionProbe?: (commandPath: string) => Promise<string | null>;
     /** 目录检查间隔；官方组件仍自行决定是否需要联网。 */
@@ -433,6 +435,7 @@ export function createCodexRuntimeGenerationManager(
       ...(options.accountFingerprintSalt ? { accountFingerprintSalt: options.accountFingerprintSalt } : {}),
       ...(options.codexHome ? { codexHome: options.codexHome } : {}),
       runtimeEnvironment,
+      readMcpThreadConfig: options.readMcpThreadConfig,
       ...(appServerFlags.length > 0 ? { appServerFlags } : {}),
       providerVersionFallback,
     });

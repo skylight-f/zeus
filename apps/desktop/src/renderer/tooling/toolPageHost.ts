@@ -10,6 +10,7 @@ export {
   type McpConfigurationCatalog,
   type PluginApprovalMode,
   type PluginDescriptor,
+  type CodexMcpCatalog,
   type PluginDirectSource,
   type PluginInstallSource,
   type PluginMarketplaceCatalog,

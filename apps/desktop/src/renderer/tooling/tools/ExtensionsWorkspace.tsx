@@ -18,6 +18,7 @@ import { ExtensionSourceFields, emptyExtensionSource, type ExtensionSourceDraft 
 import { ZeusApiError } from '../toolPageHost.js';
 import { SkillsWorkspace } from './SkillsWorkspace.js';
 import { skillCatalogChangedEvent } from '../toolPageHost.js';
+import { CodexMcpCatalog } from './CodexMcpCatalog.js';
 
 type ExtensionsClient = Pick<
   NativeConversationAppClient,
@@ -27,6 +28,7 @@ type ExtensionsClient = Pick<
   | 'loadPlugins'
   | 'loadMcpConfiguration'
   | 'loadPluginRuntimeStatus'
+  | 'loadCodexMcpServers'
   | 'installPlugin'
   | 'updatePlugin'
   | 'setPluginEnabled'
@@ -42,7 +44,7 @@ type ExtensionsClient = Pick<
   | 'setPluginMcpPolicy'
 >;
 
-type Tab = 'plugins' | 'skills' | 'marketplaces';
+type Tab = 'plugins' | 'skills' | 'marketplaces' | 'mcp';
 
 /** 扩展管理统一承载插件、技能、来源目录及操作状态。 */
 export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; language: 'zh-CN' | 'en-US'; projectId?: string | null; onChooseDirectory?: () => Promise<string | null> }) {
@@ -168,9 +170,9 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         <div className="skills-workspace-title-row">
           <div>
             <h1>{zh ? '扩展管理' : 'Extension management'}</h1>
-            <p>{zh ? '管理插件、技能和来源。更改用于新对话，进行中的对话保持原配置。' : 'Install and manage plugins here. Changes apply to conversations created afterward.'}</p>
+            <p>{zh ? '管理插件、MCP 服务、技能和来源。插件与技能更改用于新对话。' : 'Manage plugins, MCP servers, skills and sources. Plugin and skill changes apply to new conversations.'}</p>
           </div>
-          {tab !== 'skills' ? (
+          {tab !== 'skills' && tab !== 'mcp' ? (
             <Button
               variant="secondary"
               size="regular"
@@ -186,7 +188,7 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
           ) : null}
         </div>
         <nav className="extension-tabs" aria-label={zh ? '扩展类型' : 'Extension type'}>
-          {(['plugins', 'skills', 'marketplaces'] as const).map((value) => (
+          {(['plugins', 'mcp', 'skills', 'marketplaces'] as const).map((value) => (
             <button key={value} type="button" className={tab === value ? 'is-active' : ''} aria-current={tab === value ? 'page' : undefined} onClick={() => setTab(value)}>
               {tabLabel(value, zh)}
             </button>
@@ -208,6 +210,7 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         </p>
       ) : null}
       {tab === 'skills' ? <SkillsWorkspace client={props.client} language={props.language} onChooseDirectory={props.onChooseDirectory} embedded /> : null}
+      {tab === 'mcp' ? <CodexMcpCatalog client={props.client} zh={zh} /> : null}
       {tab === 'plugins' ? (
         <>
           <McpServiceCatalog
@@ -225,6 +228,7 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
           <PluginCatalog plugins={plugins} zh={zh} busyKey={busyKey} expanded={expanded} onExpanded={setExpanded} onInstall={() => setInstallOpen(true)} onMutate={mutate} client={props.client} />
         </>
       ) : null}
+
       {tab === 'marketplaces' ? <MarketplaceCatalog marketplaces={marketplaces} plugins={plugins} zh={zh} busyKey={busyKey} onAdd={() => setMarketplaceOpen(true)} onMutate={mutate} client={props.client} /> : null}
 
       <MotionPresence>
@@ -758,6 +762,7 @@ function SourceDialog(props: {
 
 /** 导航使用当前语言的产品名称。 */
 function tabLabel(tab: Tab, zh: boolean): string {
+  if (tab === 'mcp') return zh ? 'MCP 服务' : 'MCP servers';
   if (tab === 'plugins') return zh ? '插件' : 'Plugins';
   if (tab === 'marketplaces') return zh ? '插件市场' : 'Marketplaces';
   return zh ? '技能' : 'Skills';

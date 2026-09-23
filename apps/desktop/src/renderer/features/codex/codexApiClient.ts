@@ -119,6 +119,7 @@ export interface CodexApiClient {
   loadPlugins: (projectId?: string) => Promise<import('./codexContracts.js').PluginDescriptor[]>;
   loadMcpConfiguration: () => Promise<import('./codexContracts.js').McpConfigurationCatalog>;
   loadPluginRuntimeStatus: () => Promise<{ available: boolean; dangerouslyBypassHookTrust: boolean }>;
+  loadCodexMcpServers: () => Promise<import('./codexContracts.js').CodexMcpCatalog>;
   installPlugin: (input: { scope: import('./codexContracts.js').PluginScope; projectId?: string | null; source: import('./codexContracts.js').PluginInstallSource }) => Promise<import('./codexContracts.js').PluginDescriptor>;
   updatePlugin: (pluginId: string) => Promise<import('./codexContracts.js').PluginDescriptor>;
   setPluginEnabled: (pluginId: string, enabled: boolean, expectedRevision?: number) => Promise<import('./codexContracts.js').PluginDescriptor>;
@@ -433,6 +434,7 @@ export function createCodexApiClient(transport: LocalApiTransport): CodexApiClie
     },
     loadMcpConfiguration: () => transport.request<import('./codexContracts.js').McpConfigurationCatalog>('/api/mcp-configuration'),
     loadPluginRuntimeStatus: () => transport.request<{ available: boolean; dangerouslyBypassHookTrust: boolean }>('/api/plugin-runtime-status'),
+    loadCodexMcpServers: () => transport.request<import('./codexContracts.js').CodexMcpCatalog>('/api/codex/mcp-servers'),
     installPlugin: (input) => transport.request<import('./codexContracts.js').PluginDescriptor>('/api/plugins/install', { method: 'POST', body: JSON.stringify({ ...input, projectId: input.projectId ?? null }) }),
     updatePlugin: (pluginId) => transport.request<import('./codexContracts.js').PluginDescriptor>(`/api/plugins/${encodeURIComponent(pluginId)}/update`, { method: 'POST' }),
     setPluginEnabled: (pluginId, enabled, expectedRevision) =>

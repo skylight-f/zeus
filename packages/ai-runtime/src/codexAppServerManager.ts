@@ -566,6 +566,8 @@ interface CreateCodexAppServerManagerOptions {
   generationId?: () => string;
   requestTimeoutMs?: number;
   appServerFlags?: readonly string[];
+  /** 每次新建或恢复线程时读取 MCP 兼容配置；不经命令行传递认证值。 */
+  readMcpThreadConfig?: (nativeMcpServers: unknown) => Promise<Record<string, JsonValue>>;
   onRestartScheduled?: (delayMs: number, attempt: number) => void;
   onDiagnostic?: (entry: { generationId: string; sequence: number; stderrSummary: string }) => void;
   eventReplayLimit?: number;
@@ -715,6 +717,13 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
   function currentGenerationId(): string {
     if (state.type === 'idle' || state.type === 'closed') throw managerError('ZEUS_CODEX_NOT_READY', 'Codex app-server is not ready.');
     return state.generationId;
+  }
+
+  /** 原生解析器决定可信项目与 profile 的覆盖关系，外部 Home 只补充未配置的 MCP。 */
+  async function readMcpThreadConfig(generationId: string, cwd?: string): Promise<Record<string, JsonValue>> {
+    if (!options.readMcpThreadConfig) return {};
+    const response = asRecord(await rpc(generationId, 'config/read', { includeLayers: false, ...(cwd ? { cwd } : {}) }));
+    return options.readMcpThreadConfig(asRecord(response.config).mcp_servers);
   }
 
   /** 使用与版本检测一致的程序环境；直接创建的管理器也支持终端安装目录。 */
@@ -1564,6 +1573,7 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
             // 原生线程及其子任务也不能隐式取得整个系统临时目录的写权限。
             config: {
               ...contextCapacityConfig(input.contextCapacityTokens),
+              ...(await readMcpThreadConfig(capabilities.generationId, input.cwd)),
               'sandbox_workspace_write.exclude_tmpdir_env_var': true,
               'sandbox_workspace_write.exclude_slash_tmp': true,
               // 原生新内核把主代理计入并发数；五个执行名额对应四个子代理。
@@ -1622,6 +1632,7 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
             cwd: input.cwd,
             config: {
               ...contextCapacityConfig(input.contextCapacityTokens),
+              ...(await readMcpThreadConfig(capabilities.generationId, input.cwd)),
               // 恢复与新建遵守同一权限和子代理上限，不能恢复旧默认值。
               'sandbox_workspace_write.exclude_tmpdir_env_var': true,
               'sandbox_workspace_write.exclude_slash_tmp': true,
