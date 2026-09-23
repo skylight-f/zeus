@@ -20,8 +20,8 @@ export interface PresentedModelOption {
   label: string;
   group?: string;
   searchText: string;
-  /** 置顶区仍需标明供应商，单供应商目录也保留来源。 */
-  description: string;
+  /** 置顶区和单供应商目录需要来源；已有供应商分组时不重复渲染。 */
+  description?: string;
 }
 
 export interface ModelOptionPresentation<Model extends ModelOptionSource> {
@@ -35,8 +35,15 @@ export interface ModelOptionPresentation<Model extends ModelOptionSource> {
   pinning: ZeusSelectPinning;
 }
 
+/** 将旧版内置供应商名称映射为当前对用户展示的 OpenAI。 */
+export function modelSourceDisplayName(sourceName: string | null | undefined): string | undefined {
+  const normalized = sourceName?.trim();
+  if (!normalized) return undefined;
+  return normalized.toLowerCase() === 'codex' ? 'OpenAI' : normalized;
+}
+
 function providerName(model: ModelOptionSource, zh: boolean): string {
-  return model.sourceName?.trim() || (zh ? '未命名供应商' : 'Unnamed provider');
+  return modelSourceDisplayName(model.sourceName) || (zh ? '未命名供应商' : 'Unnamed provider');
 }
 
 function modelName(model: ModelOptionSource): string {
@@ -111,7 +118,7 @@ export function presentModelOptions<Model extends ModelOptionSource>(
         label: badges.length > 0 ? `${displayName} · ${badges.join(' · ')}` : displayName,
         ...(showProviderGroups ? { group: group.providerName } : {}),
         searchText: `${group.providerName} ${displayName} ${model.model}${contextBadge ? ' 1M' : ''}`,
-        description: group.providerName,
+        description: showProviderGroups ? undefined : group.providerName,
       } satisfies PresentedModelOption;
     }),
   );

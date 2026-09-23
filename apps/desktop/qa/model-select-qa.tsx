@@ -7,7 +7,7 @@ import { GoalPanel } from '../src/renderer/session/GoalPanel.js';
 
 /** 固定目录包含同名模型、长名称、不可用项；仅供本机预览，不连接模型服务。 */
 const models = [
-  ...['GPT-6-Astra', 'GPT-5.3-Codex-Spark', 'GPT-5.5', 'GPT-5.6-Luna', 'GPT-5.6-Sol', 'GPT-5.6-Terra'].map((name) => ({ id: `codex:${name}`, model: name, sourceName: 'Codex' })),
+  ...['GPT-6-Astra', 'GPT-5.3-Codex-Spark', 'GPT-5.5', 'GPT-5.6-Luna', 'GPT-5.6-Sol', 'GPT-5.6-Terra'].map((name) => ({ id: `codex:${name}`, model: name, sourceName: 'OpenAI' })),
   ...['1XM', 'APIKey'].flatMap((sourceName) => ['Claude Fable 5', 'Claude Opus 5'].map((name) => ({ id: `${sourceName}:${name}`, model: name, sourceName }))),
   { id: 'long:model', model: 'Model with a deliberately long name for narrow window inspection', sourceName: 'Long provider name' },
   { id: 'unavailable:model', model: '不可用模型', sourceName: 'Unavailable', available: false },

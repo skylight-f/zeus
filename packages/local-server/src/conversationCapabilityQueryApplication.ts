@@ -388,7 +388,7 @@ function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSna
     agentKind: 'codex',
     supports1MContext: false,
     sourceId: 'codex',
-    sourceName: 'Codex',
+    sourceName: 'OpenAI',
     available: true,
     availabilityReason: 'Codex app-server 已报告该模型。',
     supportedReasoningEfforts: [...model.supportedReasoningEfforts],
