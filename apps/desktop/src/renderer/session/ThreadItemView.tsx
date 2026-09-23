@@ -27,6 +27,7 @@ import { useApplicationErrorDialog, VisibleApplicationError } from '../ui/Applic
 import { ConversationMarkdown, conversationMarkdownPhaseForStatus, type StructuredMessageToken } from './ConversationMarkdown.js';
 import { McpAppFrame, type McpAppToolCall, type McpAppToolResult } from './McpAppFrame.js';
 import { AnsweredRequestHistory, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
+import { modelSourceDisplayName } from '../modelOptionPresentation.js';
 
 export type SessionUiLanguage = 'zh-CN' | 'en-US';
 export type ThreadItemRole = 'user' | 'assistant' | 'commentary' | 'notice' | 'tool' | 'file' | 'image' | 'request' | 'error' | 'unknown';
@@ -40,8 +41,8 @@ const STREAM_STRUCTURED_IDLE_FLUSH_MS = 180;
 const copy = {
   'zh-CN': {
     user: '你',
-    assistant: 'Codex',
-    commentary: 'Codex',
+    assistant: 'OpenAI',
+    commentary: 'OpenAI',
     notice: '速度提示',
     tool: '工具调用',
     file: '文件变更',
@@ -89,8 +90,8 @@ const copy = {
   },
   'en-US': {
     user: 'You',
-    assistant: 'Codex',
-    commentary: 'Codex',
+    assistant: 'OpenAI',
+    commentary: 'OpenAI',
     notice: 'Speed notice',
     tool: 'Tool call',
     file: 'File change',
@@ -1101,12 +1102,12 @@ function roleLabel(role: ThreadItemRole, labels: (typeof copy)[SessionUiLanguage
 
 function providerRoleLabel(item: NativeSessionItemBuffer, role: ThreadItemRole, fallback?: string): string | null {
   if (role !== 'assistant' && role !== 'commentary') return null;
-  const sourceName = primitiveText(item.payload.modelSourceName);
+  const sourceName = modelSourceDisplayName(primitiveText(item.payload.modelSourceName));
   if (sourceName) return sourceName;
   const agentKind = primitiveText(item.payload.agentKind);
   if (agentKind === 'pi') return 'Pi';
   if (agentKind === 'claude') return 'Claude';
-  if (agentKind === 'codex') return 'Codex';
+  if (agentKind === 'codex') return 'OpenAI';
   return fallback?.trim() || null;
 }
 

@@ -92,7 +92,7 @@ import { conversationDisplayTitle } from './conversationDisplayTitle.js';
 import { conversationRuntimePreferenceKind, readConversationRuntimePreferences, writeConversationRuntimePreferences } from './conversationRuntimePreferences.js';
 import { hasAvailableConversationModel, resolveModelCapability } from './modelSelection.js';
 import { GoalPanel, GoalRail } from './GoalPanel.js';
-import { presentModelOptions } from '../modelOptionPresentation.js';
+import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
 import { NewConversationExecutionContext } from './NewConversationExecutionContext.js';
 import { modelSetupRequestedEvent, reportApplicationError, useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
 import type { ConversationModelSetupContext } from '../settings/ModelSetup.js';
@@ -1880,7 +1880,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       reason: capabilityGoals?.supported && capabilityGoals?.enabled ? 'available' : capabilityGoals?.supported ? 'disabled' : 'unverified',
     } as const);
   const selectedComposerModel = resolveModelCapability(props.capabilities?.models, composerRuntimeSettings?.model ?? props.state?.snapshot?.nextTurnSettings?.model ?? props.state?.providerSettings?.model);
-  const assistantLabel = selectedComposerModel?.sourceName?.trim() || ((selectedComposerModel?.agentKind ?? props.state?.snapshot?.agent?.kind ?? props.conversation?.agent?.kind) === 'pi' ? 'Pi' : 'Codex');
+  const assistantLabel = modelSourceDisplayName(selectedComposerModel?.sourceName) || ((selectedComposerModel?.agentKind ?? props.state?.snapshot?.agent?.kind ?? props.conversation?.agent?.kind) === 'pi' ? 'Pi' : 'OpenAI');
   const goalAvailable = !legacy && (selectedComposerModel?.features?.goals.state === 'available' || (!selectedComposerModel?.features && goalCapability.supported && goalCapability.enabled));
   /** 历史会话可显式操作目标，归档、只读和不支持目标的会话仍禁止写入。 */
   const goalWritable = goalAvailable && !hardInteractionReadOnly;

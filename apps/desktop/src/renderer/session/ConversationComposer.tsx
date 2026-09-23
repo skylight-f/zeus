@@ -31,7 +31,7 @@ import { ServiceTierToggle } from './ServiceTierToggle.js';
 import { resolveModelCapability } from './modelSelection.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
-import { presentModelOptions } from '../modelOptionPresentation.js';
+import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
 import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
 import { findProjectModelServiceTierPreference, projectModelServiceTierSelection } from './projectServiceTierPreferences.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
@@ -172,7 +172,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const modelPresentation = useMemo(() => presentModelOptions(props.capabilities?.models ?? [], selectedModel, props.language, { preserveMissingSelection: true }), [props.capabilities?.models, props.language, selectedModel]);
   const effectiveModel = modelPresentation.selectedId || selectedModel;
   const selectedCapability = resolveModelCapability(modelPresentation.models, effectiveModel);
-  const providerLabel = selectedCapability?.sourceName?.trim() || (selectedCapability?.agentKind === 'pi' ? 'Pi' : 'Codex');
+  const providerLabel = modelSourceDisplayName(selectedCapability?.sourceName) || (selectedCapability?.agentKind === 'pi' ? 'Pi' : 'OpenAI');
   const inputLabel = copy.input(providerLabel);
   const settingsWritable = props.readOnly !== true && props.inputBlocked !== true && Boolean(selectedCapability);
   const modelSelectionWritable = props.readOnly !== true && props.inputBlocked !== true && modelPresentation.options.length > 0;
