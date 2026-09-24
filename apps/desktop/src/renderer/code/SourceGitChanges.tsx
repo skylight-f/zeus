@@ -420,6 +420,7 @@ export function SourceGitChanges(props: {
                         <SourceChangeTree
                           view={fileView}
                           files={files}
+                          submodules={item.snapshot.submodules?.map((module) => module.path) ?? []}
                           selected={selection[item.id] ?? []}
                           selectedPath={activeFile.startsWith(`${item.id}:`) ? activeFile.slice(item.id.length + 1) : ''}
                           zh={zh}
@@ -591,6 +592,7 @@ function SelectionCheckbox(props: { label: string; paths: string[]; selected: st
 function SourceChangeTree(props: {
   view: 'tree' | 'flat';
   files: GitFileStatusSummary[];
+  submodules: string[];
   selected: string[];
   selectedPath: string;
   zh: boolean;
@@ -659,7 +661,7 @@ function SourceChangeTree(props: {
               onClick={() => props.onOpen(file)}
               onDoubleClick={() => props.onOpenFile(file)}
             >
-              <GitFileStatusIcon category={gitFileStatusCategory(file)} zh={props.zh} />
+              {props.submodules.includes(file.path) ? <Folder aria-hidden="true" /> : <GitFileStatusIcon category={gitFileStatusCategory(file)} zh={props.zh} />}
               <span className="source-git-file-name">{props.view === 'flat' ? file.path.slice(file.path.lastIndexOf('/') + 1) : file.path.slice(prefix.length)}</span>
               {props.view === 'flat' && file.path.includes('/') ? <span className="source-git-file-directory">{file.path.slice(0, file.path.lastIndexOf('/'))}</span> : null}
             </button>

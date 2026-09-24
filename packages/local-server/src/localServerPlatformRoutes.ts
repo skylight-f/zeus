@@ -959,6 +959,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         return project ? { id: project.id, localPath: project.localPath } : undefined;
       },
       now,
+      /** 预览必须与真实派发一致地呈现全局规则。 */
+      agentRulesDirectory: dataLayout.agentRules,
     }),
   );
 
@@ -1010,7 +1012,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     async (
       request: FastifyRequest<{
         Params: { runId: string };
-        Body: { model?: unknown; prompt?: unknown };
+        Body: { prompt?: unknown };
       }>,
       reply,
     ) => {
@@ -1023,9 +1025,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         });
       }
       try {
-        const model = typeof request.body?.model === 'string' ? request.body.model : '';
         const prompt = typeof request.body?.prompt === 'string' ? request.body.prompt : '';
-        return await generateReleaseNotesWithDeepSeek(modelConnections, { model, prompt });
+        return await generateReleaseNotesWithDeepSeek(modelConnections, { prompt });
       } catch (error) {
         const statusCode = typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number' ? error.statusCode : 500;
         const code = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : 'ZEUS_RELEASE_NOTES_GENERATION_FAILED';
@@ -3438,7 +3439,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   registerGlobalAgentSettingsRoutes({
     server,
-    codexHome: dependencies.codexHome,
+    agentRulesDirectory: dataLayout.agentRules,
     commands: settingsCommands,
     redactSensitiveText,
     recordSaved: (metadata) => appendAuditLog({ actorType: 'local_api', action: 'settings.agents.updated', resourceType: 'settings', resourceId: 'agents', payload: { path: metadata.path, revision: metadata.revision } }),
@@ -3702,6 +3703,15 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     tasks,
     resolveRegisteredRuntimeAdapter: (command) => resolveRegisteredRuntimeAdapter(command, resolveInteractiveRuntimeShell(platformMutableState.runtimeSettings.shell).command),
     resolveExistingRuntimeSessionAdapter,
+    /** 复用会话执行目录的唯一来源，跨项目、跨任务或目录失效均不回退到主目录。 */
+    resolveConversationExecutionRoot: (projectId, taskId, conversationId) => {
+      /** 终端必须绑定界面正在查看的会话，不能任意指定其他任务的工作树。 */
+      const conversation = conversations.getRecordById(conversationId);
+      if (!conversation || conversation.projectId !== projectId || (conversation.taskId ?? undefined) !== taskId) return null;
+      /** 同时覆盖直接目录、任务环境以及会话独立工作树。 */
+      const root = resolveNativeConversationExecutionRoot(conversation);
+      return root && existsSync(root) && statSync(root).isDirectory() ? root : null;
+    },
     readProjectAllowsShell: (projectId) => readProjectConfig(projectId).security.allowShell,
     readTerminalStartupCommand: () => platformMutableState.runtimeSettings.terminalStartupCommand,
     buildRuntimeProcessEnv,

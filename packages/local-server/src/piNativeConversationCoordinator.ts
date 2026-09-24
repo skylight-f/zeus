@@ -52,7 +52,7 @@ import type {
   ZeusConversationWithMessagesRecord,
   ZeusDatabase,
 } from '@zeus/storage';
-import { projectConversationTurnFailure } from '@zeus/storage';
+import { isQueueMemberStatus, projectConversationTurnFailure } from '@zeus/storage';
 import type { ModelConnectionService } from './modelConnectionService.js';
 import type { BrowserAutomationPort } from './browserAutomation.js';
 import type { CreateCodexNativeConversationCoordinatorOptions, NativeConversationAttachmentInput, NativeConversationSkillInput } from './codexNativeConversationContracts.js';
@@ -61,6 +61,8 @@ import { hasUnwrittenSubmissionEvidence } from './unboundConversationArchiveAppl
 import type { ConversationSegmentLifecycle } from './conversationExecutionCoordinator.js';
 import type { ManagedConversationToolResultStore } from './conversationPortableContext.js';
 import { TurnProcessProjector } from './turnProcessProjector.js';
+import { isDurableConversationEventTooLarge } from './conversationSyncProtocol.js';
+import { boundLiveProcessPayload } from './livePayloadBudget.js';
 import type { ContextDispatchEnvelope, ProviderDispatchContextCompiler } from './contextDispatchService.js';
 import { PiProviderCommandApplicationService, type PiProviderCommandAttempt } from './piProviderCommandDelivery.js';
 import { projectLocallyAcceptedUserMessage } from './localUserSubmissionProjection.js';
@@ -260,11 +262,17 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       .then(() => handleRuntimeEvent(event))
       .catch(async (error: unknown) => {
         const message = options.redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        /** 只超出实时投影预算的失败不代表 Provider 结果未知：明细已落处理项存储，跳过本次推送即可。 */
+        if (isDurableConversationEventTooLarge(error)) {
+          console.error('Pi 事件超过实时投影预算，已跳过本次推送；完整明细保留在本地存储，刷新可见。', message);
+          return;
+        }
         console.error('Pi 事件未能完整保存，停止续跑并保留结果待核对。', message);
         const run = runs.get(runId);
         const context = run ? contexts.get(run.providerThreadId) : undefined;
         if (context) await driver.interruptRun({ session: context.session, nativeRunId: runId }).catch(() => undefined);
-        await handleRuntimeEvent({ ...event, type: 'runtime_error', payload: { code: 'ZEUS_PROVIDER_WORKER_RESULT_UNKNOWN', message } }).catch((failure: unknown) => {
+        /** 原始错误码与诊断随失败一起入库，避免把本地故障笼统报成 Provider 结果未知。 */
+        await handleRuntimeEvent({ ...event, type: 'runtime_error', payload: { code: 'ZEUS_PROVIDER_WORKER_RESULT_UNKNOWN', message, cause: failureCause(error) } }).catch((failure: unknown) => {
           console.error('Pi 失败状态无法落盘；保留存储故障供宿主恢复。', options.redactSensitiveText(String(failure)).text);
         });
       })
@@ -299,6 +307,16 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       const detail = asRecord(JSON.parse(processItem.detailJson));
       // 与历史回看使用同一转换，实时事件不再另造工具字段和类型。
       const presentation = conversationProcessPresentation(processItem.kind, detail);
+      /** 实时载荷先过预算：完整明细已在处理项存储里，推送只带可渲染的摘要。 */
+      const livePayload = boundLiveProcessPayload({
+        ...presentation.payload,
+        processKind: processItem.kind,
+        title: processItem.title,
+        detail,
+        protocolFamily: detail.protocolFamily,
+        stageId: detail.stageId,
+        ...(detail.reasoningPresentation !== undefined ? { reasoningPresentation: detail.reasoningPresentation } : {}),
+      });
       publish(processItem.status === 'in_progress' ? 'conversation.item.started' : 'conversation.item.completed', run.conversationId, {
         turnId: run.providerTurnId,
         itemId: conversationProcessProviderItemId(processItem.sourceEventId) ?? processItem.id,
@@ -310,15 +328,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           sourceId: processItem.id,
           facet: processItem.kind === 'reasoning' ? 'reasoning_block' : 'tool_activity',
         }),
-        itemPayload: {
-          ...presentation.payload,
-          processKind: processItem.kind,
-          title: processItem.title,
-          detail,
-          protocolFamily: detail.protocolFamily,
-          stageId: detail.stageId,
-          ...(detail.reasoningPresentation !== undefined ? { reasoningPresentation: detail.reasoningPresentation } : {}),
-        },
+        itemPayload: livePayload.itemPayload,
+        ...(livePayload.truncated ? { detailTruncated: true } : {}),
         protocolFamily: detail.protocolFamily,
         stageId: detail.stageId,
         status: processItem.status,
@@ -628,7 +639,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     }
     const createdAt = options.now();
     try {
-      if (submission.status === 'queued' || submission.status === 'paused' || submission.status === 'failed') {
+      if (isQueueMemberStatus(submission.status)) {
         submission = options.submissions.updateStatus(submission.id, 'dispatching', { dispatchedAt: createdAt, updatedAt: createdAt });
       }
       await input.segmentLifecycle?.beginDispatch();
@@ -1027,7 +1038,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     context.permissionMode = input.permissionMode;
     context.workMode = input.workMode;
     context.pluginSkillRoots = uniquePaths([...skillCatalog, ...(pluginPreparation?.skills ?? [])].map((skill) => dirname(skill.path)));
-    if (submission.status === 'queued' || submission.status === 'paused' || submission.status === 'failed') {
+    if (isQueueMemberStatus(submission.status)) {
       submission = options.submissions.updateStatus(submission.id, 'dispatching', { dispatchedAt: createdAt, updatedAt: createdAt });
     }
     let compiledDispatchContext: ContextDispatchEnvelope | null = null;
@@ -2619,8 +2630,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
           ...options.conversations.getNextTurnSettings(conversation.id),
           collaborationMode: nextMode,
         });
-        const queuedIds = options.submissions.listQueueByConversation(conversation.id).map((candidate) => candidate.id);
-        options.submissions.reorderQueued(conversation.id, [created.id, ...queuedIds.filter((id) => id !== created.id)], timestamp);
+        /** 队列名单由仓储统一给出，确认卡提交的提交必须成为下一个派发对象。 */
+        options.submissions.promoteQueuedHead(conversation.id, created.id, timestamp);
       }
       return created;
     });
@@ -3270,6 +3281,8 @@ function toPiRunDispatchContext(envelope: ContextDispatchEnvelope | null) {
       fingerprint: envelope.compiled.fingerprint,
       manifest: envelope.rendered.manifest,
       content: envelope.rendered.application,
+      /** 规则已随编译上下文送达时，Pi 不再从项目目录重复注入 AGENTS.md。 */
+      agentRulesIncluded: envelope.compiled.applicationSections.some((section) => section.category === 'agent_rules'),
     },
     ...(envelope.rendered.untrusted
       ? {
@@ -3320,6 +3333,15 @@ function processText(title: string, detailJson: string): string {
   const detail = asRecord(JSON.parse(detailJson));
   const block = asRecord(detail.block);
   return typeof detail.text === 'string' ? detail.text : typeof block.text === 'string' ? block.text : typeof block.thinking === 'string' ? block.thinking : title;
+}
+
+/** 把原始错误码与诊断放进失败载荷，界面才能看到真实原因而不是笼统的「结果未知」。 */
+function failureCause(error: unknown): Record<string, unknown> | null {
+  if (!error || typeof error !== 'object') return null;
+  const code = typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : null;
+  const details = (error as { details?: unknown }).details;
+  if (!code && details === undefined) return null;
+  return { ...(code ? { code } : {}), ...(details === undefined ? {} : { details }) };
 }
 
 function piError(code: string, message: string): Error & { code: string } {

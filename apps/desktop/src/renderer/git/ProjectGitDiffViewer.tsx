@@ -289,7 +289,9 @@ function selectFileDiff(diff: GitDiffSummary, path: string): GitDiffSummary {
 
 /** 仓库各入口共用媒体预览，文本保留原来的区块操作。 */
 export function SideBySideDiff(props: SideBySideDiffProps) {
-  return props.previewRequest ? (
+  /** 子模块是提交指针，不是可预览的普通目录；始终直接显示 Git 生成的指针差异。 */
+  const submodule = props.diff?.fileDiffs[0]?.isSubmodule === true;
+  return props.previewRequest && !submodule ? (
     <FilePreview request={props.previewRequest} revision={props.revision} zh={props.zh}>
       {props.diff?.fileDiffs.length ? <TextSideBySideDiff {...props} /> : null}
     </FilePreview>

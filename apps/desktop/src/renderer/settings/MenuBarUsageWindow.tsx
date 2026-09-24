@@ -49,6 +49,7 @@ const copy = {
     cacheUnsupported: '供应源未提供',
     cost: '近 7 日估算费用',
     costShort: '7 日估算费用',
+    pricingBackfill: '含历史补算：按补价时价格估算',
     noPrice: '暂无价格',
     recentUsage: `${applicationName} 本地 Token`,
     accountRecentUsage: 'Codex 账户 Token',
@@ -99,6 +100,7 @@ const copy = {
     cacheUnsupported: 'Not provided',
     cost: 'Estimated cost · 7 days',
     costShort: '7-day estimate',
+    pricingBackfill: 'Includes historical usage estimated at backfill-time prices',
     noPrice: 'No pricing',
     recentUsage: `${applicationName} local tokens`,
     accountRecentUsage: 'Codex account tokens',
@@ -463,6 +465,7 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
         <Metric label={text.cache} value={!sevenDayLocalComplete ? '—' : cacheAvailable ? formatPercent(provider.sevenDayLocal.cacheHitRate, language, '—') : text.cacheUnsupported} />
         <Metric label={text.costShort} accessibleLabel={text.cost} value={sevenDayLocalComplete ? formatCost(provider, language, text.noPrice) : '—'} />
       </dl>
+      {provider.sevenDayLocal.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
 
       <DailyBars provider={provider} language={language} />
     </article>

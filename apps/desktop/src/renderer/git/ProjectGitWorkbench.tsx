@@ -2181,6 +2181,7 @@ function ChangeTreeEntry(props: Parameters<typeof ChangeDirectoryTree>[0] & { no
   const checked = props.stage === 'staged';
   const status = props.repository.snapshot.fileStatuses.find((file) => file.path === props.node.path);
   const category = gitFileStatusCategory(status, props.stage);
+  const submodule = props.repository.snapshot.submodules?.some((item) => item.path === props.node.path) ?? false;
   return (
     <div data-git-context={JSON.stringify({ kind: 'file', repositoryId: props.repository.id, ref: props.node.path, stage: props.stage })} className={`project-git-change-file-row${selected ? ' is-current' : ''}`}>
       <input
@@ -2206,7 +2207,7 @@ function ChangeTreeEntry(props: Parameters<typeof ChangeDirectoryTree>[0] & { no
         }}
         onDoubleClick={() => props.onOpenDiff(props.repository, props.node.path, { stage: props.stage })}
       >
-        <GitFileStatusIcon category={category} zh={props.zh} />
+        {submodule ? <Folder aria-hidden="true" /> : <GitFileStatusIcon category={category} zh={props.zh} />}
         <span>{props.node.name}</span>
       </button>
     </div>

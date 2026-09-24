@@ -1,6 +1,6 @@
 {
   "name": "zeus",
-  "version": "0.3.142",
+  "version": "0.3.144",
   "private": true,
   "type": "module",
   "scripts": {
@@ -109,7 +109,8 @@
     },
     "patchedDependencies": {
       "@earendil-works/pi-ai@0.83.0": "patches/@earendil-works__pi-ai@0.83.0.patch",
-      "@earendil-works/pi-coding-agent@0.83.0": "patches/@earendil-works__pi-coding-agent@0.83.0.patch"
+      "@earendil-works/pi-coding-agent@0.83.0": "patches/@earendil-works__pi-coding-agent@0.83.0.patch",
+      "node-pty@1.1.0": "patches/node-pty@1.1.0.patch"
     }
   }
 }

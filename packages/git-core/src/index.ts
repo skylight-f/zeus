@@ -462,6 +462,8 @@ export interface GitFileDiff {
   oldPath: string;
   newPath: string;
   changeType: GitDiffFileChangeType;
+  /** Gitlink 子模块的差异应展示提交指针行，不应作为普通目录预览。 */
+  isSubmodule?: boolean;
   addedLines: number;
   deletedLines: number;
   hunks: GitDiffHunk[];
@@ -2345,8 +2347,8 @@ export async function getProjectGitRepositorySnapshot(cwd: string): Promise<Proj
   const [status, diff, stagedDiffText, unstagedDiffText, upstreamText, tagsText, headTagsText, reflogText, stashText, recentText] = await Promise.all([
     getGitStatus(context.topLevel),
     getGitDiff(context.topLevel),
-    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--cached', '--', '.']),
-    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--', '.']),
+    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--cached', '--submodule=short', '--', '.']),
+    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', '.']),
     readGitStdout(context.topLevel, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']),
     readGitStdout(context.topLevel, ['tag', '--sort=-creatordate']),
     readGitStdout(context.topLevel, ['tag', '--points-at', 'HEAD', '--sort=-creatordate']),
@@ -3201,13 +3203,13 @@ export async function getGitDiff(cwd: string): Promise<GitDiffSummary> {
       .fileStatuses.filter((file) => file.indexStatus === '?')
       .map((file) => file.path);
     const diffText = (
-      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--', '.'], {
+      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', '.'], {
         cwd,
         maxBuffer: 10 * 1024 * 1024,
       })
     ).stdout;
     const stagedDiffText = (
-      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--cached', '--', '.'], {
+      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--cached', '--submodule=short', '--', '.'], {
         cwd,
         maxBuffer: 10 * 1024 * 1024,
       })
@@ -3257,10 +3259,16 @@ export function parseGitUnifiedDiff(diffText: string): GitFileDiff[] {
     }
     if (line.startsWith('new file mode ')) {
       currentFile.changeType = 'added';
+      if (line.endsWith(' 160000')) currentFile.isSubmodule = true;
       continue;
     }
     if (line.startsWith('deleted file mode ')) {
       currentFile.changeType = 'deleted';
+      if (line.endsWith(' 160000')) currentFile.isSubmodule = true;
+      continue;
+    }
+    if (line.startsWith('index ') && / 160000$/u.test(line)) {
+      currentFile.isSubmodule = true;
       continue;
     }
     if (line.startsWith('copy from ') || line.startsWith('copy to ')) {

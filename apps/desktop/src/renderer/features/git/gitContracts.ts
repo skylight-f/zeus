@@ -32,6 +32,7 @@ export interface GitFileDiff {
   oldPath: string;
   newPath: string;
   changeType: GitDiffFileChangeType;
+  isSubmodule?: boolean;
   addedLines: number;
   deletedLines: number;
   hunks: GitDiffHunk[];

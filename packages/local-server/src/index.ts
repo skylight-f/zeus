@@ -171,7 +171,7 @@ import { isSafeRuntimeProcessId } from './runtimeProcessIdentity.js';
 import { type RuntimeSettingsSnapshot, toAiRuntimeSession } from './runtimeQueryApplication.js';
 import { RuntimeEphemeralCapabilityService, RuntimeSessionCommandApplication } from './runtimeSessionCommandApplication.js';
 import { SettingsCommandApplication } from './settingsCommandApplication.js';
-import { ensurePiGlobalAgentProjection, migrateRuntimeDirectory, prepareTaskAttachmentRoot, repairTaskAttachmentReferences } from './taskAttachmentLifecycle.js';
+import { ensureGlobalAgentRules, migrateRuntimeDirectory, prepareTaskAttachmentRoot, repairTaskAttachmentReferences } from './taskAttachmentLifecycle.js';
 import { TaskEventFileProjectionService } from './taskEventFileProjectionService.js';
 import { createTaskRuntimeOperations } from './taskRuntimeOperations.js';
 import { TelegramCommandApplication } from './telegramCommandApplication.js';
@@ -1126,6 +1126,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     memory: longTermMemories,
     now,
     audit: contextDispatchAudit,
+    /** 全局规则真源目录：所有 Provider 派发都从这里注入全局规则。 */
+    agentRulesDirectory: dataLayout.agentRules,
   });
   type DispatchModelBudget = {
     contextWindowTokens: number;
@@ -1293,7 +1295,17 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   });
   const piAgentDirectory = readOnlyValidation ? dataLayout.piConfig : migrateRuntimeDirectory(join(dataLayout.root, 'pi-agent'), dataLayout.piConfig);
   const piSessionDirectory = readOnlyValidation ? dataLayout.piSessions : migrateRuntimeDirectory(join(dataLayout.root, 'pi-sessions'), dataLayout.piSessions);
-  if (!readOnlyValidation) ensurePiGlobalAgentProjection(options.codexHome ?? dataLayout.codexHome, piAgentDirectory);
+  if (!readOnlyValidation) {
+    /** 真源与投影的一次性保障；内容冲突必须留痕，不允许静默覆盖用户文本。 */
+    const globalAgentRules = ensureGlobalAgentRules({
+      agentRulesDirectory: dataLayout.agentRules,
+      codexHome: options.codexHome ?? dataLayout.codexHome,
+      legacyPiAgentDirectory: piAgentDirectory,
+    });
+    if (globalAgentRules.conflictBackupPath) {
+      server.log.warn({ sourcePath: globalAgentRules.sourcePath, backupPath: globalAgentRules.conflictBackupPath }, 'Codex 侧 AGENTS.md 与全局规则真源内容不一致，已备份并收敛为指向真源的链接');
+    }
+  }
   /** 原生协调器先建立端口，平台恢复前绑定唯一工作服务。 */
   /** 接纳与恢复使用真实目标身份，能力失效时不静默降档。 */
   function validateNativeContextCapacity(budget: number | null, sourceId: string | null, modelId: string, runtime: 'codex' | 'pi'): void {
@@ -1775,7 +1787,10 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     persist: () => db.save(),
     now: () => now().toISOString(),
     repairLegacyCodexSourceAlias: !readOnlyValidation,
+    automaticPricing: !readOnlyValidation,
   });
+  // 关闭服务时等待补价任务退出，避免数据库关闭后继续后台写入。
+  server.addHook('onClose', () => codexUsageService.dispose());
   const usageOverviewService = createUsageOverviewService({
     ledger: codexUsageLedger,
     codexUsage: codexUsageService,
@@ -1787,6 +1802,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   let usageRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let usageRefreshInFlight: Promise<void> | undefined;
   const refreshOfficialUsageInBackground = async (): Promise<void> => {
+    // 定价来自公开页面，不需要启动 Codex 或等待账户登录。
+    await codexUsageService.refreshMissingPricing();
     // 后台用量刷新只能复用已经由用户操作启动的 Codex，应用首次打开不得为读取用量而执行外部 CLI。
     if (codexAppServerManager.getState().type !== 'ready') return;
     const official = await codexUsageService.refreshOfficialUsage();

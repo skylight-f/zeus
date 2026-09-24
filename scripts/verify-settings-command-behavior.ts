@@ -64,7 +64,7 @@ try {
     const agentsAudit: unknown[] = [];
     registerGlobalAgentSettingsRoutes({
       server: agentsServer,
-      codexHome: agentsRoot,
+      agentRulesDirectory: agentsRoot,
       commands: application,
       redactSensitiveText,
       recordSaved: (metadata) => {
@@ -391,7 +391,12 @@ try {
     );
     assertProbe(unknownInvocations === 1 && unknownCode === 'ZEUS_SETTINGS_COMMAND_OUTCOME_UNKNOWN' && replayCode === 'ZEUS_COMMAND_DELIVERY_REPLAY_BLOCKED', 'Unknown after write must block automatic resend.');
     assertProbe(secretWrites === 1 && !durableText.includes(secretSentinel) && !unknownAttempt.receipt.evidenceJson.includes(secretSentinel), 'Secret plaintext must not enter durable command evidence.');
-    assertProbe((observed.routeCounts as { total: number }).total === 9, '设置命令清单必须覆盖全局规则在内的九条路由。');
+    assertProbe(
+      (observed.routeCounts as { total: number }).total === 10 &&
+        settingsCommandRoutePolicy.coreApplications.includes('PUT /api/attention/item-state') &&
+        settingsCommandRoutePolicy.externalOperations.includes('PUT /api/settings/agents'),
+      '设置命令清单必须覆盖本地关注项和全局规则在内的十条路由。',
+    );
     assertProbe(observed.quickCheck === 'ok', 'Temporary SQLite quick_check must pass.');
     console.log(JSON.stringify({ status: 'passed', observed }, null, 2));
   } finally {

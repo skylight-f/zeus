@@ -1195,6 +1195,7 @@ function ModelCapabilityFacts(props: { language: 'zh-CN' | 'en-US'; model: Model
  */
 function reasoningBasisLabel(basis: ModelReasoningBasis, zh: boolean): string {
   if (basis === 'official_endpoint') return zh ? '依据：官方端点声明' : 'Basis: official endpoint';
+  if (basis === 'vendor_docs') return zh ? '依据：厂商文档档位表（同族通用，未逐个渠道验证）' : 'Basis: vendor documentation (same family, per-channel unverified)';
   if (basis === 'catalog') return zh ? '依据：内置目录声明（未逐档真机验证）' : 'Basis: built-in catalog (not verified level by level)';
   if (basis === 'catalog_default') return zh ? '依据：目录默认假设，未验证' : 'Basis: catalog default assumption, unverified';
   if (basis === 'model_name') return zh ? '依据：按模型名推断，未验证' : 'Basis: inferred from model name, unverified';
