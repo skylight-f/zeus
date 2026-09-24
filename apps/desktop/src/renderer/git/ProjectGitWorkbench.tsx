@@ -35,6 +35,7 @@ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type M
 import { createPortal } from 'react-dom';
 import { ArchiveIcon as Archive } from '@phosphor-icons/react/dist/csr/Archive';
 import { ArrowsClockwiseIcon as ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
+import { StopIcon as Stop } from '@phosphor-icons/react/dist/csr/Stop';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
@@ -705,43 +706,6 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       }}
       aria-label={zh ? '项目 Git 工作台' : 'Project Git workbench'}
     >
-      {busy || selectedRepository?.snapshot.integrationState ? (
-        <div className="git-integration-actions">
-          {' '}
-          {busy && !props.conversationScope && window.zeus?.cancelProjectGitAction ? (
-            <Button
-              variant="secondary"
-              size="compact"
-              onClick={() => {
-                void window.zeus!.cancelProjectGitAction(busy.repositoryId).catch((reason: unknown) => setError(errorMessage(reason, zh)));
-              }}
-            >
-              {zh ? '中止操作' : 'Stop operation'}
-            </Button>
-          ) : null}
-          {selectedRepository?.snapshot.integrationState ? (
-            <>
-              <Button
-                variant="secondary"
-                size="compact"
-                disabled={busy !== null || selectedRepository.snapshot.conflictFiles.length > 0}
-                onClick={() => void execute(selectedRepository, { type: 'continue_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '继续合并或变基' : 'Continue integration')}
-              >
-                {zh ? '继续' : 'Continue'}
-              </Button>
-              <Button
-                variant="secondary"
-                size="compact"
-                disabled={busy !== null}
-                onClick={() => void execute(selectedRepository, { type: 'abort_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '终止合并或变基' : 'Abort integration')}
-              >
-                {zh ? '终止合并/变基' : 'Abort integration'}
-              </Button>
-            </>
-          ) : null}
-        </div>
-      ) : null}
-
       <MotionPresence>
         {conversationDiff ? (
           <ModalPortal role="dialog" aria-label={zh ? '文件差异' : 'File diff'} onDismiss={() => setConversationDiff(null)}>
@@ -1005,6 +969,28 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
               <GitMerge />
               <span>{zh ? '合并' : 'Merge'}</span>
             </button>
+            {selectedRepository?.snapshot.integrationState ? (
+              <>
+                <button
+                  className="git-command-integration-action"
+                  type="button"
+                  disabled={busy !== null || selectedRepository.snapshot.conflictFiles.length > 0}
+                  onClick={() => void execute(selectedRepository, { type: 'continue_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '继续合并或变基' : 'Continue integration')}
+                >
+                  <CheckCircle aria-hidden="true" />
+                  <span>{zh ? '继续' : 'Continue'}</span>
+                </button>
+                <button
+                  className="git-command-integration-action"
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void execute(selectedRepository, { type: 'abort_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '终止合并或变基' : 'Abort integration')}
+                >
+                  <Stop aria-hidden="true" />
+                  <span>{zh ? '终止合并/变基' : 'Abort integration'}</span>
+                </button>
+              </>
+            ) : null}
             <button
               type="button"
               disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.clean || selectedRepository.snapshot.conflictFiles.length > 0}
@@ -1042,10 +1028,23 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
               </MotionPresence>
             </span>
 
-            <button type="button" disabled={busy !== null} onClick={() => void loadWorkbench()}>
-              <ArrowsClockwise />
-              <span>{zh ? '刷新' : 'Refresh'}</span>
-            </button>
+            {busy && !props.conversationScope && window.zeus?.cancelProjectGitAction ? (
+              <button
+                className="git-command-trailing-action"
+                type="button"
+                onClick={() => {
+                  void window.zeus!.cancelProjectGitAction(busy.repositoryId).catch((reason: unknown) => setError(errorMessage(reason, zh)));
+                }}
+              >
+                <Stop aria-hidden="true" />
+                <span>{zh ? '中止操作' : 'Stop operation'}</span>
+              </button>
+            ) : (
+              <button className="git-command-trailing-action" type="button" disabled={busy !== null} onClick={() => void loadWorkbench()}>
+                <ArrowsClockwise aria-hidden="true" />
+                <span>{zh ? '刷新' : 'Refresh'}</span>
+              </button>
+            )}
           </header>
           <div className="git-content-toolbar">
             <strong>{tab === 'changes' ? (zh ? '文件状态' : 'File Status') : tab === 'log' ? (zh ? '提交历史' : 'Commit history') : tab === 'stash' ? (zh ? '贮藏' : 'Stashes') : zh ? '操作记录' : 'Operation history'}</strong>

@@ -54,6 +54,13 @@
   background: var(--zeus-source-list-selected);
   color: var(--zeus-control-accent);
 }
+.git-command-toolbar > .git-command-integration-action,
+.git-command-toolbar > .git-command-trailing-action {
+  white-space: nowrap;
+}
+.git-command-toolbar > .git-command-trailing-action {
+  flex: 0 0 88px;
+}
 .git-command-toolbar > i {
   height: 30px;
   border-left: 1px solid var(--zeus-product-line);
@@ -80,14 +87,6 @@
   width: 100%;
   color: var(--zeus-product-text);
   font-size: 12px;
-}
-.git-integration-actions {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 12px;
-  background: var(--zeus-source-list-hover);
-  border-bottom: 1px solid var(--zeus-product-line);
 }
 .macos-ai-app.zeus-shell .project-git-workbench .git-workspace-navigation {
   display: flex;
