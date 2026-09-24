@@ -1,3 +1,4 @@
+import { formatEstimatedCosts } from '@zeus/shared';
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { calculateUncachedInputTokens, type CodexLocalUsageDay, type CodexLocalUsageGroup, type CodexOfficialUsageSnapshot, type CodexUsageRange, type UsageAnalyticsSnapshot, type UsageProviderAnalytics } from '@zeus/shared';
@@ -243,7 +244,7 @@ function AllProvidersOverview(props: { providers: UsageProviderAnalytics[]; lang
                 [copy.today, formatTokens(analytics.provider.todayLocal.totalTokens, props.language)],
                 [copy.selectedRange, formatTokens(analytics.local.totals.totalTokens, props.language)],
                 [props.language === 'zh-CN' ? '轮次数' : 'Turns', String(analytics.local.totals.turnCount)],
-                [props.language === 'zh-CN' ? 'API 等价美元' : 'API-equivalent USD', formatEstimate(analytics.local.totals.apiEquivalentUsd, 'usd', props.language)],
+                [props.language === 'zh-CN' ? '费用估算' : 'Estimated cost', formatEstimatedCosts(analytics.local.totals.costs, analytics.local.totals.apiEquivalentUsd)],
               ]}
             />
           </article>
@@ -267,7 +268,7 @@ function LocalProviderOverview(props: { analytics: UsageProviderAnalytics; langu
             [props.language === 'zh-CN' ? '当前范围 Token' : 'Range tokens', formatTokens(totals.totalTokens, props.language)],
             [props.language === 'zh-CN' ? '轮次数' : 'Turns', String(totals.turnCount)],
             [props.language === 'zh-CN' ? '缓存命中率' : 'Cache hit rate', formatPercent(totals.cacheHitRate, props.language)],
-            [props.language === 'zh-CN' ? 'API 等价美元' : 'API-equivalent USD', formatEstimate(totals.apiEquivalentUsd, 'usd', props.language)],
+            [props.language === 'zh-CN' ? '费用估算' : 'Estimated cost', formatEstimatedCosts(totals.costs, totals.apiEquivalentUsd)],
           ]}
         />
       </div>
@@ -486,7 +487,7 @@ function LocalOverview(props: { local: UsageProviderAnalytics['local']; runtimeN
           [props.language === 'zh-CN' ? '缓存写入' : 'Cache writes', formatTokens(totals.cacheWriteInputTokens, props.language)],
           [props.language === 'zh-CN' ? '缓存命中率' : 'Cache hit rate', formatPercent(totals.cacheHitRate, props.language)],
           ['Credits', formatEstimate(totals.estimatedCredits, 'credits', props.language)],
-          [props.language === 'zh-CN' ? 'API 等价美元' : 'API-equivalent USD', formatEstimate(totals.apiEquivalentUsd, 'usd', props.language)],
+          [props.language === 'zh-CN' ? '费用估算' : 'Estimated cost', formatEstimatedCosts(totals.costs, totals.apiEquivalentUsd)],
           [props.language === 'zh-CN' ? '缓存节省估算' : 'Estimated cache savings', formatEstimate(totals.cacheSavingsUsd, 'usd', props.language)],
           [props.language === 'zh-CN' ? '费用覆盖率' : 'Price coverage', formatPercent(totals.priceCoverage, props.language)],
         ]}
@@ -562,7 +563,7 @@ function UsageCalendarCard(props: UsageCalendarCardProps) {
           [zh ? '未缓存' : 'Uncached', localDay ? `${formatTokens(calculateUncachedInputTokens(localDay), props.language)} Token` : missing],
           [zh ? '缓存' : 'Cached', localDay ? `${formatTokens(localDay.cachedInputTokens, props.language)} Token` : missing],
           [zh ? '输出' : 'Output', localDay ? `${formatTokens(localDay.outputTokens, props.language)} Token` : missing],
-          [zh ? '估算' : 'Estimate', localDay ? formatEstimate(localDay.apiEquivalentUsd, 'usd', props.language) : missing],
+          [zh ? '估算' : 'Estimate', localDay ? formatEstimatedCosts(localDay.costs, localDay.apiEquivalentUsd) : missing],
           [zh ? '口径' : 'Scope', props.label],
         ]
       : [
@@ -788,7 +789,7 @@ function UsageBreakdownTable(props: { title: string; rows: CodexLocalUsageGroup[
                 <td>{formatTokens(row.totalTokens, props.language)}</td>
                 <td>{formatPercent(row.cacheHitRate, props.language)}</td>
                 <td>{formatEstimate(row.estimatedCredits, 'credits', props.language)}</td>
-                <td>{formatEstimate(row.apiEquivalentUsd, 'usd', props.language)}</td>
+                <td>{formatEstimatedCosts(row.costs, row.apiEquivalentUsd)}</td>
                 <td>{formatPercent(row.priceCoverage, props.language)}</td>
               </tr>
             ))}

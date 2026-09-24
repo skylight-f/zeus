@@ -1,6 +1,6 @@
 import { distributionAppName } from '../tooling/distribution.js';
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { CodexOfficialRateWindow, UsageOverviewSnapshot, UsageProviderSummary } from '@zeus/shared';
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageOverviewSnapshot, UsageProviderSummary } from '@zeus/shared';
 import type { AppShellSettings, DashboardClient } from '../apiClient.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { menuBarRateLimitWindows, renderClassicTray } from './menuBarClassicTray.js';
@@ -53,6 +53,14 @@ const copy = {
     noPrice: '暂无价格',
     recentUsage: `${applicationName} 本地 Token`,
     accountRecentUsage: 'Codex 账户 Token',
+    statisticsSource: '统计来源',
+    localSource: `${applicationName} 本地统计`,
+    accountSource: 'Codex 账户统计',
+    accountSourceHint: '账户统计包含其他客户端的 Token；官方未提供每日费用。',
+    costDetail: '查看模型费用依据',
+    unitPrice: '单价',
+    consumedTokens: '消耗 Token',
+    model: '模型',
     officialUsageUnavailable: '官方账户暂未提供日用量',
     insufficientHistory: '用量积累后显示趋势',
     missingDay: '暂无数据',
@@ -104,6 +112,14 @@ const copy = {
     noPrice: 'No pricing',
     recentUsage: `${applicationName} local tokens`,
     accountRecentUsage: 'Codex account tokens',
+    statisticsSource: 'Statistics source',
+    localSource: `${applicationName} local stats`,
+    accountSource: 'Codex account stats',
+    accountSourceHint: 'Account tokens include other clients; official daily cost is unavailable.',
+    costDetail: 'View model cost details',
+    unitPrice: 'Unit price',
+    consumedTokens: 'Tokens used',
+    model: 'Model',
     officialUsageUnavailable: 'Official daily account usage is unavailable',
     insufficientHistory: 'A trend appears after usage is recorded',
     missingDay: 'No data',
@@ -139,46 +155,72 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
   useEffect(() => {
     document.title = surfaceSettings.language === 'zh-CN' ? `${applicationName} 用量` : `${applicationName} Usage`;
   }, [surfaceSettings.language]);
-  const load = useCallback(() => {
-    if (requestRef.current) return requestRef.current;
-    const request = (async () => {
-      setLoading(true);
-      try {
-        const next = await props.client.loadUsageOverview();
-        setSnapshot(next);
-        setHasLoaded(true);
-        storeSnapshot(next);
-        setError(null);
-      } catch (cause) {
-        setError(cause);
-      } finally {
-        requestRef.current = null;
-        setLoading(false);
-      }
-    })();
-    requestRef.current = request;
-    return request;
-  }, [props.client]);
+  const load = useCallback(
+    (refresh: 'if-stale' | 'force' = 'if-stale') => {
+      if (requestRef.current) return requestRef.current;
+      const request = (async () => {
+        setLoading(true);
+        try {
+          const next = await props.client.loadUsageOverview(refresh);
+          setSnapshot(next);
+          setHasLoaded(true);
+          storeSnapshot(next);
+          setError(null);
+        } catch (cause) {
+          setError(cause);
+        } finally {
+          requestRef.current = null;
+          setLoading(false);
+        }
+      })();
+      requestRef.current = request;
+      return request;
+    },
+    [props.client],
+  );
 
   useEffect(() => {
-    void load();
+    void load('if-stale');
     // 浮窗在后台也持续更新状态栏，用户无需先点击才看到额度。
-    const refreshTimer = window.setInterval(() => void load(), 60_000);
+    const refreshTimer = window.setInterval(() => void load('if-stale'), 60_000);
+    /** 同一批用量通知只请求一次；请求中出现新变化则在完成后再读。 */
+    let dirty = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+    const schedule = () => {
+      if (disposed || timer || !dirty) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (disposed || !dirty) return;
+        if (requestRef.current) {
+          void requestRef.current.finally(schedule);
+          return;
+        }
+        dirty = false;
+        void load('if-stale').finally(schedule);
+      }, 150);
+    };
     const unsubscribe = props.client.subscribeEvents(
       (event) => {
-        if (event.type === 'usage.changed' || event.type === 'codex.usage.changed') void load();
+        if (event.type === 'usage.changed' || event.type === 'codex.usage.changed') {
+          dirty = true;
+          schedule();
+        }
       },
       () => undefined,
     );
-    const refreshWhenShown = () => void load();
+    const refreshWhenShown = () => void load('if-stale');
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (document.querySelector('.menu-bar-usage-cost-detail:popover-open')) return;
       event.preventDefault();
       void window.zeus?.hideMenuBarUsage?.();
     };
     window.addEventListener('focus', refreshWhenShown);
     window.addEventListener('keydown', closeOnEscape);
     return () => {
+      disposed = true;
+      clearTimeout(timer);
       window.clearInterval(refreshTimer);
       unsubscribe();
       window.removeEventListener('focus', refreshWhenShown);
@@ -267,7 +309,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
             <small className="menu-bar-usage-freshness" data-stale={stale && !loading ? 'true' : 'false'} aria-live="polite" title={freshness}>
               {freshness}
             </small>
-            <button className="menu-bar-usage-refresh" type="button" aria-label={loading ? text.loading : text.retry} title={loading ? text.loading : text.retry} aria-busy={loading} disabled={loading} onClick={() => void load()}>
+            <button className="menu-bar-usage-refresh" type="button" aria-label={loading ? text.loading : text.retry} title={loading ? text.loading : text.retry} aria-busy={loading} disabled={loading} onClick={() => void load('force')}>
               {loading ? <RefreshPendingIcon /> : <RefreshIcon />}
             </button>
           </span>
@@ -304,7 +346,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
 
         <div className="menu-bar-usage-content" role="tabpanel">
           {!snapshot && error ? (
-            <UsageLoadFailure error={error} language={surfaceSettings.language} loading={loading} onRetry={load} />
+            <UsageLoadFailure error={error} language={surfaceSettings.language} loading={loading} onRetry={() => load('force')} />
           ) : !snapshot ? (
             <UsageSkeleton label={text.loading} />
           ) : selectedProvider ? (
@@ -463,11 +505,11 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
       <dl className="menu-bar-usage-metrics">
         <Metric label={text.sevenDaysShort} accessibleLabel={text.sevenDays} value={formatIncompleteTokens(provider.sevenDayLocal.totalTokens, provider.sevenDayLocalComplete, language)} />
         <Metric label={text.cache} value={!sevenDayLocalComplete ? '—' : cacheAvailable ? formatPercent(provider.sevenDayLocal.cacheHitRate, language, '—') : text.cacheUnsupported} />
-        <Metric label={text.costShort} accessibleLabel={text.cost} value={sevenDayLocalComplete ? formatCost(provider, language, text.noPrice) : '—'} />
+        <Metric label={text.costShort} accessibleLabel={text.cost} value={sevenDayLocalComplete ? formatCost(provider, language, text.noPrice) : '—'} costBreakdown={provider.sevenDayCostBreakdown ?? []} language={language} />
       </dl>
       {provider.sevenDayLocal.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
 
-      <DailyBars provider={provider} language={language} />
+      <DailyBars key={provider.providerId} provider={provider} language={language} />
     </article>
   );
 }
@@ -529,20 +571,32 @@ function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: 
 /** 按原统计来源展示每日柱形、日期与数值，缺失数据不推算成零。 */
 function DailyBars(props: { provider: UsageProviderSummary; language: Language }) {
   const text = copy[props.language];
-  const accountUsage = props.provider.kind === 'subscription';
+  /** Codex 可切换来源，首次展示本机账本；其他供应商始终使用本机账本。 */
+  const [source, setSource] = useState<'local' | 'account'>('local');
+  const codex = props.provider.providerId === 'codex';
+  const accountUsage = codex && source === 'account';
   const buckets = accountUsage ? (props.provider.dailyAccount ?? null) : props.provider.dailyLocal;
   const label = accountUsage ? text.accountRecentUsage : text.recentUsage;
+  const sourcePicker = codex ? (
+    <label className="menu-bar-usage-chart-source-picker" title={accountUsage ? text.accountSourceHint : text.localSource}>
+      <span className="menu-bar-usage-sr-only">{text.statisticsSource}</span>
+      <select aria-label={text.statisticsSource} value={source} onChange={(event) => setSource(event.currentTarget.value === 'account' ? 'account' : 'local')}>
+        <option value="local">{text.localSource}</option>
+        <option value="account">{text.accountSource}</option>
+      </select>
+    </label>
+  ) : null;
   if (buckets === null)
     return (
       <div className="menu-bar-usage-chart-empty">
-        <span>{label}</span>
+        {sourcePicker ?? <span>{label}</span>}
         <small>{text.officialUsageUnavailable}</small>
       </div>
     );
   if (buckets.length === 0 && (accountUsage || !props.provider.collectionStartedAt))
     return (
       <div className="menu-bar-usage-chart-empty">
-        <span>{label}</span>
+        {sourcePicker ?? <span>{label}</span>}
         <small>{text.insufficientHistory}</small>
       </div>
     );
@@ -553,7 +607,7 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
   return (
     <figure className="menu-bar-usage-bars" aria-label={`${providerDisplayName(props.provider)} ${label}`}>
       <figcaption>
-        <span>{label}</span>
+        {sourcePicker ?? <span>{label}</span>}
         <dl>
           <div>
             <dt>{text.todaySummary}</dt>
@@ -585,13 +639,107 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
 }
 
 /** 菜单栏指标只显示名称和数值，减少重复说明占用的空间。 */
-function Metric(props: { label: string; accessibleLabel?: string; value: string }) {
+function Metric(props: { label: string; accessibleLabel?: string; value: string; costBreakdown?: UsageModelCostBreakdown[]; language?: Language }) {
+  const detailId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const positionDetail = useCallback(() => {
+    const trigger = triggerRef.current;
+    const panel = detailRef.current;
+    if (!trigger || !panel?.matches(':popover-open')) return;
+    const anchor = trigger.getBoundingClientRect();
+    const width = panel.getBoundingClientRect().width;
+    const height = panel.getBoundingClientRect().height;
+    panel.style.left = `${Math.max(12, Math.min(anchor.left, window.innerWidth - width - 12))}px`;
+    panel.style.top = `${Math.max(12, Math.min(anchor.bottom + 8, window.innerHeight - height - 12))}px`;
+  }, []);
+  useEffect(() => {
+    window.addEventListener('resize', positionDetail);
+    window.addEventListener('scroll', positionDetail, true);
+    return () => {
+      window.removeEventListener('resize', positionDetail);
+      window.removeEventListener('scroll', positionDetail, true);
+    };
+  }, [positionDetail]);
+  const hasDetail = Boolean(props.costBreakdown?.length && props.language);
+  const text = props.language ? copy[props.language] : null;
   return (
     <div>
-      <dt aria-label={props.accessibleLabel}>{props.label}</dt>
+      <dt aria-label={props.accessibleLabel}>
+        {props.label}
+        {hasDetail ? (
+          <button
+            ref={triggerRef}
+            className="menu-bar-usage-cost-detail-trigger"
+            type="button"
+            aria-label={text?.costDetail}
+            aria-controls={detailId}
+            aria-expanded={detailOpen}
+            title={text?.costDetail}
+            onClick={() => {
+              const panel = detailRef.current;
+              if (!panel) return;
+              if (panel.matches(':popover-open')) panel.hidePopover();
+              else {
+                panel.showPopover();
+                positionDetail();
+              }
+            }}
+          >
+            i
+          </button>
+        ) : null}
+      </dt>
       <dd>{props.value}</dd>
+      {hasDetail ? (
+        <div
+          ref={detailRef}
+          id={detailId}
+          className="menu-bar-usage-cost-detail"
+          popover="auto"
+          onToggle={(event) => {
+            const open = event.currentTarget.matches(':popover-open');
+            setDetailOpen(open);
+            if (open) positionDetail();
+          }}
+        >
+          <strong>{props.accessibleLabel ?? props.label}</strong>
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">{text?.model}</th>
+                <th scope="col">{text?.unitPrice}</th>
+                <th scope="col">{text?.consumedTokens}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {props.costBreakdown?.map((entry, index) => (
+                <tr key={`${entry.model}:${index}`}>
+                  <th scope="row">{entry.model}</th>
+                  <td>{formatModelRate(entry, props.language!)}</td>
+                  <td>{formatTokens(entry.usage.totalTokens, props.language!)} Token</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
     </div>
   );
+}
+
+/** 费用明细保留请求当时的原币单价；未知缓存价不写成零。 */
+function formatModelRate(entry: UsageModelCostBreakdown, language: Language): string {
+  const rate = entry.rate;
+  if (!rate) return copy[language].noPrice;
+  const amount = (value: number) => `${rate.currency} ${new Intl.NumberFormat(language, { maximumFractionDigits: 6 }).format(value)}`;
+  if (rate.perRequest !== null) return `${amount(rate.perRequest)} / ${language === 'zh-CN' ? '次' : 'request'}`;
+  if (!rate.perMillion) return copy[language].noPrice;
+  const parts = [`${language === 'zh-CN' ? '输入' : 'Input'} ${amount(rate.perMillion.input)}`, `${language === 'zh-CN' ? '输出' : 'Output'} ${amount(rate.perMillion.output)}`];
+  if (rate.perMillion.cachedInput !== null) parts.push(`${language === 'zh-CN' ? '缓存读取' : 'Cached input'} ${amount(rate.perMillion.cachedInput)}`);
+  if (rate.perMillion.cacheWrite !== null) parts.push(`${language === 'zh-CN' ? '缓存写入' : 'Cache write'} ${amount(rate.perMillion.cacheWrite)}`);
+  return `${parts.join(' · ')} / 1M Token`;
 }
 
 function UsageSkeleton(props: { label: string }) {
@@ -702,11 +850,21 @@ function formatPercent(value: number | null, language: Language, unavailable = '
   return value === null ? unavailable : new Intl.NumberFormat(language, { style: 'percent', maximumFractionDigits: 1 }).format(Math.max(0, value));
 }
 
-/** 美元使用简短货币符号，保留小额费用精度。 */
+/** 原币种分别展示，不把人民币等费用折算成美元。 */
 function formatCost(provider: UsageProviderSummary, language: Language, unavailable: string): string {
-  const value = provider.sevenDayLocal.apiEquivalentUsd;
-  if (value === null || !provider.sevenDayLocal.priceCoverage) return unavailable;
-  return `~${new Intl.NumberFormat(language, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: value > 0 && value < 0.01 ? 4 : 2, maximumFractionDigits: 4 }).format(value)}`;
+  if (!provider.sevenDayLocal.priceCoverage) return unavailable;
+  const costs = provider.sevenDayLocal.costs ?? (provider.sevenDayLocal.apiEquivalentUsd === null ? [] : [{ currency: 'USD', amount: provider.sevenDayLocal.apiEquivalentUsd }]);
+  if (!costs.length) return unavailable;
+  const formatted = costs.map(({ currency, amount }) => {
+    if (!Number.isFinite(amount)) return null;
+    try {
+      return new Intl.NumberFormat(language, { style: 'currency', currency, currencyDisplay: 'narrowSymbol', minimumFractionDigits: amount > 0 && amount < 0.01 ? 4 : 2, maximumFractionDigits: 4 }).format(amount);
+    } catch {
+      // 旧快照中的币种不合法时保留数值，避免整个浮窗渲染失败。
+      return `${currency} ${new Intl.NumberFormat(language, { maximumFractionDigits: 4 }).format(amount)}`;
+    }
+  });
+  return formatted.every(Boolean) ? `~${formatted.join(' + ')}` : unavailable;
 }
 
 /** 直接显示本地日期和时间，跨日重置无需悬停猜测。 */

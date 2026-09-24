@@ -392,8 +392,11 @@ try {
     assertProbe(unknownInvocations === 1 && unknownCode === 'ZEUS_SETTINGS_COMMAND_OUTCOME_UNKNOWN' && replayCode === 'ZEUS_COMMAND_DELIVERY_REPLAY_BLOCKED', 'Unknown after write must block automatic resend.');
     assertProbe(secretWrites === 1 && !durableText.includes(secretSentinel) && !unknownAttempt.receipt.evidenceJson.includes(secretSentinel), 'Secret plaintext must not enter durable command evidence.');
     assertProbe(
-      (observed.routeCounts as { total: number }).total === 10 && settingsCommandRoutePolicy.coreApplications.includes('PUT /api/attention/item-state') && settingsCommandRoutePolicy.externalOperations.includes('PUT /api/settings/agents'),
-      '设置命令清单必须覆盖本地关注项和全局规则在内的十条路由。',
+      (observed.routeCounts as { total: number }).total === 11 &&
+        settingsCommandRoutePolicy.coreApplications.includes('PUT /api/attention/item-state') &&
+        settingsCommandRoutePolicy.externalOperations.includes('POST /api/runtime/adapters/codex/update') &&
+        settingsCommandRoutePolicy.externalOperations.includes('PUT /api/settings/agents'),
+      '设置命令清单必须覆盖本地关注项、Codex 手动更新和全局规则在内的十一条路由。',
     );
     assertProbe(observed.quickCheck === 'ok', 'Temporary SQLite quick_check must pass.');
     console.log(JSON.stringify({ status: 'passed', observed }, null, 2));

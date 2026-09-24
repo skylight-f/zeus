@@ -5,7 +5,10 @@ import {
   emptyTokenUsageBreakdown,
   estimateCodexUsage,
   estimateCodexUsageWithRateSnapshot,
-  estimateDeepSeekUsage,
+  aggregateRequestPrices,
+  sumEstimatedCosts,
+  unavailableRateSnapshot,
+  type CodexUsageEstimate,
   type CodexLocalUsageDay,
   type CodexLocalUsageTotals,
   type CodexOfficialUsageSnapshot,
@@ -38,6 +41,19 @@ interface PersistedOfficialUsage {
 }
 
 export interface CodexUsageService {
+  /** 真实请求单独固化单价；相同响应身份重放不新增费用。 */
+  recordRequest(input: {
+    projectId: string;
+    conversationId: string;
+    providerThreadId: string;
+    providerTurnId: string;
+    requestId: string;
+    model: string;
+    modelSourceId?: string | null;
+    serviceTier?: string | null;
+    usage: TokenUsageBreakdown;
+    occurredAt: string;
+  }): Promise<CodexUsageEstimate>;
   /** 后台补齐缺价记录，不由查询接口触发写入。 */
   refreshMissingPricing(): Promise<void>;
   /** 停止补价请求与延迟任务，避免服务关闭后写入账本。 */
@@ -57,7 +73,7 @@ export interface CodexUsageService {
     modelContextWindow: number | null;
     occurredAt: string;
   }): Promise<NativeTokenUsageSnapshot>;
-  refreshOfficialUsage(): Promise<CodexOfficialUsageSnapshot>;
+  refreshOfficialUsage(minimumAgeMs?: number): Promise<CodexOfficialUsageSnapshot>;
   readCachedOfficialUsage(): CodexOfficialUsageSnapshot;
   handleSparseRateLimitUpdate(): void;
   handleAccountChanged(): void;
@@ -74,6 +90,12 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
   const now = options.now ?? (() => new Date().toISOString());
   let accountCache: { value: CodexAccountSnapshot; expiresAt: number } | null = null;
   let officialRefresh: Promise<CodexOfficialUsageSnapshot> | null = null;
+  /** 最近检查结果也保留未登录和失败状态，避免打开浮窗连续重试。 */
+  let officialSnapshot: CodexOfficialUsageSnapshot | null = null;
+  /** 官方检查节流使用单调时钟，不受系统校时影响。 */
+  let officialCheckedAt = -Infinity;
+  /** 账户切换后丢弃旧账户在途刷新，避免旧快照重新出现。 */
+  let officialAccountEpoch = 0;
   let sparseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** 一个服务实例只维护一份下载，缺价并发不会重复联网。 */
   let pricingRefresh: Promise<void> | null = null;
@@ -101,11 +123,11 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
 
   if (options.repairLegacyCodexSourceAlias !== false) repairLegacyCodexSourceAlias();
 
-  /** 先用已有本地价格，缺价才使用已经自动获取的官方价格。 */
+  /** 当前公开目录优先；已记录请求继续引用各自快照。 */
   function estimateAvailablePrice(input: { model: string; serviceTier?: string | null; usage: TokenUsageBreakdown }) {
-    /** 内置价格保持当前记账口径，不在补价时重定价已知模型。 */
+    /** 尚未下载过目录时保留带日期的离线价格依据。 */
     const local = estimateCodexUsage(input);
-    return local.apiEquivalentUsd !== null || !publishedPricing ? local : (estimatePublishedCodexUsage({ ...input, catalog: publishedPricing, prices: publishedPrices }) ?? local);
+    return publishedPricing ? (estimatePublishedCodexUsage({ ...input, catalog: publishedPricing, prices: publishedPrices }) ?? estimateCodexUsageWithRateSnapshot(input.usage, unavailableRateSnapshot(input.model))) : local;
   }
 
   /** 只更新空费用，重新读取账本避免联网期间覆盖新增 Token 或已补齐的价格。 */
@@ -113,7 +135,7 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     /** 会话价格汇总只在该会话存在实际变化时重建一次。 */
     const affected = new Set<string>();
     for (const row of options.ledger.list({ providerId: 'codex' })) {
-      if (row.estimate.apiEquivalentUsd !== null) continue;
+      if (row.estimate.apiEquivalentUsd !== null || row.estimate.requests) continue;
       /** 补价不是历史价格证明，因此始终保存补价标记。 */
       const estimate = estimateAvailablePrice({ model: row.model, serviceTier: row.serviceTier, usage: row.usage });
       if (estimate.apiEquivalentUsd === null) continue;
@@ -132,9 +154,8 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     pricingRefresh = (async () => {
       /** 优先使用缓存补价，离线也能恢复已经有依据的费用。 */
       let changed = backfillAvailablePrices();
-      /** 只有仍缺价时才联网，官方模型之外的供应源不套用官方费率。 */
-      const missing = options.ledger.list({ providerId: 'codex' }).some((row) => row.estimate.apiEquivalentUsd === null);
-      if (missing && Date.parse(now()) >= nextPricingAttemptAt) {
+      /** 到期即刷新，已有模型涨降价也能更新后续请求。 */
+      if (Date.parse(now()) >= nextPricingAttemptAt) {
         nextPricingAttemptAt = Date.parse(now()) + 5 * 60_000;
         /** 只捕获下载错误，存储失败必须交给现有服务错误边界处理。 */
         let fetched: PublishedCodexPricing | null = null;
@@ -180,7 +201,7 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     pricingAbort.abort();
     if (pricingTimer) clearTimeout(pricingTimer);
     if (sparseRefreshTimer) clearTimeout(sparseRefreshTimer);
-    await pricingRefresh?.catch(() => undefined);
+    await Promise.allSettled([pricingRefresh, officialRefresh]);
   }
 
   /**
@@ -208,7 +229,7 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
           providerBaseline: row.providerBaseline,
           providerTotal: row.providerTotal,
           usageComplete: row.usageComplete,
-          estimate: estimateCodexUsage({ model: row.model, serviceTier: row.serviceTier, usage: row.usage }),
+          estimate: row.estimate,
           occurredAt: row.occurredAt,
         });
       }
@@ -228,9 +249,10 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     const latest = rows.at(-1);
     options.conversations.repairProviderTokenUsagePricing(conversationId, {
       ...previous,
+      costs: local.costs,
       estimatedCredits: local.estimatedCredits,
       apiEquivalentUsd: local.apiEquivalentUsd,
-      lastApiEquivalentUsd: latest?.estimate.apiEquivalentUsd ?? null,
+      lastApiEquivalentUsd: latest?.estimate.requests?.at(-1)?.estimate.apiEquivalentUsd ?? latest?.estimate.apiEquivalentUsd ?? null,
       cacheSavingsUsd: local.cacheSavingsUsd,
       priceCoverage: local.priceCoverage,
       pricingCatalogDate: catalogDates.at(-1) ?? null,
@@ -241,7 +263,9 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
 
   async function readAccount(): Promise<CodexAccountSnapshot> {
     if (accountCache && accountCache.expiresAt > Date.now()) return accountCache.value;
+    const epoch = officialAccountEpoch;
     const value = await options.manager.readAccount();
+    if (epoch !== officialAccountEpoch) return value;
     accountCache = { value, expiresAt: Date.now() + 60_000 };
     return value;
   }
@@ -259,16 +283,22 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     await options.persist?.();
   }
 
-  async function refreshOfficialUsage(): Promise<CodexOfficialUsageSnapshot> {
+  async function refreshOfficialUsage(minimumAgeMs = 15_000): Promise<CodexOfficialUsageSnapshot> {
+    if (pricingAbort.signal.aborted) return readCachedOfficialUsage();
     if (officialRefresh) return officialRefresh;
+    const cached = readCachedOfficialUsage();
+    const cacheAge = cached.fetchedAt ? Date.parse(now()) - Date.parse(cached.fetchedAt) : Infinity;
+    if (performance.now() - officialCheckedAt < minimumAgeMs || (!cached.stale && cacheAge >= 0 && cacheAge < minimumAgeMs)) return cached;
+    const epoch = officialAccountEpoch;
     officialRefresh = (async () => {
       let account: CodexAccountSnapshot;
       try {
         account = await readAccount();
       } catch (error) {
-        const previous = cachedOfficial();
+        const previous = officialAccountEpoch === 0 ? cachedOfficial() : officialSnapshot;
         return previous ? { ...previous, stale: true, error: errorMessage(error) } : emptyOfficial('unavailable', null, null, null, true, errorMessage(error));
       }
+      if (epoch !== officialAccountEpoch) return readCachedOfficialUsage();
       if (!account.signedIn) return emptyOfficial('signed_out', account.accountScopeId, account.accountType, account.planType, false, null);
       if (account.accountType !== 'chatgpt') return emptyOfficial('unsupported', account.accountScopeId, account.accountType, account.planType, false, null);
 
@@ -298,12 +328,59 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
         stale: usageResult.status === 'rejected' || limitsResult.status === 'rejected',
         error: [usageResult, limitsResult].map(settledError).filter(Boolean).join('；') || null,
       };
+      if (epoch !== officialAccountEpoch) return readCachedOfficialUsage();
       await persistOfficial(snapshot);
       return snapshot;
-    })().finally(() => {
-      officialRefresh = null;
-    });
+    })()
+      .then((snapshot) => {
+        if (epoch !== officialAccountEpoch) return readCachedOfficialUsage();
+        officialSnapshot = snapshot;
+        officialCheckedAt = performance.now();
+        return snapshot;
+      })
+      .finally(() => {
+        officialRefresh = null;
+        if (epoch !== officialAccountEpoch) handleSparseRateLimitUpdate();
+      });
     return officialRefresh;
+  }
+
+  /** 原始响应是请求计价的权威；累计 Token 通知只负责轮次和会话总量。 */
+  async function recordRequest(input: Parameters<CodexUsageService['recordRequest']>[0]): Promise<CodexUsageEstimate> {
+    validateBreakdown(input.usage);
+    const providerId = !input.modelSourceId || input.modelSourceId === 'codex' ? 'codex' : `api:${input.modelSourceId}`;
+    const existing = options.ledger.findByProviderTurn(providerId, input.providerThreadId, input.providerTurnId);
+    /** 旧轮次已有整体快照时保持原样，迟到的单请求事件不能覆盖历史总额。 */
+    if (existing && !existing.estimate.requests) return estimateCodexUsageWithRateSnapshot(input.usage, unavailableRateSnapshot(input.model));
+    const requests = existing?.estimate.requests ?? [];
+    const previous = requests.find((request) => request.id === input.requestId);
+    if (previous) return previous.estimate;
+    const estimate = providerId === 'codex' ? estimateAvailablePrice(input) : estimateCodexUsageWithRateSnapshot(input.usage, unavailableRateSnapshot(input.model));
+    const next = [...requests, { id: input.requestId, occurredAt: input.occurredAt, usage: input.usage, estimate }];
+    const measured = sumBreakdowns(next.map((request) => request.usage));
+    const usage = existing && existing.usage.totalTokens > measured.totalTokens ? existing.usage : measured;
+    const totalEstimate = aggregateRequestPrices(next);
+    totalEstimate.billableTokens = Math.max(totalEstimate.billableTokens, usage.inputTokens + usage.outputTokens);
+    totalEstimate.coverage = totalEstimate.billableTokens ? totalEstimate.pricedTokens / totalEstimate.billableTokens : null;
+    options.ledger.upsert({
+      ...existing,
+      providerId,
+      accountScopeId: existing?.accountScopeId ?? (providerId === 'codex' ? 'codex-local' : input.modelSourceId!),
+      projectId: input.projectId,
+      conversationId: input.conversationId,
+      providerThreadId: input.providerThreadId,
+      providerTurnId: input.providerTurnId,
+      model: input.model,
+      serviceTier: input.serviceTier,
+      usage,
+      usageComplete: existing?.usageComplete ?? false,
+      estimate: totalEstimate,
+      occurredAt: input.occurredAt,
+    });
+    repairConversationUsageSnapshot(input.conversationId);
+    await options.persist?.();
+    schedulePricingRefresh();
+    return estimate;
   }
 
   async function recordTurn(input: Parameters<CodexUsageService['recordTurn']>[0]): Promise<NativeTokenUsageSnapshot> {
@@ -323,12 +400,10 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
       existing?.providerBaseline ?? priorProviderTotal ?? previousSnapshotTotal ?? (existing ? subtractBreakdowns(input.total, existing.usage) : legacyRowsExist ? subtractBreakdowns(input.total, input.last) : emptyTokenUsageBreakdown());
     const usage = subtractBreakdowns(input.total, providerBaseline);
     const usageComplete = existing?.providerBaseline ? existing.usageComplete : Boolean(priorProviderTotal || previousSnapshotTotal || (!existing && !legacyRowsExist));
-    const estimate =
-      existing && (!nativeCodexSource || existing.estimate.apiEquivalentUsd !== null)
-        ? estimateCodexUsageWithRateSnapshot(usage, existing.estimate.rateSnapshot)
-        : nativeCodexSource
-          ? estimateAvailablePrice({ model: input.model, serviceTier: input.serviceTier, usage })
-          : estimateDeepSeekUsage({ model: input.model, usage, occurredAt: input.occurredAt });
+    /** 累计通知不重算已完成请求；未观测到请求的剩余用量保持缺价。 */
+    const estimate = existing && !existing.estimate.requests ? { ...existing.estimate } : aggregateRequestPrices(existing?.estimate.requests ?? []);
+    estimate.billableTokens = Math.max(estimate.billableTokens, usage.inputTokens + usage.outputTokens);
+    estimate.coverage = estimate.billableTokens ? estimate.pricedTokens / estimate.billableTokens : null;
     if (nativeCodexSource && existing && existing.estimate.apiEquivalentUsd === null && estimate.apiEquivalentUsd !== null) estimate.rateSnapshot.backfilledAt = now();
     let accountScopeId = nativeCodexSource ? 'codex-local' : input.modelSourceId!;
     if (nativeCodexSource) {
@@ -367,9 +442,10 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
       last: input.last,
       modelContextWindow: input.modelContextWindow,
       cacheHitRate: calculateCacheHitRate(input.total),
+      costs: local.costs,
       estimatedCredits: local.estimatedCredits,
       apiEquivalentUsd: local.apiEquivalentUsd,
-      lastApiEquivalentUsd: estimate.apiEquivalentUsd,
+      lastApiEquivalentUsd: estimate.requests?.at(-1)?.estimate.apiEquivalentUsd ?? null,
       cacheSavingsUsd: local.cacheSavingsUsd,
       priceCoverage: local.priceCoverage,
       pricingCatalogDate: catalogDates.at(-1) ?? null,
@@ -382,10 +458,10 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
   }
 
   function handleSparseRateLimitUpdate(): void {
-    if (sparseRefreshTimer) return;
+    if (sparseRefreshTimer || pricingAbort.signal.aborted) return;
     sparseRefreshTimer = setTimeout(() => {
       sparseRefreshTimer = null;
-      void refreshOfficialUsage().then(
+      void refreshOfficialUsage(0).then(
         (official) => options.broadcast('codex.usage.changed', { providerId: 'codex', scope: 'official', stale: official.stale, updatedAt: now() }),
         () => undefined,
       );
@@ -394,16 +470,21 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
 
   function handleAccountChanged(): void {
     accountCache = null;
+    officialAccountEpoch += 1;
+    officialCheckedAt = -Infinity;
+    officialSnapshot = emptyOfficial('unavailable', null, null, null, true, null);
     handleSparseRateLimitUpdate();
   }
 
   function readCachedOfficialUsage(): CodexOfficialUsageSnapshot {
-    const cached = cachedOfficial();
-    return cached ? { ...cached, creditBalance: cached.creditBalance ?? null, creditsUnlimited: cached.creditsUnlimited ?? false } : emptyOfficial('unavailable', null, null, null, true, null);
+    const cached = officialSnapshot ?? cachedOfficial();
+    return cached
+      ? { ...cached, stale: cached.stale || !cached.fetchedAt || Date.parse(now()) - Date.parse(cached.fetchedAt) >= 10 * 60_000, creditBalance: cached.creditBalance ?? null, creditsUnlimited: cached.creditsUnlimited ?? false }
+      : emptyOfficial('unavailable', null, null, null, true, null);
   }
 
   async function readSummary(): Promise<CodexUsageSummarySnapshot> {
-    const [official] = await Promise.all([refreshOfficialUsage()]);
+    const official = readCachedOfficialUsage();
     const today = localDate(new Date());
     const sevenDayStart = localDate(addDays(startOfLocalDay(new Date()), -6));
     const rows = options.ledger.list({ accountScopeId: official.accountScopeId ?? 'codex-local', since: addDays(startOfLocalDay(new Date()), -6).toISOString() });
@@ -419,7 +500,7 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
   }
 
   async function readAnalytics(input: Parameters<CodexUsageService['readAnalytics']>[0]): Promise<CodexUsageAnalyticsSnapshot> {
-    const official = await refreshOfficialUsage();
+    const official = readCachedOfficialUsage();
     const rows = options.ledger.list({ accountScopeId: official.accountScopeId ?? 'codex-local', since: rangeStart(input.range), projectId: input.projectId, model: input.model });
     return {
       providerId: 'codex',
@@ -454,7 +535,7 @@ export function createCodexUsageService(options: CreateCodexUsageServiceOptions)
     };
   }
 
-  return { recordTurn, refreshOfficialUsage, readCachedOfficialUsage, handleSparseRateLimitUpdate, handleAccountChanged, readSummary, readAnalytics, refreshMissingPricing, dispose };
+  return { recordRequest, recordTurn, refreshOfficialUsage, readCachedOfficialUsage, handleSparseRateLimitUpdate, handleAccountChanged, readSummary, readAnalytics, refreshMissingPricing, dispose };
 }
 
 function emptyOfficial(state: CodexOfficialUsageSnapshot['state'], accountScopeId: string | null, accountType: string | null, planType: string | null, stale: boolean, error: string | null): CodexOfficialUsageSnapshot {
@@ -525,6 +606,7 @@ function aggregateRows(rows: readonly CodexUsageLedgerRecord[]): CodexLocalUsage
   const savingsValues = rows.flatMap((row) => (row.estimate.cacheSavingsUsd === null ? [] : [row.estimate.cacheSavingsUsd]));
   return {
     ...usage,
+    costs: sumEstimatedCosts(rows.map((row) => row.estimate)),
     hasBackfilledPricing: rows.some((row) => Boolean(row.estimate.rateSnapshot.backfilledAt)),
     conversationCount: new Set(rows.map((row) => row.conversationId)).size,
     turnCount: rows.length,

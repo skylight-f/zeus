@@ -256,6 +256,8 @@ export interface ConversationProviderSettingsSnapshot extends ProviderSequenceSn
 }
 
 export interface ConversationProviderTokenUsageSnapshot extends ProviderSequenceSnapshot {
+  /** 原币费用汇总，保持美元字段的原有语义。 */
+  costs?: import('@zeus/shared').EstimatedMoney[];
   serviceTier?: string | null;
   total: TokenUsageBreakdown;
   last: TokenUsageBreakdown;
@@ -2014,6 +2016,24 @@ export class ConversationProviderSyncCheckpointRepository {
 
 /** 供应源用量账本不建立外键，被引用对象删除后仍保留真实历史消耗。 */
 export class CodexUsageLedgerRepository {
+  /** 账本提交后递增，概览缓存不受无关的任务日志写入影响。 */
+  private revision = 0;
+  /** 未提交或回滚过的修改不允许命中概览缓存。 */
+  private committedRevision = 0;
+
+  /** 外部连接写入也使缓存失效；本进程只有共享仓储负责运行期账本修改。 */
+  readRevision(): string | null {
+    if (this.revision !== this.committedRevision) return null;
+    return `${this.revision}:${this.db.get<{ data_version: number }>('PRAGMA data_version')?.data_version ?? 0}`;
+  }
+
+  /** 只取历史边界和缓存能力，概览无需加载七天以前的正文及计价快照。 */
+  listOverviewProviders(): Array<{ providerId: string; firstAt: string; lastAt: string; hasCache: number }> {
+    return this.db.select(`SELECT CASE WHEN provider_id LIKE 'pi:%' THEN 'api:' || substr(provider_id, 4) ELSE provider_id END AS providerId,
+      MIN(occurred_at) AS firstAt, MAX(occurred_at) AS lastAt,
+      MAX(cached_input_tokens > 0 OR cache_write_input_tokens > 0) AS hasCache
+      FROM codex_usage_ledger GROUP BY providerId ORDER BY MIN(occurred_at || char(0) || id)`);
+  }
   constructor(private readonly db: ZeusDatabasePort) {}
 
   upsert(input: UpsertCodexUsageLedgerInput): CodexUsageLedgerRecord {
@@ -2077,6 +2097,10 @@ export class CodexUsageLedgerRepository {
         timestamp,
       ],
     );
+    const revision = ++this.revision;
+    this.db.afterCommit(() => {
+      this.committedRevision = revision;
+    });
     return this.findByProviderTurn(input.providerId, input.providerThreadId, input.providerTurnId)!;
   }
 
@@ -2087,6 +2111,10 @@ export class CodexUsageLedgerRepository {
 
   deleteById(id: string): void {
     this.db.execute(`DELETE FROM codex_usage_ledger WHERE id = ?`, [id]);
+    const revision = ++this.revision;
+    this.db.afterCommit(() => {
+      this.committedRevision = revision;
+    });
   }
 
   list(input: ListCodexUsageLedgerInput = {}): CodexUsageLedgerRecord[] {
@@ -2961,12 +2989,14 @@ function validateProviderTokenUsageSnapshot(snapshot: unknown): asserts snapshot
       'lastApiEquivalentUsd',
       'cacheSavingsUsd',
       'priceCoverage',
+      'costs',
       'pricingCatalogDate',
       'pricingSourceUrls',
       'historyComplete',
     ],
     'provider token usage snapshot',
   );
+  validateEstimatedMoney(candidate.costs);
   validateTokenUsageBreakdown(candidate.total);
   validateTokenUsageBreakdown(candidate.last);
   if (candidate.serviceTier !== undefined && candidate.serviceTier !== null && typeof candidate.serviceTier !== 'string') throw new Error('Invalid provider token usage snapshot');
@@ -2987,7 +3017,30 @@ export function validateTokenUsageBreakdown(value: unknown): asserts value is To
 
 function validateCodexUsageEstimate(value: unknown): asserts value is CodexUsageEstimate {
   if (!isPlainRecord(value) || !isPlainRecord(value.rateSnapshot)) throw new Error('Invalid Codex usage estimate');
-  assertNoSecretLikeProviderKeys(value, new Set(['input', 'cachedinput', 'cachewrite', 'output', 'billabletokens', 'pricedtokens']));
+  validateEstimatedMoney(value.costs);
+  if (value.requests !== undefined) {
+    if (!Array.isArray(value.requests)) throw new Error('Invalid request price snapshots');
+    const identities = new Set<string>();
+    for (const request of value.requests) {
+      if (
+        !isPlainRecord(request) ||
+        typeof request.id !== 'string' ||
+        identities.has(request.id) ||
+        typeof request.occurredAt !== 'string' ||
+        !Number.isFinite(Date.parse(request.occurredAt)) ||
+        !isPlainRecord(request.estimate) ||
+        request.estimate.requests !== undefined
+      )
+        throw new Error('Invalid request price snapshot');
+      identities.add(request.id);
+      validateTokenUsageBreakdown(request.usage);
+      validateCodexUsageEstimate(request.estimate);
+    }
+  }
+  assertNoSecretLikeProviderKeys(
+    value,
+    new Set(['input', 'cachedinput', 'cachewrite', 'output', 'billabletokens', 'pricedtokens', 'totaltokens', 'inputtokens', 'cachedinputtokens', 'cachewriteinputtokens', 'outputtokens', 'reasoningoutputtokens']),
+  );
   for (const candidate of [value.credits, value.apiEquivalentUsd, value.cacheSavingsUsd, value.coverage]) {
     if (candidate !== null && (typeof candidate !== 'number' || !Number.isFinite(candidate) || candidate < 0)) throw new Error('Invalid Codex usage estimate');
   }
@@ -3703,4 +3756,16 @@ function mapIdempotencyRequestRow(row: DbIdempotencyRequestRow): ZeusIdempotency
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/** 货币数组是跨进程数据，拒绝重复币种、非有限数和负金额。 */
+function validateEstimatedMoney(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > 32) throw new Error('Invalid estimated money');
+  const currencies = new Set<string>();
+  for (const cost of value) {
+    if (!isPlainRecord(cost) || typeof cost.currency !== 'string' || !/^[A-Z]{3}$/u.test(cost.currency) || currencies.has(cost.currency) || typeof cost.amount !== 'number' || !Number.isFinite(cost.amount) || cost.amount < 0)
+      throw new Error('Invalid estimated money');
+    currencies.add(cost.currency);
+  }
 }

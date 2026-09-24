@@ -560,6 +560,63 @@ body:has(.menu-bar-usage-root),
   white-space: nowrap;
 }
 
+/* 明细留在浮窗顶层，不改变本地三列指标卡片的高度。 */
+.menu-bar-usage-cost-detail-trigger {
+  display: inline-grid;
+  place-items: center;
+  inline-size: 15px;
+  block-size: 15px;
+  margin-inline-start: 4px;
+  padding: 0;
+  border: 1px solid var(--usage-edge);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--usage-muted);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.menu-bar-usage-cost-detail:popover-open {
+  position: fixed;
+  inline-size: min(360px, calc(100vw - 24px));
+  max-block-size: min(320px, calc(100vh - 24px));
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--usage-edge);
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-bg);
+  color: var(--usage-text);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 16%);
+  font: inherit;
+}
+
+.menu-bar-usage-cost-detail > strong {
+  display: block;
+  margin-block-end: 8px;
+}
+
+.menu-bar-usage-cost-detail table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  text-align: start;
+}
+
+.menu-bar-usage-cost-detail :is(th, td) {
+  padding: 6px 4px;
+  border-block-start: 1px solid var(--usage-line);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.menu-bar-usage-cost-detail thead th {
+  color: var(--usage-muted);
+  font-weight: 600;
+}
+
 .menu-bar-usage-bars {
   display: grid;
   gap: 7px;
@@ -583,6 +640,25 @@ body:has(.menu-bar-usage-root),
   font-weight: 620;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.menu-bar-usage-chart-source-picker {
+  display: inline-flex;
+  align-items: center;
+  min-inline-size: 0;
+}
+
+.menu-bar-usage-chart-source-picker select {
+  max-inline-size: 100%;
+  min-block-size: 24px;
+  padding: 2px 18px 2px 4px;
+  border: 1px solid var(--usage-line);
+  border-radius: 6px;
+  background: var(--usage-panel-strong);
+  color: var(--usage-text);
+  font: inherit;
+  font-weight: 620;
+  cursor: pointer;
 }
 
 .menu-bar-usage-bars figcaption dl {

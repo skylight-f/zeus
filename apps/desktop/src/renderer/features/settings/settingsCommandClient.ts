@@ -7,6 +7,8 @@ export const settingsClientCommandTypes = {
   projectConfigPut: 'settings.project_config.put',
   projectModelServiceTierPreferencePut: 'settings.project_model_service_tier_preference.put',
   runtimeSettingsPut: 'settings.runtime.put',
+  /** 设置页手动操作与主进程静默调度共用的 Codex 官方程序更新。 */
+  codexRuntimeUpdate: 'settings.codex_runtime.update',
   appShellSettingsPut: 'settings.app_shell.put',
   attentionItemStatePut: 'settings.attention_item_state.put',
   /** 全局规则文件的手动保存。 */

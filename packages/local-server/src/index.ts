@@ -1,3 +1,5 @@
+/** 桌面动态价格读取复用受限公网访问边界。 */
+export { readPricingDocument } from './modelPricingDocument.js';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
 import { assertContextCapacitySupported } from '@zeus/shared';
 import type { ConversationWorktreeOptions } from '@zeus/shared';
@@ -138,7 +140,7 @@ import { ManagedConversationToolResultStore } from './conversationPortableContex
 import { ConversationQueueCoreMutationApplication, selectAutomaticQueueDispatchCandidate } from './conversationQueueCoreMutationApplication.js';
 import { ConversationQueueDispatchScheduler, mustWaitForInProcessRuntimeTurn, shouldRequestConversationQueueDispatch } from './conversationQueueDispatchScheduler.js';
 import { isObjectLike, quotePosixShellArgument } from './conversationResourcePreview.js';
-import { normalizeConversationResources } from './conversationResources.js';
+import { normalizeConversationResources, syncConversationResources } from './conversationResources.js';
 import { readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
 import { ConversationSyncProtocol } from './conversationSyncProtocol.js';
 import { type ConversationRealtimeSocket } from './conversationSyncRoutes.js';
@@ -906,6 +908,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const telegramCommandRunMessages = new Map<string, { chatId: number; messageId?: number }>();
   const telegramCommandRunLogCounts = new Map<string, number>();
   const eventSubscribers = new Set<ConversationRealtimeSocket>();
+  /** IM 复用现有提交后事件；未启用连接时监听回调只作常量时间判断。 */
+  let imRealtimeObserver: ((event: ZeusRealtimeEvent) => void) | undefined;
   const nativeLocalEventGenerationId = `zeus-local-${randomUUID()}`;
   const conversationEventFlow = new ConversationEventFlowControl();
   const realtimeSubscriberHighWaterBytes = conversationEventFlowBudgets.websocket.maximumBufferedBytes;
@@ -946,7 +950,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const codexAccountFingerprintSaltKey = 'codex.usage.account_fingerprint_salt';
   const conversationResourceBackfillSettingKey = 'conversation.resource_backfill';
   // 仅补齐已完成答复遗漏的托管产物图片，保留已有资源。
-  const conversationResourceBackfillRevision = '20260907_managed_artifact_markdown_images';
+  /** 补齐 Pi 历史文件链接，仍保留已登记的资源和图片原件。 */
+  const conversationResourceBackfillRevision = '20260923_pi_conversation_resources';
   const localLogDirectory = dataLayout.localLogs;
   const localConfigPath = options.localConfigPath ?? dataLayout.localConfig;
   // 本地日志目录是设计书明确要求的物理落点；服务启动时创建，避免 UI 只展示一个不存在的路径。
@@ -1112,6 +1117,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         publish: publishNativeConversationEvent,
       });
   const modelConnections = createModelConnectionService({
+    readPricingPage: options.browserAutomation?.readPricingPage?.bind(options.browserAutomation),
     settings,
     secretStore,
     save: () => db.save(),
@@ -1327,6 +1333,23 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const piNativeCoordinator = readOnlyValidation
     ? createReadOnlyValidationPiCoordinator(() => now().toISOString())
     : createPiNativeConversationCoordinator({
+        /** 消息到达时读取已经准备好的资源目录，按真实执行根复用公共登记。 */
+        syncItemResources: (item, projectRoot) =>
+          syncConversationResources(
+            {
+              projectId: conversations.getById(item.conversationId)!.projectId,
+              projectRoot,
+              conversationId: item.conversationId,
+              turnId: item.turnId,
+              item,
+              payload: parseJsonObject(item.payloadJson),
+              text: item.textContent,
+              trustedAttachmentRoots: trustedConversationAttachmentRoots,
+              artifactsDirectory: dataLayout.artifactsDirectory,
+              now: item.updatedAt,
+            },
+            conversationResources,
+          ),
         // 延后到实际派发时读取已完成装配的共用恢复入口。
         ensureExecutionContext: (input) => ensureNativeConversationExecutionContext(input),
         validateContextCapacity: validateNativeContextCapacity,
@@ -1611,7 +1634,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   if (!readOnlyValidation && resourceBackfillState?.revision !== conversationResourceBackfillRevision) {
     const existingResourceCount = db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM conversation_resources`)?.count ?? 0;
     let conversationResourceBackfillCount = 0;
-    // 首次资源回填仍处理全部 item；升级路径只读取带 Markdown 图片的已完成最终答复，
+    // 首次资源回填仍处理全部 item；升级只补最终答复图片和 Pi 已完成消息中的链接，
     // 不把全部历史正文重新载入内存，也不覆盖已经存在的文件/网页资源。
     if (existingResourceCount === 0) {
       for (const conversation of conversations.listNativeBoundRecords()) {
@@ -1651,13 +1674,16 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         }
       }
     } else {
-      const imageItems = conversationProviderItems.listCompletedFinalAnswersWithMarkdownImages();
-      for (const item of imageItems) {
+      /** 数据库先筛选有资源引用的历史消息，避免扫描全部正文。 */
+      const resourceItems = conversationProviderItems.listCompletedItemsForResourceBackfill();
+      for (const item of resourceItems) {
         const conversation = conversations.getById(item.conversationId);
         if (!conversation) continue;
         const project = projects.getById(conversation.projectId);
         if (!project) continue;
-        const projectRoot = resolveNativeConversationExecutionRoot(conversation) ?? project.localPath;
+        const projectRoot = resolveNativeConversationExecutionRoot(conversation);
+        // 执行根丢失时不借用项目主目录，否则同名代码文件会指向错误工作树。
+        if (!projectRoot) continue;
         const normalized = normalizeConversationResources({
           projectId: conversation.projectId,
           projectRoot,
@@ -1671,11 +1697,12 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           assistantImageArchiveRoot: conversationAttachmentRoot,
           artifactsDirectory: dataLayout.artifactsDirectory,
           now: item.updatedAt,
-        }).filter(isDurableAssistantMarkdownImageResource);
+        }).filter((resource) => item.agentKind === 'pi' || isDurableAssistantMarkdownImageResource(resource));
         if (normalized.length === 0) continue;
         const existing = conversationResources.listByItem(item.id);
-        const existingDigests = new Set(existing.map((resource) => resource.canonicalTargetDigest));
-        const merged = [...existing, ...normalized.filter((resource) => !existingDigests.has(resource.canonicalTargetDigest))];
+        // 同一 HTML 的正文链接和卡片共用目标，但属于两种展示，必须分别补齐。
+        const existingDigests = new Set(existing.map((resource) => `${resource.presentation}:${resource.canonicalTargetDigest}`));
+        const merged = [...existing, ...normalized.filter((resource) => !existingDigests.has(`${resource.presentation}:${resource.canonicalTargetDigest}`))];
         if (merged.length === existing.length) continue;
         conversationResources.replaceForItem(item.id, merged, item.updatedAt);
         conversationResourceBackfillCount += merged.length - existing.length;
@@ -1772,6 +1799,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     const capabilities = await codexAppServerManager.activateFreshGeneration({
       commandPath: currentCodexRuntimeCommandPath(),
       ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}),
+      remoteControl: codexRemoteControlEnabled,
       requireFreshModels: input.syncSubscriptionModels === true,
     });
     return { runtimeReloaded: true, runtimeGenerationId: capabilities.generationId, restartRequired: false };
@@ -1803,7 +1831,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   let usageRefreshInFlight: Promise<void> | undefined;
   const refreshOfficialUsageInBackground = async (): Promise<void> => {
     // 定价来自公开页面，不需要启动 Codex 或等待账户登录。
-    await codexUsageService.refreshMissingPricing();
+    await Promise.all([codexUsageService.refreshMissingPricing(), modelConnections.pricing.refreshDue()]);
     // 后台用量刷新只能复用已经由用户操作启动的 Codex，应用首次打开不得为读取用量而执行外部 CLI。
     if (codexAppServerManager.getState().type !== 'ready') return;
     const official = await codexUsageService.refreshOfficialUsage();
@@ -2545,6 +2573,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
 
   /** 慢订阅者在有界高水位断开，随后通过耐久游标补拉，避免 Core 为单个窗口无界缓存。 */
   function broadcastRealtimeEvent(event: ZeusRealtimeEvent): void {
+    imRealtimeObserver?.(event);
     const encoded = JSON.stringify(event);
     for (const subscriber of eventSubscribers) {
       if (subscriber.readyState !== subscriber.OPEN) continue;
@@ -3595,6 +3624,9 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     db,
     dispatchUnifiedConversationQueueHead,
     eventSubscribers,
+    setImRealtimeObserver: (listener: ((event: ZeusRealtimeEvent) => void) | undefined) => {
+      imRealtimeObserver = listener;
+    },
     executeConversationDispatchMessage,
     executeConversationDispatchRequestResponse,
     executeProjectConversationIdempotent,

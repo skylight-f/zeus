@@ -677,6 +677,45 @@
   .model-connection-wide-field {
     grid-column: 1 / -1;
   }
+  .model-connection-pricing {
+    display: grid;
+    justify-items: start;
+    gap: 8px;
+    min-inline-size: 0;
+    padding-block-start: 14px;
+    border-block-start: 1px solid var(--zeus-product-line-soft);
+  }
+  .model-connection-pricing > label {
+    display: grid;
+    gap: 6px;
+    inline-size: 100%;
+    min-inline-size: 0;
+  }
+  .model-connection-pricing > label > span {
+    font-size: 12px;
+    font-weight: 550;
+  }
+  .model-connection-pricing > p,
+  .model-connection-pricing > div > p {
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+  }
+  .model-connection-pricing > div,
+  .model-connection-pricing details {
+    max-inline-size: 100%;
+    min-inline-size: 0;
+  }
+  .model-connection-pricing details a {
+    display: block;
+    overflow-wrap: anywhere;
+  }
+  .model-connection-pricing details ul {
+    display: grid;
+    gap: 6px;
+    max-block-size: 260px;
+    overflow: auto;
+    padding-inline-start: 20px;
+  }
   .model-setup-advanced {
     padding: 0;
     border: 0;
@@ -913,6 +952,56 @@
     align-items: center;
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+  .model-setup-account .codex-update-row,
+  .model-setup-account .codex-available-models,
+  .model-setup-account .codex-update-progress {
+    grid-column: 1 / -1;
+  }
+  .model-setup-account .codex-update-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-block-start: 12px;
+    border-block-start: 1px solid var(--zeus-product-line-soft);
+  }
+  .model-setup-account .codex-update-row > p {
+    flex: 1 1 220px;
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+  }
+  .model-setup-account .codex-available-models {
+    display: grid;
+    gap: 8px;
+    min-inline-size: 0;
+  }
+  .model-setup-account .codex-available-models ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .model-setup-account .codex-available-models li {
+    padding: 4px 8px;
+    border: 1px solid var(--zeus-product-line-soft);
+    border-radius: 6px;
+    background: var(--zeus-card-background);
+  }
+  .model-setup-account .codex-update-progress {
+    overflow: hidden;
+    block-size: 3px;
+    border-radius: 3px;
+    background: var(--zeus-product-line-soft);
+  }
+  .model-setup-account .codex-update-progress > span {
+    display: block;
+    inline-size: 45%;
+    block-size: 100%;
+    border-radius: inherit;
+    background: var(--zeus-product-accent);
   }
 
   /* Zeus 本地明细保持原始开放布局，只有官方账户半年活动图使用独立日历卡片。 */
