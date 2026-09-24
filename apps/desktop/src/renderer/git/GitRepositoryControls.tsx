@@ -982,6 +982,7 @@ export function BranchTreeEntry(props: Parameters<typeof BranchDirectoryTree>[0]
       onContextMenu={(event) => props.onContextMenu(event, props.node.branch)}
       title={props.onCheckout ? (props.zh ? `双击切换到分支“${props.node.branch}”` : `Double-click to check out '${props.node.branch}'`) : undefined}
     >
+      {props.node.branch === props.current ? <span className="git-current-branch-dot" aria-hidden="true" /> : null}
       {props.hideBranchIcons ? null : <GitBranch aria-hidden="true" />}
       <span>{props.node.name}</span>
       {props.node.branch === props.current ? (

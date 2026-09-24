@@ -720,19 +720,6 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         ) : null}
       </MotionPresence>
 
-      {conflictCount > 0 ? (
-        <section className="project-git-conflict-banner" role="alert">
-          <WarningCircle aria-hidden="true" />
-          <span>
-            <strong>{zh ? `存在 ${conflictCount} 个冲突文件` : `${conflictCount} conflicted files`}</strong>
-            <small>{zh ? '请在变更页逐个检查冲突，解决后暂存文件，再继续合并或变基。' : 'Review each file in Local Changes, stage resolved files, then continue the merge or rebase.'}</small>
-          </span>
-          <Button variant="secondary" size="compact" onClick={() => setTab('changes')}>
-            {zh ? '处理冲突' : 'Resolve conflicts'}
-          </Button>
-        </section>
-      ) : null}
-
       <div className="project-git-browser-layout">
         <aside className="project-git-navigator" aria-label={zh ? 'Git 导航' : 'Git navigation'}>
           <div className="git-toolbar-identity">
@@ -1048,6 +1035,27 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
           </header>
           <div className="git-content-toolbar">
             <strong>{tab === 'changes' ? (zh ? '文件状态' : 'File Status') : tab === 'log' ? (zh ? '提交历史' : 'Commit history') : tab === 'stash' ? (zh ? '贮藏' : 'Stashes') : zh ? '操作记录' : 'Operation history'}</strong>
+            {conflictCount > 0 ? (
+              <button
+                className="git-conflict-summary"
+                type="button"
+                title={zh ? '查看冲突文件，解决后暂存，再继续合并或变基。' : 'Review conflicted files, stage the resolutions, then continue the merge or rebase.'}
+                onClick={() => {
+                  const target = selectedRepository?.snapshot.conflictFiles.length ? selectedRepository : repositories.find((repository) => repository.snapshot.conflictFiles.length > 0);
+                  setTab('changes');
+                  setFileQuery('');
+                  setSubtree(null);
+                  if (!target) return;
+                  setSelectedRepositoryId(target.id);
+                  setSelectedFilePath(target.snapshot.conflictFiles[0] ?? '');
+                  setSelectedFileStage('unstaged');
+                }}
+              >
+                <WarningCircle aria-hidden="true" />
+                <span>{zh ? `${conflictCount} 个冲突文件` : `${conflictCount} conflicts`}</span>
+                <small>{zh ? '处理' : 'Resolve'}</small>
+              </button>
+            ) : null}
             {tab === 'log' && selectedRepository ? (
               <select
                 aria-label={zh ? '历史分支范围' : 'History branch scope'}
@@ -1794,6 +1802,7 @@ function LocalChangesSurface(props: {
       return 'tree';
     }
   });
+  const [conflictsExpanded, setConflictsExpanded] = useState(true);
   const [editingRepository, setEditingRepository] = useState<string | null>(null);
   const commitInputRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -1839,14 +1848,21 @@ function LocalChangesSurface(props: {
         {repository && repository.snapshot.conflictFiles.length > 0 ? (
           <section className="project-git-conflict-files" aria-label={props.zh ? '冲突文件' : 'Conflicted files'}>
             <header>
-              <WarningCircle aria-hidden="true" />
-              <strong>{props.zh ? `冲突文件 (${repository.snapshot.conflictFiles.length})` : `Conflicts (${repository.snapshot.conflictFiles.length})`}</strong>
-            </header>
-            {repository.snapshot.conflictFiles.map((path) => (
-              <button key={path} type="button" className={path === props.selectedFilePath ? 'is-current' : ''} onClick={() => props.onSelectFile(path, 'unstaged')} title={path}>
-                <span>{path}</span>
+              <button type="button" aria-expanded={conflictsExpanded} onClick={() => setConflictsExpanded((expanded) => !expanded)}>
+                <WarningCircle aria-hidden="true" />
+                <strong>{props.zh ? `冲突文件 (${repository.snapshot.conflictFiles.length})` : `Conflicts (${repository.snapshot.conflictFiles.length})`}</strong>
+                <CaretDown aria-hidden="true" />
               </button>
-            ))}
+            </header>
+            {conflictsExpanded ? (
+              <div className="project-git-conflict-file-list">
+                {repository.snapshot.conflictFiles.map((path) => (
+                  <button key={path} type="button" className={path === props.selectedFilePath ? 'is-current' : ''} onClick={() => props.onSelectFile(path, 'unstaged')} title={path}>
+                    <span>{path}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </section>
         ) : null}
         <header>

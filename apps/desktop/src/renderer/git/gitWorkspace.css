@@ -137,6 +137,39 @@
   font-size: 12px;
   white-space: nowrap;
 }
+.git-content-toolbar > .git-conflict-summary {
+  align-items: center;
+  background: var(--zeus-control-danger-bg);
+  border: 1px solid var(--zeus-control-danger-line);
+  border-radius: 6px;
+  color: var(--zeus-control-danger-text);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  gap: 5px;
+  min-height: 25px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+.git-content-toolbar > .git-conflict-summary:hover {
+  background: var(--zeus-control-danger-bg-hover);
+}
+.git-content-toolbar > .git-conflict-summary:focus-visible {
+  outline: 2px solid var(--zeus-control-danger-text);
+  outline-offset: 2px;
+}
+.git-conflict-summary > svg {
+  flex: 0 0 13px;
+  height: 13px;
+  width: 13px;
+}
+.git-conflict-summary > small {
+  border-left: 1px solid var(--zeus-control-danger-line);
+  font-size: 11px;
+  padding-left: 5px;
+}
 .git-content-toolbar select {
   max-width: 230px;
   min-width: 100px;
@@ -359,8 +392,92 @@
   color: var(--zeus-product-text);
   font-weight: 650;
 }
+.project-git-branch-directory-tree button > .git-current-branch-dot {
+  background: var(--zeus-product-accent, var(--zeus-brand-primary));
+  border-radius: 50%;
+  flex: 0 0 6px;
+  height: 6px;
+  margin-left: -12px;
+}
 .git-checked-out-mark {
   margin-left: auto;
+}
+.macos-ai-app.zeus-shell .project-git-workbench .project-git-conflict-files {
+  border-bottom: 1px solid var(--zeus-product-line);
+  flex: 0 0 auto;
+  margin: 0 0 4px;
+  min-height: 0;
+  padding: 0 0 5px;
+}
+.macos-ai-app.zeus-shell .project-git-workbench .project-git-conflict-files > header {
+  padding: 0 2px 2px;
+}
+.project-git-conflict-files > header > button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 6px;
+  text-align: left;
+  width: 100%;
+}
+.project-git-conflict-files > header > button:hover {
+  background: var(--zeus-control-danger-bg);
+}
+.project-git-conflict-files > header > button:focus-visible,
+.project-git-conflict-file-list > button:focus-visible {
+  outline: 2px solid var(--zeus-control-danger-text);
+  outline-offset: -2px;
+}
+.project-git-conflict-files > header > button > svg {
+  flex: 0 0 13px;
+  height: 13px;
+  width: 13px;
+}
+.project-git-conflict-files > header > button > svg:last-child {
+  margin-left: auto;
+}
+.project-git-conflict-files > header > button[aria-expanded='false'] > svg:last-child {
+  transform: rotate(-90deg);
+}
+.project-git-conflict-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: min(112px, 18vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.project-git-conflict-file-list > button {
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--zeus-control-danger-text);
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  min-height: 26px;
+  min-width: 0;
+  padding: 4px 6px;
+  text-align: left;
+  width: 100%;
+}
+.project-git-conflict-file-list > button:hover,
+.project-git-conflict-file-list > button.is-current {
+  background: var(--zeus-control-danger-bg);
+}
+.project-git-conflict-file-list > button > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .macos-ai-app.zeus-shell .project-git-workbench .project-git-list-header,
 .macos-ai-app.zeus-shell .project-git-workbench .project-git-commit-row {
