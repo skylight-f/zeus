@@ -12,7 +12,7 @@ import { GlobalAgentSettingsPane } from '../../settings/GlobalAgentSettingsPane.
 import { FileTextIcon } from '@phosphor-icons/react/dist/csr/FileText';
 import type { UpdateAppShellSettingsRequest } from '../settings/settingsContracts.js';
 import type { ProjectSourceContentMatch, SidebarConversationFilters } from '@zeus/shared';
-import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
+import { reportApplicationError, VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { RuntimeXtermPane } from '../runtime/RuntimeXtermPane.js';
 import { terminateProjectTerminalSessions } from '../runtime/projectTerminalCleanup.js';
 import { handleInlineRailKeyboardNavigation } from './workspaceSupport.js';
@@ -23,20 +23,21 @@ import { SlidersHorizontalIcon } from '@phosphor-icons/react/dist/csr/SlidersHor
 import { ChartBarIcon } from '@phosphor-icons/react/dist/csr/ChartBar';
 import { BrainIcon } from '@phosphor-icons/react/dist/csr/Brain';
 import { ListChecksIcon } from '@phosphor-icons/react/dist/csr/ListChecks';
-import { RobotIcon } from '@phosphor-icons/react/dist/csr/Robot';
 import { PlugsConnectedIcon } from '@phosphor-icons/react/dist/csr/PlugsConnected';
 import { CubeIcon } from '@phosphor-icons/react/dist/csr/Cube';
 import { BrowserIcon } from '@phosphor-icons/react/dist/csr/Browser';
+import { GlobeIcon } from '@phosphor-icons/react/dist/csr/Globe';
 import { ChatCircleDotsIcon } from '@phosphor-icons/react/dist/csr/ChatCircleDots';
 import { PuzzlePieceIcon } from '@phosphor-icons/react/dist/csr/PuzzlePiece';
 import { TerminalIcon } from '@phosphor-icons/react/dist/csr/Terminal';
 import { ArrowCircleUpIcon } from '@phosphor-icons/react/dist/csr/ArrowCircleUp';
 import { DatabaseIcon } from '@phosphor-icons/react/dist/csr/Database';
 import { Suspense, useEffect, useId, useMemo, useState } from 'react';
-import type { DashboardClient, ProjectRecord } from '../../apiClient.js';
+import type { ProjectRecord } from '../../apiClient.js';
 import { openAutomaticUpdateIndicatorInMain } from '../../appShellBridge.js';
 import { ProjectGitWorkbench } from '../../git/ProjectGitWorkbench.js';
 import { conversationDisplayTitle } from '../../session/conversationDisplayTitle.js';
+import type { NativeConversationChoice } from '../../session/sessionTypes.js';
 import { TaskGitReviewModal } from '../../task/TaskGitReviewModal.js';
 import { persistPendingConflictAiStart, TaskGitMergeModal } from '../../task/TaskGitMergeModal.js';
 import { TaskModelPushModal, writeTaskModelPushPreferences } from '../../task/TaskModelPushModal.js';
@@ -46,6 +47,7 @@ import { CodexConfigImportSettings } from '../../settings/CodexConfigImportSetti
 import { TerminalSettingsPane } from '../../settings/TerminalSettingsPane.js';
 import { BrowserSettingsPane } from '../../settings/BrowserSettingsPane.js';
 import { GeneralSettingsPane } from '../../settings/GeneralSettingsPane.js';
+import { NetworkSettingsPane } from '../../settings/NetworkSettingsPane.js';
 import { SettingsPagination, settingsPage, settingsPageSize } from '../../settings/SettingsPagination.js';
 import { CodexRemoteControlSettings } from '../../settings/CodexRemoteControlSettings.js';
 import { ModelConnectionsSettingsPane } from '../../settings/ModelConnectionsSettingsPane.js';
@@ -55,8 +57,6 @@ import { CodexUsageSettingsPane } from '../../settings/CodexUsageSettingsPane.js
 import { MemorySettingsPane } from '../memory/MemorySettingsPane.js';
 import { DigitalEmployeeTemplatesSettings } from '../digital-employees/DigitalEmployeeTemplatesSettings.js';
 import { ImRobotSettingsPane } from '../telegram/ImRobotSettingsPane.js';
-import { ProjectDigitalEmployeesPanel } from '../digital-employees/ProjectDigitalEmployeesPanel.js';
-import { ProjectContextCapacitySettings } from '../../settings/ProjectContextCapacitySettings.js';
 import { defaultTaskTableEnumSortOrders, normalizeTaskTableEnumSortOrders } from '../../task/taskWorkspaceModel.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { Button } from '../../ui/Button.js';
@@ -82,10 +82,8 @@ import {
   formatReleaseWaitingForItems,
   formatRuntimeSessionStatus,
   formatRuntimeAdapterDisplayName,
-  type NativeConversationAppClient,
   NativeSettingsPane,
   PROJECT_SIDEBAR_MIN_WIDTH,
-  ProjectArchiveWorkbench,
   type SettingsCategory,
   TaskCreateModal,
   TaskDeleteRelationshipDialog,
@@ -98,64 +96,6 @@ import {
 import type { WorkspaceQueryState } from './useWorkspaceQueryState.js';
 import type { WorkspaceDomainActions } from './useWorkspaceDomainActions.js';
 import type { WorkspaceOperations } from './useWorkspaceOperations.js';
-
-/** 项目设置只保留两个同级入口，避免把两块长内容纵向拼成一个页面。 */
-type ProjectSettingsSection = 'employees' | 'capacity';
-
-/** 项目设置页在离开页面或切换项目时重新挂载，因此默认入口始终是数字员工。 */
-function ProjectSettingsWorkspace(props: { project: ProjectRecord; commandClient: DashboardClient | null; conversationClient: NativeConversationAppClient | null; language: 'zh-CN' | 'en-US' }) {
-  const zh = props.language === 'zh-CN';
-  const [section, setSection] = useState<ProjectSettingsSection>('employees');
-  const sectionId = useId();
-  const employeesTabId = `${sectionId}-employees-tab`;
-  const employeesPanelId = `${sectionId}-employees-panel`;
-  const capacityTabId = `${sectionId}-capacity-tab`;
-  const capacityPanelId = `${sectionId}-capacity-panel`;
-
-  return (
-    <div className="project-settings-shell" data-section={section}>
-      <header className="project-settings-page-heading">
-        <span className="project-settings-page-title">
-          <h1>{zh ? '项目设置' : 'Project settings'}</h1>
-          <p>{props.project.name}</p>
-        </span>
-        <nav className="project-settings-section-tabs" aria-label={zh ? '项目设置分类' : 'Project settings sections'} role="tablist" data-inline-rail-keyboard="horizontal" onKeyDown={handleInlineRailKeyboardNavigation}>
-          <button
-            id={employeesTabId}
-            type="button"
-            role="tab"
-            aria-selected={section === 'employees'}
-            aria-controls={employeesPanelId}
-            tabIndex={section === 'employees' ? 0 : -1}
-            data-inline-rail-item="true"
-            onClick={() => setSection('employees')}
-          >
-            {zh ? '数字员工' : 'Digital employees'}
-          </button>
-          <button
-            id={capacityTabId}
-            type="button"
-            role="tab"
-            aria-selected={section === 'capacity'}
-            aria-controls={capacityPanelId}
-            tabIndex={section === 'capacity' ? 0 : -1}
-            data-inline-rail-item="true"
-            onClick={() => setSection('capacity')}
-          >
-            {zh ? '上下文容量' : 'Context capacity'}
-          </button>
-        </nav>
-      </header>
-
-      <section id={employeesPanelId} className="project-settings-panel" role="tabpanel" aria-labelledby={employeesTabId} hidden={section !== 'employees'}>
-        <ProjectDigitalEmployeesPanel projectId={props.project.id} projectName={props.project.name} client={props.commandClient} skillClient={props.conversationClient} language={props.language} />
-      </section>
-      <section id={capacityPanelId} className="project-settings-panel" role="tabpanel" aria-labelledby={capacityTabId} hidden={section !== 'capacity'}>
-        <ProjectContextCapacitySettings projectId={props.project.id} client={props.commandClient} language={props.language} />
-      </section>
-    </div>
-  );
-}
 
 export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions: WorkspaceDomainActions; operations: WorkspaceOperations }) {
   const [attentionOpen, setAttentionOpen] = useState(false);
@@ -186,9 +126,9 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     activeTaskManagementStatusLabels,
     activeTaskTableColumns,
     appShellSettings,
+    archivedConversationError,
     archivedConversationLoadState,
     archivedConversations,
-    archivedProjects,
     automaticUpdateIndicator,
     codeWorkspaceCopy,
     codexConfigImportError,
@@ -225,7 +165,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     projectCreationReady,
     projectDetail,
     projectDirectoryChoosing,
-    projectPanel,
     projectSidebarResizing,
     projectSourceWorkspaceRef,
     globalAgentSettingsRef,
@@ -270,7 +209,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     setPendingProjectDeleteId,
     setProjectCreateError,
     setProjectCreateForm,
-    setProjectPanel,
     setRuntimeConfirmation,
     setRuntimeConfirmationCommand,
     setRuntimeConfirmationStatus,
@@ -291,9 +229,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     setTaskGitMergeTaskId,
     setTaskModelPushForm,
     setTaskSearchQuery,
-    setTaskStatusSettingsTargetId,
     setTaskTableLayoutDraft,
-    setTaskTableLayoutScopeDialogOpen,
     setTaskTagFilter,
     settingsCategory,
     settingsWorkspaceCopy,
@@ -324,7 +260,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     taskModelPushForm,
     taskModelPushRefreshingRepositoryId,
     taskModelPushRuntimeCapabilities,
-    taskModelPushServiceTierPreferences,
     taskModelPushStatus,
     taskModelPushTaskId,
     taskPageViewMode,
@@ -332,12 +267,12 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     taskStatusFilter,
     taskStatusFilterValues,
     taskTableLayoutDirty,
-    taskTableLayoutLeaveDialogOpen,
     taskTableLayoutSaveBusy,
-    taskTableLayoutScopeDialogOpen,
+    taskTableLayoutLeaveDialogOpen,
     taskTagFilter,
     taskTemplates,
     taskTerminalCleanupConfirmation,
+    pendingTaskStatuses,
     taskWorkspaceCopy,
     uiCopy,
     updatingTaskBusy,
@@ -358,7 +293,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     closeTaskModelPush,
     createCurrentProject,
     deleteProject,
-    effectiveTaskStatusSettingsTargetId,
     materializeTaskCreateResources,
     openProjectCreateDialog,
     openTaskConflictAiConversation,
@@ -366,6 +300,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     openNativeConversationDrawer,
     openNativeConversationPage,
     openTaskCreateModal,
+    openTaskCreateForTeam,
     openTaskDetailPane,
     openTaskGitDelivery,
     openTaskModelPush,
@@ -374,13 +309,11 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     prepareNewConversationDraft,
     readTaskCreateClipboardResources,
     refreshArchivedConversations,
-    refreshArchivedProjects,
     refreshNativeConversationChoices,
     refreshTaskModelPushRepository,
     removeTaskCreateAttachment,
     renameProjectDisplayName,
     resolveTaskTerminalCleanupConfirmation,
-    restoreProject,
     restoreTaskConversation,
     runStorageRecoveryPreflightAndRestart,
     revealProjectInFinder,
@@ -404,7 +337,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     beginSaveTaskTableLayoutAndLeave,
     cancelSourceWorkspaceLeave,
     cancelTaskTableLayoutLeave,
-    cancelTaskTableLayoutScopeDialog,
     checkReleaseUpdate,
     checkRuntimeAdapter,
     clearNetworkCache,
@@ -435,7 +367,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     loadTaskTemplates,
     moveTaskBoardTask,
     openProjectSection,
-    projectDrawerVisualProps,
     projectSidebarMaximumWidth,
     projectSidebarShellStyle,
     projectSidebarWidth,
@@ -444,9 +375,9 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     rejectGenericRuntimeConfirmation,
     renderNativeConversationWorkspace,
     renderTaskDetailPaneContent,
+    digitalTeamEntrySelection,
     digitalTeamTask,
     returnFromDigitalTeam,
-    repositoryPickerLabel,
     resetProjectSidebarWidth,
     resizeRuntimeSession,
     restoreRuntimeSession,
@@ -467,6 +398,10 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     updateTaskBoardSettings,
     workspaceDrawerPortalStyle,
   } = operations;
+  /** 任务详情各展示形态统一用任务编码作为顶栏身份，避免重复展示泛化标题。 */
+  const taskDetailPresentationLabel = taskDetailPaneTask
+    ? `${taskWorkspaceCopy.taskCodeLabel ?? (appShellSettings.appLanguage === 'zh-CN' ? '任务编码' : 'Task code')} ${taskDetailPaneTask.taskCode?.trim() || taskDetailPaneTask.id}`
+    : taskWorkspaceCopy.detailPaneLabel;
   const openProjectView: typeof openProjectSection = (project, section, codeMode = projectCodeWorkspaceMode) => {
     if (section === 'sessions') {
       const group = nativeConversationGroups.find((item) => item.projectId === project.id);
@@ -517,6 +452,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   }, [activeProjectId, activeProjectSection, pendingGlobalSource, projectCodeWorkspaceMode, projectSourceWorkspaceRef]);
   /** 任务详情也可从会话页打开；接入上下文仍由原工作面身份约束，关闭或切换后旧回执失效。 */
   const modelSetupTask = snapshot.tasks.find((task) => task.id === taskModelPushTaskId);
+  /** 团队执行读取最新任务授权与修订，避免授权保存后继续携带旧任务进入下一次操作。 */
+  const currentDigitalTeamTask = digitalTeamTask ? (snapshot.tasks.find((task) => task.id === digitalTeamTask.id) ?? digitalTeamTask) : undefined;
   const taskModelSetupContext: TaskModelSetupContext | undefined =
     modelSetupTask &&
     (activeNavTarget === 'projects' || activeNavTarget === 'conversations') &&
@@ -540,12 +477,16 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     taskContext: taskModelSetupContext,
     requestedTaskStep: taskModelPushEntry === 'choose' || taskModelPushEntry === 'custom' ? taskModelPushEntry : undefined,
   });
+  /** 点击后立即展示确认面，模型接入分流完成前由弹窗承载真实加载状态。 */
+  const taskModelPushModalOpen = Boolean(modelSetupTask) && (taskModelPushEntry === 'checking' || taskModelPushEntry === 'confirmation') && !modelSetup.step;
   /** 侧栏选项与当前详情相互关联，键盘和读屏均可定位内容。 */
   const settingsPanelId = useId();
   /** 归档筛选只作用于当前列表，不修改任何会话。 */
   const [archiveQuery, setArchiveQuery] = useState('');
+  /** 恢复失败归属于归档列表，不升级为全局弹窗。 */
+  const [archiveActionError, setArchiveActionError] = useState<unknown>(null);
   /** 任务字段的写入状态；仅提交该页拥有的偏好。 */
-  const taskAutosave = useSettingsAutosave(appShellSettings.appLanguage);
+  const taskAutosave = useSettingsAutosave();
   /** 两个复合页共享各自页面标题处的保存反馈。 */
   const [modelSaveState, setModelSaveState] = useState<SettingsSaveState>('idle');
   /** 漏斗立即响应；复用客户端串行队列只保存该字段，不回填旧的整份设置响应。 */
@@ -559,7 +500,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     });
   }
   /** 删除状态的替换关系随失败草稿保留，成功后才清除。 */
-  function saveTaskFields(patch: Pick<UpdateAppShellSettingsRequest, 'taskTableEnumSortOrders' | 'taskManagementStatusTemplate' | 'taskManagementStatusByProject' | 'taskManagementStatusReplacements'>): void {
+  function saveTaskFields(patch: Pick<UpdateAppShellSettingsRequest, 'taskTableEnumSortOrders' | 'taskManagementStatusTemplate' | 'taskManagementStatusReplacements'>): void {
     setAppShellSettings((current) => ({ ...current, ...patch }));
     /** 客户端串行保存，避免与通用设置互相覆盖。 */
     const client = props.nativeConversationClient?.settings;
@@ -573,6 +514,15 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const [archiveProjectId, setArchiveProjectId] = useState('');
   /** 分页状态随列表缩短自动夹紧。 */
   const [archiveRequestedPage, setArchiveRequestedPage] = useState(1);
+  /** 恢复操作保留原条目，并由归档区域承接失败原因。 */
+  async function restoreArchivedConversation(conversation: NativeConversationChoice): Promise<void> {
+    setArchiveActionError(null);
+    try {
+      await restoreTaskConversation(conversation);
+    } catch (error) {
+      setArchiveActionError(error);
+    }
+  }
   /** 列表变化时一次关联项目和任务，搜索时不再逐条扫描全部任务。 */
   const archiveItems = useMemo(() => {
     /** 任务编号和标题来自当前任务记录。 */
@@ -601,13 +551,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
         ['usage', settingsWorkspaceCopy.categories.usage, ChartBarIcon],
         ['memory', settingsWorkspaceCopy.categories.memory, BrainIcon],
         ['tasks', settingsWorkspaceCopy.categories.tasks, ListChecksIcon],
-        ['employees', settingsWorkspaceCopy.categories.employees, RobotIcon],
       ],
     },
     {
       group: settingsWorkspaceCopy.sectionGroups.integrations,
       items: [
         ['runtime', settingsWorkspaceCopy.categories.runtime, PlugsConnectedIcon],
+        ['network', settingsWorkspaceCopy.categories.network, GlobeIcon],
         ['models', settingsWorkspaceCopy.categories.models, CubeIcon],
         ['browser', settingsWorkspaceCopy.categories.browser, BrowserIcon],
         // IM 接入名称同时用于侧栏展示与设置搜索。
@@ -643,9 +593,16 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const projectWorkspaceNavigationVisible = !upstreamMainLayout && Boolean(selectedProject);
   /** 会话使用项目/会话来源列表；其他模式由各自工作区提供紧邻活动栏的上下文导航。 */
   const projectSessionSourceListVisible =
-    !upstreamMainLayout && Boolean(selectedProject) && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions';
+    !upstreamMainLayout &&
+    Boolean(selectedProject) &&
+    activeNavTarget !== 'settings' &&
+    activeNavTarget !== 'skills' &&
+    activeNavTarget !== 'digital-employees' &&
+    activeNavTarget !== 'digital-teams' &&
+    activeNavTarget !== 'automations' &&
+    activeProjectSection === 'sessions';
   const sessionCodexParityVisible = upstreamMainLayout
-    ? activeProjectSection === 'sessions' && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations'
+    ? activeProjectSection === 'sessions' && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-employees' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations'
     : projectSessionSourceListVisible;
 
   return (
@@ -681,18 +638,10 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       <output className="sr-only" aria-live="polite" aria-atomic="true">
         {taskModelPushAnnouncement}
       </output>
-      {nativeConversationStatusSyncState !== 'connected' ? (
+      {/* 常规连接和同步不占用全局提示；只有列表可能过期时说明数据新鲜度。 */}
+      {nativeConversationStatusSyncState === 'stale' || nativeConversationStatusSyncState === 'reconnecting' ? (
         <output className="conversation-status-sync-indicator" data-state={nativeConversationStatusSyncState} role="status" aria-live="polite" aria-atomic="true">
-          {nativeConversationStatusSyncState === 'stale' ? null : <span className="conversation-status-sync-spinner" aria-hidden="true" />}
-          <span>
-            {nativeConversationStatusSyncState === 'stale'
-              ? appShellSettings.appLanguage === 'zh-CN'
-                ? '会话状态暂未同步，正在后台重试'
-                : 'Conversation status is unavailable; retrying in the background'
-              : appShellSettings.appLanguage === 'zh-CN'
-                ? '正在同步会话状态'
-                : 'Syncing conversation status'}
-          </span>
+          <span>{appShellSettings.appLanguage === 'zh-CN' ? '会话列表可能不是最新状态，正在自动恢复' : 'The conversation list may be outdated. Recovering automatically.'}</span>
         </output>
       ) : null}
       {storageRecoveryFault ? (
@@ -822,49 +771,15 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           />
         ) : null}
       </MotionPresence>
-      <MotionPresence>
-        {taskTableLayoutScopeDialogOpen ? (
-          <TaskTableLayoutDecisionDialog
-            open={taskTableLayoutScopeDialogOpen}
-            title={appShellSettings.appLanguage === 'zh-CN' ? '保存任务列表布局' : 'Save task list layout'}
-            description={
-              appShellSettings.appLanguage === 'zh-CN'
-                ? '请选择这次布局修改的作用范围。保存到全部项目会更新全局默认，并清除所有项目的单独覆盖。'
-                : 'Choose where this layout applies. Saving for all projects updates the global default and clears project-specific overrides.'
-            }
-            busy={taskTableLayoutSaveBusy}
-            actions={[
-              {
-                id: 'project',
-                label: appShellSettings.appLanguage === 'zh-CN' ? '仅当前项目' : 'Current project only',
-                onClick: () => void saveTaskTableLayout('project'),
-              },
-              {
-                id: 'global',
-                label: appShellSettings.appLanguage === 'zh-CN' ? '全部项目' : 'All projects',
-                variant: 'primary',
-                onClick: () => void saveTaskTableLayout('global'),
-              },
-              {
-                id: 'cancel',
-                label: appShellSettings.appLanguage === 'zh-CN' ? '取消' : 'Cancel',
-                onClick: cancelTaskTableLayoutScopeDialog,
-              },
-            ]}
-            onCancel={cancelTaskTableLayoutScopeDialog}
-          />
-        ) : null}
-      </MotionPresence>
       {!upstreamMainLayout && projectWorkspaceNavigationVisible && selectedProject ? (
         <ProjectWorkspaceNavigation
           attentionAction={<AttentionToggle open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} />}
           project={selectedProject}
           projects={orderedProjects}
-          onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+          onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection, projectCodeWorkspaceMode)}
           onCloseProject={async (project) => {
             await terminateProjectTerminalSessions(props.commandClient ?? null, project.id);
           }}
-          onOpenProjectSettings={(project) => openProjectSection(project, 'project-settings')}
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
           activeNavTarget={activeNavTarget}
@@ -950,7 +865,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           pendingProjectDeleteId={pendingProjectDeleteId}
         />
       ) : null}
-      {(upstreamMainLayout && activeNavTarget !== 'settings') || projectSessionSourceListVisible ? (
+      {/* 无项目时沿用首页三列布局，分隔列必须存在，避免内容误占一像素列。 */}
+      {((upstreamMainLayout || !selectedProject) && activeNavTarget !== 'settings') || projectSessionSourceListVisible ? (
         <div
           className="project-sidebar-resizer"
           role="separator"
@@ -971,6 +887,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           <ProjectStartGuide language={appShellSettings.appLanguage} busy={projectDirectoryChoosing || creatingProjectBusy} available={Boolean(props.onCreateCurrentProject)} onChooseFolder={() => void chooseProjectDirectoryForCreate()} />
         ) : null}
         {activeNavTarget === 'skills' ? <toolPages.extensions client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} projectId={activeProjectId} onChooseDirectory={props.onChooseProjectDirectory} /> : null}
+        {/* 全局员工管理直接复用原页面，项目员工绑定仍由项目设置承载。 */}
+        {activeNavTarget === 'digital-employees' ? <DigitalEmployeeTemplatesSettings client={props.commandClient ?? null} skillClient={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} /> : null}
         {activeNavTarget === 'digital-teams' ? (
           <Suspense
             fallback={
@@ -980,14 +898,11 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             }
           >
             <toolPages.digitalTeams
-              key={digitalTeamTask?.id ?? 'team'}
-              task={digitalTeamTask}
-              onBackToTask={digitalTeamTask ? returnFromDigitalTeam : undefined}
-              onManageEmployees={(projectId) => {
-                /** 角色权限始终在所属项目的现有设置入口修改。 */
-                const project = snapshot.projects.find((candidate) => candidate.id === projectId);
-                if (project) openProjectSection(project, 'project-settings');
-              }}
+              key={`${digitalTeamTask?.id ?? 'team'}:${digitalTeamEntrySelection?.kind ?? 'manage'}:${digitalTeamEntrySelection?.kind === 'template' ? digitalTeamEntrySelection.templateId : digitalTeamEntrySelection?.kind === 'run' ? digitalTeamEntrySelection.runId : ''}`}
+              task={currentDigitalTeamTask}
+              onCreateTask={openTaskCreateForTeam}
+              initialSelection={digitalTeamEntrySelection}
+              onBackToTask={currentDigitalTeamTask ? returnFromDigitalTeam : undefined}
               client={props.commandClient ?? null}
               projects={snapshot.projects}
               initialProjectId={activeProjectId}
@@ -1000,6 +915,38 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             />
           </Suspense>
         ) : null}
+        {/* 任务、会话和全局团队共用同一个任务创建入口。 */}
+        <MotionPresence>
+          {taskCreateModalOpen ? (
+            <TaskCreateModal
+              projects={snapshot.projects}
+              onProjectChange={(projectId) => setTaskCreateForm((current) => ({ ...current, projectId, parentTaskId: null }))}
+              open={taskCreateModalOpen}
+              copy={taskWorkspaceCopy}
+              form={taskCreateForm}
+              parentTasks={snapshot.tasks.filter((task) => task.projectId === taskCreateForm.projectId && taskHierarchyDepth(task, snapshot.tasks) < 3)}
+              error={taskCreateError}
+              busy={creatingTaskBusy}
+              titleInputRef={taskCreateTitleInputRef}
+              onFormChange={updateTaskCreateForm}
+              onTaskTypeChange={updateTaskCreateType}
+              onPriorityChange={updateTaskCreatePriority}
+              onParentChange={(parentTaskId) => setTaskCreateForm((current) => ({ ...current, parentTaskId }))}
+              onAuthorizeFiles={authorizeTaskCreateFiles}
+              onMaterializeResources={materializeTaskCreateResources}
+              onReadClipboardResources={readTaskCreateClipboardResources}
+              onParseThirdPartyLink={(url) => props.onParseThirdPartyTaskLink?.(url) ?? Promise.resolve({ kind: 'unsupported', sourceUrl: url })}
+              onApplyThirdPartyTaskInfo={applyThirdPartyTaskExtract}
+              onOpenThirdPartyLink={openThirdPartyLinkInBrowser}
+              onAddAttachments={addTaskCreateAttachments}
+              onLoadAttachmentPreview={props.onLoadTaskAttachmentPreview}
+              onOpenAttachment={props.onOpenTaskAttachment}
+              onRemoveAttachment={removeTaskCreateAttachment}
+              onClose={closeTaskCreateModal}
+              onSubmit={(event) => void submitTaskCreateModal(event)}
+            />
+          ) : null}
+        </MotionPresence>
         {activeNavTarget === 'automations' ? (
           <toolPages.automations
             client={props.commandClient ?? null}
@@ -1010,13 +957,40 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               const choice = await props.nativeConversationClient.loadNativeConversationChoice(run.projectId, run.conversationId);
               await selectNativeConversation(choice);
             }}
+            onOpenExecution={async (_run, reference, target) => {
+              /** 员工工作和流程都先读取实际任务归属，临时工作不依赖左栏项目目录。 */
+              const client = props.commandClient;
+              if (!client) throw new Error('工作服务尚未连接。');
+              const taskId = reference.taskId ?? (reference.kind === 'workflow' ? (await client.loadDigitalTeamRun(reference.id)).run.taskId : null);
+              if (!taskId) throw new Error('当前执行尚未提供可查看的任务身份。');
+              const task = await client.loadTask(taskId);
+              if (target === 'conversation') {
+                /** TaskWork 会话在真实派发后生成，不能把运行 ID 当作会话 ID。 */
+                const workRun = reference.kind === 'task_work' ? (await client.loadTaskWorkManagement(task.id)).workItems.flatMap((item) => item.runs).find((item) => item.id === reference.id) : null;
+                const conversationId = workRun?.conversationId ?? reference.conversationId;
+                if (!conversationId || !props.nativeConversationClient) throw new Error('工作会话尚未建立，请先查看任务与成果。');
+                await selectNativeConversation(await props.nativeConversationClient.loadNativeConversationChoice(task.projectId, conversationId));
+                return;
+              }
+              if (target === 'workflow') {
+                /** 沿用任务详情进入数字团队的同一页面与准确运行选择。 */
+                closeTaskDetail();
+                state.setDigitalTeamTask(task);
+                state.setDigitalTeamEntrySelection({ kind: 'run', runId: reference.id });
+                state.setActiveNavTarget('digital-teams');
+                return;
+              }
+              const project = snapshot.projects.find((item) => item.id === task.projectId) ?? (await client.loadProject(task.projectId));
+              setPendingGlobalTask({ taskId: task.id, projectId: project.id, presentation: 'full_page' });
+              openProjectSection(project, 'tasks');
+            }}
           />
         ) : null}
-        {upstreamMainLayout && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && selectedProject ? (
+        {upstreamMainLayout && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-employees' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && selectedProject ? (
           <ProjectWorkspaceModeToolbar
             project={selectedProject}
             projects={orderedProjects}
-            onSelectProject={(project) => openProjectSection(project, activeProjectSection === 'project-settings' ? 'tasks' : activeProjectSection, projectCodeWorkspaceMode)}
+            onSelectProject={(project) => openProjectSection(project, activeProjectSection, projectCodeWorkspaceMode)}
             section={activeProjectSection}
             codeMode={projectCodeWorkspaceMode}
             language={appShellSettings.appLanguage}
@@ -1028,7 +1002,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             }}
           />
         ) : null}
-        {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && activeProjectSection === 'code' && selectedProject ? (
+        {activeNavTarget !== 'settings' &&
+        activeNavTarget !== 'skills' &&
+        activeNavTarget !== 'digital-employees' &&
+        activeNavTarget !== 'digital-teams' &&
+        activeNavTarget !== 'automations' &&
+        activeProjectSection === 'code' &&
+        selectedProject ? (
           <section className="workspace-view workspace-view-project-code project-code-workspace" aria-label={codeWorkspaceCopy.projectCodeAria}>
             <div className="project-code-mode-host">
               {projectCodeWorkspaceMode === 'source' ? (
@@ -1055,60 +1035,22 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           </section>
         ) : null}
 
-        {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && activeProjectSection === 'git' && selectedProject && props.nativeConversationClient ? (
+        {activeNavTarget !== 'settings' &&
+        activeNavTarget !== 'skills' &&
+        activeNavTarget !== 'digital-employees' &&
+        activeNavTarget !== 'digital-teams' &&
+        activeNavTarget !== 'automations' &&
+        activeProjectSection === 'git' &&
+        selectedProject &&
+        props.nativeConversationClient ? (
           <section className="workspace-view workspace-view-project-git">
             <ProjectGitWorkbench key={selectedProject.id} project={selectedProject} client={props.nativeConversationClient} language={appShellSettings.appLanguage} />
           </section>
         ) : null}
 
-        {activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && snapshot.projects.length > 0 && activeProjectSection === 'project-settings' ? (
-          <section className="workspace-view workspace-view-project-settings" aria-label={codeWorkspaceCopy.projectSettingsAria}>
-            <section className="workspace-detail-pane project-detail-pane" aria-label={codeWorkspaceCopy.detailAria}>
-              {selectedProject ? (
-                <ProjectSettingsWorkspace key={selectedProject.id} project={selectedProject} commandClient={props.commandClient ?? null} conversationClient={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} />
-              ) : (
-                <>
-                  <InlineRecoveryPrompt
-                    title={uiCopy.sidebar.selectLocalRepository}
-                    body=""
-                    actions={[
-                      {
-                        label: repositoryPickerLabel(),
-                        onAction: openProjectCreateDialog,
-                        disabled: !projectCreationReady || creatingProjectBusy,
-                        busy: creatingProjectBusy,
-                      },
-                    ]}
-                  />
-                  <MotionPresence>
-                    {projectPanel === 'archive' ? (
-                      <WorkspaceDrawer
-                        {...projectDrawerVisualProps}
-                        label={codeWorkspaceCopy.drawerLabel}
-                        backdropLabel={codeWorkspaceCopy.drawerBackdrop}
-                        closeLabel={codeWorkspaceCopy.drawerClose}
-                        className="project-drawer"
-                        portalStyle={workspaceDrawerPortalStyle}
-                        onClose={() => setProjectPanel(undefined)}
-                      >
-                        <ProjectArchiveWorkbench
-                          projects={archivedProjects}
-                          copy={codeWorkspaceCopy.projectArchive}
-                          codeCopy={codeWorkspaceCopy}
-                          onRefresh={refreshArchivedProjects}
-                          refreshDisabled={!props.onLoadArchivedProjects}
-                          onRestore={restoreProject}
-                        />
-                      </WorkspaceDrawer>
-                    ) : null}
-                  </MotionPresence>
-                </>
-              )}
-            </section>
-          </section>
-        ) : null}
         {activeNavTarget !== 'settings' &&
         activeNavTarget !== 'skills' &&
+        activeNavTarget !== 'digital-employees' &&
         activeNavTarget !== 'digital-teams' &&
         activeNavTarget !== 'automations' &&
         snapshot.projects.length > 0 &&
@@ -1125,12 +1067,12 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                 <>
                   {/* 默认仍是完整宽度的任务列表；看板可按项目切换，只有全页详情会临时替换任务工作区。 */}
                   {taskDetailPaneTask && taskDetailPresentation === 'full_page' ? (
-                    <section className="task-detail-full-page" aria-label={taskWorkspaceCopy.detailPaneLabel}>
+                    <section className="task-detail-full-page" aria-label={taskDetailPresentationLabel}>
                       <header className="task-detail-presentation-header">
                         <Button variant="secondary" size="compact" onClick={closeTaskDetail}>
                           {appShellSettings.appLanguage === 'zh-CN' ? '返回任务' : 'Back to tasks'}
                         </Button>
-                        <strong>{taskDetailPaneTask.title}</strong>
+                        <strong>{taskDetailPresentationLabel}</strong>
                       </header>
                       {renderTaskDetailPaneContent()}
                     </section>
@@ -1160,9 +1102,10 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                       taskTableColumns={activeTaskTableColumns}
                       taskTableEnumSortOrders={taskTableEnumSortOrders}
                       taskTableLayoutDirty={taskTableLayoutDirty}
+                      taskTableLayoutSaveBusy={taskTableLayoutSaveBusy}
                       creatingTaskBusy={creatingTaskBusy}
+                      pendingTaskStatuses={pendingTaskStatuses}
                       bulkActionBusy={updatingTaskBusy}
-                      statusChangeBusy={updatingTaskBusy}
                       bulkActionStatus={taskBulkActionStatus}
                       modelPushEntry={
                         taskModelPushTaskId && (taskModelPushEntry === 'checking' || taskModelPushEntry === 'error')
@@ -1179,8 +1122,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                       onSearchChange={setTaskSearchQuery}
                       onStatusFilterChange={(filter) => void saveTaskStatusFilter(filter)}
                       onTagFilterChange={setTaskTagFilter}
-                      onTaskTableColumnsChange={(preferences) => setTaskTableLayoutDraft({ projectId: activeProjectId, preferences })}
-                      onSaveTaskTableLayout={() => setTaskTableLayoutScopeDialogOpen(true)}
+                      onTaskTableColumnsChange={(preferences) => setTaskTableLayoutDraft({ preferences })}
+                      onSaveTaskTableLayout={() => void saveTaskTableLayout()}
                       onCreateTask={() => openTaskCreateModal()}
                       onOpenZentaoImport={() => setZentaoImportOpen(true)}
                       onOpenTaskDetail={(taskId, mode) => void openTaskDetailPane(taskId, mode)}
@@ -1203,7 +1146,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                       onRetryTaskList={
                         props.onLoadTasks && activeProjectId ? () => void props.onLoadTasks?.(activeProjectId, taskSearchQuery, taskStatusFilter && taskStatusFilter !== 'unfinished' ? taskStatusFilter : undefined, taskTagFilter) : undefined
                       }
-                      onOpenProjectSettings={selectedProject ? () => openProjectSection(selectedProject, 'project-settings') : undefined}
                       onOpenProjectCode={selectedProject ? () => openProjectSection(selectedProject, 'code') : undefined}
                       controlBusyProps={controlBusyProps}
                     />
@@ -1224,54 +1166,21 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                 renderNativeConversationWorkspace((taskId) => void openTaskDetailPane(taskId))
               )}
 
-              {/* 任务详情也可从会话进入；创建表单必须与任务、会话共享显示边界。 */}
               <MotionPresence>
-                {taskCreateModalOpen ? (
-                  <TaskCreateModal
-                    projects={snapshot.projects}
-                    onProjectChange={(projectId) => setTaskCreateForm((current) => ({ ...current, projectId, parentTaskId: null }))}
-                    open={taskCreateModalOpen}
-                    copy={taskWorkspaceCopy}
-                    form={taskCreateForm}
-                    parentTasks={snapshot.tasks.filter((task) => task.projectId === taskCreateForm.projectId && taskHierarchyDepth(task, snapshot.tasks) < 3)}
-                    error={taskCreateError}
-                    busy={creatingTaskBusy}
-                    titleInputRef={taskCreateTitleInputRef}
-                    onFormChange={updateTaskCreateForm}
-                    onTaskTypeChange={updateTaskCreateType}
-                    onPriorityChange={updateTaskCreatePriority}
-                    onParentChange={(parentTaskId) => setTaskCreateForm((current) => ({ ...current, parentTaskId }))}
-                    onAuthorizeFiles={authorizeTaskCreateFiles}
-                    onMaterializeResources={materializeTaskCreateResources}
-                    onReadClipboardResources={readTaskCreateClipboardResources}
-                    onParseThirdPartyLink={(url) => props.onParseThirdPartyTaskLink?.(url) ?? Promise.resolve({ kind: 'unsupported', sourceUrl: url })}
-                    onApplyThirdPartyTaskInfo={applyThirdPartyTaskExtract}
-                    onOpenThirdPartyLink={openThirdPartyLinkInBrowser}
-                    onAddAttachments={addTaskCreateAttachments}
-                    onLoadAttachmentPreview={props.onLoadTaskAttachmentPreview}
-                    onOpenAttachment={props.onOpenTaskAttachment}
-                    onRemoveAttachment={removeTaskCreateAttachment}
-                    onClose={closeTaskCreateModal}
-                    onSubmit={(event) => void submitTaskCreateModal(event)}
-                  />
-                ) : null}
-              </MotionPresence>
-
-              <MotionPresence>
-                {Boolean(taskModelPushTaskId) && taskModelPushEntry === 'confirmation' && !modelSetup.step && (snapshot.tasks.find((task) => task.id === taskModelPushTaskId) ?? null) ? (
+                {taskModelPushModalOpen && modelSetupTask ? (
                   <TaskModelPushModal
-                    open={Boolean(taskModelPushTaskId) && taskModelPushEntry === 'confirmation' && !modelSetup.step}
+                    open={taskModelPushModalOpen}
                     language={appShellSettings.appLanguage}
-                    task={snapshot.tasks.find((task) => task.id === taskModelPushTaskId) ?? null}
-                    projectName={snapshot.projects.find((project) => project.id === snapshot.tasks.find((task) => task.id === taskModelPushTaskId)?.projectId)?.name}
+                    task={modelSetupTask}
+                    projectName={snapshot.projects.find((project) => project.id === modelSetupTask.projectId)?.name}
                     capabilities={taskModelPushCapabilities}
                     runtimeCapabilities={taskModelPushRuntimeCapabilities}
-                    serviceTierPreferences={taskModelPushServiceTierPreferences}
                     form={taskModelPushForm}
                     status={taskModelPushStatus}
                     refreshingRepositoryId={taskModelPushRefreshingRepositoryId}
                     error={taskModelPushError}
                     skillClient={props.nativeConversationClient ?? null}
+                    environmentClient={props.nativeConversationClient ?? null}
                     onChange={(nextForm) => {
                       setTaskModelPushForm((current) => {
                         const resolved = typeof nextForm === 'function' ? nextForm(current) : nextForm;
@@ -1280,7 +1189,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                         return resolved;
                       });
                     }}
-                    onServiceTierPreferenceChange={domainActions.saveTaskModelPushServiceTierPreference}
                     onRefreshRepository={(repositoryId) => void refreshTaskModelPushRepository(repositoryId)}
                     onRefreshLocalRepositories={() => void domainActions.refreshTaskModelPushRepositories()}
                     onConnectModel={() => modelSetup.open('choose', taskModelSetupContext ?? null)}
@@ -1325,7 +1233,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                     presentation="floating"
                     backdrop="dimmed"
                     size="wide"
-                    label={taskWorkspaceCopy.detailPaneLabel}
+                    label={taskDetailPresentationLabel}
                     backdropLabel={taskWorkspaceCopy.detailPaneBackdrop}
                     closeLabel={taskWorkspaceCopy.detailPaneClose}
                     className="task-detail-floating-drawer"
@@ -1338,10 +1246,10 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
               </MotionPresence>
               <MotionPresence>
                 {taskDetailPaneTask && taskDetailPresentation === 'center_peek' ? (
-                  <ModalPortal rootClassName="task-detail-center-portal" backdropClassName="task-detail-center-backdrop" onDismiss={closeTaskDetail} role="dialog" aria-label={taskWorkspaceCopy.detailPaneLabel}>
+                  <ModalPortal rootClassName="task-detail-center-portal" backdropClassName="task-detail-center-backdrop" onDismiss={closeTaskDetail} role="dialog" aria-label={taskDetailPresentationLabel}>
                     <section className="task-detail-center-dialog" data-modal-surface="dialog">
                       <header className="task-detail-presentation-header">
-                        <strong>{taskWorkspaceCopy.detailPaneLabel}</strong>
+                        <strong>{taskDetailPresentationLabel}</strong>
                         <Button variant="secondary" size="compact" onClick={closeTaskDetail} aria-label={taskWorkspaceCopy.detailPaneClose}>
                           {appShellSettings.appLanguage === 'zh-CN' ? '关闭' : 'Close'}
                         </Button>
@@ -1921,7 +1829,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                     initialProjectId={projectDetail?.id}
                   />
                 ) : null}
-                {settingsCategory === 'employees' ? <DigitalEmployeeTemplatesSettings client={props.commandClient ?? null} skillClient={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} /> : null}
                 {settingsCategory === 'tasks' ? (
                   <section className="settings-product-pane task-list-settings-pane" aria-label={settingsWorkspaceCopy.categories.tasks}>
                     <header className="settings-page-heading">
@@ -1951,25 +1858,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                             <section className="settings-product-section" aria-labelledby="task-status-config-title">
                               <header className="settings-section-heading">
                                 <strong id="task-status-config-title">{appShellSettings.appLanguage === 'zh-CN' ? '任务状态' : 'Task statuses'}</strong>
-                                <span>
-                                  {appShellSettings.appLanguage === 'zh-CN'
-                                    ? '每个项目独立维护状态名称、颜色和顺序。删除使用中的状态时，先迁移任务再删除。'
-                                    : 'Each project owns its status names, colors, and order. In-use statuses migrate before deletion.'}
-                                </span>
+                                <span>{appShellSettings.appLanguage === 'zh-CN' ? '所有项目统一使用这些状态。删除使用中的状态时，先迁移任务再删除。' : 'All projects use these statuses. In-use statuses migrate before deletion.'}</span>
                               </header>
-                              <label className="task-status-config-scope">
-                                <span>{appShellSettings.appLanguage === 'zh-CN' ? '配置对象' : 'Configuration target'}</span>
-                                <ZeusSelect
-                                  size="regular"
-                                  ariaLabel={appShellSettings.appLanguage === 'zh-CN' ? '选择任务状态配置对象' : 'Choose task status configuration target'}
-                                  value={effectiveTaskStatusSettingsTargetId}
-                                  onChange={setTaskStatusSettingsTargetId}
-                                  options={[
-                                    { value: '__template__', label: appShellSettings.appLanguage === 'zh-CN' ? '新项目默认模板' : 'New project default template' },
-                                    ...snapshot.projects.map((project) => ({ value: project.id, label: project.name })),
-                                  ]}
-                                />
-                              </label>
                               <TaskManagementStatusEditor
                                 language={appShellSettings.appLanguage}
                                 config={taskStatusSettingsConfig}
@@ -1977,18 +1867,12 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                                 labelForStatus={(status) => formatConfiguredTaskManagementStatus(status, taskStatusSettingsConfig, appShellSettings.appLanguage)}
                                 onChange={(config, deletion) => {
                                   /** 迁移关系与状态配置在同一笔本地事务提交。 */
-                                  const replacements =
-                                    effectiveTaskStatusSettingsTargetId !== '__template__' && deletion?.replacementStatusId
-                                      ? {
-                                          ...state.taskManagementStatusReplacements,
-                                          [effectiveTaskStatusSettingsTargetId]: { ...state.taskManagementStatusReplacements[effectiveTaskStatusSettingsTargetId], [deletion.removedStatusId]: deletion.replacementStatusId },
-                                        }
-                                      : state.taskManagementStatusReplacements;
+                                  const replacements = deletion?.replacementStatusId
+                                    ? { ...state.taskManagementStatusReplacements, __global__: { ...state.taskManagementStatusReplacements.__global__, [deletion.removedStatusId]: deletion.replacementStatusId } }
+                                    : state.taskManagementStatusReplacements;
                                   state.setTaskManagementStatusReplacements(replacements);
                                   saveTaskFields({
-                                    ...(effectiveTaskStatusSettingsTargetId === '__template__'
-                                      ? { taskManagementStatusTemplate: config }
-                                      : { taskManagementStatusByProject: { ...appShellSettings.taskManagementStatusByProject, [effectiveTaskStatusSettingsTargetId]: config } }),
+                                    taskManagementStatusTemplate: config,
                                     taskManagementStatusReplacements: replacements,
                                   });
                                 }}
@@ -2062,6 +1946,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                 ) : null}
                 {settingsCategory === 'terminal' ? <TerminalSettingsPane client={props.commandClient ?? null} language={appShellSettings.appLanguage} /> : null}
                 {settingsCategory === 'browser' ? <BrowserSettingsPane language={appShellSettings.appLanguage} /> : null}
+                {settingsCategory === 'network' ? <NetworkSettingsPane value={appShellSettings} client={props.nativeConversationClient ?? null} onChange={setAppShellSettings} /> : null}
                 {settingsCategory === 'models' ? (
                   <>
                     <header className="settings-page-heading">
@@ -2284,11 +2169,17 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                         <span className="settings-archived-conversation-list" aria-live="polite">
                           {archivedConversationLoadState === 'loading' ? <small>{settingsWorkspaceCopy.data.loadingArchivedConversations}</small> : null}
                           {archivedConversationLoadState === 'error' ? (
-                            <span className="settings-archived-conversation-state">
+                            <span className="settings-archived-conversation-state" role="alert">
+                              <VisibleApplicationError error={archivedConversationError ?? settingsWorkspaceCopy.data.archivedConversationsError} language={appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en'} />
                               <button type="button" onClick={() => void refreshArchivedConversations()}>
                                 {settingsWorkspaceCopy.data.retryArchivedConversations}
                               </button>
                             </span>
+                          ) : null}
+                          {archiveActionError ? (
+                            <small role="alert">
+                              <VisibleApplicationError error={archiveActionError} language={appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en'} />
+                            </small>
                           ) : null}
                           {archivedConversationLoadState === 'ready' && filteredArchives.length === 0 ? (
                             <small>
@@ -2309,7 +2200,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                                     {formatArchivedConversationDate(conversation.updatedAt, appShellSettings.appLanguage)}
                                   </time>
                                 </span>
-                                <button type="button" disabled={restoringArchivedConversationId !== null} onClick={() => void restoreTaskConversation(conversation)}>
+                                <button type="button" disabled={restoringArchivedConversationId !== null} onClick={() => void restoreArchivedConversation(conversation)}>
                                   {restoringArchivedConversationId === conversation.id ? settingsWorkspaceCopy.data.restoringArchivedConversation : settingsWorkspaceCopy.data.restoreArchivedConversation}
                                 </button>
                               </span>

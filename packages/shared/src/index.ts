@@ -109,7 +109,7 @@ export interface TaskWorkspaceConflictRecovery {
   unavailableReason: string | null;
 }
 
-/** 项目管理阶段与 Coding Agent 执行状态严格分离；状态标识由项目配置持有，不再限制为固定联合类型。 */
+/** 任务管理阶段与 Coding Agent 执行状态严格分离；状态标识由全局配置持有，不再限制为固定联合类型。 */
 export type TaskManagementStatus = string;
 
 /** 旧项目与新项目默认模板继续沿用现有七个状态，保存行为兼容且不改变用户已有任务。 */
@@ -145,7 +145,22 @@ const defaultTaskManagementStatusColors: Record<(typeof taskManagementStatusOrde
   cancelled: '#6b7280',
 };
 
-/** 全局模板的初始值只负责兼容现有行为；复制到项目后，每个状态都可以平等增删改。 */
+/** 内置状态的默认文案；空文案与这两种已保存的默认文案表达同一状态。 */
+export const defaultTaskManagementStatusLabels: Record<'zh-CN' | 'en-US', Record<string, string>> = {
+  'zh-CN': { todo: '待开始', in_development: '开发中', in_testing: '测试中', awaiting_acceptance: '待验收', blocked: '已阻塞', completed: '已完成', cancelled: '已取消' },
+  'en-US': { todo: 'To do', in_development: 'In development', in_testing: 'In testing', awaiting_acceptance: 'Awaiting acceptance', blocked: 'Blocked', completed: 'Completed', cancelled: 'Cancelled' },
+};
+
+/** 仅相同标识和颜色可以等价，用户自定义文案与不同颜色仍保留独立含义。 */
+export function taskManagementStatusDefinitionsEquivalent(left: TaskManagementStatusDefinition, right: TaskManagementStatusDefinition): boolean {
+  if (left.id !== right.id || left.color !== right.color) return false;
+  if (left.label === right.label) return true;
+  /** 只识别内置状态的准确默认文案，不能按同名显示内容合并自定义状态。 */
+  const defaults = [null, defaultTaskManagementStatusLabels['zh-CN'][left.id], defaultTaskManagementStatusLabels['en-US'][left.id]];
+  return taskManagementStatusOrder.includes(left.id as (typeof taskManagementStatusOrder)[number]) && defaults.includes(left.label) && defaults.includes(right.label);
+}
+
+/** 全局状态初始值沿用默认行为，所有项目共用同一份可编辑定义。 */
 export const defaultTaskManagementStatusConfig: TaskManagementStatusConfig = {
   statuses: taskManagementStatusOrder.map((id) => ({ id, label: null, color: defaultTaskManagementStatusColors[id] })),
   roles: {
@@ -228,7 +243,8 @@ export function normalizeTaskManagementStatusConfig(value: unknown, fallback: Ta
     const color = typeof definition.color === 'string' && taskManagementStatusColorPattern.test(definition.color) ? definition.color.toLowerCase() : '#6b7280';
     statuses.push({ id: definition.id, label, color });
     seen.add(definition.id);
-    if (statuses.length >= 32) break;
+    // 全局集合需容纳旧项目各自最多 32 项的状态，避免统一时丢失已有自定义状态。
+    if (statuses.length >= 3232) break;
   }
   if (statuses.length === 0) return normalizedFallback;
   const firstStatusId = statuses[0].id;
@@ -796,6 +812,8 @@ export * from './distribution.js';
 
 export * from './conversationCapabilities.js';
 export * from './employeeWorkPlanning.js';
+export * from './employeeIdentity.js';
+export * from './automationActions.js';
 export * from './digitalTeamWorkflow.js';
 export * from './conversationWorkspace.js';
 export * from './projectSourceLanguage.js';

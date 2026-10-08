@@ -5,9 +5,10 @@ import { type DashboardClient, type TaskRecord } from '../apiClient.js';
 import type { BatchTaskWorkspaceResponse, TaskGitDiffSummary, TaskGitFileStatus, TaskWorkspaceIndexCollection, TaskWorkspaceIndexSnapshot, TaskWorkspaceSnapshot } from '../session/sessionTypes.js';
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
-import { reportApplicationError, useApplicationErrorDialog, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { TaskWorkspaceBranchList } from './TaskWorkspaceBranchList.js';
 import { TaskGitDiffTable } from './TaskGitDiffTable.js';
+import { FileTypeIcon } from '../code/FileTypeIcon.js';
 
 type ReviewMode = 'commit' | 'commit-only' | 'push-only' | 'delivery';
 type ReviewStatus = 'loading' | 'ready' | 'submitting' | 'error';
@@ -65,10 +66,6 @@ function TaskGitReviewModalContent(props: TaskGitReviewModalContentProps) {
   const activeWorkspaceIndex = workspaceIndex?.items.find((workspace) => workspace.id === activeWorkspaceId) ?? null;
   const activeWorkspace = workspaceDetails[activeWorkspaceId] ?? null;
   const files = useMemo(() => collectReviewFiles(activeWorkspace), [activeWorkspace]);
-  const workspaceError = activeWorkspace?.reviewError ?? activeWorkspace?.remoteRefreshError ?? null;
-  useApplicationErrorDialog(error ?? workspaceError, {
-    language: zh ? 'zh-CN' : 'en',
-  });
 
   useEffect(() => {
     if (!interactionOpen || !props.task || !props.client) return;
@@ -348,6 +345,11 @@ function TaskGitReviewModalContent(props: TaskGitReviewModalContentProps) {
                 <strong>{props.mode === 'push-only' ? (zh ? '本机未提交变更' : 'Local uncommitted changes') : zh ? '变更' : 'Changes'}</strong>
                 <small>{files.length}</small>
               </span>
+              {error && detailStates[activeWorkspaceId] !== 'error' ? (
+                <p className="task-git-review-error" role="alert">
+                  <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+                </p>
+              ) : null}
               {status === 'loading' || detailStates[activeWorkspaceId] === 'loading' ? <p>{zh ? '正在读取当前仓库 Git 状态…' : 'Loading Git status for this repository…'}</p> : null}
               {detailStates[activeWorkspaceId] === 'error' ? (
                 <p className="task-git-review-error" role="alert">
@@ -370,7 +372,8 @@ function TaskGitReviewModalContent(props: TaskGitReviewModalContentProps) {
                         />
                       ) : null}
                       <button type="button" onClick={() => setSelectedFile(file.path)}>
-                        <span>{file.path}</span>
+                        <FileTypeIcon name={file.path} />
+                        <span data-file-status={file.category}>{file.path}</span>
                         <small>{fileStatusLabel(file, zh)}</small>
                       </button>
                     </label>
@@ -382,7 +385,7 @@ function TaskGitReviewModalContent(props: TaskGitReviewModalContentProps) {
 
             <section className="task-git-review-diff" aria-label={zh ? '差异对比' : 'Diff'}>
               <span className="task-git-review-pane-title">
-                <strong>{selectedFile || (zh ? '选择文件查看差异' : 'Select a file to view its diff')}</strong>
+                <strong data-file-status={files.find((file) => file.path === selectedFile)?.category}>{selectedFile || (zh ? '选择文件查看差异' : 'Select a file to view its diff')}</strong>
                 {fileDiff?.fileDiffs[0] ? (
                   <small>
                     +{fileDiff.fileDiffs[0].addedLines} −{fileDiff.fileDiffs[0].deletedLines}
@@ -579,5 +582,5 @@ function confirmActiveSessionRisk(action: 'reclaim' | 'discard', activeConversat
 }
 
 function errorMessage(error: unknown, zh: boolean): string {
-  return reportApplicationError(error, { language: zh ? 'zh-CN' : 'en' });
+  return formatVisibleApplicationError(error, zh ? 'zh-CN' : 'en');
 }

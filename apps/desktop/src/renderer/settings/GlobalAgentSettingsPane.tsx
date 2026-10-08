@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useImperativeHandle, useRef, us
 import type { GlobalAgentSettingsSnapshot } from '@zeus/shared';
 import type { SettingsApiClient } from '../features/settings/settingsApiClient.js';
 import { Button } from '../ui/Button.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 
 const CodeEditor = lazy(() => import('../code/CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
 
@@ -176,7 +177,11 @@ export function GlobalAgentSettingsPane(props: {
                         : 'Loaded'
                       : null}
         </span>
-        {error ? <p role="alert">{error}</p> : null}
+        {error ? (
+          <p role="alert">
+            <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+          </p>
+        ) : null}
       </div>
       {snapshot ? (
         <div className="global-agent-settings-editor">

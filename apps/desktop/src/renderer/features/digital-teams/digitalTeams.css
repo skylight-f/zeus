@@ -774,3 +774,195 @@
     grid-template-columns: 238px minmax(0, 1fr);
   }
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.digital-team-empty > .zeus-button {
+  justify-self: center;
+}
+.digital-team-header-actions > .digital-team-refresh-button {
+  flex: 0 0 var(--zeus-control-height);
+  inline-size: var(--zeus-control-height);
+  padding-inline: 0;
+}
+.task-digital-team-progress {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-block-end: 1px solid var(--zeus-product-border);
+  color: var(--zeus-product-text);
+  background: var(--zeus-product-panel);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.task-digital-team-progress > div {
+  flex: 1;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+.task-digital-team-progress > div > strong,
+.task-digital-team-progress > div > span {
+  display: inline;
+  margin-inline-end: 10px;
+}
+.task-digital-team-progress > .application-error-inline,
+.digital-team-message > .application-error-inline {
+  inline-size: 100%;
+}
+.task-digital-team-progress .application-error-inline-action,
+.digital-team-message .application-error-inline-action {
+  margin-inline-start: auto;
+}
+.task-conversation-with-team-progress {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-block-size: 0;
+  min-inline-size: 0;
+  block-size: 100%;
+}
+.digital-team-template-browser {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 14px;
+  border-block-end: 1px solid var(--zeus-product-line);
+  background: var(--zeus-product-panel);
+}
+.digital-team-template-browser > .zeus-select {
+  inline-size: min(360px, 45%);
+}
+.digital-team-member-picker-anchor {
+  position: relative;
+}
+.digital-team-member-picker {
+  position: absolute;
+  inset-block-start: calc(100% + 8px);
+  inset-inline-end: 0;
+  z-index: 8;
+  inline-size: min(360px, 80vw);
+  max-block-size: min(520px, 70vh);
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--zeus-product-line);
+  border-radius: 12px;
+  background: var(--zeus-product-panel);
+  box-shadow: var(--zeus-product-shadow, 0 12px 32px rgb(0 0 0 / 14%));
+}
+.digital-team-editor-layout .digital-team-canvas-column:has(> .digital-team-start-description) {
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+}
+.digital-team-settings-content > label > span {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.digital-team-settings {
+  min-inline-size: 0;
+}
+.digital-team-settings > summary {
+  box-sizing: border-box;
+  min-block-size: 34px;
+  padding: 7px 10px;
+  border: 1px solid var(--zeus-product-line);
+  border-radius: var(--zeus-control-radius);
+  cursor: pointer;
+}
+.digital-team-settings[open] {
+  flex: 1 1 100%;
+  order: 2;
+}
+.digital-team-settings-content {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  max-block-size: 32vh;
+  overflow: auto;
+  padding-block-start: 12px;
+}
+.digital-team-settings-content > label {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 4px;
+}
+.digital-team-settings-content > .digital-team-template-actions {
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+}
+.digital-team-workspace .digital-team-start-description {
+  margin: 0;
+  padding: 8px 14px;
+  border-block-end: 1px solid var(--zeus-product-line);
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+.digital-team-workspace label.digital-team-checkbox {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+.digital-team-workspace .digital-team-checkbox input {
+  inline-size: 16px;
+  block-size: 16px;
+  min-block-size: 16px;
+  margin: 2px 0 0;
+  padding: 0;
+}
+.digital-team-work-permission {
+  margin: 0;
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+.digital-team-employee-editor {
+  display: grid;
+  min-inline-size: 0;
+  gap: 14px;
+}
+.digital-team-inspector :where(.digital-employee-form-grid, .digital-employee-policy-grid, .digital-employee-grant-flow) {
+  grid-template-columns: minmax(0, 1fr);
+}
+.digital-team-inspector .digital-employee-project-form {
+  gap: 16px;
+}
+@media (max-width: 840px) {
+
+  .digital-team-template-browser {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+.digital-team-workspace .zeus-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.digital-team-advanced-settings {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+.digital-team-advanced-settings > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.digital-team-advanced-settings > label {
+  margin-block-start: 10px;
+}
+.digital-team-advanced-settings > summary > small {
+  margin-inline-start: 8px;
+  color: var(--zeus-product-muted);
+  font-weight: 400;
+}
+.digital-team-advanced-settings > .zeus-button {
+  margin-block-start: 10px;
+}
+.digital-team-field-error {
+  color: var(--zeus-control-danger-text);
+}
+@media (max-width: 840px) {
+  .digital-team-settings-content {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

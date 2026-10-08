@@ -23,8 +23,13 @@ export async function renderClassicTray(provider: UsageProviderSummary | null, u
   // API 供应商没有官方额度，以本机今日用量替代占位圆环，不依赖官方账户状态。
   const tokenProvider = provider && provider.providerId !== 'codex' ? provider : null;
   const todayTokens =
-    tokenProvider && !unavailable && !tokenProvider.stale && tokenProvider.todayLocalComplete !== false && Number.isFinite(tokenProvider.todayLocal.totalTokens) && tokenProvider.todayLocal.totalTokens >= 0
-      ? tokenProvider.todayLocal.totalTokens
+    tokenProvider &&
+    !unavailable &&
+    !tokenProvider.stale &&
+    tokenProvider.overviewRanges.today.complete !== false &&
+    Number.isFinite(tokenProvider.overviewRanges.today.local.totalTokens) &&
+    tokenProvider.overviewRanges.today.local.totalTokens >= 0
+      ? tokenProvider.overviewRanges.today.local.totalTokens
       : null;
   const tokenLabel = todayTokens === null ? '—' : todayTokens < 1_000 ? String(todayTokens) : new Intl.NumberFormat('en-US', { notation: 'compact', minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(todayTokens);
   const windows = provider ? menuBarRateLimitWindows(provider) : [];

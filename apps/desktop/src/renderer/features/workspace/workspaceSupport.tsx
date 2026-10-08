@@ -1,12 +1,15 @@
 import { temporaryWorkspaceId } from '@zeus/shared';
 import { usePresenceOpen } from '../../ui/MotionPresence.js';
 import { retainInputFocus } from '../../ui/retainInputFocus.js';
+import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { type ClipboardEvent as ReactClipboardEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import {
+  defaultTaskBranchPrefix,
   defaultTaskManagementStatusConfig,
   extractThirdPartyTaskLink,
   isTaskStatusFilter,
+  normalizeTaskBranchPrefix,
   normalizeTaskManagementStatusConfig,
   type ProjectCodeWorkspacePreference,
   type TaskManagementStatusConfig,
@@ -14,6 +17,8 @@ import {
   type ThirdPartyTaskExtract,
 } from '@zeus/shared';
 import { PENDING_RESOURCE_LONG_TEXT_THRESHOLD } from '../../ui/pendingResourcePolicy.js';
+import { clipboardNeedsResourceRead, clipboardTextAfterResources, dataTransferFiles, usePendingResourcePreviews } from '../../ui/usePendingResourcePreviews.js';
+import type { PendingResourceCardItem } from '../../ui/PendingResourceCards.js';
 import { TaskAttachmentPreviewList } from '../../task/TaskAttachmentPreviewList.js';
 import { type NativeConversationStartStorage, type SessionWorkspaceTask } from '../../session/SessionWorkspace.js';
 import type { NativeConversationChoice, NativeConversationChoicesSnapshot, NativeProjectConversationChoicesSnapshot } from '../../session/sessionTypes.js';
@@ -72,9 +77,10 @@ import {
   type ZeusRealtimeEvent,
 } from '../../apiClient.js';
 
-export type MainNavTarget = 'projects' | 'conversations' | 'automations' | 'skills' | 'digital-teams' | 'settings';
+/** 全局数字员工与数字团队均从首页独立进入。 */
+export type MainNavTarget = 'projects' | 'conversations' | 'automations' | 'skills' | 'digital-employees' | 'digital-teams' | 'settings';
 export type LegacyMainNavTarget = MainNavTarget | 'dashboard' | 'tasks' | 'runtime' | 'git-diff' | 'telegram' | 'settings-data';
-export type ProjectWorkspaceSection = 'tasks' | 'git' | 'code' | 'sessions' | 'project-settings';
+export type ProjectWorkspaceSection = 'tasks' | 'git' | 'code' | 'sessions';
 export type ProjectCodeWorkspaceMode = 'source' | 'commands';
 export type ProjectWorkspaceEntryId = 'tasks' | 'git' | 'source' | 'commands';
 export type ProjectWorkspaceEntry = Readonly<{
@@ -118,8 +124,10 @@ export type SessionDrawerTarget =
   | Readonly<{ projectId: string; taskId: string; conversationId?: undefined; navigationId?: undefined; status: 'empty' }>
   | undefined;
 export type TaskConversationReopenState = Readonly<{ conversationId: string; status: 'busy' | 'error'; error?: string }> | undefined;
-export type SettingsCategory = 'general' | 'usage' | 'memory' | 'agents' | 'tasks' | 'employees' | 'runtime' | 'models' | 'browser' | 'terminal' | 'im' | 'zentao' | 'commands' | 'release' | 'data';
-export const SETTINGS_CATEGORIES = ['general', 'usage', 'memory', 'agents', 'tasks', 'employees', 'runtime', 'models', 'browser', 'terminal', 'im', 'zentao', 'commands', 'release', 'data'] as const satisfies readonly SettingsCategory[];
+/** 系统设置仅列出当前设置分区，数字员工由首页管理。 */
+export type SettingsCategory = 'general' | 'usage' | 'memory' | 'agents' | 'tasks' | 'runtime' | 'network' | 'models' | 'browser' | 'terminal' | 'im' | 'zentao' | 'commands' | 'release' | 'data';
+/** 设置哈希只接受真实存在的稳定分区。 */
+export const SETTINGS_CATEGORIES = ['general', 'usage', 'memory', 'agents', 'tasks', 'runtime', 'network', 'models', 'browser', 'terminal', 'im', 'zentao', 'commands', 'release', 'data'] as const satisfies readonly SettingsCategory[];
 export type DataPortabilityStatusState = { kind: 'idle' } | { kind: 'exported'; target: string } | { kind: 'imported'; target: string; changedSettings: string[] };
 export type TaskBulkActionStatusState = { kind: 'idle' | 'running' | 'done' | 'failed'; message?: string };
 export type RuntimeLogExportStatusState = { kind: 'idle' } | { kind: 'empty' } | { kind: 'cancelled' } | { kind: 'saved'; filePath: string } | { kind: 'failed' };
@@ -223,6 +231,7 @@ export type NativeConversationAppClient = SessionControllerClient &
     | 'loadDigitalEmployeeCapabilities'
     | 'refreshTaskPushRepositoryRemote'
     | 'loadCodexAccount'
+    | 'diagnoseCodexConnection'
     | 'loadCodexUsageSummary'
     | 'loadUsageOverview'
     | 'loadUsageAnalytics'
@@ -579,7 +588,8 @@ export function shouldRefreshNativeConversationListForRealtimeEvent(event: ZeusR
   return nativeConversationListLifecycleEventTypes.has(event.type) && typeof event.payload.projectId === 'string' && typeof event.payload.conversationId === 'string';
 }
 
-export type WorkMode = ProjectConfig['defaultWorkMode'];
+/** 工作模式属于当前任务或会话，不作为项目偏好。 */
+export type WorkMode = 'plan' | 'develop' | 'review' | 'debug';
 export type DiagramExportFormat = 'mermaid' | 'plantuml';
 export type AppShellSettingsSavePayload = Pick<
   AppShellSettings,
@@ -587,6 +597,7 @@ export type AppShellSettingsSavePayload = Pick<
   | 'appLanguage'
   | 'appearance'
   | 'mainLayout'
+  | 'taskBranchPrefix'
   | 'webviewDebugEnabled'
   | 'developerModeEnabled'
   | 'multiWindowEnabled'
@@ -600,13 +611,11 @@ export type AppShellSettingsSavePayload = Pick<
   | 'defaultModel'
   | 'defaultTaskTemplateId'
   | 'taskTableColumns'
-  | 'taskTableColumnsByProject'
   | 'taskTableEnumSortOrders'
   | 'taskManagementStatusTemplate'
-  | 'taskManagementStatusByProject'
-  | 'taskStatusFilterByProject'
-  | 'taskViewModeByProject'
-  | 'taskPageViewByProject'
+  | 'taskStatusFilter'
+  | 'taskViewMode'
+  | 'taskPageView'
   | 'taskExpandedIdsByProject'
   | 'codeWorkspaceByProject'
 > & { taskManagementStatusReplacements?: Record<string, Record<string, string>> };
@@ -828,9 +837,9 @@ export const taskManagementStatusLabels: Record<AppLanguage, Record<string, stri
   },
 };
 
-export function resolveTaskManagementStatusConfig(settings: AppShellSettings, projectId?: string): TaskManagementStatusConfig {
-  const template = normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig);
-  return projectId ? normalizeTaskManagementStatusConfig(settings.taskManagementStatusByProject?.[projectId], template) : template;
+/** 所有项目使用同一份任务状态配置。 */
+export function resolveTaskManagementStatusConfig(settings: AppShellSettings): TaskManagementStatusConfig {
+  return normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig);
 }
 
 export function formatConfiguredTaskManagementStatus(status: TaskManagementStatusDefinition | string, config: TaskManagementStatusConfig, language: AppLanguage): string {
@@ -847,7 +856,7 @@ export function buildConfiguredTaskManagementStatusLabels(config: TaskManagement
 }
 
 export function createSessionWorkspaceTask(task: TaskRecord, settings: AppShellSettings, language: AppLanguage): SessionWorkspaceTask {
-  const config = resolveTaskManagementStatusConfig(settings, task.projectId);
+  const config = resolveTaskManagementStatusConfig(settings);
   const managementStatusId = resolveTaskManagementStatus(task);
   const definition = config.statuses.find((status) => status.id === managementStatusId);
   return {
@@ -872,29 +881,19 @@ export function controlBusyProps(isBusy: boolean): ControlBusyProps {
   return isBusy ? { 'aria-busy': true, 'data-loading': 'true' } : {};
 }
 
-export function normalizeTaskStatusFilterByProject(value: unknown): Record<string, TaskStatusFilter> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const normalized: Record<string, TaskStatusFilter> = {};
-  let count = 0;
-  for (const [projectId, filter] of Object.entries(value)) {
-    const normalizedProjectId = projectId.trim();
-    const containsControlCharacter = Array.from(normalizedProjectId).some((character) => character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127);
-    if (!normalizedProjectId || normalizedProjectId.length > 160 || containsControlCharacter || !isTaskStatusFilter(filter)) continue;
-    normalized[normalizedProjectId] = filter;
-    count += 1;
-    if (count >= 100) break;
-  }
-  return normalized;
+/** 所有项目共用同一任务筛选，损坏或缺失值回到未完成。 */
+export function normalizeTaskStatusFilter(value: unknown): TaskStatusFilter {
+  return isTaskStatusFilter(value) ? value : 'unfinished';
 }
 
-export function normalizeTaskViewModeByProject(value: unknown): Record<string, TaskWorkspaceViewMode> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value).filter(([projectId, mode]) => Boolean(projectId.trim()) && (mode === 'hierarchy' || mode === 'flat'))) as Record<string, TaskWorkspaceViewMode>;
+/** 所有项目共用同一任务层级显示偏好。 */
+export function normalizeTaskViewMode(value: unknown): TaskWorkspaceViewMode {
+  return value === 'flat' ? 'flat' : 'hierarchy';
 }
 
-export function normalizeTaskPageViewByProject(value: unknown): Record<string, TaskPageViewMode> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value).filter(([projectId, mode]) => Boolean(projectId.trim()) && (mode === 'list' || mode === 'board'))) as Record<string, TaskPageViewMode>;
+/** 所有项目共用同一列表或看板入口。 */
+export function normalizeTaskPageView(value: unknown): TaskPageViewMode {
+  return value === 'board' ? 'board' : 'list';
 }
 
 export function normalizeTaskExpandedIdsByProject(value: unknown): Record<string, string[]> {
@@ -935,29 +934,18 @@ export function normalizeCodeWorkspaceByProject(value: unknown): Record<string, 
 }
 
 export function normalizeRendererAppShellSettings(settings: AppShellSettings): AppShellSettings {
-  const taskTableColumnsByProject = Object.fromEntries(
-    Object.entries(settings.taskTableColumnsByProject ?? {})
-      .filter(([projectId]) => Boolean(projectId.trim()))
-      .map(([projectId, preferences]) => [projectId.trim(), normalizeTaskTableColumnPreferences(preferences)]),
-  );
   const taskManagementStatusTemplate = normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig);
-  const taskManagementStatusByProject = Object.fromEntries(
-    Object.entries(settings.taskManagementStatusByProject ?? {})
-      .filter(([projectId]) => Boolean(projectId.trim()))
-      .map(([projectId, config]) => [projectId.trim(), normalizeTaskManagementStatusConfig(config, taskManagementStatusTemplate)]),
-  );
   return {
     ...settings,
     mainLayout: settings.mainLayout === 'current' ? 'current' : 'upstream',
+    taskBranchPrefix: normalizeTaskBranchPrefix(settings.taskBranchPrefix) ?? defaultTaskBranchPrefix,
     collapsedProjectIds: Array.isArray(settings.collapsedProjectIds) ? [...new Set(settings.collapsedProjectIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim())).map((id) => id.trim()))].slice(0, 100) : [],
     taskTableColumns: normalizeTaskTableColumnPreferences(settings.taskTableColumns),
-    taskTableColumnsByProject,
     taskTableEnumSortOrders: normalizeTaskTableEnumSortOrders(settings.taskTableEnumSortOrders),
     taskManagementStatusTemplate,
-    taskManagementStatusByProject,
-    taskStatusFilterByProject: normalizeTaskStatusFilterByProject(settings.taskStatusFilterByProject),
-    taskViewModeByProject: normalizeTaskViewModeByProject(settings.taskViewModeByProject),
-    taskPageViewByProject: normalizeTaskPageViewByProject(settings.taskPageViewByProject),
+    taskStatusFilter: normalizeTaskStatusFilter(settings.taskStatusFilter),
+    taskViewMode: normalizeTaskViewMode(settings.taskViewMode),
+    taskPageView: normalizeTaskPageView(settings.taskPageView),
     taskExpandedIdsByProject: normalizeTaskExpandedIdsByProject(settings.taskExpandedIdsByProject),
     codeWorkspaceByProject: normalizeCodeWorkspaceByProject(settings.codeWorkspaceByProject),
   };
@@ -966,14 +954,13 @@ export function normalizeRendererAppShellSettings(settings: AppShellSettings): A
 export function toAppShellSettingsSavePayload(settings: AppShellSettings, taskManagementStatusReplacements?: Record<string, Record<string, string>>): AppShellSettingsSavePayload {
   // 漏斗由独立局部请求保存，不放入通用整份快照，避免较早收集的设置回写旧筛选。
   const taskTableColumns = normalizeTaskTableColumnPreferences(settings.taskTableColumns);
-  const taskTableColumnsByProject = Object.fromEntries(Object.entries(settings.taskTableColumnsByProject ?? {}).map(([projectId, preferences]) => [projectId, normalizeTaskTableColumnPreferences(preferences)]));
-  const taskStatusFilterByProject = normalizeTaskStatusFilterByProject(settings.taskStatusFilterByProject);
   return {
     // 代理草稿随通用设置保存；其他偏好更新继续携带原值。
     networkProxy: settings.networkProxy,
     appLanguage: settings.appLanguage,
     appearance: settings.appearance,
     mainLayout: settings.mainLayout,
+    taskBranchPrefix: settings.taskBranchPrefix,
     webviewDebugEnabled: settings.webviewDebugEnabled,
     developerModeEnabled: settings.developerModeEnabled,
     multiWindowEnabled: settings.multiWindowEnabled,
@@ -992,34 +979,27 @@ export function toAppShellSettingsSavePayload(settings: AppShellSettings, taskMa
       // 空对象是“恢复默认列宽”的显式协议；省略字段表示局部保存时继续沿用已存列宽。
       columnWidths: taskTableColumns.columnWidths ?? {},
     },
-    taskTableColumnsByProject,
     taskTableEnumSortOrders: normalizeTaskTableEnumSortOrders(settings.taskTableEnumSortOrders),
     taskManagementStatusTemplate: normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig),
-    taskManagementStatusByProject: Object.fromEntries(
-      Object.entries(settings.taskManagementStatusByProject ?? {}).map(([projectId, config]) => [projectId, normalizeTaskManagementStatusConfig(config, resolveTaskManagementStatusConfig(settings))]),
-    ),
     ...(taskManagementStatusReplacements && Object.keys(taskManagementStatusReplacements).length > 0 ? { taskManagementStatusReplacements } : {}),
-    taskStatusFilterByProject,
-    taskViewModeByProject: normalizeTaskViewModeByProject(settings.taskViewModeByProject),
-    taskPageViewByProject: normalizeTaskPageViewByProject(settings.taskPageViewByProject),
+    taskStatusFilter: normalizeTaskStatusFilter(settings.taskStatusFilter),
+    taskViewMode: normalizeTaskViewMode(settings.taskViewMode),
+    taskPageView: normalizeTaskPageView(settings.taskPageView),
     taskExpandedIdsByProject: normalizeTaskExpandedIdsByProject(settings.taskExpandedIdsByProject),
     codeWorkspaceByProject: normalizeCodeWorkspaceByProject(settings.codeWorkspaceByProject),
   };
 }
 
-export function resolveTaskTableColumnsForProject(settings: AppShellSettings, projectId: string | undefined): TaskTableColumnPreferences {
-  if (projectId) {
-    const projectPreferences = settings.taskTableColumnsByProject?.[projectId];
-    if (projectPreferences) return normalizeTaskTableColumnPreferences(projectPreferences);
-  }
+/** 任务表格只解析一份全局字段布局。 */
+export function resolveTaskTableColumns(settings: AppShellSettings): TaskTableColumnPreferences {
   return normalizeTaskTableColumnPreferences(settings.taskTableColumns);
 }
 
-export function resolveTaskStatusFilterForProject(settings: AppShellSettings, projectId: string | undefined): TaskStatusFilter {
-  if (!projectId) return 'unfinished';
-  const filter = settings.taskStatusFilterByProject?.[projectId];
+/** 全局状态目录决定筛选值是否仍然有效。 */
+export function resolveTaskStatusFilter(settings: AppShellSettings): TaskStatusFilter {
+  const filter = settings.taskStatusFilter;
   if (filter === '' || filter === 'unfinished') return filter;
-  return isTaskStatusFilter(filter) && resolveTaskManagementStatusConfig(settings, projectId).statuses.some((status) => status.id === filter) ? filter : 'unfinished';
+  return isTaskStatusFilter(filter) && resolveTaskManagementStatusConfig(settings).statuses.some((status) => status.id === filter) ? filter : 'unfinished';
 }
 
 export function taskTableColumnPreferencesEqual(left: TaskTableColumnPreferences, right: TaskTableColumnPreferences): boolean {
@@ -1034,11 +1014,10 @@ export function resolveTaskTableColumnsSaveResponse(input: { currentSettings: Ap
   return {
     ...currentSettings,
     taskTableColumns: savedSettings.taskTableColumns,
-    taskTableColumnsByProject: savedSettings.taskTableColumnsByProject,
     taskTableEnumSortOrders: savedSettings.taskTableEnumSortOrders,
-    taskStatusFilterByProject: currentSettings.taskStatusFilterByProject,
-    taskViewModeByProject: currentSettings.taskViewModeByProject,
-    taskPageViewByProject: currentSettings.taskPageViewByProject,
+    taskStatusFilter: currentSettings.taskStatusFilter,
+    taskViewMode: currentSettings.taskViewMode,
+    taskPageView: currentSettings.taskPageView,
     taskExpandedIdsByProject: currentSettings.taskExpandedIdsByProject,
     codeWorkspaceByProject: currentSettings.codeWorkspaceByProject,
   };
@@ -1054,11 +1033,10 @@ export function mergeAppShellSettingsSaveResponse(input: { currentSettings: AppS
     sidebarConversationFilters: currentSettings.sidebarConversationFilters,
     modelSetupStatus: currentSettings.modelSetupStatus,
     taskTableColumns: currentSettings.taskTableColumns,
-    taskTableColumnsByProject: currentSettings.taskTableColumnsByProject,
     taskTableEnumSortOrders: currentSettings.taskTableEnumSortOrders,
-    taskStatusFilterByProject: currentSettings.taskStatusFilterByProject,
-    taskViewModeByProject: currentSettings.taskViewModeByProject,
-    taskPageViewByProject: currentSettings.taskPageViewByProject,
+    taskStatusFilter: currentSettings.taskStatusFilter,
+    taskViewMode: currentSettings.taskViewMode,
+    taskPageView: currentSettings.taskPageView,
     taskExpandedIdsByProject: currentSettings.taskExpandedIdsByProject,
     codeWorkspaceByProject: currentSettings.codeWorkspaceByProject,
   };
@@ -1260,6 +1238,7 @@ export function normalizeMainNavTarget(hash: string | undefined): MainNavTarget 
   if (target === 'dashboard' || target === 'tasks' || target === 'runtime' || target === 'conversations') return 'conversations';
   if (target === 'git-diff' || target === 'projects' || target === 'project-commands' || target.startsWith('project-code')) return 'projects';
   if (target === 'skills') return 'skills';
+  if (target === 'digital-employees') return 'digital-employees';
   if (target === 'digital-teams') return 'digital-teams';
   if (target === 'automations') return 'automations';
   if (target === 'telegram' || target === 'settings' || target?.startsWith('settings-')) return 'settings';
@@ -1384,7 +1363,6 @@ export function inferInitialProjectSection(props: {
   if (typeof window !== 'undefined' && (window.location.hash === '#project-commands' || window.location.hash.startsWith('#project-code'))) return 'code';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-tasks' || window.location.hash === '#tasks')) return 'tasks';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-sessions' || window.location.hash === '#conversations')) return 'sessions';
-  if (props.initialProjectConfig || props.initialProjectDatabaseSecret) return 'project-settings';
   if (props.initialMainNavTarget === 'tasks') return 'tasks';
   if (props.initialMainNavTarget === 'git-diff' || props.initialMainNavTarget === 'projects') return 'code';
   if (props.initialMainNavTarget === 'conversations' || props.initialMainNavTarget === 'runtime' || props.initialMainNavTarget === 'dashboard') return 'sessions';
@@ -1459,6 +1437,8 @@ export function orderProjectsByPinnedIds(projects: ProjectRecord[], pinnedProjec
 
 export function TaskCreateFieldAttachments(props: {
   field: TaskCreateAttachmentField;
+  /** 各字段独立显示导入卡片，成功预览按真实路径共享。 */
+  pendingResources?: PendingResourceCardItem[];
   attachments: TaskCreateAttachment[];
   copy: ReturnType<typeof getLanguageCopy>['taskWorkspace'];
   disabled: boolean;
@@ -1468,11 +1448,14 @@ export function TaskCreateFieldAttachments(props: {
   onOpenAttachment?: (path: string) => Promise<{ opened: boolean; error?: string }>;
 }) {
   const attachments = taskAttachmentsForField(props.attachments, props.field);
-  if (attachments.length === 0) return null;
+  /** 只把当前字段的导入反馈放在对应输入框旁。 */
+  const previews = props.pendingResources?.filter((resource) => !resource.pending || resource.scope === props.field);
+  if (attachments.length === 0 && !previews?.some((resource) => resource.pending)) return null;
   return (
     <div className="task-create-field-attachments">
       <TaskAttachmentPreviewList
         attachments={attachments}
+        pendingResources={previews}
         mode="editable"
         disabled={props.disabled}
         onRemove={props.onRemove}
@@ -1532,6 +1515,15 @@ export function TaskCreateModal(props: {
   const interactionOpen = usePresenceOpen() && props.open;
   const pasteShortcutFallbackTokenRef = useRef(0);
   const [resourceProcessingCount, setResourceProcessingCount] = useState(0);
+  /** 资源读取失败和部分成功保持在当前表单内可见。 */
+  const [resourceError, setResourceError] = useState<string | null>(null);
+  /** 与会话输入共用预览生命周期，创建和复制均按字段归属显示。 */
+  const previews = usePendingResourcePreviews(
+    props.form.attachments.map((attachment) => ({ id: attachment.path, name: attachment.name, kind: attachment.kind })),
+    props.copy.taskCountPrefix === 'Tasks' ? 'en-US' : 'zh-CN',
+    interactionOpen ? 'task-create' : false,
+  );
+
   /** 附加设置由底部操作栏展开，默认不占正文空间。 */
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** 展开后定位附加字段，长表单中也能直接编辑。 */
@@ -1548,6 +1540,8 @@ export function TaskCreateModal(props: {
   const thirdPartyRequestRef = useRef<symbol | null>(null);
   const taskTypeOptions = useMemo(() => [{ value: '' as const, label: props.copy.taskCreateTypePlaceholder, disabled: true }, ...props.copy.taskCreateTypeOptions], [props.copy.taskCreateTypeOptions, props.copy.taskCreateTypePlaceholder]);
   useEffect(() => {
+    setResourceProcessingCount(0);
+    setResourceError(null);
     if (interactionOpen) {
       setSettingsOpen(false);
       setThirdPartyOpen(false);
@@ -1571,7 +1565,9 @@ export function TaskCreateModal(props: {
     if (interactionOpen && !thirdPartyOpen) props.titleInputRef.current?.focus();
   }, [interactionOpen, thirdPartyOpen, props.titleInputRef]);
   if (!props.open) return null;
-  const describedBy = thirdPartyOpen ? 'task-create-third-party-help' : props.error ? 'task-create-error' : undefined;
+  /** 当前资源错误优先显示，保留上层字段校验结果。 */
+  const visibleError = resourceError ?? props.error;
+  const describedBy = thirdPartyOpen ? 'task-create-third-party-help' : visibleError ? 'task-create-error' : undefined;
   const resourcesBusy = resourceProcessingCount > 0;
   /** 附件处理只阻止提交和切换任务结构，不禁用正在输入的文字框。 */
   const textInputDisabled = props.busy || thirdPartyParsing;
@@ -1583,7 +1579,7 @@ export function TaskCreateModal(props: {
 
   function handleTaskCreatePasteShortcutFallback(event: ReactKeyboardEvent<HTMLFormElement>): void {
     const pasteTarget = resolveTaskCreatePasteField(event.target);
-    if (!pasteTarget || interactionBusy || typeof window === 'undefined') return;
+    if (!pasteTarget || textInputDisabled || typeof window === 'undefined') return;
     if (event.key.toLowerCase() !== 'v' || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
     const fallbackToken = pasteShortcutFallbackTokenRef.current + 1;
     pasteShortcutFallbackTokenRef.current = fallbackToken;
@@ -1592,14 +1588,14 @@ export function TaskCreateModal(props: {
     // 这里不阻止默认粘贴，只在短暂等待后发现 paste 事件没有到达时，让 Main 读取统一的文件、目录、图片或长文本资源。
     window.setTimeout(() => {
       if (pasteShortcutFallbackTokenRef.current !== fallbackToken) return;
-      void runTaskResourceOperation(async () => {
+      void runTaskResourceOperation(pasteTarget.field, async (pending) => {
         const result = await props.onReadClipboardResources();
-        if (pasteShortcutFallbackTokenRef.current !== fallbackToken) return;
+        if (!pending.current() || pasteShortcutFallbackTokenRef.current !== fallbackToken) return;
         if (result.resources.length > 0) {
           props.onAddAttachments(withTaskAttachmentRestoreTarget(result.resources, restoreTarget));
         }
         // 兜底路径同样可能只剩正文：附件之外的文字必须回到当前字段。
-        if (result.text) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text);
+        if (result.text) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text, restoreTarget);
         if (pasteShortcutFallbackTokenRef.current === fallbackToken) {
           pasteShortcutFallbackTokenRef.current += 1;
         }
@@ -1608,17 +1604,24 @@ export function TaskCreateModal(props: {
           pasteShortcutFallbackTokenRef.current += 1;
         }
       });
-    }, 120);
+    }, 0);
   }
 
-  async function runTaskResourceOperation(operation: () => Promise<void>): Promise<void> {
-    /** 保留粘贴来源字段的焦点，附件回填不改变用户选区。 */
+  /** 先显示当前字段的卡片，再导入；允许连续粘贴并分别清理。 */
+  async function runTaskResourceOperation(field: TaskCreateAttachmentField, operation: (pending: ReturnType<typeof previews.begin>) => Promise<void>, files: File[] = [], text = ''): Promise<void> {
+    /** 保留输入位置，用户主动转移焦点时不干预。 */
     const restoreFocus = retainInputFocus(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    /** 临时资源只用于界面，不进入任务草稿附件。 */
+    const pending = previews.begin(files, text, field);
+    setResourceError(null);
     setResourceProcessingCount((current) => current + 1);
     try {
-      await operation();
+      await operation(pending);
+    } catch {
+      if (pending.current()) setResourceError(props.copy.taskCreatePasteAttachmentFailed);
     } finally {
-      setResourceProcessingCount((current) => Math.max(0, current - 1));
+      if (pending.current()) setResourceProcessingCount((current) => Math.max(0, current - 1));
+      pending.finish();
       restoreFocus();
     }
   }
@@ -1694,35 +1697,57 @@ export function TaskCreateModal(props: {
       }
     }
     const pasteTarget = resolveTaskCreatePasteField(event.target);
-    if (!pasteTarget || interactionBusy) return;
+    if (!pasteTarget || textInputDisabled) return;
     pasteShortcutFallbackTokenRef.current += 1;
+    /** 固定长文本恢复位置，保存期间继续输入不会改变原归属。 */
     const restoreTarget = captureTaskAttachmentRestoreTarget(pasteTarget.field, pasteTarget.control);
+    /** 已有浏览器载荷直接导入，普通文字直接走控件的原生粘贴。 */
     const plainText = safelyReadClipboardData(event.clipboardData, 'text/plain');
-    const pastedFiles = taskCreateDataTransferFiles(event.clipboardData);
+    /** 两种剪贴板视图只读取其中一种，避免同一图片被重复导入。 */
+    const pastedFiles = dataTransferFiles(event.clipboardData);
+    /** 文件引用仍由宿主识别和授权，页面不自行信任路径。 */
+    const readNative = pastedFiles.length === 0 && clipboardNeedsResourceRead(event.clipboardData, plainText);
+    if (pastedFiles.length === 0 && plainText.length < PENDING_RESOURCE_LONG_TEXT_THRESHOLD && !readNative) return;
     event.preventDefault();
-    await runTaskResourceOperation(async () => {
-      const nativeResult = await props.onReadClipboardResources();
-      if (nativeResult.resources.length > 0) {
-        props.onAddAttachments(withTaskAttachmentRestoreTarget(nativeResult.resources, restoreTarget));
-        // 剪贴板里的文件路径已经变成附件，剩下的说明文字仍要写回当前字段。
-        insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, nativeResult.text);
-        return;
-      }
-      if (pastedFiles.length > 0) {
-        const result = await props.onAuthorizeFiles(pastedFiles, 'paste');
-        if (result.resources.length > 0) props.onAddAttachments(withTaskAttachmentField(result.resources, pasteTarget.field));
-        return;
-      }
-      const text = nativeResult.text || plainText;
-      if (text.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD) {
-        const resources = await props.onMaterializeResources([{ name: 'Pasted text.txt', type: 'text/plain', text, kind: 'pasted_text' }]);
-        if (resources.length > 0) {
-          props.onAddAttachments(withTaskAttachmentRestoreTarget(resources, restoreTarget));
+    await runTaskResourceOperation(
+      pasteTarget.field,
+      async (pending) => {
+        if (pastedFiles.length > 0) {
+          /** 直接使用已有 File，避免先做一次系统读取或图片编码。 */
+          const result = await props.onAuthorizeFiles(pastedFiles, 'paste');
+          if (!pending.current()) return;
+          if (result.resources.length === 0) throw new Error('没有可读取的附件。');
+          pending.complete(
+            result.resources.map((resource) => ({ id: resource.path, name: resource.name, kind: resource.kind })),
+            result.failedCount,
+          );
+          props.onAddAttachments(withTaskAttachmentField(result.resources, pasteTarget.field));
+          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, clipboardTextAfterResources(plainText, result.resources), restoreTarget);
+          if (result.failedCount > 0) setResourceError(props.copy.taskCountPrefix === 'Tasks' ? `${result.failedCount} attachment(s) could not be read.` : `另有 ${result.failedCount} 项附件无法读取。`);
           return;
         }
-      }
-      insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, text);
-    });
+        if (readNative) {
+          /** 只对真实文件引用或原生格式使用系统回退。 */
+          const result = await props.onReadClipboardResources();
+          if (!pending.current()) return;
+          if (result.resources.length > 0) props.onAddAttachments(withTaskAttachmentRestoreTarget(result.resources, restoreTarget));
+          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text || (result.resources.length === 0 ? plainText : ''), restoreTarget);
+          return;
+        }
+        try {
+          /** 已知长文本直接保存，不必再从剪贴板读取同一份内容。 */
+          const resources = await props.onMaterializeResources([{ name: 'Pasted text.txt', type: 'text/plain', text: plainText, kind: 'pasted_text' }]);
+          if (!pending.current()) return;
+          if (resources.length === 0) throw new Error('长文本附件未能保存。');
+          props.onAddAttachments(withTaskAttachmentRestoreTarget(resources, restoreTarget));
+        } catch (error) {
+          if (pending.current()) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, plainText, restoreTarget);
+          throw error;
+        }
+      },
+      pastedFiles,
+      plainText,
+    );
   }
 
   function restoreTaskCreateText(attachment: TaskCreateAttachment): void {
@@ -1748,15 +1773,18 @@ export function TaskCreateModal(props: {
     });
   }
 
-  function insertTaskCreatePlainTextPaste(field: TaskCreateTextField, control: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  /** 异步回填使用粘贴时的选区，保留处理期间继续输入的正文。 */
+  function insertTaskCreatePlainTextPaste(field: TaskCreateTextField, control: HTMLInputElement | HTMLTextAreaElement, text: string, selection?: TaskAttachmentRestoreTarget): void {
     if (!text) return;
-    const selectionStart = control.selectionStart ?? control.value.length;
-    const selectionEnd = control.selectionEnd ?? selectionStart;
+    const selectionStart = Math.min(selection?.start ?? control.selectionStart ?? control.value.length, control.value.length);
+    const selectionEnd = Math.min(selection?.end ?? control.selectionEnd ?? selectionStart, control.value.length);
     const nextValue = `${control.value.slice(0, selectionStart)}${text}${control.value.slice(selectionEnd)}`;
     const nextCaretPosition = selectionStart + text.length;
     props.onFormChange(field, nextValue);
     // 文字粘贴被我们拦截后手动回填；下一帧恢复光标，避免用户继续输入时跳到末尾。
-    window.requestAnimationFrame(() => control.setSelectionRange(nextCaretPosition, nextCaretPosition));
+    window.requestAnimationFrame(() => {
+      if (document.activeElement === control) control.setSelectionRange(nextCaretPosition, nextCaretPosition);
+    });
   }
 
   const modalSurface = (
@@ -1903,8 +1931,8 @@ export function TaskCreateModal(props: {
                     value={props.form.title}
                     placeholder={props.copy.taskCreateTitlePlaceholder}
                     aria-labelledby="task-create-title-label"
-                    aria-invalid={props.error ? true : undefined}
-                    aria-describedby={props.error ? 'task-create-error' : undefined}
+                    aria-invalid={visibleError ? true : undefined}
+                    aria-describedby={visibleError ? 'task-create-error' : undefined}
                     onChange={(event) => props.onFormChange('title', event.currentTarget.value)}
                     disabled={textInputDisabled}
                   />
@@ -1928,6 +1956,7 @@ export function TaskCreateModal(props: {
                   <TaskCreateFieldAttachments
                     field="description"
                     attachments={props.form.attachments}
+                    pendingResources={previews.pendingResources}
                     copy={props.copy}
                     disabled={interactionBusy}
                     onRemove={props.onRemoveAttachment}
@@ -1953,6 +1982,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="defectCurrentState"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -1975,6 +2005,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="defectExpectedOutcome"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -1997,6 +2028,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="defectReproductionSteps"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -2023,6 +2055,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="optimizationCurrentState"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -2045,6 +2078,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="optimizationExpectedOutcome"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -2087,6 +2121,7 @@ export function TaskCreateModal(props: {
                     <TaskCreateFieldAttachments
                       field="tags"
                       attachments={props.form.attachments}
+                      pendingResources={previews.pendingResources}
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
@@ -2106,9 +2141,9 @@ export function TaskCreateModal(props: {
                   </div>
                 </div>
               ) : null}
-              {props.error ? (
+              {visibleError ? (
                 <p className="task-create-error" id="task-create-error" role="alert">
-                  {props.error}
+                  <VisibleApplicationError error={visibleError} language={props.copy.taskCountPrefix === 'Tasks' ? 'en' : 'zh-CN'} />
                 </p>
               ) : null}
             </>
@@ -2419,23 +2454,6 @@ export function withTaskAttachmentField(attachments: TaskCreateAttachmentCandida
 
 export function withTaskAttachmentRestoreTarget(attachments: TaskCreateAttachmentCandidate[], restoreTarget: TaskAttachmentRestoreTarget): TaskCreateAttachment[] {
   return attachments.map((attachment) => ({ ...attachment, field: restoreTarget.field, ...(attachment.restorableText ? { restoreTarget } : {}) }));
-}
-
-export function taskCreateDataTransferFiles(dataTransfer: DataTransfer): File[] {
-  const candidates = [
-    ...Array.from(dataTransfer.files),
-    ...Array.from(dataTransfer.items)
-      .filter((item) => item.kind === 'file')
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null),
-  ];
-  const seen = new Set<string>();
-  return candidates.filter((file) => {
-    const fingerprint = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
-    if (seen.has(fingerprint)) return false;
-    seen.add(fingerprint);
-    return true;
-  });
 }
 
 export function taskCreateControlId(field: TaskCreateTextField): string {

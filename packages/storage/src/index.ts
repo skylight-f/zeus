@@ -18,6 +18,7 @@ import { DatabasePerformanceCollector, type DatabasePerformanceSnapshot } from '
 import { migrateExecutionHostHandoffSchema } from './executionHostHandoffStore.js';
 import { migrateExecutionHostWorkSchema } from './executionHostWorkStore.js';
 import { migrateDigitalEmployeeSchema } from './digitalEmployeeStore.js';
+import { migrateDigitalEmployeeGlobalIdentity } from './digitalEmployeeIdentityMigration.js';
 import { migrateAutomationSchema } from './automationStore.js';
 import { migrateDigitalEmployeeCapabilitySchema } from './digitalEmployeeCapabilityMigration.js';
 import { migrateImSchema } from './imStore.js';
@@ -35,7 +36,10 @@ import { migrateTaskWorkReviewSchema } from './taskWorkReviewStore.js';
 import { migrateTaskWorkDeploymentSchema } from './taskWorkDeploymentStore.js';
 import { migrateTaskWorkPlanningSchema } from './taskWorkPlanningStore.js';
 import { migrateTaskWorkSchema, migrateTaskWorkWorkspaceBindingSchema } from './taskWorkStore.js';
-import { migrateDigitalTeamWorkflowSchema } from './digitalTeamWorkflowStore.js';
+import { migrateDigitalTeamWorkflowSchema, migrateLegacyEmployeeTeamTemplates } from './digitalTeamWorkflowStore.js';
+import { migrateDefectWorkflowSchema } from './defectWorkflowStore.js';
+import { migrateWorkArtifactSchema } from './workArtifactStore.js';
+import { migrateEmployeeAutomationsToUnified } from './automationEmployeeMigration.js';
 import type { SqlValue, ZeusDatabasePort } from './databasePort.js';
 import { type DbCodexUsageLedgerRow, deriveConversationStageProjection, isPlainRecord, ProviderEventReceiptRepository, subtractTokenUsageBreakdown, validateTokenUsageBreakdown } from './conversationStore.js';
 
@@ -46,6 +50,10 @@ export * from './databasePerformance.js';
 export * from './databasePort.js';
 export * from './imStore.js';
 export * from './digitalEmployeeStore.js';
+export * from './digitalEmployeeIdentityMigration.js';
+export * from './defectWorkflowStore.js';
+export * from './workArtifactStore.js';
+export * from './automationEmployeeMigration.js';
 export * from './automationStore.js';
 export * from './digitalEmployeeCapabilityMigration.js';
 export * from './digitalEmployeeStageHandoffMigration.js';
@@ -1030,6 +1038,8 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateTaskWorkDeploymentSchema(zeusDb);
     migrateDigitalTeamWorkflowSchema(zeusDb);
     migrateDigitalEmployeeLegacyRetirement(zeusDb);
+    migrateDefectWorkflowSchema(zeusDb);
+    migrateWorkArtifactSchema(zeusDb);
     migrateProviderEventReceipts(zeusDb);
     migrateUnifiedConversationStoreSchema(zeusDb);
     migrateConversationExpertSchema(zeusDb);
@@ -1045,6 +1055,10 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateConversationSyncProtocolV2(zeusDb);
     migrateLongTermMemorySchema(zeusDb);
     migrateEmployeeMemorySchema(zeusDb);
+    migrateDigitalEmployeeGlobalIdentity(zeusDb);
+    /** 导入依赖准确的全局员工目录，必须等待身份列和迁移来源完整建立。 */
+    migrateLegacyEmployeeTeamTemplates(zeusDb);
+    migrateEmployeeAutomationsToUnified(zeusDb);
     migrateEmployeeMemoryProposalSchema(zeusDb);
     migratePluginStoreSchema(zeusDb);
     migrateExecutionHostWorkSchema(zeusDb);

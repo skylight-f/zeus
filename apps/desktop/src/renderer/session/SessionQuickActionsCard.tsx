@@ -1,8 +1,4 @@
-import { AnimatedSize } from '../ui/AnimatedSize.js';
-import { MotionPresence } from '../ui/MotionPresence.js';
-import { useMotionPresence } from '../ui/useMotionPresence.js';
 import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { ArrowSquareOutIcon as ArrowSquareOut } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
 import { DesktopIcon as Desktop } from '@phosphor-icons/react/dist/csr/Desktop';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
@@ -17,27 +13,29 @@ import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { ShareNetworkIcon as ShareNetwork } from '@phosphor-icons/react/dist/csr/ShareNetwork';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { UsersThreeIcon as UsersThree } from '@phosphor-icons/react/dist/csr/UsersThree';
+import { AnimatedSize } from '../ui/AnimatedSize.js';
+import { MotionPresence } from '../ui/MotionPresence.js';
+import { useMotionPresence } from '../ui/useMotionPresence.js';
+
+import { createPortal } from 'react-dom';
+
 import { conversationAttachmentIdentity } from './ConversationComposerAttachments.js';
 import { isImageResource, isPendingImageAttachment, ResourceIcon } from './ConversationResources.js';
 import { SessionCodeReviewDialog, type SessionCodeReviewSelection } from './SessionCodeReviewDialog.js';
 import { SessionComputerPreview } from './SessionComputerPreview.js';
 import type {
   CodexConversationCapabilities,
-  CodexTaskPushModelCapability,
   ConversationResource,
   ConversationResourcePreview,
   NativeConversationAttachment,
   NativeConversationChoice,
   NativeSessionState,
-  NativeServiceTierSelection,
   TaskWorkspaceSnapshot,
   TaskWorkspacesSnapshot,
 } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
-import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
-import { ProjectGitWorkbench } from '../git/ProjectGitWorkbench.js';
-import { ModalPortal } from '../ui/ModalPortal.js';
-import type { DashboardClient, ProjectRecord, ProjectGitWorkbenchSnapshot, ProjectModelServiceTierPreference } from '../apiClient.js';
+import { VisibleApplicationError, reportApplicationError } from '../ui/ApplicationErrorDialog.js';
+import type { DashboardClient, ProjectRecord, ProjectGitWorkbenchSnapshot } from '../apiClient.js';
 
 interface SessionQuickActionsCardProps {
   gitContext?: { client: DashboardClient; project: ProjectRecord };
@@ -53,8 +51,6 @@ interface SessionQuickActionsCardProps {
   forceCollapsed?: boolean;
   suppressed?: boolean;
   capabilities?: CodexConversationCapabilities | null;
-  serviceTierPreferences: readonly ProjectModelServiceTierPreference[];
-  onServiceTierPreferenceChange?: (model: CodexTaskPushModelCapability, selection: NativeServiceTierSelection) => void | Promise<void>;
   onLoadCapabilities?: (projectId: string) => Promise<CodexConversationCapabilities>;
   onLoadSkills?: (projectId?: string, forceReload?: boolean) => Promise<import('../features/codex/codexContracts.js').SkillCatalog>;
   onLoadTaskWorkspaces?: (taskId: string) => Promise<TaskWorkspacesSnapshot>;
@@ -96,37 +92,48 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const [workspaces, setWorkspaces] = useState<TaskWorkspacesSnapshot | null>(null);
   const [workspaceState, setWorkspaceState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [workspaceError, setWorkspaceError] = useState<unknown>(null);
-  useApplicationErrorDialog(props.conversation.taskId ? workspaceError : null, {
-    language: zh ? 'zh-CN' : 'en',
-  });
   const taskId = props.task?.id ?? props.conversation.taskId;
   const gitClient = props.gitContext?.client;
-  const conversationGitClient = useMemo(() => (!taskId && gitClient ? { ...gitClient, ...gitClient.forConversationGit(props.conversation.id) } : null), [gitClient, props.conversation.id, taskId]);
+  /** 普通目录读取项目仓库，独立工作树继续使用服务端绑定的会话范围。 */
+  const directWorkspace = props.conversation.workspaceMode === 'direct';
+  const conversationGitClient = useMemo(
+    () => (!taskId && gitClient ? (directWorkspace ? gitClient : { ...gitClient, ...gitClient.forConversationGit(props.conversation.id) }) : null),
+    [gitClient, props.conversation.id, taskId, directWorkspace],
+  );
   const [conversationGit, setConversationGit] = useState<{ id: string; snapshot: ProjectGitWorkbenchSnapshot } | null>(null);
-  const [deliveryOpen, setDeliveryOpen] = useState(false);
-  const [deliveryRevision, setDeliveryRevision] = useState(0);
   const conversationRepository = conversationGit?.id === props.conversation.id ? conversationGit.snapshot.repositories[0] : null;
   const conversationReview = conversationRepository?.snapshot;
+  /** 普通项目可能包含多个仓库，环境卡片统计与交付页采用相同范围。 */
+  const conversationReviews = conversationGit?.id === props.conversation.id ? conversationGit.snapshot.repositories.map((repository) => repository.snapshot) : [];
   const conversationReady = !taskId && workspaceState === 'ready' && Boolean(conversationRepository);
 
   const workspace = resolveConversationWorkspace(workspaces, props.conversation, props.state);
   const exactReviewWorkspace = workspace && workspace.id === props.conversation.workspaceId && workspace.environmentId === props.conversation.environmentId ? workspace : null;
   /** 两处环境展示采用相同的最近命令事实，工作区交付身份仍沿用会话绑定。 */
   const executionContext = props.state.snapshot?.executionContext?.recentCommand ?? props.state.snapshot?.executionContext;
-  const cwd = conversationRepository?.localPath ?? executionContext?.cwd ?? workspace?.review?.cwd ?? workspace?.worktreePath ?? null;
-  const branch = conversationReview?.branch ?? (executionContext?.cwd ? executionContext.branch : (workspace?.review?.branch ?? workspace?.branchName ?? null));
+  const cwd = (directWorkspace ? props.gitContext?.project.localPath : conversationRepository?.localPath) ?? executionContext?.cwd ?? workspace?.review?.cwd ?? workspace?.worktreePath ?? null;
+  /** 多仓目录不把首仓分支冒充整个项目的分支，具体选择由交付页呈现。 */
+  const branch =
+    directWorkspace && conversationReviews.length > 1
+      ? zh
+        ? '多个仓库'
+        : 'Multiple repositories'
+      : (conversationReview?.branch ?? (executionContext?.cwd ? executionContext.branch : (workspace?.review?.branch ?? workspace?.branchName ?? null)));
   const changes = conversationReview
-    ? [...conversationReview.stagedDiff.fileDiffs, ...conversationReview.unstagedDiff.fileDiffs].reduce((summary, file) => ({ ...summary, additions: summary.additions + file.addedLines, deletions: summary.deletions + file.deletedLines }), {
-        files: conversationReview.fileStatuses.length,
-        additions: 0,
-        deletions: 0,
-      })
+    ? conversationReviews
+        .flatMap((review) => [...review.stagedDiff.fileDiffs, ...review.unstagedDiff.fileDiffs])
+        .reduce((summary, file) => ({ ...summary, additions: summary.additions + file.addedLines, deletions: summary.deletions + file.deletedLines }), {
+          files: conversationReviews.reduce((total, review) => total + review.fileStatuses.length, 0),
+          additions: 0,
+          deletions: 0,
+        })
     : summarizeWorkspaceChanges(workspace);
   const sources = useMemo(() => collectSources(props.state), [props.state.attachments, props.state.items]);
   const visibleSources = showAllSources ? sources : sources.slice(0, DEFAULT_VISIBLE_SOURCE_COUNT);
-  const dirty = conversationReview ? !conversationReview.clean : workspace?.review ? !workspace.review.clean : false;
+  const dirty = conversationReview ? conversationReviews.some((review) => !review.clean) : workspace?.review ? !workspace.review.clean : false;
   const canOpenReview = Boolean(conversationReady || (taskId && workspace && props.onOpenGitReview));
-  const canOpenDelivery = Boolean(conversationReady || (taskId && props.onOpenGitDelivery));
+  /** 进入页面不依赖预读成功；加载和目录错误由交付页呈现并提供重试。 */
+  const canOpenDelivery = Boolean(conversationGitClient || (taskId && props.onOpenGitDelivery));
   const codeReviewUnavailableReason = resolveCodeReviewUnavailableReason({
     zh,
     taskId,
@@ -170,7 +177,6 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
     setOpen(false);
     setShowAllSources(false);
     setReviewDialogOpen(false);
-    setDeliveryOpen(false);
     setConversationGit(null);
     setWorkspaces(null);
     setWorkspaceState('idle');
@@ -218,7 +224,7 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
       window.removeEventListener('focus', refreshWorkspaces);
       document.removeEventListener('visibilitychange', refreshWorkspaces);
     };
-  }, [cardVisible, props.conversation.id, props.conversation.workspaceId, props.onLoadTaskWorkspaces, props.state.activeTurnId, props.taskGitDeliveryRevision, props.conversation.projectId, taskId, conversationGitClient, deliveryRevision]);
+  }, [cardVisible, props.conversation.id, props.conversation.workspaceId, props.onLoadTaskWorkspaces, props.state.activeTurnId, props.taskGitDeliveryRevision, props.conversation.projectId, taskId, conversationGitClient]);
 
   useEffect(() => {
     if (!open) return;
@@ -295,8 +301,7 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
 
   function openReview(): void {
     if (conversationReady) {
-      setOpen(false);
-      setDeliveryOpen(true);
+      void openDelivery();
       return;
     }
     if (!taskId || !workspace || !props.onOpenGitReview) return;
@@ -304,11 +309,16 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
     props.onOpenGitReview(taskId, workspace.id, 'commit');
   }
 
-  /** 优先携带会话绑定的工作区，避免列表暂缺时误选其他分支。 */
-  function openDelivery(): void {
-    if (conversationReady) {
+  /** 同一个按钮统一打开原生交付窗口，任务范围保留现有工作区定位。 */
+  async function openDelivery(): Promise<void> {
+    if (conversationGitClient) {
       setOpen(false);
-      setDeliveryOpen(true);
+      try {
+        if (!window.zeus?.openTaskGitDeliveryWindow) throw new Error(zh ? '当前环境无法打开代码交付窗口。' : 'The code delivery window is unavailable in this environment.');
+        await window.zeus.openTaskGitDeliveryWindow({ projectId: props.conversation.projectId, conversationId: props.conversation.id });
+      } catch (error) {
+        reportApplicationError(error, { language: zh ? 'zh-CN' : 'en' });
+      }
       return;
     }
     if (!taskId || !props.onOpenGitDelivery) return;
@@ -334,6 +344,11 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
 
   return (
     <div className="session-quick-actions-anchor" ref={rootRef} data-presentation={persistent ? 'persistent' : 'collapsed'}>
+      {props.conversation.taskId && workspaceError ? (
+        <span role="alert">
+          <VisibleApplicationError error={workspaceError} language={zh ? 'zh-CN' : 'en'} />
+        </span>
+      ) : null}
       {persistent || props.suppressed ? null : (
         <button
           ref={triggerRef}
@@ -445,7 +460,13 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                 <ArrowSquareOut aria-hidden="true" weight="regular" />
               </button>
 
-              <button type="button" className="session-quick-actions-row" disabled={!canOpenDelivery} title={!canOpenDelivery ? (zh ? '会话工作树尚未就绪' : 'Conversation worktree is unavailable') : undefined} onClick={openDelivery}>
+              <button
+                type="button"
+                className="session-quick-actions-row"
+                disabled={!canOpenDelivery}
+                title={!canOpenDelivery ? (zh ? '当前会话没有可用的项目 Git 入口' : 'Project Git is unavailable for this conversation') : undefined}
+                onClick={openDelivery}
+              >
                 <GithubLogo aria-hidden="true" weight="regular" />
                 <span className="session-quick-actions-copy">
                   <strong>{zh ? '代码交付' : 'Code delivery'}</strong>
@@ -520,35 +541,6 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
         </SessionQuickActionsCardMount>
       ) : null}
       <MotionPresence>
-        {deliveryOpen && conversationGitClient && props.gitContext ? (
-          <ModalPortal
-            role="dialog"
-            aria-label={zh ? '会话代码交付' : 'Conversation code delivery'}
-            onDismiss={() => {
-              setDeliveryOpen(false);
-              setDeliveryRevision((value) => value + 1);
-            }}
-          >
-            <section className="conversation-git-delivery">
-              <header>
-                <strong>
-                  {zh ? '代码交付' : 'Code delivery'} · {props.conversation.title}
-                </strong>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setDeliveryOpen(false);
-                    setDeliveryRevision((value) => value + 1);
-                  }}
-                  aria-label={zh ? '关闭代码交付' : 'Close code delivery'}
-                >
-                  ×
-                </button>
-              </header>
-              <ProjectGitWorkbench conversationScope project={props.gitContext.project} client={conversationGitClient} language={props.language} />
-            </section>
-          </ModalPortal>
-        ) : null}
         {reviewDialogOpen ? (
           <SessionCodeReviewDialog
             open={reviewDialogOpen}
@@ -558,8 +550,6 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
             workspace={exactReviewWorkspace}
             repositoryName={conversationRepository?.name}
             capabilities={props.capabilities ?? null}
-            serviceTierPreferences={props.serviceTierPreferences}
-            onServiceTierPreferenceChange={props.onServiceTierPreferenceChange}
             onLoadCapabilities={props.onLoadCapabilities}
             onLoadSkills={props.onLoadSkills}
             onClose={() => setReviewDialogOpen(false)}
@@ -684,7 +674,7 @@ function resolveCodeReviewUnavailableReason(input: {
   if (!input.startAvailable) return input.zh ? '当前版本没有可用的代码审查入口' : 'Code review is unavailable in this version';
   if (!input.taskId) {
     if (input.conversationReady) return null;
-    return input.zh ? (input.workspaceState === 'error' ? '会话工作树不可用，请检查目录后重试' : '正在检查会话工作树…') : 'The conversation worktree is not ready';
+    return input.zh ? (input.workspaceState === 'error' ? '会话工作目录不可用，请检查目录后重试' : '正在检查会话工作目录…') : 'The conversation working folder is not ready';
   }
   if (!input.conversation.workspaceId || !input.conversation.environmentId) {
     return input.zh ? '此对话没有任务开始时的代码记录。请从拥有独立工作目录的任务对话启动审查' : 'This conversation has no record of the code when the task started. Start the review from a task conversation with its own working folder';

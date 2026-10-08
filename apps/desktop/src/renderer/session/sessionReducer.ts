@@ -1,4 +1,5 @@
-import { classifyAssistantMessage, type AsyncQuestionAnswer, type TurnChangeSet } from '@zeus/shared';
+import { compareTranscriptTimelineOrder } from './transcriptReconciliation.js';
+import { classifyAssistantMessage, type AsyncQuestionAnswer, type AsyncQuestionResponse, type TurnChangeSet } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
 import type {
   ConversationState,
@@ -33,7 +34,7 @@ import { type ConversationContextDraft, emptyConversationContextDraft, type Task
 import { mergeConversationContentV2, reconcileConversationHistoryCache } from './conversationSnapshotV2Adapter.js';
 import { isTranscriptContentUpdate } from './transcriptProjection.js';
 import { mergeTranscriptItem, newestTranscriptPlacement, orderTranscriptCandidates, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
-import { isPendingQueueTranscriptMessage, isUnacceptedTranscriptMessage } from './conversationQueuePresentation.js';
+import { isUnacceptedTranscriptMessage } from './conversationQueuePresentation.js';
 
 export type NativeSessionAction =
   | { type: 'transport_changed'; transportState: TransportState; reconnectAttempt?: number; error?: NativeSessionError | null }
@@ -66,7 +67,8 @@ export type NativeSessionAction =
       collaborationMode?: 'plan' | 'default';
     }
   | { type: 'queue_hydrated'; queue: NativeQueueSnapshot }
-  | { type: 'queued_submission_deleted'; submissionId: string; clientUserMessageId?: string; queue: NativeQueueSnapshot }
+  /** 用户删除答案时携带原题身份，避免迟到的队列回执丢失关联。 */
+  | { type: 'queued_submission_deleted'; submissionId: string; clientUserMessageId?: string; questionAnswer?: AsyncQuestionAnswer; queue: NativeQueueSnapshot }
   | { type: 'steering_submission_hydrated'; submission: NativeQueuedSubmission; queue?: NativeQueueSnapshot }
   | { type: 'steering_submission_failed'; submissionId: string; clientUserMessageId?: string; error: NativeSessionError }
   | { type: 'operation_started'; operation: string }
@@ -111,7 +113,7 @@ export type NativeSessionAction =
       /** 结果待核对属于可自行收敛的内部状态，允许不携带面向用户的错误。 */
       error?: NativeSessionError;
     }
-  | { type: 'send_accepted'; clientUserMessageId: string; status: string; submissionId?: string; providerTurnId?: string }
+  | { type: 'send_accepted'; clientUserMessageId: string; status: string; messageCreatedAt?: string; submissionId?: string; providerTurnId?: string }
   | { type: 'send_reconciliation_failed'; error: NativeSessionError }
   | { type: 'send_succeeded' };
 
@@ -128,6 +130,9 @@ export function createInitialSessionState(): NativeSessionState {
   return {
     transportState: 'disconnected',
     reconnectAttempt: 0,
+    providerReconnectAttempt: 0,
+    providerReconnectAttempts: 0,
+    providerReconnectTurnId: null,
     conversationState: 'native_loading',
     projectId: null,
     conversationId: null,
@@ -270,7 +275,7 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
       return projectQueueSubmissionMessages(state, action.queue);
     }
     case 'queued_submission_deleted':
-      return removeQueuedSubmissionProjection(state, action.submissionId, action.clientUserMessageId, action.queue);
+      return removeQueuedSubmissionProjection(state, action.submissionId, action.clientUserMessageId, action.queue, action.questionAnswer);
     case 'steering_submission_hydrated':
       return projectSteeringSubmission(state, action.submission, action.queue);
     case 'steering_submission_failed':
@@ -362,6 +367,16 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
       const optimisticKey = optimisticEntry?.[0] ?? optimisticUserItemKey(state, action.clientUserMessageId);
       const optimistic = optimisticEntry?.[1];
       if (!optimistic) return { ...state, error: null };
+      // 接纳到提交队列即完成本地交接；初始回执不能把已删除或已执行的队列项重新写回正文。
+      if (action.submissionId && isUnacceptedTranscriptMessage(optimistic) && !action.providerTurnId) {
+        return {
+          ...state,
+          items: Object.fromEntries(Object.entries(state.items).filter(([key]) => key !== optimisticKey)),
+          itemOrder: state.itemOrder.filter((key) => key !== optimisticKey),
+          error: null,
+          transcriptRevision: state.transcriptRevision + 1,
+        };
+      }
       const terminal = action.providerTurnId ? state.terminalTurnIds[action.providerTurnId] : undefined;
       const payload: Record<string, unknown> = {
         ...optimistic.payload,
@@ -378,6 +393,7 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
           ...state.items,
           [optimisticKey]: {
             ...optimistic,
+            messageCreatedAt: action.messageCreatedAt ?? optimistic.messageCreatedAt,
             ...(action.providerTurnId ? { turnId: action.providerTurnId } : {}),
             status: terminal ? 'completed' : action.status,
             payload,
@@ -395,9 +411,12 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
   }
 }
 
+/** 权威快照按持久显示身份接管缓存，轮次编号变化不产生第二份正文。 */
 function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConversationSnapshot, reconcileHistoryCache = true): NativeSessionState {
   const historyReconciliation = reconcileHistoryCache ? reconcileConversationHistoryCache(state.snapshot, incomingSnapshot) : { snapshot: incomingSnapshot, preserveCachedHistory: true };
-  const snapshot = historyReconciliation.snapshot;
+  /** 正文页不能把较新的队列事实回退到请求发出时。 */
+  const snapshot =
+    state.queue && state.queue.throughEventSeq > historyReconciliation.snapshot.queue.throughEventSeq ? { ...historyReconciliation.snapshot, queue: state.queue, submissions: state.queue.submissions } : historyReconciliation.snapshot;
   /** 有界首屏未包含的已结束轮次仍可能拥有缓存过程；轮次身份必须随过程一起保留。 */
   const cachedTurns = state.conversationId === snapshot.id ? Object.values(state.turnsByProviderId).filter((turn) => isTerminalTurnStatus(turn.status)) : [];
   /** 首屏中的轮次仍以本次权威结果为准，缓存只补齐首屏范围外的归属。 */
@@ -467,7 +486,13 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     let itemClientId = isUserMessageType(item.type) ? (stringValue(item.payload.clientId) ?? stringValue(item.payload.clientUserMessageId)) : null;
     /** 同一条用户消息无论先到的是本地气泡还是落库条目，都按持久显示身份认作一条。 */
     const durableIdentityEntry = isUserMessageType(item.type) ? previousUserEntryByDurableIdentity.get(item.transcript.placement.entryId) : undefined;
-    const previousUserItem = (itemClientId ? previousUserItemsByClientId.get(itemClientId) : undefined) ?? (itemSubmissionId ? previousUserItemsBySubmissionId.get(itemSubmissionId) : undefined) ?? durableIdentityEntry?.item;
+    /** 活动预览可能缺少客户端身份；相同 Provider 消息仍应接管原输入，不重复加入正文顺序。 */
+    const previousProviderItem = item.providerItemId ? previousItemsByProviderId.get(item.providerItemId) : undefined;
+    const previousUserItem =
+      (itemClientId ? previousUserItemsByClientId.get(itemClientId) : undefined) ??
+      (itemSubmissionId ? previousUserItemsBySubmissionId.get(itemSubmissionId) : undefined) ??
+      durableIdentityEntry?.item ??
+      (isUserMessageType(item.type) && previousProviderItem?.turnId === turnId && isUserMessageItem(previousProviderItem) ? previousProviderItem : undefined);
     itemClientId ??= previousUserItem ? (userMessageClientIds(previousUserItem)[0] ?? null) : null;
     const existingProviderUserKey = itemClientId ? providerUserItemKeyByClientId.get(itemClientId) : undefined;
     if (existingProviderUserKey) {
@@ -477,7 +502,11 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
       continue;
     }
     // 同一条用户消息从本地发送态交接为 Provider item 时沿用可见身份，避免气泡被卸载后重建。
-    const key = (itemClientId ? previousUserItemKeys.get(itemClientId) : undefined) ?? durableIdentityEntry?.key ?? nativeSessionItemKey(snapshot.id, threadId, turnId, item.transcript.placement.entryId);
+    const key =
+      (itemClientId ? previousUserItemKeys.get(itemClientId) : undefined) ??
+      durableIdentityEntry?.key ??
+      previousItemsByEntryId.get(item.transcript.placement.entryId)?.key ??
+      nativeSessionItemKey(snapshot.id, threadId, turnId, item.transcript.placement.entryId);
     // 资源分页已经补齐到 Renderer 后，后续轻量权威快照仍可能只携带正文、把 resources
     // 投影为空。资源属于同一持久 item 的展示增量，必须按稳定身份合并，不能在新一轮
     // 对账时倒退为“图片不可用”。
@@ -506,6 +535,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
       resources: mergeDurableItemResources(previousDurableItem?.resources, item.resources),
       timelineAt,
       updatedAt: item.updatedAt,
+      messageCreatedAt: item.messageCreatedAt,
       transcript: item.transcript,
       ...(itemClientId ? { clientUserMessageId: itemClientId, durableClientUserMessageId: itemClientId } : {}),
     };
@@ -533,18 +563,22 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
       .flatMap((item) => (item.providerItemId ? [scopedProviderItemIdentity(item.turnId, item.providerItemId)] : []))
       .filter((identity): identity is string => Boolean(identity)),
   );
+  /** 来源行和轮次编号可以变化；同一持久正文只能在缓存中占一个位置。 */
+  const projectedEntryIds = new Set(Object.values(items).flatMap((item) => (item.transcript ? [item.transcript.placement.entryId] : [])));
   for (const key of state.itemOrder) {
     const previous = state.items[key];
     if (
       !previous ||
       previous.conversationId !== snapshot.id ||
       key in items ||
+      (previous.transcript ? projectedEntryIds.has(previous.transcript.placement.entryId) : false) ||
       (previous.localItemId ? projectedLocalItemIds.has(previous.localItemId) : false) ||
       (previous.providerItemId ? projectedProviderItemIds.has(scopedProviderItemIdentity(previous.turnId, previous.providerItemId)) : false) ||
       !shouldPreserveBoundedTranscriptItem(previous, activeTurnIdentities, historyReconciliation.preserveCachedHistory)
     )
       continue;
     items[key] = previous;
+    if (previous.transcript) projectedEntryIds.add(previous.transcript.placement.entryId);
     orderedItems.push({
       key,
       order: previous.transcript?.placement.order ?? null,
@@ -577,6 +611,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
           optimistic: false,
           ...(clientUserMessageId ? { clientUserMessageId, durableClientUserMessageId: clientUserMessageId } : {}),
           updatedAt: message.createdAt,
+          messageCreatedAt: message.createdAt,
         };
         continue;
       }
@@ -602,46 +637,9 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
       ...(message.providerItemId ? { providerItemId: message.providerItemId } : {}),
       timelineAt: message.createdAt,
       updatedAt: message.createdAt,
+      messageCreatedAt: message.createdAt,
     };
     orderedItems.push({ key, order: null, stableIndex: stableIndexForClient(clientUserMessageId) });
-  }
-
-  // Provider 尚未回放精确 userMessage 时，从持久 submission 恢复同一条用户消息。
-  // 排队阶段也保留稳定客户端身份，后续开轮只更新状态与 turnId，不把消息挪出再重建。
-  for (const submission of snapshot.submissions) {
-    const clientUserMessageId = submission.clientUserMessageId;
-    const pendingStatus = shouldProjectSubmissionMessage(submission);
-    if (!pendingStatus || !clientUserMessageId) continue;
-    const providerTurnId = submission.providerTurnId ?? `pending:${clientUserMessageId}`;
-    const itemId = `${submission.delivery === 'steer_now' ? 'steering' : 'submission'}:${submission.id}`;
-    const existingUserEntry = Object.entries(items).find(([, item]) => isUserMessageItem(item) && (userMessageClientIds(item).includes(clientUserMessageId) || stringValue(item.payload.submissionId) === submission.id));
-    if (existingUserEntry) {
-      const [key, existing] = existingUserEntry;
-      const submissionItem = submissionUserMessageItem(snapshot.id, threadId, submission, key, itemId, providerTurnId);
-      items[key] = {
-        ...existing,
-        status: submissionItem.status,
-        payload: mergeStableUserMessagePresentation(existing.payload, submissionItem.payload),
-        optimistic: submissionItem.optimistic,
-        clientUserMessageId,
-        durableClientUserMessageId: clientUserMessageId,
-        updatedAt: submissionItem.updatedAt ?? existing.updatedAt,
-      };
-      durableClientIds.add(clientUserMessageId);
-      continue;
-    }
-    if (durableClientIds.has(clientUserMessageId)) continue;
-    const key = previousUserItemKeys.get(clientUserMessageId) ?? nativeSessionItemKey(snapshot.id, threadId, providerTurnId, itemId);
-    const submissionItem = submissionUserMessageItem(snapshot.id, threadId, submission, key, itemId, providerTurnId);
-    const previousUserItem = previousUserItemsByClientId.get(clientUserMessageId);
-    items[key] = previousUserItem
-      ? {
-          ...submissionItem,
-          payload: mergeStableUserMessagePresentation(previousUserItem.payload, submissionItem.payload),
-        }
-      : submissionItem;
-    orderedItems.push({ key, order: null, stableIndex: stableIndexForClient(clientUserMessageId) });
-    durableClientIds.add(clientUserMessageId);
   }
 
   // A pending user message is renderer-owned until a durable conversation_message with
@@ -653,7 +651,8 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     const knownSubmission = userMessageClientIds(item)
       .map((clientId) => submissionsByClientId.get(clientId))
       .find((submission): submission is NativeQueuedSubmission => Boolean(submission));
-    if (knownSubmission && shouldDiscardSubmissionProjection(knownSubmission)) continue;
+    // 权威队列接管后不再保留本地副本；接纳后的正文由持久消息来源提供。
+    if (knownSubmission) continue;
     if ((item.clientUserMessageId && durableClientIds.has(item.clientUserMessageId)) || (item.durableClientUserMessageId && durableClientIds.has(item.durableClientUserMessageId))) continue;
     items[key] = item;
     orderedItems.push({ key, order: item.transcript?.placement.order ?? null, stableIndex: stableIndexForClient(item.clientUserMessageId ?? item.durableClientUserMessageId ?? null) });
@@ -706,6 +705,9 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     projectId: snapshot.projectId,
     conversationId: snapshot.id,
     providerThreadId: snapshot.providerThreadId,
+    providerReconnectAttempt: 0,
+    providerReconnectAttempts: 0,
+    providerReconnectTurnId: null,
     activeTurnId,
     startedTurnId: activeTurnId,
     snapshot: { ...snapshot, turns: retainedTurns, changeSets: Object.values(changeSetsByProviderId) },
@@ -870,6 +872,10 @@ function changeCompleteContentLoadError(state: NativeSessionState, action: Extra
  * 若用普通水合处理，较早的分页基准会把刚完成的轮次降回运行中并丢掉实时最终答复。
  */
 function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversationSnapshot): NativeSessionState {
+  /** 加载、游标或错误变化只更新分页状态，不重新水合消息或改变内容修订。 */
+  if (state.snapshot && Object.keys(snapshot).length === Object.keys(state.snapshot).length && Object.entries(snapshot).every(([key, value]) => key === 'v2Paging' || value === state.snapshot![key as keyof NativeConversationSnapshot])) {
+    return snapshot === state.snapshot ? state : { ...state, snapshot };
+  }
   const hydrated = hydrateSnapshot(state, snapshot, false);
   const items = { ...hydrated.items };
   /** 唯一显示身份已在服务端统一；原生条目编号可以在不同分段重复。 */
@@ -879,6 +885,7 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
     const canonicalKey = canonicalKeys.get(previous.transcript?.placement.entryId ?? key) ?? key;
     canonicalKeyByAlias.set(key, canonicalKey);
     const projected = items[canonicalKey];
+    /** 同一持久身份的多个旧别名仍逐项归并，不能丢失较新的实时修订。 */
     items[canonicalKey] = projected ? mergeSnapshotPageItem(previous, projected, canonicalKey) : previous;
   }
 
@@ -895,8 +902,18 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
   const turnsByProviderId = { ...hydrated.turnsByProviderId };
   for (const [turnId, previous] of Object.entries(state.turnsByProviderId)) {
     const projected = turnsByProviderId[turnId];
-    if (!projected || (isTerminalTurnStatus(previous.status) && !isTerminalTurnStatus(projected.status)) || previous.updatedAt.localeCompare(projected.updatedAt) > 0) turnsByProviderId[turnId] = previous;
+    if (!projected || (isTerminalTurnStatus(previous.status) && !isTerminalTurnStatus(projected.status)) || previous.updatedAt.localeCompare(projected.updatedAt) > 0 || sameSerializableValue(previous, projected))
+      turnsByProviderId[turnId] = previous;
   }
+  /** 未变化轮次保留映射身份，分页不改变已确认的轮次归属。 */
+  const stableTurns =
+    Object.keys(turnsByProviderId).length === Object.keys(state.turnsByProviderId).length && Object.entries(turnsByProviderId).every(([key, turn]) => turn === state.turnsByProviderId[key]) ? state.turnsByProviderId : turnsByProviderId;
+  /** 内容相同的分页条目继续复用已经展示的对象。 */
+  const stableItems = reuseEquivalentSessionItems(state.items, items);
+  /** 相同顺序不产生新的结构引用。 */
+  const stableItemOrder = sameStringArray(state.itemOrder, itemOrder) ? state.itemOrder : itemOrder;
+  /** 分页没有新增终态时继续沿用原终态表。 */
+  const terminalTurnIds = { ...hydrated.terminalTurnIds, ...state.terminalTurnIds };
   const turns = [...new Map([...snapshot.turns, ...Object.values(turnsByProviderId)].map((turn) => [turn.providerTurnId ?? turn.id, turn])).values()].sort(
     (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
   );
@@ -904,10 +921,10 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
   return {
     ...hydrated,
     snapshot: { ...hydrated.snapshot!, turns },
-    turnsByProviderId,
-    terminalTurnIds: { ...hydrated.terminalTurnIds, ...state.terminalTurnIds },
-    items,
-    itemOrder,
+    turnsByProviderId: stableTurns,
+    terminalTurnIds: sameSerializableValue(state.terminalTurnIds, terminalTurnIds) ? state.terminalTurnIds : terminalTurnIds,
+    items: stableItems,
+    itemOrder: stableItemOrder,
     activeTurnId: state.activeTurnId,
     startedTurnId: state.startedTurnId,
     queue: state.queue,
@@ -920,7 +937,7 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
     rateLimits: state.rateLimits,
     mcpStartup: state.mcpStartup,
     conversationState: state.conversationState,
-    transcriptRevision: state.transcriptRevision + 1,
+    transcriptRevision: state.transcriptRevision + (stableItems === state.items && stableItemOrder === state.itemOrder ? 0 : 1),
     feedbackEpoch: state.feedbackEpoch,
     visibleFeedbackEpoch: state.visibleFeedbackEpoch,
     error: state.error,
@@ -966,6 +983,7 @@ function equivalentSessionItem(left: NativeSessionItemBuffer, right: NativeSessi
     left.durableClientUserMessageId === right.durableClientUserMessageId &&
     left.timelineAt === right.timelineAt &&
     left.updatedAt === right.updatedAt &&
+    left.messageCreatedAt === right.messageCreatedAt &&
     sameSerializableValue(left.transcript, right.transcript) &&
     sameSerializableValue(left.payload, right.payload) &&
     sameSerializableValue(left.resources, right.resources)
@@ -1063,13 +1081,16 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         createdAt: existingTurn?.createdAt ?? startedAt,
         updatedAt: event.createdAt,
       };
-      const queue = turnBase.queue
-        ? {
-            ...turnBase.queue,
-            state: { type: 'active' as const, turnId, phase: 'prework' as const },
-            submissions: submissionId ? turnBase.queue.submissions.filter((submission) => submission.id !== submissionId) : turnBase.queue.submissions,
-          }
-        : null;
+      const queue =
+        turnBase.queue && payload.sequence >= turnBase.queue.throughEventSeq
+          ? {
+              ...turnBase.queue,
+              throughEventSeq: payload.sequence,
+              state: { type: 'active' as const, turnId, phase: 'prework' as const },
+              // 回显前的待确认展示仍由权威队列接管；不能仅凭轮次开始删除提交。
+              submissions: turnBase.queue.submissions,
+            }
+          : turnBase.queue;
       const openingUserEntry = submissionId ? Object.entries(turnBase.items).find(([, item]) => item.optimistic && isUserMessageItem(item) && stringValue(item.payload.submissionId) === submissionId) : undefined;
       let items = turnBase.items;
       if (openingUserEntry) {
@@ -1204,7 +1225,7 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
       const queueBase = queuedThreadTransition ? applyProviderIdentityChange(base, payload, false) : base;
       const queue = isRecord(payload.queue) ? (payload.queue as unknown as NativeQueueSnapshot) : queueBase.queue;
       if (!queue) return queueBase;
-      const projected = projectQueueSubmissionMessages(queueBase, queue);
+      const projected = projectQueueSubmissionMessages(queueBase, { ...queue, throughEventSeq: payload.sequence });
       if (!queuedThreadTransition || queue.state.type !== 'active') return projected;
       return { ...projected, activeTurnId: queue.state.turnId, startedTurnId: queue.state.turnId };
     }
@@ -1435,6 +1456,7 @@ function planImplementationStatus(value: unknown): NativePlanImplementationReque
   return value === 'pending' || value === 'dismissed' || value === 'implemented' || value === 'refinement_requested' || value === 'superseded' ? value : null;
 }
 
+/** 实时条目与历史正文按同一持久身份接管，保留已有可见键和正文权威。 */
 function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConversationEvent, { type: 'conversation.item.started' | 'conversation.item.delta' | 'conversation.item.completed' }>): NativeSessionState {
   const payload = event.payload;
   const conversationId = stringValue(payload.conversationId) ?? state.conversationId;
@@ -1466,10 +1488,10 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
   const optimisticEntry = matchedUserEntry?.[1].optimistic ? matchedUserEntry : undefined;
   const matchedUserItem = matchedUserEntry?.[1];
   /**
-   * 落库条目带着持久显示身份到达时直接接管同身份的本地条目。
-   * 本地乐观气泡还没有位置记录，但它的持久身份已经确定，不能因为少了位置就多留一个气泡。
+   * 所有实时条目都接管同持久身份的历史条目；不能只核对用户消息。
+   * 历史分页可能尚未取得 Provider 轮次编号，因此不能用技术缓存键判定它是新条目。
    */
-  const transcriptEntry = !providerItem && incomingTranscript ? Object.entries(state.items).find(([, item]) => durableUserMessageIdentity(item) === incomingTranscript.placement.entryId) : undefined;
+  const transcriptEntry = !providerItem && incomingTranscript ? Object.entries(state.items).find(([, item]) => sessionTranscriptEntryId(item) === incomingTranscript.placement.entryId) : undefined;
   const matchedKey = matchedUserEntry?.[0] ?? transcriptEntry?.[0];
   const key = matchedKey ?? providerKey;
   const previous = state.items[key] ?? providerItem ?? transcriptEntry?.[1];
@@ -1509,6 +1531,7 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
     // 首次事件确定条目的时间线位置；delta/completed 只更新内容，不能让历史位置漂移。
     timelineAt: previous?.timelineAt ?? matchedUserItem?.timelineAt ?? event.createdAt,
     updatedAt: event.createdAt,
+    messageCreatedAt: stringValue(incomingPayload?.messageCreatedAt) ?? previous?.messageCreatedAt,
     ...(incomingTranscript || previous?.transcript ? { transcript: incomingTranscript ?? previous?.transcript } : {}),
   };
   /** 实时、历史与分页共用正文权威判定。 */
@@ -1564,12 +1587,37 @@ function reduceTranscriptPlacements(state: NativeSessionState, batch: NativeConv
   return { ...state, items, pendingRequests, removedTranscriptEntryIds, itemOrder: sortSessionItemOrder(candidateOrder, items), transcriptRevision: state.transcriptRevision + 1 };
 }
 
-/** 实时条目只按持久位置插入；无位置的乐观队列继续保留当前相对顺序。 */
+/** 实时条目按正文时间线插入；已开轮用户消息用后续事件的显式开场身份临时固定位置。 */
 function sortSessionItemOrder(order: readonly string[], items: Readonly<Record<string, NativeSessionItemBuffer>>): string[] {
-  return orderTranscriptCandidates(order, (key) => ({
-    order: items[key]?.transcript?.placement.order,
-    entryId: items[key]?.transcript?.placement.entryId ?? key,
-  }));
+  const previousIndex = new Map(order.map((key, index) => [key, index]));
+  /** Provider 后续事件携带的开场身份和首个位置，可在用户消息落库前固定其阅读位置。 */
+  const firstOrderByOpeningInputId = new Map<string, number>();
+  for (const item of Object.values(items)) {
+    const openingInputId = item.transcript?.placement.openingInputId;
+    const itemOrder = item.transcript?.placement.order;
+    if (!openingInputId || itemOrder === null || itemOrder === undefined) continue;
+    firstOrderByOpeningInputId.set(openingInputId, Math.min(firstOrderByOpeningInputId.get(openingInputId) ?? itemOrder, itemOrder));
+  }
+  /** 暂未落库的开场消息借用其首个后续事件的位置，正式位置到达后不会发生视觉跳位。 */
+  const timelineEntry = (key: string) => {
+    const item = items[key];
+    const persistentOrder = item?.transcript?.placement.order ?? null;
+    const openingInputId = item ? durableUserMessageIdentity(item) : null;
+    const anchoredOrder = persistentOrder === null && openingInputId ? (firstOrderByOpeningInputId.get(openingInputId) ?? null) : null;
+    return {
+      entryId: item?.transcript?.placement.entryId ?? openingInputId ?? key,
+      order: persistentOrder ?? anchoredOrder,
+      fallbackIndex: previousIndex.get(key) ?? 0,
+      anchored: anchoredOrder !== null,
+    };
+  };
+  return [...order].sort((leftKey, rightKey) => {
+    const left = timelineEntry(leftKey);
+    const right = timelineEntry(rightKey);
+    // 锚点与首个事件共用位置时，开场用户消息必须先出现；其他条目继续使用统一全序规则。
+    if (left.order !== null && left.order === right.order && left.anchored !== right.anchored) return left.anchored ? -1 : 1;
+    return compareTranscriptTimelineOrder(left, right);
+  });
 }
 
 /**
@@ -1664,6 +1712,18 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
   const key = existingOptimisticEntry?.[0] ?? optimisticUserItemKey(state, action.clientUserMessageId);
   const conversationId = state.conversationId ?? 'pending-conversation';
   const threadId = state.providerThreadId ?? 'pending-thread';
+  /** 活跃轮次后的普通发送进入输入框排队区；任务推送首条消息仍属于新会话正文。 */
+  const queuedForActiveTurn =
+    !action.taskPushLayout &&
+    action.delivery === 'queue' &&
+    (action.previousConversationState === 'starting_turn' ||
+      action.previousConversationState === 'active_prework' ||
+      action.previousConversationState === 'active_final_answer' ||
+      action.previousConversationState === 'waiting_approval' ||
+      action.previousConversationState === 'waiting_user_input' ||
+      state.queue?.state.type === 'active' ||
+      state.queue?.state.type === 'waiting' ||
+      state.queue?.state.type === 'dispatching');
   const item: NativeSessionItemBuffer = {
     key,
     conversationId,
@@ -1677,6 +1737,7 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
     payload: {
       attachments: action.submittedAttachments,
       delivery: action.delivery,
+      ...(queuedForActiveTurn ? { queuedForActiveTurn: true } : {}),
       ...(action.questionAnswer ? { questionAnswer: action.questionAnswer } : {}),
       ...(action.queuedUntilHydrated ? { queuedUntilHydrated: true } : {}),
       ...(action.taskPushLayout ? { taskPushLayout: action.taskPushLayout } : {}),
@@ -1687,6 +1748,7 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
     optimistic: true,
     clientUserMessageId: action.clientUserMessageId,
     durableClientUserMessageId: action.durableClientUserMessageId,
+    messageCreatedAt: action.startedAt,
     timelineAt: action.startedAt,
     updatedAt: action.startedAt,
   };
@@ -1710,95 +1772,39 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
   };
 }
 
-/** 新投影的历史提交按首次发言位置插入，已有历史顺序和仍在推进的队尾保持不变。 */
-function insertSubmissionTimelineItem(order: string[], items: NativeSessionState['items'], item: NativeSessionItemBuffer): string[] {
-  /** 仍在推进的未接纳消息继续交给队列排序；缺少首次时间时不猜测历史位置。 */
-  const timestamp = item.timelineAt;
-  if (isPendingQueueTranscriptMessage(item) || !timestamp) return [...order, item.key];
-  /** 只寻找插入点，不对整段历史重新排序，避免扰动原生消息与答题记录。 */
-  const index = order.findIndex((key) => {
-    /** 待发消息不作为历史时间锚点，其展示位置继续由队列决定。 */
-    const existing = items[key];
-    return Boolean(existing && !isPendingQueueTranscriptMessage(existing) && (existing.timelineAt ?? existing.updatedAt ?? '') > timestamp);
-  });
-  return index < 0 ? [...order, item.key] : [...order.slice(0, index), item.key, ...order.slice(index)];
-}
-
 function projectQueueSubmissionMessages(state: NativeSessionState, queue: NativeQueueSnapshot): NativeSessionState {
-  let items = state.items;
-  let itemOrder = state.itemOrder;
-  let transcriptChanged = false;
-  const conversationId = state.conversationId;
-  const threadId = state.providerThreadId ?? state.snapshot?.providerThreadId ?? 'unbound-thread';
-  // send-now 的本地交接先于 HTTP/事件确认完成。旧的 queued/dispatching 快照不能把
-  // 已经进入当前 turn 的 steer 消息重新画回队列，否则会出现“队列消失后又闪回”的断层。
-  const projectedQueue: NativeQueueSnapshot = {
-    ...queue,
-    submissions: queue.submissions.filter((submission) => !hasPendingSteeringProjection(state.items, submission)),
-  };
-
-  if (conversationId) {
-    for (const submission of projectedQueue.submissions) {
-      const clientUserMessageId = submission.clientUserMessageId;
-      if (!clientUserMessageId || !shouldProjectSubmissionMessage(submission)) continue;
-      const matchedEntry = Object.entries(items).find(([, item]) => isUserMessageItem(item) && (userMessageClientIds(item).includes(clientUserMessageId) || stringValue(item.payload.submissionId) === submission.id));
-
-      const key = matchedEntry?.[0] ?? optimisticUserItemKey(state, clientUserMessageId);
-      const previous = matchedEntry?.[1];
-      const turnId = submission.providerTurnId ?? `pending:${clientUserMessageId}`;
-      const itemId = `${submission.delivery === 'steer_now' ? 'steering' : 'submission'}:${submission.id}`;
-      const projected = submissionUserMessageItem(conversationId, threadId, submission, key, itemId, turnId);
-      const next = previous
-        ? {
-            // 队列只覆盖提交字段，保留已接纳消息的显示身份、位置与来源修订。
-            ...previous,
-            ...projected,
-            ...(!previous.optimistic
-              ? {
-                  itemId: previous.itemId,
-                  turnId: previous.turnId,
-                  ...(previous.localItemId ? { localItemId: previous.localItemId } : {}),
-                  ...(previous.providerItemId ? { providerItemId: previous.providerItemId } : {}),
-                }
-              : {}),
-            text: previous.text || projected.text,
-            resources: previous.resources,
-            payload: mergeSubmissionUserMessagePayload(previous.payload, submission),
-            timelineAt: previous.timelineAt ?? projected.timelineAt,
-          }
-        : projected;
-      if (previous && equivalentSessionItem(previous, next)) continue;
-      if (items === state.items) items = { ...state.items };
-      items[key] = next;
-      if (!previous) itemOrder = insertSubmissionTimelineItem(itemOrder, items, next);
-      transcriptChanged = true;
-    }
-  }
-
+  if (state.queue && queue.throughEventSeq < state.queue.throughEventSeq) return state;
+  /** 同一次提交仅凭稳定身份交接，普通重复文本仍是两条消息。 */
+  const submissionIds = new Set(queue.submissions.map((submission) => submission.id));
+  /** HTTP 回执到达前也能用客户端身份确认归属。 */
+  const clientIds = new Set(queue.submissions.map((submission) => submission.clientUserMessageId));
+  /** 只移交未接纳的本地输入，持久正文及已进入轮次的插话保留。 */
+  const removedKeys = new Set(
+    state.itemOrder.filter((key) => {
+      const item = state.items[key];
+      return item && isUserMessageItem(item) && isUnacceptedTranscriptMessage(item) && (submissionIds.has(stringValue(item.payload.submissionId) ?? '') || userMessageClientIds(item).some((id) => clientIds.has(id)));
+    }),
+  );
   return {
     ...state,
-    items,
-    itemOrder,
-    queue: projectedQueue,
-    conversationState: conversationStateFromQueue(projectedQueue, state),
-    transcriptRevision: state.transcriptRevision + (transcriptChanged ? 1 : 0),
+    items: removedKeys.size ? Object.fromEntries(Object.entries(state.items).filter(([key]) => !removedKeys.has(key))) : state.items,
+    itemOrder: removedKeys.size ? state.itemOrder.filter((key) => !removedKeys.has(key)) : state.itemOrder,
+    queue,
+    conversationState: conversationStateFromQueue(queue, state),
+    transcriptRevision: state.transcriptRevision + (removedKeys.size ? 1 : 0),
   };
-}
-
-function shouldProjectSubmissionMessage(submission: NativeQueuedSubmission): boolean {
-  if (submission.status === 'queued' || submission.status === 'dispatching' || submission.status === 'active' || submission.status === 'failed' || submission.status === 'completed' || submission.status === 'resolved') return true;
-  return submission.status === 'paused';
-}
-
-function shouldDiscardSubmissionProjection(submission: NativeQueuedSubmission): boolean {
-  return submission.status === 'cancelled' || submission.status === 'deleted';
 }
 
 function projectSteeringSubmission(state: NativeSessionState, submission: NativeQueuedSubmission, authoritativeQueue?: NativeQueueSnapshot): NativeSessionState {
+  // 队列水位只约束队列；迟到的明确接纳证据仍须交给正文。
+  if (authoritativeQueue && state.queue && authoritativeQueue.throughEventSeq < state.queue.throughEventSeq) {
+    if (submission.status === 'paused') return state;
+    authoritativeQueue = state.queue;
+  }
   // 引导失败仍保留原消息及阻塞事实，不能被正常“引导中”投影从队列抹掉。
   if (submission.status === 'paused') {
     const queue = authoritativeQueue ?? state.queue;
-    if (queue) return projectQueueSubmissionMessages(state, { ...queue, submissions: [...queue.submissions.filter((entry) => entry.id !== submission.id), submission] });
+    if (queue) return projectQueueSubmissionMessages(state, queue);
   }
   const queue = authoritativeQueue
     ? { ...authoritativeQueue, submissions: authoritativeQueue.submissions.filter((entry) => entry.id !== submission.id) }
@@ -1831,7 +1837,7 @@ function projectSteeringSubmission(state: NativeSessionState, submission: Native
       : {}),
   };
   const items = { ...state.items, [key]: item };
-  const itemOrder = previousKey || state.itemOrder.includes(key) ? state.itemOrder : insertSubmissionTimelineItem(state.itemOrder, items, item);
+  const itemOrder = previousKey || state.itemOrder.includes(key) ? state.itemOrder : sortSessionItemOrder([...state.itemOrder, key], items);
   return {
     ...state,
     items,
@@ -1843,7 +1849,7 @@ function projectSteeringSubmission(state: NativeSessionState, submission: Native
 
 function markSteeringSubmissionUnconfirmed(state: NativeSessionState, submissionId: string, clientUserMessageId: string | undefined, error: NativeSessionError): NativeSessionState {
   const matchedEntry = Object.entries(state.items).find(
-    ([, item]) => item.optimistic && isUserMessageItem(item) && ((clientUserMessageId ? userMessageClientIds(item).includes(clientUserMessageId) : false) || stringValue(item.payload.submissionId) === submissionId),
+    ([, item]) => isUnacceptedTranscriptMessage(item) && isUserMessageItem(item) && ((clientUserMessageId ? userMessageClientIds(item).includes(clientUserMessageId) : false) || stringValue(item.payload.submissionId) === submissionId),
   );
   if (!matchedEntry) return { ...state, error };
   const [key, previous] = matchedEntry;
@@ -1865,37 +1871,37 @@ function markSteeringSubmissionUnconfirmed(state: NativeSessionState, submission
   };
 }
 
-function hasPendingSteeringProjection(items: Record<string, NativeSessionItemBuffer>, submission: NativeQueuedSubmission): boolean {
-  if (submission.status !== 'queued' && submission.status !== 'dispatching') return false;
-  if (submission.providerTurnId) return false;
-  return Object.values(items).some(
-    (item) =>
-      item.optimistic &&
-      isUserMessageItem(item) &&
-      stringValue(item.payload.delivery) === 'steer_now' &&
-      item.status !== 'failed' &&
-      item.status !== 'unconfirmed' &&
-      ((submission.clientUserMessageId ? userMessageClientIds(item).includes(submission.clientUserMessageId) : false) || stringValue(item.payload.submissionId) === submission.id),
-  );
-}
-
-function removeQueuedSubmissionProjection(state: NativeSessionState, submissionId: string, requestedClientUserMessageId: string | undefined, queue: NativeQueueSnapshot): NativeSessionState {
+/** 删除普通排队投影，并按原题身份释放尚未送达的回答状态。 */
+function removeQueuedSubmissionProjection(state: NativeSessionState, submissionId: string, requestedClientUserMessageId: string | undefined, queue: NativeQueueSnapshot, questionAnswer?: AsyncQuestionAnswer): NativeSessionState {
+  /** 迟到的删除回执只清理原题状态，不能覆盖更新的权威队列。 */
+  const authoritativeQueue = state.queue && queue.throughEventSeq < state.queue.throughEventSeq ? state.queue : queue;
+  if (authoritativeQueue !== queue && !questionAnswer) return state;
   const clientUserMessageId = requestedClientUserMessageId ?? state.queue?.submissions.find((submission) => submission.id === submissionId)?.clientUserMessageId;
   const removedKeys = Object.entries(state.items)
-    .filter(([, item]) => item.optimistic && isUserMessageItem(item) && ((clientUserMessageId ? userMessageClientIds(item).includes(clientUserMessageId) : false) || stringValue(item.payload.submissionId) === submissionId))
+    .filter(
+      ([, item]) => isUnacceptedTranscriptMessage(item) && isUserMessageItem(item) && ((clientUserMessageId ? userMessageClientIds(item).includes(clientUserMessageId) : false) || stringValue(item.payload.submissionId) === submissionId),
+    )
     .map(([key]) => key);
-  if (removedKeys.length === 0) {
-    return { ...state, queue, conversationState: conversationStateFromQueue(queue, state) };
+  if (removedKeys.length === 0 && !questionAnswer) {
+    return { ...state, queue: authoritativeQueue, conversationState: conversationStateFromQueue(authoritativeQueue, state) };
   }
   const removedKeySet = new Set(removedKeys);
   const items = { ...state.items };
   for (const key of removedKeys) delete items[key];
+  if (questionAnswer && !authoritativeQueue.submissions.some((submission) => submission.questionAnswer?.providerItemId === questionAnswer.providerItemId && submission.questionAnswer.providerTurnId === questionAnswer.providerTurnId)) {
+    for (const [key, item] of Object.entries(items)) {
+      /** 原题保留删除账本以生成重答身份，已确认的回答不能退回待答。 */
+      const response = item.payload.questionResponse as AsyncQuestionResponse | undefined;
+      if ((item.providerItemId ?? item.itemId) !== questionAnswer.providerItemId || item.turnId !== questionAnswer.providerTurnId || (response && ['resolved', 'completed'].includes(response.status))) continue;
+      items[key] = { ...item, payload: { ...item.payload, questionResponse: { status: 'deleted', answer: questionAnswer, submissionId } satisfies AsyncQuestionResponse } };
+    }
+  }
   return {
     ...state,
     items,
     itemOrder: state.itemOrder.filter((key) => !removedKeySet.has(key)),
-    queue,
-    conversationState: conversationStateFromQueue(queue, state),
+    queue: authoritativeQueue,
+    conversationState: conversationStateFromQueue(authoritativeQueue, state),
     transcriptRevision: state.transcriptRevision + 1,
   };
 }
@@ -1916,7 +1922,8 @@ function submissionUserMessageItem(conversationId: string, threadId: string, sub
     optimistic: submission.status !== 'completed' && submission.status !== 'resolved',
     clientUserMessageId: submission.clientUserMessageId,
     durableClientUserMessageId: submission.clientUserMessageId,
-    timelineAt: submission.createdAt ?? submission.updatedAt,
+    messageCreatedAt: submission.createdAt,
+    timelineAt: submission.createdAt,
     updatedAt: submission.updatedAt ?? submission.createdAt,
   };
 }
@@ -2006,6 +2013,25 @@ function applyProviderIdentityChange(state: NativeSessionState, payload: Record<
   const providerThreadId = stringValue(payload.providerThreadId) ?? stringValue(payload.threadId) ?? state.providerThreadId;
   const providerState = stringValue(payload.providerState);
   const transportKind = updateTransport ? stringValue(payload.transportKind) : null;
+  /** Provider 恢复进度与 Renderer 到本地服务的连接重试分开记录。 */
+  const recoveryState = stringValue(payload.recoveryState);
+  /** 非负整数才可进入进度显示，异常协议值按未提供处理。 */
+  const reconnectAttempt = numberValue(payload.reconnectAttempt);
+  /** 总次数至少为一，避免生成无意义的零分母。 */
+  const reconnectAttempts = numberValue(payload.reconnectAttempts);
+  /** 回复流恢复绑定原失败轮次，不能借当前活动轮次猜测。 */
+  const providerReconnectTurnId = stringValue(payload.providerTurnId) ?? stringValue(payload.turnId);
+  /** idle 明确结束本轮恢复；其他普通 transport 事件不清空正在运行的 Provider 核对。 */
+  const providerRecovery =
+    recoveryState === 'reconnecting' && reconnectAttempt !== null && reconnectAttempt > 0 && reconnectAttempts !== null && reconnectAttempts > 0
+      ? {
+          providerReconnectAttempt: Math.floor(reconnectAttempt),
+          providerReconnectAttempts: Math.floor(reconnectAttempts),
+          providerReconnectTurnId: providerReconnectTurnId ?? state.providerReconnectTurnId,
+        }
+      : recoveryState === 'idle'
+        ? { providerReconnectAttempt: 0, providerReconnectAttempts: 0, providerReconnectTurnId: null }
+        : {};
   const threadChanged = Boolean(providerThreadId && providerThreadId !== state.providerThreadId);
   const snapshot = state.snapshot
     ? {
@@ -2022,6 +2048,7 @@ function applyProviderIdentityChange(state: NativeSessionState, payload: Record<
     : null;
   return {
     ...state,
+    ...providerRecovery,
     providerThreadId,
     snapshot,
     ...(threadChanged
@@ -2032,6 +2059,9 @@ function applyProviderIdentityChange(state: NativeSessionState, payload: Record<
           terminalTurnIds: {},
           queue: null,
           pendingRequests: [],
+          providerReconnectAttempt: 0,
+          providerReconnectAttempts: 0,
+          providerReconnectTurnId: null,
           conversationState: providerState === 'failed' ? ('turn_failed' as const) : ('native_idle' as const),
         }
       : providerState === 'failed'

@@ -2663,3 +2663,178 @@
   display: block;
   margin-block: 8px;
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app .workspace.ai-workspace:has(> .digital-employee-settings-pane) {
+  overflow: auto;
+}
+
+.macos-ai-app .workspace.ai-workspace > .digital-employee-settings-pane {
+  flex: 0 0 auto;
+  padding: 24px;
+}
+
+.macos-ai-app .zeus-form-dialog.digital-employee-template-picker-dialog {
+  inline-size: min(640px, 100%);
+}
+
+.macos-ai-app .digital-employee-template-picker {
+  display: grid;
+  gap: 6px;
+}
+
+.macos-ai-app .digital-employee-template-choice {
+  border-radius: 9px;
+}
+
+.macos-ai-app .digital-employee-template-blank-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px dashed color-mix(in oklab, var(--zeus-product-accent) 40%, var(--zeus-control-border));
+  border-radius: 9px;
+  color: var(--zeus-product-accent);
+  background: color-mix(in oklab, var(--zeus-product-accent) 7%, var(--zeus-product-panel));
+  font-size: 19px;
+}
+
+.macos-ai-app .employee-identity-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 18px 0;
+}
+
+.macos-ai-app .employee-identity-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.macos-ai-app .employee-identity-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.macos-ai-app .employee-identity-heading > div > span {
+  color: var(--zeus-control-muted-text);
+  font-size: 12px;
+}
+
+.macos-ai-app .employee-avatar-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.macos-ai-app .digital-employee-advanced-settings {
+  min-inline-size: 0;
+}
+
+.macos-ai-app .digital-employee-advanced-settings > summary {
+  cursor: pointer;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.macos-ai-app .digital-employee-advanced-settings > summary > small {
+  margin-inline-start: 8px;
+  color: var(--zeus-product-muted);
+  font-weight: 400;
+}
+
+.macos-ai-app .digital-employee-advanced-settings > :not(summary) {
+  margin-block-start: 12px;
+}
+
+.macos-ai-app :where(.digital-employee-page-heading, .digital-employee-editor-actions, .digital-employee-actions, .digital-employee-binding-summary) {
+  min-inline-size: 0;
+  flex-wrap: wrap;
+}
+
+.macos-ai-app :where(.digital-employee-form small, .digital-employee-form label > span, .digital-employee-editor-actions > small, .digital-employee-binding-summary > span) {
+  overflow-wrap: anywhere;
+}
+
+.macos-ai-app .employee-avatar-option {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 3px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--zeus-product-panel);
+  cursor: pointer;
+}
+
+.macos-ai-app .employee-avatar-option[aria-pressed='true'] {
+  border-color: var(--zeus-product-accent);
+  background: var(--zeus-product-accent-soft);
+}
+
+.macos-ai-app .employee-avatar-option:focus-visible {
+  outline: 2px solid var(--zeus-product-accent);
+  outline-offset: 2px;
+}
+
+.macos-ai-app .employee-avatar-option img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.macos-ai-app .employee-avatar-option:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.macos-ai-app .digital-employee-list-search {
+  display: block;
+  width: calc(100% - 20px);
+  margin: 10px;
+  min-width: 0;
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 6px 9px;
+  border: 1px solid var(--zeus-control-border);
+  border-radius: 7px;
+  background: var(--zeus-control-background, var(--zeus-product-panel));
+  color: var(--zeus-control-text);
+  font: inherit;
+}
+
+.macos-ai-app .digital-employee-disclosure {
+  min-width: 0;
+  margin: 0;
+  padding: 12px 18px;
+}
+
+.macos-ai-app .digital-employee-disclosure > summary {
+  cursor: pointer;
+  color: var(--zeus-control-muted-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.macos-ai-app .digital-employee-disclosure[open] > summary {
+  margin-bottom: 12px;
+}
+
+.macos-ai-app :where(.digital-employee-form, .employee-identity-heading) .digital-employee-disclosure {
+  padding: 0;
+}
+
+.macos-ai-app .digital-employee-form .digital-employee-disclosure > :not(summary) + :not(summary) {
+  margin-top: 12px;
+}
+
+.macos-ai-app .digital-employee-save-state {
+  color: var(--zeus-control-muted-text);
+  font-size: 11px;
+}

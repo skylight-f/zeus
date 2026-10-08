@@ -145,3 +145,9 @@
 .task-data-table-overlay > section {
   max-width: 100%;
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app .task-data-table-status > .task-save-spinner {
+  inset-block-start: calc(50% - 6px);
+}

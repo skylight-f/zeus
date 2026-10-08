@@ -1,11 +1,12 @@
 import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
-import { contextCapacitySelectionAllowed, contextCapacitySelectionOptions, contextCapacitySelectionFromValue, contextCapacitySelectionValue } from './contextCapacitySelection.js';
+
 import { ActivitySkillCatalogContext } from './SessionActivity.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { temporaryWorkspaceId, isConversationWorktreeOptions, type ConversationWorktreeOptions, type AsyncQuestionAnswer } from '@zeus/shared';
 import { type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
+import { ModelBrainIcon } from './ModelBrainIcon.js';
 import { GlobeSimpleIcon as GlobeSimple } from '@phosphor-icons/react/dist/csr/GlobeSimple';
 import { PaperclipIcon as Paperclip } from '@phosphor-icons/react/dist/csr/Paperclip';
 import { TargetIcon as Target } from '@phosphor-icons/react/dist/csr/Target';
@@ -21,12 +22,13 @@ import {
   type ZeusBrowserConversationSnapshot,
   type ZeusBrowserPreparedSubmission,
 } from '@zeus/shared';
-import type { DashboardClient, ProjectConfig, ProjectGitAction, ProjectGitActionResponse, ProjectGitWorkbenchSnapshot, ProjectModelServiceTierPreference, ProjectRecord } from '../apiClient.js';
+import type { DashboardClient, ProjectGitAction, ProjectGitActionResponse, ProjectGitWorkbenchSnapshot, ProjectRecord } from '../apiClient.js';
 import { openConversationResourceInMain, openTurnChangeFileInMain } from '../appShellBridge.js';
 import { codexCapabilitiesChangedEvent } from '../features/codex/codexApiClient.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { canSteerActiveTurn, type ComposerRuntimeSettings, ConversationComposer, type ConversationComposerProps, resolveComposerKeyIntent } from './ConversationComposer.js';
 import { ConversationTranscript, type ConversationTranscriptProps, hasUnclaimedRecoveredRequestUserInput, type SessionCreationStatus } from './ConversationTranscript.js';
+import { QueuedConversationMessages, type QueuedConversationMessagesProps } from './QueuedConversationMessages.js';
 import { SessionPlanProgress } from './SessionActivity.js';
 import { LegacyConversationBanner } from './LegacyConversationBanner.js';
 import { hasPendingRequestDetails, PendingRequestSurface, requestKind } from './PendingRequestSurface.js';
@@ -44,7 +46,6 @@ import { RuntimeDetails } from './RuntimeDetails.js';
 import { defaultOpenTarget, isImageResource } from './ConversationResources.js';
 import type {
   CodexConversationCapabilities,
-  CodexTaskPushModelCapability,
   ConversationResource,
   ConversationResourcePreview,
   NativeCollaborationMode,
@@ -75,9 +76,9 @@ import type {
   TurnChangeSet,
   TurnChangeSetOperationResult,
 } from './sessionTypes.js';
-import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierWireOverride } from './serviceTierSelection.js';
+import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
 import { type SessionController, type SessionControllerClient, useSessionControllerInstance, useSessionControllerSelector } from './useSessionController.js';
-import { createConversationComposerStateSelector, createConversationTranscriptStateSelector, createSessionWorkspaceStateSelector } from './sessionStateSlices.js';
+import { createConversationComposerStateSelector, createConversationQueueStateSelector, createConversationTranscriptStateSelector, createSessionWorkspaceStateSelector } from './sessionStateSlices.js';
 import { createSessionEscapeController, type SessionEscapeController, type SessionEscapeLayer, type SessionEscapeResult } from './useThreadScrollController.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { ConversationMarkdown } from './ConversationMarkdown.js';
@@ -95,9 +96,8 @@ import { hasAvailableConversationModel, resolveModelCapability } from './modelSe
 import { GoalPanel, GoalRail } from './GoalPanel.js';
 import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
 import { NewConversationExecutionContext } from './NewConversationExecutionContext.js';
-import { modelSetupRequestedEvent, reportApplicationError, useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
+import { formatVisibleApplicationError, modelSetupRequestedEvent, reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { ConversationModelSetupContext } from '../settings/ModelSetup.js';
-import { projectModelServiceTierSelection, toProjectModelServiceTierPreference, upsertProjectModelServiceTierPreference } from './projectServiceTierPreferences.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import { isSessionTerminalShortcut, SessionTerminalPanel, type SessionTerminalClient } from './SessionTerminal.js';
 import { useSessionTerminalVisibility } from './useSessionTerminalVisibility.js';
@@ -174,12 +174,8 @@ export interface SessionWorkspaceActions {
   ) => void | boolean | NativeConversationStartPreparation | NativeConversationStartFailure | Promise<void | boolean | NativeConversationStartPreparation | NativeConversationStartFailure>;
   onStartProjectConversation?: (input: ProjectSessionWorkspaceStartInput) => void | boolean | NativeConversationStartFailure | Promise<void | boolean | NativeConversationStartFailure>;
   onLoadCapabilities?: (projectId: string) => Promise<CodexConversationCapabilities>;
-  onLoadProjectConfig?: (projectId: string) => Promise<ProjectConfig>;
-  onSaveProjectModelServiceTierPreference?: (projectId: string, input: ProjectModelServiceTierPreference) => Promise<ProjectConfig>;
   onLoadSkills?: import('../features/codex/codexApiClient.js').CodexApiClient['loadSkills'];
   onLoadDigitalEmployees?: (projectId: string) => Promise<import('../features/digital-employees/digitalEmployeeContracts.js').DigitalEmployeeRecord[]>;
-  /** 任务讨论沿用当前任务的有效配置。 */
-  onLoadTaskWorkSettings?: (taskId: string) => Promise<import('@zeus/shared').EmployeeWorkSettings>;
   /** 解释失败原因后可直接打开对应的现有设置页。 */
   onOpenAiSettings?: (section: 'runtime' | 'models') => void;
   onOpenComputerSettings?: () => void;
@@ -247,7 +243,8 @@ export interface SessionWorkspaceActions {
   onLoadSubagentThread?: (threadId: string) => Promise<NativeSubagentThreadSnapshot>;
   onOperateTurnChangeSet?: (changeSet: TurnChangeSet, action: 'undo' | 'reapply') => Promise<TurnChangeSetOperationResult>;
   onLoadEarlierHistory?: () => void | Promise<void>;
-  onLoadTurnProcess?: (turnId: string) => void | Promise<void>;
+  /** 深历史展开时保留从头或从尾读取的明确意图。 */
+  onLoadTurnProcess?: (turnId: string, startAtBeginning?: boolean) => void | Promise<void>;
   onLoadConversationResources?: () => void | Promise<void>;
   onLoadTurnArtifacts?: (turnId: string) => void | Promise<void>;
   onLoadV2Content?: (handle: string) => Promise<void>;
@@ -361,12 +358,8 @@ export interface ConnectedSessionWorkspaceProps {
   onStartProjectConversation?: SessionWorkspaceActions['onStartProjectConversation'];
   onLoadSkills?: SessionWorkspaceActions['onLoadSkills'];
   onLoadDigitalEmployees?: SessionWorkspaceActions['onLoadDigitalEmployees'];
-  /** 当前任务覆盖在展开成员配置时读取。 */
-  onLoadTaskWorkSettings?: SessionWorkspaceActions['onLoadTaskWorkSettings'];
   onOpenAiSettings?: SessionWorkspaceActions['onOpenAiSettings'];
   onOpenComputerSettings?: SessionWorkspaceActions['onOpenComputerSettings'];
-  onLoadProjectConfig?: SessionWorkspaceActions['onLoadProjectConfig'];
-  onSaveProjectModelServiceTierPreference?: SessionWorkspaceActions['onSaveProjectModelServiceTierPreference'];
   onOpenTaskDetail?: SessionWorkspaceActions['onOpenTaskDetail'];
   onTaskManagementStatusChange?: SessionWorkspaceActions['onTaskManagementStatusChange'];
   taskManagementStatusChangeBusy?: boolean;
@@ -715,11 +708,8 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
       onOpenTaskGitDelivery: props.onOpenTaskGitDelivery,
       onOpenProjectCommands: props.onOpenProjectCommands,
       onLoadCapabilities: props.client.loadCodexConversationCapabilities,
-      onLoadProjectConfig: props.onLoadProjectConfig,
-      onSaveProjectModelServiceTierPreference: props.onSaveProjectModelServiceTierPreference,
       onLoadSkills: props.onLoadSkills,
       onLoadDigitalEmployees: props.onLoadDigitalEmployees,
-      onLoadTaskWorkSettings: props.onLoadTaskWorkSettings,
       onOpenAiSettings: props.onOpenAiSettings,
       onOpenComputerSettings: props.onOpenComputerSettings,
       onChooseStartAttachments: props.onChooseAttachments,
@@ -736,11 +726,8 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
     props.localActions,
     props.onChooseAttachments,
     props.onLoadTaskWorkspaces,
-    props.onLoadProjectConfig,
-    props.onSaveProjectModelServiceTierPreference,
     props.onLoadSkills,
     props.onLoadDigitalEmployees,
-    props.onLoadTaskWorkSettings,
     props.onOpenAiSettings,
     props.onOpenComputerSettings,
     props.onOpenProjectCommands,
@@ -869,7 +856,10 @@ export function createConnectedSessionActions(input: { controller: SessionContro
     onAnswerAsyncQuestion: async (item, answers, asNewMessage, answerAttachments) => {
       await input.controller.answerAsyncQuestion(item, answers, asNewMessage, answerAttachments);
     },
-    onReorderQueue: (orderedSubmissionIds) => settle(input.controller.reorderQueue(orderedSubmissionIds)),
+    // 重排失败必须回到原卡片，不能像后台恢复操作一样静默吞掉。
+    onReorderQueue: async (orderedSubmissionIds) => {
+      await input.controller.reorderQueue(orderedSubmissionIds);
+    },
     onResumeQueue: () => settle(input.controller.resumeQueue()),
     // 检查失败回传消息旁的反馈，不由通用操作吞掉或重复弹窗。
     onRecoverQueue: async () => {
@@ -883,7 +873,7 @@ export function createConnectedSessionActions(input: { controller: SessionContro
     onPermissionModeChange: (permissionMode) => settle(input.controller.setPermissionMode(permissionMode)),
     onCollaborationModeChange: (collaborationMode) => settle(input.controller.setCollaborationMode(collaborationMode)),
     onLoadEarlierHistory: () => settle(input.controller.loadEarlierHistory()),
-    onLoadTurnProcess: (turnId) => settle(input.controller.loadTurnProcess(turnId)),
+    onLoadTurnProcess: (turnId, startAtBeginning) => settle(input.controller.loadTurnProcess(turnId, startAtBeginning)),
     onLoadConversationResources: () => settle(input.controller.loadConversationResources()),
     onLoadTurnArtifacts: (turnId) => settle(input.controller.loadTurnArtifacts(turnId)),
     onLoadV2Content: (handle) => input.controller.loadV2Content(handle),
@@ -1463,8 +1453,6 @@ export function isDurableNativeConversationAcceptance(
 }
 
 export interface NewConversationDraft {
-  /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
-  contextCapacityTokens?: number | null;
   worktreeDrafts?: Record<string, ConversationWorktreeOptions>;
   workspaceMode?: 'direct' | 'worktree';
   content: string;
@@ -1485,6 +1473,8 @@ export interface SessionWorkspaceProps {
   gitContext?: { client: DashboardClient; project: ProjectRecord };
   newConversationDrafts?: NewConversationDraftStore;
   language: SessionUiLanguage;
+  /** 新建项目会话工作树时使用的全局分支前缀。 */
+  taskBranchPrefix?: string;
   state: NativeSessionState | null;
   /** 真实会话用 selector 子组件订阅；本地创建态继续直接使用 state。 */
   stateController?: SessionController;
@@ -1561,6 +1551,13 @@ function SessionComposerProjection(props: Omit<ConversationComposerProps, 'state
   const { controller, state: fallbackState, ...composerProps } = props;
   const state = useOptionalSessionStateSlice(controller, fallbackState, createConversationComposerStateSelector);
   return <ConversationComposer {...composerProps} state={state} />;
+}
+
+/** 排队卡片独立订阅队列，避免输入编辑器跟随队列操作重建。 */
+function SessionQueueProjection(props: Omit<QueuedConversationMessagesProps, 'state'> & { state: NativeSessionState; controller?: SessionController }) {
+  const { controller, state: fallbackState, ...queueProps } = props;
+  const state = useOptionalSessionStateSlice(controller, fallbackState, createConversationQueueStateSelector);
+  return <QueuedConversationMessages {...queueProps} state={state} />;
 }
 
 const labels = {
@@ -1730,6 +1727,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const [interruptArmed, setInterruptArmed] = useState(false);
   /** 子智能体列表仅由用户主动打开，历史加载和新增智能体不改变面板状态。 */
   const [contextWorkspace, setContextWorkspace] = useState<SessionContextWorkspace>({ kind: 'none' });
+  /** 关闭上下文工作区失败时保留当前工作面，并在本会话内说明原因。 */
+  const [contextWorkspaceError, setContextWorkspaceError] = useState<unknown>(null);
   /** 图片弹窗独立于右侧审阅，关闭后保留原有阅读位置。 */
   const [imagePreviewRequest, setImagePreviewRequest] = useState<FilePreviewRequest | null>(null);
   const contextWorkspaceRef = useRef<SessionContextWorkspace>(contextWorkspace);
@@ -1760,8 +1759,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const [goalBusy, setGoalBusy] = useState(false);
   const [goalError, setGoalError] = useState<string | null>(null);
   const [localSubmissionRevision, setLocalSubmissionRevision] = useState(0);
-  const [serviceTierPreferences, setServiceTierPreferences] = useState<ProjectModelServiceTierPreference[]>([]);
-  const [serviceTierPreferenceError, setServiceTierPreferenceError] = useState<string | null>(null);
   const browserSplitRef = useRef<HTMLDivElement | null>(null);
   const browserResizeActiveRef = useRef(false);
   const contextOpen = contextWorkspace.kind !== 'none';
@@ -1813,57 +1810,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     props.state?.transportState === 'failed' && ['ZEUS_CONVERSATION_TRANSCRIPT_INITIALIZATION_PENDING', 'ZEUS_CONVERSATION_TRANSCRIPT_INITIALIZATION_FAILED'].includes(props.state.error?.code ?? '') ? props.state.error : null;
   // 空闲历史会话只读本地快照，不存在“连接失败”；只有真实轮次、排队或待处理请求需要实时连接时才报告连接错误。
   const transportError = !transcriptPreparationError && realtimeExpected && props.state?.transportState === 'failed' && props.state.error?.retryable === false ? (props.state.error ?? props.loadError ?? copy.failed) : null;
-  useApplicationErrorDialog(props.historyOnly ? null : props.readOnlyGate?.error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(!props.historyOnly && props.loadState === 'error' ? (props.loadError ?? copy.failed) : null, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(props.historyOnly ? null : transportError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(serviceTierPreferenceError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  const serviceTierPreferenceProjectId = props.conversation?.projectId ?? owner?.projectId ?? null;
-  useEffect(() => {
-    if (!serviceTierPreferenceProjectId || !actions.onLoadProjectConfig) {
-      setServiceTierPreferences([]);
-      return;
-    }
-    let active = true;
-    setServiceTierPreferenceError(null);
-    void actions
-      .onLoadProjectConfig(serviceTierPreferenceProjectId)
-      .then((config) => {
-        if (active) setServiceTierPreferences(config.serviceTierPreferences ?? []);
-      })
-      .catch((error: unknown) => {
-        if (active) setServiceTierPreferenceError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
-      });
-    return () => {
-      active = false;
-    };
-  }, [actions.onLoadProjectConfig, serviceTierPreferenceProjectId]);
-
-  async function saveServiceTierPreference(model: CodexTaskPushModelCapability, selection: NativeServiceTierSelection): Promise<void> {
-    if (!serviceTierPreferenceProjectId || !actions.onSaveProjectModelServiceTierPreference) return;
-    const preference = toProjectModelServiceTierPreference(model, selection);
-    setServiceTierPreferences((current) => upsertProjectModelServiceTierPreference(current, preference));
-    setServiceTierPreferenceError(null);
-    try {
-      const saved = await actions.onSaveProjectModelServiceTierPreference(serviceTierPreferenceProjectId, preference);
-      setServiceTierPreferences(saved.serviceTierPreferences ?? []);
-    } catch (error) {
-      setServiceTierPreferenceError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
-      try {
-        const refreshed = await actions.onLoadProjectConfig?.(serviceTierPreferenceProjectId);
-        if (refreshed) setServiceTierPreferences(refreshed.serviceTierPreferences ?? []);
-      } catch {
-        // 保留原错误；下一次进入工作面时会重新加载项目配置。
-      }
-    }
-  }
+  /** 会话自身可恢复的失败留在会话工作面，不阻断用户操作其他会话。 */
+  const conversationSurfaceError = props.historyOnly ? null : props.loadState === 'error' ? (props.loadError ?? copy.failed) : (transportError ?? contextWorkspaceError);
   const pendingRequests = props.historyOnly ? [] : (props.state?.pendingRequests.filter((request) => request.status === 'pending' && hasPendingRequestDetails(request)) ?? []);
   const pendingPlanImplementationRequests = props.historyOnly ? [] : (props.state?.planImplementationRequests.filter((request) => request.status === 'pending').slice(-1) ?? []);
   const blockingPendingRequest =
@@ -2090,6 +2038,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
 
   function handleWorkspaceKeyDownCapture(event: ReactKeyboardEvent<HTMLElement>): void {
     if (event.key !== 'Escape') return;
+    // 终端搜索先消费 Escape，不能触发工作区关闭或会话操作。
+    if (event.target instanceof Element && event.target.closest('[data-terminal-search-open="true"]')) return;
     // 格式预览先退出阅读状态，避免编辑草稿时触发中断确认。
     if (event.target instanceof Element && event.target.closest('.structured-composer-preview')) return;
     if (event.target instanceof Element && event.target.closest('.session-composer-shell[data-goal-input="true"]')) return;
@@ -2192,7 +2142,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       await actions.onRespondToRequest(request.id, fullAccess ? { ...response, zeusGrantFullAccess: true } : response);
     } catch (error) {
       if (workspaceIdentityRef.current !== conversationId) return;
-      setRequestErrors((current) => ({ ...current, [request.id]: reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }) }));
+      setRequestErrors((current) => ({ ...current, [request.id]: formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en') }));
     } finally {
       responseGuard.finish(request.id);
     }
@@ -2269,7 +2219,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       if (workspaceIdentityRef.current !== conversationId) return;
       setRequestErrors((current) => ({
         ...current,
-        [request.id]: reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }),
+        [request.id]: formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'),
       }));
     } finally {
       responseGuard.finish(request.id);
@@ -2392,10 +2342,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     if (contextWorkspaceRef.current.kind === 'browser' && conversationId && window.zeus?.closeBrowserConversation) {
       if (closingBrowserConversationsRef.current.has(conversationId)) return;
       closingBrowserConversationsRef.current.add(conversationId);
+      setContextWorkspaceError(null);
       try {
         await window.zeus.closeBrowserConversation(conversationId);
       } catch (error) {
-        reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' });
+        setContextWorkspaceError(error);
         return;
       } finally {
         closingBrowserConversationsRef.current.delete(conversationId);
@@ -2426,7 +2377,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       return true;
     } catch (error) {
       if (workspaceIdentityRef.current !== conversationId) return false;
-      setGoalError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
+      setGoalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
       return false;
     } finally {
       if (workspaceIdentityRef.current === conversationId) setGoalBusy(false);
@@ -2495,8 +2446,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
         controller={props.stateController}
         language={props.language}
         capabilities={props.capabilities}
-        serviceTierPreferences={serviceTierPreferences}
-        onServiceTierPreferenceChange={saveServiceTierPreference}
         onDraftChange={(draft) => actions.onDraftChange?.(draft)}
         onSubmit={(delivery, settings) => {
           setLocalSubmissionRevision((revision) => revision + 1);
@@ -2512,7 +2461,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
         onLoadExtensions={actions.onLoadSkills}
         onLoadEmployees={actions.onLoadDigitalEmployees}
         taskId={props.conversation?.taskId ?? undefined}
-        onLoadTaskWorkSettings={actions.onLoadTaskWorkSettings}
         onOpenComputerSettings={actions.onOpenComputerSettings}
         readOnly={composerReadOnly || interactionAuthorityMissing || props.state.queue?.submissions.some((submission) => submission.pausedReason === 'recovered_unsent')}
         inputBlocked={recoveredInputBlocked}
@@ -2534,12 +2482,29 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     );
   }
 
+  /** 普通排队消息固定靠近底部输入区，所有操作继续使用权威提交身份。 */
+  function renderQueuedConversationMessages(): ReactNode {
+    if (!props.state || props.historyOnly || props.suppressComposer) return null;
+    return (
+      <SessionQueueProjection
+        state={props.state}
+        controller={props.stateController}
+        language={props.language}
+        onEdit={transcriptInteractionsEnabled ? actions.onEditQueuedSubmission : undefined}
+        onDelete={transcriptInteractionsEnabled ? actions.onDeleteQueuedSubmission : undefined}
+        onSendNow={transcriptInteractionsEnabled ? actions.onSendQueuedNow : undefined}
+        onReorder={transcriptInteractionsEnabled ? actions.onReorderQueue : undefined}
+      />
+    );
+  }
+
   /** 同步与异步表单共享底部容器，分别保留既有提交权限和生命周期。 */
   function renderBottomInteraction(): ReactNode {
     if (props.suppressComposer || props.historyOnly) return null;
     if (blockingPendingRequest) {
       return (
         <section className="session-interaction-dock" aria-label={props.language === 'zh-CN' ? '待处理交互' : 'Pending interaction'}>
+          {renderQueuedConversationMessages()}
           <PendingRequestSurface
             key={blockingPendingRequest.id}
             request={blockingPendingRequest}
@@ -2562,6 +2527,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     if (blockingPlanImplementationRequest) {
       return (
         <section className="session-interaction-dock" aria-label={props.language === 'zh-CN' ? '待处理交互' : 'Pending interaction'}>
+          {renderQueuedConversationMessages()}
           <PlanImplementationRequestSurface
             key={blockingPlanImplementationRequest.id}
             request={blockingPlanImplementationRequest}
@@ -2578,6 +2544,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     if (dockedAsyncQuestion && props.state && actions.onAnswerAsyncQuestion) {
       return (
         <section className="session-interaction-dock" aria-label={props.language === 'zh-CN' ? '待回答问题' : 'Question to answer'}>
+          {renderQueuedConversationMessages()}
           <AsyncQuestionPanel
             key={asyncQuestionIdentity(dockedAsyncQuestion)}
             item={dockedAsyncQuestion}
@@ -2718,8 +2685,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   conversationColumnWidth={conversationColumnWidth}
                   suppressed={props.quickActionsSuppressed}
                   capabilities={props.capabilities}
-                  serviceTierPreferences={serviceTierPreferences}
-                  onServiceTierPreferenceChange={saveServiceTierPreference}
                   onLoadCapabilities={actions.onLoadCapabilities}
                   onLoadSkills={actions.onLoadSkills}
                   onLoadTaskWorkspaces={actions.onLoadTaskWorkspaces}
@@ -2799,11 +2764,18 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           <span>
             <strong>{props.readOnlyGate.title}</strong>
             <small>{props.readOnlyGate.description}</small>
+            {props.readOnlyGate.error ? <VisibleApplicationError error={props.readOnlyGate.error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : null}
           </span>
           <button type="button" onClick={() => void props.readOnlyGate?.onAction()} disabled={props.readOnlyGate.busy} aria-busy={props.readOnlyGate.busy || undefined}>
             {props.readOnlyGate.busy ? (props.language === 'zh-CN' ? '正在重新打开…' : 'Reopening…') : props.readOnlyGate.actionLabel}
           </button>
         </section>
+      ) : null}
+
+      {conversationSurfaceError ? (
+        <p className="session-composer-unavailable" role="alert">
+          <VisibleApplicationError error={conversationSurfaceError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+        </p>
       ) : null}
 
       {legacy && props.conversation ? (
@@ -2877,7 +2849,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     onRetryPendingSend={transcriptInteractionsEnabled ? actions.onRetryPendingSend : undefined}
                     onCancelPendingSend={transcriptInteractionsEnabled ? actions.onCancelPendingSend : undefined}
                     onCancelQueuedSubmission={transcriptInteractionsEnabled ? actions.onDeleteQueuedSubmission : undefined}
-                    onSendQueuedNow={transcriptInteractionsEnabled ? actions.onSendQueuedNow : undefined}
                     onOpenAsyncQuestion={transcriptInteractionsEnabled && !props.suppressComposer && actions.onAnswerAsyncQuestion ? asyncQuestionDock.open : undefined}
                     openPlanItem={planWorkspaceItem}
                     onOpenPlan={(item) => {
@@ -2942,19 +2913,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   ) : null}
                   {props.suppressComposer || blockingPendingRequest || blockingPlanImplementationRequest || dockedAsyncQuestion ? null : (
                     <>
-                      {!props.historyOnly && transcriptInteractionsEnabled && asyncQuestionDock.questions.length > 0 ? (
-                        <nav className="session-interaction-dock session-async-question-reminder" aria-label={props.language === 'zh-CN' ? '待回答问题' : 'Unanswered questions'}>
-                          <div className="session-message-delivery-actions">
-                            {asyncQuestionDock.questions.map((item, index) => (
-                              <button key={asyncQuestionIdentity(item)} type="button" onClick={() => asyncQuestionDock.open(item)}>
-                                {props.language === 'zh-CN' ? `回答问题${asyncQuestionDock.questions.length > 1 ? ` ${index + 1}` : ''}` : `Answer question${asyncQuestionDock.questions.length > 1 ? ` ${index + 1}` : ''}`}
-                              </button>
-                            ))}
-                          </div>
-                        </nav>
-                      ) : null}
                       {goal ? <GoalRail goal={goal} language={props.language} onOpen={() => setGoalPanelOpen(true)} /> : null}
-                      {renderConversationComposer()}
+                      <div className="session-composer-stack">
+                        {renderQueuedConversationMessages()}
+                        {renderConversationComposer()}
+                      </div>
                     </>
                   )}
                   {!props.historyOnly && interruptArmed ? (
@@ -3120,6 +3083,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           key={owner?.kind === 'task' ? `task:${props.task?.id}` : 'project'}
           drafts={props.newConversationDrafts}
           language={props.language}
+          taskBranchPrefix={props.taskBranchPrefix}
           owner={owner}
           task={props.task}
           projects={props.projects}
@@ -3127,14 +3091,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           loadState={props.loadState}
           loadError={props.loadError}
           capabilities={props.capabilities}
-          serviceTierPreferences={serviceTierPreferences}
-          onServiceTierPreferenceChange={saveServiceTierPreference}
           onStartTask={actions.onStartConversation}
           onStartProject={actions.onStartProjectConversation}
           onLoadCapabilities={actions.onLoadCapabilities}
           onLoadSkills={actions.onLoadSkills}
           onLoadDigitalEmployees={actions.onLoadDigitalEmployees}
-          onLoadTaskWorkSettings={actions.onLoadTaskWorkSettings}
           onOpenComputerSettings={actions.onOpenComputerSettings}
           onSelectProject={actions.onSelectNewConversationProject}
           onLoadProjectGit={actions.onLoadNewConversationProjectGit}
@@ -3272,6 +3233,8 @@ function isComposerWritableForFocus(state: NativeSessionState | null, readOnly: 
 export function NewConversationComposer(props: {
   drafts?: NewConversationDraftStore;
   language: SessionUiLanguage;
+  /** 新建项目会话工作树时使用的全局分支前缀。 */
+  taskBranchPrefix?: string;
   owner?: SessionConversationOwner;
   task: SessionWorkspaceTask | null;
   projects?: readonly Pick<ProjectRecord, 'id' | 'name' | 'localPath'>[];
@@ -3283,15 +3246,11 @@ export function NewConversationComposer(props: {
   loadState?: SessionWorkspaceProps['loadState'];
   loadError?: string | null;
   capabilities?: CodexConversationCapabilities | null;
-  serviceTierPreferences: readonly ProjectModelServiceTierPreference[];
-  onServiceTierPreferenceChange?: (model: CodexTaskPushModelCapability, selection: NativeServiceTierSelection) => void | Promise<void>;
   onStartTask?: SessionWorkspaceActions['onStartConversation'];
   onStartProject?: SessionWorkspaceActions['onStartProjectConversation'];
   onLoadCapabilities?: SessionWorkspaceActions['onLoadCapabilities'];
   onLoadSkills?: SessionWorkspaceActions['onLoadSkills'];
   onLoadDigitalEmployees?: SessionWorkspaceActions['onLoadDigitalEmployees'];
-  /** 当前任务覆盖在展开成员配置时读取。 */
-  onLoadTaskWorkSettings?: SessionWorkspaceActions['onLoadTaskWorkSettings'];
   onOpenComputerSettings?: SessionWorkspaceActions['onOpenComputerSettings'];
   onSelectProject?: SessionWorkspaceActions['onSelectNewConversationProject'];
   onLoadProjectGit?: SessionWorkspaceActions['onLoadNewConversationProjectGit'];
@@ -3323,8 +3282,8 @@ export function NewConversationComposer(props: {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(!props.capabilities);
   const [selectedModelId, setSelectedModelId] = useState(() => restoredDraft?.selectedModelId ?? '');
   const [selectedEffort, setSelectedEffort] = useState(() => restoredDraft?.selectedEffort ?? '');
-  /** 本次覆盖只保存在新建草稿中，不写入已有会话下一轮设置。 */
-  const [contextCapacityTokens, setContextCapacityTokens] = useState<number | null | undefined>(() => restoredDraft?.contextCapacityTokens);
+  /** 新会话使用模型默认容量。 */
+  const contextCapacityTokens = null;
   const [serviceTierSelection, setServiceTierSelection] = useState<NativeServiceTierSelection>(() => restoredDraft?.serviceTierSelection ?? { type: 'standard' });
   const [isComposing, setIsComposing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -3356,13 +3315,13 @@ export function NewConversationComposer(props: {
       selectedModelId,
       selectedEffort,
       serviceTierSelection,
-      contextCapacityTokens,
       goalInputOpen,
       goalObjective,
       tokenDraft,
     });
-  }, [props.drafts, draftKey, workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, contextCapacityTokens, goalInputOpen, goalObjective, tokenDraft]);
+  }, [props.drafts, draftKey, workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, goalInputOpen, goalObjective, tokenDraft]);
   const inputResources = useConversationInputResources({
+    attachments: attachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef,
     text: content,
@@ -3378,9 +3337,8 @@ export function NewConversationComposer(props: {
     onError: setLocalError,
   });
 
-  useApplicationErrorDialog(localError ?? (props.loadState === 'error' ? props.loadError : null), {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
+  /** 新会话初始化和附件错误共用编辑器内的错误位。 */
+  const visibleLocalError = localError ?? (props.loadState === 'error' ? props.loadError : null);
 
   useEffect(() => {
     if (props.autoFocus) textareaRef.current?.focus();
@@ -3412,7 +3370,7 @@ export function NewConversationComposer(props: {
         if (active && snapshot) setCapabilities(snapshot);
       })
       .catch((error: unknown) => {
-        if (active) setLocalError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
+        if (active) setLocalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
       })
       .finally(() => {
         if (active) setCapabilitiesLoading(false);
@@ -3442,9 +3400,12 @@ export function NewConversationComposer(props: {
     if (!selectedModel) return;
     if (selectedModelId !== selectedModel.id) setSelectedModelId(selectedModel.id);
     if (!selectedModel.supportedReasoningEfforts.includes(selectedEffort)) setSelectedEffort(selectedModel.defaultReasoningEffort ?? selectedModel.supportedReasoningEfforts[0] ?? '');
-    const preferredTier = projectModelServiceTierSelection(props.serviceTierPreferences, selectedModel);
-    setServiceTierSelection(normalizeServiceTierSelection(preferredTier, selectedModel).selection);
-  }, [props.serviceTierPreferences, selectedEffort, selectedModel, selectedModelId]);
+    /** 模型变化时只校验当前选择，不再读取项目档位。 */
+    setServiceTierSelection((current) => {
+      const normalized = normalizeServiceTierSelection(current, selectedModel).selection;
+      return serviceTierSelectionValue(normalized) === serviceTierSelectionValue(current) ? current : normalized;
+    });
+  }, [selectedEffort, selectedModel, selectedModelId]);
 
   useEffect(() => {
     const projectId = props.owner?.projectId;
@@ -3476,6 +3437,8 @@ export function NewConversationComposer(props: {
   }, []);
 
   async function submit(overrides: { content?: string; goalObjective?: string } = {}): Promise<void> {
+    // 键盘提交也需等待导入完成，避免附件落回已发送的草稿。
+    if (inputResources.processing) return;
     const structured = structuredSelectionRef.current;
     const submittedContent = overrides.content ?? structured.promptText;
     const submittedDisplayText = overrides.content === undefined ? structured.displayText : overrides.content;
@@ -3529,7 +3492,7 @@ export function NewConversationComposer(props: {
           permissionMode,
           collaborationMode,
           serviceTierSelection,
-          contextCapacityTokens: contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens,
+          contextCapacityTokens,
           model: selectedModel?.id,
           effort: selectedEffort || undefined,
           ...(submittedGoal ? { goalObjective: submittedGoal } : {}),
@@ -3550,7 +3513,7 @@ export function NewConversationComposer(props: {
           permissionMode,
           collaborationMode,
           serviceTierSelection,
-          contextCapacityTokens: contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens,
+          contextCapacityTokens,
           model: selectedModel?.id,
           effort: selectedEffort || undefined,
           ...(submittedGoal ? { goalObjective: submittedGoal } : {}),
@@ -3569,7 +3532,7 @@ export function NewConversationComposer(props: {
       if (!accepted || typeof accepted !== 'object' || accepted.state !== 'preparing') props.drafts?.delete(draftKey);
       await props.onAccepted?.();
     } catch (error) {
-      setLocalError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
+      setLocalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
     } finally {
       setSubmitting(false);
     }
@@ -3589,20 +3552,22 @@ export function NewConversationComposer(props: {
     >
       <ConversationComposerAttachments
         attachments={attachments}
+        pendingResources={inputResources.pendingResources}
         language={props.language}
         disabled={submitting || inputResources.processing}
         onRemove={(attachment) => setAttachments((current) => current.filter((candidate) => candidate !== attachment))}
         onRestorePastedText={goalInputActive ? undefined : inputResources.restorePastedText}
       />
-      {localError ? (
-        <p className="session-new-conversation-error" role="status">
-          {typeof localError === 'string' ? localError : localError.message}
+      {visibleLocalError ? (
+        <p className="session-new-conversation-error" role="alert">
+          {typeof visibleLocalError === 'string' ? visibleLocalError : visibleLocalError.message}
         </p>
       ) : null}
       <div className="session-composer-input-frame" data-goal-input={goalInputActive ? 'true' : 'false'}>
         {props.owner?.kind === 'project' && props.projects?.length ? (
           <NewConversationExecutionContext
             language={props.language}
+            taskBranchPrefix={props.taskBranchPrefix ?? 'zeus'}
             projectId={props.owner.projectId}
             projects={props.projects}
             workspaceMode={workspaceMode}
@@ -3663,7 +3628,6 @@ export function NewConversationComposer(props: {
           />
         ) : (
           <StructuredComposerInput
-            models={capabilities?.models}
             tokenDraft={tokenDraft}
             value={content}
             onValueChange={setContent}
@@ -3680,8 +3644,6 @@ export function NewConversationComposer(props: {
             placeholder={copy.newPlaceholder}
             loadCatalog={props.onLoadSkills}
             loadEmployees={props.onLoadDigitalEmployees}
-            taskId={props.owner?.kind === 'task' ? props.owner.taskId : undefined}
-            loadTaskSettings={props.onLoadTaskWorkSettings}
             goalAvailable={goalAvailable}
             onPlanMode={() => setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))}
             onGoalMode={() => {
@@ -3751,7 +3713,7 @@ export function NewConversationComposer(props: {
                       setAttachments((current) => mergeConversationAttachments(current, selected));
                     }
                   } catch (error) {
-                    setLocalError(reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' }));
+                    setLocalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
                   }
                 }}
               >
@@ -3791,16 +3753,7 @@ export function NewConversationComposer(props: {
           <span className="session-composer-trailing-actions">
             {selectedModel ? (
               <span className="session-composer-runtime-settings">
-                <ComposerDropdown
-                  className="session-composer-capacity-dropdown"
-                  label={props.language === 'zh-CN' ? '上下文容量' : 'Context capacity'}
-                  value={contextCapacitySelectionValue(contextCapacityTokens, capabilities?.projectContextCapacityTokens)}
-                  disabled={submitting || !props.owner}
-                  options={contextCapacitySelectionOptions(selectedModel.contextCapacity, props.language === 'zh-CN')}
-                  title={selectedModel.contextCapacity?.reason}
-                  onChange={(value) => setContextCapacityTokens(contextCapacitySelectionFromValue(value))}
-                />
-                <ContextUsageIndicator contextCapacityTokens={contextCapacityTokens === undefined ? (capabilities?.projectContextCapacityTokens ?? null) : contextCapacityTokens} unifiedUsage={null} language={props.language} />
+                <ContextUsageIndicator contextCapacityTokens={contextCapacityTokens} unifiedUsage={null} language={props.language} />
                 {selectedModel.serviceTiers.length ? (
                   <ServiceTierToggle
                     language={props.language}
@@ -3809,7 +3762,6 @@ export function NewConversationComposer(props: {
                     disabled={submitting || !props.owner}
                     onChange={(selection) => {
                       setServiceTierSelection(selection);
-                      if (selectedModel) void props.onServiceTierPreferenceChange?.(selectedModel, selection);
                     }}
                   />
                 ) : null}
@@ -3817,6 +3769,8 @@ export function NewConversationComposer(props: {
                   label={props.language === 'zh-CN' ? '模型' : 'Model'}
                   triggerLabel={`${props.language === 'zh-CN' ? '模型' : 'Model'}：${selectedModelLabel}`}
                   displayLabel={selectedModelLabel}
+                  // 新建会话与已有会话共用窄输入框的模型图标布局。
+                  triggerIcon={<ModelBrainIcon />}
                   className="session-composer-model-dropdown"
                   value={selectedModel?.id ?? ''}
                   options={modelPresentation.options}
@@ -3829,7 +3783,7 @@ export function NewConversationComposer(props: {
                     const nextModel = resolveModelCapability(modelPresentation.models, value);
                     setSelectedModelId(nextModel?.id ?? value);
                     setSelectedEffort(nextModel?.defaultReasoningEffort ?? nextModel?.supportedReasoningEfforts[0] ?? '');
-                    const normalized = normalizeServiceTierSelection(projectModelServiceTierSelection(props.serviceTierPreferences, nextModel), nextModel);
+                    const normalized = normalizeServiceTierSelection({ type: 'standard' }, nextModel);
                     setServiceTierSelection(normalized.selection);
                   }}
                 />
@@ -3858,7 +3812,6 @@ export function NewConversationComposer(props: {
                   inputResources.processing ||
                   !props.owner ||
                   (!selectedModel && !needsModelSetup) ||
-                  (!needsModelSetup && !contextCapacitySelectionAllowed(contextCapacityTokens, capabilities?.projectContextCapacityTokens, selectedModel?.contextCapacity)) ||
                   (!needsModelSetup && (goalInputActive ? !goalObjectiveValid : !content.trim() && attachments.length === 0))
                 }
                 aria-busy={submitting || undefined}
@@ -4015,8 +3968,8 @@ function SessionRuntimeDetails(props: { state: NativeSessionState; conversation:
       contextWindow: runtimeFact(latestRequest?.contextWindow ?? usage?.modelContextWindow ?? null, props.language === 'zh-CN' ? '尚未读取到模型可处理的最大长度。' : 'The model’s maximum context length is unavailable.'),
       cacheHitRate: runtimeFact(cacheHitRate, props.language === 'zh-CN' ? '暂无缓存使用比例。' : 'The cache usage ratio is unavailable.'),
       costs: cost.costs,
-      apiEquivalentUsd: runtimeFact(cost.apiEquivalentUsd, props.language === 'zh-CN' ? '当前模型没有可用于估算费用的价格。' : 'No price is available to estimate this model’s cost.'),
-      priceCoverage: runtimeFact(cost.priceCoverage, props.language === 'zh-CN' ? '尚未确定有多少用量可估算费用。' : 'The amount of usage covered by pricing is unknown.'),
+      apiEquivalentUsd: runtimeFact(cost.apiEquivalentUsd, props.language === 'zh-CN' ? '当前模型没有可用于计算费用的价格。' : 'No price is available to calculate this model’s cost.'),
+      priceCoverage: runtimeFact(cost.priceCoverage, props.language === 'zh-CN' ? '尚未确定有多少用量可计算费用。' : 'The amount of usage covered by pricing is unknown.'),
       pricingCatalogDate: runtimeFact(cost.pricingCatalogDate, props.language === 'zh-CN' ? '暂无价格更新时间。' : 'The pricing update date is unavailable.'),
       pricingSourceUrls: cost.pricingSourceUrls.length > 0 ? { state: 'available', value: cost.pricingSourceUrls } : { state: 'unavailable', reason: props.language === 'zh-CN' ? '暂无价格来源。' : 'The pricing source is unavailable.' },
       historyComplete: { state: 'available', value: cost.historyComplete },

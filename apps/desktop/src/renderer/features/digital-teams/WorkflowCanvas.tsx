@@ -18,15 +18,15 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import type { DigitalTeamEdge, DigitalTeamNode, DigitalTeamNodeType, DigitalTeamWorkflowDefinition, DigitalTeamWorkflowValidationIssue } from '@zeus/shared';
+import type { DigitalTeamEdge, DigitalTeamExecutionMode, DigitalTeamNode, DigitalTeamNodeType, DigitalTeamWorkflowDefinition, DigitalTeamWorkflowValidationIssue } from '@zeus/shared';
 import { digitalTeamNodeTypes } from '@zeus/shared';
 import { useEffect, type DragEvent as ReactDragEvent } from 'react';
 
 /** 数字团队跨组件拖放使用的受限数据类型。 */
 export const digitalTeamDragMime = 'application/x-zeus-digital-team-node';
 
-/** 角色栏拖入画布时唯一允许传递的业务负载。 */
-export type DigitalTeamDragPayload = { kind: 'employee'; employeeId: string } | { kind: 'node'; nodeType: Exclude<DigitalTeamNodeType, 'employee'> };
+/** 角色栏拖入画布时唯一允许传递的员工身份。 */
+export type DigitalTeamDragPayload = { kind: 'employee'; employeeId: string };
 
 /** 运行节点投影只影响外观，不写回模板定义。 */
 export interface DigitalTeamCanvasRuntimeState {
@@ -72,19 +72,18 @@ type CanvasNode = Node<CanvasNodeData, DigitalTeamNodeType>;
 /** 五类节点共用稳定组件引用，避免实时状态更新时重建节点类型表。 */
 const canvasNodeTypes: NodeTypes = Object.fromEntries(digitalTeamNodeTypes.map((type) => [type, WorkflowNodeCard])) as NodeTypes;
 
-/** 节点职责的人类可读名称。 */
-const employeePurposeLabels = {
-  plan: 'CTO 规划',
-  work: '员工开发',
-  verify: '候选验证',
-  summary: 'CTO 汇总',
-} as const;
-
 /** 人工确认职责的人类可读名称。 */
 const approvalPurposeLabels = {
   plan_approval: '规划批准',
   final_acceptance: '最终验收',
 } as const;
+
+/** 画布与常用配置共用实际执行方式，不根据员工名称推断权限。 */
+export const digitalTeamWorkModeLabels: Record<DigitalTeamExecutionMode, string> = {
+  read_only: '只读分析',
+  isolated_write: '修改代码',
+  candidate_read_only: '验收代码',
+};
 
 /** 提供 React Flow 上下文，并让内部组件使用准确的屏幕到画布坐标换算。 */
 export function WorkflowCanvas(props: WorkflowCanvasProps) {
@@ -112,10 +111,12 @@ function WorkflowCanvasSurface(props: WorkflowCanvasProps) {
     id: node.id,
     type: node.type,
     position: node.position,
+    /** 当前模板节点均可删除；历史运行图由只读模式统一保护。 */
+    deletable: true,
     selected: props.selectedNodeId === node.id,
     data: {
       workflowNode: node,
-      employeeName: node.type === 'employee' ? (props.employeeNames.get(node.data.employeeId) ?? node.data.employeeId) : null,
+      employeeName: node.type === 'employee' ? (props.employeeNames.get(node.data.employeeId) ?? null) : null,
       issues: issuesByNodeId.get(node.id) ?? [],
       runtimeState: props.runtimeStateByNodeId?.get(node.id) ?? null,
     },
@@ -234,25 +235,33 @@ function WorkflowCanvasSurface(props: WorkflowCanvasProps) {
 function WorkflowNodeCard(props: NodeProps<CanvasNode>) {
   /** 当前持久业务节点决定卡片类型与内容。 */
   const node = props.data.workflowNode;
-  /** 员工与流程节点分别给出最关键的第二行信息。 */
+  /** 员工节点始终显示权威数字员工名称，不显示历史节点标题副本。 */
+  const displayTitle = node.type === 'employee' ? (props.data.employeeName ?? node.data.title) : node.data.title;
+  /** 未分配角色使用原分工标题，内部身份不进入产品界面。 */
+  const assignmentLabel = node.type === 'employee' && !props.data.employeeName ? (props.data.issues.length ? '员工不可用' : '待分配员工') : null;
+  /** 工作方式来自当前模板或冻结运行中的真实配置，始终在卡片可见。 */
+  const workModeLabel = node.type === 'employee' ? digitalTeamWorkModeLabels[node.data.executionMode] : null;
+  /** 员工节点直接展示实际工作要求，用户能从连线读出协作分工。 */
   const detail =
     node.type === 'employee'
-      ? `${employeePurposeLabels[node.data.purpose]} · ${props.data.employeeName ?? '未绑定员工'}`
+      ? node.data.instructions.trim() || '按任务目标与员工职责执行'
       : node.type === 'human_confirmation'
         ? approvalPurposeLabels[node.data.purpose]
         : node.type === 'code_integration'
           ? '合并候选'
           : node.type === 'start'
-            ? '任务事实与基线'
-            : '闭环完成';
+            ? '任务输入'
+            : '流程完成';
   /** 当前状态同时提供文字与视觉标记，不依赖颜色表达。 */
   const runtimeLabel = props.data.runtimeState ? `${props.data.runtimeState.status}${props.data.runtimeState.attempt ? ` · 第 ${props.data.runtimeState.attempt} 次` : ''}` : null;
   return (
-    <article className={`digital-team-node is-${node.type}${props.selected ? ' is-selected' : ''}${props.data.issues.length ? ' has-error' : ''}`} aria-label={`${node.data.title}，${detail}`}>
+    <article className={`digital-team-node is-${node.type}${props.selected ? ' is-selected' : ''}${props.data.issues.length ? ' has-error' : ''}`} aria-label={`${displayTitle}，${workModeLabel ? `${workModeLabel}，` : ''}${detail}`}>
       {node.type !== 'start' ? <Handle type="target" position={Position.Left} isConnectable={props.isConnectable} aria-label="输入：连接上游节点" title="输入：从上游节点右侧拖到这里" /> : null}
       <span className="digital-team-node-kind">{nodeTypeLabel(node.type)}</span>
-      <strong>{node.data.title}</strong>
-      <small>{detail}</small>
+      <strong>{displayTitle}</strong>
+      {workModeLabel ? <span className="digital-team-node-status">{workModeLabel}</span> : null}
+      <small title={detail}>{detail}</small>
+      {assignmentLabel ? <span className="digital-team-node-status">{assignmentLabel}</span> : null}
       {runtimeLabel ? <span className="digital-team-node-status">{runtimeLabel}</span> : null}
       {props.data.issues[0] ? <span className="digital-team-node-error">{props.data.issues[0]}</span> : null}
       {node.type !== 'end' ? <Handle type="source" position={Position.Right} isConnectable={props.isConnectable} aria-label="输出：连接下游节点" title="输出：拖到下游节点左侧" /> : null}
@@ -276,9 +285,6 @@ function parseDragPayload(value: string): DigitalTeamDragPayload | null {
     const parsed: unknown = JSON.parse(value);
     if (!parsed || typeof parsed !== 'object') return null;
     if ('kind' in parsed && parsed.kind === 'employee' && 'employeeId' in parsed && typeof parsed.employeeId === 'string' && parsed.employeeId.trim()) return { kind: 'employee', employeeId: parsed.employeeId };
-    if ('kind' in parsed && parsed.kind === 'node' && 'nodeType' in parsed && digitalTeamNodeTypes.includes(parsed.nodeType as DigitalTeamNodeType) && parsed.nodeType !== 'employee') {
-      return { kind: 'node', nodeType: parsed.nodeType as Exclude<DigitalTeamNodeType, 'employee'> };
-    }
     return null;
   } catch {
     return null;
@@ -287,11 +293,11 @@ function parseDragPayload(value: string): DigitalTeamDragPayload | null {
 
 /** 前端连线提示拒绝自环、重复边和新增环路。 */
 export function isConnectionAllowed(definition: DigitalTeamWorkflowDefinition, source: string, target: string): boolean {
-  /** 连接端点必须存在，且方向不能违背开始与结束节点。 */
+  /** 连接端点必须是现有员工分工。 */
   const sourceNode = definition.nodes.find((node) => node.id === source);
-  /** 目标必须是可接收输入的节点。 */
+  /** 目标也必须是现有员工分工。 */
   const targetNode = definition.nodes.find((node) => node.id === target);
-  if (!sourceNode || !targetNode || sourceNode.type === 'end' || targetNode.type === 'start') return false;
+  if (!sourceNode || !targetNode || sourceNode.type !== 'employee' || targetNode.type !== 'employee') return false;
   if (source === target || definition.edges.some((edge) => edge.source === source && edge.target === target)) return false;
   const outgoing = new Map(definition.nodes.map((node) => [node.id, [] as string[]]));
   for (const edge of definition.edges) outgoing.get(edge.source)?.push(edge.target);

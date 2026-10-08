@@ -95,8 +95,10 @@ export function PermissionModeControl(props: PermissionModeControlProps) {
     { value: 'full-access', label: copy.fullAccess, description: copy.fullAccessDescription, icon: <ShieldWarning size={20} weight="fill" /> },
   ] as const;
   const selectedLabel = options.find((option) => option.value === props.value)?.label ?? copy.label;
-  /** 当前入口复用选项图标，避免菜单和触发器表达不同权限。 */
+  /** 当前入口复用选项图标，计划模式不改写用户选择的权限。 */
   const triggerIcon = options.find((option) => option.value === props.value)?.icon;
+  /** 协作模式由独立入口表达，权限入口只说明真实权限。 */
+  const effectiveLabel = `${copy.label}: ${selectedLabel}`;
 
   function closeConfirmation(next?: NativePermissionMode): void {
     setConfirmingFullAccess(false);
@@ -112,8 +114,8 @@ export function PermissionModeControl(props: PermissionModeControlProps) {
       <ComposerDropdown
         triggerRef={triggerRef}
         label={copy.label}
-        title={props.disabled ? copy.locked : `${copy.label}：${selectedLabel}`}
-        triggerLabel={`${copy.label}：${selectedLabel}`}
+        title={props.disabled ? copy.locked : effectiveLabel}
+        triggerLabel={effectiveLabel}
         triggerIcon={triggerIcon}
         hideSelectedLabel
         className="session-permission-dropdown"

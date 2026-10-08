@@ -84,6 +84,11 @@ export interface ConversationModelHistoryRecord {
   confirmedAt: string;
 }
 
+/** 请求观察和费用补算共用持久身份，不按时间或 Token 数猜测旧记录。 */
+export function conversationModelRequestId(conversationId: string, observationIdentity: string): string {
+  return `conversation_model_request_${createHash('sha256').update(`${conversationId}\0${observationIdentity}`).digest('hex').slice(0, 24)}`;
+}
+
 export interface ConversationModelRequestUsageRecord {
   id: string;
   conversationId: string;
@@ -107,6 +112,20 @@ export interface ConversationModelRequestUsageRecord {
   completedAt: string | null;
   measurementComplete: boolean;
   occurredAt: string;
+}
+
+/** 已完成文本请求的输出速率计算依据，供跨会话用量概览按真实时长聚合。 */
+export interface ConversationOutputRateMeasurement {
+  /** 产品会话身份。 */
+  conversationId: string;
+  /** 原生线程身份。 */
+  providerThreadId: string;
+  /** 原生轮次身份。 */
+  providerTurnId: string;
+  /** 不含推理 Token 的可见输出量。 */
+  visibleOutputTokens: number;
+  /** 从首个文本增量到请求完成的毫秒数。 */
+  durationMs: number;
 }
 
 export interface ConversationProcessItemRecord {
@@ -1346,7 +1365,7 @@ export class ConversationExecutionRepository {
   }
 
   observeModelRequest(input: Omit<ConversationModelRequestUsageRecord, 'id' | 'requestSequence'> & { observationIdentity?: string }): ConversationModelRequestUsageRecord {
-    const id = input.observationIdentity ? `conversation_model_request_${createHash('sha256').update(`${input.conversationId}\0${input.observationIdentity}`).digest('hex').slice(0, 24)}` : `conversation_model_request_${randomId(12)}`;
+    const id = input.observationIdentity ? conversationModelRequestId(input.conversationId, input.observationIdentity) : `conversation_model_request_${randomId(12)}`;
     const existing = this.modelRequestById(id);
     if (existing) return existing;
     const requestSequence = this.nextSequence(input.conversationId, 'model_request_sequence');
@@ -1411,6 +1430,37 @@ export class ConversationExecutionRepository {
       return null;
     }
     return { effort: typeof level === 'string' && level.trim() ? level.trim() : null, observedAt: row.observed_at };
+  }
+
+  /** 历史补价只接纳同一原生轮次的唯一已确认配置；降档或冲突的轮次保持未知。 */
+  codexTurnPricingContext(conversationId: string, threadId: string, providerTurnId: string): { model: string; serviceTier: string | null } | null {
+    /** 精确轮次关联配置证据和提交记录，不使用当前会话设置。 */
+    const rows = this.db.select<{ configuration_json: string; input_json: string }>(
+      `SELECT e.configuration_json, s.input_json FROM conversation_config_evidence e
+       JOIN conversation_turns t ON t.id = e.turn_id
+       JOIN conversation_submissions s ON s.id = t.client_submission_id
+       WHERE t.conversation_id = ? AND t.provider_thread_id = ? AND t.provider_turn_id = ? AND e.layer = 'runtime_acknowledged' AND e.mismatch = 0`,
+      [conversationId, threadId, providerTurnId],
+    );
+    /** 多条相同配置可重复确认，不同配置不能套用到整个轮次。 */
+    const contexts = new Map<string, { model: string; serviceTier: string | null }>();
+    for (const row of rows) {
+      /** 存储 JSON 也经过结构校验，缺失字段不是普通档位。 */
+      const configuration = parseJsonRecord(row.configuration_json);
+      /** 降档标记没有逐请求边界，因此不推测哪一笔仍为快速档位。 */
+      const submission = parseJsonRecord(row.input_json);
+      if (
+        submission.serviceTierDowngrade ||
+        typeof configuration.modelId !== 'string' ||
+        !Object.prototype.hasOwnProperty.call(configuration, 'serviceTier') ||
+        (configuration.serviceTier !== null && typeof configuration.serviceTier !== 'string')
+      )
+        return null;
+      /** 仅暴露计价必要的模型和服务档位。 */
+      const context = { model: configuration.modelId, serviceTier: configuration.serviceTier as string | null };
+      contexts.set(JSON.stringify(context), context);
+    }
+    return contexts.size === 1 ? [...contexts.values()][0]! : null;
   }
 
   /** 压缩完成项可能晚于用量到达；仅修正其起止范围内的请求，避免吞掉同轮普通回答的容量回报。 */
@@ -1570,6 +1620,34 @@ export class ConversationExecutionRepository {
 
   sessionMetrics(conversationId: string, turnId?: string | null): ConversationSessionMetricsSnapshot {
     return readConversationSessionMetrics(this.db, conversationId, turnId);
+  }
+
+  /** 读取具备完整文本计时的请求；非文本请求不会冲淡或覆盖真实输出速率。 */
+  listOutputRateMeasurements(): ConversationOutputRateMeasurement[] {
+    const rows = this.db.select<{
+      conversation_id: string;
+      provider_thread_id: string;
+      provider_turn_id: string;
+      output_tokens: number;
+      reasoning_output_tokens: number;
+      first_text_output_at: string;
+      completed_at: string;
+    }>(
+      `SELECT r.conversation_id, t.provider_thread_id, t.provider_turn_id,
+              r.output_tokens, r.reasoning_output_tokens, r.first_text_output_at, r.completed_at
+         FROM conversation_model_requests r
+         JOIN conversation_turns t ON t.id = r.turn_id
+        WHERE r.measurement_complete = 1
+          AND r.output_tokens IS NOT NULL AND r.reasoning_output_tokens IS NOT NULL
+          AND r.first_text_output_at IS NOT NULL AND r.completed_at IS NOT NULL
+          AND t.provider_thread_id IS NOT NULL AND t.provider_turn_id IS NOT NULL
+        ORDER BY r.request_sequence`,
+    );
+    return rows.flatMap((row) => {
+      const durationMs = elapsedMs(row.first_text_output_at, row.completed_at);
+      const visibleOutputTokens = row.output_tokens - row.reasoning_output_tokens;
+      return durationMs !== null && durationMs > 0 && visibleOutputTokens > 0 ? [{ conversationId: row.conversation_id, providerThreadId: row.provider_thread_id, providerTurnId: row.provider_turn_id, visibleOutputTokens, durationMs }] : [];
+    });
   }
 
   private requireOpenSwitch(operationId: string): ConversationSwitchOperationRecord {
@@ -2501,8 +2579,17 @@ function stringOrNull(value: unknown): string | null {
 export function readConversationSessionMetrics(db: ZeusDatabasePort, conversationId: string, turnId?: string | null): ConversationSessionMetricsSnapshot {
   const usage = readConversationUsageSnapshot(db, conversationId, turnId);
   const providerUsage = readProviderUsageMetrics(db, conversationId);
-  const latestRequest = usage.latestModelRequest;
-  const latestOutputTokensPerSecond = outputRate(latestRequest);
+  /** 工具调用等不可测速请求不能覆盖最近一次已经完整测得的文本输出速率。 */
+  const latestOutputTokensPerSecond =
+    db
+      .select<ModelRequestRow>(
+        `SELECT * FROM conversation_model_requests
+        WHERE conversation_id = ? AND request_kind <> 'context_compaction' AND measurement_complete = 1
+        ORDER BY request_sequence DESC`,
+        [conversationId],
+      )
+      .map((row) => outputRate(mapModelRequest(row)))
+      .find((rate): rate is number => rate !== null) ?? null;
   const latestTurn = db.get<{ id: string; started_at: string | null }>(`SELECT id, started_at FROM conversation_turns WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, [conversationId]);
   const latestFirstVisibleAt = latestTurn
     ? (db.get<{ first_visible_output_at: string | null }>(
@@ -2567,6 +2654,7 @@ export function readConversationSessionMetrics(db: ZeusDatabasePort, conversatio
   };
 }
 
+/** 仅在文本请求的 Token 与首尾时间都完整时计算输出速率。 */
 function outputRate(request: ConversationModelRequestUsageRecord | null): number | null {
   if (!request?.measurementComplete || request.outputTokens === null || request.reasoningOutputTokens === null) return null;
   const durationMs = elapsedMs(request.firstTextOutputAt, request.completedAt);
@@ -2588,7 +2676,7 @@ function readProviderUsageMetrics(db: ZeusDatabasePort, conversationId: string):
   const pricingSourceUrls = Array.isArray(value?.pricingSourceUrls) ? value.pricingSourceUrls.filter((url): url is string => typeof url === 'string' && url.trim().length > 0) : [];
   const historyComplete = value?.historyComplete === true;
   return {
-    costs,
+    ...(costs === undefined ? {} : { costs }),
     apiEquivalentUsd,
     priceCoverage,
     pricingCatalogDate,

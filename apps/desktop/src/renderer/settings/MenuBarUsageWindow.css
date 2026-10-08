@@ -999,3 +999,30 @@ body:has(.menu-bar-usage-root),
   border-radius: 50%;
   animation: menu-bar-usage-spin 800ms linear infinite;
 }
+
+.menu-bar-usage-range {
+  display: flex;
+  gap: 4px;
+  margin-block: 8px;
+}
+.menu-bar-usage-range button {
+  flex: 1;
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.menu-bar-usage-range button[aria-pressed='true'] {
+  background: rgb(118 56 245 / 12%);
+  color: #7638f5;
+}
+.menu-bar-usage-cost-detail td small,
+.menu-bar-usage-cost-detail th small {
+  display: block;
+  margin-block-start: 4px;
+  font-size: 10px;
+}

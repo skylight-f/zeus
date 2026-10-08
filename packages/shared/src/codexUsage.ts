@@ -7,6 +7,16 @@ export interface TokenUsageBreakdown {
   reasoningOutputTokens: number;
 }
 
+/** 固定字段顺序比较供应商用量，避免对象字段顺序影响请求关联。 */
+export function tokenUsageSignature(usage: TokenUsageBreakdown): string {
+  return JSON.stringify([usage.inputTokens, usage.cachedInputTokens, usage.cacheWriteInputTokens, usage.outputTokens, usage.reasoningOutputTokens, usage.totalTokens]);
+}
+
+/** 累计进度相同的通知是同一次观察；相同单次用量但累计进度不同的请求保持独立。 */
+export function codexUsageObservationIdentity(threadId: string, turnId: string, total: TokenUsageBreakdown): string {
+  return `codex-usage:${threadId}:${turnId}:${tokenUsageSignature(total)}`;
+}
+
 export interface CodexUsageRateSnapshot {
   /** 其他供应商的原币公开费率及依据。 */
   price?: import('./modelPricing.js').ModelPrice;
@@ -80,7 +90,11 @@ export interface CodexOfficialUsageSnapshot {
   longestStreakDays: number | null;
   dailyUsageBuckets: Array<{ startDate: string; tokens: number }> | null;
   rateLimitWindows: CodexOfficialRateWindow[];
+  /** 官方点数可用状态；未返回时为未知，不从余额推断。 */
+  hasCredits: boolean | null;
+  /** Codex 对应额度 bucket 返回的官方点数余额，不累加其他 bucket。 */
   creditBalance: string | null;
+  /** Codex 官方是否返回无限点数。 */
   creditsUnlimited: boolean;
   fetchedAt: string | null;
   stale: boolean;
@@ -96,11 +110,40 @@ export interface UsageModelRate {
   perRequest: number | null;
 }
 
-/** 同一模型和同一价格快照归为一行，调价后的记录保持分开。 */
+/** 账本已知价格目录的适用周期；结束日期为空表示当前最新目录。 */
+export interface UsageModelPricePeriod {
+  /** 价格目录开始日期，格式固定为 YYYY-MM-DD。 */
+  from: string;
+  /** 下一份目录生效前一天；当前最新目录为空。 */
+  to: string | null;
+}
+
+/** 同一模型、计费档位和价格快照归为一行，调价后的记录保持分开。 */
 export interface UsageModelCostBreakdown {
   model: string;
   rate: UsageModelRate | null;
+  /** Codex 请求快照的服务档位，统一普通和快速档位别名；其他供应源为空。 */
+  serviceTier: string | null;
+  /** Codex 请求快照是否采用长上下文价格，不根据累计 Token 推断。 */
+  longContext: boolean;
+  /** 只展示账本能够证明的价格目录周期，缺少有效目录日期时不猜测。 */
+  pricePeriod: UsageModelPricePeriod | null;
   usage: TokenUsageBreakdown;
+  /** 该行按请求价格快照汇总的原币估算费用。 */
+  estimatedCosts: import('./modelPricing.js').EstimatedMoney[];
+}
+
+/** 菜单栏概览支持的快捷时间范围。 */
+export type UsageOverviewRange = 'today' | '7d' | '30d' | 'all';
+
+/** 单个快捷时间范围的本地汇总与费用明细。 */
+export interface UsageOverviewRangeSummary {
+  /** 当前范围内的本地用量汇总。 */
+  local: CodexLocalUsageTotals;
+  /** 当前范围内按模型和历史单价归组的费用依据。 */
+  costBreakdown: UsageModelCostBreakdown[];
+  /** 当前范围内所有账本记录是否都包含完整用量。 */
+  complete: boolean;
 }
 
 export interface UsageProviderSummary {
@@ -118,19 +161,33 @@ export interface UsageProviderSummary {
   accountTodayTokens: number | null;
   accountSevenDayTokens: number | null;
   dailyAccount: Array<{ date: string; totalTokens: number }> | null;
-  todayLocal: CodexLocalUsageTotals;
-  /** 今日按模型和历史单价归组的费用依据。 */
-  todayCostBreakdown: UsageModelCostBreakdown[];
-  todayLocalComplete: boolean;
-  sevenDayLocal: CodexLocalUsageTotals;
-  /** 近七日按模型和历史单价归组的费用依据。 */
-  sevenDayCostBreakdown: UsageModelCostBreakdown[];
-  sevenDayLocalComplete: boolean;
+  /** 菜单栏快捷时间筛选所需的轻量汇总。 */
+  overviewRanges: Record<UsageOverviewRange, UsageOverviewRangeSummary>;
   dailyLocal: CodexLocalUsageDay[];
   collectionStartedAt: string | null;
   updatedAt: string;
   stale: boolean;
   error: string | null;
+}
+
+/** 菜单栏仅对 Codex 订阅使用等价费用口径，API 认证和其他供应商保持原展示。 */
+export function isCodexSubscriptionUsage(provider: Pick<UsageProviderSummary, 'providerId' | 'kind' | 'officialState'>): boolean {
+  return provider.providerId === 'codex' && provider.kind === 'subscription' && provider.officialState !== 'unsupported';
+}
+
+/** 官方点数余额仅展示有限正数，零值、缺失和非法值不占位。 */
+export function hasPositiveCodexCredits(value: string | number | null | undefined): boolean {
+  /** 官方数值字符串统一校验，空白和空值同样不展示。 */
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0;
+}
+
+/** 点数使用本地化短数字；缺失或非法余额显示未知，小数点数不被舍入成零。 */
+export function formatCodexCredits(value: string | number | null | undefined, language: 'zh-CN' | 'en-US'): string {
+  if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return '—';
+  /** 官方余额保持数值校验，不能把未知字符串误显示成零。 */
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount >= 0 ? new Intl.NumberFormat(language, { notation: 'compact', maximumSignificantDigits: 4 }).format(amount) : '—';
 }
 
 export interface UsageOverviewSnapshot {
@@ -147,6 +204,8 @@ export interface CodexLocalUsageTotals extends TokenUsageBreakdown {
   conversationCount: number;
   turnCount: number;
   cacheHitRate: number | null;
+  /** 当前范围内可测文本请求按 Token 与生成时长加权后的输出速率。 */
+  outputTokensPerSecond: number | null;
   estimatedCredits: number | null;
   apiEquivalentUsd: number | null;
   cacheSavingsUsd: number | null;

@@ -1,6 +1,5 @@
 import { randomId } from './randomId.js';
 import {
-  createDefaultTaskBoardViewSettings,
   isTaskManagementStatus,
   isTaskType,
   normalizeTaskBoardViewSettings,
@@ -35,7 +34,6 @@ export interface ZeusProjectRecord {
   localPath: string;
   description: string | null;
   note: string | null;
-  defaultTemplateId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -667,14 +665,13 @@ export class ProjectRepository {
       localPath,
       description: input.description ?? null,
       note: input.note ?? null,
-      defaultTemplateId: null,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
     this.db.execute(
-      `INSERT INTO projects (id, name, slug, local_path, description, note, default_template_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [record.id, record.name, record.slug, record.localPath, record.description, record.note, record.defaultTemplateId, record.createdAt, record.updatedAt],
+      `INSERT INTO projects (id, name, slug, local_path, description, note, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [record.id, record.name, record.slug, record.localPath, record.description, record.note, record.createdAt, record.updatedAt],
     );
     return record;
   }
@@ -687,7 +684,7 @@ export class ProjectRepository {
     const query = options.query?.trim().toLowerCase();
     const projects = this.db
       .select<DbProjectRow>(
-        `SELECT id, name, slug, local_path, description, note, default_template_id, created_at, updated_at
+        `SELECT id, name, slug, local_path, description, note, created_at, updated_at
        FROM projects WHERE archived = 0 AND deleted_at IS NULL ORDER BY created_at ASC`,
       )
       .map(mapProjectRow)
@@ -700,7 +697,7 @@ export class ProjectRepository {
 
   getById(projectId: string): ZeusProjectRecord | undefined {
     const row = this.db.get<DbProjectRow>(
-      `SELECT id, name, slug, local_path, description, note, default_template_id, created_at, updated_at
+      `SELECT id, name, slug, local_path, description, note, created_at, updated_at
        FROM projects WHERE id = ? AND deleted_at IS NULL`,
       [projectId],
     );
@@ -742,7 +739,7 @@ export class ProjectRepository {
   private findByLocalPath(localPath: string, excludeProjectId?: string): ZeusProjectRecord | undefined {
     return this.db
       .select<DbProjectRow>(
-        `SELECT id, name, slug, local_path, description, note, default_template_id, created_at, updated_at
+        `SELECT id, name, slug, local_path, description, note, created_at, updated_at
        FROM projects WHERE deleted_at IS NULL ORDER BY created_at ASC`,
       )
       .map(mapProjectRow)
@@ -772,17 +769,6 @@ export class ProjectRepository {
     return existing;
   }
 
-  setDefaultTemplate(projectId: string, templateId: string | null): ZeusProjectRecord {
-    const timestamp = nowIso();
-    // 项目默认模板只保存模板引用，不创建任务，避免引入任何 seed/mock 业务记录。
-    this.db.execute(`UPDATE projects SET default_template_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, [templateId, timestamp, projectId]);
-    const updated = this.getById(projectId);
-    if (!updated) {
-      throw new Error(`Zeus project not found: ${projectId}`);
-    }
-    return updated;
-  }
-
   archive(projectId: string): ZeusProjectRecord {
     const timestamp = nowIso();
     this.db.execute(`UPDATE projects SET archived = 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, [timestamp, projectId]);
@@ -806,7 +792,7 @@ export class ProjectRepository {
   listArchived(): ZeusProjectRecord[] {
     return this.db
       .select<DbProjectRow>(
-        `SELECT id, name, slug, local_path, description, note, default_template_id, created_at, updated_at
+        `SELECT id, name, slug, local_path, description, note, created_at, updated_at
        FROM projects WHERE archived = 1 AND deleted_at IS NULL ORDER BY updated_at DESC`,
       )
       .map(mapProjectRow);
@@ -837,7 +823,7 @@ export class TaskRepository {
       const timestamp = nowIso();
       const taskSequence = this.nextTaskSequence(input.projectId);
       const parentTaskId = input.parentTaskId ?? null;
-      if (parentTaskId) this.assertValidParent(input.projectId, '__new_task__', parentTaskId, 1);
+      if (parentTaskId) this.assertValidParent(input.projectId, '__new_task__', parentTaskId);
       const record: ZeusTaskRecord = {
         id: input.id ?? `task_${randomId(12)}`,
         projectId: input.projectId,
@@ -962,6 +948,7 @@ export class TaskRepository {
   updateStatus(taskId: string, status: ZeusTaskRecord['status']): ZeusTaskRecord {
     const existing = this.getById(taskId);
     if (!existing) throw new Error(`Zeus task not found: ${taskId}`);
+    if (status === 'completed') this.assertCanComplete(taskId);
     const timestamp = nextIsoTimestamp(existing.updatedAt);
     this.db.execute(`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, [status, timestamp, taskId]);
     const updated = this.getById(taskId);
@@ -975,6 +962,7 @@ export class TaskRepository {
     if (!isTaskManagementStatus(managementStatus)) throw new Error(`Unknown Zeus task management status: ${String(managementStatus)}`);
     const existing = this.getById(taskId);
     if (!existing) throw new Error(`Zeus task not found: ${taskId}`);
+    if (managementStatus === 'completed') this.assertCanComplete(taskId);
     if (expectedUpdatedAt && existing.updatedAt !== expectedUpdatedAt) throwTaskEditConflict(taskId, existing.updatedAt);
     if (existing.managementStatus === managementStatus) return existing;
     const timestamp = nextIsoTimestamp(existing.updatedAt);
@@ -994,7 +982,9 @@ export class TaskRepository {
     if (fromStatus === toStatus) return [];
     return this.db.transaction(() => {
       const taskIds = this.db.select<{ id: string }>(`SELECT id FROM tasks WHERE project_id = ? AND management_status = ? AND deleted_at IS NULL ORDER BY created_at ASC`, [projectId, fromStatus]).map((row) => row.id);
-      return taskIds.map((taskId) => this.updateManagementStatus(taskId, toStatus));
+      const updated = taskIds.map((taskId) => this.updateManagementStatus(taskId, toStatus));
+      migrateTaskBoardStatusPositions(this.db, projectId, { [fromStatus]: toStatus });
+      return updated;
     });
   }
 
@@ -1212,7 +1202,7 @@ export class TaskRepository {
       if (existing.updatedAt !== input.expectedUpdatedAt) throwTaskEditConflict(taskId, existing.updatedAt);
       const parentTaskId = input.parentTaskId === undefined ? existing.parentTaskId : input.parentTaskId;
       const relatedTaskIds = input.relatedTaskIds === undefined ? existing.relatedTaskIds : [...new Set(input.relatedTaskIds)];
-      this.assertValidParent(existing.projectId, taskId, parentTaskId, this.subtreeHeight(taskId));
+      this.assertValidParent(existing.projectId, taskId, parentTaskId);
       this.assertValidRelatedTasks(existing, relatedTaskIds);
       if (parentTaskId === existing.parentTaskId && canonicalJson(relatedTaskIds.slice().sort()) === canonicalJson(existing.relatedTaskIds.slice().sort())) return existing;
       const timestamp = nextIsoTimestamp(existing.updatedAt);
@@ -1236,7 +1226,7 @@ export class TaskRepository {
   validateParentChange(taskId: string, parentTaskId: string | null): void {
     const existing = this.getById(taskId);
     if (!existing) throw Object.assign(new Error('Task not found.'), { code: 'ZEUS_TASK_NOT_FOUND' as const });
-    this.assertValidParent(existing.projectId, taskId, parentTaskId, this.subtreeHeight(taskId));
+    this.assertValidParent(existing.projectId, taskId, parentTaskId);
   }
 
   delete(taskId: string, input: DeleteTaskInput = {}): DeleteTaskResult {
@@ -1262,7 +1252,7 @@ export class TaskRepository {
         if (!replacementParentTaskId) throw Object.assign(new Error('A replacement parent task is required.'), { code: 'ZEUS_TASK_REPLACEMENT_PARENT_REQUIRED' as const });
         const descendantIds = new Set(this.listDescendantIds(taskId));
         if (descendantIds.has(replacementParentTaskId)) throw Object.assign(new Error('The replacement parent cannot be inside the deleted task branch.'), { code: 'ZEUS_TASK_PARENT_CYCLE' as const });
-        for (const child of directChildren) this.assertValidParent(existing.projectId, child.id, replacementParentTaskId, this.subtreeHeight(child.id));
+        for (const child of directChildren) this.assertValidParent(existing.projectId, child.id, replacementParentTaskId);
         for (const child of directChildren) {
           this.db.execute(`UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`, [replacementParentTaskId, nextIsoTimestamp(child.updatedAt), child.id]);
         }
@@ -1338,18 +1328,19 @@ export class TaskRepository {
     return descendants;
   }
 
-  private subtreeHeight(taskId: string): number {
-    const children = this.db.select<{ id: string }>(`SELECT id FROM tasks WHERE parent_task_id = ? AND deleted_at IS NULL`, [taskId]);
-    return children.length === 0 ? 1 : 1 + Math.max(...children.map((child) => this.subtreeHeight(child.id)));
+  /** 完成前检查正式登记的阻塞缺陷，自动执行和人工关单共用。 */
+  assertCanComplete(taskId: string): void {
+    // 独立任务仓库也可用于尚未初始化流程模块的资料读取；未登记缺陷时没有额外完成门禁。
+    if (!this.db.get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'defect_workflow_records'`)) return;
+    /** 父任务及缺陷自身都必须经过复验或明确接受风险后才能完成。 */
+    const blocker = this.db.get<{ id: string }>(`SELECT id FROM defect_workflow_records WHERE (parent_task_id = ? OR defect_task_id = ?) AND status NOT IN ('accepted', 'risk_accepted') LIMIT 1`, [taskId, taskId]);
+    if (blocker) throw Object.assign(new Error('存在尚未通过复验的阻塞缺陷，请完成复验或登记接受风险的理由。'), { code: 'ZEUS_TASK_BLOCKING_DEFECT', statusCode: 409, defectId: blocker.id });
   }
 
-  private assertValidParent(projectId: string, taskId: string, parentTaskId: string | null, subtreeHeight: number): void {
-    if (!parentTaskId) {
-      if (subtreeHeight > 3) throw Object.assign(new Error('Task hierarchy cannot exceed three levels.'), { code: 'ZEUS_TASK_HIERARCHY_DEPTH_EXCEEDED' as const });
-      return;
-    }
+  /** 父子关系只限制同项目与无循环，层数由用户实际组织需要决定。 */
+  private assertValidParent(projectId: string, taskId: string, parentTaskId: string | null): void {
+    if (!parentTaskId) return;
     if (parentTaskId === taskId) throw Object.assign(new Error('A task cannot be its own parent.'), { code: 'ZEUS_TASK_PARENT_CYCLE' as const });
-    let depth = 1;
     let cursor: string | null = parentTaskId;
     const visited = new Set<string>();
     while (cursor) {
@@ -1360,10 +1351,8 @@ export class TaskRepository {
       ]);
       if (!parent) throw Object.assign(new Error('Parent task not found.'), { code: 'ZEUS_TASK_PARENT_NOT_FOUND' as const });
       if (parent.project_id !== projectId) throw Object.assign(new Error('Parent task must belong to the same project.'), { code: 'ZEUS_TASK_RELATION_PROJECT_MISMATCH' as const });
-      depth += 1;
       cursor = parent.parent_task_id;
     }
-    if (depth + subtreeHeight - 1 > 3) throw Object.assign(new Error('Task hierarchy cannot exceed three levels.'), { code: 'ZEUS_TASK_HIERARCHY_DEPTH_EXCEEDED' as const });
   }
 
   private assertValidRelatedTasks(task: ZeusTaskRecord, relatedTaskIds: string[]): void {
@@ -1415,6 +1404,34 @@ interface DbTaskBoardPositionRow {
   updated_at: string;
 }
 
+/** 按原状态一次映射看板泳道，保留rank；映射碰撞时保留最近保存的位置。 */
+export function migrateTaskBoardStatusPositions(db: ZeusDatabasePort, projectId: string, replacements: Record<string, string>): void {
+  const positions = db.select<DbTaskBoardPositionRow>('SELECT * FROM task_board_positions WHERE project_id = ? ORDER BY updated_at ASC, rank ASC', [projectId]);
+  const changed = positions.some((row) => {
+    const [groupBy, subgroupBy] = row.layout_key.split(':');
+    return (
+      (groupBy === 'managementStatus' && replacements[row.group_id] && replacements[row.group_id] !== row.group_id) || (subgroupBy === 'managementStatus' && replacements[row.subgroup_id] && replacements[row.subgroup_id] !== row.subgroup_id)
+    );
+  });
+  if (!changed) return;
+  db.execute('DELETE FROM task_board_positions WHERE project_id = ?', [projectId]);
+  for (const row of positions) {
+    const [groupBy, subgroupBy] = row.layout_key.split(':');
+    const groupId = groupBy === 'managementStatus' ? (replacements[row.group_id] ?? row.group_id) : row.group_id;
+    const subgroupId = subgroupBy === 'managementStatus' ? (replacements[row.subgroup_id] ?? row.subgroup_id) : row.subgroup_id;
+    db.execute('INSERT OR REPLACE INTO task_board_positions (project_id, layout_key, group_id, subgroup_id, task_id, rank, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [
+      projectId,
+      row.layout_key,
+      groupId,
+      subgroupId,
+      row.task_id,
+      row.rank,
+      row.updated_at,
+    ]);
+  }
+}
+
+/** 看板修订冲突继续使用既有明确错误，避免覆盖其它窗口保存。 */
 function taskBoardRevisionConflict(currentRevision: number): Error {
   return Object.assign(new Error('Task board changed after editing started.'), {
     code: 'ZEUS_TASK_BOARD_REVISION_CONFLICT' as const,
@@ -1422,20 +1439,19 @@ function taskBoardRevisionConflict(currentRevision: number): Error {
   });
 }
 
-/** 任务看板仓储只保存项目视图配置和手工顺序，不复制任务业务字段。 */
+/** 所有项目共用一份看板显示设置；项目表仍保存卡片顺序的修订。 */
+const globalTaskBoardViewSettingsKey = 'task-board.global-display';
+
+/** 看板显示设置统一全局，真实任务卡片顺序继续属于原项目。 */
 export class TaskBoardRepository {
   constructor(private readonly db: ZeusDatabasePort) {}
 
   getSnapshot(projectId: string): TaskBoardViewSnapshot {
     const view = this.db.get<DbTaskBoardViewRow>(`SELECT project_id, settings_json, revision, created_at, updated_at FROM task_board_views WHERE project_id = ?`, [projectId]);
-    let settings = createDefaultTaskBoardViewSettings();
-    if (view) {
-      try {
-        settings = normalizeTaskBoardViewSettings(JSON.parse(view.settings_json));
-      } catch {
-        settings = createDefaultTaskBoardViewSettings();
-      }
-    }
+    /** 旧项目显示设置保留在表中，仅作为历史资源，不再读取生效。 */
+    const global = new SettingRepository(this.db).getJson<{ settings?: TaskBoardViewSettings; revision?: number; updatedAt?: string }>(globalTaskBoardViewSettingsKey);
+    const settings = normalizeTaskBoardViewSettings(global?.settings);
+    const globalRevision = Number.isSafeInteger(global?.revision) && (global?.revision ?? 0) >= 0 ? global!.revision! : 0;
     const positions = this.db
       .select<DbTaskBoardPositionRow>(
         `SELECT project_id, layout_key, group_id, subgroup_id, task_id, rank, updated_at
@@ -1445,10 +1461,15 @@ export class TaskBoardRepository {
       .map(mapTaskBoardPositionRow);
     return {
       projectId,
-      revision: view?.revision ?? 0,
+      /** 两种变化都递增同一项目快照修订，不能使用max吞掉较小一方的更新。 */
+      revision: (view?.revision ?? 0) + globalRevision,
       settings,
       positions,
-      updatedAt: view?.updated_at ?? null,
+      updatedAt:
+        [view?.updated_at, global?.updatedAt]
+          .filter((value): value is string => Boolean(value))
+          .sort()
+          .at(-1) ?? null,
     };
   }
 
@@ -1458,14 +1479,13 @@ export class TaskBoardRepository {
     const settings = normalizeTaskBoardViewSettings({ ...current.settings, ...patch }, current.settings);
     if (JSON.stringify(settings) === JSON.stringify(current.settings)) return current;
     this.db.transaction(() => {
-      const timestamp = nowIso();
-      const existing = this.db.get<{ revision: number }>(`SELECT revision FROM task_board_views WHERE project_id = ?`, [projectId]);
-      if ((existing?.revision ?? 0) !== expectedRevision) throw taskBoardRevisionConflict(existing?.revision ?? 0);
-      if (existing) {
-        this.db.execute(`UPDATE task_board_views SET settings_json = ?, revision = revision + 1, updated_at = ? WHERE project_id = ? AND revision = ?`, [JSON.stringify(settings), timestamp, projectId, expectedRevision]);
-      } else {
-        this.db.execute(`INSERT INTO task_board_views (project_id, settings_json, revision, created_at, updated_at) VALUES (?, ?, 1, ?, ?)`, [projectId, JSON.stringify(settings), timestamp, timestamp]);
-      }
+      /** 事务内重新检查完整修订，跨项目显示修改也使旧表单失效。 */
+      const latest = this.getSnapshot(projectId);
+      if (latest.revision !== expectedRevision) throw taskBoardRevisionConflict(latest.revision);
+      const store = new SettingRepository(this.db);
+      const global = store.getJson<{ revision?: number }>(globalTaskBoardViewSettingsKey);
+      const revision = Number.isSafeInteger(global?.revision) && (global?.revision ?? 0) >= 0 ? global!.revision! : 0;
+      store.setJson(globalTaskBoardViewSettingsKey, { settings, revision: revision + 1, updatedAt: nowIso() });
     });
     return this.getSnapshot(projectId);
   }
@@ -1487,7 +1507,8 @@ export class TaskBoardRepository {
     this.db.transaction(() => {
       const timestamp = nowIso();
       const existing = this.db.get<{ revision: number }>(`SELECT revision FROM task_board_views WHERE project_id = ?`, [input.projectId]);
-      if ((existing?.revision ?? 0) !== input.expectedRevision) throw taskBoardRevisionConflict(existing?.revision ?? 0);
+      const latest = this.getSnapshot(input.projectId);
+      if (latest.revision !== input.expectedRevision) throw taskBoardRevisionConflict(latest.revision);
       if (!existing) {
         this.db.execute(`INSERT INTO task_board_views (project_id, settings_json, revision, created_at, updated_at) VALUES (?, ?, 0, ?, ?)`, [input.projectId, JSON.stringify(current.settings), timestamp, timestamp]);
       }
@@ -2106,7 +2127,6 @@ interface DbProjectRow {
   local_path: string;
   description: string | null;
   note: string | null;
-  default_template_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -2261,7 +2281,6 @@ function mapProjectRow(row: DbProjectRow): ZeusProjectRecord {
     localPath: row.local_path,
     description: row.description,
     note: row.note,
-    defaultTemplateId: row.default_template_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

@@ -1,4 +1,4 @@
-import { createContext, lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, lazy, Suspense, useEffect, useMemo, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
 import { XIcon } from '@phosphor-icons/react/dist/csr/X';
 import { detectSourceLanguage, userFacingErrorCause, type FilePreviewItem, type FilePreviewRequest, type FileReview, type ConversationFileLocation, type UserFacingErrorCause } from '@zeus/shared';
 import { ModalPortal } from '../ui/ModalPortal.js';
@@ -15,6 +15,16 @@ const CodeEditor = lazy(() => import('./CodeEditor.js').then((module) => ({ defa
 const CodeDiffView = lazy(() => import('./CodeDiffView.js').then((module) => ({ default: module.CodeDiffView })));
 /** Markdown 沿用受限渲染器，不加载任意活动 HTML。 */
 const Markdown = lazy(() => import('../session/ConversationMarkdown.js').then((module) => ({ default: module.ConversationMarkdown })));
+
+/** 新入口复用本地文字按钮，保持原工具栏样式。 */
+export function PreviewIconButton({ label, children, ...buttonProps }: { label: string; children: ReactNode } & Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'aria-label' | 'className' | 'title' | 'type'>) {
+  void children;
+  return (
+    <button {...buttonProps} type="button" aria-label={label} title={label}>
+      {label}
+    </button>
+  );
+}
 
 /** 两类文件审阅共用切换入口；带行号先定位源码，普通打开优先查看差异。 */
 export function FileReviewContent(props: { review?: FileReview; zh: boolean; children: ReactNode }) {
@@ -65,21 +75,31 @@ export function FilePreview(props: {
   /** 中英文文案。 */
   zh: boolean;
   /** 文本继续复用原差异与评论界面。 */
-  children?: ReactNode;
+  children?: ReactNode | ((toolbar: ReactNode) => ReactNode);
+  actions?: ReactNode;
+  fileStatus?: string;
   /** 外部已知的修订用于显式刷新当前文件。 */
   revision?: string | number;
 }) {
   /** 序列化的请求避免父组件重渲染触发重复读取。 */
   const identity = JSON.stringify(props.request);
   return (
-    <FilePreviewBody key={`${identity}:${JSON.stringify(props.location)}:${props.revision ?? ''}`} identity={identity} location={props.location} zh={props.zh}>
+    <FilePreviewBody key={`${identity}:${JSON.stringify(props.location)}:${props.revision ?? ''}`} identity={identity} location={props.location} zh={props.zh} actions={props.actions} fileStatus={props.fileStatus}>
       {props.children}
     </FilePreviewBody>
   );
 }
 
 /** 一个挂载周期只对应一个文件身份。 */
-function FilePreviewBody(props: { location?: ConversationFileLocation; identity: string; zh: boolean; children?: ReactNode; /** 弹窗提供关闭动作，单张图片据此使用纯预览布局。 */ onClose?: () => void }) {
+function FilePreviewBody(props: {
+  location?: ConversationFileLocation;
+  identity: string;
+  zh: boolean;
+  children?: ReactNode | ((toolbar: ReactNode) => ReactNode);
+  actions?: ReactNode;
+  fileStatus?: string;
+  /** 弹窗提供关闭动作，单张图片据此使用纯预览布局。 */ onClose?: () => void;
+}) {
   /** 资源读取完成前不复用旧文件的内容。 */
   const [items, setItems] = useState<FilePreviewItem[] | null>(null);
   /** 本次操作的可见错误。 */
@@ -179,10 +199,11 @@ function FilePreviewBody(props: { location?: ConversationFileLocation; identity:
           <button type="button" onClick={() => setAttempt((value) => value + 1)}>
             {error ? (props.zh ? '重试' : 'Retry') : props.zh ? '刷新' : 'Refresh'}
           </button>
+          {props.actions}
         </nav>
       ) : null}
       {showDiff ? (
-        <CodeReviewTextContext.Provider value={reviewText}>{props.children}</CodeReviewTextContext.Provider>
+        <CodeReviewTextContext.Provider value={reviewText}>{typeof props.children === 'function' ? props.children(null) : props.children}</CodeReviewTextContext.Provider>
       ) : error ? (
         <p role="alert">{simpleImage && typeof error === 'string' ? error : <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />}</p>
       ) : !items ? (

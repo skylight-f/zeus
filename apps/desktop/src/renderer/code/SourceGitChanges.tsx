@@ -5,6 +5,8 @@ import { SparkleIcon as Sparkle } from '@phosphor-icons/react/dist/csr/Sparkle';
 import { StopIcon as Stop } from '@phosphor-icons/react/dist/csr/Stop';
 import { ArchiveIcon as Archive } from '@phosphor-icons/react/dist/csr/Archive';
 import { GitFileStatusIcon, gitFileStatusCategory, gitFileStatusLabel } from '../git/GitFileStatusIcon.js';
+
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { TreeStructureIcon as TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
 import { ListBulletsIcon as ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
@@ -343,7 +345,7 @@ export function SourceGitChanges(props: {
         ) : null}
         {error || loadError ? (
           <p className="source-git-error" role="alert">
-            {error || loadError}
+            <VisibleApplicationError error={error || loadError} language={zh ? 'zh-CN' : 'en'} />
           </p>
         ) : null}
         {!client ? <p className="source-git-empty">{zh ? 'Git 服务尚未连接。' : 'Git is not connected.'}</p> : !snapshot && loading ? <p className="source-git-empty">{zh ? '正在读取更改…' : 'Loading changes…'}</p> : null}
@@ -589,6 +591,7 @@ function SelectionCheckbox(props: { label: string; paths: string[]; selected: st
   );
 }
 
+/** 树形和平铺入口使用同一文件状态、图标与选择行为。 */
 function SourceChangeTree(props: {
   view: 'tree' | 'flat';
   files: GitFileStatusSummary[];
@@ -635,7 +638,7 @@ function SourceChangeTree(props: {
                   }
                 />
               ) : null}
-              <Folder />
+              <Folder weight="duotone" aria-hidden="true" />
               <span>{folder.slice(0, -1)}</span>
               <small>{children.length}</small>
             </summary>
@@ -645,7 +648,7 @@ function SourceChangeTree(props: {
       {files
         .sort((a, b) => a.path.localeCompare(b.path))
         .map((file) => (
-          <div key={file.path} className="source-git-file" data-selected={props.selectedPath === file.path} data-status={file.category}>
+          <div key={file.path} className="source-git-file" data-selected={props.selectedPath === file.path}>
             {props.selectable ? (
               <SelectionCheckbox
                 label={(props.zh ? '选择提交文件 ' : 'Select file for commit ') + file.path}

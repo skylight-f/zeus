@@ -64,12 +64,17 @@ export function reconcileTranscriptItems(current: readonly NativeItemSnapshot[],
       const next = byEntryId.get(transcriptEntryId(item))!;
       return next.transcript.placement.order !== item.transcript.placement.order;
     });
-  let items = changedEntryIds.size === 0 ? (current as NativeItemSnapshot[]) : [...byEntryId.values()];
-  if (structuralChange)
-    items = orderTranscriptCandidates(items, (item) => ({
-      order: item.transcript.placement.order,
-      entryId: transcriptEntryId(item),
-    }));
+  const items = changedEntryIds.size === 0 && !structuralChange ? (current as NativeItemSnapshot[]) : [...byEntryId.values()];
+  if (structuralChange) {
+    /** 排序前记录候选顺序；没有位置的本地条目按该顺序整体留在持久区之后。 */
+    const candidateIndex = new Map(items.map((item, index) => [transcriptEntryId(item), index]));
+    items.sort((left, right) =>
+      compareTranscriptTimelineOrder(
+        { entryId: transcriptEntryId(left), order: left.transcript.placement.order, fallbackIndex: candidateIndex.get(transcriptEntryId(left)) ?? 0 },
+        { entryId: transcriptEntryId(right), order: right.transcript.placement.order, fallbackIndex: candidateIndex.get(transcriptEntryId(right)) ?? 0 },
+      ),
+    );
+  }
   const movedEntryIds = items.flatMap((item, index) => {
     const entryId = transcriptEntryId(item);
     const before = previousOrder.get(entryId);
@@ -100,7 +105,7 @@ export function transcriptEntryId(item: Pick<NativeItemSnapshot, 'transcript'>):
 }
 
 /** 统一合并器只依赖内容、状态和来源证据，供快照与实时缓冲共同使用。 */
-type TranscriptContent = Pick<NativeItemSnapshot, 'text' | 'payload' | 'status'> & { transcript?: ConversationTranscriptEnvelope };
+type TranscriptContent = Pick<NativeItemSnapshot, 'text' | 'payload' | 'status' | 'messageCreatedAt'> & { transcript?: ConversationTranscriptEnvelope };
 
 /** 来源修订用于去重；正文权威只由实际载荷的内容修订决定。 */
 export function mergeTranscriptItem<T extends TranscriptContent>(previous: T, incoming: T): T {
@@ -124,6 +129,7 @@ export function mergeTranscriptItem<T extends TranscriptContent>(previous: T, in
   return {
     ...incoming,
     text: content.text,
+    messageCreatedAt: incoming.messageCreatedAt ?? previous.messageCreatedAt,
     payload: content.payload,
     // 正文来源和状态来源彼此独立：较完整的旧正文不能把随后确认的 completed/failed 状态留在进行中。
     status,

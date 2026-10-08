@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { type CommandActor, type CommandEnvelope, commandEnvelopeSchemaGeneration, type CommandScopeKind, splitZeusSkillIds, type TaskManagementStatus } from '@zeus/shared';
+import {
+  type AutomationActionConfig,
+  type AutomationExecutionReference,
+  type AutomationExecutionState,
+  type CommandActor,
+  type CommandEnvelope,
+  commandEnvelopeSchemaGeneration,
+  type CommandScopeKind,
+  splitZeusSkillIds,
+  type TaskManagementStatus,
+} from '@zeus/shared';
 import {
   CommandRunRepository,
   ConversationRepository,
@@ -9,7 +19,6 @@ import {
   type DigitalEmployeeExecutionRecord,
   DigitalEmployeeExecutionRepository,
   type DigitalEmployeeExecutionSource,
-  type DigitalEmployeeProjectEvent,
   DigitalEmployeeProjectEventRepository,
   type DigitalEmployeeRecord,
   DigitalEmployeeRepository,
@@ -30,17 +39,31 @@ import type { ConversationCapabilityQueryApplication } from './conversationCapab
 import { conversationWorkExecutionState } from './conversationWorkExecutionState.js';
 import type { TaskStageApplication } from './taskStageApplication.js';
 import type { CreateUserTaskInput } from './workManagementCoreCommandRoutes.js';
-import { type ParsedWorkManagementMutation, WorkManagementCommandApplication, workManagementCommandTypes, workManagementInputSha256 } from './workManagementCommandApplication.js';
+import { WorkManagementCommandApplication, workManagementCommandTypes, workManagementInputSha256 } from './workManagementCommandApplication.js';
 import { WorkspaceGitCommandApplication, type WorkspaceGitCommandType, workspaceGitCommandTypes, workspaceGitInputSha256, type WorkspaceGitScopeKind } from './workspaceGitCommandApplication.js';
 import type { PreparedWorkspaceGitCommand, WorkspaceGitCommandRouteOperations } from './workspaceGitCommandRoutes.js';
 import type { TaskWorkManagementController } from './taskWorkManagement.js';
 
 const DEFAULT_TICK_MS = 10_000;
 const LEASE_MS = 45_000;
-const MAX_EVENTS_PER_RULE_TICK = 20;
-const MAX_AUTOMATION_CHAIN_DEPTH = 4;
 
 interface DigitalEmployeeOrchestratorOptions {
+  /** 旧 API 新建的规则在任何消费前移交给唯一普通调度器。 */
+  migrateAutomations?(): void;
+  /** 已移交的员工自动化只允许由统一调度器消费。 */
+  isAutomationMigrated?(automationId: string): boolean;
+  /** 项目流程的唯一指派入口；仅未配置流程时返回空。 */
+  acceptProjectWorkflowAssignment?(input: {
+    projectId: string;
+    taskId: string;
+    employeeId: string;
+    executionId: string | null;
+    source: string;
+    sourceRef: string;
+    context?: { permissionMode: 'read-only' | 'auto' | 'full-access' };
+  }): Promise<{ workflowRunId: string } | null>;
+  /** 历史排队执行接入流程后读取完整流程终态。 */
+  readProjectWorkflowRun?(runId: string): AutomationExecutionState | undefined;
   server: FastifyInstance;
   apiToken: string;
   workManagement: WorkManagementCommandApplication;
@@ -76,6 +99,10 @@ interface DigitalEmployeeOrchestratorOptions {
 }
 
 export interface DigitalEmployeeOrchestrator {
+  /** 统一自动化按规则筛选领取已有任务，不创建替代任务。 */
+  selectEligibleAutomationTask(projectId: string, employeeId: string, taskId?: string, filter?: AutomationActionConfig['taskFilter']): ZeusTaskRecord | null;
+  /** 普通自动化复用员工工作接纳，返回真实执行关联。 */
+  queueAutomatedAssignment(input: { projectId: string; taskId: string; employeeId: string; sourceRef: string; bypassWorkflow?: boolean; permissionMode?: 'read-only' | 'auto' | 'full-access' }): Promise<AutomationExecutionReference | null>;
   kick(): void;
   close(): Promise<void>;
 }
@@ -127,8 +154,7 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
   };
 
   async function tick(): Promise<void> {
-    await processAutomations();
-    await processTaskPool();
+    options.migrateAutomations?.();
     // 新指派只走 Task Work；这里仅维持已有 staged 协作记录的收口能力。
     for (const candidate of options.executions.listRecoverable(50).filter((execution) => execution.executionMode === 'staged')) {
       if (closed) return;
@@ -145,201 +171,6 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     }
   }
 
-  async function processAutomations(): Promise<void> {
-    const timestamp = now();
-    for (const automation of options.automations.listEnabled()) {
-      try {
-        const employee = options.employees.getById(automation.employeeId);
-        if (!employee?.enabled || employee.projectId !== automation.projectId) continue;
-        if (automation.actionKind === 'explore_project' && !employee.autonomousExploration) continue;
-        if (automation.nextRunAt && Date.parse(automation.nextRunAt) <= timestamp.getTime()) {
-          const identity = `scheduled:${automation.nextRunAt}`;
-          const triggered = await triggerAutomation(automation, employee, identity, null);
-          if (triggered) {
-            options.automations.advance({
-              id: automation.id,
-              nextRunAt: nextScheduledRun(automation, timestamp),
-              lastTriggeredAt: timestamp.toISOString(),
-            });
-            await options.save();
-          }
-        }
-
-        if (isTaskEventTrigger(automation.triggerKind)) {
-          const events = options.projectEvents.listTaskEvents({ projectId: automation.projectId, triggerKind: automation.triggerKind, afterSequence: automation.cursorSequence, limit: MAX_EVENTS_PER_RULE_TICK });
-          await processProjectEvents(automation, employee, events);
-        } else if (automation.triggerKind === 'code_changed') {
-          const events = options.projectEvents.listCodeEvents({ projectId: automation.projectId, afterSequence: automation.cursorSequence, limit: MAX_EVENTS_PER_RULE_TICK });
-          await processProjectEvents(automation, employee, events);
-        }
-      } catch (error) {
-        options.appendAuditLog({
-          actorType: 'worker',
-          actorRef: automation.employeeId,
-          action: 'digital_employee.automation.processing_failed',
-          resourceType: 'digital_employee_automation',
-          resourceId: automation.id,
-          payload: { projectId: automation.projectId, error: serializeError(error) },
-          createdAt: now().toISOString(),
-        });
-        await options.save();
-      }
-    }
-  }
-
-  async function processProjectEvents(automation: DigitalEmployeeAutomationRecord, employee: DigitalEmployeeRecord, events: DigitalEmployeeProjectEvent[]): Promise<void> {
-    for (const event of events) {
-      if (event.suppressAutomation) {
-        consumeAutomationWithoutExecution(automation, event.identity, '来源事件明确禁止再次触发自动化');
-        options.automations.advance({ id: automation.id, cursorSequence: event.sequence, lastTriggeredAt: automation.lastTriggeredAt ?? automation.createdAt });
-        await options.save();
-        continue;
-      }
-      const task = options.tasks.getById(event.taskId);
-      if (!task || task.projectId !== automation.projectId) {
-        consumeAutomationWithoutExecution(automation, event.identity, '来源任务已经不可用或不属于当前项目');
-        options.automations.advance({ id: automation.id, cursorSequence: event.sequence, lastTriggeredAt: automation.lastTriggeredAt ?? automation.createdAt });
-        await options.save();
-        continue;
-      }
-      const source = readTaskSourceContext(task);
-      const automationCreated = typeof source.digitalEmployeeAutomationId === 'string';
-      const ignoreAutomationCreated = automation.triggerConfig.ignoreAutomationCreated !== false;
-      const automationChainDepth = typeof source.digitalEmployeeAutomationDepth === 'number' ? Math.max(0, Math.trunc(source.digitalEmployeeAutomationDepth)) : automationCreated ? 1 : 0;
-      if ((automationCreated && ignoreAutomationCreated) || automationChainDepth >= MAX_AUTOMATION_CHAIN_DEPTH || !taskMatchesEmployee(task, employee)) {
-        consumeAutomationWithoutExecution(
-          automation,
-          event.identity,
-          automationChainDepth >= MAX_AUTOMATION_CHAIN_DEPTH ? '自动化触发链已达到边界' : automationCreated && ignoreAutomationCreated ? '该规则忽略自动化创建的任务' : '任务不符合员工领取条件',
-        );
-        options.automations.advance({ id: automation.id, cursorSequence: event.sequence, lastTriggeredAt: automation.lastTriggeredAt ?? automation.createdAt });
-        await options.save();
-        continue;
-      }
-      const triggered = await triggerAutomation(automation, employee, event.identity, event);
-      if (!triggered) return;
-      options.automations.advance({ id: automation.id, cursorSequence: event.sequence, lastTriggeredAt: now().toISOString() });
-      await options.save();
-    }
-  }
-
-  async function triggerAutomation(automation: DigitalEmployeeAutomationRecord, employee: DigitalEmployeeRecord, eventIdentity: string, event: DigitalEmployeeProjectEvent | null): Promise<boolean> {
-    if (options.automations.hasEventReceipt(automation.id, eventIdentity)) return true;
-    let task: ZeusTaskRecord | null = null;
-    if (automation.actionKind === 'assign_task') {
-      const configuredTaskId = typeof automation.actionConfig.taskId === 'string' ? automation.actionConfig.taskId : null;
-      const useEventTask = automation.actionConfig.useEventTask === true;
-      task = configuredTaskId ? (options.tasks.getById(configuredTaskId) ?? null) : event && useEventTask ? (options.tasks.getById(event.taskId) ?? null) : selectEligibleTask(employee);
-      if (!task || task.projectId !== automation.projectId || !taskMatchesEmployee(task, employee)) {
-        consumeAutomationWithoutExecution(automation, eventIdentity, '没有符合条件且可认领的任务');
-        return true;
-      }
-    } else {
-      task = createAutomationTask(automation, employee, eventIdentity, event);
-    }
-    if (!task) {
-      consumeAutomationWithoutExecution(automation, eventIdentity, '自动化没有解析到可用任务');
-      return true;
-    }
-    const source: DigitalEmployeeExecutionSource = automation.actionKind === 'explore_project' ? 'exploration' : 'automation';
-    await queueExecution({ employee, task, automation, source, sourceRef: `${automation.id}:${eventIdentity}`, eventIdentity });
-    return true;
-  }
-
-  function createAutomationTask(automation: DigitalEmployeeAutomationRecord, employee: DigitalEmployeeRecord, eventIdentity: string, event: DigitalEmployeeProjectEvent | null): ZeusTaskRecord {
-    const taskIdentity = stableIdentity('task', `${automation.id}\0${eventIdentity}`);
-    const action = automation.actionConfig;
-    const titleTemplate = typeof action.title === 'string' ? action.title : automation.actionKind === 'explore_project' ? `项目探索：${employee.name}` : `自动任务：${automation.name}`;
-    const descriptionTemplate =
-      typeof action.description === 'string'
-        ? action.description
-        : automation.actionKind === 'explore_project'
-          ? `仅在当前项目的任务、代码和文档范围内进行只读探索，整理有证据的改进机会、风险和候选任务。不得扫描其他项目、本机任意目录或未授权外部系统。`
-          : `由数字员工自动化“${automation.name}”创建并交付。`;
-    const sourceTask = event ? options.tasks.getById(event.taskId) : null;
-    const sourceContext = sourceTask ? readTaskSourceContext(sourceTask) : {};
-    const sourceDepth = typeof sourceContext.digitalEmployeeAutomationDepth === 'number' ? Math.max(0, Math.trunc(sourceContext.digitalEmployeeAutomationDepth)) : typeof sourceContext.digitalEmployeeAutomationId === 'string' ? 1 : 0;
-    const input: CreateUserTaskInput = {
-      projectId: automation.projectId,
-      title: interpolateAutomationText(titleTemplate, event),
-      taskType: readTaskType(action.taskType),
-      description: interpolateAutomationText(descriptionTemplate, event),
-      sourceContext: {
-        type: 'digital_employee_automation',
-        digitalEmployeeAutomationId: automation.id,
-        digitalEmployeeId: employee.id,
-        eventIdentity,
-        digitalEmployeeAutomationDepth: Math.min(MAX_AUTOMATION_CHAIN_DEPTH, sourceDepth + 1),
-        ...(event ? { sourceTaskId: event.taskId, sourceEventType: event.eventType } : {}),
-      },
-      tags: Array.isArray(action.tags) ? action.tags.filter((tag): tag is string => typeof tag === 'string') : ['数字员工'],
-      allowCodeChanges: automation.actionKind !== 'explore_project' && employee.allowCodeChanges,
-      allowTests: automation.actionKind !== 'explore_project' && employee.allowTests,
-      allowGitCommit: false,
-    };
-    const parsed = parseWorkerWorkManagementCommand<CreateUserTaskInput>({
-      application: options.workManagement,
-      commandType: workManagementCommandTypes.taskCreate,
-      scopeKind: 'task',
-      scopeId: taskIdentity,
-      operationIdentity: taskIdentity,
-      input,
-      actorId: employee.id,
-    });
-    const mutation = options.workManagement.executeCore({
-      parsed,
-      destinationId: 'work-management-task-application',
-      resourceId: taskIdentity,
-      mutateBusinessState: () => options.createTask(input, taskIdentity, { commandId: parsed.command.commandId, operationIdentity: parsed.operationIdentity, actor: parsed.command.actor }),
-    });
-    if (!mutation.replayed) {
-      options.publishRealtimeEvent('task.created', { projectId: automation.projectId, taskId: mutation.result.id, source: 'digital_employee_automation' });
-    }
-    return mutation.result;
-  }
-
-  function consumeAutomationWithoutExecution(automation: DigitalEmployeeAutomationRecord, eventIdentity: string, reason: string): void {
-    options.appendAuditLog({
-      actorType: 'worker',
-      actorRef: automation.employeeId,
-      action: 'digital_employee.automation.noop',
-      resourceType: 'digital_employee_automation',
-      resourceId: automation.id,
-      payload: { projectId: automation.projectId, eventIdentity, reason },
-      createdAt: now().toISOString(),
-    });
-  }
-
-  async function processTaskPool(): Promise<void> {
-    for (const employee of options.employees.listEnabled()) {
-      if (!employee.autoClaim) continue;
-      for (const task of options.tasks.listByProject(employee.projectId)) {
-        if (!taskMatchesEmployee(task, employee)) continue;
-        if (options.taskWorkManagement.claimPlannedWork(task.id, employee.id)) {
-          await options.save();
-          continue;
-        }
-        /** 没有阶段安排时，同一任务的默认分工也只允许一名员工领取。 */
-        const sourceRef = `task_pool:${task.id}`;
-        if (!taskMatchesEmployee(task, employee) || options.taskWorkManagement.hasAutomationSource(sourceRef) || options.taskWorkManagement.hasExistingTaskWork(task.id)) continue;
-        try {
-          await queueExecution({ employee, task, source: 'task_pool', sourceRef });
-        } catch (error) {
-          options.appendAuditLog({
-            actorType: 'worker',
-            actorRef: employee.id,
-            action: 'digital_employee.task_pool.claim_failed',
-            resourceType: 'task',
-            resourceId: task.id,
-            payload: { projectId: employee.projectId, error: serializeError(error) },
-            createdAt: now().toISOString(),
-          });
-          await options.save();
-        }
-      }
-    }
-  }
-
   async function queueExecution(input: {
     employee: DigitalEmployeeRecord;
     task: ZeusTaskRecord;
@@ -347,18 +178,43 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     source: DigitalEmployeeExecutionSource;
     sourceRef: string;
     eventIdentity?: string;
-  }): Promise<void> {
+    /** 调研工作不进入项目研发流程。 */
+    bypassWorkflow?: boolean;
+    /** 自动化权限只能收紧员工和任务的既有授权。 */
+    permissionMode?: 'read-only' | 'auto' | 'full-access';
+  }): Promise<AutomationExecutionReference | null> {
     if (input.employee.entrypoint?.kind !== 'agent' || input.employee.entrypointMigrationState !== 'ready') {
       throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_AGENT_ENTRYPOINT_REQUIRED', '数字员工必须通过 Agent 会话执行；自动化不会运行旧版入口配置。', false);
+    }
+    if (!input.bypassWorkflow && options.acceptProjectWorkflowAssignment) {
+      const accepted = await options.acceptProjectWorkflowAssignment({
+        projectId: input.task.projectId,
+        taskId: input.task.id,
+        employeeId: input.employee.id,
+        executionId: null,
+        source: input.source,
+        sourceRef: input.sourceRef,
+        ...(input.permissionMode ? { context: { permissionMode: input.permissionMode } } : {}),
+      });
+      if (accepted) {
+        if (input.automation && input.eventIdentity) options.automations.recordEventReceipt({ automationId: input.automation.id, eventIdentity: input.eventIdentity, executionId: null, createdAt: now().toISOString() });
+        await options.save();
+        return { kind: 'workflow', id: accepted.workflowRunId, taskId: input.task.id };
+      }
+    }
+    /** 统一自动化沿旧安排的正式接纳回执等待整份原计划，不另建工作。 */
+    if (input.source === 'automation' && !input.automation) {
+      const planned = await options.taskWorkManagement.claimPlannedAutomationWork({ taskId: input.task.id, employeeId: input.employee.id, sourceRef: input.sourceRef, permissionMode: input.permissionMode });
+      if (planned !== undefined) return planned;
     }
     /** 有阶段安排的任务只领取其中的分工，不另建整份任务的重复执行。 */
     if (options.taskWorkManagement.claimPlannedWork(input.task.id, input.employee.id)) {
       if (input.automation && input.eventIdentity) options.automations.recordEventReceipt({ automationId: input.automation.id, eventIdentity: input.eventIdentity, executionId: null, createdAt: now().toISOString() });
       await options.save();
-      return;
+      return null;
     }
     const sourceRef = input.source === 'task_pool' ? input.sourceRef : `${input.employee.id}:${input.sourceRef}`;
-    const created = await options.taskWorkManagement.createAutomatedWorkItem({ taskId: input.task.id, employeeId: input.employee.id, sourceRef });
+    const created = await options.taskWorkManagement.createAutomatedWorkItem({ taskId: input.task.id, employeeId: input.employee.id, sourceRef, permissionMode: input.permissionMode });
     if (input.automation && input.eventIdentity) options.automations.recordEventReceipt({ automationId: input.automation.id, eventIdentity: input.eventIdentity, executionId: null, createdAt: now().toISOString() });
     options.taskEvents.create({
       taskId: input.task.id,
@@ -367,9 +223,21 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
       payload: { workItemId: created.item.id, runId: created.run.id, employeeId: input.employee.id, source: input.source, automationId: input.automation?.id ?? null, entrypointKind: 'agent' },
     });
     await options.save();
+    return { kind: 'task_work', id: created.run.id, taskId: input.task.id, ...(created.run.conversationId ? { conversationId: created.run.conversationId } : {}) };
   }
 
   async function processExecution(execution: DigitalEmployeeExecutionRecord): Promise<void> {
+    /** 新流程接纳后的历史执行只跟随整个流程，不再监视首个员工会话。 */
+    const workflowRunId = execution.deliveryState.projectWorkflowRunId;
+    if (typeof workflowRunId === 'string') {
+      const state = options.readProjectWorkflowRun?.(workflowRunId);
+      if (!state || state.status === 'outcome_unknown') throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_WORKFLOW_OUTCOME_UNKNOWN', '项目流程的执行结果未知，不能重复指派。', true);
+      if (state.status === 'running') return;
+      if (state.status !== 'completed') throw orchestratorError(state.errorCode ?? 'ZEUS_DIGITAL_EMPLOYEE_WORKFLOW_FAILED', state.errorMessage ?? '项目流程未完成交付。', false);
+      if (execution.status !== 'delivery_pending') options.executions.update(execution.id, { status: 'delivery_pending' });
+      options.executions.update(execution.id, { status: 'delivered', completedAt: now().toISOString() });
+      return;
+    }
     if (execution.status === 'queued' || execution.status === 'dispatching') {
       if (execution.status === 'queued') options.executions.update(execution.id, { status: 'dispatching', startedAt: now().toISOString(), errorCode: null, errorMessage: null });
       await dispatchExecution(options.executions.getById(execution.id)!);
@@ -386,6 +254,22 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     const task = options.tasks.getById(execution.taskId);
     const project = task ? options.projects.getById(task.projectId) : undefined;
     if (!task || !project || task.projectId !== execution.projectId) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_TASK_UNAVAILABLE', '数字员工要处理的任务或项目已经不存在。', false);
+    /** 已开始的历史会话继续冻结配置，仅仍未提交的工作接纳项目流程。 */
+    if (!execution.conversationId && options.acceptProjectWorkflowAssignment) {
+      const accepted = await options.acceptProjectWorkflowAssignment({
+        projectId: project.id,
+        taskId: task.id,
+        employeeId: execution.employeeId,
+        executionId: execution.id,
+        source: execution.source,
+        sourceRef: execution.sourceRef ?? execution.id,
+      });
+      if (accepted) {
+        options.executions.update(execution.id, { status: 'running', deliveryState: { ...execution.deliveryState, projectWorkflowRunId: accepted.workflowRunId } });
+        await options.save();
+        return;
+      }
+    }
     const snapshot = execution.employeeSnapshot;
     const skillSelection = splitZeusSkillIds(snapshot.skillIds);
     if (skillSelection.invalidIds.length > 0) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_SKILL_INVALID', '数字员工执行快照包含无效的 Skill 身份。', false);
@@ -563,6 +447,7 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
       }
     }
     const executionState = conversationWorkExecutionState(conversation, options.conversationSubmissions.listByConversation(conversation.id));
+    if (executionState.type === 'blocked') throw orchestratorError(executionState.code, executionState.message, false, true);
     if (executionState.type === 'failed') throw orchestratorError(executionState.code, executionState.message, false);
     if (executionState.type === 'outcome_unknown') throw orchestratorError(executionState.code, executionState.message, true);
     if (executionState.type === 'waiting') {
@@ -863,9 +748,10 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     await options.save();
   }
 
+  /** 将执行失败、结果未知和 Provider 阻塞分别落为准确的数字员工终态。 */
   async function failExecution(execution: DigitalEmployeeExecutionRecord, error: unknown): Promise<void> {
     const failure = normalizeOrchestratorError(error);
-    const status = failure.recoveryRequired ? 'blocked' : 'failed';
+    const status = failure.recoveryRequired || failure.blocked ? 'blocked' : 'failed';
     const current = options.executions.getById(execution.id);
     if (!current || current.status === 'delivered' || current.status === 'cancelled') return;
     const retryUnsafe = retryWouldDuplicateUnknownWork(failure.code);
@@ -922,13 +808,22 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     return workspaces;
   }
 
-  function selectEligibleTask(employee: DigitalEmployeeRecord): ZeusTaskRecord | null {
-    return options.tasks.listByProject(employee.projectId).find((task) => taskMatchesEmployee(task, employee)) ?? null;
+  function selectEligibleTask(employee: DigitalEmployeeRecord, filter: AutomationActionConfig['taskFilter']): ZeusTaskRecord | null {
+    return (
+      options.tasks
+        .listByProject(employee.projectId)
+        .find(
+          (task) =>
+            taskMatchesAutomation(task, employee, filter) &&
+            !options.taskWorkManagement.hasExistingTaskWork(task.id) &&
+            !options.executions.listByTask(task.id).some((execution) => ['queued', 'dispatching', 'running', 'waiting', 'delivery_pending'].includes(execution.status)),
+        ) ?? null
+    );
   }
 
-  function taskMatchesEmployee(task: ZeusTaskRecord, employee: DigitalEmployeeRecord): boolean {
+  function taskMatchesAutomation(task: ZeusTaskRecord, employee: DigitalEmployeeRecord, filter: AutomationActionConfig['taskFilter']): boolean {
     if (task.projectId !== employee.projectId || options.isTaskTerminal(task) || task.status === 'completed' || task.status === 'cancelled') return false;
-    const filter = employee.taskFilter;
+    if (!filter) return true;
     if (filter.managementStatuses.length > 0 && !filter.managementStatuses.includes(task.managementStatus)) return false;
     if (filter.taskTypes.length > 0 && !filter.taskTypes.includes(task.taskType)) return false;
     if (filter.requiredTags.length > 0 && filter.requiredTags.some((tag) => !task.tags.includes(tag))) return false;
@@ -949,6 +844,21 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
 
   schedule(2_000);
   return {
+    selectEligibleAutomationTask: (projectId, employeeId, taskId, filter) => {
+      /** 员工身份只用于指派，领取条件来自本次自动化规则。 */
+      const employee = options.employees.ensureProjectEmployee(projectId, employeeId);
+      if (!employee.enabled) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '自动化选择的员工未启用。', false);
+      /** 指定任务与事件任务同样遵守规则筛选条件。 */
+      const task = taskId ? options.tasks.getById(taskId) : selectEligibleTask(employee, filter);
+      return task && taskMatchesAutomation(task, employee, filter) ? task : null;
+    },
+    queueAutomatedAssignment: async (input) => {
+      const task = options.tasks.getById(input.taskId);
+      if (!task || task.projectId !== input.projectId) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_TASK_UNAVAILABLE', '自动化目标任务已不可用。', false);
+      const employee = options.employees.ensureProjectEmployee(input.projectId, input.employeeId);
+      if (!employee.enabled) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '自动化选择的员工未启用。', false);
+      return queueExecution({ employee, task, source: 'automation', sourceRef: input.sourceRef, bypassWorkflow: input.bypassWorkflow, permissionMode: input.permissionMode });
+    },
     kick: () => {
       if (timer) clearTimeout(timer);
       timer = null;
@@ -961,23 +871,6 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
       await active;
     },
   };
-}
-
-function parseWorkerWorkManagementCommand<TInput extends object>(input: {
-  application: WorkManagementCommandApplication;
-  commandType: (typeof workManagementCommandTypes)[keyof typeof workManagementCommandTypes];
-  scopeKind: Extract<CommandScopeKind, 'project' | 'task' | 'settings'>;
-  scopeId: string;
-  operationIdentity: string;
-  input: TInput;
-  actorId: string;
-}): ParsedWorkManagementMutation<TInput> {
-  return input.application.parse<TInput>({
-    value: workManagementEnvelope(input),
-    commandType: input.commandType,
-    scopeKind: input.scopeKind,
-    expectedScopeId: () => input.scopeId,
-  });
 }
 
 function workManagementEnvelope<TInput extends object>(input: {
@@ -1090,32 +983,6 @@ function deliveryStageLabel(stage: 'commit' | 'push' | 'merge'): string {
   return '合入';
 }
 
-function nextScheduledRun(automation: DigitalEmployeeAutomationRecord, from: Date): string | null {
-  const config = automation.triggerConfig;
-  if (automation.triggerKind === 'immediate' || automation.triggerKind === 'once' || isTaskEventTrigger(automation.triggerKind) || automation.triggerKind === 'code_changed') return null;
-  if (automation.triggerKind === 'interval') {
-    const minutes = typeof config.intervalMinutes === 'number' ? Math.max(1, Math.trunc(config.intervalMinutes)) : 60;
-    return new Date(from.getTime() + minutes * 60_000).toISOString();
-  }
-  const hour = typeof config.hour === 'number' ? Math.max(0, Math.min(23, Math.trunc(config.hour))) : 9;
-  const minute = typeof config.minute === 'number' ? Math.max(0, Math.min(59, Math.trunc(config.minute))) : 0;
-  const candidate = new Date(from);
-  candidate.setHours(hour, minute, 0, 0);
-  if (automation.triggerKind === 'daily') {
-    if (candidate.getTime() <= from.getTime()) candidate.setDate(candidate.getDate() + 1);
-    return candidate.toISOString();
-  }
-  const weekday = typeof config.weekday === 'number' ? Math.max(0, Math.min(6, Math.trunc(config.weekday))) : 1;
-  const dayDelta = (weekday - candidate.getDay() + 7) % 7;
-  candidate.setDate(candidate.getDate() + dayDelta);
-  if (candidate.getTime() <= from.getTime()) candidate.setDate(candidate.getDate() + 7);
-  return candidate.toISOString();
-}
-
-function isTaskEventTrigger(value: DigitalEmployeeAutomationRecord['triggerKind']): value is 'task_created' | 'task_updated' | 'task_status_changed' {
-  return value === 'task_created' || value === 'task_updated' || value === 'task_status_changed';
-}
-
 function isCapabilityModel(value: unknown): value is { id: string; model: string; agentKind: 'codex' | 'pi'; available: boolean } {
   return isRecord(value) && typeof value.id === 'string' && typeof value.model === 'string' && (value.agentKind === 'codex' || value.agentKind === 'pi') && typeof value.available === 'boolean';
 }
@@ -1136,43 +1003,26 @@ function filePaths(value: unknown): string[] {
   return value.flatMap((entry) => (typeof entry === 'string' ? [entry] : isRecord(entry) && typeof entry.path === 'string' ? [entry.path] : []));
 }
 
-function readTaskSourceContext(task: ZeusTaskRecord): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(task.sourceContextJson);
-    return isRecord(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function interpolateAutomationText(value: string, event: DigitalEmployeeProjectEvent | null): string {
-  return value
-    .replaceAll('{{event_task_id}}', event?.taskId ?? '')
-    .replaceAll('{{event_type}}', event?.eventType ?? '')
-    .trim();
-}
-
-function readTaskType(value: unknown): ZeusTaskRecord['taskType'] {
-  return value === 'defect' || value === 'optimization' || value === 'requirement' ? value : 'requirement';
-}
-
 interface OrchestratorFailure extends Error {
   code: string;
   recoveryRequired: boolean;
+  blocked: boolean;
 }
 
-function orchestratorError(code: string, message: string, recoveryRequired: boolean): OrchestratorFailure {
-  return Object.assign(new Error(message), { code, recoveryRequired });
+/** 构造可区分结果未知与外部服务阻塞的编排错误。 */
+function orchestratorError(code: string, message: string, recoveryRequired: boolean, blocked = false): OrchestratorFailure {
+  return Object.assign(new Error(message), { code, recoveryRequired, blocked });
 }
 
-function normalizeOrchestratorError(error: unknown): { code: string; message: string; recoveryRequired: boolean } {
+/** 统一数字员工异常，同时保留 Provider 阻塞而非执行失败的语义。 */
+function normalizeOrchestratorError(error: unknown): { code: string; message: string; recoveryRequired: boolean; blocked: boolean } {
   if (error instanceof Error) {
-    const candidate = error as Error & { code?: unknown; recoveryRequired?: unknown };
+    const candidate = error as Error & { code?: unknown; recoveryRequired?: unknown; blocked?: unknown };
     const code = typeof candidate.code === 'string' ? candidate.code : 'ZEUS_DIGITAL_EMPLOYEE_EXECUTION_FAILED';
     const outcomeUnknown = code.includes('OUTCOME_UNKNOWN') || candidate.recoveryRequired === true;
-    return { code, message: error.message || '数字员工执行失败。', recoveryRequired: outcomeUnknown };
+    return { code, message: error.message || '数字员工执行失败。', recoveryRequired: outcomeUnknown, blocked: candidate.blocked === true };
   }
-  return { code: 'ZEUS_DIGITAL_EMPLOYEE_EXECUTION_FAILED', message: '数字员工执行失败。', recoveryRequired: false };
+  return { code: 'ZEUS_DIGITAL_EMPLOYEE_EXECUTION_FAILED', message: '数字员工执行失败。', recoveryRequired: false, blocked: false };
 }
 
 function httpOrchestratorError(code: string, response: { statusCode: number; body: string }, recoveryRequired: boolean): OrchestratorFailure {

@@ -1,7 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { splitZeusSkillIds } from '@zeus/shared';
 import {
-  CommandDefinitionRepository,
   ConversationRepository,
   DigitalEmployeeAutomationRepository,
   DigitalEmployeeExecutionRepository,
@@ -13,7 +12,6 @@ import {
   TaskStageStoreError,
   type AppendAuditLogInput,
   type CreateDigitalEmployeeAutomationInput,
-  type CreateDigitalEmployeeInput,
   type CreateDigitalEmployeeTemplateInput,
   type DigitalEmployeeRecord,
   type DigitalEmployeeExecutionRecord,
@@ -40,7 +38,8 @@ interface DigitalEmployeeRouteOptions {
   automations: DigitalEmployeeAutomationRepository;
   executions: DigitalEmployeeExecutionRepository;
   projectEvents: DigitalEmployeeProjectEventRepository;
-  commandDefinitions: CommandDefinitionRepository;
+  /** 已移交的规则只保留历史读取，写入由统一自动化入口负责。 */
+  isAutomationMigrated(automationId: string): boolean;
   stages: TaskStageRepository;
   conversations: ConversationRepository;
   taskStageApplication: TaskStageApplication;
@@ -52,18 +51,9 @@ interface DigitalEmployeeRouteOptions {
 }
 
 type DeleteInput = { expectedRevision: number };
-type CreateEmployeeBody = { templateId?: string; overrides?: Partial<Omit<CreateDigitalEmployeeInput, 'projectId' | 'templateId'>> } & Partial<Omit<CreateDigitalEmployeeInput, 'projectId'>>;
+/** 项目仅关联已创建员工，不接收身份、职责或经验的独立配置。 */
+type CreateEmployeeBody = { templateId?: string; globalEmployeeId?: string };
 type CreateExecutionBody = { employeeId: string };
-type RetryStagedExecutionBody = { targetEmployeeId: string; expectedExecutionRevision: number };
-type HandoffExecutionBody = {
-  sourceStageId: string;
-  deliverableId: string;
-  deliverableVersion: number;
-  targetEmployeeId: string;
-  expectedExecutionRevision: number;
-  expectedSourceStageRevision: number;
-};
-type ReworkExecutionBody = HandoffExecutionBody & { reason: string };
 type FinalizeExecutionBody = {
   sourceStageId: string;
   deliverableId: string;
@@ -75,9 +65,23 @@ type AdoptLegacyExecutionBody = { expectedExecutionRevision: number };
 
 /** 数字员工的公开读写边界；写操作全部复用工作管理 Command ledger。 */
 export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptions): void {
+  /** 全局员工与项目关联共用同一活动任务判断，终态及已删除任务不会继续占用员工。 */
+  const taskBlocksDeletion = (taskId: string): boolean => {
+    /** 只以当前任务生命周期决定是否保护关联中的活动工作。 */
+    const task = options.tasks.getById(taskId);
+    return Boolean(task && !options.isTaskTerminal(task));
+  };
   options.server.get('/api/digital-employee-templates', async () => options.templates.list());
-  options.server.get('/api/projects/:projectId/digital-employees', async (request: FastifyRequest<{ Params: { projectId: string } }>, reply) => {
+  /** 全局员工目录只返回真实员工，内置创建模板保留在原模板目录。 */
+  options.server.get('/api/digital-employees', async () => options.templates.list().filter((employee) => !employee.builtIn));
+  options.server.get('/api/projects/:projectId/digital-employees', async (request: FastifyRequest<{ Params: { projectId: string }; Querystring: { available?: string } }>, reply) => {
     if (!requireProject(options, request.params.projectId, reply)) return;
+    /** 可指派目录只投影真实全局身份，读取时不创建项目绑定。 */
+    if (request.query.available === 'true')
+      return options.templates
+        .list()
+        .filter((employee) => !employee.builtIn)
+        .flatMap((employee) => options.employees.previewProjectEmployee(request.params.projectId, employee.id) ?? []);
     return options.employees.listByProject(request.params.projectId);
   });
   options.server.get('/api/projects/:projectId/digital-employee-automations', async (request: FastifyRequest<{ Params: { projectId: string } }>, reply) => {
@@ -157,7 +161,7 @@ export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptio
         destinationId: 'digital-employee-template-repository',
         resourceId: `digital_employee_template:${request.params.templateId}`,
         mutateBusinessState: () => {
-          const record = options.templates.delete(request.params.templateId, parsed.input.expectedRevision);
+          const record = options.templates.delete(request.params.templateId, parsed.input.expectedRevision, taskBlocksDeletion);
           audit(options, parsed, 'digital_employee.template.deleted', 'digital_employee_template', record.id, {});
           return record;
         },
@@ -183,7 +187,6 @@ export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptio
         resourceId: `digital_employee:${parsed.operationIdentity}`,
         mutateBusinessState: () => {
           const record = createEmployee(options, project.id, parsed.operationIdentity, parsed.input);
-          validateDeployCommand(options, record.projectId, record.deliveryGrants.allowDeploy, record.deployCommandId);
           validateEmployeeEntrypoint(record);
           audit(options, parsed, 'digital_employee.created', 'digital_employee', record.id, { projectId: project.id, templateId: record.templateId });
           return record;
@@ -207,9 +210,6 @@ export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptio
           scopeKind: 'project',
           expectedScopeId: () => current.projectId,
         });
-        const projectedGrants = { ...current.deliveryGrants, ...parsed.input.deliveryGrants };
-        const projectedDeployCommandId = parsed.input.deployCommandId === undefined ? current.deployCommandId : parsed.input.deployCommandId;
-        validateDeployCommand(options, current.projectId, projectedGrants.allowDeploy, projectedDeployCommandId);
         const mutation = options.application.executeCore({
           parsed,
           destinationId: 'digital-employee-repository',
@@ -237,7 +237,7 @@ export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptio
         destinationId: 'digital-employee-repository',
         resourceId: `digital_employee:${current.id}`,
         mutateBusinessState: () => {
-          const record = options.employees.delete(current.id, parsed.input.expectedRevision);
+          const record = options.employees.delete(current.id, parsed.input.expectedRevision, taskBlocksDeletion);
           audit(options, parsed, 'digital_employee.deleted', 'digital_employee', record.id, { projectId: record.projectId });
           return record;
         },
@@ -251,36 +251,14 @@ export function registerDigitalEmployeeRoutes(options: DigitalEmployeeRouteOptio
   registerExecutionRoutes(options);
 }
 
+/** 旧自动化读取保持可用，新增与已迁移规则写入明确导向统一入口。 */
 function registerAutomationRoutes(options: DigitalEmployeeRouteOptions): void {
-  options.server.post(
-    '/api/projects/:projectId/digital-employee-automations',
-    async (request: FastifyRequest<{ Params: { projectId: string }; Body: WorkManagementMutationRequest<Omit<CreateDigitalEmployeeAutomationInput, 'projectId'>> }>, reply) =>
-      runRoute(reply, async () => {
-        const project = requireProject(options, request.params.projectId, reply);
-        if (!project) return;
-        const parsed = options.application.parse<Omit<CreateDigitalEmployeeAutomationInput, 'projectId'>>({
-          value: request.body,
-          commandType: workManagementCommandTypes.digitalEmployeeAutomationCreate,
-          scopeKind: 'project',
-          expectedScopeId: () => project.id,
-        });
-        const employee = requireEmployee(options, project.id, parsed.input.employeeId);
-        validateAutomationEmployee(employee!, parsed.input.actionKind);
-        const initialCursorSequence = isProjectEventTrigger(parsed.input.triggerKind) ? options.projectEvents.latestSequence(project.id, parsed.input.triggerKind) : 0;
-        const mutation = options.application.executeCore({
-          parsed,
-          destinationId: 'digital-employee-automation-repository',
-          resourceId: `digital_employee_automation:${parsed.operationIdentity}`,
-          mutateBusinessState: () => {
-            const record = options.automations.create({ ...parsed.input, id: parsed.operationIdentity, projectId: project.id }, { initialCursorSequence });
-            audit(options, parsed, 'digital_employee.automation.created', 'digital_employee_automation', record.id, { projectId: project.id, employeeId: record.employeeId, triggerKind: record.triggerKind });
-            return record;
-          },
-        });
-        await finishMutation(options, mutation.replayed, 'digital_employee.automation.changed', { projectId: project.id, automationId: mutation.result.id });
-        options.kick();
-        return reply.code(201).send(mutation.result);
-      }),
+  options.server.post('/api/projects/:projectId/digital-employee-automations', async (request: FastifyRequest<{ Params: { projectId: string } }>, reply) =>
+    runRoute(reply, async () => {
+      const project = requireProject(options, request.params.projectId, reply);
+      if (!project) return;
+      return reply.code(410).send({ error: 'ZEUS_DIGITAL_EMPLOYEE_AUTOMATION_MIGRATED', message: '员工自动化已统一，请通过自动化页面或 /api/automations 创建规则。', automationApi: '/api/automations' });
+    }),
   );
 
   options.server.post(
@@ -405,80 +383,15 @@ function registerExecutionRoutes(options: DigitalEmployeeRouteOptions): void {
     }),
   );
 
-  options.server.post(
-    '/api/tasks/:taskId/digital-employee-executions/:executionId/retries',
-    async (request: FastifyRequest<{ Params: { taskId: string; executionId: string }; Body: WorkManagementMutationRequest<RetryStagedExecutionBody> }>, reply) =>
+  /** 旧阶段入口不再按当前员工配置创建新尝试，统一回到任务指派与数字团队。 */
+  for (const action of ['retries', 'handoffs', 'reworks']) {
+    options.server.post(`/api/tasks/:taskId/digital-employee-executions/:executionId/${action}`, async (request: FastifyRequest<{ Params: { taskId: string; executionId: string } }>, reply) =>
       runRoute(reply, async () => {
-        const current = requireOwnedStagedExecution(options, request.params.taskId, request.params.executionId);
-        const parsed = options.application.parse<RetryStagedExecutionBody>({
-          value: request.body,
-          commandType: workManagementCommandTypes.digitalEmployeeExecutionRetry,
-          scopeKind: 'task',
-          expectedScopeId: () => current.taskId,
-        });
-        const employee = requireEmployee(options, current.projectId, parsed.input.targetEmployeeId)!;
-        if (!employee.enabled) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '数字员工已停用，不能接收失败重试。');
-        const mutation = options.application.executeCore({
-          parsed,
-          destinationId: 'digital-employee-stage-retry',
-          resourceId: `digital_employee_execution:${current.id}`,
-          mutateBusinessState: () => retryStagedExecution(options, current, employee, parsed.input),
-        });
-        await finishMutation(options, mutation.replayed, 'digital_employee.execution.changed', { projectId: current.projectId, taskId: current.taskId, executionId: current.id, reason: 'retry' });
-        options.kick();
-        return reply.code(202).send(mutation.result);
+        requireOwnedStagedExecution(options, request.params.taskId, request.params.executionId);
+        return reply.code(410).send({ error: 'ZEUS_DIGITAL_EMPLOYEE_ASSIGNMENT_MIGRATED', message: '旧阶段交接、返工和新尝试入口已停用；请从任务重新指派数字员工，或按数字团队流程执行。' });
       }),
-  );
-
-  options.server.post(
-    '/api/tasks/:taskId/digital-employee-executions/:executionId/handoffs',
-    async (request: FastifyRequest<{ Params: { taskId: string; executionId: string }; Body: WorkManagementMutationRequest<HandoffExecutionBody> }>, reply) =>
-      runRoute(reply, async () => {
-        const current = requireOwnedStagedExecution(options, request.params.taskId, request.params.executionId);
-        const parsed = options.application.parse<HandoffExecutionBody>({
-          value: request.body,
-          commandType: workManagementCommandTypes.digitalEmployeeExecutionHandoff,
-          scopeKind: 'task',
-          expectedScopeId: () => current.taskId,
-        });
-        const employee = requireEmployee(options, current.projectId, parsed.input.targetEmployeeId)!;
-        if (!employee.enabled) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '数字员工已停用，不能接收下一阶段。');
-        const mutation = options.application.executeCore({
-          parsed,
-          destinationId: 'digital-employee-stage-handoff',
-          resourceId: `digital_employee_execution:${current.id}`,
-          mutateBusinessState: () => handoffExecution(options, current, employee, parsed.input),
-        });
-        await finishMutation(options, mutation.replayed, 'digital_employee.execution.changed', { projectId: current.projectId, taskId: current.taskId, executionId: current.id, reason: 'handoff' });
-        options.kick();
-        return reply.code(202).send(mutation.result);
-      }),
-  );
-
-  options.server.post(
-    '/api/tasks/:taskId/digital-employee-executions/:executionId/reworks',
-    async (request: FastifyRequest<{ Params: { taskId: string; executionId: string }; Body: WorkManagementMutationRequest<ReworkExecutionBody> }>, reply) =>
-      runRoute(reply, async () => {
-        const current = requireOwnedStagedExecution(options, request.params.taskId, request.params.executionId);
-        const parsed = options.application.parse<ReworkExecutionBody>({
-          value: request.body,
-          commandType: workManagementCommandTypes.digitalEmployeeExecutionRework,
-          scopeKind: 'task',
-          expectedScopeId: () => current.taskId,
-        });
-        const employee = requireEmployee(options, current.projectId, parsed.input.targetEmployeeId)!;
-        if (!employee.enabled) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '数字员工已停用，不能接收返工。');
-        const mutation = options.application.executeCore({
-          parsed,
-          destinationId: 'digital-employee-stage-rework',
-          resourceId: `digital_employee_execution:${current.id}`,
-          mutateBusinessState: () => reworkExecution(options, current, employee, parsed.input),
-        });
-        await finishMutation(options, mutation.replayed, 'digital_employee.execution.changed', { projectId: current.projectId, taskId: current.taskId, executionId: current.id, reason: 'rework' });
-        options.kick();
-        return reply.code(202).send(mutation.result);
-      }),
-  );
+    );
+  }
 
   options.server.post(
     '/api/tasks/:taskId/digital-employee-executions/:executionId/finalize',
@@ -548,16 +461,19 @@ function registerExecutionRoutes(options: DigitalEmployeeRouteOptions): void {
 }
 
 function createEmployee(options: DigitalEmployeeRouteOptions, projectId: string, id: string, input: CreateEmployeeBody) {
-  const templateId = typeof input.templateId === 'string' ? input.templateId : undefined;
+  if (Object.keys(input).some((key) => key !== 'globalEmployeeId' && key !== 'templateId')) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_INVALID', '项目只保留员工关联，请在数字员工中修改职责和经验。');
+  /** 新入口表达全局员工身份，原 templateId 入口保留同一创建语义。 */
+  const templateId = typeof input.globalEmployeeId === 'string' ? input.globalEmployeeId : typeof input.templateId === 'string' ? input.templateId : undefined;
   if (templateId) {
     const template = options.templates.getById(templateId);
     if (!template) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_TEMPLATE_NOT_FOUND', '数字员工模板不存在。');
-    return options.employees.createFromTemplate({ projectId, template, overrides: { id, ...(input.overrides ?? {}) } });
+    return options.employees.createFromTemplate({
+      projectId,
+      template,
+      id,
+    });
   }
-  const value = input.overrides ? { ...input.overrides } : { ...input };
-  delete (value as { templateId?: unknown }).templateId;
-  delete (value as { overrides?: unknown }).overrides;
-  return options.employees.create({ ...(value as Omit<CreateDigitalEmployeeInput, 'projectId'>), id, projectId });
+  throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_GLOBAL_UNAVAILABLE', '请选择已经创建的全局数字员工。');
 }
 
 function validateEmployeeEntrypoint(employee: DigitalEmployeeRecord): void {
@@ -690,107 +606,6 @@ async function adoptLegacyExecution(options: DigitalEmployeeRouteOptions, execut
   return updated;
 }
 
-function handoffExecution(options: DigitalEmployeeRouteOptions, execution: DigitalEmployeeExecutionRecord, employee: DigitalEmployeeRecord, input: HandoffExecutionBody) {
-  const source = requireCandidateDeliverable(options, execution, input);
-  const accepted = options.stages.acceptDeliverable(source.deliverable.id, input.expectedSourceStageRevision);
-  const nextStage = accepted.stages.find((stage) => stage.sequence > source.stage.sequence && stage.status !== 'skipped');
-  if (!nextStage) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_FINAL_CONFIRMATION_REQUIRED', '这是最终阶段，请使用“结束协作并进入交付”。', { statusCode: 409 });
-  const assigned = options.stages.assignEmployee(nextStage.id, stageEmployeeInput(nextStage, employee));
-  const assignedStage = assigned.stages.find((stage) => stage.id === nextStage.id)!;
-  const updated = options.executions.advanceStage(execution.id, {
-    expectedRevision: input.expectedExecutionRevision,
-    employee,
-    currentStageId: assignedStage.id,
-    deliveryState: {
-      acceptedDeliverableId: source.deliverable.id,
-      acceptedDeliverableVersion: source.deliverable.version,
-      previousStageId: source.stage.id,
-      handoffAt: new Date().toISOString(),
-    },
-  });
-  options.taskEvents.create({
-    taskId: execution.taskId,
-    eventType: 'task.digital_employee.handoff.created',
-    title: `阶段交接给${employee.name}`,
-    payload: {
-      executionId: execution.id,
-      sourceStageId: source.stage.id,
-      targetStageId: assignedStage.id,
-      deliverableId: source.deliverable.id,
-      deliverableVersion: source.deliverable.version,
-      employeeId: employee.id,
-    },
-  });
-  return updated;
-}
-
-function retryStagedExecution(options: DigitalEmployeeRouteOptions, execution: DigitalEmployeeExecutionRecord, employee: DigitalEmployeeRecord, input: RetryStagedExecutionBody) {
-  if (execution.revision !== input.expectedExecutionRevision) {
-    throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_REVISION_CONFLICT', '数字员工协作执行已更新，请刷新后重试。', { statusCode: 409 });
-  }
-  if (execution.status !== 'failed' && execution.status !== 'blocked') {
-    throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_EXECUTION_NOT_RETRYABLE', '只有失败或阻塞的阶段执行可以创建新尝试。', { statusCode: 409 });
-  }
-  if (execution.deliveryState.retryUnsafe === true) {
-    throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_RECOVERY_REQUIRED', '该执行的外部结果未知，不能自动创建新尝试；请先核对关联会话、Git 或部署现场。', { statusCode: 409 });
-  }
-  if (!execution.currentStageId) throw new DigitalEmployeeStoreError('ZEUS_TASK_STAGE_NOT_FOUND', '失败执行缺少当前阶段身份。', { statusCode: 409 });
-  const currentStage = options.stages.getStage(execution.currentStageId);
-  if (!currentStage || currentStage.taskId !== execution.taskId) throw new DigitalEmployeeStoreError('ZEUS_TASK_STAGE_NOT_FOUND', '失败执行的当前阶段不存在。', { statusCode: 404 });
-  const assigned = options.stages.assignEmployee(currentStage.id, stageEmployeeInput(currentStage, employee));
-  const assignedStage = assigned.stages.find((stage) => stage.id === currentStage.id)!;
-  const updated = options.executions.advanceStage(execution.id, {
-    expectedRevision: input.expectedExecutionRevision,
-    employee,
-    currentStageId: assignedStage.id,
-    deliveryState: {
-      retryOfExecutionAttempt: execution.attempt,
-      retryOfErrorCode: execution.errorCode,
-      retryAt: new Date().toISOString(),
-    },
-  });
-  options.taskEvents.create({
-    taskId: execution.taskId,
-    eventType: 'task.digital_employee.stage_retry.created',
-    title: `失败阶段已交给${employee.name}重新尝试`,
-    payload: { executionId: execution.id, stageId: assignedStage.id, employeeId: employee.id, previousAttempt: execution.attempt, nextAttempt: updated.attempt },
-  });
-  return updated;
-}
-
-function reworkExecution(options: DigitalEmployeeRouteOptions, execution: DigitalEmployeeExecutionRecord, employee: DigitalEmployeeRecord, input: ReworkExecutionBody) {
-  const source = requireCandidateDeliverable(options, execution, input);
-  const changed = options.stages.requestChanges(source.deliverable.id, {
-    expectedStageRevision: input.expectedSourceStageRevision,
-    reason: requiredText(input.reason, 'reason', 4_000),
-    // 数字员工的“继续完善”只重做当前阶段交付物。普通阶段代码审查的
-    // “要求修改”仍沿用退回实施阶段的既有领域语义。
-    stayOnStage: true,
-  });
-  const currentStage = changed.stages.find((stage) => stage.id === source.stage.id);
-  if (!currentStage) throw new DigitalEmployeeStoreError('ZEUS_TASK_STAGE_NOT_FOUND', '返工阶段不存在。', { statusCode: 404 });
-  const assigned = options.stages.assignEmployee(currentStage.id, stageEmployeeInput(currentStage, employee));
-  const assignedStage = assigned.stages.find((stage) => stage.id === currentStage.id)!;
-  const updated = options.executions.advanceStage(execution.id, {
-    expectedRevision: input.expectedExecutionRevision,
-    employee,
-    currentStageId: assignedStage.id,
-    deliveryState: {
-      reworkOfDeliverableId: source.deliverable.id,
-      reworkOfDeliverableVersion: source.deliverable.version,
-      reason: input.reason.trim(),
-      reworkAt: new Date().toISOString(),
-    },
-  });
-  options.taskEvents.create({
-    taskId: execution.taskId,
-    eventType: 'task.digital_employee.rework.created',
-    title: `阶段返工已交给${employee.name}`,
-    payload: { executionId: execution.id, stageId: assignedStage.id, deliverableId: source.deliverable.id, employeeId: employee.id, reason: input.reason.trim() },
-  });
-  return updated;
-}
-
 function finalizeExecution(options: DigitalEmployeeRouteOptions, execution: DigitalEmployeeExecutionRecord, input: FinalizeExecutionBody) {
   const source = requireCandidateDeliverable(options, execution, input);
   const workflow = options.stages.getWorkflowByTask(execution.taskId);
@@ -811,7 +626,7 @@ function finalizeExecution(options: DigitalEmployeeRouteOptions, execution: Digi
 function requireCandidateDeliverable(
   options: DigitalEmployeeRouteOptions,
   execution: DigitalEmployeeExecutionRecord,
-  input: Pick<HandoffExecutionBody, 'sourceStageId' | 'deliverableId' | 'deliverableVersion' | 'expectedExecutionRevision'>,
+  input: Pick<FinalizeExecutionBody, 'sourceStageId' | 'deliverableId' | 'deliverableVersion' | 'expectedExecutionRevision'>,
 ) {
   if (execution.status !== 'waiting') throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_EXECUTION_ACTIVE', '当前阶段尚未完成，不能交接或返工。', { statusCode: 409 });
   if (execution.revision !== input.expectedExecutionRevision) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_REVISION_CONFLICT', '协作执行已更新，请刷新后重试。', { statusCode: 409 });
@@ -856,7 +671,7 @@ function readCollaborationProjection(options: DigitalEmployeeRouteOptions, taskI
     blockingReasons.push(
       execution.deliveryState.retryUnsafe === true
         ? { code: 'recovery_required', message: '当前尝试的外部结果未知；创建新尝试前必须先核对关联会话、Git 或部署现场。' }
-        : { code: 'failed_attempt_retry_available', message: '失败尝试已保留；请选择同一或另一位数字员工创建新尝试。' },
+        : { code: 'failed_attempt_retry_available', message: '失败尝试已保留；请从任务重新指派数字员工，或使用数字团队流程。' },
     );
   }
   return {
@@ -870,22 +685,6 @@ function readCollaborationProjection(options: DigitalEmployeeRouteOptions, taskI
       !['queued', 'dispatching', 'running', 'waiting', 'delivery_pending'].includes(execution.status),
     ),
   };
-}
-
-function requiredText(value: unknown, label: string, maximum: number): string {
-  if (typeof value !== 'string' || !value.trim()) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_INVALID', `${label} 不能为空。`);
-  if (value.length > maximum) throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_INVALID', `${label} 不能超过 ${maximum} 个字符。`);
-  return value.trim();
-}
-
-function validateDeployCommand(options: DigitalEmployeeRouteOptions, projectId: string, allowDeploy: boolean, commandId: string | null | undefined): void {
-  // v2 的 deliveryGrants 只是显式管理动作的权限上限，不再隐含自动部署路线。
-  // 仅在旧配置仍明确引用部署命令时保留兼容校验。
-  if (!allowDeploy || !commandId) return;
-  const command = options.commandDefinitions.getById(commandId);
-  if (!command || !command.enabled || (command.scope === 'project' && command.projectId !== projectId)) {
-    throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_DEPLOY_COMMAND_INVALID', '部署命令不存在、已停用或不属于当前项目。');
-  }
 }
 
 function validateAutomationEmployee(employee: DigitalEmployeeRecord, actionKind: CreateDigitalEmployeeAutomationInput['actionKind']): void {
@@ -914,7 +713,7 @@ function requireTask(options: DigitalEmployeeRouteOptions, taskId: string, reply
 }
 
 function requireEmployee(options: DigitalEmployeeRouteOptions, projectId: string, employeeId: string, reply?: FastifyReply): DigitalEmployeeRecord | undefined {
-  const employee = employeeId ? options.employees.getById(employeeId) : undefined;
+  const employee = employeeId ? options.employees.resolveProjectEmployee(projectId, employeeId) : undefined;
   if (!employee || employee.projectId !== projectId) {
     if (reply) void reply.code(404).send({ error: 'ZEUS_DIGITAL_EMPLOYEE_NOT_FOUND', message: '数字员工不存在。' });
     else throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_NOT_FOUND', '数字员工不存在。', { statusCode: 404 });
@@ -923,11 +722,23 @@ function requireEmployee(options: DigitalEmployeeRouteOptions, projectId: string
   return employee;
 }
 
+/** 所有旧规则写入共用移交门禁，历史目录读取不经过该函数。 */
 function requireAutomation(options: DigitalEmployeeRouteOptions, projectId: string, automationId: string, reply?: FastifyReply) {
   const automation = options.automations.getById(automationId);
   if (!automation || automation.projectId !== projectId) {
     if (reply) void reply.code(404).send({ error: 'ZEUS_DIGITAL_EMPLOYEE_AUTOMATION_NOT_FOUND', message: '数字员工自动化不存在。' });
     else throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_AUTOMATION_NOT_FOUND', '数字员工自动化不存在。', { statusCode: 404 });
+    return undefined;
+  }
+  if (options.isAutomationMigrated(automation.id)) {
+    if (reply)
+      void reply.code(410).send({
+        error: 'ZEUS_DIGITAL_EMPLOYEE_AUTOMATION_MIGRATED',
+        message: '该规则已移交统一自动化，请通过自动化页面或统一 API 修改、删除或运行。',
+        automationId: automation.id,
+        automationApi: `/api/automations/${encodeURIComponent(automation.id)}`,
+      });
+    else throw new DigitalEmployeeStoreError('ZEUS_DIGITAL_EMPLOYEE_AUTOMATION_MIGRATED', '该规则已移交统一自动化，请使用 /api/automations。', { statusCode: 410 });
     return undefined;
   }
   return automation;

@@ -22,7 +22,7 @@ import type {
   TaskWorkspaceSnapshotResponse,
   TaskWorkspacesSnapshot,
 } from '../../session/sessionTypes.js';
-import type { CodexUsageAnalyticsSnapshot, CodexUsageRange, CodexUsageSummarySnapshot, UsageAnalyticsSnapshot, UsageOverviewSnapshot } from '@zeus/shared';
+import type { CodexSubscriptionConnectionDiagnostic, CodexUsageAnalyticsSnapshot, CodexUsageRange, CodexUsageSummarySnapshot, UsageAnalyticsSnapshot, UsageOverviewSnapshot } from '@zeus/shared';
 import type { CodexConfigActivationResult, CodexConfigImportPreview, CodexConfigImportResult, CodexLegacyImportResult, CodexLegacyImportSnapshot, SkillCatalog, SkillInstallResult, SkillInstallSource } from './codexContracts.js';
 import { buildCodexPublicCommandRequest, codexPublicClientCommandTypes, codexPublicClientScopeIds } from './codexPublicCommandClient.js';
 import { buildConversationStartCommandRequest, conversationStartClientCommandTypes } from '../conversations/conversationStartCommandClient.js';
@@ -32,11 +32,32 @@ import { type LocalApiTransport, ZeusApiError } from '../../transport/localApiTr
 /** 新运行实例就绪后通知当前窗口刷新模型选择器，保留正在编辑的草稿。 */
 export const codexCapabilitiesChangedEvent = 'zeus:codex-capabilities-changed';
 
+/** Codex 更新阶段通过窗口事件同步给设置页，不创建第二条轮询链路。 */
+export const codexRuntimeUpdateProgressEvent = 'zeus:codex-runtime-update-progress';
+
+/** 后台只读检查的结果与设置页共用，不代表已经安装或验证兼容性。 */
+export const codexRuntimeUpdateCheckedEvent = 'zeus:codex-runtime-update-checked';
+
+/** 只接受服务端定义的更新阶段。 */
+export function isCodexRuntimeUpdateStage(value: unknown): value is CodexRuntimeUpdateProgress['stage'] {
+  return ['checking', 'waiting', 'preparing', 'downloading', 'installing', 'verifying', 'switching', 'completed'].includes(String(value));
+}
+
+/** 设置页只接收服务端确认完成的真实更新阶段。 */
+export interface CodexRuntimeUpdateProgress {
+  /** 当前更新阶段。 */
+  stage: 'checking' | 'waiting' | 'preparing' | 'downloading' | 'installing' | 'verifying' | 'switching' | 'completed';
+  /** 当前阶段有真实总量时返回 0 到 1，否则不伪造数值。 */
+  progress: number | null;
+}
+
 export interface CodexApiClient {
   loadAgents: () => Promise<AgentCatalogSnapshot>;
   loadCodexTaskPushCapabilities: (projectId: string, taskId: string) => Promise<CodexTaskPushCapabilities>;
   refreshTaskPushRepositoryRemote: (projectId: string, taskId: string, repositoryId: string) => Promise<CodexTaskRepositoryCapability>;
   loadCodexAccount: () => Promise<CodexAccountSnapshot>;
+  /** 刷新订阅凭据与模型目录，不发送推理请求。 */
+  diagnoseCodexConnection: () => Promise<CodexSubscriptionConnectionDiagnostic>;
   loadCodexUsageSummary: () => Promise<CodexUsageSummarySnapshot>;
   loadUsageOverview: (refresh?: 'if-stale' | 'force') => Promise<UsageOverviewSnapshot>;
   loadUsageAnalytics: (input: { range: CodexUsageRange; projectId?: string; model?: string }) => Promise<UsageAnalyticsSnapshot>;
@@ -169,6 +190,7 @@ export function createCodexApiClient(transport: LocalApiTransport): CodexApiClie
       });
     },
     loadCodexAccount: () => transport.request<CodexAccountSnapshot>('/api/codex/account'),
+    diagnoseCodexConnection: () => transport.request<CodexSubscriptionConnectionDiagnostic>('/api/codex/connection/diagnose', { method: 'POST', body: '{}' }),
     loadCodexUsageSummary: () => transport.request<CodexUsageSummarySnapshot>('/api/codex/usage-summary'),
     loadUsageOverview,
     loadUsageAnalytics: (input) => {
@@ -493,6 +515,13 @@ function normalizeLegacyCodexUsageOverview(analytics: CodexUsageAnalyticsSnapsho
   const sevenDayStart = localDateKey(sevenDayStartDate);
   const dailyAccount = analytics.official.dailyUsageBuckets?.filter((bucket) => bucket.startDate >= sevenDayStart && bucket.startDate <= today).map((bucket) => ({ date: bucket.startDate, totalTokens: bucket.tokens })) ?? null;
   const todayLocal = analytics.local.daily.find((bucket) => bucket.date === today) ?? emptyLocalUsageTotals();
+  /** 旧后台只返回七日分析；更长范围沿用已知下限并明确标记为不完整。 */
+  const overviewRanges = {
+    today: { local: todayLocal, costBreakdown: [], complete: false },
+    '7d': { local: analytics.local.totals, costBreakdown: [], complete: false },
+    '30d': { local: analytics.local.totals, costBreakdown: [], complete: false },
+    all: { local: analytics.local.totals, costBreakdown: [], complete: false },
+  };
   return {
     providers: [
       {
@@ -510,12 +539,7 @@ function normalizeLegacyCodexUsageOverview(analytics: CodexUsageAnalyticsSnapsho
         accountTodayTokens: dailyAccount?.find((bucket) => bucket.date === today)?.totalTokens ?? null,
         accountSevenDayTokens: dailyAccount && dailyAccount.length > 0 ? dailyAccount.reduce((sum, bucket) => sum + bucket.totalTokens, 0) : null,
         dailyAccount,
-        todayLocal,
-        todayCostBreakdown: [],
-        todayLocalComplete: false,
-        sevenDayLocal: analytics.local.totals,
-        sevenDayCostBreakdown: [],
-        sevenDayLocalComplete: false,
+        overviewRanges,
         dailyLocal: analytics.local.daily,
         collectionStartedAt: analytics.local.collectionStartedAt,
         updatedAt: analytics.updatedAt,
@@ -539,6 +563,7 @@ function emptyLocalUsageTotals() {
     conversationCount: 0,
     turnCount: 0,
     cacheHitRate: null,
+    outputTokensPerSecond: null,
     estimatedCredits: null,
     apiEquivalentUsd: null,
     cacheSavingsUsd: null,

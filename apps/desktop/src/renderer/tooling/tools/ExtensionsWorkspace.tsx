@@ -2,8 +2,10 @@ import { McpServiceCatalog } from './McpServiceCatalog.js';
 import { MotionPresence } from '../toolPageHost.js';
 import { Collapsible } from '../toolPageHost.js';
 import { FormDialog } from '../toolPageHost.js';
-import { reportApplicationError } from '../toolPageHost.js';
+
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { formatVisibleApplicationError } from '../toolPageHost.js';
+
 import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { ShieldCheckIcon as ShieldCheck } from '@phosphor-icons/react/dist/csr/ShieldCheck';
@@ -775,7 +777,7 @@ function connectionLabel(state: PluginDescriptor['plugin']['connectionState'], z
   return zh ? '不兼容' : 'Incompatible';
 }
 
-/** 显示当前语言的原因，并保留可展开的原始详情。 */
+/** 将插件错误转换为当前页面的本地化提示。 */
 function message(error: unknown, language: 'zh-CN' | 'en'): string {
-  return reportApplicationError(error, { language });
+  return formatVisibleApplicationError(error, language);
 }

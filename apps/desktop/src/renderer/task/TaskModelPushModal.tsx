@@ -13,16 +13,16 @@ import {
   type TaskPushRelatedContextOption,
   type TaskPushSupplementalAttachment,
 } from '@zeus/shared';
-import type { ProjectModelServiceTierPreference, TaskRecord } from '../apiClient.js';
+import type { TaskRecord } from '../apiClient.js';
 import type {
   CodexConversationCapabilities,
   CodexTaskPushCapabilities,
-  CodexTaskPushModelCapability,
   NativeConversationAttachment,
   NativePermissionMode,
   NativeServiceTierSelection,
   TaskPushSupplementalAttachmentDraft,
   TaskPushSupplementalAttachmentInput,
+  TaskWorkspaceIndexCollection,
 } from '../session/sessionTypes.js';
 import { useConversationInputResources } from '../session/useConversationInputResources.js';
 import { ConversationPendingAttachmentImages } from '../session/ConversationResources.js';
@@ -34,13 +34,12 @@ import { ModalPortal } from '../ui/ModalPortal.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { presentModelOptions } from '../modelOptionPresentation.js';
-import { projectModelServiceTierSelection } from '../session/projectServiceTierPreferences.js';
 import { TaskPushSupplementalAttachmentCards } from './TaskPushSupplementalAttachmentCards.js';
 import { SkillSelector } from '../features/skills/SkillSelector.js';
 import type { CodexApiClient } from '../features/codex/codexApiClient.js';
 
 export interface TaskModelPushForm {
-  /** 缺省跟随项目，null 显式默认。 */
+  /** 缺省使用模型默认，具体数值仅用于本次工作。 */
   contextCapacityTokens?: number | null;
   stageId?: string;
   model: string;
@@ -532,7 +531,7 @@ export function readTaskModelPushPreferences(storage: Pick<Storage, 'getItem'> |
   if (!storage) return null;
   try {
     /** 推送专属记录不受打开会话或修改会话参数影响。 */
-    const value = JSON.parse(storage.getItem(`${preferencesKeyPrefix}${encodeURIComponent(projectId)}`) ?? 'null') as Partial<TaskModelPushPreferences> | null;
+    const value = JSON.parse(storage.getItem(`${preferencesKeyPrefix}global`) ?? 'null') as Partial<TaskModelPushPreferences> | null;
     if (
       value?.model &&
       typeof value.model === 'string' &&
@@ -552,7 +551,7 @@ export function readTaskModelPushPreferences(storage: Pick<Storage, 'getItem'> |
   } catch {
     // 损坏的推送记录不阻断已有会话偏好的恢复。
   }
-  /** 旧项目继续沿用已有默认值，速度仍由项目中的模型速度偏好决定。 */
+  /** 当前任务优先复用全局操作偏好，速度保持标准档位。 */
   const current = readConversationRuntimePreferences(storage, projectId, 'task_development');
   if (current?.model) {
     return {
@@ -578,7 +577,7 @@ export function writeTaskModelPushPreferences(storage: Pick<Storage, 'getItem' |
     ...(form.workspaceModeSelected ? { workspaceMode: form.workspaceMode } : {}),
   });
   storage.setItem(
-    `${preferencesKeyPrefix}${encodeURIComponent(projectId)}`,
+    `${preferencesKeyPrefix}global`,
     JSON.stringify({
       model: form.model,
       effort: form.effort,
@@ -589,12 +588,7 @@ export function writeTaskModelPushPreferences(storage: Pick<Storage, 'getItem' |
   );
 }
 
-export function resolveTaskModelPushInitialForm(
-  capabilities: CodexTaskPushCapabilities,
-  remembered: TaskModelPushPreferences | null,
-  serviceTierPreferences: readonly ProjectModelServiceTierPreference[] = [],
-  skillId = '',
-): TaskModelPushForm {
+export function resolveTaskModelPushInitialForm(capabilities: CodexTaskPushCapabilities, remembered: TaskModelPushPreferences | null, skillId = ''): TaskModelPushForm {
   const availableModels = capabilities.models.filter((model) => model.available !== false);
   const rememberedModel = resolveModelCapability(availableModels, remembered?.model);
   // 已记住或已配置的模型失效时等待用户明确选择。
@@ -602,9 +596,7 @@ export function resolveTaskModelPushInitialForm(
   const selectedModel = requestedModel ? resolveModelCapability(availableModels, requestedModel) : availableModels[0];
   const effort = rememberedModel && remembered && selectedModel?.supportedReasoningEfforts.includes(remembered.effort) ? remembered.effort : (selectedModel?.defaultReasoningEffort ?? selectedModel?.supportedReasoningEfforts[0] ?? '');
   // 模型目录未就绪不能阻断本地仓库表单，模型到达后由既有选择器补齐模型能力。
-  const normalizedServiceTier = selectedModel
-    ? normalizeServiceTierSelection(projectModelServiceTierSelection(serviceTierPreferences, selectedModel), selectedModel)
-    : { selection: remembered?.serviceTier ?? { type: 'standard' as const }, downgraded: false };
+  const normalizedServiceTier = selectedModel ? normalizeServiceTierSelection(remembered?.serviceTier ?? { type: 'standard' }, selectedModel) : { selection: remembered?.serviceTier ?? { type: 'standard' as const }, downgraded: false };
   const firstAvailableEnvironment = capabilities.existingEnvironments?.find((environment) => environment.available);
   return {
     model: selectedModel?.id ?? requestedModel ?? '',
@@ -630,7 +622,7 @@ export function resolveTaskModelPushInitialForm(
             // 来源默认使用真实当前本地分支，远端来源始终由用户明确选择。
             sourceRef: currentSourceRef,
             branchName: repository.suggestedBranchName,
-            includeLocalChanges: false,
+            includeLocalChanges: !repository.headSha,
           },
         ];
       }),
@@ -668,11 +660,11 @@ export function reconcileTaskPushRepositories(form: TaskModelPushForm, capabilit
         return [
           repository.id,
           previous
-            ? { ...previous, sourceRef: sourceAvailable ? previous.sourceRef : '', includeLocalChanges: sourceAvailable && previous.includeLocalChanges }
+            ? { ...previous, sourceRef: sourceAvailable ? previous.sourceRef : '', includeLocalChanges: sourceAvailable && (!repository.headSha || previous.includeLocalChanges) }
             : {
                 sourceRef: repository.sourceRefs.find((source) => source.current)?.ref ?? '',
                 branchName: repository.suggestedBranchName,
-                includeLocalChanges: false,
+                includeLocalChanges: !repository.headSha,
               },
         ];
       }),
@@ -688,14 +680,14 @@ export function TaskModelPushModal(props: {
   projectName?: string;
   capabilities: CodexTaskPushCapabilities | null;
   runtimeCapabilities: CodexConversationCapabilities | null;
-  serviceTierPreferences: readonly ProjectModelServiceTierPreference[];
   form: TaskModelPushForm;
   status: TaskModelPushModalStatus;
   refreshingRepositoryId: string | null;
   error: string | null;
   skillClient: Pick<CodexApiClient, 'loadSkills'> | null;
+  /** 已有环境的仓库配置独立于代码交付，新增成员仅由用户明确补入。 */
+  environmentClient?: Pick<CodexApiClient, 'loadTaskGitWorkspaceIndex' | 'attachTaskRepository'> | null;
   onChange: Dispatch<SetStateAction<TaskModelPushForm>>;
-  onServiceTierPreferenceChange: (model: CodexTaskPushModelCapability, selection: NativeServiceTierSelection) => void | Promise<void>;
   onRefreshRepository: (repositoryId: string) => void;
   /** 本地发现与各仓远端拉取分别操作。 */
   onRefreshLocalRepositories: () => void;
@@ -708,6 +700,34 @@ export function TaskModelPushModal(props: {
 }) {
   /** 退出时立即停用附件输入与焦点恢复。 */
   const interactionOpen = usePresenceOpen() && props.open;
+  /** 已有环境使用权威成员清单，不因项目新增仓库自动扩容。 */
+  const [environmentRepositoryIndex, setEnvironmentRepositoryIndex] = useState<TaskWorkspaceIndexCollection | null>(null);
+  /** 补入结果通过重新读取索引确认，不在前端拼接成员。 */
+  const [environmentRepositoryRevision, setEnvironmentRepositoryRevision] = useState(0);
+  /** 补入期间锁定环境与表单，避免请求中途切换任务。 */
+  const [attachingRepositoryId, setAttachingRepositoryId] = useState<string | null>(null);
+  /** 配置读取失败只影响可选补入，不阻断原有环境继续工作。 */
+  const [environmentRepositoryError, setEnvironmentRepositoryError] = useState<unknown>(null);
+  /** 在 React 更新前阻止同一补入操作重复进入。 */
+  const attachmentPendingRef = useRef(false);
+  useEffect(() => {
+    setEnvironmentRepositoryIndex(null);
+    setEnvironmentRepositoryError(null);
+    if (!interactionOpen || !props.task || !props.environmentClient || props.form.workspaceMode !== 'worktree' || props.form.taskBranchMode !== 'existing' || !props.form.environmentId) return;
+    /** 读取绑定到当前任务和环境；退出或切换后丢弃旧响应。 */
+    let cancelled = false;
+    void props.environmentClient.loadTaskGitWorkspaceIndex(props.task.id).then(
+      (index) => {
+        if (!cancelled) setEnvironmentRepositoryIndex(index);
+      },
+      (reason: unknown) => {
+        if (!cancelled) setEnvironmentRepositoryError(reason);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [interactionOpen, props.task?.id, props.environmentClient, props.form.workspaceMode, props.form.taskBranchMode, props.form.environmentId, environmentRepositoryRevision]);
   const commonSources = useMemo(() => resolveTaskPushCommonSources(props.capabilities?.repositories ?? []), [props.capabilities?.repositories]);
   /** 窄窗口由正文统一滚动，接入模型返回后恢复原位置。 */
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -737,6 +757,7 @@ export function TaskModelPushModal(props: {
   const repositoryRefreshError = props.capabilities?.repositories.find((repository) => repository.remoteRefreshError)?.remoteRefreshError ?? null;
   const resourceInputDisabled = !interactionOpen || props.status === 'submitting';
   const inputResources = useConversationInputResources({
+    attachments: props.form.supplementalAttachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef: supplementalTextareaRef,
     text: props.form.supplementalInfo,
@@ -763,7 +784,9 @@ export function TaskModelPushModal(props: {
   const selectedModel = requestedModel?.available === false ? undefined : requestedModel;
   if (!props.open || !props.task) return null;
   const zh = props.language === 'zh-CN';
-  const busy = props.status === 'submitting' || inputResources.processing;
+  /** 模型等级始终保留位置，能力加载与模型切换只改变选项和可用状态。 */
+  const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts ?? [];
+  const busy = props.status === 'submitting' || inputResources.processing || attachingRepositoryId !== null;
   const codexLoginRequired = selectedModel?.agentKind !== 'pi' && selectedModel?.sourceId === 'codex' && codexAccount?.requiresOpenaiAuth === true && !codexAccount.signedIn;
   /** 只有已完成的能力查询才能判定需要接入；查询失败保持为失败。 */
   const modelSetupRequired = Boolean(props.capabilities) && (!selectedModel || codexLoginRequired);
@@ -773,6 +796,27 @@ export function TaskModelPushModal(props: {
   const existingEnvironments = props.capabilities?.existingEnvironments ?? [];
   const availableEnvironments = existingEnvironments.filter((environment) => environment.available);
   const selectedEnvironment = existingEnvironments.find((environment) => environment.id === props.form.environmentId);
+  /** 只在当前选中环境展示可补入项，避免重复列出其他历史环境。 */
+  const pendingEnvironmentRepositories = environmentRepositoryIndex?.pendingRepositories?.filter((repository) => repository.environmentId === props.form.environmentId) ?? [];
+  /** 成员优先采用补入后重读的权威索引。 */
+  const environmentRepositories = environmentRepositoryIndex?.items.filter((workspace) => workspace.environmentId === props.form.environmentId) ?? selectedEnvironment?.repositories ?? [];
+  /** 补入复用既有耐久 Git 命令入口；失败保留错误且不自动重试。 */
+  async function attachEnvironmentRepository(repositoryId: string): Promise<void> {
+    if (!props.task || !props.environmentClient || !selectedEnvironment?.available || busy || attachmentPendingRef.current) return;
+    attachmentPendingRef.current = true;
+    setAttachingRepositoryId(repositoryId);
+    setEnvironmentRepositoryError(null);
+    try {
+      await props.environmentClient.attachTaskRepository(props.task.id, { environmentId: selectedEnvironment.id, repositoryId });
+      setEnvironmentRepositoryRevision((revision) => revision + 1);
+      props.onRefreshLocalRepositories();
+    } catch (reason: unknown) {
+      setEnvironmentRepositoryError(reason);
+    } finally {
+      attachmentPendingRef.current = false;
+      setAttachingRepositoryId(null);
+    }
+  }
   const selectedCommonSourceKey = resolveSelectedTaskPushCommonSourceKey(repositories, props.form.repositorySelections, commonSources);
   const selectedCommonSource = commonSources.find((source) => source.key === selectedCommonSourceKey);
   const hasRepositorySourceSelection = repositories.some((repository) => Boolean(props.form.repositorySelections[repository.id]?.sourceRef));
@@ -797,7 +841,7 @@ export function TaskModelPushModal(props: {
 
   function onModelChange(model: string): void {
     const capability = resolveModelCapability(runtimeCapabilities?.models, model);
-    const normalizedTier = normalizeServiceTierSelection(projectModelServiceTierSelection(props.serviceTierPreferences, capability), capability);
+    const normalizedTier = normalizeServiceTierSelection({ type: 'standard' }, capability);
     props.onChange({
       ...props.form,
       model: capability?.id ?? model,
@@ -833,6 +877,7 @@ export function TaskModelPushModal(props: {
     <ModalPortal rootClassName="task-model-push-portal-root" backdropClassName="task-model-push-backdrop" dismissDisabled={busy} onDismiss={props.onClose} role="dialog" aria-labelledby="task-model-push-title">
       <form
         className="task-model-push-modal zeus-solid-form-surface"
+        aria-busy={props.status === 'loading' || undefined}
         onSubmit={props.onSubmit}
         onFocusCapture={(event) => {
           /** 保存接入按钮或具备稳定标识的输入框，返回时保持键盘位置。 */
@@ -873,8 +918,9 @@ export function TaskModelPushModal(props: {
           >
             <div className="task-model-push-toolbar">
               <strong id="task-model-push-model-heading">{zh ? '模型选择' : 'Model selection'}</strong>
+              {/* 加载时保留接入按钮的布局，只禁用交互，避免工具栏高度变化。 */}
               {props.onConnectModel && !modelSetupRequired ? (
-                <Button className="task-model-connect-link" variant="secondary" size="compact" onClick={props.onConnectModel} disabled={busy}>
+                <Button className="task-model-connect-link" variant="secondary" size="compact" onClick={props.onConnectModel} disabled={busy || props.status === 'loading'}>
                   {zh ? '接入其他模型' : 'Connect another model'}
                 </Button>
               ) : null}
@@ -915,29 +961,28 @@ export function TaskModelPushModal(props: {
                 <ZeusSelect
                   size="regular"
                   ariaLabel={zh ? '上下文容量' : 'Context capacity'}
-                  value={contextCapacitySelectionValue(props.form.contextCapacityTokens, props.capabilities?.projectContextCapacityTokens)}
+                  value={contextCapacitySelectionValue(props.form.contextCapacityTokens)}
                   options={contextCapacitySelectionOptions(selectedModel?.contextCapacity, zh)}
                   disabled={busy}
                   onChange={(value) => props.onChange((current) => ({ ...current, contextCapacityTokens: contextCapacitySelectionFromValue(value) }))}
                 />
               </label>
-              {selectedModel?.supportedReasoningEfforts.length ? (
-                <label className="task-model-push-effort-field">
-                  <span>{zh ? '模型等级' : 'Reasoning effort'}</span>
-                  <ZeusSelect
-                    size="regular"
-                    ariaLabel={zh ? '模型等级' : 'Reasoning effort'}
-                    value={props.form.effort}
-                    options={selectedModel.supportedReasoningEfforts.map((effort) => ({
-                      value: effort,
-                      label: effort,
-                    }))}
-                    onChange={(effort) => props.onChange({ ...props.form, effort })}
-                    disabled={busy || Boolean(props.form.stageId)}
-                    searchable={false}
-                  />
-                </label>
-              ) : null}
+              <label className="task-model-push-effort-field">
+                <span>{zh ? '模型等级' : 'Reasoning effort'}</span>
+                <ZeusSelect
+                  size="regular"
+                  ariaLabel={zh ? '模型等级' : 'Reasoning effort'}
+                  value={props.form.effort}
+                  options={supportedReasoningEfforts.map((effort) => ({
+                    value: effort,
+                    label: effort,
+                  }))}
+                  triggerLabel={!selectedModel ? (props.status === 'loading' ? (zh ? '加载中…' : 'Loading…') : '—') : supportedReasoningEfforts.length === 0 ? (zh ? '不支持' : 'Not supported') : undefined}
+                  onChange={(effort) => props.onChange({ ...props.form, effort })}
+                  disabled={supportedReasoningEfforts.length === 0 || busy || Boolean(props.form.stageId)}
+                  searchable={false}
+                />
+              </label>
               <label>
                 <span>{zh ? '速度' : 'Speed'}</span>
                 <ZeusSelect
@@ -953,7 +998,6 @@ export function TaskModelPushModal(props: {
                       serviceTier: selection,
                       serviceTierDowngraded: !selectedModel.serviceTiers.some((tier) => tier.id === 'priority') && selection.type === 'catalog',
                     });
-                    void props.onServiceTierPreferenceChange(selectedModel, selection);
                   }}
                   disabled={!selectedModel || busy || Boolean(props.form.stageId)}
                   searchable={false}
@@ -1023,6 +1067,7 @@ export function TaskModelPushModal(props: {
               </label>
               <TaskPushSupplementalAttachmentCards
                 attachments={props.form.supplementalAttachments}
+                pendingResources={inputResources.pendingResources}
                 language={props.language}
                 disabled={busy}
                 onRemove={(attachment) => {
@@ -1058,8 +1103,8 @@ export function TaskModelPushModal(props: {
 
             <TaskPushLayoutPreview layout={taskPushLayout} language={props.language} previewAttachments={[...(props.capabilities?.attachmentPreviewSources ?? []), ...props.form.supplementalAttachments]} />
             {props.status === 'loading' ? (
-              <p className="task-model-push-message">
-                {runtimeCapabilities ? (zh ? '正在读取任务上下文、模型配置与工作目录…' : 'Loading task context, model configuration and working folder…') : zh ? '正在读取模型配置…' : 'Loading model configuration…'}
+              <p className="task-model-push-message" role="status" aria-live="polite" aria-atomic="true">
+                {zh ? '正在准备模型、任务上下文与工作区…' : 'Preparing models, task context, and workspace…'}
               </p>
             ) : null}
           </div>
@@ -1216,7 +1261,7 @@ export function TaskModelPushModal(props: {
                 />
                 {selectedEnvironment ? (
                   <ul className="task-model-push-existing-repositories">
-                    {selectedEnvironment.repositories.map((repository) => (
+                    {environmentRepositories.map((repository) => (
                       <li key={`${repository.repositoryId ?? repository.repositoryRelativePath}:${repository.branchName}`}>
                         <span>{repository.repositoryName}</span>
                         <code>{repository.branchName}</code>
@@ -1229,9 +1274,32 @@ export function TaskModelPushModal(props: {
                     {zh ? '请选择一组当前可继续的任务分支。' : 'Choose a task branch environment that is currently available.'}
                   </p>
                 )}
+                {environmentRepositoryError ? <VisibleApplicationError error={environmentRepositoryError} language={zh ? 'zh-CN' : 'en'} /> : null}
+                {pendingEnvironmentRepositories.length > 0 ? (
+                  <details>
+                    <summary>{zh ? `按需补入仓库（${pendingEnvironmentRepositories.length}）` : `Add repositories as needed (${pendingEnvironmentRepositories.length})`}</summary>
+                    <small>{zh ? '只有需要在当前任务中修改时才补入；现有环境可以直接继续。' : 'Add a repository only when this task needs to change it. The existing environment can continue as-is.'}</small>
+                    <ul className="task-model-push-existing-repositories">
+                      {pendingEnvironmentRepositories.map((repository) => (
+                        <li key={repository.repositoryId}>
+                          <span title={repository.relativePath}>{repository.repositoryName}</span>
+                          <Button
+                            variant="secondary"
+                            size="compact"
+                            busy={attachingRepositoryId === repository.repositoryId}
+                            disabled={busy || !selectedEnvironment?.available}
+                            onClick={() => void attachEnvironmentRepository(repository.repositoryId)}
+                          >
+                            {zh ? '补入当前环境' : 'Add to this environment'}
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
               </section>
             ) : !props.capabilities ? (
-              <p className={props.status === 'error' ? 'task-model-push-error' : 'task-model-push-message'} role="status">
+              <p className={props.status === 'error' ? 'task-model-push-error' : 'task-model-push-message'} role={props.status === 'error' ? 'alert' : undefined}>
                 {props.status === 'error' ? (
                   <VisibleApplicationError error={props.error ?? (zh ? 'Git 仓库检查未完成。' : 'The Git repository check did not complete.')} language={zh ? 'zh-CN' : 'en'} />
                 ) : zh ? (
@@ -1303,6 +1371,8 @@ export function TaskModelPushModal(props: {
                     includeLocalChanges: false,
                   };
                   const selectedSource = repository.sourceRefs.find((source) => source.ref === selection.sourceRef);
+                  /** unborn 来源的项目文件就是初始代码，不作为可选的“未提交修改”。 */
+                  const selectedSourceUnborn = !repository.headSha && selectedSource?.kind === 'local' && selectedSource.current;
                   const refreshing = props.refreshingRepositoryId === repository.id;
                   return (
                     <section key={repository.id} className="task-model-push-repository" aria-label={repository.name}>
@@ -1375,13 +1445,19 @@ export function TaskModelPushModal(props: {
                           ) : (
                             'Local branches and locally known remote branches are shown. Refresh manually when current remote state is needed.'
                           )
+                        ) : selectedSourceUnborn ? (
+                          zh ? (
+                            '该仓库尚无首次提交，将把当前项目文件带入独立工作树。完成提交后可直接交付到来源分支。'
+                          ) : (
+                            'This repository has no first commit. Current project files will seed the isolated worktree and can be delivered back after commit.'
+                          )
                         ) : zh ? (
                           '该仓库没有远端，将使用本地分支的代码。默认不包含未提交的修改。'
                         ) : (
                           'This repository has no remote, so local branch code will be used. Uncommitted changes are excluded by default.'
                         )}
                       </p>
-                      {selectedSource?.kind === 'local' && repository.clean === false ? (
+                      {selectedSource?.kind === 'local' && repository.clean === false && !selectedSourceUnborn ? (
                         <label className="task-model-push-concurrency-confirm">
                           <input
                             type="checkbox"
@@ -1431,7 +1507,7 @@ export function TaskModelPushModal(props: {
                 : 'Confirm to create a conversation and start this task.'}
           </small>
           <span>
-            <Button variant="secondary" size="regular" onClick={props.onClose} disabled={props.status === 'submitting'}>
+            <Button variant="secondary" size="regular" onClick={props.onClose} disabled={busy}>
               {zh ? '取消' : 'Cancel'}
             </Button>
             <Button
@@ -1446,7 +1522,7 @@ export function TaskModelPushModal(props: {
                 !props.capabilities ||
                 props.status === 'loading' ||
                 (!modelSetupRequired && (!props.form.model || !selectedModel)) ||
-                (!modelSetupRequired && !contextCapacitySelectionAllowed(props.form.contextCapacityTokens, props.capabilities?.projectContextCapacityTokens, selectedModel?.contextCapacity)) ||
+                (!modelSetupRequired && !contextCapacitySelectionAllowed(props.form.contextCapacityTokens, selectedModel?.contextCapacity)) ||
                 (!modelSetupRequired &&
                   (props.form.workspaceMode === 'direct'
                     ? directWorkspaceNeedsConfirmation && !props.form.directConcurrencyConfirmed

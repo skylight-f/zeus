@@ -34,7 +34,7 @@ concurrency:
 jobs:
   source-verify:
     if: ${{ github.event_name == 'push' && github.repository == 'skylight-f/zeus' }}
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,7 +52,7 @@ jobs:
         env:
           ZEUS_VERIFY_BASE: ${{ github.event.before }}
           ZEUS_VERIFY_HEAD: ${{ github.sha }}
-        run: pnpm verify:publish
+        run: pnpm verify:publish --checks-only
 
   candidate:
     needs: source-verify
@@ -172,9 +172,9 @@ jobs:
 
   verify:
     needs: preflight
-    # 候选预检成功才检查源码，同时允许手动发布跳过上游自动检查。
     if: ${{ !cancelled() && needs.preflight.result == 'success' }}
-    runs-on: macos-latest
+    # 静态检查不占用 macOS；完整源码构建由打包作业执行，两者通过后才公开发布。
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,13 +188,13 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: 执行与本地一致的发布前检查
-        run: pnpm verify:publish
+      - name: 执行发布前静态检查
+        run: pnpm verify:publish --checks-only
 
   package-mac:
     needs: preflight
-    # 候选预检成功才打包，失败或取消时不继续。
     if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    # 候选预检成功才打包，失败或取消时不继续。
     runs-on: macos-latest
     env:
       CSC_LINK: ${{ secrets.MACOS_CERTIFICATE }}
@@ -225,6 +225,40 @@ jobs:
         with:
           path: ~/Library/Caches/electron
           key: zeus-electron-macos-${{ runner.arch }}-${{ hashFiles('apps/desktop/electron-builder.yml', 'pnpm-lock.yaml') }}
+      - name: 计算 CUA 原生构建缓存身份
+        id: cua_inputs
+        # 与本地构建共用专属模块，外层 Swift 与组装改动不使 Rust 成品失效。
+        run: node apps/desktop/scripts/build-computer-native.mjs --cache-info >> "$GITHUB_OUTPUT"
+      - name: 恢复 CUA 编译成品
+        id: cua_cache
+        uses: actions/cache/restore@v4
+        # 缓存是可选加速，恢复失败回到正常原生构建。
+        continue-on-error: true
+        with:
+          # 成品必须精确匹配当前源码、补丁、构建模块与工具链。
+          path: ${{ steps.cua_inputs.outputs.artifact_path }}
+          key: ${{ steps.cua_inputs.outputs.native_key }}
+      - name: 清理未精确命中的 CUA 成品
+        # 不允许部分匹配或恢复失败留下的成品被继续复用。
+        if: ${{ steps.cua_cache.outputs.cache-hit != 'true' }}
+        run: node apps/desktop/scripts/build-computer-native.mjs --clear-artifacts
+      - name: 恢复 Cargo 编译缓存
+        id: cua_cargo_cache
+        # 成品已匹配时无需传输较大的编译缓存；失配时仍由 Cargo 重建变化部分。
+        if: ${{ steps.cua_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          # 只保存编译结果和公开依赖，不包含 Cargo 凭据或用户配置。
+          path: |
+            ${{ steps.cua_inputs.outputs.cargo_target_path }}
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: ${{ steps.cua_inputs.outputs.cargo_key }}
+          # 备用键仍固定系统、架构、SDK、编译器、锁文件和构建参数。
+          restore-keys: ${{ steps.cua_inputs.outputs.cargo_restore_key }}
       - name: 准备 App Store Connect API Key
         if: ${{ env.APPLE_API_KEY_P8 != '' }}
         run: |
@@ -242,6 +276,29 @@ jobs:
           RELEASE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: node scripts/distribution-config.mjs --manifest dist/zeus-release-manifest.json
+      - name: 保存已验证的 CUA 编译成品
+        # 只有通过来源预检的发行分支正式发布保存缓存；已有精确命中不重复上传。
+        if: ${{ needs.preflight.outputs.publish == 'true' && github.ref == 'refs/heads/develop' && steps.cua_cache.outputs.cache-hit != 'true' && steps.cua_cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        # 缓存保存失败不改变正式产物的校验结果。
+        continue-on-error: true
+        with:
+          # 只保存当前精确输入的两份成品和构建凭证。
+          path: ${{ steps.cua_inputs.outputs.artifact_path }}
+          key: ${{ steps.cua_cache.outputs.cache-primary-key }}
+      - name: 保存已验证的 Cargo 编译缓存
+        # 仅来源预检和正式产物校验成功的发行分支发布可以写入共享编译缓存。
+        if: ${{ needs.preflight.outputs.publish == 'true' && github.ref == 'refs/heads/develop' && steps.cua_cache.outputs.cache-hit != 'true' && steps.cua_cargo_cache.outputs.cache-hit != 'true' && steps.cua_cargo_cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: |
+            ${{ steps.cua_inputs.outputs.cargo_target_path }}
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: ${{ steps.cua_cargo_cache.outputs.cache-primary-key }}
       - name: 上传已校验正式产物
         id: upload_release_artifact
         continue-on-error: true

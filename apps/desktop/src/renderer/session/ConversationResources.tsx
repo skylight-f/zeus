@@ -1,8 +1,4 @@
-import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
-import { MotionPresence } from '../ui/MotionPresence.js';
-import { useMotionPresence } from '../ui/useMotionPresence.js';
 import { type ComponentType, type CSSProperties, type KeyboardEvent, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { FileArchiveIcon as FileArchive } from '@phosphor-icons/react/dist/csr/FileArchive';
@@ -23,12 +19,20 @@ import { GithubLogoIcon as GithubLogo } from '@phosphor-icons/react/dist/csr/Git
 import { AppWindowIcon as AppWindow } from '@phosphor-icons/react/dist/csr/AppWindow';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
-import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
+
+import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
+import { MotionPresence } from '../ui/MotionPresence.js';
+import { useMotionPresence } from '../ui/useMotionPresence.js';
+
+import { createPortal } from 'react-dom';
+
+import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
+
 import type { ConversationFileIconKind, ConversationFileLocation, ConversationOpenTarget, ConversationResource, ConversationResourceOpenTarget, ConversationResourcePreview } from '@zeus/shared';
 import { listConversationResourceOpenTargetsInMain } from '../appShellBridge.js';
 import type { NativeConversationAttachment } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
-import { formatVisibleApplicationError, useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
+import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 
 export interface ConversationResourceInteraction {
   onOpenResource?: (resource: ConversationResource, target: ConversationOpenTarget, location?: ConversationFileLocation) => void | Promise<void>;
@@ -117,7 +121,7 @@ function ConversationPendingAttachmentImage(props: { attachment: NativeConversat
           <img decoding="async" src={previewUrl} alt={props.attachment.name} onError={() => setFailed(true)} />
         ) : (
           <span className="session-resource-image-placeholder" role="status">
-            <FileImage aria-hidden="true" weight="duotone" />
+            <FileImage aria-hidden="true" weight="regular" />
             <span>{props.language === 'zh-CN' ? '正在显示图片' : 'Showing image'}</span>
           </span>
         )}
@@ -168,10 +172,6 @@ export function ConversationInlineResource(
   const location = rawLocation && !label.endsWith(rawLocation) ? rawLocation : null;
   const title = props.resource.kind === 'file' ? props.resource.projectRelativePath : props.resource.kind === 'website' ? props.resource.url : props.resource.displayName;
 
-  useApplicationErrorDialog(error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-
   async function open(): Promise<void> {
     if (!props.onOpenResource || busy) return;
     setBusy(true);
@@ -192,6 +192,7 @@ export function ConversationInlineResource(
         <span>{label}</span>
         {location ? <span className="session-inline-resource-location">{location}</span> : null}
       </button>
+      {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : null}
     </span>
   );
 }
@@ -339,7 +340,7 @@ function ConversationImagePreview(
         <img decoding="async" src={preview.dataUrl} alt={props.label} loading="lazy" onError={() => reportPreviewFailure(languageRef.current === 'zh-CN' ? '图片预览加载失败。' : 'The image preview failed to load.')} />
       ) : (
         <span className={props.placeholderClassName} role="status">
-          {!error ? <FileImage aria-hidden="true" weight="duotone" /> : null}
+          {!error ? <FileImage aria-hidden="true" weight="regular" /> : null}
           <span>{status}</span>
         </span>
       )}
@@ -400,10 +401,6 @@ function ConversationResourceCard(
   const [error, setError] = useState<unknown>(null);
   const subtitle = resourceSubtitle(props.resource, props.language);
 
-  useApplicationErrorDialog(error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-
   async function open(target = defaultOpenTarget(props.resource)): Promise<void> {
     if (!props.onOpenResource || busy) return;
     setBusy(true);
@@ -429,6 +426,7 @@ function ConversationResourceCard(
         </span>
       </button>
       <OpenWithMenu resource={props.resource} language={props.language} disabled={busy} onOpen={(target) => open(target)} />
+      {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : null}
     </article>
   );
 }
@@ -444,10 +442,6 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
   const [targets, setTargets] = useState<ConversationResourceOpenTarget[]>([]);
   const [error, setError] = useState<unknown>(null);
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
-
-  useApplicationErrorDialog(error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
 
   useEffect(() => {
     if (!open) return;
@@ -576,6 +570,11 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                 style={menuPositionStyle(menuPosition)}
               >
                 {loading ? <span className="session-open-with-status">{props.language === 'zh-CN' ? '正在检测应用…' : 'Detecting apps…'}</span> : null}
+                {error ? (
+                  <span className="session-open-with-status" role="alert">
+                    <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+                  </span>
+                ) : null}
                 {!loading && !error
                   ? targets.map((target) => (
                       <button
@@ -597,7 +596,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                           ) : target.id === 'copy_path' || target.id === 'copy_link' ? (
                             <Copy aria-hidden="true" />
                           ) : target.id === 'file_manager' ? (
-                            <Folder aria-hidden="true" />
+                            <FolderOpen aria-hidden="true" weight="regular" />
                           ) : target.id === 'zeus_browser' ? (
                             <GlobeSimple aria-hidden="true" />
                           ) : target.id === 'zeus_source' ? (
@@ -669,25 +668,6 @@ export function ResourceIcon(props: { resource: ConversationResource }) {
   return <Icon aria-hidden="true" weight="duotone" />;
 }
 
-function fileIcon(kind: ConversationFileIconKind): ComponentType<{ weight?: 'duotone'; 'aria-hidden'?: string }> {
-  if (kind === 'javascript') return FileJs;
-  if (kind === 'typescript') return FileTs;
-  if (kind === 'sql') return FileSql;
-  if (kind === 'html') return FileHtml;
-  if (kind === 'css') return FileCss;
-  if (kind === 'markdown') return FileMd;
-  if (kind === 'image') return FileImage;
-  if (kind === 'pdf') return FilePdf;
-  if (kind === 'spreadsheet') return FileXls;
-  if (kind === 'presentation') return FilePpt;
-  if (kind === 'document') return FileDoc;
-  if (kind === 'archive') return FileArchive;
-  if (sourceIconKinds.has(kind)) return FileCode;
-  return File;
-}
-
-const sourceIconKinds = new Set<ConversationFileIconKind>(['code', 'java', 'javascript', 'typescript', 'json', 'markdown', 'sql', 'css']);
-
 /** 行号依照界面语言显示，实际打开仍使用原始位置字段。 */
 function locationLabel(resource: Extract<ConversationResource, { kind: 'file' }>, language: SessionUiLanguage): string | null {
   const line = resource.location?.line;
@@ -755,3 +735,22 @@ function localizedTargetLabel(target: ConversationResourceOpenTarget, language: 
   };
   return labels[target.id] ?? target.label;
 }
+
+function fileIcon(kind: ConversationFileIconKind): ComponentType<{ weight?: 'duotone'; 'aria-hidden'?: string }> {
+  if (kind === 'javascript') return FileJs;
+  if (kind === 'typescript') return FileTs;
+  if (kind === 'sql') return FileSql;
+  if (kind === 'html') return FileHtml;
+  if (kind === 'css') return FileCss;
+  if (kind === 'markdown') return FileMd;
+  if (kind === 'image') return FileImage;
+  if (kind === 'pdf') return FilePdf;
+  if (kind === 'spreadsheet') return FileXls;
+  if (kind === 'presentation') return FilePpt;
+  if (kind === 'document') return FileDoc;
+  if (kind === 'archive') return FileArchive;
+  if (sourceIconKinds.has(kind)) return FileCode;
+  return File;
+}
+
+const sourceIconKinds = new Set<ConversationFileIconKind>(['code', 'java', 'javascript', 'typescript', 'json', 'markdown', 'sql', 'css']);

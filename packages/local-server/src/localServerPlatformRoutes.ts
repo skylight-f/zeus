@@ -1,16 +1,20 @@
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
+import { resolveArchivedTaskManagementStatus, type ArchivedProjectTaskStatuses } from './taskManagementStatusMigration.js';
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
 import { resolveInteractiveRuntimeShell } from './localServerPlatformSupport.js';
 import { missingTaskRepositories } from './taskRepositoryMembership.js';
-import type { FilePreviewIntent, FilePreviewRequest } from '@zeus/shared';
-import { EmployeeMemoryProposalRepository } from '@zeus/storage';
+import type { AutomationExecutionState, CommandActor, CodexSubscriptionConnectionDiagnostic, FilePreviewIntent, FilePreviewRequest } from '@zeus/shared';
+import { DefectWorkflowRepository, EmployeeMemoryProposalRepository, migrateEmployeeAutomationsToUnified, WorkArtifactRepository } from '@zeus/storage';
+import { WorkArtifactDelivery } from './workArtifactDelivery.js';
 import type { TaskWorkToolPort } from './taskWorkDynamicTools.js';
 import { TaskWorkPlanningRepository, TaskWorkReviewRepository, TaskWorkDeploymentRepository } from '@zeus/storage';
 import { hasDatabaseUriPassword } from './projectCore.js';
 import { createAutomationConversationDispatch } from './automationConversationDispatch.js';
+import { probeCodexConversation } from './codexConnectionDiagnostic.js';
 import {
   checkAiCliAdapter,
   type AiCliAdapterStatus,
+  type CodexRuntimeMaintenanceControl,
   type CodexModelCapability,
   type CodexRemoteControlStatus,
   createAgentCapabilityCatalog,
@@ -36,9 +40,9 @@ import {
   type GitPatchExport,
   readTaskIntegrationConflict,
 } from '@zeus/git-core';
-import { normalizeProjectConfig, normalizeProjectModelServiceTierPreference, type ProjectConfigSnapshot, type ProjectModelServiceTierPreference, type UpdateProjectConfigBody } from './projectCore.js';
+import { normalizeProjectConfig, type ProjectConfigSnapshot, type UpdateProjectConfigBody } from './projectCore.js';
 import { getSecretPresenceLabel } from './securityCore.js';
-import { cloneTaskManagementStatusConfig, type TaskAttachmentReference, type TaskPushParentAttachmentOption } from '@zeus/shared';
+import { temporaryWorkspaceId, type TaskAttachmentReference, type TaskPushParentAttachmentOption } from '@zeus/shared';
 import {
   AutomationRunRepository,
   AutomationTaskRepository,
@@ -168,13 +172,23 @@ import { registerProjectGitQueryRoutes } from './projectGitQueryRoutes.js';
 import { ProjectQueryApplication } from './projectQueryApplication.js';
 import { registerProjectQueryRoutes } from './projectQueryRoutes.js';
 import { createCommitCodexPool } from './gitCommitCodexGeneration.js';
-import { readGitCommitContext, readCommitFingerprint, resolveCommitRepository } from './gitCommitContext.js';
+import { readGitCommitContext, readCommitFingerprint, resolveCommitRepository, resolveTaskCommitRepository } from './gitCommitContext.js';
 import { PassThrough } from 'node:stream';
 import { generateGitCommitMessage } from './gitCommitMessageGeneration.js';
 import { generateReleaseNotesWithDeepSeek } from './releaseNotesGeneration.js';
 import { registerReleaseUpdateApi } from './releaseUpdateApi.js';
 import { compareSemverLike } from './releaseCore.js';
-import { parseRuntimeArgs, RuntimeQueryApplication, runtimeSessionIsConfirmedTerminal, type CodexRuntimeUpdateStatus, type RuntimeSettingsSnapshot, toAiRuntimeLogEntry, toAiRuntimeSession } from './runtimeQueryApplication.js';
+import {
+  assertCodexUpdateTarget,
+  isManagedCodexStandalone,
+  parseRuntimeArgs,
+  RuntimeQueryApplication,
+  runtimeSessionIsConfirmedTerminal,
+  type CodexRuntimeUpdateStatus,
+  type RuntimeSettingsSnapshot,
+  toAiRuntimeLogEntry,
+  toAiRuntimeSession,
+} from './runtimeQueryApplication.js';
 import { registerRuntimeQueryRoutes } from './runtimeQueryRoutes.js';
 import { registerRuntimeSessionCommandRoutes } from './runtimeSessionCommandRoutes.js';
 import { type ParsedSettingsCommand, SettingsCommandApplication, settingsCommandHttpError, type SettingsCommandRequest, settingsCommandTypes } from './settingsCommandApplication.js';
@@ -213,6 +227,8 @@ const codexReleaseMetadataMaximumBytes = 512_000;
 const codexInstallerMaximumBytes = 128_000;
 /** 官方自更新允许下载和原子切换的最长时间。 */
 const codexUpdateTimeoutMs = 5 * 60_000;
+/** 远程接管守护进程应在短时间内完成有序退出。 */
+const codexRemoteControlStopTimeoutMs = 30_000;
 /** 失败诊断只保留有界尾部，避免外部程序输出占满内存或回执。 */
 const codexUpdateOutputMaximumBytes = 64 * 1024;
 
@@ -226,8 +242,10 @@ function parseLatestCodexVersion(value: unknown): string {
 }
 
 /** 检查官方稳定版；只读取公开元数据，不下载或切换用户正在使用的程序。 */
-async function checkPublishedCodexUpdate(adapter: AiCliAdapterStatus, checkedAt: string): Promise<CodexRuntimeUpdateStatus> {
-  if (!adapter.version) return { adapter, status: 'unavailable', currentVersion: null, latestVersion: null, checkedAt };
+async function checkPublishedCodexUpdate(adapter: AiCliAdapterStatus, checkedAt: string, codexHome: string | undefined): Promise<CodexRuntimeUpdateStatus> {
+  /** 安装归属来自实际程序路径，不相信界面提供的安装方式。 */
+  const managedInstallation = isManagedCodexStandalone(adapter.resolvedCommandPath, codexHome);
+  if (!adapter.version) return { adapter, managedInstallation, status: 'unavailable', currentVersion: null, latestVersion: null, checkedAt };
   /** 单次检查总等待上限，页面不会因公网异常长期锁住。 */
   const signal = AbortSignal.timeout(10_000);
   /** 固定官方 HTTPS 来源且禁止重定向，避免版本判断漂移到未知站点。 */
@@ -254,6 +272,7 @@ async function checkPublishedCodexUpdate(adapter: AiCliAdapterStatus, checkedAt:
   const latestVersion = parseLatestCodexVersion(metadata);
   return {
     adapter,
+    managedInstallation,
     status: compareSemverLike(adapter.version, latestVersion) < 0 ? 'available' : 'up_to_date',
     currentVersion: adapter.version,
     latestVersion,
@@ -262,7 +281,8 @@ async function checkPublishedCodexUpdate(adapter: AiCliAdapterStatus, checkedAt:
 }
 
 /** 读取固定官方来源的安装脚本；Zeus 管理的 standalone 无法通过 CLI 自更新。 */
-async function readOfficialCodexInstaller(): Promise<Buffer> {
+async function readOfficialCodexInstaller(onProgress: (progress: number | null, stage: string) => void): Promise<Buffer> {
+  onProgress(null, 'preparing');
   /** 安装脚本和资产下载共用更新总等待上限。 */
   const signal = AbortSignal.timeout(codexUpdateTimeoutMs);
   /** 直接访问最终官方地址且禁止重定向，避免执行未知站点内容。 */
@@ -283,38 +303,43 @@ async function readOfficialCodexInstaller(): Promise<Buffer> {
   if (!header.startsWith('#!/bin/sh\n') || !header.includes('RELEASES_BASE_URL="https://releases.openai.com/codex"')) {
     throw Object.assign(new Error('Codex 官方安装脚本格式无法识别。'), { code: 'ZEUS_CODEX_UPDATE_INVALID' });
   }
-  return script;
+  /** 只为真实资产下载打开 curl 原生进度；元数据与校验文件继续静默。 */
+  const source = script.toString('utf8');
+  /** 修改范围严格限制在官方 download_file 函数。 */
+  const downloadFunctionStart = source.indexOf('download_file() {');
+  /** download_text 是相邻的下一个官方函数。 */
+  const downloadFunctionEnd = source.indexOf('\n}\n\ndownload_text() {', downloadFunctionStart);
+  if (downloadFunctionStart < 0 || downloadFunctionEnd < 0) throw Object.assign(new Error('Codex 官方安装脚本缺少下载函数。'), { code: 'ZEUS_CODEX_UPDATE_INVALID' });
+  /** 当前函数正文只增加显示选项，不改变来源、超时、目标路径或校验流程。 */
+  const downloadFunction = source.slice(downloadFunctionStart, downloadFunctionEnd + 2);
+  const instrumentedDownloadFunction = downloadFunction
+    .replace('  output="$2"\n', '  output="$2"\n  codex_progress_option="-s"\n  if [ "${archive_path:-}" = "$output" ]; then codex_progress_option="--progress-bar"; fi\n')
+    .replaceAll('curl -fsSL', 'curl -fSL "$codex_progress_option"');
+  if (instrumentedDownloadFunction === downloadFunction || !instrumentedDownloadFunction.includes('curl -fSL "$codex_progress_option"') || instrumentedDownloadFunction.includes('curl -fsSL')) {
+    throw Object.assign(new Error('Codex 官方安装脚本无法提供下载进度。'), { code: 'ZEUS_CODEX_UPDATE_INVALID' });
+  }
+  onProgress(null, 'preparing');
+  return Buffer.from(`${source.slice(0, downloadFunctionStart)}${instrumentedDownloadFunction}${source.slice(downloadFunctionEnd + 2)}`);
 }
 
-/** 判断实际程序是否属于 Zeus 当前 CODEX_HOME 管理的 standalone。 */
-function isManagedCodexStandalone(commandPath: string, codexHome: string | undefined): codexHome is string {
-  if (!codexHome || !isAbsolute(codexHome)) return false;
-  /** realpath 探针返回发布目录中的真实程序，按受管根目录判断归属。 */
-  const managedRoot = `${resolve(codexHome, 'packages', 'standalone')}/`;
-  return resolve(commandPath).startsWith(managedRoot);
-}
-
-/** 调用官方 CLI 自更新或官方 standalone 安装器；不执行界面回传的命令。 */
-async function runCodexSelfUpdate(commandPath: string, codexHome: string | undefined, targetVersion: string): Promise<void> {
-  /** Zeus 管理的 standalone 使用同一官方安装脚本更新固定 current 链接。 */
-  const managed = isManagedCodexStandalone(commandPath, codexHome);
-  /** 仅受管安装需要下载脚本，普通 CLI 继续使用自身安装方式。 */
-  const installer = managed ? await readOfficialCodexInstaller() : null;
-  /** 不通过 shell 解析命令行；受管脚本只作为标准输入交给系统 sh。 */
-  const executable = managed ? '/bin/sh' : commandPath;
-  /** 官方安装器由环境固定目标版本，普通安装继续调用原生 update 子命令。 */
-  const args = managed ? ['-s'] : ['update'];
+/** 只调用受管安装的官方安装器；全局程序不会被当作更新命令执行。 */
+async function runCodexSelfUpdate(commandPath: string, codexHome: string | undefined, targetVersion: string, onProgress: (progress: number | null, stage: string) => void): Promise<void> {
+  if (!isManagedCodexStandalone(commandPath, codexHome)) throw Object.assign(new Error('请使用原安装方式更新这份 Codex。'), { code: 'ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION' });
+  /** 受管脚本只作为标准输入交给系统 sh，目标版本固定为用户确认的版本。 */
+  const installer = await readOfficialCodexInstaller(onProgress);
   /** 更新命令只继承当前服务环境，并显式固定 Zeus 的 Codex 数据目录。 */
   const environment = {
     ...process.env,
-    ...(codexHome ? { CODEX_HOME: codexHome } : {}),
-    ...(managed ? { CODEX_INSTALL_DIR: join(codexHome, 'bin'), CODEX_RELEASE: targetVersion, CODEX_NON_INTERACTIVE: 'true' } : {}),
+    CODEX_HOME: codexHome,
+    CODEX_INSTALL_DIR: join(codexHome, 'bin'),
+    CODEX_RELEASE: targetVersion,
+    CODEX_NON_INTERACTIVE: 'true',
   };
   return new Promise((resolveUpdate, rejectUpdate) => {
     /** stdout 与 stderr 只用于有界错误诊断，安装脚本通过标准输入传递。 */
-    const child = spawn(executable, args, {
+    const child = spawn('/bin/sh', ['-s'], {
       shell: false,
-      stdio: [installer ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       env: environment,
     });
     /** stdout 与 stderr 共同使用同一诊断预算。 */
@@ -323,17 +348,31 @@ async function runCodexSelfUpdate(commandPath: string, codexHome: string | undef
     let settled = false;
     /** 单独记录超时事实，不能依赖子进程最终上报的退出信号。 */
     let timedOut = false;
+    /** 输入失败仍等待子进程退出，避免维护窗口提前放开。 */
+    let inputFailure: Error | null = null;
     /** 强制结束计时器由统一完成路径清理。 */
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 受管安装器的当前阶段由官方稳定输出推进。 */
+    let installerStage: 'preparing' | 'downloading' | 'installing' = 'preparing';
     /** 只保留最新输出，通常包含官方更新失败原因。 */
     const remember = (chunk: unknown): void => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       output = Buffer.concat([output, bytes]).subarray(-codexUpdateOutputMaximumBytes);
+      const text = output.toString('utf8');
+      if (text.includes('Installing standalone package')) installerStage = 'installing';
+      else if (text.includes('Downloading Codex CLI')) installerStage = 'downloading';
+      if (installerStage === 'downloading') {
+        /** curl 的 progress-bar 百分比来自已下载字节与响应总字节。 */
+        const matches = [...text.matchAll(/(\d{1,3}(?:\.\d+)?)%/gu)];
+        /** 只使用最新一条进度，官方回退下载时允许百分比从头开始。 */
+        const percent = Number(matches.at(-1)?.[1]);
+        onProgress(Number.isFinite(percent) && percent >= 0 && percent <= 100 ? percent / 100 : null, 'downloading');
+      }
+      if (installerStage === 'installing') onProgress(null, 'installing');
     };
     child.stdout?.on('data', remember);
     child.stderr?.on('data', remember);
-    /** 脚本内容已经过来源与大小校验；EPIPE 由子进程退出路径统一报告。 */
-    if (installer) child.stdin?.end(installer);
+    onProgress(null, 'preparing');
     /** 超时后先温和终止，进程退出事件负责最终收口。 */
     const timer = setTimeout(() => {
       if (settled) return;
@@ -353,13 +392,81 @@ async function runCodexSelfUpdate(commandPath: string, codexHome: string | undef
       else resolveUpdate();
     };
     child.on('error', (cause) => finish(Object.assign(new Error('无法启动 Codex 官方更新命令。', { cause }), { code: 'ZEUS_CODEX_UPDATE_START_FAILED' })));
+    /** 安装器提前退出时，输入管道错误也走统一失败出口，不能让宿主崩溃。 */
+    child.stdin?.on('error', (cause) => {
+      inputFailure = Object.assign(new Error('无法向 Codex 安装器传递安装内容。', { cause }), { code: 'ZEUS_CODEX_UPDATE_FAILED' });
+      child.kill('SIGTERM');
+    });
+    child.stdin?.end(installer);
     child.on('close', (code, signal) => {
-      if (code === 0) return finish();
+      if (inputFailure) return finish(inputFailure);
+      if (code === 0 && !timedOut) {
+        onProgress(null, 'verifying');
+        return finish();
+      }
       /** 更新命令的文本只作为脱敏错误原因，不参与成功判断。 */
       const detail = output.toString('utf8').trim().slice(-4_000);
       finish(
         Object.assign(new Error(detail ? `Codex 更新失败：${detail}` : `Codex 更新失败（${String(code ?? signal ?? 'unknown')}）。`), {
           code: timedOut ? 'ZEUS_CODEX_UPDATE_TIMEOUT' : 'ZEUS_CODEX_UPDATE_FAILED',
+        }),
+      );
+    });
+  });
+}
+
+/** 使用升级后的官方 CLI 关闭旧远程接管守护进程，下一次启动才会加载新程序。 */
+async function stopCodexRemoteControlDaemon(commandPath: string, codexHome: string | undefined): Promise<void> {
+  /** 守护进程身份由同一 CODEX_HOME 决定，不能依赖桌面进程偶然继承的环境。 */
+  const environment = { ...process.env, ...(codexHome ? { CODEX_HOME: codexHome } : {}) };
+  return new Promise((resolveStop, rejectStop) => {
+    /** 官方 stop 命令负责找到并有序结束匹配的数据目录实例。 */
+    const child = spawn(commandPath, ['remote-control', 'stop', '--json'], {
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: environment,
+    });
+    /** stdout 与 stderr 共用更新链已有的诊断上限。 */
+    let output = Buffer.alloc(0);
+    /** error、close 与超时只允许一个路径完成 Promise。 */
+    let settled = false;
+    /** 超时事实独立保存，避免被最终退出信号覆盖。 */
+    let timedOut = false;
+    /** 温和结束失败后使用的强制退出计时器。 */
+    let forceTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 只保留外部命令输出尾部，用于脱敏后的失败诊断。 */
+    const remember = (chunk: unknown): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      output = Buffer.concat([output, bytes]).subarray(-codexUpdateOutputMaximumBytes);
+    };
+    child.stdout?.on('data', remember);
+    child.stderr?.on('data', remember);
+    /** 退出超时后先请求终止 stop 命令本身，再兜底强制结束。 */
+    const timer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      child.kill('SIGTERM');
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+      forceTimer.unref?.();
+    }, codexRemoteControlStopTimeoutMs);
+    timer.unref?.();
+    /** 所有完成路径共用一次资源清理。 */
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (error) rejectStop(error);
+      else resolveStop();
+    };
+    child.on('error', (cause) => finish(Object.assign(new Error('无法启动 Codex 远程接管停止命令。', { cause }), { code: 'ZEUS_CODEX_REMOTE_CONTROL_STOP_FAILED' })));
+    child.on('close', (code, signal) => {
+      if (code === 0) return finish();
+      /** 文本只作为错误原因，不参与是否成功的判断。 */
+      const detail = output.toString('utf8').trim().slice(-4_000);
+      finish(
+        Object.assign(new Error(detail ? `Codex 远程接管停止失败：${detail}` : `Codex 远程接管停止失败（${String(code ?? signal ?? 'unknown')}）。`), {
+          code: timedOut ? 'ZEUS_CODEX_REMOTE_CONTROL_STOP_TIMEOUT' : 'ZEUS_CODEX_REMOTE_CONTROL_STOP_FAILED',
         }),
       );
     });
@@ -415,9 +522,28 @@ export type LocalServerPlatformRouteDependencies = Record<string, any> & {
   tasks: TaskRepository;
   telegramCommands: TelegramCommandApplication;
   terminalEvents: TerminalEventRepository;
-  readRuntimeTerminalTail(sessionId: string, maxBytes: number): { text: string; truncated: boolean };
+  readRuntimeTerminalTail(sessionId: string, maxBytes: number): { text: string; truncated: boolean; startByte: number; totalBytes: number };
   workManagementCommands: WorkManagementCommandApplication;
 };
+
+/** 订阅连接诊断必须比普通页面请求更早结束，避免设置页再次永久等待。 */
+const codexConnectionDiagnosticTimeoutMs = 35_000;
+
+/** 为不支持 AbortSignal 的 Codex RPC 组合补上用户可见的硬截止时间。 */
+async function withCodexConnectionDiagnosticTimeout<T>(operation: Promise<T>): Promise<T> {
+  /** 超时句柄只在本次诊断存活。 */
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(Object.assign(new Error('Codex 订阅真实请求检查在 35 秒内没有完成。'), { code: 'ZEUS_CODEX_CONNECTION_TIMEOUT' })), codexConnectionDiagnosticTimeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 export async function registerLocalServerPlatformRoutes(dependencies: LocalServerPlatformRouteDependencies): Promise<{
   close(): Promise<void>;
@@ -810,7 +936,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   server.post(
     '/api/projects/:projectId/git/commit-message',
     { bodyLimit: 512_000 },
-    async (request: FastifyRequest<{ Params: { projectId: string }; Body: { repositoryId?: unknown; relativePath?: unknown; language?: unknown; modelRef?: unknown; stream?: boolean; selection?: unknown } }>, reply) => {
+    async (request: FastifyRequest<{ Params: { projectId: string }; Body: { repositoryId?: unknown; relativePath?: unknown; taskId?: unknown; language?: unknown; modelRef?: unknown; stream?: boolean; selection?: unknown } }>, reply) => {
       const project = projects.getById(request.params.projectId);
       if (!project) return reply.code(404).send({ error: 'ZEUS_PROJECT_NOT_FOUND', message: '项目不存在。' });
       const body = request.body;
@@ -819,6 +945,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         typeof body?.repositoryId !== 'string' ||
         body.repositoryId.length > 200 ||
         (body.relativePath !== undefined && (typeof body.relativePath !== 'string' || body.relativePath.length > 4096)) ||
+        (body.taskId !== undefined && (typeof body.taskId !== 'string' || !body.taskId.trim() || body.taskId.length > 200 || body.selection === undefined)) ||
         (body.modelRef !== undefined && (typeof body.modelRef !== 'string' || !body.modelRef.trim() || body.modelRef.length > 2000))
       ) {
         return reply.code(400).send({ error: 'ZEUS_GIT_COMMIT_MESSAGE_INPUT_INVALID', message: '已暂存改动内容无效或过大，请缩小提交范围。' });
@@ -852,6 +979,15 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         return reply.code(400).send({ error: 'ZEUS_GIT_COMMIT_MESSAGE_INPUT_INVALID', message: '所选提交范围无效或过大，请重新选择。' });
       }
       const selection = body.selection as CommitSelection[] | undefined;
+      /** 任务身份必须属于请求中的项目；客户端不能跨项目读取任务工作树。 */
+      if (typeof body.taskId === 'string' && tasks.getById(body.taskId)?.projectId !== project.id) return reply.code(404).send({ error: 'ZEUS_TASK_NOT_FOUND', message: '当前项目中没有此任务。' });
+      /** 保留项目与独立会话入口，任务入口仅使用持久化工作区身份。 */
+      const resolveRepository = async (target: { repositoryId: string; relativePath?: string }) =>
+        typeof body.taskId === 'string'
+          ? resolveTaskCommitRepository(project, body.taskId, taskWorkspaces.getById(target.repositoryId))
+          : target.repositoryId.startsWith('conversation:')
+            ? resolveConversationGitWorkspace(project, target.repositoryId.slice('conversation:'.length), conversations, conversationSubmissions)
+            : resolveCommitRepository(project, target.repositoryId, target.relativePath);
       const controller = new AbortController();
       const stream = body.stream === true ? new PassThrough() : null;
       const disconnected = () => {
@@ -869,9 +1005,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         ];
         const contexts = await Promise.all(
           targets.map(async (target) => {
-            const repository = target.repositoryId.startsWith('conversation:')
-              ? await resolveConversationGitWorkspace(project, target.repositoryId.slice('conversation:'.length), conversations, conversationSubmissions)
-              : await resolveCommitRepository(project, target.repositoryId, target.relativePath);
+            const repository = await resolveRepository(target);
             return { repository, context: await readGitCommitContext(repository.localPath, target.paths), paths: target.paths };
           }),
         );
@@ -914,7 +1048,13 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         };
         const result = await run();
         const generated = performance.now();
-        const fingerprints = await Promise.all(contexts.map(({ repository, paths }) => readCommitFingerprint(repository.localPath, paths)));
+        const fingerprints = await Promise.all(
+          contexts.map(async ({ repository, paths }, index) => {
+            // 生成期间回收、换分支或重建工作树后，旧结果不能写回提交框。
+            if (body.taskId !== undefined && (await resolveRepository(targets[index]!)).localPath !== repository.localPath) throw new Error('生成期间任务工作树已变化，请重新生成。');
+            return readCommitFingerprint(repository.localPath, paths);
+          }),
+        );
         if (contexts.some(({ context }, index) => context.fingerprint !== fingerprints[index])) throw new Error(selection ? '生成期间所选内容已变化，请重新生成。' : '生成期间暂存内容已变化，请重新生成。');
         controller.signal.throwIfAborted();
         request.log.info(
@@ -1017,78 +1157,167 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         };
       },
       /** 版本探针成功后才访问官方稳定版元数据，不安装或重启 Codex。 */
-      checkCodexUpdate: (adapter) => checkPublishedCodexUpdate(adapter, now().toISOString()),
+      checkCodexUpdate: async (adapter) => {
+        /** 检测只发布事实，供已打开的设置页接收后台检查结果。 */
+        const checked = await checkPublishedCodexUpdate(adapter, now().toISOString(), dependencies.codexHome);
+        publishRealtimeEvent('codex.update.checked', { ...checked });
+        return checked;
+      },
     },
     readSettings: () => platformMutableState.runtimeSettings,
     now,
   });
   registerRuntimeQueryRoutes({ server, application: runtimeQueries });
 
+  /** 安装请求串行执行，后到请求仍需重新核对用户确认的版本。 */
+  let codexUpdateChain: Promise<void> = Promise.resolve();
+
   /** 更新属于可恢复的外部写入：先记录命令，再调用官方 CLI，最后热切换运行实例。 */
-  server.post('/api/runtime/adapters/codex/update', async (request: FastifyRequest<{ Body: SettingsCommandRequest<Record<string, never>> }>, reply) => {
+  server.post('/api/runtime/adapters/codex/update', async (request: FastifyRequest<{ Body: SettingsCommandRequest<{ targetVersion: string }> }>, reply) => {
     try {
-      /** 空输入仍使用统一命令信封，断线后不会重复执行外部更新。 */
-      const parsed = settingsCommands.parse<Record<string, never>>({
+      /** 目标版本参与命令摘要，旧的空请求不能再触发静默安装。 */
+      const parsed = settingsCommands.parse<{ targetVersion: string }>({
         value: request.body,
         commandType: settingsCommandTypes.codexRuntimeUpdate,
         scopeKind: 'settings',
         expectedScopeId: () => 'codex-runtime-update',
       });
-      if (Object.keys(parsed.input).length > 0) return reply.code(400).send({ error: 'ZEUS_CODEX_UPDATE_INVALID', message: 'Codex 更新不接受额外参数。' });
+      if (Object.keys(parsed.input).length !== 1 || typeof parsed.input.targetVersion !== 'string') {
+        return reply.code(400).send({ error: 'ZEUS_CODEX_UPDATE_CONFIRMATION_REQUIRED', message: '请先检测更新，再选择要安装的 Codex 版本。' });
+      }
       if (readOnlyValidation) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '只读验证模式不能更新 Codex。');
-      /** 常规周期检测不占维护窗口，已是最新时直接返回且不打扰正在运行的任务。 */
-      const detected = await runtimeQueries.checkCodexUpdate();
-      if (detected.status !== 'available') return detected;
-      /** 只有多世代运行管理器能原子阻止新任务进入维护窗口。 */
-      const runMaintenance = codexAppServerManager.runExclusiveMaintenance?.bind(codexAppServerManager);
-      if (!runMaintenance) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '当前 Codex 运行服务不支持安全在线更新。');
-      /** 已是最新版时不能因周期检测而重建运行世代。 */
-      let updateApplied = false;
-      /** 更新完成前不接纳新的 Codex 写操作；已有查询仍可返回。 */
-      const result = await runMaintenance(async () => {
-        /** 服务端重新读取实际程序和官方版本，不信任界面上一次检测结果。 */
-        const available = await runtimeQueries.checkCodexUpdate();
-        if (available.status !== 'available') return available;
-        /** 只执行探针解析出的真实路径，禁止客户端指定任意命令。 */
-        const commandPath = available.adapter.resolvedCommandPath;
-        if (!commandPath || !available.latestVersion) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '没有可安全更新的 Codex 程序。');
-        /** 外部更新回执保存更新后的版本事实，重放时不再次执行命令。 */
-        const mutation = await settingsCommands.executeExternal({
-          parsed,
-          destinationId: 'codex_runtime_update',
-          resourceId: 'codex-runtime',
-          externalOperationId: `${parsed.operationIdentity}:codex-update`,
-          invoke: async (): Promise<CodexRuntimeUpdateStatus> => {
-            await runCodexSelfUpdate(commandPath, dependencies.codexHome, available.latestVersion!);
-            /** 成功退出后重新探测同一配置，不能把 CLI 的文字提示当成更新成功。 */
-            const adapter = await runtimeQueries.checkAdapter('codex');
-            if (!adapter.available || !adapter.version || compareSemverLike(adapter.version, available.latestVersion!) < 0) {
-              throw Object.assign(new Error('Codex 更新命令已结束，但实际版本没有达到目标版本。'), { code: 'ZEUS_CODEX_UPDATE_NOT_APPLIED' });
+      /** 当前请求进入串行队列，前一轮完成后会重新检测是否仍需更新。 */
+      const operation = codexUpdateChain.then(async () => {
+        /** 进度只在真实阶段完成时推进，不使用计时器估算。 */
+        const reportProgress = (progress: number | null, stage: string): void => {
+          publishRealtimeEvent('codex.update.progress', { progress, stage });
+        };
+        reportProgress(null, 'checking');
+        /** 安装请求先重新检查，归属或目标版本变化时不得进入维护窗口。 */
+        const detected = await runtimeQueries.checkCodexUpdate();
+        assertCodexUpdateTarget(detected, parsed.input.targetVersion);
+        /** 远程守护进程可能跨越应用重启，必须用握手版本识别磁盘已更新但进程仍陈旧的状态。 */
+        const detectedRuntimeState = codexAppServerManager.getState();
+        /** 只有 ready 状态提供实际运行程序的可信版本。 */
+        const detectedRuntimeVersion = detectedRuntimeState.type === 'ready' ? detectedRuntimeState.capabilities.providerVersion : null;
+        /** 远程模式没有可验证运行态或版本不一致时，即使磁盘已最新也要完成接管。 */
+        const runtimeRepairRequired =
+          detected.adapter.available && detected.adapter.version && platformMutableState.codexRemoteControlEnabled
+            ? detectedRuntimeState.type !== 'ready' || (Boolean(detected.adapter.version) && detectedRuntimeVersion !== detected.adapter.version)
+            : detectedRuntimeState.type === 'ready' && Boolean(detected.adapter.version) && detectedRuntimeVersion !== detected.adapter.version;
+        if (detected.status !== 'available' && !runtimeRepairRequired) {
+          reportProgress(1, 'completed');
+          return detected;
+        }
+        /** 只有多世代运行管理器能原子阻止新任务进入维护窗口。 */
+        const runMaintenance = codexAppServerManager.runExclusiveMaintenance?.bind(codexAppServerManager);
+        if (!runMaintenance) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '当前 Codex 运行服务不支持安全在线更新。');
+        /** 已有轮次、目标和授权自然收口；设置页明确展示等待，不把排队误报成失败。 */
+        reportProgress(null, 'waiting');
+        /** 取得维护窗口后不接纳新的 Codex 写操作；已有查询仍可返回。 */
+        const result = await runMaintenance(async (maintenance: CodexRuntimeMaintenanceControl) => {
+          reportProgress(null, 'preparing');
+          /** 服务端重新读取实际程序和官方版本，不信任界面上一次检测结果。 */
+          const available = await runtimeQueries.checkCodexUpdate();
+          assertCodexUpdateTarget(available, parsed.input.targetVersion);
+          /** 记录本轮是否执行或重放过外部更新；这种情况必须重新验证运行进程。 */
+          let updateApplied = false;
+          /** 默认沿用重新检测结果；真正更新后替换成持久化的更新回执。 */
+          let updated = available;
+          if (available.status === 'available') {
+            /** 只执行探针解析出的真实路径，禁止客户端指定任意命令。 */
+            const commandPath = available.adapter.resolvedCommandPath;
+            if (!commandPath || !available.latestVersion) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '没有可安全更新的 Codex 程序。');
+            /** 外部更新回执只保存磁盘版本事实；运行时接管失败时可安全重试而不重复下载。 */
+            await settingsCommands.executeExternal({
+              parsed,
+              destinationId: 'codex_runtime_update',
+              resourceId: 'codex-runtime',
+              externalOperationId: `${parsed.operationIdentity}:codex-update`,
+              invoke: async (): Promise<CodexRuntimeUpdateStatus> => {
+                await runCodexSelfUpdate(commandPath, dependencies.codexHome, available.latestVersion!, reportProgress);
+                reportProgress(null, 'verifying');
+                /** 成功退出后重新探测同一配置，不能把 CLI 的文字提示当成更新成功。 */
+                const adapter = await runtimeQueries.checkAdapter('codex');
+                if (!adapter.available || adapter.version !== parsed.input.targetVersion) {
+                  throw Object.assign(new Error('Codex 安装结束，但无法确认程序与选择的版本一致。请重新检测，不要自动重试安装。'), { code: 'ZEUS_CODEX_UPDATE_NOT_APPLIED' });
+                }
+                return {
+                  adapter,
+                  managedInstallation: isManagedCodexStandalone(adapter.resolvedCommandPath, dependencies.codexHome),
+                  status: 'up_to_date',
+                  currentVersion: adapter.version,
+                  latestVersion: available.latestVersion,
+                  checkedAt: now().toISOString(),
+                };
+              },
+              mutateAcceptedBusinessState: (result) => {
+                appendAuditLog({
+                  actorType: 'local_api',
+                  action: 'settings.codex_runtime.updated',
+                  resourceType: 'settings',
+                  resourceId: 'codex-runtime',
+                  payload: { previousVersion: available.currentVersion, currentVersion: result.currentVersion, latestVersion: result.latestVersion },
+                });
+              },
+            });
+            updateApplied = true;
+            /** 断线重放可能晚于后续升级；接管目标始终重新探测当前磁盘，不能沿用旧回执路径。 */
+            const installedAdapter = await runtimeQueries.checkAdapter('codex');
+            if (!installedAdapter.available || installedAdapter.version !== parsed.input.targetVersion || !isManagedCodexStandalone(installedAdapter.resolvedCommandPath, dependencies.codexHome)) {
+              throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_APPLIED', 'Codex 安装后程序来源或版本已变化，请重新检测。');
             }
-            return {
-              adapter,
-              status: 'up_to_date',
-              currentVersion: adapter.version,
+            updated = {
+              adapter: installedAdapter,
+              managedInstallation: isManagedCodexStandalone(installedAdapter.resolvedCommandPath, dependencies.codexHome),
+              status: compareSemverLike(installedAdapter.version, available.latestVersion) < 0 ? 'available' : 'up_to_date',
+              currentVersion: installedAdapter.version,
               latestVersion: available.latestVersion,
               checkedAt: now().toISOString(),
             };
-          },
-          mutateAcceptedBusinessState: (updated) => {
-            appendAuditLog({
-              actorType: 'local_api',
-              action: 'settings.codex_runtime.updated',
-              resourceType: 'settings',
-              resourceId: 'codex-runtime',
-              payload: { previousVersion: available.currentVersion, currentVersion: updated.currentVersion, latestVersion: updated.latestVersion },
-            });
-          },
+          }
+          /** 接管目标必须来自更新后的磁盘探针，不从 CLI 输出或界面状态猜测。 */
+          const targetVersion = updated.adapter.version;
+          /** 再读一次维护窗口内的运行态，覆盖等待维护锁期间发生的合法切换。 */
+          const currentRuntimeState = codexAppServerManager.getState();
+          /** 活动握手版本是实际守护进程身份，不等同于磁盘符号链接。 */
+          const currentRuntimeVersion = currentRuntimeState.type === 'ready' ? currentRuntimeState.capabilities.providerVersion : null;
+          /** 真正更新或磁盘与进程不一致时，都要在同一维护窗口内完成接管。 */
+          const runtimeSwitchRequired =
+            updateApplied ||
+            (platformMutableState.codexRemoteControlEnabled && Boolean(targetVersion) && Boolean(updated.adapter.resolvedCommandPath) && currentRuntimeState.type !== 'ready') ||
+            (currentRuntimeState.type === 'ready' && Boolean(targetVersion) && currentRuntimeVersion !== targetVersion);
+          if (!runtimeSwitchRequired) return updated;
+          if (!targetVersion || !updated.adapter.resolvedCommandPath) throw nativeApiError('ZEUS_CODEX_UPDATE_NOT_APPLIED', 'Codex 更新后无法确认可运行的程序版本。');
+          reportProgress(null, 'switching');
+          try {
+            /** 新程序可能改变共享状态；先关闭空闲旧实例，失败后也不能自动继续使用旧程序。 */
+            await maintenance.deactivateCurrentGeneration();
+            if (platformMutableState.codexRemoteControlEnabled) {
+              /** 官方 stop 命令结束独立守护进程；下一次激活才会加载新 CLI。 */
+              await stopCodexRemoteControlDaemon(updated.adapter.resolvedCommandPath, dependencies.codexHome);
+            }
+            /** 新世代、版本握手和新模型目录全部成功后才允许维护窗口结束。 */
+            await activateCurrentCodexConfiguration({ syncSubscriptionModels: true, activateFreshGeneration: maintenance.activateFreshGeneration });
+            /** 主动刷新会发布模型更新事件，让所有模型选择器同步收到新目录。 */
+            const capabilities = await codexAppServerManager.refreshModels();
+            if (capabilities.providerVersion !== targetVersion) {
+              throw Object.assign(new Error(`Codex 已安装 ${targetVersion}，但当前运行进程仍是 ${String(capabilities.providerVersion ?? 'unknown')}。`), { code: 'ZEUS_CODEX_RUNTIME_VERSION_MISMATCH' });
+            }
+          } catch (cause) {
+            /** 新程序可能已写入持久状态；连接失败不能自动降级或覆盖升级后的对话。 */
+            throw Object.assign(new Error('Codex 程序已安装，但连接尚未完成。请重新连接 Codex；Zeus 未自动降级或恢复旧对话数据。', { cause }), { code: 'ZEUS_CODEX_UPDATE_ACTIVATION_FAILED' });
+          }
+          return updated;
         });
-        updateApplied = true;
-        return mutation.result;
+        reportProgress(1, 'completed');
+        return result;
       });
-      /** 只有真实更新或回放已完成的更新才切换世代；纯检测不打扰现有实例。 */
-      if (updateApplied) await activateCurrentCodexConfiguration();
-      return result;
+      codexUpdateChain = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      return await operation;
     } catch (error) {
       /** 维护门禁和运行时热切换错误保留自身错误码，其余命令错误按外部写入语义返回。 */
       const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : '';
@@ -1116,7 +1345,6 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   registerCodexSubagentQueryRoutes({ server, application: codexSubagentQueries });
 
   const conversationCapabilityQueries = new ConversationCapabilityQueryApplication({
-    readProjectContextCapacity: (projectId) => readProjectConfig(projectId).contextCapacityTokens,
     readContextCapacitySupport: (model) => {
       const state = codexAppServerManager.getState();
       return resolveContextCapacityPolicy(
@@ -1140,6 +1368,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       readAccount: () => codexAppServerManager.readAccount(),
     },
     modelCatalog: {
+      hasConfiguredProvider: () => modelConnections.listMetadata().length > 0,
       listSelectableModels: () => modelConnections.listSelectableModels(),
     },
     git: {
@@ -1151,6 +1380,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       readAttachmentOptions: (project, task) => inspectTaskPushAttachments(task, project.localPath).inspected.map((attachment: { option: TaskPushParentAttachmentOption }) => attachment.option),
     },
     readDefaultModel: () => platformMutableState.runtimeSettings.adapterModels.codex ?? null,
+    readTaskBranchPrefix: () => platformMutableState.appShellSettings.taskBranchPrefix,
     codexNativeEnabled: () => codexNativeEnabled,
     now,
   });
@@ -1549,7 +1779,6 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     },
     archiveNativeConversation,
     restoreNativeConversation,
-    rememberContextCapacity: (projectId, capacity) => settings.setJson(projectConfigSettingsPrefix + projectId, { ...readProjectConfig(projectId), contextCapacityTokens: capacity }),
     validateContextCapacity: async (conversation, model) => {
       if (conversation.contextCapacityTokens === null) return;
       /** 复用界面的同一能力来源，换模型不能把旧预算静默丢掉。 */
@@ -1573,6 +1802,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     server,
     application: conversationDispatchCommands,
     operations: {
+      readQueueState: (params) => toNativeQueueApiSnapshot(requireNativeQueueConversation(params)),
       changeSet: async ({ params, action, changeSetId, expectedState, operationIdentity }) =>
         turnChangeSetService.operate({
           projectId: params.projectId,
@@ -2238,63 +2468,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     },
   );
 
-  server.put(
-    '/api/projects/:projectId/model-service-tier-preference',
-    async (
-      request: FastifyRequest<{
-        Params: { projectId: string };
-        Body: SettingsCommandRequest<ProjectModelServiceTierPreference>;
-      }>,
-      reply,
-    ): Promise<ProjectConfigSnapshot | unknown> => {
-      try {
-        const parsed = settingsCommands.parse<ProjectModelServiceTierPreference>({
-          value: request.body,
-          commandType: settingsCommandTypes.projectModelServiceTierPreferencePut,
-          scopeKind: 'project',
-          expectedScopeId: () => request.params.projectId,
-        });
-        const project = projects.getById(request.params.projectId);
-        if (!project) return reply.code(404).send({ error: 'ZEUS_PROJECT_NOT_FOUND', message: 'Project not found' });
-        const preference = normalizeProjectModelServiceTierPreference(parsed.input);
-        if (!preference) {
-          return reply.code(400).send({
-            error: 'ZEUS_INVALID_PROJECT_SERVICE_TIER_PREFERENCE',
-            message: 'Project model service tier preference must identify one model and use standard or priority',
-          });
-        }
-        const current = readProjectConfig(project.id);
-        const replacesExisting = current.serviceTierPreferences.some((entry: ProjectModelServiceTierPreference) => entry.modelSourceId === preference.modelSourceId && entry.modelId === preference.modelId);
-        if (!replacesExisting && current.serviceTierPreferences.length >= 100) {
-          return reply.code(409).send({ error: 'ZEUS_PROJECT_SERVICE_TIER_PREFERENCE_LIMIT', message: 'Project model service tier preference limit reached' });
-        }
-        const nextConfig: ProjectConfigSnapshot = {
-          ...current,
-          serviceTierPreferences: [...current.serviceTierPreferences.filter((entry: ProjectModelServiceTierPreference) => entry.modelSourceId !== preference.modelSourceId || entry.modelId !== preference.modelId), preference],
-        };
-        const mutation = settingsCommands.executeCore({
-          parsed,
-          destinationId: 'project_model_service_tier_preference',
-          resourceId: project.id,
-          mutateBusinessState: () => {
-            settings.setJson(projectConfigSettingsPrefix + project.id, nextConfig);
-            appendAuditLog({
-              actorType: 'local_api',
-              action: 'project.service_tier_preference.updated',
-              resourceType: 'project',
-              resourceId: project.id,
-              payload: { ...preference },
-            });
-            return nextConfig;
-          },
-        });
-        return mutation.result;
-      } catch (error) {
-        const mapped = settingsCommandHttpError(error, redactSensitiveText);
-        return reply.code(mapped.statusCode).send(mapped.body);
-      }
-    },
-  );
+  /** 项目模型偏好已退役，旧调用不能继续写入隐藏覆盖。 */
+  server.put('/api/projects/:projectId/model-service-tier-preference', async (_request, reply) => reply.code(410).send({ error: 'ZEUS_PROJECT_PREFERENCES_REMOVED', message: '项目独立设置已移除，请在当前任务或会话中选择模型档位。' }));
 
   server.put(
     '/api/projects/:projectId/config',
@@ -2314,11 +2489,11 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         });
         const project = projects.getById(request.params.projectId);
         if (!project) return reply.code(404).send({ error: 'ZEUS_PROJECT_NOT_FOUND', message: 'Project not found' });
-        // 普通项目设置保存不拥有模型速度偏好，避免旧界面快照覆盖专用接口写入的显式选择。
-        const ordinaryConfigBody: UpdateProjectConfigBody = { ...parsed.input };
-        delete ordinaryConfigBody.serviceTierPreferences;
-        // 预算与其他项目字段统一严格校验，让非法输入沿用下方 400 回执，避免被通用异常映射为 500。
-        const nextConfig = normalizeProjectConfig(project.id, ordinaryConfigBody, readProjectConfig(project.id));
+        /** 资源接口拒绝已退役字段，不接受隐藏的项目偏好。 */
+        if (Object.keys(parsed.input).some((key) => !['vcs', 'database', 'security'].includes(key))) {
+          return reply.code(400).send({ error: 'ZEUS_PROJECT_PREFERENCES_REMOVED', message: '项目独立设置已移除，仅可保存连接资源与授权。' });
+        }
+        const nextConfig = normalizeProjectConfig(project.id, parsed.input, readProjectConfig(project.id));
         if (!nextConfig) return reply.code(400).send({ error: 'ZEUS_INVALID_PROJECT_CONFIG', message: 'Project config must use safe single-line values and supported options' });
         if (hasDatabaseUriPassword(nextConfig.database.connectionName)) {
           return reply.code(400).send({ error: 'ZEUS_DATABASE_CONNECTION_SECRET_IN_URI', message: 'Database connection URI must not include a password; save the password in the project Keychain field.' });
@@ -2334,7 +2509,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
               action: 'project.config.updated',
               resourceType: 'project',
               resourceId: project.id,
-              payload: { defaultWorkMode: nextConfig.defaultWorkMode, language: nextConfig.language.primary },
+              payload: { connectionName: nextConfig.database.connectionName, security: nextConfig.security },
             });
             return nextConfig;
           },
@@ -2490,7 +2665,10 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
             return {
               name: (phase === 'pre' ? file.oldPath : file.newPath) || file.newPath || file.oldPath || '文件',
               label: phase === 'pre' ? '变更前 · 轮次快照' : '变更后 · 轮次快照',
-              ...(exists && path && hash ? { path, root: join(dataLayout.turnChangeSets, input.changeSetId, 'blobs'), sha256: hash } : { reason: exists ? '此轮次没有保存可用的历史文件内容。' : '此版本中不存在该文件。' }),
+              // 预览协议只传纯 SHA-256；存储哈希保留算法前缀。
+              ...(exists && path && hash
+                ? { path, root: join(dataLayout.turnChangeSets, input.changeSetId, 'blobs'), sha256: hash.replace(/^sha256:/u, '') }
+                : { reason: exists ? '此轮次没有保存可用的历史文件内容。' : '此版本中不存在该文件。' }),
             };
           }),
         };
@@ -2534,26 +2712,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     repositoryDiscovery,
     projects,
     sharedPaths: projectSharedPaths,
-    templates: taskTemplates,
     saveProjectConfig: (projectId, config) => settings.setJson(projectConfigSettingsPrefix + projectId, config),
-    stageProjectManagementStatus: (projectId) => {
-      settings.setJson(appShellSettingsKey, {
-        ...platformMutableState.appShellSettings,
-        taskManagementStatusByProject: {
-          ...platformMutableState.appShellSettings.taskManagementStatusByProject,
-          [projectId]: cloneTaskManagementStatusConfig(platformMutableState.appShellSettings.taskManagementStatusTemplate),
-        },
-      });
-    },
-    activateProjectManagementStatus: (projectId) => {
-      platformMutableState.appShellSettings = {
-        ...platformMutableState.appShellSettings,
-        taskManagementStatusByProject: {
-          ...platformMutableState.appShellSettings.taskManagementStatusByProject,
-          [projectId]: cloneTaskManagementStatusConfig(platformMutableState.appShellSettings.taskManagementStatusTemplate),
-        },
-      };
-    },
     appendAuditLog,
     afterCommit: (callback) => db.afterCommit(callback),
     publishRealtimeEvent,
@@ -2569,7 +2728,6 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     archiveConfirmation: (projectId) => workManagementProjectOperations.archiveConfirmation(projectId),
     archive: (projectId) => workManagementProjectOperations.archive(projectId),
     restore: (projectId) => workManagementProjectOperations.restore(projectId),
-    setDefaultTemplate: (projectId, input) => workManagementProjectOperations.setDefaultTemplate(projectId, input),
     mapDomainError: mapWorkManagementTaskDomainError,
   });
 
@@ -3269,12 +3427,20 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   const automationRuns = new AutomationRunRepository(db);
   /** 自动化存储统一接收 ISO 时间，避免 Date 被 SQLite 静默绑定为 NULL。 */
   const automationNow = (): string => now().toISOString();
+  /** 无项目自动化复用产品已有临时会话工作区，不创建普通项目。 */
+  const ensureAutomationTemporaryWorkspace = (runIdentity: string) =>
+    workManagementProjectOperations.create({ temporary: true, name: '临时会话', localPath: '' }, temporaryWorkspaceId, {
+      commandId: `automation-temporary-workspace:${runIdentity}`,
+      operationIdentity: `automation:${runIdentity}`,
+      actor: { kind: 'system', id: 'automation-scheduler' },
+    });
 
   registerAutomationRoutes({
     server,
     tasks: automationTasks,
     runs: automationRuns,
     db,
+    ensureTemporaryWorkspace: ensureAutomationTemporaryWorkspace,
     kick: () => automationScheduler?.kick(),
     now: automationNow,
   });
@@ -3288,9 +3454,9 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     templates: digitalEmployeeTemplates,
     employees: digitalEmployees,
     automations: digitalEmployeeAutomations,
+    isAutomationMigrated: (automationId) => Boolean(automationTasks.getById(automationId)),
     executions: digitalEmployeeExecutions,
     projectEvents: digitalEmployeeProjectEvents,
-    commandDefinitions: digitalEmployeeCommandDefinitions,
     stages: taskStages,
     conversations,
     taskStageApplication,
@@ -3299,6 +3465,75 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     isTaskTerminal: taskManagementStatusIsTerminal,
     save: () => db.save(),
     kick: () => digitalEmployeeOrchestrator?.kick(),
+  });
+
+  /** 手动、员工与自动化指派共用耐久命令；项目未配置流程时才返回单员工入口。 */
+  const acceptProjectWorkflowAssignment = async (input: {
+    projectId: string;
+    taskId: string;
+    employeeId: string;
+    executionId?: string | null;
+    source: string;
+    sourceRef?: string;
+    inputDeliverableIds?: string[];
+    reason?: string;
+    context?: Record<string, unknown>;
+  }): Promise<{ workflowRunId: string } | null> => {
+    if (!digitalTeamWorkflowCoordinator) throw nativeApiError('ZEUS_DIGITAL_TEAM_NOT_READY', '项目流程服务尚未就绪。');
+    /** 本次入口权限必须进入运行快照，不能被任务长期授权或员工默认扩大。 */
+    const permissionMode = input.context?.permissionMode;
+    if (permissionMode !== undefined && !['read-only', 'auto', 'full-access'].includes(String(permissionMode))) throw nativeApiError('ZEUS_DIGITAL_TEAM_PERMISSION_INVALID', '本次流程权限无效。');
+    /** 过期任务事实与正式成果选择一起冻结。 */
+    const assignment = {
+      taskId: input.taskId,
+      employeeId: input.employeeId,
+      permissionMode: permissionMode as 'read-only' | 'auto' | 'full-access' | undefined,
+      expectedTaskUpdatedAt: typeof input.context?.expectedTaskUpdatedAt === 'string' ? input.context.expectedTaskUpdatedAt : undefined,
+      inputDeliverableIds: input.inputDeliverableIds,
+      reason: input.reason,
+    };
+    /** 准备只读核验真实代码基线，不重放未知运行。 */
+    const prepared = await digitalTeamWorkflowCoordinator.prepareEmployeeAssignment(input.projectId, assignment);
+    if (!prepared) return null;
+    /** 来自既有执行或会话提交的身份，重复请求关联同一接纳。 */
+    const operationIdentity = `project-workflow:${input.executionId ?? input.sourceRef ?? `${input.taskId}:${input.employeeId}`}`;
+    /** 内部命令沿用统一摘要和幂等账本，人工来源保留真实 actor。 */
+    const request = imInternalCommandRequest({
+      commandType: workManagementCommandTypes.digitalTeamRunCreate,
+      scopeKind: 'project',
+      scopeId: input.projectId,
+      operationIdentity,
+      input: assignment,
+      inputSha256: workManagementInputSha256(assignment),
+    });
+    request.command.actor = input.context?.actor ? (input.context.actor as CommandActor) : { kind: 'system', id: 'project-workflow-admission' };
+    /** 已接纳的同身份返回原回执，改派由协调器登记交接。 */
+    const parsed = workManagementCommands.parse<typeof assignment>({ value: request, commandType: workManagementCommandTypes.digitalTeamRunCreate, scopeKind: 'project', expectedScopeId: () => input.projectId });
+    /** 业务写入和运行冻结在同一事务完成。 */
+    const receipt = workManagementCommands.executeCore({
+      parsed,
+      destinationId: 'project-workflow-admission',
+      resourceId: input.taskId,
+      mutateBusinessState: () =>
+        digitalTeamWorkflowCoordinator!.acceptEmployeeAssignment(input.projectId, assignment, { commandId: parsed.command.commandId, operationIdentity: parsed.operationIdentity, actor: parsed.command.actor }, prepared),
+    });
+    await db.save();
+    /** 使用协调器实际运行身份，而不是第一个员工会话身份。 */
+    const projection = receipt.result as { run: { id: string } };
+    return { workflowRunId: projection.run.id };
+  };
+
+  /** 正式成果存于 ArtifactStore，项目 docs 与无项目受管目录均可从账本重建。 */
+  const workArtifacts = new WorkArtifactDelivery({
+    publications: new WorkArtifactRepository(db),
+    artifacts: artifactStore,
+    deliverables: taskWorkDeliverables,
+    runs: taskWorkRuns,
+    tasks,
+    projects,
+    conversations,
+    workspaces: taskWorkspaces,
+    managedRoot: join(dataLayout.artifactsDirectory, 'task-docs'),
   });
 
   taskWorkManagement = registerTaskWorkManagement({
@@ -3329,6 +3564,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     commandDefinitions: digitalEmployeeCommandDefinitions,
     commandRuns,
     artifacts: artifactStore,
+    workArtifacts,
+    acceptProjectWorkflowAssignment,
     skillSnapshotRoot: join(dataLayout.artifactsDirectory, 'task-work-skill-snapshots'),
     skills: zeusSkillService,
     plugins: zeusPluginService,
@@ -3343,8 +3580,42 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     readOnlyValidation: Boolean(readOnlyValidation),
   });
 
+  /** 只有迁移归档中的准确旧来源可解释项目状态，新修订与新事件统一使用全局状态。 */
+  const resolveArchivedTaskStatus = (projectId: string, statusId: string, source: { revisionId: string } | { eventSequence: number } | { runId: string }): string => {
+    /** 来源身份与事件边界独立归档，不改历史运行或修订快照。 */
+    const archive = settings.getJson<ArchivedProjectTaskStatuses>('archive.project-task-status-settings');
+    return resolveArchivedTaskManagementStatus(archive, projectId, statusId, source);
+  };
+
   /** 数字团队复用现有任务、会话、证据与 Git 能力，只新增冻结图和节点尝试账本。 */
   digitalTeamWorkflowCoordinator = new DigitalTeamWorkflowCoordinator({
+    defects: new DefectWorkflowRepository(db),
+    isCompletedTaskStatus: (projectId, statusId) => resolveTaskManagementStatusConfigForProject(projectId).roles.completedStatusId === statusId,
+    validateTaskStatus: (projectId, statusId) => resolveTaskManagementStatusConfigForProject(projectId).statuses.some((status: import('@zeus/shared').TaskManagementStatusDefinition) => status.id === statusId),
+    resolveLegacyTaskStatus: (projectId, statusId, runId) => resolveArchivedTaskStatus(projectId, statusId, { runId }),
+    advanceTaskStatus: (taskId, statusId, source) => {
+      /** 流程产生的状态事件保留发生前后身份并阻止自触发。 */
+      const before = tasks.getById(taskId);
+      if (!before || before.managementStatus === statusId) return;
+      if (statusId === resolveTaskManagementStatusConfigForProject(before.projectId).roles.completedStatusId) tasks.assertCanComplete(taskId);
+      /** 状态与来源事件在当前 Core 事务内统一更新。 */
+      const updated = tasks.updateManagementStatus(taskId, statusId, before.updatedAt);
+      taskEvents.create({
+        taskId,
+        eventType: 'task.management_status.changed',
+        title: '项目流程推进任务状态',
+        payload: { before: before.managementStatus, after: updated.managementStatus, source: 'digital_team_workflow', suppressAutomation: true, digitalTeamRunId: source.runId, nodeId: source.nodeId, phase: source.phase },
+      });
+      publishRealtimeEvent('task.management_status.changed', { taskId, projectId: before.projectId, before: before.managementStatus, after: updated.managementStatus, source: 'digital_team_workflow' });
+    },
+    finishAcceptedDefect: (taskId, runId) => {
+      /** 父流程确已接纳复验后，缺陷任务才允许完成。 */
+      const defectTask = tasks.getById(taskId);
+      if (!defectTask) return;
+      tasks.assertCanComplete(taskId);
+      tasks.updateManagementStatus(taskId, resolveTaskManagementStatusConfigForProject(defectTask.projectId).roles.completedStatusId);
+      taskEvents.create({ taskId, eventType: 'task.defect.accepted', title: '缺陷复验通过', payload: { source: 'digital_team_workflow', suppressAutomation: true, digitalTeamRunId: runId } });
+    },
     isTaskTerminal: taskManagementStatusIsTerminal,
     templates: new DigitalTeamWorkflowTemplateRepository(db, () => now().toISOString()),
     runs: new DigitalTeamWorkflowRunRepository(db, () => now().toISOString()),
@@ -3352,7 +3623,6 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     projects,
     tasks,
     projectRepositories,
-    employees: digitalEmployees,
     environments: taskEnvironments,
     workspaces: taskWorkspaces,
     submissions: conversationSubmissions,
@@ -3362,28 +3632,179 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     turnChanges: turnChangeSets,
     artifacts: artifactStore,
     taskWork: taskWorkManagement,
-    taskCreation: { create: (input, taskId, context) => workManagementCoreOperations.createUserTask(input, taskId, context) },
+    taskCreation: {
+      /** 团队任务仍复用任务创建的既有审计与来源处理。 */
+      create: (input, taskId, context) => workManagementCoreOperations.createUserTask(input, taskId, context),
+      /** 本次明确代码授权与运行创建共用 Core 事务，权限审计和实时投影沿用任务更新入口。 */
+      grantCodeAuthority: (taskId, expectedUpdatedAt, context) => workManagementTaskOperations.updateTask(taskId, { expectedUpdatedAt, allowCodeChanges: true, allowTests: true, allowGitCommit: true }, context),
+    },
     save: () => db.save(),
     publish: publishRealtimeEvent,
     now,
     readOnlyValidation: Boolean(readOnlyValidation),
   });
-  taskWorkManagement.bindDigitalTeamTools(digitalTeamWorkflowCoordinator.workTools);
+  taskWorkManagement.bindDigitalTeamTools(digitalTeamWorkflowCoordinator.workTools, async () => {
+    await digitalTeamWorkflowCoordinator?.processRuns();
+  });
   registerDigitalTeamWorkflowRoutes({ server, application: workManagementCommands, coordinator: digitalTeamWorkflowCoordinator, save: () => db.save() });
 
   if (!readOnlyValidation) {
     automationScheduler = createAutomationScheduler({
+      migrateLegacy: () => migrateEmployeeAutomationsToUnified(db),
+      resolveLegacyTaskStatus: resolveArchivedTaskStatus,
       tasks: automationTasks,
       runs: automationRuns,
       conversations,
       submissions: conversationSubmissions,
       getProject: (projectId) => projects.getById(projectId),
+      ensureTemporaryWorkspace: ensureAutomationTemporaryWorkspace,
       save: () => db.save(),
       now: automationNow,
       publish: publishRealtimeEvent,
-      dispatch: createAutomationConversationDispatch({ conversations, modelConnections, executeConversationDispatchMessage, executeProjectConversationIdempotent }),
+      dispatch: createAutomationConversationDispatch({ conversations, modelConnections, executeConversationDispatchMessage, executeProjectConversationIdempotent, publish: publishNativeConversationEvent }),
+      prepareAction: async ({ run, snapshot, project }) => {
+        if (!digitalEmployeeOrchestrator) throw nativeApiError('ZEUS_AUTOMATION_WORK_UNAVAILABLE', '员工工作服务尚未就绪。');
+        /** 员工绑定与任务在业务接纳前解析并交由调度器冻结。 */
+        const employee = digitalEmployees.ensureProjectEmployee(project.id, snapshot.action.projectEmployeeIds?.[project.id] ?? snapshot.action.employeeId!);
+        if (!employee.enabled) throw nativeApiError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '自动化选择的员工未启用。');
+        /** 新配置明确策略；既有新规则仍保留原指定与事件优先语义。 */
+        const selection =
+          snapshot.action.kind === 'employee_work'
+            ? 'create'
+            : (snapshot.action.taskSelection ?? (snapshot.action.taskId ? 'specified' : snapshot.action.useEventTask !== false && run.sourceEvent?.projectId === project.id ? 'event' : 'create'));
+        /** 任务池为空明确跳过，不创建替代任务。 */
+        const pooledTask = selection === 'pool' ? digitalEmployeeOrchestrator.selectEligibleAutomationTask(project.id, employee.id, undefined, snapshot.action.taskFilter) : null;
+        if (selection === 'pool' && !pooledTask) return null;
+        /** 目标身份在接纳前冻结，重启不能另选一条任务。 */
+        const taskId =
+          selection === 'pool'
+            ? pooledTask!.id
+            : selection === 'specified'
+              ? snapshot.action.taskId
+              : selection === 'event'
+                ? run.sourceEvent?.projectId === project.id
+                  ? run.sourceEvent.taskId
+                  : null
+                : stableIdentity('automation_work_task', `${run.id}:${project.id}`);
+        if (!taskId) throw nativeApiError('ZEUS_AUTOMATION_TASK_REQUIRED', '所选策略没有可用目标任务。');
+        /** 已有目标必须属于当前项目且仍可执行，新建身份也不能覆盖旧任务。 */
+        const task = tasks.getById(taskId);
+        if (selection !== 'create' && (!task || task.projectId !== project.id)) throw nativeApiError('ZEUS_AUTOMATION_TASK_SCOPE', '自动化目标任务不属于已选择项目。');
+        if (task && taskManagementStatusIsTerminal(task)) throw nativeApiError('ZEUS_AUTOMATION_TASK_TERMINAL', '目标任务已经结束，过期事件不重新执行。');
+        if (selection !== 'create' && !digitalEmployeeOrchestrator.selectEligibleAutomationTask(project.id, employee.id, taskId, snapshot.action.taskFilter)) return null;
+        return { taskId, employeeId: employee.id };
+      },
+      dispatchAction: async ({ run, snapshot, project, target }) => {
+        if (!digitalEmployeeOrchestrator) throw nativeApiError('ZEUS_AUTOMATION_WORK_UNAVAILABLE', '员工工作服务尚未就绪。');
+        /** 只使用已经耐久冻结的任务与项目绑定，不再读取当前选择。 */
+        const taskId = target.taskId!;
+        /** 历史绑定的有效授权仍需实时核对，但不能换成另一员工。 */
+        const employee = digitalEmployees.getById(target.employeeId!);
+        if (!employee || employee.projectId !== project.id || !employee.enabled) throw nativeApiError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '已冻结的自动化员工不可用。');
+        /** 创建任务采用原运行与项目的稳定身份，中断恢复只读取原记录。 */
+        let task = tasks.getById(taskId);
+        if (!task) {
+          /** 只有明确新建策略或既有新建语义才有创建权限。 */
+          const selection = snapshot.action.taskSelection ?? (snapshot.action.taskId ? 'specified' : snapshot.action.useEventTask !== false && run.sourceEvent?.projectId === project.id ? 'event' : 'create');
+          if (snapshot.action.kind === 'project_task' && selection !== 'create') throw nativeApiError('ZEUS_AUTOMATION_TASK_REQUIRED', '已冻结的待领取任务已不可用，不能创建替代任务。');
+          task = workManagementCoreOperations.createUserTask(
+            {
+              projectId: project.id,
+              title: snapshot.action.title || snapshot.name,
+              /** 自动化新建普通任务沿用任务域现行类型，不省略 Core 必填字段。 */
+              taskType: 'requirement',
+              description: snapshot.prompt,
+              sourceContext: { type: 'automation', automationId: run.automationId, automationRunId: run.id, suppressAutomation: true },
+              /** 新建任务沿用本条自动化的明确模式，不再叠加员工动作开关。 */
+              allowCodeChanges: snapshot.action.kind === 'project_task' && snapshot.permissionMode === 'full-access',
+              allowTests: snapshot.permissionMode !== 'read-only',
+              /** 项目任务自动化的持续授权明确包含本地提交，调度器在派发前核对冻结修订的授权。 */
+              allowGitCommit: snapshot.action.kind === 'project_task' && snapshot.permissionMode === 'full-access',
+            },
+            taskId,
+            { commandId: `automation-work:${run.id}:${project.id}`, operationIdentity: `automation-work:${run.id}:${project.id}`, actor: { kind: 'system', id: 'automation-scheduler' } },
+          );
+          await db.save();
+        }
+        if (task.projectId !== project.id) throw nativeApiError('ZEUS_AUTOMATION_TASK_SCOPE', '已冻结的自动化目标不属于当前项目。');
+        if (taskManagementStatusIsTerminal(task)) throw nativeApiError('ZEUS_AUTOMATION_TASK_TERMINAL', '目标任务已经结束，过期事件不重新执行。');
+        /** 创建任务保存会让出控制权，真正接纳工作前再次核对原修订授权。 */
+        const authorizationRevision = automationTasks.getRevision(run.automationRevisionId);
+        if (snapshot.permissionMode === 'full-access' && (!authorizationRevision || !automationTasks.hasFullAccessGrant(run.automationId, authorizationRevision.revision)))
+          throw nativeApiError('ZEUS_AUTOMATION_PERMISSION_GRANT_REQUIRED', '原运行的完全访问授权已失效，请重新保存授权后运行。');
+        /** 项目任务复用项目流程；员工调研仍保留独立工作。 */
+        const reference = await digitalEmployeeOrchestrator.queueAutomatedAssignment({
+          projectId: project.id,
+          taskId,
+          employeeId: employee.id,
+          sourceRef: target.sourceRef,
+          bypassWorkflow: snapshot.action.kind === 'employee_work',
+          permissionMode: snapshot.permissionMode,
+        });
+        return reference;
+      },
+      readExecution: (reference): AutomationExecutionState | undefined => {
+        if (reference.kind === 'task_plan') {
+          /** 原安排按准确代次等待整体完成，不采用重新安排后的成功状态。 */
+          const plan = reference.taskId ? new TaskWorkPlanningRepository(db).get(reference.taskId) : null;
+          if (!plan || plan.id !== reference.id || plan.generation !== reference.generation) return { status: 'outcome_unknown', errorCode: 'ZEUS_AUTOMATION_PLAN_REPLACED', errorMessage: '自动化关联的原工作安排已变化，请核对原分工交付。' };
+          /** 必要分工结果未知或失败时不能把仍在等待的旧安排显示为成功。 */
+          const required = plan.stages.flatMap((stage) => stage.items).filter((item) => item.arrangement?.required !== false);
+          const unknown = required.some((item) => item.currentRunId && taskWorkRuns.getById(item.currentRunId)?.status === 'outcome_unknown');
+          if (unknown) return { status: 'outcome_unknown', errorCode: 'ZEUS_AUTOMATION_PLAN_OUTCOME_UNKNOWN', errorMessage: '原工作安排存在结果未知的必要分工。' };
+          if (required.some((item) => item.status === 'failed')) return { status: 'failed', errorCode: 'ZEUS_AUTOMATION_PLAN_WORK_FAILED', errorMessage: '原工作安排的必要分工失败。' };
+          return { status: plan.state === 'completed' ? 'completed' : plan.state === 'cancelled' ? 'cancelled' : 'running', paused: plan.state === 'paused' || plan.state === 'draft' };
+        }
+        if (reference.kind === 'workflow') {
+          /** 等待完整流程终结，第一份员工会话结束不能宣布成功。 */
+          const run = (digitalTeamWorkflowCoordinator?.getRunProjection(reference.id) as { run: import('@zeus/shared').DigitalTeamWorkflowRunRecord } | undefined)?.run;
+          if (!run) return undefined;
+          return {
+            status: run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'cancelled' ? 'cancelled' : run.status === 'outcome_unknown' ? 'outcome_unknown' : 'running',
+            paused: run.controlState === 'paused',
+            errorCode: typeof run.error?.code === 'string' ? run.error.code : null,
+            errorMessage: typeof run.error?.message === 'string' ? run.error.message : null,
+          };
+        }
+        if (reference.kind === 'task_work') {
+          /** Task Work 成功以真实运行成果为准，等待输入仍保持运行。 */
+          const run = taskWorkRuns.getById(reference.id);
+          if (!run) return undefined;
+          return {
+            status: run.status === 'succeeded' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'cancelled' ? 'cancelled' : run.status === 'outcome_unknown' ? 'outcome_unknown' : 'running',
+            errorCode: run.errorCode,
+            errorMessage: run.errorMessage,
+          };
+        }
+        if (reference.kind === 'legacy_employee') {
+          /** 迁移中的旧执行继续使用自己的回执，不重建会话。 */
+          const execution = digitalEmployeeExecutions.getById(reference.id);
+          if (!execution) return undefined;
+          return {
+            status: execution.status === 'delivered' ? 'completed' : execution.status === 'failed' ? 'failed' : execution.status === 'cancelled' ? 'cancelled' : 'running',
+            errorCode: execution.errorCode,
+            errorMessage: execution.errorMessage,
+          };
+        }
+        return undefined;
+      },
     });
     digitalEmployeeOrchestrator = createDigitalEmployeeOrchestrator({
+      migrateAutomations: () => migrateEmployeeAutomationsToUnified(db),
+      acceptProjectWorkflowAssignment,
+      isAutomationMigrated: (automationId) => Boolean(automationTasks.getById(automationId)),
+      readProjectWorkflowRun: (runId) => {
+        /** 员工入口同样读取完整流程终态，而非初始会话。 */
+        const run = (digitalTeamWorkflowCoordinator?.getRunProjection(runId) as { run: import('@zeus/shared').DigitalTeamWorkflowRunRecord } | undefined)?.run;
+        return run
+          ? {
+              status: run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'cancelled' ? 'cancelled' : run.status === 'outcome_unknown' ? 'outcome_unknown' : 'running',
+              paused: run.controlState === 'paused',
+              errorCode: typeof run.error?.code === 'string' ? run.error.code : null,
+              errorMessage: typeof run.error?.message === 'string' ? run.error.message : null,
+            }
+          : undefined;
+      },
       server,
       apiToken: options.apiToken,
       workManagement: workManagementCommands,
@@ -3453,6 +3874,78 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       return await codexAppServerManager.readAccount();
     } catch (error) {
       return sendNativeConversationApiError(reply, error);
+    }
+  });
+
+  /** 显式检查订阅身份并用临时线程发送一次最小真实模型请求。 */
+  server.post('/api/codex/connection/diagnose', async (): Promise<CodexSubscriptionConnectionDiagnostic> => {
+    /** 延迟覆盖 Provider RPC、凭据刷新、模型目录与真实请求。 */
+    const startedAt = performance.now();
+    /** 失败阶段随实际推进更新，不能把目录失败误报成未登录。 */
+    let stage: CodexSubscriptionConnectionDiagnostic['stage'] = 'runtime';
+    /** 即使失败也返回已确认的计划类型，不暴露账号身份。 */
+    let planType: string | null = null;
+    /** 只有进入真实请求阶段才记录测试模型。 */
+    let testedModelId: string | null = null;
+    /** 所有出口使用同一单调时钟。 */
+    const latencyMs = (): number => Math.max(0, Math.round(performance.now() - startedAt));
+    try {
+      return await withCodexConnectionDiagnosticTimeout(
+        (async () => {
+          stage = 'credential';
+          /** 强制刷新凭据，禁止用传输失败时的旧快照冒充本次成功。 */
+          const account = await codexAppServerManager.readAccount({ refreshToken: true, allowCachedOnTransportFailure: false, preferCached: false });
+          planType = account.planType;
+          if (!account.signedIn || account.accountType !== 'chatgpt') {
+            return {
+              ok: false,
+              stage,
+              code: 'ZEUS_CODEX_SUBSCRIPTION_REQUIRED',
+              message: '请先在“模型供应商”中登录 Codex 订阅。',
+              latencyMs: latencyMs(),
+              modelIds: [],
+              testedModelId,
+              planType,
+              checkedAt: now().toISOString(),
+            };
+          }
+          stage = 'catalog';
+          /** 刷新当前运行世代的官方模型目录，结果随订阅可用模型变化。 */
+          const capabilities = await codexAppServerManager.refreshModels();
+          /** 隐藏模型不能用于用户对话，连接检查选择第一个可见模型。 */
+          const model = capabilities.models.find((candidate: CodexModelCapability) => candidate.raw.hidden !== true);
+          if (!model) throw Object.assign(new Error('Codex 订阅没有返回可用于对话的模型。'), { code: 'ZEUS_CODEX_MODEL_UNAVAILABLE' });
+          testedModelId = model.model;
+          stage = 'inference';
+          /** 临时线程只回答 ok，不携带项目内容、工具或写权限。 */
+          await probeCodexConversation({ manager: codexAppServerManager, model, cwd: zeusSkillDefaultCwd });
+          return {
+            ok: true,
+            stage,
+            code: 'ZEUS_CODEX_INFERENCE_AVAILABLE',
+            message: `Codex 模型 ${model.displayName || model.model} 已完成真实请求；这证明当前连接可发起对话。`,
+            latencyMs: latencyMs(),
+            modelIds: capabilities.models.map((model: CodexModelCapability) => model.model),
+            testedModelId,
+            planType,
+            checkedAt: now().toISOString(),
+          };
+        })(),
+      );
+    } catch (error) {
+      /** 错误码和文案均先脱敏，避免 Provider 输出带入本地路径或凭据。 */
+      const code = error instanceof Error && 'code' in error && typeof (error as Error & { code?: unknown }).code === 'string' ? String((error as Error & { code: string }).code) : 'ZEUS_CODEX_CONNECTION_FAILED';
+      return {
+        ok: false,
+        stage,
+        code,
+        message: redactSensitiveText(error instanceof Error ? error.message : 'Codex 订阅连接检查失败。').text,
+        latencyMs: latencyMs(),
+        modelIds: [],
+        testedModelId,
+        planType,
+        checkedAt: now().toISOString(),
+      };
     }
   });
 
@@ -3716,18 +4209,22 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         scopeKind: 'settings',
         expectedScopeId: () => 'app-shell',
       });
+      /** 拒绝旧界面提交项目独立设置，不能重新写入已退役覆盖。 */
+      if (['taskManagementStatusByProject', 'taskTableColumnsByProject', 'taskStatusFilterByProject', 'taskViewModeByProject', 'taskPageViewByProject'].some((key) => Object.prototype.hasOwnProperty.call(parsed.input, key))) {
+        return reply.code(400).send({ error: 'ZEUS_PROJECT_PREFERENCES_REMOVED', message: '项目独立设置已移除，请保存全局设置。' });
+      }
       const previousSettings = platformMutableState.appShellSettings;
       const nextSettings = patchAppShellSettings(previousSettings, parsed.input, settingsIdentityCatalog);
       const migrationOperations: Array<{ projectId: string; fromStatus: TaskManagementStatus; toStatus: TaskManagementStatus }> = [];
-      if (Object.prototype.hasOwnProperty.call(parsed.input, 'taskManagementStatusByProject')) {
-        for (const project of projects.list()) {
-          const previousConfig = previousSettings.taskManagementStatusByProject[project.id] ?? previousSettings.taskManagementStatusTemplate;
-          const nextConfig = nextSettings.taskManagementStatusByProject[project.id] ?? nextSettings.taskManagementStatusTemplate;
+      if (Object.prototype.hasOwnProperty.call(parsed.input, 'taskManagementStatusTemplate')) {
+        for (const project of [...projects.list(), ...projects.listArchived()]) {
+          const previousConfig = previousSettings.taskManagementStatusTemplate;
+          const nextConfig = nextSettings.taskManagementStatusTemplate;
           const nextStatusIds = new Set(nextConfig.statuses.map((status) => status.id));
           const removedStatusIds = previousConfig.statuses.map((status) => status.id).filter((statusId) => !nextStatusIds.has(statusId));
           for (const removedStatusId of removedStatusIds) {
-            if (nextSettings.taskStatusFilterByProject[project.id] === removedStatusId) nextSettings.taskStatusFilterByProject[project.id] = 'unfinished';
-            const replacementStatusId = parsed.input.taskManagementStatusReplacements?.[project.id]?.[removedStatusId];
+            if (nextSettings.taskStatusFilter === removedStatusId) nextSettings.taskStatusFilter = 'unfinished';
+            const replacementStatusId = parsed.input.taskManagementStatusReplacements?.__global__?.[removedStatusId] ?? parsed.input.taskManagementStatusReplacements?.[project.id]?.[removedStatusId];
             const taskCount = tasks.listByProject(project.id, { managementStatus: removedStatusId }).length + tasks.listArchivedByProject(project.id, { managementStatus: removedStatusId }).length;
             const carriesSystemBehavior = Object.values(previousConfig.roles).includes(removedStatusId);
             if ((taskCount > 0 || carriesSystemBehavior) && (!replacementStatusId || !nextStatusIds.has(replacementStatusId))) {
@@ -3781,14 +4278,13 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
               defaultModel: nextSettings.defaultModel,
               defaultTaskTemplateId: nextSettings.defaultTaskTemplateId,
               taskTableColumns: nextSettings.taskTableColumns,
-              taskTableColumnsByProject: nextSettings.taskTableColumnsByProject,
               taskTableEnumSortOrders: nextSettings.taskTableEnumSortOrders,
               taskManagementStatusTemplate: nextSettings.taskManagementStatusTemplate,
-              taskManagementStatusProjectCount: Object.keys(nextSettings.taskManagementStatusByProject).length,
+              taskManagementStatusCount: nextSettings.taskManagementStatusTemplate.statuses.length,
               migratedTaskManagementStatusCount: migratedTasks.length,
-              taskStatusFilterByProject: nextSettings.taskStatusFilterByProject,
-              taskViewModeByProject: nextSettings.taskViewModeByProject,
-              taskPageViewByProject: nextSettings.taskPageViewByProject,
+              taskStatusFilter: nextSettings.taskStatusFilter,
+              taskViewMode: nextSettings.taskViewMode,
+              taskPageView: nextSettings.taskPageView,
               taskExpandedIdsByProject: nextSettings.taskExpandedIdsByProject,
               codeWorkspaceByProject: nextSettings.codeWorkspaceByProject,
             },
@@ -3832,16 +4328,24 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
       // 全部字段先完成 parse/normalize/关联约束计划，之后才允许写 Artifact、SQLite 或文件。
       const plannedAppShell = parsed.input.settings.appShell ? patchAppShellSettings(platformMutableState.appShellSettings, parsed.input.settings.appShell, settingsIdentityCatalog) : null;
+      /** 导入不重新恢复项目偏好，历史数据由启动迁移旁路保存。 */
+      if (
+        ['taskManagementStatusByProject', 'taskTableColumnsByProject', 'taskStatusFilterByProject', 'taskViewModeByProject', 'taskPageViewByProject'].some((key) =>
+          Object.prototype.hasOwnProperty.call(parsed.input.settings?.appShell ?? {}, key),
+        )
+      ) {
+        return reply.code(400).send({ error: 'ZEUS_PROJECT_PREFERENCES_REMOVED', message: '导入内容包含已移除的项目独立设置，请使用全局设置。' });
+      }
       const plannedRuntime = parsed.input.settings.runtime ? normalizeImportedRuntimeSettings(parsed.input.settings.runtime) : null;
       const plannedTelegramNotification = parsed.input.settings.telegramNotification ? normalizeImportedTelegramNotificationSettings(parsed.input.settings.telegramNotification) : null;
       const plannedTelegramSecurity = parsed.input.settings.telegramSecurity ? normalizeImportedTelegramSecuritySettings(parsed.input.settings.telegramSecurity) : null;
       if (parsed.input.settings.runtime && !plannedRuntime) return reply.code(400).send({ error: 'ZEUS_INVALID_SETTINGS_IMPORT', message: 'runtime settings are invalid or unsafe' });
       if (parsed.input.settings.telegramNotification && !plannedTelegramNotification) return reply.code(400).send({ error: 'ZEUS_INVALID_SETTINGS_IMPORT', message: 'telegram notification settings are invalid' });
       if (parsed.input.settings.telegramSecurity && !plannedTelegramSecurity) return reply.code(400).send({ error: 'ZEUS_INVALID_SETTINGS_IMPORT', message: 'telegram security settings are invalid' });
-      if (plannedAppShell && Object.prototype.hasOwnProperty.call(parsed.input.settings.appShell, 'taskManagementStatusByProject')) {
-        for (const project of projects.list()) {
-          const previousConfig = platformMutableState.appShellSettings.taskManagementStatusByProject[project.id] ?? platformMutableState.appShellSettings.taskManagementStatusTemplate;
-          const nextConfig = plannedAppShell.taskManagementStatusByProject[project.id] ?? plannedAppShell.taskManagementStatusTemplate;
+      if (plannedAppShell && Object.prototype.hasOwnProperty.call(parsed.input.settings.appShell, 'taskManagementStatusTemplate')) {
+        for (const project of [...projects.list(), ...projects.listArchived()]) {
+          const previousConfig = platformMutableState.appShellSettings.taskManagementStatusTemplate;
+          const nextConfig = plannedAppShell.taskManagementStatusTemplate;
           const nextStatusIds = new Set(nextConfig.statuses.map((status) => status.id));
           for (const removedStatusId of previousConfig.statuses.map((status) => status.id).filter((statusId) => !nextStatusIds.has(statusId))) {
             const taskCount = tasks.listByProject(project.id, { managementStatus: removedStatusId }).length + tasks.listArchivedByProject(project.id, { managementStatus: removedStatusId }).length;
@@ -4017,18 +4521,15 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     sendError: sendWorkspaceGitCommandError,
   });
 
-  server.get(
-    '/api/settings/runtime-status',
-    async (): Promise<RuntimeStatusSnapshot> => ({
-      aiCli: toPassiveRuntimeStatus(platformMutableState.runtimeSettings),
-      telegram: getTelegramConfigurationState(await readTelegramToken(), platformMutableState.telegramSecuritySettings.allowedUserIds),
-      terminal: {
-        ...runtimeTerminalStatus,
-        /** 用户显式配置优先，图形界面没有 SHELL 时使用系统账户登记值。 */
-        shell: resolveInteractiveRuntimeShell(platformMutableState.runtimeSettings.shell),
-      },
-    }),
-  );
+  server.get('/api/settings/runtime-status', async (): Promise<RuntimeStatusSnapshot> => ({
+    aiCli: toPassiveRuntimeStatus(platformMutableState.runtimeSettings),
+    telegram: getTelegramConfigurationState(await readTelegramToken(), platformMutableState.telegramSecuritySettings.allowedUserIds),
+    terminal: {
+      ...runtimeTerminalStatus,
+      /** 用户显式配置优先，图形界面没有 SHELL 时使用系统账户登记值。 */
+      shell: resolveInteractiveRuntimeShell(platformMutableState.runtimeSettings.shell),
+    },
+  }));
 
   async function ensureCodexRemoteControlReady(remoteControl = platformMutableState.codexRemoteControlEnabled): Promise<void> {
     await codexAppServerManager.ensureReady({
@@ -4045,13 +4546,10 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     return { enabled: platformMutableState.codexRemoteControlEnabled, status: currentStatus, clients, managedStandalone: readCodexRemoteControlStandalone() };
   }
 
-  server.get(
-    '/api/security/secrets',
-    async (): Promise<SecuritySecretsSnapshot> => ({
-      telegramBotToken: getSecretPresenceLabel(await readTelegramToken()),
-      externalApiKey: getSecretPresenceLabel(await secretStore.getSecret('external.apiKey')),
-    }),
-  );
+  server.get('/api/security/secrets', async (): Promise<SecuritySecretsSnapshot> => ({
+    telegramBotToken: getSecretPresenceLabel(await readTelegramToken()),
+    externalApiKey: getSecretPresenceLabel(await secretStore.getSecret('external.apiKey')),
+  }));
 
   server.get('/api/security/audit-logs', async (): Promise<SecurityAuditLogEntry[]> => auditLogs.listRecent().map(toSecurityAuditLogEntry));
 

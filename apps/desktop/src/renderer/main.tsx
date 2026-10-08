@@ -123,7 +123,6 @@ async function renderWithClient(
             onLoadProject={(projectId) => client.projects.loadProject(projectId)}
             onLoadProjectConfig={(projectId) => client.projects.loadProjectConfig(projectId)}
             onSaveProjectConfig={(projectId, input) => client.projects.saveProjectConfig(projectId, input)}
-            onSaveProjectModelServiceTierPreference={(projectId, input) => client.projects.saveProjectModelServiceTierPreference(projectId, input)}
             onLoadProjectDatabaseSecret={(projectId) => client.projects.loadProjectDatabaseSecret(projectId)}
             onSaveProjectDatabasePassword={(projectId, password) => client.projects.saveProjectDatabasePassword(projectId, password)}
             onClearProjectDatabasePassword={(projectId) => client.projects.clearProjectDatabasePassword(projectId)}
@@ -143,10 +142,6 @@ async function renderWithClient(
             }}
             onLoadArchivedProjects={() => client.projects.loadArchivedProjects()}
             onLoadArchivedTasks={(projectId) => client.tasks.loadArchivedTasks(projectId)}
-            onSetProjectDefaultTemplate={async (projectId, templateId) => {
-              await client.projects.setProjectDefaultTemplate(projectId, templateId);
-              return client.loadDashboard();
-            }}
             onAuthorizeTaskFiles={(files, source) => window.zeus?.authorizeTaskFiles?.(files, source) ?? Promise.resolve({ resources: [], failedCount: files.length })}
             onMaterializeTaskResources={(resources) => window.zeus?.materializeTaskResources?.(resources) ?? Promise.resolve([])}
             onReadTaskClipboardResources={() => window.zeus?.readTaskClipboardResources?.() ?? Promise.resolve({ resources: [], text: '' })}
@@ -366,25 +361,41 @@ async function renderMenuBarUsageWithClient(client: DashboardClient): Promise<vo
   );
 }
 
-async function renderTaskGitDeliveryWithClient(client: DashboardClient, taskId: string): Promise<void> {
-  const [{ TaskGitDeliveryWindow }, task, snapshot, appShellSettings, currentContext] = await Promise.all([
+/** 独立费用明细只依赖主进程桥接数据，不启动 Dashboard API 客户端。 */
+
+async function renderTaskGitDeliveryWithClient(client: DashboardClient, parameters: URLSearchParams): Promise<void> {
+  /** URL 只携带真实业务身份，记录和工作目录由已有接口重新读取。 */
+  const taskId = parameters.get('taskId')?.trim();
+  /** 普通会话必须同时指定归属项目与会话。 */
+  const projectId = parameters.get('projectId')?.trim();
+  /** 任务和会话两种范围不能混用。 */
+  const conversationId = parameters.get('conversationId')?.trim();
+  if (taskId ? projectId || conversationId : !projectId || !conversationId) throw new Error('代码交付窗口范围无效。');
+  /** 元数据与设置并行读取，完整交付页只创建一次。 */
+  const [{ TaskGitDeliveryWindow }, task, conversation, snapshot, appShellSettings, currentContext] = await Promise.all([
     import('./task/TaskGitDeliveryWindow.js'),
-    client.tasks.loadTask(taskId),
+    taskId ? client.tasks.loadTask(taskId) : Promise.resolve(null),
+    projectId && conversationId ? client.loadNativeConversationChoice(projectId, conversationId) : Promise.resolve(null),
     client.loadDashboard(),
     client.settings.loadAppShellSettings(),
     window.zeus?.getTaskGitDeliveryCurrentContext?.() ?? Promise.resolve({ taskId: null, workspaceId: null }),
   ]);
+  /** 所有窗口使用同一 React 根及启动错误边界。 */
   const root = document.getElementById('root');
   if (!root) throw new Error('Zeus renderer root element is missing');
-  const projectName = snapshot.projects.find((project) => project.id === task.projectId)?.name;
+  /** 不接受从其他项目借用的会话或缺失记录。 */
+  const project = snapshot.projects.find((item) => item.id === (task?.projectId ?? projectId));
+  if (!task && (!project || !conversation || conversation.projectId !== project.id || conversation.id !== conversationId || conversation.taskId)) throw new Error('代码交付会话归属无效，请从当前会话重新打开。');
+  /** 控制器能力由真实记录选择，原生窗口壳与交付视图保持一致。 */
+  const scope: import('./task/TaskGitDeliveryWindow.js').GitDeliveryWindowScope = task ? { kind: 'task', task, projectName: project?.name } : { kind: 'conversation', project: project!, conversation: conversation! };
   document.body.dataset.surface = 'task-git-delivery';
-  document.title = `${appShellSettings.appLanguage === 'zh-CN' ? '代码交付' : 'Code Delivery'} · ${task.taskCode ?? task.id}`;
+  document.title = `${appShellSettings.appLanguage === 'zh-CN' ? '代码交付' : 'Code Delivery'} · ${task ? (task.taskCode ?? task.id) : conversation!.title}`;
   startupLanguage = appShellSettings.appLanguage;
   const errorLanguage = appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en';
   createRoot(root).render(
     <>
       <RendererErrorBoundary appLanguage={appShellSettings.appLanguage} onFatalError={(error) => reportSurfaceFatalError(error, errorLanguage, 'TaskGitDeliveryWindow')}>
-        <TaskGitDeliveryWindow client={client} task={task} projectName={projectName} language={appShellSettings.appLanguage} appearance={appShellSettings.appearance} initialCurrentContext={currentContext} />
+        <TaskGitDeliveryWindow client={client} scope={scope} language={appShellSettings.appLanguage} appearance={appShellSettings.appearance} initialCurrentContext={currentContext} />
         <RendererBootstrapReady />
       </RendererErrorBoundary>
       <ApplicationErrorDialogHost language={errorLanguage} />
@@ -397,7 +408,13 @@ async function renderProjectGitDiffWithClient(client: DashboardClient, parameter
   const projectId = parameters.get('projectId')?.trim();
   const repositoryId = parameters.get('repositoryId')?.trim();
   const filePath = parameters.get('filePath') ?? '';
-  if (!projectId || !repositoryId) throw new Error('仓库差异窗口缺少项目或仓库身份。');
+  /** 任务来源必须同时指定工作区和比较范围。 */
+  const taskId = parameters.get('taskId');
+  /** 任务工作区与项目仓库使用不同的身份。 */
+  const workspaceId = parameters.get('workspaceId');
+  /** 任务差异明确区分未提交文件和已提交成果。 */
+  const scope = parameters.get('scope');
+  if (taskId ? !workspaceId || !filePath || (scope !== 'working' && scope !== 'committed') : !projectId || !repositoryId) throw new Error('差异窗口缺少有效的读取身份。');
   const stage = parameters.get('stage') === 'staged' || parameters.get('stage') === 'unstaged' ? (parameters.get('stage') as 'staged' | 'unstaged') : 'combined';
   const root = document.getElementById('root');
   if (!root) throw new Error('Zeus renderer root element is missing');
@@ -409,13 +426,26 @@ async function renderProjectGitDiffWithClient(client: DashboardClient, parameter
       <RendererErrorBoundary appLanguage={appShellSettings.appLanguage} onFatalError={(error) => reportSurfaceFatalError(error, errorLanguage, 'ProjectGitDiffWindow')}>
         <ProjectGitDiffWindow
           client={client}
-          projectId={projectId}
-          repositoryId={repositoryId}
-          filePath={filePath}
-          stage={stage}
-          commitHash={parameters.get('commitHash') ?? undefined}
-          comparisonRef={parameters.get('comparisonRef') ?? undefined}
-          comparisonMode={parameters.get('comparisonMode') === 'working-tree' ? 'working-tree' : 'current'}
+          source={
+            taskId && workspaceId && (scope === 'working' || scope === 'committed')
+              ? {
+                  kind: 'task-git',
+                  taskId,
+                  workspaceId,
+                  path: filePath,
+                  scope,
+                }
+              : {
+                  kind: 'project-git',
+                  projectId: projectId!,
+                  repositoryId: repositoryId!,
+                  path: filePath,
+                  stage,
+                  commitHash: parameters.get('commitHash') ?? undefined,
+                  comparisonRef: parameters.get('comparisonRef') ?? undefined,
+                  comparisonMode: parameters.get('comparisonMode') === 'working-tree' ? 'working-tree' : 'current',
+                }
+          }
           language={appShellSettings.appLanguage}
           appearance={appShellSettings.appearance}
         />
@@ -458,9 +488,10 @@ function gitOperationReason(operation: string): string {
 
 async function hydrateRenderer(): Promise<void> {
   if (!window.zeus?.getLocalServerConfig) throw new Error('Electron 本地桥接未就绪');
-  await waitForConversationStoreMigration();
   const parameters = new URLSearchParams(window.location.search);
   const surface = parameters.get('surface');
+  /** 明细窗口不依赖本地服务或数据库迁移，避免无关启动状态阻塞短时悬浮展示。 */
+  await waitForConversationStoreMigration();
   // App 模块和纯本地显示缓存不依赖执行宿主，先与宿主就绪检查并行。
   const mainWindowBootstrap = surface
     ? undefined
@@ -497,9 +528,7 @@ async function hydrateRenderer(): Promise<void> {
     return;
   }
   if (surface === 'task-git-delivery') {
-    const taskId = parameters.get('taskId')?.trim();
-    if (!taskId) throw new Error('代码交付窗口缺少任务身份。');
-    await renderTaskGitDeliveryWithClient(client, taskId);
+    await renderTaskGitDeliveryWithClient(client, parameters);
     return;
   }
   if (surface === 'project-git-diff') {

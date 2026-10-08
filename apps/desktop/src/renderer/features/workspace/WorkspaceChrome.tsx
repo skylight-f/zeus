@@ -5,12 +5,14 @@ import { Collapsible } from '../../ui/Collapsible.js';
 import { handleSourceListKeyboardNavigation } from './workspaceSupport.js';
 import { type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type UIEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 import { FolderPlusIcon as FolderPlus } from '@phosphor-icons/react/dist/csr/FolderPlus';
 import { FunnelIcon as Funnel } from '@phosphor-icons/react/dist/csr/Funnel';
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { DotsThreeVerticalIcon as DotsThreeVertical } from '@phosphor-icons/react/dist/csr/DotsThreeVertical';
 import { GearSixIcon as GearSix } from '@phosphor-icons/react/dist/csr/GearSix';
+import { UserCircleIcon } from '@phosphor-icons/react/dist/csr/UserCircle';
 import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { PushPinIcon as PushPin } from '@phosphor-icons/react/dist/csr/PushPin';
@@ -41,8 +43,9 @@ import { type AppLanguage } from './workspaceCopy.js';
 import { Button } from '../../ui/Button.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { ModalPortal } from '../../ui/ModalPortal.js';
-import { MenuSurface } from '../../ui/MenuSurface.js';
+
 import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
+import { formatVisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { SourceListRow } from '../../ui/SourceListRow.js';
 import { useNewItemMotionIds } from '../../ui/useNewItemMotion.js';
 import { type AiRuntimeAdapterDescriptor, type AiRuntimeAdapterStatus, type AiRuntimeTerminalEvent, type ProjectConfig, type ProjectRecord, type RuntimeSettings, type TaskRecord } from '../../apiClient.js';
@@ -672,7 +675,6 @@ export function ProjectWorkspaceNavigation(props: {
   onSelectProject: (project: ProjectRecord) => void;
   /** 关闭槽位前先收口该项目持有的后台终端。 */
   onCloseProject: (project: ProjectRecord) => Promise<void>;
-  onOpenProjectSettings: (project: ProjectRecord) => void;
   canCreateProject: boolean;
   createProjectBusy: boolean;
   activeNavTarget: WorkspaceViewId;
@@ -710,7 +712,8 @@ export function ProjectWorkspaceNavigation(props: {
     commands: <WorkspaceCommandsIcon size={18} weight="regular" aria-hidden="true" />,
   };
   /** 全局工作区激活时不保留上一个项目工作区的伪选中态。 */
-  const projectWorkspaceActive = props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
+  const projectWorkspaceActive =
+    props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-employees' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
   /** 顶部允许并列打开多个项目槽位；恢复上次退出时的顺序与打开集合。 */
   const [initialProjectWorkspace] = useState(() => resolveProjectWorkspaceTabs(props.projects, props.project.id));
   const projectStatuses = useMemo(() => summarizeProjectConversationStatuses(props.conversationGroups, props.conversationStates, props.language), [props.conversationGroups, props.conversationStates, props.language]);
@@ -727,9 +730,6 @@ export function ProjectWorkspaceNavigation(props: {
   const projectCloseBusy = closingProjectSlotId !== null;
   const [draggingProjectSlotId, setDraggingProjectSlotId] = useState<string | null>(null);
   const [dragOverProjectSlotId, setDragOverProjectSlotId] = useState<string | null>(null);
-  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
-  const contextProject = projectContextMenu && projectSlots.some((slot) => slot.projectId === projectContextMenu.projectId) ? props.projects.find((project) => project.id === projectContextMenu.projectId) : undefined;
-  useEffect(() => setProjectContextMenu(null), [props.project.id]);
   const projectIdsKey = props.projects.map((project) => project.id).join('\u0000');
   useEffect(() => {
     const knownProjectIds = new Set(props.projects.map((project) => project.id));
@@ -863,12 +863,6 @@ export function ProjectWorkspaceNavigation(props: {
                   onDragOver={(event) => handleProjectSlotDragOver(event, slot.id)}
                   onDrop={(event) => handleProjectSlotDrop(event, slot.id)}
                   onDragEnd={handleProjectSlotDragEnd}
-                  onContextMenu={(event) => {
-                    if (projectCloseBusy || !slotProject || slotProject.id === temporaryWorkspaceId) return;
-                    event.preventDefault();
-                    event.currentTarget.querySelector<HTMLButtonElement>('.project-workspace-project-slot-primary')?.focus({ preventScroll: true });
-                    setProjectContextMenu({ projectId: slotProject.id, x: event.clientX, y: event.clientY });
-                  }}
                 >
                   <button
                     type="button"
@@ -877,13 +871,6 @@ export function ProjectWorkspaceNavigation(props: {
                     title={projectStatus?.label}
                     aria-pressed={active}
                     aria-disabled={!slotProject || projectCloseBusy || undefined}
-                    aria-haspopup={slotProject && slotProject.id !== temporaryWorkspaceId ? 'menu' : undefined}
-                    onKeyDown={(event) => {
-                      if (projectCloseBusy || !slotProject || slotProject.id === temporaryWorkspaceId || !(event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) return;
-                      event.preventDefault();
-                      const rect = event.currentTarget.getBoundingClientRect();
-                      setProjectContextMenu({ projectId: slotProject.id, x: rect.left, y: rect.bottom });
-                    }}
                     onClick={() => {
                       if (!projectCloseBusy && slotProject && slotProject.id !== props.project.id) props.onSelectProject(slotProject);
                     }}
@@ -932,8 +919,36 @@ export function ProjectWorkspaceNavigation(props: {
                     disabled={projectSlots.length <= 1 || projectCloseBusy}
                     aria-busy={closing || undefined}
                     data-closing={closing || undefined}
-                    aria-label={closing ? (zh ? `正在关闭项目 ${slotProject?.name ?? ''}` : `Closing project ${slotProject?.name ?? ''}`) : slotProject ? (zh ? `关闭项目 ${slotProject.name}` : `Close project ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
-                    title={closing ? (zh ? '正在终止项目终端…' : 'Stopping project terminals…') : projectSlots.length <= 1 ? (zh ? '至少保留一个项目' : 'Keep at least one project open') : slotProject ? (zh ? `关闭 ${slotProject.name}` : `Close ${slotProject.name}`) : zh ? '关闭项目槽位' : 'Close project slot'}
+                    aria-label={
+                      closing
+                        ? zh
+                          ? `正在关闭项目 ${slotProject?.name ?? ''}`
+                          : `Closing project ${slotProject?.name ?? ''}`
+                        : slotProject
+                          ? zh
+                            ? `关闭项目 ${slotProject.name}`
+                            : `Close project ${slotProject.name}`
+                          : zh
+                            ? '关闭项目槽位'
+                            : 'Close project slot'
+                    }
+                    title={
+                      closing
+                        ? zh
+                          ? '正在终止项目终端…'
+                          : 'Stopping project terminals…'
+                        : projectSlots.length <= 1
+                          ? zh
+                            ? '至少保留一个项目'
+                            : 'Keep at least one project open'
+                          : slotProject
+                            ? zh
+                              ? `关闭 ${slotProject.name}`
+                              : `Close ${slotProject.name}`
+                            : zh
+                              ? '关闭项目槽位'
+                              : 'Close project slot'
+                    }
                     onClick={(event) => {
                       event.stopPropagation();
                       void closeProjectSlot(slot.id);
@@ -988,30 +1003,6 @@ export function ProjectWorkspaceNavigation(props: {
         />
         {props.attentionAction}
       </header>
-      {projectContextMenu && contextProject
-        ? createPortal(
-            <MenuSurface
-              className="project-more-popover"
-              aria-label={zh ? `${contextProject.name} 项目菜单` : `${contextProject.name} project menu`}
-              style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
-              onClose={() => setProjectContextMenu(null)}
-              onContextMenu={(event) => event.preventDefault()}
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setProjectContextMenu(null);
-                  props.onOpenProjectSettings(contextProject);
-                }}
-              >
-                <GearSix size={18} aria-hidden="true" />
-                <span>{zh ? '项目设置' : 'Project settings'}</span>
-              </button>
-            </MenuSurface>,
-            document.querySelector('.macos-ai-app.zeus-shell') ?? document.body,
-          )
-        : null}
       <nav className="project-workspace-mode-rail" aria-label={zh ? '项目工作区' : 'Project workspace'}>
         <button
           type="button"
@@ -1088,6 +1079,20 @@ export function ProjectWorkspaceNavigation(props: {
             </svg>
           </span>
           <span className="project-workspace-mode-label">{zh ? '扩展管理' : 'Extensions'}</span>
+        </button>
+        {/* 数字员工使用人物头像线框，并在全局导航中紧邻数字团队上方。 */}
+        <button
+          type="button"
+          className={props.activeNavTarget === 'digital-employees' ? 'is-active' : ''}
+          aria-label={zh ? '数字员工' : 'Digital employees'}
+          aria-current={props.activeNavTarget === 'digital-employees' ? 'page' : undefined}
+          data-tooltip={zh ? '数字员工' : 'Digital employees'}
+          onClick={() => props.onNavigate('digital-employees')}
+        >
+          <span className="project-workspace-mode-icon" aria-hidden="true">
+            <UserCircleIcon size={18} weight="regular" aria-hidden="true" data-icon-source="phosphor" />
+          </span>
+          <span className="project-workspace-mode-label">{zh ? '数字员工' : 'Digital employees'}</span>
         </button>
         <button
           type="button"
@@ -1369,7 +1374,8 @@ export function SidebarNav(props: {
   const copy = getLanguageCopy(props.appLanguage).sidebar;
   const zh = props.appLanguage === 'zh-CN';
   const showConversationNavigation =
-    props.mainLayout === 'upstream' || (props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations' && props.activeProjectSection === 'sessions');
+    props.mainLayout === 'upstream' ||
+    (props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-employees' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations' && props.activeProjectSection === 'sessions');
   const scopeToCurrentProject = showConversationNavigation && props.mainLayout !== 'upstream' && props.activeProjectId;
   /** 会话侧栏严格跟随顶部选中的当前项目，其他项目通过顶部入口切换。 */
   const scopedProjects = scopeToCurrentProject ? props.projects.filter((project) => project.id === props.activeProjectId) : props.projects;
@@ -1381,27 +1387,31 @@ export function SidebarNav(props: {
         : 'Automations'
       : props.activeNavTarget === 'skills'
         ? copy.skills
-        : props.activeNavTarget === 'digital-teams'
+        : props.activeNavTarget === 'digital-employees'
           ? zh
-            ? '数字团队'
-            : 'Digital teams'
-          : props.activeProjectSection === 'tasks'
+            ? '数字员工'
+            : 'Digital employees'
+          : props.activeNavTarget === 'digital-teams'
             ? zh
-              ? '任务'
-              : 'Tasks'
-            : props.activeProjectSection === 'git'
-              ? 'Git'
-              : props.activeProjectSection === 'code'
-                ? props.activeProjectCodeMode === 'commands'
-                  ? zh
-                    ? '命令'
-                    : 'Commands'
+              ? '数字团队'
+              : 'Digital teams'
+            : props.activeProjectSection === 'tasks'
+              ? zh
+                ? '任务'
+                : 'Tasks'
+              : props.activeProjectSection === 'git'
+                ? 'Git'
+                : props.activeProjectSection === 'code'
+                  ? props.activeProjectCodeMode === 'commands'
+                    ? zh
+                      ? '命令'
+                      : 'Commands'
+                    : zh
+                      ? '源码'
+                      : 'Source'
                   : zh
-                    ? '源码'
-                    : 'Source'
-                : zh
-                  ? '会话'
-                  : 'Conversations';
+                    ? '会话'
+                    : 'Conversations';
   const openProjectRenameDialog = (project: ProjectRecord) => {
     closeProjectMoreMenuWithMotion(project.id);
     setProjectRenameTarget(project);
@@ -1554,6 +1564,18 @@ export function SidebarNav(props: {
             </span>
             <span className="project-quick-action-label">{copy.skills}</span>
           </button>
+          {/* 上游首页也保持员工在团队上方的相同顺序。 */}
+          <button
+            type="button"
+            className={`project-quick-action${props.activeNavTarget === 'digital-employees' ? ' is-active' : ''}`}
+            aria-current={props.activeNavTarget === 'digital-employees' ? 'page' : undefined}
+            onClick={() => props.onNavigate('digital-employees')}
+          >
+            <span className="project-quick-action-icon" aria-hidden="true">
+              <UserCircleIcon size={20} weight="regular" aria-hidden="true" data-icon-source="phosphor" />
+            </span>
+            <span className="project-quick-action-label">{zh ? '数字员工' : 'Digital employees'}</span>
+          </button>
           <button
             type="button"
             className={`project-quick-action${props.activeNavTarget === 'digital-teams' ? ' is-active' : ''}`}
@@ -1685,7 +1707,12 @@ export function SidebarNav(props: {
             ) : (
               visibleProjects.map((project) => {
                 const isActiveProject =
-                  project.id === props.activeProjectId && props.activeNavTarget !== 'settings' && props.activeNavTarget !== 'skills' && props.activeNavTarget !== 'digital-teams' && props.activeNavTarget !== 'automations';
+                  project.id === props.activeProjectId &&
+                  props.activeNavTarget !== 'settings' &&
+                  props.activeNavTarget !== 'skills' &&
+                  props.activeNavTarget !== 'digital-employees' &&
+                  props.activeNavTarget !== 'digital-teams' &&
+                  props.activeNavTarget !== 'automations';
                 const pinned = props.pinnedProjectIds.includes(project.id);
                 const expanded = Boolean(scopeToCurrentProject) || !props.collapsedProjectIds.includes(project.id);
                 const menuOpen = openProjectMenuIds.has(project.id);
@@ -1817,14 +1844,6 @@ export function SidebarNav(props: {
                         actions={
                           project.id === temporaryWorkspaceId ? undefined : (
                             <>
-                              <button
-                                type="button"
-                                className="project-settings-button"
-                                aria-label={`${copy.projectSettingsPrefix}${copy.labelSeparator}${project.name}`}
-                                onClick={() => props.onOpenProjectSection(project, 'project-settings')}
-                              >
-                                <GearSix aria-hidden="true" weight="regular" />
-                              </button>
                               <div className={`project-row-actions ${menuOpen ? 'open' : ''} ${menuClosing ? 'closing' : ''}`.trim()} onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}>
                                 <button
                                   type="button"
@@ -1905,6 +1924,18 @@ export function SidebarNav(props: {
                 </svg>
               </span>
               {copy.skills}
+            </button>
+            {/* 无项目首页仍可管理全局员工。 */}
+            <button
+              type="button"
+              className={props.activeNavTarget === 'digital-employees' ? 'active' : ''}
+              aria-current={props.activeNavTarget === 'digital-employees' ? 'page' : undefined}
+              onClick={() => props.onNavigate('digital-employees')}
+            >
+              <span aria-hidden="true">
+                <UserCircleIcon size={20} weight="regular" aria-hidden="true" data-icon-source="phosphor" />
+              </span>
+              {zh ? '数字员工' : 'Digital employees'}
             </button>
             <button type="button" className={props.activeNavTarget === 'digital-teams' ? 'active' : ''} aria-current={props.activeNavTarget === 'digital-teams' ? 'page' : undefined} onClick={() => props.onNavigate('digital-teams')}>
               <span aria-hidden="true">
@@ -2091,85 +2122,32 @@ export function formatRuntimeTerminalEnv(env: RuntimeSettings['terminalEnv']): s
     .join('\n');
 }
 
+/** 连接资源和授权仍独立于工作偏好保存。 */
 export interface ProjectConfigFormState {
-  defaultWorkMode: ProjectConfig['defaultWorkMode'];
-  languagePrimary: string;
-  languageAdditional: string;
-  packageManagers: string;
-  manifestPaths: string;
   databaseConnectionName: string;
-  telegramAlias: string;
   allowShell: boolean;
   allowGitWrite: boolean;
 }
 
+/** 只读取项目资源，忽略历史独立偏好。 */
 export function normalizeProjectConfig(config?: Partial<ProjectConfig>, projectId?: string): ProjectConfig | undefined {
   const resolvedProjectId = config?.projectId ?? projectId;
   if (!resolvedProjectId) return undefined;
   return {
     projectId: resolvedProjectId,
-    serviceTierPreferences: config?.serviceTierPreferences ?? [],
-    defaultWorkMode: config?.defaultWorkMode ?? 'plan',
-    language: {
-      primary: config?.language?.primary ?? 'typescript',
-      additional: config?.language?.additional ?? [],
-    },
-    dependencies: {
-      packageManagers: config?.dependencies?.packageManagers ?? [],
-      manifestPaths: config?.dependencies?.manifestPaths ?? [],
-    },
-    vcs: {
-      isGitRepository: config?.vcs?.isGitRepository ?? false,
-      gitRoot: config?.vcs?.gitRoot ?? null,
-    },
-    database: {
-      connectionName: config?.database?.connectionName ?? null,
-    },
-    telegram: {
-      alias: config?.telegram?.alias ?? null,
-    },
-    security: {
-      allowShell: config?.security?.allowShell ?? false,
-      allowGitWrite: config?.security?.allowGitWrite ?? false,
-    },
+    vcs: { isGitRepository: config?.vcs?.isGitRepository ?? false, gitRoot: config?.vcs?.gitRoot ?? null },
+    database: { connectionName: config?.database?.connectionName ?? null },
+    security: { allowShell: config?.security?.allowShell ?? false, allowGitWrite: config?.security?.allowGitWrite ?? false },
   };
 }
 
+/** 将连接资源与授权转为现有操作表单。 */
 export function toProjectConfigForm(config?: ProjectConfig): ProjectConfigFormState {
-  const normalized = normalizeProjectConfig(config, config?.projectId) ?? {
-    projectId: '',
-    defaultWorkMode: 'plan',
-    language: { primary: 'typescript', additional: [] },
-    dependencies: { packageManagers: [], manifestPaths: [] },
-    vcs: { isGitRepository: false, gitRoot: null },
-    database: { connectionName: null },
-    telegram: { alias: null },
-    security: { allowShell: false, allowGitWrite: false },
-  };
   return {
-    defaultWorkMode: normalized.defaultWorkMode,
-    languagePrimary: normalized.language.primary,
-    languageAdditional: normalized.language.additional.join(', '),
-    packageManagers: normalized.dependencies.packageManagers.join(', '),
-    manifestPaths: normalized.dependencies.manifestPaths.join(', '),
-    databaseConnectionName: redactDatabaseConnectionName(normalized.database.connectionName),
-    telegramAlias: normalized.telegram.alias ?? '',
-    allowShell: normalized.security.allowShell,
-    allowGitWrite: normalized.security.allowGitWrite,
+    databaseConnectionName: redactDatabaseConnectionName(config?.database.connectionName),
+    allowShell: config?.security.allowShell ?? false,
+    allowGitWrite: config?.security.allowGitWrite ?? false,
   };
-}
-
-export function parseProjectConfigList(text: string): string[] {
-  const seen = new Set<string>();
-  return text
-    .split(',')
-    .map((item) => item.trim())
-    .filter((item) => item && !item.includes('..'))
-    .filter((item) => {
-      if (seen.has(item)) return false;
-      seen.add(item);
-      return true;
-    });
 }
 
 export function parseNumericList(text: string): number[] {
@@ -2183,22 +2161,6 @@ export function parseNumericList(text: string): number[] {
       seen.add(item);
       return true;
     });
-}
-
-export function formatProjectLanguage(form: ProjectConfigFormState): string {
-  const additional = parseProjectConfigList(form.languageAdditional);
-  return [form.languagePrimary.trim() || 'typescript', ...additional].join(' + ');
-}
-
-export function formatProjectDependencies(form: ProjectConfigFormState, copy: ReturnType<typeof getLanguageCopy>['codeWorkspace']['projectConfig']): string {
-  const managers = parseProjectConfigList(form.packageManagers).join(', ') || copy.unsetPackageManagers;
-  const manifests = parseProjectConfigList(form.manifestPaths).join(', ') || copy.unsetManifestPaths;
-  return `${managers} · ${manifests}`;
-}
-
-export function formatProjectDatabase(form: ProjectConfigFormState, copy: ReturnType<typeof getLanguageCopy>['codeWorkspace']['projectConfig']): string {
-  const connectionName = redactDatabaseConnectionName(form.databaseConnectionName) || copy.unsetConnectionName;
-  return connectionName;
 }
 
 export function isExternalDatabaseUri(value: string | null | undefined): boolean {
@@ -2228,7 +2190,7 @@ export function normalizeLocalUiError(error?: LocalUiErrorSnapshot): LocalUiErro
 }
 
 export function errorToLocalUiMessage(error: unknown, language: AppLanguage): string {
-  return reportApplicationError(error, { language: language === 'zh-CN' ? 'zh-CN' : 'en' });
+  return formatVisibleApplicationError(error, language === 'zh-CN' ? 'zh-CN' : 'en');
 }
 
 export function redactLocalUiErrorMessage(message: string): string {

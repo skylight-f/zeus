@@ -160,6 +160,8 @@ contextBridge.exposeInMainWorld('zeus', {
   notifyTaskGitDeliveryCurrentContext: (context: unknown) => ipcRenderer.send('zeus:task-git-delivery:current-context-changed', context),
   notifyTaskGitDeliveryChanged: (taskId: string) => ipcRenderer.send('zeus:task-git-delivery:changed', taskId),
   openTaskGitDeliveryConversation: (input: unknown) => ipcRenderer.invoke('zeus:task-git-delivery:open-conversation', input),
+  /** 使用任务工作区及比较范围打开只读差异窗口。 */
+  openTaskGitDiffWindow: (input: unknown) => ipcRenderer.invoke('zeus:task-git-diff:open', input),
   openProjectGitDiffWindow: (input: unknown) => ipcRenderer.invoke('zeus:project-git-diff:open', input),
   loadProjectGitWorkbench: (projectId: string) => ipcRenderer.invoke('zeus:project-git:load-workbench', projectId),
   loadProjectGitHistory: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-history', input),
@@ -283,7 +285,7 @@ contextBridge.exposeInMainWorld('zeus', {
   importBusinessDataSnapshotFromFile: () => ipcRenderer.invoke('zeus:import-business-data-snapshot'),
   clearNetworkCache: () => ipcRenderer.invoke('zeus:clear-network-cache'),
   /** 仅检查当前草稿，不保存或切换运行代理。 */
-  checkNetworkProxyConnection: (settings: unknown, address: string) => ipcRenderer.invoke('zeus:network-proxy:check', settings, address),
+  checkNetworkProxyConnection: (settings: unknown, address: string, checkTarget: 'browser' | 'node') => ipcRenderer.invoke('zeus:network-proxy:check', settings, address, checkTarget),
   exportPatchToFile: (patch: unknown) => ipcRenderer.invoke('zeus:export-patch', patch),
   openSource: (source: unknown) => ipcRenderer.invoke('zeus:open-source', source),
   openExternalHttpsUrl: (url: string) => ipcRenderer.invoke('zeus:open-external-https-url', url),
@@ -370,15 +372,22 @@ contextBridge.exposeInMainWorld('zeus', {
   restoreRetiredNativeRuntimes: () => invokeMainCommand('zeus:browser:restore-retired-runtimes', 'desktop.browser.restore_retired_runtimes', 'settings', 'retired-native-runtimes'),
   getComputerSettings: () => ipcRenderer.invoke('zeus:computer:get-settings'),
   /** 只读获取对应会话的控制画面，不启动采集。 */
-  getComputerPreview: (conversationId: string) => ipcRenderer.invoke('zeus:computer:get-preview', conversationId),
+  getComputerPreview: (conversationId: string, imageId?: string | null) => ipcRenderer.invoke('zeus:computer:get-preview', conversationId, imageId),
+  /** 变化通知不带图片，页面按所属会话请求增量画面。 */
+  onComputerPreviewChanged: (listener: (conversationId: string) => void) => {
+    /** 原生 IPC 内容先核对类型。 */
+    const handler = (_event: unknown, conversationId: unknown) => {
+      if (typeof conversationId === 'string') listener(conversationId);
+    };
+    ipcRenderer.on('zeus:computer:preview-changed', handler);
+    return () => ipcRenderer.removeListener('zeus:computer:preview-changed', handler);
+  },
   updateComputerSettings: (input: unknown) => invokeMainCommand('zeus:computer:update-settings', 'desktop.computer.update_settings', 'settings', 'computer-use-settings', input),
   requestComputerPermissions: () => invokeMainCommand('zeus:computer:request-permissions', 'desktop.computer.request_permissions', 'settings', 'computer-use-permissions'),
   openComputerPermissionSettings: (input: unknown) => invokeMainCommand('zeus:computer:open-permission-settings', 'desktop.computer.open_permission_settings', 'settings', 'computer-use-permissions', input),
   /** 会话按钮携带控制身份；设置中的全局停止保留原有语义。 */
   stopComputerUse: (input?: { conversationId: string; sessionId: string }) =>
     invokeMainCommand('zeus:computer:stop', 'desktop.computer.stop', input ? 'product_conversation' : 'settings', input?.conversationId ?? 'computer-use-settings', input),
-  /** 用户继续仍经 Main 命令账本，不向模型暴露恢复工具。 */
-  resumeComputerUse: (input: { conversationId: string; sessionId: string }) => invokeMainCommand('zeus:computer:resume', 'desktop.computer.resume', 'product_conversation', input.conversationId, input),
   onBrowserEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: unknown, value: unknown) => listener(value);
     ipcRenderer.on('zeus:browser-event', handler);

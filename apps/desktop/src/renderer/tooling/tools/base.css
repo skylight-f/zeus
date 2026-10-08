@@ -843,3 +843,9 @@
   font-size: 12px;
   color: var(--zeus-product-subtle);
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app .automation-advanced-settings > .automation-form-section {
+  margin-block-start: 16px;
+}

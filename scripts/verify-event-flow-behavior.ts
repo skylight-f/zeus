@@ -1,4 +1,6 @@
-import { mkdtemp, rm, mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
+import { createInitialSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.js';
+import { composerQueuedSubmissions, visibleQueuedSubmissions } from '../apps/desktop/src/renderer/session/conversationQueuePresentation.js';
+import { mkdtemp, rm, mkdir, readFile, writeFile, unlink, symlink } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -6,10 +8,16 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { CodexAppServerEvent, CodexAppServerManager } from '../packages/ai-runtime/src/index.js';
 import type { TranscriptTurnWorkRow } from '../apps/desktop/src/renderer/session/ConversationTranscript.js';
-import type { NativeSessionItemBuffer } from '../apps/desktop/src/renderer/session/sessionTypes.js';
+import type { NativeConversationSnapshot, NativeSessionItemBuffer, NativeQueueSnapshot, NativeSessionState } from '../apps/desktop/src/renderer/session/sessionTypes.js';
+import { reconcileConversationHistoryCache } from '../apps/desktop/src/renderer/session/conversationSnapshotV2Adapter.js';
 import type { TurnChangeSet } from '../packages/shared/src/conversationResources.js';
+import { describeUserFacingError } from '../packages/shared/src/userFacingError.js';
+import { isProviderBlockingTurnFailure, projectConversationTurnFailure } from '../packages/storage/src/conversationSnapshotV2.js';
 import { createCodexProviderEventFlow } from '../packages/local-server/src/codexProviderEventFlow.js';
+import { projectCodexProviderEvent, type CodexProviderEventProjectionDependencies } from '../packages/local-server/src/codexProviderEventProjection.js';
+import { isProviderResponseStreamDisconnected } from '../packages/local-server/src/codexNativeConversationPolicy.js';
 import { filterCompatibilitySnapshotItemAliases } from '../packages/local-server/src/codexProviderHistoryProjection.js';
+import { conversationWorkExecutionState } from '../packages/local-server/src/conversationWorkExecutionState.js';
 import { selectAutomaticQueueDispatchCandidate } from '../packages/local-server/src/conversationQueueCoreMutationApplication.js';
 import { ConversationEventFlowControl } from '../packages/local-server/src/eventFlowControl.js';
 import { ConversationSyncProtocol } from '../packages/local-server/src/conversationSyncProtocol.js';
@@ -25,10 +33,82 @@ import {
   TurnChangeSetRepository,
   ConversationProviderItemRepository,
   ConversationSyncEventRepository,
+  type ZeusConversationTurnRecord,
   createZeusDatabase,
   resolveSnapshotProviderItemId,
   scopedSnapshotProviderItemId,
 } from '../packages/storage/src/index.js';
+
+/** 验证字符串与对象形式的官方错误共用脱敏投影，并只按结构化字段决定新事件语义。 */
+function verifyProviderStreamFailurePresentation(): Record<string, unknown> {
+  /** 使用真实故障文案，覆盖 request ID 存在时的完整匹配。 */
+  const rawMessage =
+    'stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 5a794051-cd4c-45b3-8f47-8187e7cd7a75 in your message.';
+  /** 生产投影必须把模糊的 other 收窄为稳定断流身份。 */
+  const failure = projectConversationTurnFailure({
+    code: 'ZEUS_CODEX_TURN_FAILED',
+    message: rawMessage,
+    providerStatus: 'failed',
+    providerError: { codexErrorInfo: 'other' },
+  });
+  /** 中文展示必须复用统一错误目录，不能裸露英文 Provider 文案。 */
+  const explanation = describeUserFacingError(failure, 'zh-CN');
+  assertBehavior(failure.category === 'network', '回复流断开必须归类为网络连接问题。');
+  assertBehavior(failure.cause?.code === 'responseStreamDisconnected', 'other 必须收窄为 responseStreamDisconnected。');
+  assertBehavior(isProviderResponseStreamDisconnected(Object.assign(new Error(rawMessage), { code: 'ZEUS_CODEX_TURN_FAILED' })), '只有明确的回复流断开才应启动后台权威状态核对。');
+  assertBehavior(!isProviderResponseStreamDisconnected(Object.assign(new Error('Rate limit reached'), { code: 'ZEUS_CODEX_TURN_FAILED' })), '非连接故障不得进入回复流恢复重试。');
+  assertBehavior(explanation.message === 'AI 服务在回复结束前断开了连接，因此没有收到完整回复。', '断流必须显示明确的本地化说明。');
+  assertBehavior(explanation.details?.includes('5a794051-cd4c-45b3-8f47-8187e7cd7a75'), '诊断详情必须保留可提交给服务方的 request ID。');
+  assertBehavior(isProviderBlockingTurnFailure({ code: 'ZEUS_CODEX_TURN_FAILED', message: rawMessage, providerError: { codexErrorInfo: 'other' } }), '已确认的历史断流必须暂停后续执行。');
+
+  /** 对象形式错误保留官方判别字段和 HTTP 状态，但敏感信息不得进入会话。 */
+  const objectFailureRecord = {
+    code: 'ZEUS_CODEX_TURN_FAILED',
+    message: 'OpenAI request failed. Request ID req_official_503. api_key=sk-object-secret /Users/private/workspace\n    at provider.ts:42:1',
+    providerStatus: 'failed',
+    providerError: {
+      codexErrorInfo: { responseStreamConnectionFailed: { httpStatusCode: 503 } },
+      additionalDetails: 'Request ID req_official_503\nAuthorization: Bearer sk-additional-secret\n/Users/private/log.txt',
+    },
+  };
+  const objectFailure = projectConversationTurnFailure(objectFailureRecord);
+  const objectExplanation = describeUserFacingError(objectFailure, 'zh-CN');
+  assertBehavior(objectFailure.category === 'network', 'HTTP 503 的响应流错误必须归类为连接故障。');
+  assertBehavior(objectFailure.cause?.code === 'responseStreamConnectionFailed', '对象形式错误必须保留官方判别字段。');
+  assertBehavior(objectFailure.additionalDetails.includes('HTTP 状态：503'), '对象形式错误必须展示 HTTP 状态。');
+  assertBehavior(objectExplanation.details.includes('responseStreamConnectionFailed'), '展开详情必须展示官方错误码。');
+  assertBehavior(objectExplanation.details.includes('req_official_503'), '展开详情必须保留官方请求标识。');
+  assertBehavior(!/sk-object-secret|sk-additional-secret|\/Users\/private|provider\.ts:42/iu.test(objectExplanation.details), '错误详情不得暴露凭据、本机路径或堆栈。');
+  assertBehavior(isProviderBlockingTurnFailure(objectFailureRecord), '服务端 503 错误必须暂停会话。');
+
+  /** 字符串形式限流错误直接命中现有错误目录。 */
+  const rateLimitRecord = { code: 'ZEUS_CODEX_TURN_FAILED', message: 'Too many requests.', providerStatus: 'failed', providerError: { codexErrorInfo: 'rateLimitExceeded' } };
+  const rateLimitFailure = projectConversationTurnFailure(rateLimitRecord);
+  assertBehavior(rateLimitFailure.category === 'rate_limit', '字符串形式官方限流错误必须准确分类。');
+  assertBehavior(describeUserFacingError(rateLimitFailure, 'zh-CN').message === 'AI 服务收到的请求过多，暂时限制了使用。请等待限制解除后再继续。', '限流错误必须复用现有可读说明。');
+  assertBehavior(isProviderBlockingTurnFailure(rateLimitRecord), '官方限流错误必须暂停会话。');
+
+  /** 沙箱错误即使正文包含限流字样，也必须按真实 Runtime 失败处理。 */
+  const sandboxRecord = { code: 'ZEUS_CODEX_TURN_FAILED', message: 'rate limit text from a local tool', providerStatus: 'failed', providerError: { codexErrorInfo: 'sandboxError' } };
+  const sandboxFailure = projectConversationTurnFailure(sandboxRecord);
+  assertBehavior(sandboxFailure.category === 'permission', '结构化沙箱错误不得被宽泛正文正则误判为限流。');
+  assertBehavior(!isProviderBlockingTurnFailure(sandboxRecord), '沙箱或本地 Runtime 错误必须保持真实失败。');
+  /** 工作编排消费同一错误判断，服务类错误阻塞，Runtime 错误失败。 */
+  const workConversation = { stage: 'failed', providerState: 'paused' } as Parameters<typeof conversationWorkExecutionState>[0];
+  const submission = (error: Record<string, unknown>) =>
+    [{ status: 'failed', pausedReason: null, errorJson: JSON.stringify(error), updatedAt: '2026-09-28T00:00:00.000Z', createdAt: '2026-09-28T00:00:00.000Z', id: 'probe-submission' }] as Parameters<typeof conversationWorkExecutionState>[1];
+  const providerWorkState = conversationWorkExecutionState(workConversation, submission(rateLimitRecord));
+  const runtimeWorkState = conversationWorkExecutionState({ ...workConversation, providerState: 'failed' }, submission(sandboxRecord));
+  assertBehavior(providerWorkState.type === 'blocked', '服务类官方错误必须让任务工作保持阻塞。');
+  assertBehavior(runtimeWorkState.type === 'failed', '沙箱或 Runtime 错误必须让任务工作正常失败。');
+  return {
+    legacyDisconnect: { category: failure.category, cause: failure.cause?.code ?? null, message: explanation.message },
+    objectFailure: { category: objectFailure.category, cause: objectFailure.cause?.code ?? null, httpStatus: objectFailure.additionalDetails[0] ?? null },
+    rateLimit: rateLimitFailure.category,
+    sandbox: sandboxFailure.category,
+    workStates: { provider: providerWorkState.type, runtime: runtimeWorkState.type },
+  };
+}
 
 /** 用真实临时目录与数据库验证脚本修改、原有脏内容和恢复保护，不调用外部模型。 */
 async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
@@ -73,8 +153,8 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
         createdAt: timestamp,
         updatedAt: timestamp,
       });
-    /** 验证对象就是线上文件变更服务。 */
-    const service = createTurnChangeSetService({
+    /** 共用真实仓储，后续重建服务以检查拒绝原因不会随内存丢失。 */
+    const serviceOptions = {
       db,
       projects,
       changeSets: new TurnChangeSetRepository(db),
@@ -82,7 +162,9 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
       auditLogs: new AuditLogRepository(db),
       idempotency: new IdempotencyRequestRepository(db),
       recoveryRoot: join(root, 'recovery'),
-    });
+    };
+    /** 验证对象就是线上文件变更服务。 */
+    const service = createTurnChangeSetService(serviceOptions);
     /** 本轮开始前的用户修改必须成为恢复起点。 */
     const turn = newTurn('mixed-edits');
     await service.beginWorkspace(conversation, 'mixed-submission');
@@ -147,7 +229,198 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     await writeFile(join(workspace, paths[1]!), 'concurrent\n');
     await service.finishWorkspace({ conversation, turn: overlapTurn, timestamp });
     assertBehavior(service.seal({ conversation, turn: overlapTurn, timestamp })?.state === 'unavailable', '重叠目录变化不得自动撤销。');
-    return { files: changeSet.fileCount, scriptAndPatchMerged: true, dirtyBaselinePreserved: true, undoReapply: true, concurrentUndoBlocked: true };
+
+    /** 独立执行目录位于项目目录之外；授权必须以会话目录为准。 */
+    const executionRoot = join(root, 'execution');
+    await mkdir(executionRoot);
+    execFileSync('git', ['init', '--quiet', executionRoot]);
+    /** 越界文件始终保持原样，链接也不能放宽授权范围。 */
+    const outsidePath = join(root, 'outside.txt');
+    await writeFile(outsidePath, 'outside-original\n');
+    await symlink(outsidePath, join(executionRoot, 'linked.txt'));
+    /** 复用正式根目录解析入口，不能回退到项目根来放行路径。 */
+    const scopedOptions = { ...serviceOptions, getConversationRoot: () => executionRoot };
+    /** 实时记录、整轮补齐及封存共用同一实例。 */
+    const scopedService = createTurnChangeSetService(scopedOptions);
+    /** 共享目录名称不限于文档，目标内容始终留在工作目录外。 */
+    const sharedDirectory = join(root, 'shared-content');
+    await mkdir(sharedDirectory);
+    await symlink(sharedDirectory, join(executionRoot, 'shared-assets'));
+    await symlink(join(root, 'missing-target'), join(executionRoot, 'disconnected'));
+    execFileSync('git', ['-C', executionRoot, 'add', 'linked.txt', 'shared-assets', 'disconnected']);
+    /** 文件链接、目录子路径、失效链接及链接目标重命名均不进入代码撤销。 */
+    const sharedChanges = [
+      { path: join(executionRoot, 'linked.txt'), kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-outside-original\n+shared-edit\n' },
+      { path: 'shared-assets/new/note.txt', kind: { type: 'add' }, diff: 'shared-note\n' },
+      { path: 'disconnected/note.txt', kind: { type: 'add' }, diff: 'unavailable-target\n' },
+      { path: 'shared-assets/old.txt', kind: { type: 'update', move_path: 'local-copy.txt' }, diff: '@@ -1 +1 @@\n-old\n+new\n' },
+      { path: 'local-move.txt', kind: { type: 'update', move_path: 'shared-assets/new.txt' }, diff: '@@ -1 +1 @@\n-old\n+new\n' },
+    ];
+    /** 纯共享变更不创建空卡片，已跟踪链接也不会使自动快照失败。 */
+    const sharedTurn = newTurn('shared-only');
+    await scopedService.beginWorkspace(conversation, 'shared-only');
+    scopedService.bindWorkspace(conversation.id, 'shared-only', sharedTurn.providerTurnId!);
+    assertBehavior(scopedService.capture({ conversation, turn: sharedTurn, providerItemId: 'shared-only', changes: sharedChanges, phase: 'pre', timestamp }) === null, '纯共享链接事件不应创建变更集。');
+    await writeFile(join(executionRoot, 'linked.txt'), 'shared-edit\n');
+    await mkdir(join(sharedDirectory, 'new'));
+    await writeFile(join(executionRoot, 'shared-assets/new/note.txt'), 'shared-note\n');
+    scopedService.capture({ conversation, turn: sharedTurn, providerItemId: 'shared-only', changes: sharedChanges, phase: 'post', timestamp });
+    await scopedService.finishWorkspace({ conversation, turn: sharedTurn, timestamp });
+    assertBehavior(scopedService.seal({ conversation, turn: sharedTurn, timestamp }) === null && scopedService.getByTurn(conversation.id, sharedTurn.id) === null, '共享目标的真实写入不应产生警告或零文件卡片。');
+    /** 共享事件排在代码事件之前，仍须保留代码事件的原始文件索引。 */
+    const sharedCodeTurn = newTurn('shared-with-code');
+    /** 普通代码文件沿用原来的撤销快照。 */
+    const sharedCodeChanges = [...sharedChanges, { path: 'code.txt', kind: { type: 'add' }, diff: 'code\n' }];
+    await scopedService.beginWorkspace(conversation, 'shared-with-code');
+    scopedService.bindWorkspace(conversation.id, 'shared-with-code', sharedCodeTurn.providerTurnId!);
+    scopedService.capture({ conversation, turn: sharedCodeTurn, providerItemId: 'shared-with-code', changes: sharedCodeChanges, phase: 'pre', timestamp });
+    await writeFile(join(executionRoot, 'code.txt'), 'code\n');
+    scopedService.capture({ conversation, turn: sharedCodeTurn, providerItemId: 'shared-with-code', changes: sharedCodeChanges, phase: 'post', timestamp });
+    await scopedService.finishWorkspace({ conversation, turn: sharedCodeTurn, timestamp });
+    /** 链接只影响记录范围，不影响代码的实际恢复资格。 */
+    const sharedCodeSet = scopedService.seal({ conversation, turn: sharedCodeTurn, timestamp });
+    assertBehavior(sharedCodeSet?.state === 'applied' && !sharedCodeSet.conflict && sharedCodeSet.fileCount === 1 && sharedCodeSet.files[0]?.newPath === 'code.txt', '共享链接不能禁用同轮代码撤销。');
+    assertBehavior(serviceOptions.files.listByChangeSet(sharedCodeSet.id).find((file) => file.sourceItemId === 'shared-with-code')?.sourceIndex === sharedChanges.length, '排除共享事件后必须保留原始索引。');
+    /** 使用真实仓储重现已经保存的共享路径误报，读取过程不改写历史数据。 */
+    const sharedRecorded = serviceOptions.changeSets.getById(sharedCodeSet.id)!;
+    /** 旧诊断包含文件及目录链接，以及重命名时被同时列出的合法另一端。 */
+    const sharedConflict = { code: 'ZEUS_TURN_CHANGE_SET_PATH_FORBIDDEN', message: '旧共享链接拒绝', paths: [join(executionRoot, 'linked.txt'), join(executionRoot, 'shared-assets/new/note.txt'), 'local-move.txt'] };
+    serviceOptions.changeSets.upsert({ ...sharedRecorded, state: 'unavailable', conflictJson: JSON.stringify(sharedConflict), unavailableReason: '旧共享链接拒绝' });
+    assertBehavior(
+      scopedService.getById(sharedCodeSet.id)?.state === 'applied' &&
+        !scopedService.getByTurn(conversation.id, sharedCodeTurn.id)?.conflict &&
+        !scopedService.listByConversation(conversation.id).find((set) => set.id === sharedCodeSet.id)?.conflict,
+      '已有共享链接误报在各读取入口都应消除。',
+    );
+    assertBehavior(serviceOptions.changeSets.getById(sharedCodeSet.id)?.state === 'unavailable', '读取范围判断不能改写已保存的历史记录。');
+    await scopedService.operate({
+      projectId: project.id,
+      conversationId: conversation.id,
+      turnId: sharedCodeTurn.id,
+      action: 'undo',
+      request: { changeSetId: sharedCodeSet.id, expectedState: 'applied', idempotencyKey: 'undo-shared-code' },
+    });
+    assertBehavior(
+      await readFile(join(executionRoot, 'code.txt')).then(
+        () => false,
+        () => true,
+      ),
+      '共享链接旧误报不应阻止实际代码撤销。',
+    );
+    await scopedService.operate({
+      projectId: project.id,
+      conversationId: conversation.id,
+      turnId: sharedCodeTurn.id,
+      action: 'reapply',
+      request: { changeSetId: sharedCodeSet.id, expectedState: 'undone', idempotencyKey: 'reapply-shared-code' },
+    });
+    assertBehavior((await readFile(outsidePath, 'utf8')) === 'shared-edit\n' && (await readFile(join(sharedDirectory, 'new/note.txt'), 'utf8')) === 'shared-note\n', '代码撤销和重新应用均不得改动共享目标。');
+    /** 已保存的纯共享误报也不再展示为错误卡片。 */
+    const oldSharedTurn = newTurn('old-shared-only');
+    /** 空记录不生成恢复数据，只消除共享路径拒绝。 */
+    const oldSharedSet = serviceOptions.changeSets.upsert({
+      ...sharedRecorded,
+      id: undefined,
+      turnId: oldSharedTurn.id,
+      providerTurnId: oldSharedTurn.providerTurnId!,
+      state: 'unavailable',
+      unifiedDiff: '',
+      preImageDigest: null,
+      postImageDigest: null,
+      conflictJson: JSON.stringify(sharedConflict),
+      unavailableReason: '旧共享链接拒绝',
+    });
+    assertBehavior(
+      scopedService.getById(oldSharedSet.id)?.fileCount === 0 && scopedService.getById(oldSharedSet.id)?.conflict === null && scopedService.getById(oldSharedSet.id)?.unavailableReason === null,
+      '历史纯共享错误不应继续展示警告。',
+    );
+    serviceOptions.changeSets.upsert({
+      ...serviceOptions.changeSets.getById(sharedCodeSet.id)!,
+      state: 'unavailable',
+      conflictJson: JSON.stringify({ ...sharedConflict, paths: [...sharedConflict.paths, outsidePath] }),
+      unavailableReason: '混合路径拒绝',
+    });
+    assertBehavior(scopedService.getById(sharedCodeSet.id)?.state === 'unavailable' && scopedService.getById(sharedCodeSet.id)?.conflict?.paths.length === 1, '共享旧误报消除后，真正越界的拒绝仍应保留。');
+    await writeFile(outsidePath, 'outside-original\n');
+    /** 同批拒绝绝对越界、上级目录、非法路径与越界重命名；链接单独排除。 */
+    const rejectedChanges = [
+      ...[outsidePath, '../outside.txt', 'linked.txt', 'invalid\0.txt'].map((path) => ({ path, kind: { type: 'add' }, diff: 'untrusted\n' })),
+      { path: 'rename.txt', kind: { type: 'update', move_path: outsidePath }, diff: '@@ -1 +1 @@\n-old\n+new\n' },
+    ];
+    /** 合法项即便排在被拒绝的项后面也应正常记录。 */
+    const mixedChanges = [...rejectedChanges, { path: 'inside.txt', kind: { type: 'add' }, diff: 'inside\n' }];
+    /** 路径拒绝只标记本轮记录不可恢复，不抛出会话级异常。 */
+    const rejectedTurn = newTurn('rejected-paths');
+    await scopedService.beginWorkspace(conversation, 'rejected-paths');
+    scopedService.bindWorkspace(conversation.id, 'rejected-paths', rejectedTurn.providerTurnId!);
+    scopedService.capture({ conversation, turn: rejectedTurn, providerItemId: 'mixed-paths', changes: mixedChanges, phase: 'pre', timestamp });
+    await writeFile(join(executionRoot, 'inside.txt'), 'inside\n');
+    scopedService.capture({ conversation, turn: rejectedTurn, providerItemId: 'mixed-paths', changes: mixedChanges, phase: 'post', timestamp });
+    await scopedService.finishWorkspace({ conversation, turn: rejectedTurn, timestamp });
+    /** 正常快照不能清除路径拒绝原因或生成越界文件恢复记录。 */
+    const rejectedSet = scopedService.seal({ conversation, turn: rejectedTurn, timestamp });
+    assertBehavior(rejectedSet?.state === 'unavailable' && rejectedSet.fileCount === 1 && rejectedSet.files[0]?.newPath === 'inside.txt', '混合事件应只记录合法文件，并禁止整轮恢复。');
+    assertBehavior(
+      rejectedSet.conflict?.paths.length === 4 && !rejectedSet.conflict.paths.includes('linked.txt') && rejectedSet.conflict.message.includes(executionRoot) && rejectedSet.conflict.message.includes(outsidePath),
+      '重复事件诊断应排除共享链接，并保留真正越界的具体路径。',
+    );
+    /** 摘要只说明对操作的影响，具体目录留在用户主动打开的详情中。 */
+    const explanation = describeUserFacingError(rejectedSet.conflict);
+    assertBehavior(
+      explanation.message.includes('本轮修改') && !explanation.message.includes(executionRoot) && explanation.details.includes(executionRoot) && explanation.details.includes(outsidePath),
+      '局部说明应使用中文并保留可诊断的具体路径。',
+    );
+    await db.save();
+    /** 新实例从真实仓储读取拒绝状态，随后合法事件也不能恢复整轮撤销。 */
+    const restartedService = createTurnChangeSetService(scopedOptions);
+    restartedService.capture({ conversation, turn: rejectedTurn, providerItemId: 'later-valid-event', changes: [{ path: 'inside.txt', kind: { type: 'add' }, diff: 'inside\n' }], phase: 'post', timestamp });
+    assertBehavior(restartedService.seal({ conversation, turn: rejectedTurn, timestamp })?.state === 'unavailable', '服务重建与后续事件不能清除持久化的路径拒绝。');
+    /** 即便旧界面继续发出操作请求，服务端也必须保持拒绝。 */
+    const unavailableUndo = await restartedService
+      .operate({ projectId: project.id, conversationId: conversation.id, turnId: rejectedTurn.id, action: 'undo', request: { changeSetId: rejectedSet.id, expectedState: 'applied', idempotencyKey: 'undo-rejected' } })
+      .then(
+        () => false,
+        (error) => error.code === 'ZEUS_TURN_CHANGE_SET_UNAVAILABLE',
+      );
+    assertBehavior(unavailableUndo, '不完整变更集不能通过旧请求撤销。');
+    /** 全部被拒绝时也必须保存可在本轮展示的原因，不能静默丢失。 */
+    const emptyTurn = newTurn('all-paths-rejected');
+    restartedService.capture({ conversation, turn: emptyTurn, providerItemId: 'rejected-only', changes: rejectedChanges, phase: 'post', timestamp });
+    /** 零文件不是成功空结果，而是带详情的局部不可恢复状态。 */
+    const emptySet = restartedService.seal({ conversation, turn: emptyTurn, timestamp });
+    assertBehavior(emptySet?.state === 'unavailable' && emptySet.fileCount === 0 && Boolean(emptySet.conflict), '全部拒绝的路径仍应保留局部原因。');
+    /** 未受影响的其他轮次仍可记录会话执行目录中的文件。 */
+    const validTurn = newTurn('valid-execution-path');
+    /** 使用绝对路径确认合法执行目录不因位于主项目外被误拒绝。 */
+    const validChanges = [{ path: join(executionRoot, 'valid.txt'), kind: { type: 'add' }, diff: 'valid\n' }];
+    restartedService.capture({ conversation, turn: validTurn, providerItemId: 'valid', changes: validChanges, phase: 'pre', timestamp });
+    await writeFile(join(executionRoot, 'valid.txt'), 'valid\n');
+    restartedService.capture({ conversation, turn: validTurn, providerItemId: 'valid', changes: validChanges, phase: 'post', timestamp });
+    /** 有完整记录的正常轮次继续支持原恢复流程。 */
+    const validSet = restartedService.seal({ conversation, turn: validTurn, timestamp });
+    assertBehavior(validSet?.state === 'applied' && validSet.files[0]?.reversible, '合法会话目录必须继续支持恢复。');
+    await unlink(join(executionRoot, 'valid.txt'));
+    await symlink(outsidePath, join(executionRoot, 'valid.txt'));
+    /** 主动恢复重新检查当前路径，不信任捕获时的历史授权结果。 */
+    const outsideUndo = await restartedService
+      .operate({ projectId: project.id, conversationId: conversation.id, turnId: validTurn.id, action: 'undo', request: { changeSetId: validSet.id, expectedState: 'applied', idempotencyKey: 'undo-outside-link' } })
+      .then(
+        () => false,
+        (error) => error.code === 'ZEUS_TURN_CHANGE_SET_PATH_FORBIDDEN',
+      );
+    assertBehavior(outsideUndo && (await readFile(outsidePath, 'utf8')) === 'outside-original\n', '主动恢复必须拒绝链接越界且不得修改目录外文件。');
+    return {
+      files: changeSet.fileCount,
+      scriptAndPatchMerged: true,
+      dirtyBaselinePreserved: true,
+      undoReapply: true,
+      concurrentUndoBlocked: true,
+      sharedLinksExcluded: true,
+      previousSharedWarningsRemoved: true,
+      rejectedPathsLocalized: true,
+      executionRootRespected: true,
+      unsafeUndoBlocked: true,
+    };
   } finally {
     await db.close();
     await rm(root, { recursive: true, force: true });
@@ -161,7 +434,9 @@ registerHooks({
     return nextLoad(url, context);
   },
 });
-const { coalesceSupersededInterruptedQueuedUserMessages, projectTranscriptRows, projectTranscriptTurnRows } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
+/** Node 探针不经过 Vite 自动 JSX 运行时，沿用现有转录探针的 React 注入。 */
+(globalThis as typeof globalThis & { React: typeof import('react') }).React = await import('react');
+const { projectQueuedSubmissionItems, projectTranscriptRows, projectTranscriptTurnRows } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
 
 async function verifyCompatibilityItemIdentity(): Promise<Record<string, unknown>> {
   const firstScopedId = scopedSnapshotProviderItemId('turn-1', 'item-1');
@@ -234,7 +509,7 @@ function verifyAutomaticQueueDispatchSelection(): Record<string, unknown> {
   return { selectedId: selected.id, blockedSelection: null, legacyHeadId: legacyQueued.id };
 }
 
-/** 真实转录投影同时核对沟通边界分组和用户、助手文字始终位于主会话流。 */
+/** 真实投影核对运行时进展可见、完成后单层收拢及模型正文始终外置。 */
 function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
   const turnId = 'stage-turn';
   let timelineOrdinal = 0;
@@ -275,30 +550,35 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
   const rows = projectTranscriptRows(items);
   const turnRows = projectTranscriptTurnRows(rows, null, { [turnId]: 'completed' });
   const workRows = turnRows.filter((row): row is TranscriptTurnWorkRow => row.kind === 'turn_work');
-  assertBehavior(workRows.length === 4, '每段连续操作必须在助手沟通处结束，不能跨过可见说明合并。');
-  /** 操作分组继续保持全轮先后顺序，但不再接管助手沟通正文。 */
+  assertBehavior(workRows.length === 1, '完成轮次必须只有一个位于模型正文上方的过程入口。');
+  /** 完成后的过程保留所有中途说明和操作的先后顺序。 */
   const stages = workRows.flatMap((row) => row.segments);
-  assertBehavior(stages.length === 4, '四段连续操作必须各自保留一个过程阶段。');
+  assertBehavior(stages.length === 1, '完成过程直接展示明细，不恢复多余阶段分组。');
   assertBehavior(
     stages.every((stage) => stage.summary === null),
-    '助手沟通已经位于主会话，过程阶段不得再复制同一段文字。',
+    '中途说明按原顺序进入过程明细，不提升为重复摘要。',
   );
   assertBehavior(
     stages.every((stage) => !stage.rows.some((row) => row.kind === 'item' && row.item.type === 'reasoning')),
     '已完成轮次的 reasoning 摘要不得重新混入正文阶段。',
   );
   assertBehavior(
-    stages.every((stage) => stage.rows.filter((row) => row.kind === 'activity').length === 1),
-    '每个阶段的命令、工具或文件操作必须各自合并为一组。',
+    stages
+      .flatMap((stage) => stage.rows)
+      .flatMap((row) => (row.kind === 'activity' ? row.items.map((entry) => entry.key) : [row.key]))
+      .join('|') === 'bootstrap-command-a|summary-a|command-a|summary-b|tool-b|summary-c|file-c',
+    '收拢不能改变中途说明与操作的真实先后顺序。',
   );
   assertBehavior(
     workRows.every((row) => row.loadMore),
     '每段过程入口都能补齐本轮历史。',
   );
   // 活动、结束两种状态均保留三条用户输入；相同正文但不同身份的补充不能合并。
+  /** 运行现场尚无最终正文，不能用已完成记录覆盖活动身份。 */
+  const withoutReply = rows.filter((row) => row.key !== 'final');
   for (const activeTurnId of [turnId, null]) {
     /** 复用实际投影入口，只切换同一轮的活动与终态。 */
-    const projected = projectTranscriptTurnRows(rows, activeTurnId, activeTurnId ? {} : { [turnId]: 'completed' });
+    const projected = projectTranscriptTurnRows(activeTurnId ? withoutReply : rows, activeTurnId, activeTurnId ? {} : { [turnId]: 'completed' });
     assertBehavior(
       projected
         .filter((row) => row.kind === 'item' && row.item.type === 'userMessage')
@@ -309,8 +589,11 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
     assertBehavior(
       projected
         .map((row) => (row.kind === 'turn_work' ? `process:${row.segments.flatMap((segment) => segment.rows.flatMap((detail) => (detail.kind === 'activity' ? detail.items.map((entry) => entry.key) : [])).join(','))}` : row.key))
-        .join('|') === 'opening-user|process:bootstrap-command-a|summary-a|process:command-a|mid-user-a|summary-b|process:tool-b|mid-user-b|summary-c|process:file-c|final',
-      '运行和历史展示均须保持用户输入、连续操作、助手沟通的真实阅读顺序。',
+        .join('|') ===
+        (activeTurnId
+          ? 'opening-user|process:bootstrap-command-a|summary-a|process:command-a|mid-user-a|summary-b|process:tool-b|mid-user-b|summary-c|process:file-c'
+          : 'opening-user|mid-user-a|mid-user-b|process:bootstrap-command-a,command-a,tool-b,file-c|final'),
+      '运行时保持沟通顺序，完成后保留用户输入并在最终正文上方统一收起过程。',
     );
     assertBehavior(new Set(projected.map((row) => row.key)).size === projected.length, '同轮多个过程段必须有独立稳定身份。');
     assertBehavior(
@@ -318,6 +601,91 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
       '处理过程不得收起或重复展示用户输入。',
     );
   }
+  /** 完成态独立展开身份使运行中手动展开的过程在结束时回到收起状态。 */
+  const liveWorkKeys = new Set(
+    projectTranscriptTurnRows(withoutReply, turnId)
+      .filter((row) => row.kind === 'turn_work')
+      .map((row) => row.key),
+  );
+  assertBehavior(!liveWorkKeys.has(workRows[0]!.key), '完成态不能继承运行中的手动展开身份。');
+  assertBehavior(turnRows.at(-1)?.kind === 'item' && turnRows.at(-1)?.key === 'final', '最终正文必须留在过程入口之外并位于入口下方。');
+  /** 终态尚无正文时，继续显示已发生的进展，不能只剩耗时。 */
+  assertBehavior(
+    projectTranscriptTurnRows(withoutReply, null, { [turnId]: 'completed' }).some((row) => row.key === 'summary-c'),
+    '正文缺失时不能收起最后的可读进展。',
+  );
+  for (const status of ['failed', 'interrupted'] as const) {
+    assertBehavior(
+      projectTranscriptTurnRows(withoutReply, null, { [turnId]: status }).some((row) => row.key === 'summary-c'),
+      '失败或中断不能采用正常完成的收拢规则。',
+    );
+  }
+  /** 历史首屏只加载开场和正文时，过程补页前后必须共用完成态入口。 */
+  const deferredRows = projectTranscriptTurnRows(
+    rows.filter((row) => row.key === 'opening-user' || row.key === 'final'),
+    null,
+    { [turnId]: 'completed' },
+    new Set([turnId]),
+  );
+  assertBehavior(deferredRows[1]?.key === workRows[0]!.key && deferredRows[2]?.key === 'final', '按需加载的过程入口必须稳定地位于最终正文上方。');
+  /** 同一原生阶段被中途说明切成多组，收拢后所有子行仍须有唯一身份。 */
+  const sameStageItems = [
+    item('same-user', 'userMessage', '检查过程归属。'),
+    item('same-command-a', 'commandExecution', ''),
+    { ...item('same-reasoning-a', 'reasoning', '第一段思考'), payload: { reasoningPresentation: 'process_text' } },
+    item('same-command-b', 'commandExecution', ''),
+    item('same-progress', 'agentMessage', '继续检查', 'commentary'),
+    item('same-command-c', 'commandExecution', ''),
+    { ...item('same-reasoning-b', 'reasoning', '第二段思考'), payload: { reasoningPresentation: 'process_text' } },
+    item('same-command-d', 'commandExecution', ''),
+    item('same-final', 'agentMessage', '检查完成', 'final_answer'),
+  ].map((entry) => ({ ...entry, stageId: 'same-stage' }));
+  /** 隐藏思考和协调事件即使更换持久阶段，也不能拆开同一输入的可见操作。 */
+  const hiddenBoundaryItems = [
+    item('hidden-user', 'userMessage', '核对隐藏事件分组。'),
+    { ...item('hidden-command-a', 'commandExecution', ''), stageId: 'stage-a' },
+    { ...item('hidden-reasoning', 'reasoning', '临时状态摘要'), stageId: 'stage-b' },
+    { ...item('hidden-command-b', 'commandExecution', ''), stageId: 'stage-b' },
+    { ...item('hidden-coordination', 'dynamicToolCall', ''), payload: { type: 'collabAgentToolCall' }, stageId: 'stage-c' },
+    { ...item('hidden-command-c', 'commandExecution', ''), stageId: 'stage-c' },
+    item('visible-progress', 'agentMessage', '已完成第一阶段。', 'commentary'),
+    item('visible-command', 'commandExecution', ''),
+  ];
+  /** 两个操作组只由可见进度说明分隔，原始操作顺序保持完整。 */
+  const hiddenBoundaryGroups = projectTranscriptRows(hiddenBoundaryItems).filter((row) => row.kind === 'activity');
+  assertBehavior(hiddenBoundaryGroups.length === 2 && hiddenBoundaryGroups[0]!.items.map((entry) => entry.key).join('|') === 'hidden-command-a|hidden-command-b|hidden-command-c', '隐藏事件和持久阶段变化不能产生无说明的操作组。');
+  /** 重读及补入更早的隐藏事件不改变首条真实操作确定的身份。 */
+  const coldHiddenGroups = projectTranscriptRows([item('earlier-hidden', 'reasoning', '更早的临时摘要'), ...structuredClone(hiddenBoundaryItems)]).filter((row) => row.kind === 'activity');
+  assertBehavior(hiddenBoundaryGroups.map((row) => row.key).join('|') === coldHiddenGroups.map((row) => row.key).join('|'), '冷读和补页不能按隐藏阶段重编号操作组。');
+  /** 真实位置字段让开场消息尚未补入时也沿用同一个操作组身份。 */
+  const persistentInputItems = hiddenBoundaryItems.map((entry, index) => ({
+    ...entry,
+    transcript: { placement: { entryId: entry.key, order: index + 1, orderEpoch: 1, placementRevision: 1, turnId, openingInputId: 'persisted-input', displayStageId: entry.stageId ?? null }, sources: [] },
+  }));
+  /** 补入开场消息或继续加载组尾，都不改变已知首条操作确定的身份。 */
+  const persistentGroups = projectTranscriptRows(persistentInputItems).filter((row) => row.kind === 'activity');
+  assertBehavior(
+    projectTranscriptRows(persistentInputItems.slice(1))
+      .filter((row) => row.kind === 'activity')
+      .map((row) => row.key)
+      .join('|') === persistentGroups.map((row) => row.key).join('|') && projectTranscriptRows(persistentInputItems.slice(1, 6)).find((row) => row.kind === 'activity')?.key === persistentGroups[0]!.key,
+    '操作组必须用持久输入和首条操作身份，不能使用页面或片段编号。',
+  );
+  /** 使用真实两级投影覆盖阶段内操作合并，而非只检查原始消息编号。 */
+  const sameStageChildren = projectTranscriptTurnRows(projectTranscriptRows(sameStageItems), null, { [turnId]: 'completed' }).flatMap((row) => (row.kind === 'turn_work' ? row.segments.flatMap((segment) => segment.rows) : []));
+  assertBehavior(sameStageChildren.length > 0 && new Set(sameStageChildren.map((row) => row.key)).size === sameStageChildren.length, '完成态的同阶段操作组不能产生重复子行身份。');
+  assertBehavior(
+    sameStageChildren.flatMap((row) => (row.kind === 'activity' ? row.items.map((entry) => entry.key) : [row.key])).join('|') === 'same-command-a|same-reasoning-a|same-command-b|same-progress|same-command-c|same-reasoning-b|same-command-d',
+    '同一阶段的操作不能越过夹在中间的思考和沟通，收拢必须完整保留持久顺序。',
+  );
+  /** 补入更早的沟通段后，已知边界后的过程组不能按当前片段重新编号。 */
+  const tailRows = projectTranscriptTurnRows(projectTranscriptRows(sameStageItems.slice(4)), turnId);
+  /** 冷读直接重建同一份完整历史，不复用上一轮投影缓存。 */
+  const coldRows = projectTranscriptTurnRows(projectTranscriptRows(structuredClone(sameStageItems)), turnId);
+  /** 以真实操作身份定位原有后半段，避免用数组位置自证分组稳定。 */
+  const containingLaterCommand = (row: (typeof coldRows)[number]): boolean =>
+    row.kind === 'turn_work' && row.segments.some((segment) => segment.rows.some((child) => child.kind === 'activity' && child.items.some((entry) => entry.key === 'same-command-c')));
+  assertBehavior(tailRows.find(containingLaterCommand)?.key === coldRows.find(containingLaterCommand)?.key, '补入更早阶段或清除缓存重建不能改变已知沟通边界的过程身份。');
   /** 同一个显式阶段或缺少阶段身份时，都不能把引导后的活动归到引导前。 */
   for (const stageId of [undefined, 'same-stage']) {
     /** 此处不增加新摘要，直接覆盖工具在引导之后继续执行的情况。 */
@@ -337,8 +705,9 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
     '前置事件不能越过开场用户消息，后续操作也不能跨过助手沟通合并。',
   );
   return {
+    hiddenBoundaryGroupSizes: hiddenBoundaryGroups.map((row) => row.items.length),
     mainStreamUserMessages: 3,
-    mainStreamAssistantMessages: 4,
+    mainStreamAssistantMessages: 1,
     stages: stages.map((stage) => ({
       summary: stage.summary?.kind === 'item' ? stage.summary.item.text : null,
       detailGroups: stage.rows.length,
@@ -349,64 +718,69 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
   };
 }
 
-function verifyInterruptedQueueTakeoverProjection(): Record<string, unknown> {
-  const userItem = (input: { id: string; clientId: string; optimistic: boolean; status: string; timelineAt: string; updatedAt: string; pausedReason?: string; providerItemId?: string }): NativeSessionItemBuffer => ({
-    key: input.id,
-    conversationId: 'queue-takeover-conversation',
-    threadId: 'queue-takeover-thread',
-    turnId: input.providerItemId ? 'provider-turn' : `pending:${input.id}`,
-    itemId: input.id,
-    localItemId: input.id,
-    type: 'userMessage',
-    status: input.status,
-    phase: 'user',
-    text: '第二条引导消息',
-    payload: {
-      role: 'user',
-      content: '第二条引导消息',
+/** 回放同一身份在本地、队列、明确接纳之间的交接，正文不保存待发副本。 */
+function verifyQueueMessageOwnership(): Record<string, unknown> {
+  /** 原始创建时间早于重新排序的更新时间。 */
+  const createdAt = '2026-09-28T10:04:10.104Z';
+  /** 两条相同正文使用独立身份，附件只跟随第一条。 */
+  const submissions = ['first', 'repeat'].map((id, position) => ({
+    id,
+    clientUserMessageId: id,
+    conversationId: 'queue-owner',
+    content: '继续',
+    status: 'queued',
+    delivery: 'queue' as const,
+    position,
+    providerTurnId: null,
+    pausedReason: null,
+    createdAt,
+    updatedAt: '2026-09-28T10:43:42.246Z',
+    ...(position === 0 ? { attachments: [{ id: 'attachment', kind: 'file', name: '证据.txt', path: '/probe/证据.txt' }] } : {}),
+  }));
+  /** 直接经过生产 reducer，而非重写另一套队列归属逻辑。 */
+  let state: NativeSessionState = { ...createInitialSessionState(), conversationId: 'queue-owner', providerThreadId: 'thread', conversationState: 'active_prework' };
+  /** 本地发出、服务端尚未确认。 */
+  for (const submission of submissions)
+    state = sessionReducer(state, {
+      type: 'send_started',
+      clientUserMessageId: submission.id,
+      durableClientUserMessageId: submission.id,
+      draft: submission.content,
+      attachments: [],
+      submittedAttachments: [],
+      browserSubmission: null,
+      contextDraft: state.contextDraft,
+      browserComments: [],
       delivery: 'queue',
-      ...(input.pausedReason ? { pausedReason: input.pausedReason } : {}),
-    },
-    resources: [],
-    optimistic: input.optimistic,
-    clientUserMessageId: input.clientId,
-    durableClientUserMessageId: input.clientId,
-    ...(input.providerItemId ? { providerItemId: input.providerItemId } : {}),
-    timelineAt: input.timelineAt,
-    updatedAt: input.updatedAt,
-  });
-  const interrupted = userItem({
-    id: 'legacy-interrupted',
-    clientId: 'legacy-client',
-    optimistic: true,
-    status: 'paused',
-    pausedReason: 'interrupted',
-    timelineAt: '2026-08-25T09:48:45.131Z',
-    updatedAt: '2026-08-25T10:28:09.901Z',
-  });
-  const accepted = userItem({
-    id: 'provider-accepted',
-    clientId: 'provider-client',
-    optimistic: false,
-    status: 'completed',
-    providerItemId: 'provider-item',
-    timelineAt: '2026-08-25T10:28:09.615Z',
-    updatedAt: '2026-08-25T10:28:09.615Z',
-  });
-  const projected = coalesceSupersededInterruptedQueuedUserMessages([interrupted, accepted]);
-  assertBehavior(projected.length === 2, '缺少共享持久身份的旧 interrupted 气泡必须保留，不能按正文和时间猜测为同一条消息。');
-
-  const deliberateRepeat = userItem({
-    id: 'deliberate-repeat',
-    clientId: 'deliberate-client',
-    optimistic: false,
-    status: 'completed',
-    providerItemId: 'provider-item-2',
-    timelineAt: '2026-08-25T10:28:09.800Z',
-    updatedAt: '2026-08-25T10:28:09.800Z',
-  });
-  assertBehavior(coalesceSupersededInterruptedQueuedUserMessages([accepted, deliberateRepeat]).length === 2, '短时间内两条成功且正文相同的用户消息也必须保留。');
-  return { ambiguousLegacyProjectionCount: projected.length, preservedDeliberateRepeats: 2 };
+      previousConversationState: 'active_prework',
+      startedAt: createdAt,
+    });
+  assertBehavior(state.itemOrder.length === 2, '相同文本的两次本地发送必须保留两个身份。');
+  /** 队列接管后只展示权威提交，正文必须没有待发副本。 */
+  const queued: NativeQueueSnapshot = { throughEventSeq: 10, state: { type: 'active', turnId: 'turn', phase: 'prework' }, submissions: submissions as NativeQueueSnapshot['submissions'] };
+  state = sessionReducer(state, { type: 'queue_hydrated', queue: queued });
+  assertBehavior(state.itemOrder.length === 0 && composerQueuedSubmissions(state).length === 2, '队列接管必须移除本地正文副本，且不按内容去重。');
+  assertBehavior(composerQueuedSubmissions(state)[0]?.attachments?.length === 1, '附件必须随稳定提交身份保留。');
+  /** 失败与结果未知同样直接从权威队列生成。 */
+  const paused = { ...queued, throughEventSeq: 11, submissions: queued.submissions.map((submission) => ({ ...submission, status: 'paused', pausedReason: 'outcome_unknown' })) };
+  state = sessionReducer(state, { type: 'queue_hydrated', queue: paused });
+  assertBehavior(
+    projectQueuedSubmissionItems(state, visibleQueuedSubmissions(state.queue), []).every((item) => item.messageCreatedAt === createdAt),
+    '状态更新时间不能改变原始发送时间。',
+  );
+  /** 跨窗口删除后的队列先到，旧 HTTP 回执和旧队列读取后到。 */
+  const deleted: NativeQueueSnapshot = { ...queued, throughEventSeq: 12, submissions: [] };
+  state = sessionReducer(state, { type: 'queue_hydrated', queue: deleted });
+  state = sessionReducer(state, { type: 'queue_hydrated', queue: queued });
+  state = sessionReducer(state, { type: 'send_accepted', clientUserMessageId: 'first', status: 'queued', submissionId: 'first' });
+  assertBehavior(
+    state.queue?.throughEventSeq === 12 && state.itemOrder.length === 0 && composerQueuedSubmissions(state).length === 0 && projectQueuedSubmissionItems(state, visibleQueuedSubmissions(state.queue), []).length === 0,
+    '删除后迟到的队列与发送回执不得复活消息。',
+  );
+  /** 插话必须有明确接纳证据；较新队列不能吞掉迟到的接纳事件。 */
+  state = sessionReducer(state, { type: 'steering_submission_hydrated', submission: { ...queued.submissions[0]!, delivery: 'steer_now', status: 'steering', providerTurnId: 'turn' }, queue: { ...deleted, throughEventSeq: 11 } });
+  assertBehavior(state.itemOrder.length === 1 && state.items[state.itemOrder[0]!]!.messageCreatedAt === createdAt && state.queue?.throughEventSeq === 12, '明确接纳的插话正文与队列水位必须分别收敛。');
+  return { deletedVisibleMessages: 0, sameTextIdentities: 2, attachmentPreserved: true, lateReceiptRejected: true, originalCreatedAt: createdAt, steeringAccepted: true };
 }
 
 function verifyRealtimeChangeSetProjection(): Record<string, unknown> {
@@ -660,6 +1034,12 @@ async function verifyConversationSyncFlow(): Promise<Record<string, unknown>> {
     assertBehavior(snapshot.droppedEphemeralEvents === 0, '当前 ephemeral 注册表为空，不应伪造临时事件丢弃计数。');
     const quickCheck = database.get<{ quick_check: string }>('PRAGMA quick_check')?.quick_check;
     assertBehavior(quickCheck === 'ok', `临时数据库 quick_check 失败：${quickCheck ?? 'missing'}`);
+    /** 队列快照与其耐久事件使用同一个序号，不借用发布前的水位。 */
+    const queueEvent = database.durableTransactionSync(() =>
+      protocol.append({ conversationId: 'queue-watermark', type: 'conversation.queue.changed', payload: { entityRevision: 1, queue: { throughEventSeq: 0, state: { type: 'idle' }, submissions: [] } } }),
+    );
+    assertBehavior((queueEvent.payload.queue as { throughEventSeq: number }).throughEventSeq === queueEvent.payload.sequence, '队列事件水位必须与持久同步序号相同。');
+    assertBehavior((protocol.listPage({ conversationId: 'queue-watermark' }).events[0]!.payload.queue as { throughEventSeq: number }).throughEventSeq === queueEvent.payload.sequence, '重连回放必须保持原队列水位。');
     return {
       cursorPages,
       baseline: { baseSequence: baseline.baseSequence, control: baselineSocket.messages.at(-1)?.type ?? null },
@@ -723,14 +1103,148 @@ function assertBehavior(condition: unknown, message: string): asserts condition 
   if (!condition) throw new Error(`ZARCH 事件流行为核验失败：${message}`);
 }
 
+/** 验证 sealed 分段只接纳旧轮次终态，且不夺回当前 thread 的运行控制权。 */
+async function verifySealedSegmentTerminalProjection(): Promise<Record<string, unknown>> {
+  /** 当前运行态必须在旧轮次终止后保持不变。 */
+  const runStates = new Map([['conversation-sealed', { type: 'active' as const, turnId: 'turn-current', phase: 'prework' as const }]]);
+  /** 探针记录持久化前后的公开事件，确保终态落盘后才广播。 */
+  const effects: string[] = [];
+  /** 旧分段只拥有这一条尚未收口的轮次。 */
+  let sealedTurn: ZeusConversationTurnRecord = {
+    id: 'local-turn-sealed',
+    conversationId: 'conversation-sealed',
+    providerThreadId: 'thread-1',
+    providerTurnId: 'turn-1',
+    clientSubmissionId: 'submission-sealed',
+    status: 'running' as const,
+    errorJson: null,
+    planJson: null,
+    startedAt: '2026-08-21T11:59:00.000Z',
+    completedAt: null,
+    createdAt: '2026-08-21T11:59:00.000Z',
+    updatedAt: '2026-08-21T11:59:00.000Z',
+    agentKind: 'codex' as const,
+    nativeRunId: 'turn-1',
+  };
+  /** 这里只提供 sealed 分支会消费的依赖；误入普通完成链路会立即暴露缺失依赖。 */
+  const dependencies = {
+    options: {
+      execution: {
+        segmentByNativeSession: () => ({ id: 'segment-sealed', conversationId: 'conversation-sealed', state: 'sealed' }),
+        persistWarning: () => effects.push('warning-persisted'),
+      },
+      conversations: {
+        getByProviderThreadId: () => undefined,
+        getById: () => ({ id: 'conversation-sealed', projectId: 'project-sealed', providerThreadId: 'thread-current', messages: [], attentionUnread: false }),
+      },
+      turns: {
+        getByProvider: (providerThreadId: string, providerTurnId: string) => (providerThreadId === sealedTurn.providerThreadId && providerTurnId === sealedTurn.providerTurnId ? sealedTurn : undefined),
+        upsert: (input: typeof sealedTurn) => {
+          sealedTurn = input;
+          effects.push('turn-persisted');
+          return sealedTurn;
+        },
+      },
+      receipts: { record: () => effects.push('receipt-recorded') },
+      db: {
+        save: async () => {
+          effects.push('database-saved');
+        },
+      },
+      broadcast: (type: string) => effects.push(`broadcast:${type}`),
+    },
+    closed: false,
+    contexts: new Map(),
+    failedTurnResults: new Map(),
+    modelRequestTiming: { clear: () => effects.push('timing-cleared') },
+    runStates,
+    hasProcessedProviderEvent: () => false,
+    maintainProviderReceiptGenerations: () => undefined,
+    rememberProcessedProviderEvent: () => undefined,
+    reconcileTerminalTurnSubmissions: () => ({ primarySubmission: undefined, recoveryRequired: [], reconciledCount: 1 }),
+    resolveTurnResult: () => effects.push('waiter-resolved'),
+    rejectTurnResultWaiters: () => effects.push('waiter-rejected'),
+  } as unknown as CodexProviderEventProjectionDependencies;
+
+  await projectCodexProviderEvent(dependencies, providerEvent(100, 'turn/completed', { turn: { status: 'completed' } }));
+  assertBehavior(sealedTurn.status === 'completed' && sealedTurn.completedAt === '2026-08-21T12:00:00.000Z', 'sealed 分段的旧轮次终态没有持久化。');
+  assertBehavior(runStates.get('conversation-sealed')?.turnId === 'turn-current', '旧分段终态覆盖了当前运行态。');
+  assertBehavior(effects.indexOf('database-saved') < effects.indexOf('broadcast:conversation.turn.completed'), 'sealed 终态必须先落盘再广播。');
+  assertBehavior(!effects.includes('warning-persisted'), '合法的 sealed 终态不应被归类为迟到活动警告。');
+
+  await projectCodexProviderEvent(dependencies, providerEvent(101, 'item/started'));
+  assertBehavior(effects.includes('warning-persisted'), 'sealed 分段的非终态活动仍必须被拒绝并记录警告。');
+  return { status: sealedTurn.status, currentTurnId: runStates.get('conversation-sealed')?.turnId ?? null, effects };
+}
+
+/** 验证权威快照不再声明活动轮次时，深分页缓存不会复活旧分段的 running turn。 */
+function verifyAuthoritativeTurnCacheReconciliation(): Record<string, unknown> {
+  /** 两份快照使用连续的历史范围，确保探针进入缓存复用分支。 */
+  const paging = {
+    history: { loadedThroughSequence: 10, oldestLoadedSequence: 1, nextCursor: null, hasMore: false, loading: false, error: null },
+    historyByTurn: {},
+    processByTurn: {},
+  };
+  /** 只提供缓存协调器实际读取的 V2 结构身份。 */
+  const snapshotV2 = { structureGeneration: '2026-09-16-transcript-placement', collections: { modelHistory: { throughSequence: 10 } } };
+  /** 旧缓存同时包含已封存历史与错误残留的活动轮次。 */
+  const previous = {
+    id: 'conversation-cache',
+    snapshotV2,
+    v2Paging: paging,
+    items: [],
+    turns: [
+      { id: 'turn-history', providerTurnId: 'provider-history', status: 'completed' },
+      { id: 'turn-stale', providerTurnId: 'provider-stale', status: 'running' },
+    ],
+  } as unknown as NativeConversationSnapshot;
+  /** 权威快照已进入空闲态，只保留刚完成的当前轮次。 */
+  const authoritative = {
+    ...previous,
+    turns: [{ id: 'turn-current', providerTurnId: 'provider-current', status: 'completed' }],
+  } as unknown as NativeConversationSnapshot;
+  /** 协调后只允许终态历史与权威轮次继续存在。 */
+  const reconciliation = reconcileConversationHistoryCache(previous, authoritative);
+  const turnIds = reconciliation.snapshot.turns.map((turn) => turn.id);
+  assertBehavior(reconciliation.preserveCachedHistory, '连续历史范围应继续复用深分页缓存。');
+  assertBehavior(!turnIds.includes('turn-stale'), '权威快照移除的 running turn 不得从缓存复活。');
+  assertBehavior(turnIds.includes('turn-history') && turnIds.includes('turn-current'), '终态历史与权威当前轮次都应保留。');
+  return { preserveCachedHistory: reconciliation.preserveCachedHistory, turnIds };
+}
+
 const provider = await verifyCodexProviderEventFlow();
+/** 真实投影入口核对 sealed 分段终态与迟到活动的不同处理。 */
+const sealedSegmentTerminal = await verifySealedSegmentTerminalProjection();
+/** Renderer 缓存核对旧非终态不会在权威空闲快照后复活。 */
+const authoritativeTurnCache = verifyAuthoritativeTurnCacheReconciliation();
 const sync = await verifyConversationSyncFlow();
 const compatibilityItems = await verifyCompatibilityItemIdentity();
 const automaticQueueDispatch = verifyAutomaticQueueDispatchSelection();
 const stageSummaryGrouping = verifyStageSummaryProcessGrouping();
-const interruptedQueueTakeover = verifyInterruptedQueueTakeoverProjection();
+const queueMessageOwnership = verifyQueueMessageOwnership();
 const realtimeChangeSetProjection = verifyRealtimeChangeSetProjection();
+/** Provider 断流使用同一生产投影和用户可见错误目录验证。 */
+const providerStreamFailure = verifyProviderStreamFailurePresentation();
 /** 同一事件流探针同时检查文件变化的真实捕获链路。 */
 const workspaceTurnChanges = await verifyWorkspaceTurnChanges();
 
-console.log(JSON.stringify({ status: 'passed', provider, sync, compatibilityItems, automaticQueueDispatch, stageSummaryGrouping, interruptedQueueTakeover, realtimeChangeSetProjection, workspaceTurnChanges }, null, 2));
+console.log(
+  JSON.stringify(
+    {
+      status: 'passed',
+      provider,
+      sealedSegmentTerminal,
+      authoritativeTurnCache,
+      sync,
+      compatibilityItems,
+      automaticQueueDispatch,
+      stageSummaryGrouping,
+      queueMessageOwnership,
+      realtimeChangeSetProjection,
+      providerStreamFailure,
+      workspaceTurnChanges,
+    },
+    null,
+    2,
+  ),
+);

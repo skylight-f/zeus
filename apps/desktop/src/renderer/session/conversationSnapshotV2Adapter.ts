@@ -165,6 +165,10 @@ export function adaptConversationSnapshotV2(input: ConversationSnapshotV2Bootstr
 function activeTurnItems(items: readonly NativeConversationActiveItemV2[], providerTurnByLocalId: ReadonlyMap<string, string>): NativeItemSnapshot[] {
   return items.map((item) => {
     const parsedPayload = parseProjection(item.payload.preview, item.payload.truncated);
+    /** 完成命令与历史回看共用转换，活动载荷截断也保留真实命令及全文入口。 */
+    const commandDetail = item.commandDetail;
+    /** 有界身份优先补齐字段，不将无法解析的协议预览展示给用户。 */
+    const commandPresentation = commandDetail ? conversationProcessPresentation('command', { ...commandDetail.presentation, ...recordValue(parseProjection(commandDetail.content.preview, commandDetail.content.truncated)) }) : null;
     return {
       id: item.transcript.placement.entryId,
       turnId: providerTurnByLocalId.get(item.turnId) ?? item.turnId,
@@ -177,24 +181,33 @@ function activeTurnItems(items: readonly NativeConversationActiveItemV2[], provi
       text: item.text.preview,
       payload: {
         ...(recordValue(parsedPayload) ?? {}),
+        ...commandPresentation?.payload,
         ...(item.questionResponse ? { questionResponse: item.questionResponse } : {}),
         protocolFamily: item.protocolFamily ?? null,
         stageId: item.stageId ?? null,
-        v2ContentKind: 'active_item',
+        v2ContentKind: commandDetail ? 'process_detail' : 'active_item',
+        ...(commandDetail
+          ? {
+              processKind: 'command',
+              v2ContentHandle: commandDetail.content.contentHandle,
+              v2ContentTruncated: commandDetail.content.truncated,
+              v2ContentBytes: commandDetail.content.byteLength,
+              v2ContentRedacted: commandDetail.content.redacted,
+            }
+          : {}),
         // 这是首屏时点上已经完整取得的预览，不应让流式 Markdown 从空白重新播放。
         // 首个实时 item 事件到达后 reducer 会移除此标记，后续增量继续走流式渲染。
         v2SnapshotContentComplete: true,
         v2ActiveOrder: item.order,
-        v2TextTruncated: item.text.truncated,
-        v2PayloadTruncated: item.payload.truncated,
-        v2RefreshRequired: item.text.refreshRequired || item.payload.refreshRequired,
-        // 统一标记供历史与活动投影合并；活动预览本身没有可恢复全文句柄。
-        v2ContentTruncated: item.text.truncated || item.payload.truncated || item.text.refreshRequired || item.payload.refreshRequired,
+        v2TextTruncated: commandDetail ? false : item.text.truncated,
+        v2PayloadTruncated: commandDetail ? false : item.payload.truncated,
+        v2RefreshRequired: commandDetail ? false : item.text.refreshRequired || item.payload.refreshRequired,
       },
       resources: [],
       startedAt: item.startedAt,
       completedAt: item.completedAt,
       updatedAt: item.updatedAt,
+      messageCreatedAt: item.messageCreatedAt,
       transcript: item.transcript,
     };
   });
@@ -332,6 +345,10 @@ export function reconcileConversationHistoryCache(previous: NativeConversationSn
   const fresh = next.v2Paging.history;
   if (!historyRangesJoin(cached, fresh)) return { snapshot: next, preserveCachedHistory: false };
 
+  /** 权威首屏已经移除的非终态 turn 属于旧分段残留，历史缓存不得继续把它当成活动轮次。 */
+  const authoritativeTurnIds = new Set(next.turns.map((turn) => turn.id));
+  /** 历史 turn 仍可为深分页提供身份映射；只有会驱动运行 UI 的状态必须由最新快照明确声明。 */
+  const reusableTurns = previous.turns.filter((turn) => authoritativeTurnIds.has(turn.id) || !['running', 'waiting', 'dispatching'].includes(turn.status));
   return {
     snapshot: {
       ...next,
@@ -340,7 +357,7 @@ export function reconcileConversationHistoryCache(previous: NativeConversationSn
         previous.items.filter((item) => item.payload.v2ContentKind === 'model_history' || item.payload.v2ContentKind === 'process_detail'),
         next.items,
       ),
-      turns: [...new Map([...previous.turns, ...next.turns].map((turn) => [turn.id, turn])).values()],
+      turns: [...new Map([...reusableTurns, ...next.turns].map((turn) => [turn.id, turn])).values()],
       v2Paging: {
         ...next.v2Paging,
         historyByTurn: { ...previous.v2Paging.historyByTurn, ...next.v2Paging.historyByTurn },
@@ -579,6 +596,7 @@ function historyItems(items: NativeConversationModelHistoryV2Item[], providerTur
         startedAt: item.confirmedAt,
         completedAt: item.confirmedAt,
         updatedAt: item.confirmedAt,
+        messageCreatedAt: item.messageCreatedAt,
         transcript: item.transcript,
       },
     ];

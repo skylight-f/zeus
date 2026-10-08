@@ -315,7 +315,8 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['所选代码仓库已不在当前项目中。请刷新仓库列表后重新选择。', 'The selected repository is no longer in this project. Refresh the repository list and select again.'],
   ],
   [['ZEUS_PROJECT_REPOSITORY_UNAVAILABLE'], ['项目代码仓库无法访问，或已不在允许的项目目录内。请检查仓库位置。', 'The project repository cannot be accessed or is outside the permitted project folder. Check its location.']],
-  [['ZEUS_TASK_BRANCH_PREFIX_REQUIRED'], ['任务分支名称必须以 zeus/ 开头，请修改分支名称。', 'Task branch names must start with zeus/. Update the branch name.']],
+  [['ZEUS_TASK_BRANCH_PREFIX_REQUIRED'], ['任务分支名称必须使用当前设置的前缀，请修改分支名称。', 'Task branch names must use the configured prefix. Update the branch name.']],
+  [['ZEUS_TASK_BRANCH_PREFIX_INVALID'], ['分支前缀不符合 Git 的命名要求，请修改通用设置。', 'The branch prefix does not meet Git naming requirements. Update it in General settings.']],
   [
     ['ZEUS_TASK_BRANCH_INVALID', 'ZEUS_GIT_BRANCH_INVALID'],
     ['分支名称不符合 Git 的命名要求，请检查名称。', 'The branch name does not meet Git’s naming requirements. Check the name.'],
@@ -366,6 +367,30 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
   [
     ['ZEUS_TASK_WORKSPACE_CONFLICTED', 'ZEUS_GIT_CONFLICT_IN_PROGRESS'],
     ['代码仍有冲突，请先处理并确认所有冲突文件。', 'The code still has conflicts. Resolve and confirm all conflicting files first.'],
+  ],
+  [
+    ['ZEUS_TARGET_WORKTREE_CHANGED'],
+    [
+      '来源工作目录在冲突处理期间又发生了变化；Zeus 没有覆盖它。请刷新代码交付，核对最新草稿后重新处理。',
+      'The source working folder changed while conflicts were being resolved. Zeus did not overwrite it. Refresh code delivery, review the latest draft, and try again.',
+      'check',
+    ],
+  ],
+  [
+    ['ZEUS_TARGET_WORKTREE_CONFLICTED', 'ZEUS_TARGET_WORKTREE_UNSUPPORTED'],
+    [
+      '来源工作目录已有冲突，或包含当前流程不能安全处理的特殊文件。Zeus 已保留现场，请先处理该目录后重试。',
+      'The source working folder already has conflicts or contains a special file this flow cannot safely handle. Zeus preserved it. Resolve the folder state and try again.',
+      'check',
+    ],
+  ],
+  [
+    ['ZEUS_TARGET_WORKTREE_RESTORE_FAILED', 'ZEUS_TARGET_WORKTREE_VERIFICATION_FAILED', 'ZEUS_TASK_LOCAL_CHANGE_STATE_INVALID'],
+    [
+      '来源工作目录的安全落地未能确认，Zeus 已停止继续操作。请勿重复尝试，先查看错误详情并检查该目录的 Git 状态。',
+      'The safe update of the source working folder could not be confirmed, so Zeus stopped. Do not retry yet; review the error details and inspect the folder’s Git state first.',
+      'check',
+    ],
   ],
   [
     ['ZEUS_TASK_GIT_PATH_INVALID'],
@@ -433,8 +458,9 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['ZEUS_TASK_ENVIRONMENT_CLOSED', 'ZEUS_TASK_WORKSPACE_CLOSED'],
     ['这个任务工作目录已关闭或移除，请选择可用目录或新建独立工作目录。', 'This task working folder was closed or removed. Select an available folder or create a separate working folder.'],
   ],
+  [['ZEUS_TARGET_HEAD_CHANGED'], ['合入期间目标分支发生了变化，请重新合入。', 'The target branch changed during the merge. Start the merge again.']],
   [
-    ['ZEUS_TASK_REPOSITORY_SNAPSHOT_CHANGED', 'ZEUS_TASK_PUSH_CONTEXT_CHANGED', 'ZEUS_TASK_HEAD_CHANGED', 'ZEUS_TARGET_HEAD_CHANGED', 'ZEUS_TASK_INTEGRATION_ATTEMPT_STALE'],
+    ['ZEUS_TASK_REPOSITORY_SNAPSHOT_CHANGED', 'ZEUS_TASK_PUSH_CONTEXT_CHANGED', 'ZEUS_TASK_HEAD_CHANGED', 'ZEUS_TASK_INTEGRATION_ATTEMPT_STALE'],
     ['任务或代码分支已发生变化，当前预览已过期。请重新打开预览，确认最新内容后继续。', 'The task or code branch has changed, so this preview is out of date. Reopen it and review the current content before continuing.'],
   ],
   [
@@ -713,7 +739,7 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['AI 服务的账户用量或余额已达限制，暂时无法继续。请检查该服务的用量与账单。', 'The AI service account has reached its usage or credit limit. Check the service’s usage and billing.', 'settings'],
   ],
   [
-    ['rate_limit_exceeded', 'rate_limit_error', 'tooManyRequests'],
+    ['rateLimitExceeded', 'rate_limit_exceeded', 'rate_limit_error', 'tooManyRequests'],
     ['AI 服务收到的请求过多，暂时限制了使用。请等待限制解除后再继续。', 'The AI service is receiving too many requests and has temporarily limited access. Wait until the limit clears before continuing.'],
   ],
   [
@@ -725,8 +751,10 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['与 AI 服务的连接未能建立，无法读取回复。请检查该服务的连接设置。', 'A connection to the AI service could not be established. Check the service’s connection settings.', 'settings'],
   ],
   [['responseStreamDisconnected'], ['AI 服务在回复结束前断开了连接，因此没有收到完整回复。', 'The AI service disconnected before finishing its response, so the reply is incomplete.']],
+  [['responseTooManyFailedAttempts'], ['AI 服务连续多次未能完成响应，当前请求已经停止。请稍后再继续。', 'The AI service failed to complete the response repeatedly, so this request has stopped. Try again later.']],
+  [['internalServerError'], ['AI 服务内部发生错误，当前请求无法完成。请等待服务恢复后再继续。', 'The AI service encountered an internal error and could not complete this request. Wait for the service to recover.']],
   [
-    ['model_not_found'],
+    ['model_not_found', 'modelUnavailable'],
     ['AI 服务找不到所选模型，或当前账号无权使用它。请检查模型名称和账号权限。', 'The AI service cannot find the selected model, or this account cannot access it. Check the model name and account access.', 'choose_model'],
   ],
   [
@@ -922,7 +950,31 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
       'settings',
     ],
   ],
-  [['ZEUS_CODEX_NOT_READY'], ['Codex 服务尚未就绪。请在“设置 → 模型供应商”中重新连接后再试。', 'Codex is not ready. Reconnect under Settings → Model providers and try again.', 'model_settings']],
+  [['ZEUS_CODEX_NOT_READY'], ['Codex 服务尚未就绪。请在“设置 → 模型供应商”中点击“重新连接 Codex”后再试。', 'Codex is not ready. Select Reconnect Codex under Settings → Model providers and try again.', 'model_settings']],
+  [
+    ['ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION'],
+    ['这份 Codex 由你自行安装，Zeus 不会修改它。请使用原安装方式更新，再重新检测。', 'This Codex installation is managed outside Zeus. Update it with its original installer, then check again.', 'model_settings'],
+  ],
+  [
+    ['ZEUS_CODEX_UPDATE_CONFIRMATION_REQUIRED', 'ZEUS_CODEX_UPDATE_TARGET_CHANGED'],
+    ['Codex 更新需要确认当前目标版本。请重新检测后，再点击安装。', 'Check for Codex updates again, then select the version to install.', 'model_settings'],
+  ],
+  [
+    ['ZEUS_CODEX_UPDATE_BUSY', 'ZEUS_CODEX_MAINTENANCE_IN_PROGRESS'],
+    ['Codex 仍有任务、授权或更新正在处理，请完成后再更新。', 'Codex still has work, approvals, or an update in progress. Wait for them to finish before updating.', 'model_settings'],
+  ],
+  [
+    ['ZEUS_CODEX_UPDATE_NOT_APPLIED'],
+    ['安装结果尚未确认，请先重新检测 Codex 的实际版本，不要直接重复安装。', 'The installation result is unconfirmed. Check the actual Codex version before attempting another installation.', 'model_settings'],
+  ],
+  [
+    ['ZEUS_CODEX_UPDATE_ACTIVATION_FAILED'],
+    [
+      'Codex 程序已安装，但连接未完成。请点击“重新连接 Codex”。Zeus 未自动降级或用旧数据覆盖对话。',
+      'Codex is installed, but reconnection failed. Select Reconnect Codex. Zeus has not downgraded or overwritten conversations with older data.',
+      'model_settings',
+    ],
+  ],
   [['ZEUS_CODEX_LOGIN_TIMED_OUT'], ['登录等待超时，配置已保留。请重新登录。', 'Sign-in timed out. Your configuration is preserved; try again.', 'sign_in']],
   [['ZEUS_CODEX_LOGIN_FAILED'], ['这次 Codex 登录未完成，请重新登录；具体原因可查看详情。', 'This Codex sign-in did not complete. Sign in again and check the details for the cause.', 'sign_in']],
   [['ZEUS_CODEX_LOGIN_UNAVAILABLE'], ['这次 Codex 登录已失效，请重新发起登录。', 'This Codex sign-in is no longer available. Start a new sign-in.', 'sign_in']],
@@ -945,7 +997,11 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['ZEUS_CODEX_MODEL_AT_CAPACITY', 'serverOverloaded'],
     ['所选模型目前繁忙，无法处理这次请求。可以切换模型，或稍后再试。', 'The selected model is busy and cannot handle this request. Choose another model or try again later.', 'choose_model'],
   ],
-  [['ZEUS_CONTEXT_MODEL_WINDOW_UNAVAILABLE'], ['Zeus 未能读取所选模型的使用限制，暂时无法向它发送请求。请重新连接 Codex。', 'Zeus could not read the selected model’s limits and cannot send the request yet. Reconnect Codex.', 'settings']],
+  // 此错误同时用于订阅与第三方模型；不能一律要求重新连接 Codex。
+  [
+    ['ZEUS_CONTEXT_MODEL_WINDOW_UNAVAILABLE'],
+    ['暂时无法读取所选模型的使用限制，消息尚未发送。请检查模型配置，或选择其他模型。', 'The selected model’s limits are unavailable, so the message was not sent. Check the model configuration or choose another model.', 'model_settings'],
+  ],
   // 任务文档读取失败保留具体原因；缺少可选文档由读取入口正常处理，不会进入这些错误分支。
   [
     ['项目 docs 不是普通目录或是符号链接。', 'ZEUS_CONTEXT_SOURCE_PATH_INVALID: 项目 docs 不是普通目录或是符号链接。'],
@@ -982,6 +1038,10 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['找不到这段会话。它可能已被移除，请返回会话列表确认。', 'This conversation could not be found. It may have been removed; check the conversation list.'],
   ],
   [['ZEUS_PROJECT_NOT_FOUND'], ['找不到对应项目。请返回项目列表确认项目是否仍然存在。', 'The project could not be found. Check whether it is still available in the project list.']],
+  // 路径校验同时服务于变更记录和用户主动恢复，不将具体文件操作扩大成整段会话失败。
+  [['ZEUS_TURN_CHANGE_SET_PATH_FORBIDDEN'], ['部分文件超出本会话的工作目录，本轮修改无法撤销或重新应用。', 'Some files are outside this conversation’s working folder. Changes from this turn cannot be undone or reapplied.']],
+  [['ZEUS_TURN_CHANGE_SET_PATH_INVALID'], ['部分文件路径无效，本轮修改无法撤销或重新应用。', 'Some file paths are invalid. Changes from this turn cannot be undone or reapplied.']],
+  [['ZEUS_TURN_CHANGE_SET_UNAVAILABLE'], ['本轮文件变更记录不完整，无法安全撤销或重新应用。', 'File change records for this turn are incomplete. Changes cannot be safely undone or reapplied.']],
   [['ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED'], ['这段会话已归档，需要先恢复会话才能继续。', 'This conversation is archived. Restore it before continuing.']],
   [
     ['ZEUS_NATIVE_SUBMISSION_NOT_EDITABLE', 'ZEUS_NATIVE_SUBMISSION_NOT_RETRYABLE'],

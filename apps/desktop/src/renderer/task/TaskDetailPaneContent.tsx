@@ -2,20 +2,32 @@ import { DotsThreeIcon } from '@phosphor-icons/react/dist/csr/DotsThree';
 import { GitBranchIcon } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { TrashIcon } from '@phosphor-icons/react/dist/csr/Trash';
 import { retainInputFocus } from '../ui/retainInputFocus.js';
-import type { UserFacingErrorCause } from '@zeus/shared';
 import { type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
-import { isTaskPriority, type TaskAttachmentField, type TaskAttachmentReference, type TaskManagementStatusDefinition } from '@zeus/shared';
+import {
+  isTaskPriority,
+  type DigitalTeamWorkflowRunRecord,
+  type DigitalTeamWorkflowTemplateRecord,
+  type TaskAttachmentField,
+  type TaskAttachmentReference,
+  type TaskManagementStatusDefinition,
+  type UserFacingErrorCause,
+} from '@zeus/shared';
 import { type ProjectRecord, type TaskEventRecord, type TaskManagementStatus, type TaskPriority, type TaskRecord, type TaskType, type UpdateTaskRelationshipsRequest, type UpdateTaskRequest, ZeusApiError } from '../apiClient.js';
 import type { NativeConversationChoice } from '../session/sessionTypes.js';
 import type { CodexTaskPushCapabilities } from '../session/sessionTypes.js';
 import { compareConversationCreatedAsc } from '../session/conversationOrdering.js';
 import { Button } from '../ui/Button.js';
-import { reportApplicationError, useApplicationErrorDialog, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { PENDING_RESOURCE_LONG_TEXT_THRESHOLD } from '../ui/pendingResourcePolicy.js';
+import { clipboardNeedsResourceRead, clipboardTextAfterResources, dataTransferFiles, usePendingResourcePreviews } from '../ui/usePendingResourcePreviews.js';
+import type { PendingResourceCardItem } from '../ui/PendingResourceCards.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { TaskAttachmentPreviewList } from './TaskAttachmentPreviewList.js';
-import { TaskDigitalEmployeeExecutor, TaskDigitalEmployeePanel, useTaskDigitalEmployeeManagement, type TaskDigitalEmployeeSkillClient } from '../features/digital-employees/TaskDigitalEmployeePanel.js';
+import { TaskDigitalEmployeeExecutor, TaskDigitalEmployeePanel, useTaskDigitalEmployeeManagement } from '../features/digital-employees/TaskDigitalEmployeePanel.js';
 import type { DigitalEmployeeApiClient } from '../features/digital-employees/digitalEmployeeApiClient.js';
+import type { DigitalTeamApiClient } from '../features/digital-teams/digitalTeamApiClient.js';
+import type { DigitalTeamEntrySelection } from '../features/digital-teams/DigitalTeamWorkspace.js';
+import { digitalTeamRunStatusLabel } from '../features/digital-teams/digitalTeamRunPresentation.js';
 import type { TaskWorkflowClient } from './TaskWorkflowSection.js';
 import type { TaskStageRecord } from '../features/tasks/taskContracts.js';
 import {
@@ -85,7 +97,6 @@ export interface TaskDetailPaneContentProps {
   busy: boolean;
   terminalReadOnly: boolean;
   digitalEmployeeClient?: DigitalEmployeeApiClient | null;
-  digitalEmployeeSkillClient?: TaskDigitalEmployeeSkillClient | null;
   conversations?: NativeConversationChoice[];
   conversationsLoading?: boolean;
   conversationsError?: string | null;
@@ -101,8 +112,10 @@ export interface TaskDetailPaneContentProps {
   conversationWorkspace?: ReactNode;
   /** 首次讨论复用原新建会话输入与耐久接纳。 */
   newConversationWorkspace?: ReactNode;
-  /** 从任务详情选择已保存的团队流程。 */
-  onUseDigitalTeam?(): void;
+  /** 从任务详情选择已保存流程、既有运行或管理入口。 */
+  onUseDigitalTeam?(selection: DigitalTeamEntrySelection): void;
+  /** 任务详情只读取数字团队模板和当前任务运行。 */
+  digitalTeamClient?: Pick<DigitalTeamApiClient, 'loadDigitalTeamTemplates' | 'loadDigitalTeamRuns'> | null;
   /** 打开当前项目员工管理，补齐可指派员工。 */
   onManageEmployees?(): void;
   onPushNewConversation: (taskId: string) => void;
@@ -199,7 +212,7 @@ const taskEditCopies: Record<'zh-CN' | 'en-US', TaskEditCopy> = {
 };
 
 function taskEditErrorMessage(error: unknown, fallback: string, language: 'zh-CN' | 'en'): string {
-  return error === null || error === undefined || error === '' ? fallback : reportApplicationError(error, { language: language });
+  return error === null || error === undefined || error === '' ? fallback : formatVisibleApplicationError(error, language);
 }
 
 function normalizeTaskTagsInput(value: string): string[] {
@@ -223,23 +236,6 @@ function readTaskClipboardText(clipboardData: DataTransfer): string {
   } catch {
     return '';
   }
-}
-
-function taskClipboardFiles(clipboardData: DataTransfer): File[] {
-  const candidates = [
-    ...Array.from(clipboardData.files),
-    ...Array.from(clipboardData.items)
-      .filter((item) => item.kind === 'file')
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null),
-  ];
-  const seen = new Set<string>();
-  return candidates.filter((file) => {
-    const fingerprint = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
-    if (seen.has(fingerprint)) return false;
-    seen.add(fingerprint);
-    return true;
-  });
 }
 
 function TaskEditFeedback(props: { state: TaskFieldSaveState; copy: TaskEditCopy; statusId: string; onRetry?: () => void; onLoadLatest?: () => void }) {
@@ -282,6 +278,8 @@ function TaskDetailFieldAttachments(props: {
   zh: boolean;
   field: TaskAttachmentField;
   attachments: TaskAttachmentView[];
+  /** 当前字段的导入卡片与成功缩略图。 */
+  pendingResources?: PendingResourceCardItem[];
   copy: TaskDetailPaneCopy;
   editCopy: TaskEditCopy;
   disabled: boolean;
@@ -290,11 +288,14 @@ function TaskDetailFieldAttachments(props: {
   onOpenAttachment?: (path: string) => Promise<{ opened: boolean; error?: string }>;
 }) {
   const attachments = taskAttachmentsForField(props.attachments, props.field);
-  if (attachments.length === 0) return null;
+  /** 未确认卡片按字段显示，成功预览按真实路径复用。 */
+  const previews = props.pendingResources?.filter((resource) => !resource.pending || resource.scope === props.field);
+  if (attachments.length === 0 && !previews?.some((resource) => resource.pending)) return null;
   return (
     <div className="task-detail-field-attachments">
       <TaskAttachmentPreviewList
         attachments={attachments}
+        pendingResources={previews}
         mode="editable"
         disabled={props.disabled}
         onRemove={props.onRemove}
@@ -330,6 +331,8 @@ function InlineTaskTextField(props: {
   copy: TaskEditCopy;
   className?: string;
   disabled?: boolean;
+  /** 附件保存期间正文可编辑，字段提交等待资源完成。 */
+  resourcesProcessing?: boolean;
   buildPatch: (value: string) => Omit<UpdateTaskRequest, 'expectedUpdatedAt'>;
   valueFromTask: (task: TaskRecord) => string;
   onSave: (input: UpdateTaskRequest) => Promise<TaskEditResult>;
@@ -341,6 +344,11 @@ function InlineTaskTextField(props: {
   const composingRef = useRef(false);
   const suppressBlurRef = useRef(false);
   const pasteShortcutFallbackTokenRef = useRef(0);
+  /** 附件保存期间的失焦保存延后，避免正文使用过期任务版本提交。 */
+  const deferredBlurSave = useRef(false);
+  /** 延迟保存读取当前草稿和回填后的任务版本。 */
+  const commitLatest = useRef(() => undefined);
+
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(props.value);
   const [saveState, setSaveState] = useState<TaskFieldSaveState>({ kind: 'idle' });
@@ -373,6 +381,8 @@ function InlineTaskTextField(props: {
   }
 
   function cancelEditing(): void {
+    if (props.resourcesProcessing) return;
+    deferredBlurSave.current = false;
     suppressBlurRef.current = true;
     setDraft(props.value);
     setSaveState({ kind: 'idle' });
@@ -380,7 +390,8 @@ function InlineTaskTextField(props: {
   }
 
   async function commitDraft(expectedUpdatedAt = baseUpdatedAtRef.current): Promise<void> {
-    if (saveState.kind === 'saving') return;
+    if (saveState.kind === 'saving' || props.resourcesProcessing) return;
+    deferredBlurSave.current = false;
     const nextValue = props.required ? draft.trim() : draft;
     if (props.required && !nextValue) {
       setSaveState({ kind: 'error', message: props.copy.titleRequired });
@@ -411,11 +422,25 @@ function InlineTaskTextField(props: {
     }
   }
 
+  commitLatest.current = () => {
+    void commitDraft();
+  };
+  useEffect(() => {
+    if (props.resourcesProcessing || !deferredBlurSave.current) return;
+    deferredBlurSave.current = false;
+    // 用户已回到原输入框时继续编辑；仍在其他位置才补做失焦保存。
+    if (document.activeElement !== inputRef.current) commitLatest.current();
+  }, [props.resourcesProcessing]);
+
   function handleBlur(event: { relatedTarget: EventTarget | null; currentTarget: HTMLInputElement | HTMLTextAreaElement }): void {
     // 在文本与保存、取消按钮之间移动焦点时，等待用户明确操作。
     if (event.relatedTarget instanceof Node && event.currentTarget.closest('.task-inline-edit')?.contains(event.relatedTarget)) return;
     if (suppressBlurRef.current) {
       suppressBlurRef.current = false;
+      return;
+    }
+    if (props.resourcesProcessing) {
+      deferredBlurSave.current = true;
       return;
     }
     void commitDraft();
@@ -485,7 +510,7 @@ function InlineTaskTextField(props: {
         .finally(() => {
           if (pasteShortcutFallbackTokenRef.current === fallbackToken) pasteShortcutFallbackTokenRef.current += 1;
         });
-    }, 120);
+    }, 0);
   }
 
   function handlePaste(event: ReactClipboardEvent<HTMLInputElement | HTMLTextAreaElement>): void {
@@ -495,10 +520,12 @@ function InlineTaskTextField(props: {
     const selectionStart = control.selectionStart ?? control.value.length;
     const selectionEnd = control.selectionEnd ?? selectionStart;
     const request: TaskAttachmentPasteRequest = {
-      files: taskClipboardFiles(event.clipboardData),
+      files: dataTransferFiles(event.clipboardData),
       plainText: readTaskClipboardText(event.clipboardData),
-      readNativeClipboard: true,
+      readNativeClipboard: false,
     };
+    request.readNativeClipboard = request.files.length === 0 && clipboardNeedsResourceRead(event.clipboardData, request.plainText);
+    if (request.files.length === 0 && request.plainText.length < PENDING_RESOURCE_LONG_TEXT_THRESHOLD && !request.readNativeClipboard) return;
     event.preventDefault();
     void applyPasteRequest(control, request, selectionStart, selectionEnd).catch(() => {
       if (request.files.length === 0) insertPastedText(control, request.plainText, selectionStart, selectionEnd);
@@ -562,10 +589,10 @@ function InlineTaskTextField(props: {
           {saveState.kind === 'saving' ? <TaskSaveSpinner /> : null}
           {props.multiline ? (
             <span className="task-inline-edit-actions">
-              <Button variant="secondary" size="compact" disabled={saveState.kind === 'saving'} onPointerDown={(event) => event.preventDefault()} onClick={cancelEditing}>
+              <Button variant="secondary" size="compact" disabled={saveState.kind === 'saving' || props.resourcesProcessing} onPointerDown={(event) => event.preventDefault()} onClick={cancelEditing}>
                 {props.copy === taskEditCopies['zh-CN'] ? '取消' : 'Cancel'}
               </Button>
-              <Button variant="primary" size="compact" busy={saveState.kind === 'saving'} onPointerDown={(event) => event.preventDefault()} onClick={() => void commitDraft()}>
+              <Button variant="primary" size="compact" busy={saveState.kind === 'saving'} disabled={props.resourcesProcessing} onPointerDown={(event) => event.preventDefault()} onClick={() => void commitDraft()}>
                 {props.copy === taskEditCopies['zh-CN'] ? '保存' : 'Save'}
               </Button>
             </span>
@@ -677,6 +704,101 @@ function TaskImmediateSelect<T extends string>(props: {
   );
 }
 
+/** 任务详情就地读取工作流和运行，管理动作保持为下拉中的独立选项。 */
+function TaskDigitalTeamSelector(props: {
+  task: TaskRecord;
+  client: Pick<DigitalTeamApiClient, 'loadDigitalTeamTemplates' | 'loadDigitalTeamRuns'> | null;
+  language: 'zh-CN' | 'en-US';
+  terminalReadOnly: boolean;
+  onSelect(selection: DigitalTeamEntrySelection): void;
+}) {
+  /** 当前语言决定下拉分组、状态和失败提示。 */
+  const zh = props.language === 'zh-CN';
+  /** 项目内可创建运行的已保存流程。 */
+  const [templates, setTemplates] = useState<DigitalTeamWorkflowTemplateRecord[]>([]);
+  /** 当前任务已有运行，供用户直接进入准确记录。 */
+  const [runs, setRuns] = useState<DigitalTeamWorkflowRunRecord[]>([]);
+  /** 首次读取与手动重试共用同一状态。 */
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'failed'>(props.client ? 'loading' : 'failed');
+  /** 递增后重新读取，不建立额外缓存。 */
+  const [loadRevision, setLoadRevision] = useState(0);
+
+  useEffect(() => {
+    if (!props.client) return;
+    let active = true;
+    setLoadState('loading');
+    void Promise.all([props.client.loadDigitalTeamTemplates(), props.client.loadDigitalTeamRuns(props.task.projectId, props.task.id)])
+      .then(([nextTemplates, nextRuns]) => {
+        if (!active) return;
+        setTemplates(nextTemplates);
+        setRuns(nextRuns.filter((run) => run.taskId === props.task.id));
+        setLoadState('ready');
+      })
+      .catch(() => {
+        if (active) setLoadState('failed');
+      });
+    return () => {
+      active = false;
+    };
+  }, [loadRevision, props.client, props.task.id, props.task.projectId]);
+
+  /** 同一任务已有未结束运行时，只允许查看运行，避免并行冻结第二份流程。 */
+  const hasActiveRun = runs.some((run) => !['completed', 'failed', 'cancelled'].includes(run.status));
+  /** 下拉值携带来源类型，避免模板身份与运行身份碰撞。 */
+  const options = [
+    ...templates.map((template) => ({
+      value: `template:${template.id}`,
+      label: template.name,
+      group: zh ? '选择工作流' : 'Choose a workflow',
+      description: !template.ready
+        ? zh
+          ? '需要先在“管理工作流”中补齐配置'
+          : 'Complete this workflow in Manage workflows first'
+        : props.terminalReadOnly
+          ? zh
+            ? '任务已结束，仅可查看运行记录'
+            : 'This task is closed; only existing runs can be viewed'
+          : hasActiveRun
+            ? zh
+              ? '当前任务已有未结束运行'
+              : 'This task already has an active run'
+            : template.description || (zh ? `修订 ${template.revision}` : `Revision ${template.revision}`),
+      disabled: !template.ready || props.terminalReadOnly || hasActiveRun,
+    })),
+    ...runs.map((run) => ({
+      value: `run:${run.id}`,
+      label: `${zh ? '运行' : 'Run'} · ${new Date(run.createdAt).toLocaleString(props.language, { dateStyle: 'short', timeStyle: 'short' })}`,
+      group: zh ? '查看运行' : 'View runs',
+      description: digitalTeamRunStatusLabel(run, zh),
+    })),
+    { value: 'manage', label: zh ? '管理工作流' : 'Manage workflows', group: zh ? '管理' : 'Manage', description: zh ? '创建或修改数字团队流程' : 'Create or edit digital team workflows' },
+  ];
+
+  return (
+    <span className="task-digital-team-selector">
+      <ZeusSelect
+        size="compact"
+        ariaLabel={zh ? '选择数字团队工作流或运行' : 'Choose a digital team workflow or run'}
+        value=""
+        options={options}
+        searchable={templates.length + runs.length > 8}
+        searchPlaceholder={zh ? '搜索工作流或运行' : 'Search workflows or runs'}
+        triggerLabel={loadState === 'loading' ? (zh ? '正在读取工作流…' : 'Loading workflows…') : zh ? '选择工作流 / 查看运行' : 'Choose workflow / view runs'}
+        onChange={(value) => {
+          if (value === 'manage') props.onSelect({ kind: 'manage' });
+          else if (value.startsWith('template:')) props.onSelect({ kind: 'template', templateId: value.slice('template:'.length) });
+          else if (value.startsWith('run:')) props.onSelect({ kind: 'run', runId: value.slice('run:'.length) });
+        }}
+      />
+      {loadState === 'failed' ? (
+        <Button variant="secondary" size="compact" onClick={() => setLoadRevision((current) => current + 1)}>
+          {zh ? '重新读取' : 'Reload'}
+        </Button>
+      ) : null}
+    </span>
+  );
+}
+
 /** 低频项目操作默认折叠；修改需明确提交，失败保留目标便于调整。 */
 function TaskProjectActions(props: Pick<TaskDetailPaneContentProps, 'task' | 'projects' | 'language' | 'busy' | 'onUpdateTaskContent' | 'onCopyTask'>) {
   /** 默认保持当前项目，仅按钮提交时执行修改。 */
@@ -715,7 +837,7 @@ function TaskProjectActions(props: Pick<TaskDetailPaneContentProps, 'task' | 'pr
   return (
     <details className="task-detail-block task-detail-project-settings">
       <summary>
-        <span>{zh ? '项目设置' : 'Project settings'}</span>
+        <span>{zh ? '移动与复制' : 'Move and copy'}</span>
         <small title={currentProjectName}>{currentProjectName}</small>
       </summary>
       <div className="task-detail-project-settings-content">
@@ -762,9 +884,20 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
   const zh = props.language === 'zh-CN';
   const editCopy = taskEditCopies[props.language];
   const managementStatus = resolveTaskManagementStatus(props.task);
-  const taskIdentity = props.task.taskCode?.trim() || props.task.id;
   const latestEvent = props.events.at(-1);
   const taskAttachments = parseTaskAttachments(props.task.sourceContextJson);
+  /** 任务详情的所有正文与标签字段共用即时预览和场景清理。 */
+  const previews = usePendingResourcePreviews(
+    taskAttachments.map((attachment) => ({ id: attachment.path, name: attachment.name, kind: attachment.kind })),
+    props.language,
+    props.task.id,
+  );
+  /** 正文继续编辑，但任何字段保存都等待附件回写版本。 */
+  const resourcesProcessing = previews.pendingResources.some((resource) => resource.pending);
+  /** 当前任务身份用于阻止旧任务的排队回执修改新详情。 */
+  const latestTask = useRef(props.task);
+  latestTask.current = props.task;
+
   const modelPushCreating = props.modelPushOperation?.status === 'submitting';
   const modelPushFailed = props.modelPushOperation?.status === 'failed';
   const attachmentStatusId = `${useId()}-status`;
@@ -791,9 +924,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     event.stopPropagation();
     moreActionsRef.current.hidePopover();
   }
-  useApplicationErrorDialog(props.conversationsError, {
-    language: zh ? 'zh-CN' : 'en',
-  });
   useEffect(() => {
     setAttachmentSaveState({ kind: 'idle' });
     setUndoAttachment(null);
@@ -805,9 +935,9 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     if (undoTimerRef.current !== null) window.clearTimeout(undoTimerRef.current);
   }, [props.task.id]);
   useEffect(() => {
-    if (attachmentSaveState.kind === 'saving' || attachmentSaveState.kind === 'error' || attachmentSaveState.kind === 'conflict') return;
+    if (resourcesProcessing || attachmentSaveState.kind === 'saving' || attachmentSaveState.kind === 'error' || attachmentSaveState.kind === 'conflict') return;
     desiredAttachmentsRef.current = parseTaskAttachments(props.task.sourceContextJson).map(toPersistedTaskAttachment);
-  }, [attachmentSaveState.kind, props.task.id, props.task.sourceContextJson]);
+  }, [resourcesProcessing, attachmentSaveState.kind, props.task.id, props.task.updatedAt, props.task.sourceContextJson]);
   useEffect(
     () => () => {
       if (undoTimerRef.current !== null) window.clearTimeout(undoTimerRef.current);
@@ -833,23 +963,8 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       }
     }
   }
-  function hierarchyDepth(task: TaskRecord): number {
-    let depth = 1;
-    let parentTaskId = task.parentTaskId ?? null;
-    const visited = new Set<string>();
-    while (parentTaskId && !visited.has(parentTaskId)) {
-      visited.add(parentTaskId);
-      depth += 1;
-      parentTaskId = taskById.get(parentTaskId)?.parentTaskId ?? null;
-    }
-    return depth;
-  }
-  function subtreeHeight(taskId: string): number {
-    const children = props.allTasks.filter((task) => task.parentTaskId === taskId);
-    return children.length === 0 ? 1 : 1 + Math.max(...children.map((task) => subtreeHeight(task.id)));
-  }
-  const currentSubtreeHeight = subtreeHeight(props.task.id);
-  const validParentTasks = props.allTasks.filter((task) => !currentBranchTaskIds.has(task.id) && hierarchyDepth(task) + currentSubtreeHeight <= 3);
+  /** 父任务候选只排除当前子树，循环和同项目约束由服务端统一校验。 */
+  const validParentTasks = props.allTasks.filter((task) => task.projectId === props.task.projectId && !currentBranchTaskIds.has(task.id));
   let currentTaskDepth = 1;
   let currentParentTaskId = props.task.parentTaskId ?? null;
   const visitedParentTaskIds = new Set<string>();
@@ -872,28 +987,26 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       if (result.kind === 'updated') setRelatedTaskCandidateId('');
     } catch (error) {
       const relationshipMessage =
-        error instanceof ZeusApiError && error.error === 'ZEUS_TASK_HIERARCHY_DEPTH_EXCEEDED'
-          ? zh
-            ? '调整后会超过三级任务层级，无法保存。请先调整当前任务下面的结构，或选择更高层级的父任务。'
-            : 'This change would exceed the three-level task hierarchy and cannot be saved.'
-          : error instanceof ZeusApiError && error.error === 'ZEUS_TASK_PARENT_CYCLE'
-            ? zh
-              ? '不能把当前任务移动到它自己下面。'
-              : 'A task cannot be moved below itself.'
-            : taskEditErrorMessage(error, editCopy.saveFailed, zh ? 'zh-CN' : 'en');
+        error instanceof ZeusApiError && error.error === 'ZEUS_TASK_PARENT_CYCLE' ? (zh ? '不能把当前任务移动到它自己下面。' : 'A task cannot be moved below itself.') : taskEditErrorMessage(error, editCopy.saveFailed, zh ? 'zh-CN' : 'en');
       setRelationshipSaveState({ kind: 'error', message: relationshipMessage });
     }
   }
 
+  /** 保存集中在一个队列里，版本校验与冲突处理保持原契约。 */
   async function saveAttachmentReferences(attachments: TaskAttachmentReference[], expectedUpdatedAt: string): Promise<TaskEditResult | null> {
     if (!expectedUpdatedAt) {
       setAttachmentSaveState({ kind: 'error', message: editCopy.saveFailed });
       return null;
     }
+    /** 记录本次目标，后续粘贴基于它合并，避免覆盖先到的附件。 */
     desiredAttachmentsRef.current = attachments;
+    /** 固定此次授权操作的任务，不跟随之后切换的详情。 */
+    const taskId = props.task.id;
     setAttachmentSaveState({ kind: 'saving' });
     try {
-      const result = await props.onUpdateTaskContent(props.task.id, { expectedUpdatedAt, attachments });
+      // 工作区已有按任务串行队列和本地版本接续，详情不再另建一层队列。
+      const result = await props.onUpdateTaskContent(taskId, { expectedUpdatedAt, attachments });
+      if (latestTask.current.id !== taskId) return null;
       if (result.kind === 'conflict') {
         setAttachmentSaveState({ kind: 'conflict', latest: result.latest });
         return result;
@@ -901,7 +1014,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       setAttachmentSaveState({ kind: 'saved' });
       return result;
     } catch (error) {
-      setAttachmentSaveState({ kind: 'error', message: taskEditErrorMessage(error, editCopy.saveFailed, zh ? 'zh-CN' : 'en') });
+      if (latestTask.current.id === taskId) setAttachmentSaveState({ kind: 'error', message: taskEditErrorMessage(error, editCopy.saveFailed, zh ? 'zh-CN' : 'en') });
       return null;
     }
   }
@@ -922,11 +1035,14 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     let text = request.plainText;
     let nativeReadFailed = false;
 
+    /** 卡片先出现，保持到文件授权和任务记录保存都结束。 */
+    const pending = previews.begin(request.files, request.plainText, field);
     setAttachmentSaveState({ kind: 'saving' });
     try {
-      if (request.readNativeClipboard && props.onReadClipboardResources) {
+      if (request.files.length === 0 && request.readNativeClipboard && props.onReadClipboardResources) {
         try {
           const nativeResult = await props.onReadClipboardResources();
+          if (!pending.current()) return {};
           additions = nativeResult.resources;
           // 剪贴板正文已经被附件消费时，只补回剩余说明文字；没有附件才回填整段粘贴原文。
           text = additions.length > 0 ? nativeResult.text : nativeResult.text || text;
@@ -938,14 +1054,18 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       if (additions.length === 0 && request.files.length > 0) {
         if (!props.onAuthorizeFiles) throw new Error('Task attachment authorization is unavailable.');
         const result = await props.onAuthorizeFiles(request.files, 'paste');
+        if (!pending.current()) return {};
         additions = result.resources;
         failedCount = result.failedCount;
+        text = clipboardTextAfterResources(text, additions);
       }
 
       if (additions.length === 0 && text.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD) {
         if (!props.onMaterializeResources) throw new Error('Task attachment materialization is unavailable.');
         additions = await props.onMaterializeResources([{ name: 'Pasted text.txt', type: 'text/plain', text, kind: 'pasted_text' }]);
+        if (!pending.current()) return {};
         if (additions.length === 0) throw new Error('Task attachment materialization returned no resource.');
+        text = '';
       }
 
       if (additions.length === 0) {
@@ -964,6 +1084,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
         additions.map((attachment) => ({ ...attachment, field })),
       );
       const result = await saveAttachmentReferences(nextAttachments, props.task.updatedAt ?? '');
+      if (!pending.current()) return {};
       if (!result) {
         attachmentPasteRetryRef.current = null;
         return {};
@@ -973,6 +1094,10 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
         return { updatedAt: result.latest.updatedAt };
       }
 
+      pending.complete(
+        additions.map((attachment) => ({ id: attachment.path, name: attachment.name, kind: attachment.kind })),
+        failedCount,
+      );
       if (failedCount > 0) {
         attachmentPasteRetryRef.current = retryOperation;
         setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage(failedCount) });
@@ -982,6 +1107,13 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       /** 有待重试的失败项时先不写回正文，重试成功后再插入，避免同一段文字进入两次。 */
       return { updatedAt: result.task.updatedAt, ...(failedCount === 0 && text ? { insertText: text } : {}) };
     } catch {
+      if (!pending.current()) return {};
+      if (request.files.length === 0 && request.plainText.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD && additions.length === 0) {
+        // 物化失败时保留原文，不让重试再重复插入同一段文字。
+        attachmentPasteRetryRef.current = null;
+        setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage() });
+        return { insertText: request.plainText };
+      }
       const resourceLikePaste = request.files.length > 0 || text.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD;
       if (!resourceLikePaste && request.plainText) {
         attachmentPasteRetryRef.current = null;
@@ -991,6 +1123,8 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       attachmentPasteRetryRef.current = retryOperation;
       setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage() });
       return {};
+    } finally {
+      pending.finish();
     }
   }
 
@@ -1104,14 +1238,16 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
             zh={zh}
             field={field.field}
             attachments={taskAttachments}
+            pendingResources={previews.pendingResources}
             copy={props.copy}
             editCopy={editCopy}
-            disabled={props.busy || attachmentSaveState.kind === 'saving'}
+            disabled={props.busy || resourcesProcessing || attachmentSaveState.kind === 'saving'}
             onRemove={(path) => void removeAttachment(path)}
             onLoadPreview={props.onLoadAttachmentPreview}
             onOpenAttachment={props.onOpenAttachment}
           />
           <InlineTaskTextField
+            resourcesProcessing={resourcesProcessing}
             task={props.task}
             label={`${zh ? '编辑' : 'Edit'}${zh ? '' : ' '}${field.label}`}
             value={field.value}
@@ -1155,10 +1291,8 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     <section className="product-drawer-pane task-detail-pane-content task-detail-pane-shell" aria-label={props.task.title}>
       <header className="task-detail-pane-header task-detail-summary-row">
         <span className="task-detail-pane-title">
-          <small>
-            {props.copy.taskCodeLabel ?? (zh ? '任务编码' : 'Task code')} {taskIdentity}
-          </small>
           <InlineTaskTextField
+            resourcesProcessing={resourcesProcessing}
             task={props.task}
             label={editCopy.editTitle}
             value={props.task.title}
@@ -1172,6 +1306,10 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
           />
         </span>
         <div className="task-detail-header-actions" aria-label={props.copy.primaryActionsTitle} onKeyDown={closeMoreActionsOnEscape}>
+          {/* 保留创建进度的读屏播报，视觉反馈由操作按钮承担。 */}
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            {modelPushCreating ? (zh ? '正在后台创建会话' : 'Creating conversation in the background') : props.modelPushOperation?.status === 'accepted' ? (zh ? '会话已创建' : 'Conversation created') : ''}
+          </span>
           {props.terminalReadOnly ? (
             <span className="task-detail-closed-note">{zh ? '调整任务状态后可继续协作' : 'Change task status to resume collaboration'}</span>
           ) : (
@@ -1197,6 +1335,16 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
                     : props.copy.pushNewConversation}
             </Button>
           )}
+          {/* 创建结果的操作与推送按钮共用标题栏，不为成功状态另占一行。 */}
+          {modelPushFailed && props.modelPushOperation?.canRetry && props.onRetryModelPush ? (
+            <Button variant="secondary" size="regular" onClick={() => props.onRetryModelPush?.(props.task.id)}>
+              {zh ? '重试创建' : 'Retry creation'}
+            </Button>
+          ) : props.modelPushOperation?.status === 'accepted' && props.modelPushOperation.conversationId ? (
+            <Button variant="secondary" size="regular" onClick={() => props.onOpenConversation(props.task.id, props.modelPushOperation?.conversationId ?? '')}>
+              {zh ? '打开会话' : 'Open conversation'}
+            </Button>
+          ) : null}
           <Button variant="secondary" size="regular" className="task-detail-more-trigger" popoverTarget={moreActionsId} aria-label={zh ? '更多任务操作' : 'More task actions'} title={zh ? '更多操作' : 'More actions'}>
             <DotsThreeIcon size={20} weight="bold" aria-hidden="true" />
           </Button>
@@ -1241,48 +1389,27 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
         </div>
       </header>
 
-      {props.modelPushEntry?.error || props.modelPushOperation ? (
+      {props.modelPushEntry?.error || modelPushFailed ? (
         <section className="task-detail-feedback-rail" aria-label={zh ? '创建会话进度' : 'Conversation creation status'}>
           {props.modelPushEntry?.error ? (
             <span className="task-detail-model-push-feedback is-failed" role="status">
               <VisibleApplicationError error={props.modelPushEntry.error} language={zh ? 'zh-CN' : 'en'} />
             </span>
           ) : null}
-          {props.modelPushOperation ? (
-            <span className={`task-detail-model-push-feedback is-${props.modelPushOperation.status}`} role={modelPushFailed ? 'alert' : 'status'} aria-live={modelPushFailed ? 'assertive' : 'polite'} aria-atomic="true">
+          {modelPushFailed && props.modelPushOperation ? (
+            <span className="task-detail-model-push-feedback is-failed" role="alert" aria-live="assertive" aria-atomic="true">
               <span>
-                {modelPushCreating ? <TaskSaveSpinner /> : null}
                 <strong>
-                  {modelPushCreating ? (
-                    zh ? (
-                      '正在后台创建会话'
-                    ) : (
-                      'Creating conversation in the background'
-                    )
-                  ) : modelPushFailed ? (
-                    <VisibleApplicationError error={props.modelPushOperation.errorCause ?? props.modelPushOperation.error} language={zh ? 'zh-CN' : 'en'} />
-                  ) : zh ? (
-                    '会话已创建'
-                  ) : (
-                    'Conversation created'
-                  )}
+                  <VisibleApplicationError error={props.modelPushOperation.errorCause ?? props.modelPushOperation.error} language={zh ? 'zh-CN' : 'en'} />
                 </strong>
               </span>
-              {modelPushFailed && props.modelPushOperation.canRetry && props.onRetryModelPush ? (
-                <Button variant="secondary" size="compact" onClick={() => props.onRetryModelPush?.(props.task.id)}>
-                  {zh ? '重试创建' : 'Retry creation'}
-                </Button>
-              ) : props.modelPushOperation.status === 'accepted' && props.modelPushOperation.conversationId ? (
-                <Button variant="secondary" size="compact" onClick={() => props.onOpenConversation(props.task.id, props.modelPushOperation?.conversationId ?? '')}>
-                  {zh ? '打开会话' : 'Open conversation'}
-                </Button>
-              ) : null}
             </span>
           ) : null}
         </section>
       ) : null}
 
-      <div className="task-detail-arrangement" aria-label={zh ? '状态与执行人' : 'Status and employees'}>
+      {/* 高频管理项共用一行并允许自然换行，避免数字团队单独占用整行。 */}
+      <div className="task-detail-arrangement" aria-label={zh ? '状态、执行人与数字团队' : 'Status, employees, and digital team'}>
         <span className="task-detail-summary-row">
           <small>{zh ? '状态' : 'Status'}</small>
           <TaskImmediateSelect
@@ -1308,25 +1435,42 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
             projectId={props.task.projectId}
             terminalReadOnly={props.terminalReadOnly}
             client={props.digitalEmployeeClient ?? null}
-            skillClient={props.digitalEmployeeSkillClient ?? null}
             language={props.language}
             management={digitalEmployeeManagement}
             onManageEmployees={props.onManageEmployees}
             onLoadCapabilities={props.onLoadWorkflowCapabilities}
           />
         </span>
-      </div>
-      {props.onUseDigitalTeam ? (
-        <div className="task-detail-arrangement">
+        {props.onUseDigitalTeam ? (
           <span className="task-detail-summary-row">
             <small>{zh ? '数字团队' : 'Digital team'}</small>
-            <Button size="compact" onClick={props.onUseDigitalTeam}>
-              {zh ? '选择工作流 / 查看运行' : 'Choose workflow / view runs'}
-            </Button>
+            <TaskDigitalTeamSelector task={props.task} client={props.digitalTeamClient ?? null} language={props.language} terminalReadOnly={props.terminalReadOnly} onSelect={props.onUseDigitalTeam} />
           </span>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
       <div className="task-detail-workspace">
+        {/* 沟通是任务详情的主工作区，DOM 与视觉顺序保持一致，键盘阅读不会绕到右侧属性后再返回。 */}
+        <div className="task-detail-main">
+          <TaskDigitalEmployeePanel
+            onArrangeTeam={props.onUseDigitalTeam ? () => props.onUseDigitalTeam!({ kind: 'manage' }) : undefined}
+            key={props.task.id}
+            taskId={props.task.id}
+            projectId={props.task.projectId}
+            terminalReadOnly={props.terminalReadOnly}
+            client={props.digitalEmployeeClient ?? null}
+            management={digitalEmployeeManagement}
+            language={props.language}
+            conversations={conversations}
+            conversationsLoading={props.conversationsLoading}
+            conversationsError={props.conversationsError}
+            activeConversationId={props.activeConversationId}
+            conversationWorkspace={props.conversationWorkspace}
+            newConversationWorkspace={props.terminalReadOnly ? null : props.newConversationWorkspace}
+            onSelectConversation={props.onSelectConversation ? (conversationId) => props.onSelectConversation!(props.task.id, conversationId) : undefined}
+            onReloadConversations={props.onReloadConversations ? () => props.onReloadConversations!(props.task.id) : undefined}
+            onOpenConversation={(conversationId) => props.onOpenConversation(props.task.id, conversationId)}
+          />
+        </div>
         <aside className="task-detail-sidebar" aria-label={zh ? '任务说明与属性' : 'Requirements and properties'}>
           {taskOverview}
           <details className="task-detail-properties">
@@ -1390,14 +1534,16 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
                 zh={zh}
                 field="tags"
                 attachments={taskAttachments}
+                pendingResources={previews.pendingResources}
                 copy={props.copy}
                 editCopy={editCopy}
-                disabled={props.busy || attachmentSaveState.kind === 'saving'}
+                disabled={props.busy || resourcesProcessing || attachmentSaveState.kind === 'saving'}
                 onRemove={(path) => void removeAttachment(path)}
                 onLoadPreview={props.onLoadAttachmentPreview}
                 onOpenAttachment={props.onOpenAttachment}
               />
               <InlineTaskTextField
+                resourcesProcessing={resourcesProcessing}
                 task={props.task}
                 label={editCopy.editTags}
                 value={taskTagsDraft(props.task.tags)}
@@ -1431,18 +1577,12 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
                 <span className="task-detail-section-heading">
                   <span>
                     <strong>{zh ? '父子关系' : 'Hierarchy'}</strong>
-                    <small>{zh ? `当前第 ${currentTaskDepth} 级，最多三级` : `Level ${currentTaskDepth} of 3`}</small>
+                    <small>{zh ? `当前第 ${currentTaskDepth} 级` : `Level ${currentTaskDepth}`}</small>
                   </span>
                   <Button
                     variant="secondary"
                     size="compact"
                     onClick={() => {
-                      // 达到层级上限时解释可行路径，不创建第四级任务。
-                      if (currentTaskDepth >= 3) {
-                        setRelationshipHintTarget('child');
-                        setRelationshipHint(zh ? '任务最多三级。请打开父任务，在父任务下新增同级任务。' : 'Tasks support three levels. Open the parent to add a sibling task.');
-                        return;
-                      }
                       setRelationshipHint('');
                       props.onCreateChild(props.task.id);
                     }}
@@ -1555,27 +1695,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
             />
           </details>
         </aside>
-        <div className="task-detail-main">
-          <TaskDigitalEmployeePanel
-            skillClient={props.digitalEmployeeSkillClient ?? null}
-            key={props.task.id}
-            taskId={props.task.id}
-            projectId={props.task.projectId}
-            terminalReadOnly={props.terminalReadOnly}
-            client={props.digitalEmployeeClient ?? null}
-            management={digitalEmployeeManagement}
-            language={props.language}
-            conversations={conversations}
-            conversationsLoading={props.conversationsLoading}
-            conversationsError={props.conversationsError}
-            activeConversationId={props.activeConversationId}
-            conversationWorkspace={props.conversationWorkspace}
-            newConversationWorkspace={props.terminalReadOnly ? null : props.newConversationWorkspace}
-            onSelectConversation={props.onSelectConversation ? (conversationId) => props.onSelectConversation!(props.task.id, conversationId) : undefined}
-            onReloadConversations={props.onReloadConversations ? () => props.onReloadConversations!(props.task.id) : undefined}
-            onOpenConversation={(conversationId) => props.onOpenConversation(props.task.id, conversationId)}
-          />
-        </div>
       </div>
       {undoAttachment || attachmentSaveState.kind === 'saving' || attachmentSaveState.kind === 'error' || attachmentSaveState.kind === 'conflict' ? (
         <section className="task-detail-attachment-feedback" aria-live="polite" aria-busy={attachmentSaveState.kind === 'saving' || undefined}>

@@ -1,3 +1,4 @@
+import { piSdkBinaryVersion } from '@zeus/ai-runtime';
 /** 桌面动态价格读取复用受限公网访问边界。 */
 export { readPricingDocument } from './modelPricingDocument.js';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
@@ -35,6 +36,8 @@ import { applyNetworkProxyAtStartup } from './networkProxyRuntime.js';
 export { applyNetworkProxyAtStartup, networkProxyRuntimeEnvironment } from './networkProxyRuntime.js';
 import {
   cloneTaskManagementStatusConfig,
+  defaultTaskManagementStatusLabels,
+  taskManagementStatusDefinitionsEquivalent,
   type ReadOnlyValidationDescriptor,
   taskBoardEmptyGroupId,
   type TaskBoardGroupProperty,
@@ -42,7 +45,10 @@ import {
   type TaskPushParentContextSelection,
   type TaskPushRelatedContextSelection,
 } from '@zeus/shared';
+import { repairGeneratedTaskManagementStatuses, type ArchivedProjectTaskStatuses } from './taskManagementStatusMigration.js';
 import {
+  migrateTaskBoardStatusPositions,
+  migrateUnifiedDigitalTeamTemplates,
   AgentCapabilitySnapshotRepository,
   type AppendAuditLogInput,
   ArtifactStore,
@@ -154,7 +160,15 @@ import { activateHeavyWorkerJobs, closeHeavyWorkerJobs, runGitDiffHeavyJob, runG
 import { IntegrationCommandApplication } from './integrationCommandApplication.js';
 import { migrateLegacyCodexThreads } from './legacyCodexThreadMigration.js';
 import { registerLocalServerPlatformRoutes } from './localServerPlatformRoutes.js';
-import { type AppShellSettingsSnapshot, codexRemoteControlEnabledSettingKey, normalizeAppShellSettings, normalizeRuntimeSettings, runtimeSettingsKey, type TaskAgentRunStatus } from './localServerSettingsNormalization.js';
+import {
+  type AppShellSettingsSnapshot,
+  codexRemoteControlEnabledSettingKey,
+  normalizeAppShellSettings,
+  normalizeTaskManagementStatusByProject,
+  normalizeRuntimeSettings,
+  runtimeSettingsKey,
+  type TaskAgentRunStatus,
+} from './localServerSettingsNormalization.js';
 import { createLocalServerSupportOperations, normalizeTelegramNotificationSettings, normalizeTelegramSecuritySettings } from './localServerSupportOperations.js';
 import { applyLocalCorsHeaders, isAllowedLocalAppOrigin, isPathInsideProjectRoot, normalizeHeaderValue, resolveRegisteredRuntimeAdapter } from './localServerPlatformSupport.js';
 import { ManagedPortableContextStore } from './managedPortableContextStore.js';
@@ -949,9 +963,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const appShellSettingsKey = 'app.shell.settings';
   const codexAccountFingerprintSaltKey = 'codex.usage.account_fingerprint_salt';
   const conversationResourceBackfillSettingKey = 'conversation.resource_backfill';
-  // 仅补齐已完成答复遗漏的托管产物图片，保留已有资源。
-  /** 补齐 Pi 历史文件链接，仍保留已登记的资源和图片原件。 */
-  const conversationResourceBackfillRevision = '20260923_pi_conversation_resources';
+  /** 补齐工作树答复引用的主项目图片，仍保留已登记的资源和图片原件。 */
+  const conversationResourceBackfillRevision = '20261003_project_answer_images';
   const localLogDirectory = dataLayout.localLogs;
   const localConfigPath = options.localConfigPath ?? dataLayout.localConfig;
   // 本地日志目录是设计书明确要求的物理落点；服务启动时创建，避免 UI 只展示一个不存在的路径。
@@ -988,7 +1001,20 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   if (!readOnlyValidation) await runRuntimeLogRetention();
   traceStartup('runtime_retention_ready');
   let codexRemoteControlEnabled = settings.getJson<boolean>(codexRemoteControlEnabledSettingKey) === true;
-  const persistedAppShellSettings = settings.getJson<AppShellSettingsSnapshot>(appShellSettingsKey);
+  const persistedAppShellSettings = settings.getJson<
+    AppShellSettingsSnapshot & { taskManagementStatusByProject?: Record<string, TaskManagementStatusConfig> } & Partial<
+        Record<'taskTableColumnsByProject' | 'taskStatusFilterByProject' | 'taskViewModeByProject' | 'taskPageViewByProject', unknown>
+      >
+  >(appShellSettingsKey);
+  /** 旧项目视图只保留原始证据，不猜测选择一个项目升格为全局偏好。 */
+  const legacyTaskViewKeys = ['taskTableColumnsByProject', 'taskStatusFilterByProject', 'taskViewModeByProject', 'taskPageViewByProject'] as const;
+  /** 原字段和值逐项归档，后续启动不再读取其生效值。 */
+  const legacyTaskViewSettings = Object.fromEntries(legacyTaskViewKeys.filter((key) => Object.hasOwn(persistedAppShellSettings ?? {}, key)).map((key) => [key, persistedAppShellSettings?.[key]]));
+  /** 有旧视图字段时需要将统一默认与原始归档共同落库。 */
+  const hasLegacyTaskViewSettings = Object.keys(legacyTaskViewSettings).length > 0;
+  if (!readOnlyValidation && hasLegacyTaskViewSettings && !settings.getJson('archive.project-task-view-settings')) {
+    settings.setJson('archive.project-task-view-settings', { preferences: legacyTaskViewSettings, archivedAt: now().toISOString() });
+  }
   let appShellSettings: AppShellSettingsSnapshot = normalizeAppShellSettings(persistedAppShellSettings, localLogDirectory, localConfigPath, settingsIdentityCatalog);
   /** 固定本次宿主的生效值；后台任务继续运行时，重新开窗也不得提前切换浏览器代理。 */
   const activeNetworkProxy = normalizeNetworkProxySettings(appShellSettings.networkProxy);
@@ -1000,41 +1026,130 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     settings.setJson(appShellSettingsKey, appShellSettings);
     await db.save();
   }
-  const missingTaskStatusProjectIds = projects
-    .list()
-    .map((project) => project.id)
-    .filter((projectId) => !appShellSettings.taskManagementStatusByProject[projectId]);
-  if (missingTaskStatusProjectIds.length > 0) {
-    appShellSettings = {
-      ...appShellSettings,
-      taskManagementStatusByProject: {
-        ...appShellSettings.taskManagementStatusByProject,
-        ...Object.fromEntries(missingTaskStatusProjectIds.map((projectId) => [projectId, cloneTaskManagementStatusConfig(appShellSettings.taskManagementStatusTemplate)])),
+  /** 旧项目状态只在启动时读取一次，统一后归档原配置。 */
+  const legacyProjectTaskStatuses = normalizeTaskManagementStatusByProject(persistedAppShellSettings?.taskManagementStatusByProject, appShellSettings.taskManagementStatusTemplate);
+  const hasLegacyProjectTaskStatuses = Object.keys(legacyProjectTaskStatuses).length > 0;
+  if (hasLegacyProjectTaskStatuses && !readOnlyValidation) {
+    /** 保留全局默认角色；旧终态角色优先映射，普通同名状态不合并。 */
+    const unified = cloneTaskManagementStatusConfig(appShellSettings.taskManagementStatusTemplate);
+    const replacementsByProject: Record<string, Record<string, string>> = {};
+    for (const [projectId, config] of Object.entries(legacyProjectTaskStatuses)) {
+      const replacements: Record<string, string> = {};
+      for (const status of config.statuses) {
+        const role = (['completedStatusId', 'cancelledStatusId', 'pushedStatusId', 'defaultStatusId'] as const).find((key) => config.roles[key] === status.id);
+        if (role) {
+          replacements[status.id] = unified.roles[role];
+          continue;
+        }
+        const existing = unified.statuses.find((candidate) => candidate.id === status.id);
+        if (!existing) {
+          unified.statuses.push({ ...status });
+          replacements[status.id] = status.id;
+        } else if (taskManagementStatusDefinitionsEquivalent(existing, status) && !Object.values(unified.roles).includes(status.id)) {
+          replacements[status.id] = status.id;
+        } else {
+          /** 标识冲突按原项目身份生成稳定ID，不按显示名称合并。 */
+          const id = `legacy_${createHash('sha256').update(`${projectId}\0${status.id}`).digest('hex').slice(0, 32)}`;
+          unified.statuses.push({ ...status, id, label: status.label ?? defaultTaskManagementStatusLabels[appShellSettings.appLanguage][status.id] ?? status.id });
+          replacements[status.id] = id;
+        }
+      }
+      replacementsByProject[projectId] = replacements;
+    }
+    /** 规则修订和事件序号是历史来源身份，不依赖机器时钟猜测。 */
+    const automationRevisionIds = db.select<{ id: string }>('SELECT id FROM automation_task_revisions').map((row) => row.id);
+    const digitalTeamRunIds = db.select<{ id: string }>('SELECT id FROM digital_team_workflow_runs').map((row) => row.id);
+    const taskEventSequenceByProject = Object.fromEntries(
+      db
+        .select<{ project_id: string; sequence: number }>('SELECT task.project_id, MAX(event.rowid) AS sequence FROM task_events event JOIN tasks task ON task.id = event.task_id GROUP BY task.project_id')
+        .map((row) => [row.project_id, row.sequence]),
+    );
+    db.transaction(() => {
+      for (const [projectId, replacements] of Object.entries(replacementsByProject)) {
+        const changes = Object.entries(replacements).filter(([from, to]) => from !== to);
+        if (changes.length === 0) continue;
+        /** 单条CASE按原状态映射，避免互换角色发生连带二次替换；归档任务同样迁移。 */
+        const before = db
+          .select<{ id: string; management_status: string }>('SELECT id, management_status FROM tasks WHERE project_id = ? AND deleted_at IS NULL', [projectId])
+          .filter((task) => replacements[task.management_status] && replacements[task.management_status] !== task.management_status);
+        db.execute(`UPDATE tasks SET management_status = CASE management_status ${changes.map(() => 'WHEN ? THEN ?').join(' ')} ELSE management_status END WHERE project_id = ? AND deleted_at IS NULL`, [...changes.flat(), projectId]);
+        migrateTaskBoardStatusPositions(db, projectId, replacements);
+        for (const task of before) {
+          const event = taskEvents.create({
+            taskId: task.id,
+            eventType: 'task.management_status.migrated',
+            title: '项目状态统一为全局状态',
+            payload: { from: task.management_status, to: replacements[task.management_status], suppressAutomation: true, source: 'task_status_migration' },
+          });
+          taskEventFileProjectionOutbox.enqueue(event.taskId, event.id, event.createdAt);
+        }
+      }
+      settings.setJson('archive.project-task-status-settings', {
+        configurations: legacyProjectTaskStatuses,
+        replacements: replacementsByProject,
+        automationRevisionIds,
+        digitalTeamRunIds,
+        taskEventSequenceByProject,
+        migratedAt: now().toISOString(),
+      });
+      appShellSettings = { ...appShellSettings, taskManagementStatusTemplate: unified };
+      settings.setJson(appShellSettingsKey, appShellSettings);
+    });
+    await db.save();
+  }
+  if (!readOnlyValidation) {
+    /** 已经完成旧迁移的资料也按准确归档纠正，重复启动不再次写入。 */
+    const repaired = repairGeneratedTaskManagementStatuses({
+      db,
+      appShellSettings,
+      timestamp: now().toISOString(),
+      recordMigration: (task, targetStatus) => {
+        /** 记录真实更正，保留原事件并禁止迁移触发自动化工作。 */
+        const event = taskEvents.create({
+          taskId: task.id,
+          eventType: 'task.management_status.migrated',
+          title: '纠正内置任务状态迁移副本',
+          payload: { from: task.management_status, to: targetStatus, suppressAutomation: true, source: 'task_status_migration' },
+        });
+        taskEventFileProjectionOutbox.enqueue(event.taskId, event.id, event.createdAt);
       },
-    };
+    });
+    if (repaired) {
+      appShellSettings = repaired;
+      await db.save();
+    }
   }
   if (
     !readOnlyValidation &&
-    (missingTaskStatusProjectIds.length > 0 ||
+    (hasLegacyProjectTaskStatuses ||
+      hasLegacyTaskViewSettings ||
       (persistedAppShellSettings &&
         (JSON.stringify(persistedAppShellSettings.taskTableColumns) !== JSON.stringify(appShellSettings.taskTableColumns) ||
           persistedAppShellSettings.mainLayout !== appShellSettings.mainLayout ||
-          JSON.stringify(persistedAppShellSettings.taskTableColumnsByProject) !== JSON.stringify(appShellSettings.taskTableColumnsByProject) ||
           JSON.stringify(persistedAppShellSettings.taskTableEnumSortOrders) !== JSON.stringify(appShellSettings.taskTableEnumSortOrders) ||
           JSON.stringify(persistedAppShellSettings.taskManagementStatusTemplate) !== JSON.stringify(appShellSettings.taskManagementStatusTemplate) ||
-          JSON.stringify(persistedAppShellSettings.taskManagementStatusByProject) !== JSON.stringify(appShellSettings.taskManagementStatusByProject) ||
-          JSON.stringify(persistedAppShellSettings.taskStatusFilterByProject) !== JSON.stringify(appShellSettings.taskStatusFilterByProject) ||
-          JSON.stringify(persistedAppShellSettings.taskViewModeByProject) !== JSON.stringify(appShellSettings.taskViewModeByProject) ||
-          JSON.stringify(persistedAppShellSettings.taskPageViewByProject) !== JSON.stringify(appShellSettings.taskPageViewByProject) ||
+          persistedAppShellSettings.taskStatusFilter !== appShellSettings.taskStatusFilter ||
+          persistedAppShellSettings.taskViewMode !== appShellSettings.taskViewMode ||
+          persistedAppShellSettings.taskPageView !== appShellSettings.taskPageView ||
           JSON.stringify(persistedAppShellSettings.taskExpandedIdsByProject) !== JSON.stringify(appShellSettings.taskExpandedIdsByProject))))
   ) {
-    // 旧列键、旧默认顺序、新增列宽、项目筛选偏好都只迁移一次并立即落库，避免每次启动重复改写本机视图配置。
+    // 全局视图归一化后立即落库，旧项目视图只保存在独立归档记录。
     settings.setJson(appShellSettingsKey, appShellSettings);
     await db.save();
   }
+  /** 团队模板仍持有原项目身份，状态映射完成后再统一为全局模板。 */
+  if (!readOnlyValidation) {
+    const archived = settings.getJson<ArchivedProjectTaskStatuses>('archive.project-task-status-settings');
+    /** 首次统一后的模板使用已纠正身份，不重新引入已经退役的副本。 */
+    const replacements = Object.fromEntries(
+      Object.entries(archived?.replacements ?? {}).map(([projectId, mapping]) => [projectId, Object.fromEntries(Object.entries(mapping).map(([from, to]) => [from, archived?.canonicalReplacements?.[to] ?? to]))]),
+    );
+    if (migrateUnifiedDigitalTeamTemplates(db, replacements)) await db.save();
+  }
   traceStartup('settings_ready');
+  /** 正常实例统一全局状态；只读验收保留旧冻结历史的状态含义。 */
   function resolveTaskManagementStatusConfigForProject(projectId: string): TaskManagementStatusConfig {
-    return appShellSettings.taskManagementStatusByProject[projectId] ?? appShellSettings.taskManagementStatusTemplate;
+    return (readOnlyValidation ? legacyProjectTaskStatuses[projectId] : undefined) ?? appShellSettings.taskManagementStatusTemplate;
   }
 
   function isConfiguredTaskManagementStatus(projectId: string, status: unknown): status is TaskManagementStatus {
@@ -1180,8 +1295,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           ? {
               contextWindowTokens: 256_000,
               reservedOutputTokens: 8_192,
-              contextWindowSource: 'pi_sdk_0.83.0_runtime_fallback_256000',
-              reservedOutputSource: 'pi_sdk_0.83.0_runtime_fallback_8192',
+              contextWindowSource: `${piSdkBinaryVersion}_runtime_fallback_256000`,
+              reservedOutputSource: `${piSdkBinaryVersion}_runtime_fallback_8192`,
               checkedAt: null,
             }
           : null;
@@ -1214,7 +1329,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       exact: false,
       source: null,
       checkedAt: budget.checkedAt,
-      reason: input.provider === 'codex' ? '当前 Codex app-server 没有请求前 token-count RPC；只能使用请求后的真实 usage 通知。' : 'Pi SDK 0.83.0 没有对完整待发请求进行精确预检计数的公共端口；运行后的 usage 不能替代预检。',
+      reason: input.provider === 'codex' ? '当前 Codex app-server 没有请求前 token-count RPC；只能使用请求后的真实 usage 通知。' : `${piSdkBinaryVersion} 没有对完整待发请求进行精确预检计数的公共端口；运行后的 usage 不能替代预检。`,
     };
     const envelope = await contextDispatch.compileForDispatch({
       project: { id: project.id, localPath: project.localPath },
@@ -1339,6 +1454,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
             {
               projectId: conversations.getById(item.conversationId)!.projectId,
               projectRoot,
+              registeredProjectRoot: projects.getById(conversations.getById(item.conversationId)!.projectId)?.localPath ?? undefined,
               conversationId: item.conversationId,
               turnId: item.turnId,
               item,
@@ -1478,6 +1594,18 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       await db.save();
     },
     onLog: persistRuntimeLog,
+    /** 尺寸作为回放元数据单独持久化，不修改或复制终端输出正文。 */
+    onTerminalSize: ({ sessionId, cols, rows, byteOffset, createdAt }) => {
+      const session = runtimeSessions.getById(sessionId);
+      terminalEvents.appendNext({
+        sessionId,
+        ...(session?.taskId ? { taskId: session.taskId } : {}),
+        eventType: 'resize',
+        content: JSON.stringify({ cols, rows, byteOffset }),
+        createdAt,
+      });
+      scheduleRuntimePersistenceSave();
+    },
   });
   const ownsCodexAppServerManager = options.codexAppServerManager === undefined;
   const codexNativeEnabled = !readOnlyValidation && options.codexNativeEnabled !== false;
@@ -1634,7 +1762,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   if (!readOnlyValidation && resourceBackfillState?.revision !== conversationResourceBackfillRevision) {
     const existingResourceCount = db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM conversation_resources`)?.count ?? 0;
     let conversationResourceBackfillCount = 0;
-    // 首次资源回填仍处理全部 item；升级只补最终答复图片和 Pi 已完成消息中的链接，
+    // 首次资源回填仍处理全部 item；升级只补图片查看、最终答复图片和 Pi 已完成消息中的链接，
     // 不把全部历史正文重新载入内存，也不覆盖已经存在的文件/网页资源。
     if (existingResourceCount === 0) {
       for (const conversation of conversations.listNativeBoundRecords()) {
@@ -1656,6 +1784,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           const normalized = normalizeConversationResources({
             projectId: conversation.projectId,
             projectRoot: conversationExecutionRoot,
+            registeredProjectRoot: project.localPath ?? undefined,
             conversationId: conversation.id,
             turnId: item.turnId,
             item,
@@ -1687,6 +1816,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         const normalized = normalizeConversationResources({
           projectId: conversation.projectId,
           projectRoot,
+          registeredProjectRoot: project.localPath ?? undefined,
           conversationId: conversation.id,
           turnId: item.turnId,
           item,
@@ -1697,7 +1827,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           assistantImageArchiveRoot: conversationAttachmentRoot,
           artifactsDirectory: dataLayout.artifactsDirectory,
           now: item.updatedAt,
-        }).filter((resource) => item.agentKind === 'pi' || isDurableAssistantMarkdownImageResource(resource));
+        }).filter((resource) => item.itemType === 'imageView' || item.agentKind === 'pi' || isDurableAssistantMarkdownImageResource(resource));
         if (normalized.length === 0) continue;
         const existing = conversationResources.listByItem(item.id);
         // 同一 HTML 的正文链接和卡片共用目标，但属于两种展示，必须分别补齐。
@@ -1792,11 +1922,20 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     return capabilities.modelBudgets[model.model] ?? null;
   };
 
-  async function activateCurrentCodexConfiguration(input: { syncSubscriptionModels?: boolean } = {}): Promise<{ runtimeReloaded: true; runtimeGenerationId: string; restartRequired: false }> {
-    if (!codexAppServerManager.activateFreshGeneration) {
+  async function activateCurrentCodexConfiguration(
+    input: {
+      /** 是否要求新世代先取得与其版本一致的完整模型目录。 */
+      syncSubscriptionModels?: boolean;
+      /** 维护窗口传入的专用激活入口，确保接管完成前不放行新任务。 */
+      activateFreshGeneration?: NonNullable<typeof codexAppServerManager.activateFreshGeneration>;
+    } = {},
+  ): Promise<{ runtimeReloaded: true; runtimeGenerationId: string; restartRequired: false }> {
+    /** 日常配置切换使用公共入口，升级维护则使用同一门禁内的专用入口。 */
+    const activateFreshGeneration = input.activateFreshGeneration ?? codexAppServerManager.activateFreshGeneration?.bind(codexAppServerManager);
+    if (!activateFreshGeneration) {
       throw nativeApiError('ZEUS_CODEX_CONFIG_HOT_RELOAD_UNAVAILABLE', '当前 Codex 运行服务不支持配置热启用。');
     }
-    const capabilities = await codexAppServerManager.activateFreshGeneration({
+    const capabilities = await activateFreshGeneration({
       commandPath: currentCodexRuntimeCommandPath(),
       ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}),
       remoteControl: codexRemoteControlEnabled,
@@ -1816,6 +1955,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     now: () => now().toISOString(),
     repairLegacyCodexSourceAlias: !readOnlyValidation,
     automaticPricing: !readOnlyValidation,
+    // 历史补算使用绑定会话和同轮配置证据，不读取当前设置猜档位。
+    execution: conversationExecution,
   });
   // 关闭服务时等待补价任务退出，避免数据库关闭后继续后台写入。
   server.addHook('onClose', () => codexUsageService.dispose());
@@ -1825,6 +1966,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     modelConnections,
     projects,
     conversations,
+    execution: conversationExecution,
     now,
   });
   let usageRefreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -2018,7 +2160,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         providerId: frozen.runtimeKind === 'codex' ? 'codex' : `pi:${frozen.connectionId ?? 'custom'}`,
         providerModel: frozen.connectionId ? modelRef(frozen.connectionId, frozen.modelId) : frozen.modelId,
         providerProtocolVersion: frozen.runtimeKind === 'codex' ? 'app-server' : piRuntimeWorkerProtocolVersion,
-        providerBinaryVersion: frozen.runtimeKind === 'pi' ? 'pi-sdk-0.83.0' : null,
+        providerBinaryVersion: frozen.runtimeKind === 'pi' ? piSdkBinaryVersion : null,
       };
       const lifecycle = conversationExecutionCoordinator.createLifecycle({
         conversationId,
@@ -3219,7 +3361,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     executeTaskConversationIdempotent,
     recoverExpertRounds,
     startNativeTaskConversationFromPlan,
-    resolveProjectModelServiceTierPlan,
+    resolveDefaultModelServiceTierPlan,
     toNativeDurableAcceptance,
     toNativeInterruptAcceptance,
     sendNativeConversationApiError,
@@ -3242,6 +3384,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     db,
     executeTaskConversationIdempotent,
     getProjectGitQueries: () => projectGitQueries,
+    readTaskBranchPrefix: () => appShellSettings.taskBranchPrefix,
     mirrorTaskEnvironmentContainer,
     now,
     overlayTaskEnvironmentSharedPaths,
@@ -3256,7 +3399,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     readGitDiff,
     recordTaskEvent,
     resolveConversationCapabilities,
-    resolveProjectModelServiceTierPlan,
+    resolveDefaultModelServiceTierPlan,
     resolveTaskEnvironmentWritableRoots,
     runtimeSessions,
     sendNativeConversationApiError,
@@ -3439,13 +3582,13 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     return sessionDirectory;
   }
 
-  function readRuntimeTerminalTail(sessionId: string, maxBytes: number): { text: string; truncated: boolean } {
+  function readRuntimeTerminalTail(sessionId: string, maxBytes: number): { text: string; truncated: boolean; startByte: number; totalBytes: number } {
     // 查询前先落下尚在 100ms 合并窗口内的块，避免快照标记已读后遗漏最后一帧。
     flushRuntimeLogFileWrites();
     const path = join(runtimeSessionDataDirectory(sessionId), 'terminal.raw.log');
-    if (!existsSync(path)) return { text: '', truncated: false };
+    if (!existsSync(path)) return { text: '', truncated: false, startByte: 0, totalBytes: 0 };
     const size = statSync(path).size;
-    if (size <= 0) return { text: '', truncated: false };
+    if (size <= 0) return { text: '', truncated: false, startByte: 0, totalBytes: 0 };
     const boundedMaxBytes = Math.min(4 * 1024 * 1024, Math.max(1, Math.trunc(maxBytes)));
     const overlapBytes = Math.min(4 * 1024, Math.max(0, size - boundedMaxBytes));
     const fileOffset = Math.max(0, size - boundedMaxBytes - overlapBytes);
@@ -3471,7 +3614,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       if (escapeIndex >= 0 && escapeIndex - start <= overlapBytes && (newlineIndex < 0 || escapeIndex <= newlineIndex)) start = escapeIndex;
       else if (newlineIndex >= 0 && newlineIndex - start <= overlapBytes) start = newlineIndex + 1;
     }
-    return { text: content.subarray(start).toString('utf8'), truncated: fileOffset + start > 0 };
+    const startByte = fileOffset + start;
+    return { text: content.subarray(start).toString('utf8'), truncated: startByte > 0, startByte, totalBytes: size };
   }
 
   function writeRuntimeSessionMetadata(session: AiRuntimeSession): void {
@@ -3936,6 +4080,7 @@ function mapWorkManagementTaskDomainError(error: unknown): { statusCode: number;
         code.includes('UNAVAILABLE') ||
         code.includes('NOT_AVAILABLE') ||
         code.includes('MISMATCH') ||
+        code.includes('BLOCKING_DEFECT') ||
         code.includes('STALE')
       ? 409
       : code.startsWith('ZEUS_INVALID_') || code.endsWith('_INVALID') || code.endsWith('_REQUIRED') || code.includes('_UNSUPPORTED')

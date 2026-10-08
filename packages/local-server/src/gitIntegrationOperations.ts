@@ -90,6 +90,8 @@ export type GitIntegrationOperationDependencies = Record<string, any> & {
   conversations: ConversationRepository;
   db: ZeusDatabase;
   getProjectGitQueries(): ProjectGitQueryApplication;
+  /** 始终读取当前已生效设置，让保存后的新任务立即使用新前缀。 */
+  readTaskBranchPrefix(): string;
   projectRepositories: ProjectRepositoryRegistrationRepository;
   projectSharedPaths: ProjectSharedPathRepository;
   projects: ProjectRepository;
@@ -127,6 +129,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     db,
     executeTaskConversationIdempotent,
     getProjectGitQueries,
+    readTaskBranchPrefix,
     mirrorTaskEnvironmentContainer,
     now,
     overlayTaskEnvironmentSharedPaths,
@@ -141,7 +144,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     readGitDiff,
     recordTaskEvent,
     resolveConversationCapabilities,
-    resolveProjectModelServiceTierPlan,
+    resolveDefaultModelServiceTierPlan,
     resolveTaskEnvironmentWritableRoots,
     runtimeSessions,
     stopPersistedOrphanRuntimeSession,
@@ -231,8 +234,10 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       remoteRefreshError = refreshResults.find((result): result is string => Boolean(result)) ?? null;
       remoteRefreshStatus = remoteRefreshError ? 'failed' : 'succeeded';
     }
+    /** unborn 当前分支尚未写入 refs/heads，但仍是本地来源分支。 */
+    const localSourceBranches = !repository.detached && !repository.headSha && repository.branch && !repository.localBranches.includes(repository.branch) ? [repository.branch, ...repository.localBranches] : repository.localBranches;
     const sourceRefs = [
-      ...repository.localBranches.map((branch) => ({
+      ...localSourceBranches.map((branch) => ({
         ref: `refs/heads/${branch}`,
         label: branch,
         kind: 'local' as const,
@@ -261,7 +266,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       remoteRefreshStatus,
       remoteRefreshError,
       sourceRefs,
-      suggestedBranchName: buildTaskBranchName(task.taskCode, task.title, taskEnvironments.listByTask(task.id).length + 1),
+      suggestedBranchName: buildTaskBranchName(task.taskCode, task.title, taskEnvironments.listByTask(task.id).length + 1, readTaskBranchPrefix()),
     };
   }
 
@@ -295,9 +300,8 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       if (environment.state === 'reclaimed') throw nativeApiError('ZEUS_TASK_ENVIRONMENT_CLOSED', 'Reclaimed task environments cannot be selected again.');
       assertTaskEnvironmentWritable(environment);
       const members = taskWorkspaces.listByEnvironment(environment.id);
-      if (missingTaskRepositories(projectRepositories.listByProject(project.id), members).length) {
-        throw nativeApiError('ZEUS_TASK_REPOSITORIES_MISSING', '项目有新增仓库，请在代码交付页补入当前任务后继续。');
-      }
+      // 旧环境按已有成员继续工作；新增仓库由用户在环境配置中按需补入。
+      if (members.length === 0) throw nativeApiError('ZEUS_TASK_ENVIRONMENT_INVALID', '任务环境没有可继续的仓库工作区。');
       const restored: Array<{ workspace: ZeusTaskWorkspaceRecord; prepared: Awaited<ReturnType<typeof prepareTaskWorktree>> }> = [];
       try {
         for (const workspace of members) {
@@ -310,8 +314,11 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
             taskTitle: task.title,
             workspaceId: workspace.id,
             branchName: workspace.branchName,
+            branchPrefix: null,
             sourceRef: workspace.sourceHeadSha,
+            sourceBranch: workspace.sourceBranch,
             existingBranch: true,
+            includeLocalChanges: !workspace.sourceHeadSha,
             ...(workspace.remoteName ? { existingRemoteRef: `${workspace.remoteName}/${workspace.remoteBranch}` } : {}),
             ...(environment.rootPath && workspace.repositoryRelativePath ? { worktreePath: join(environment.rootPath, workspace.repositoryRelativePath) } : {}),
           });
@@ -389,6 +396,8 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         return repository;
       });
       const sequence = taskEnvironments.listByTask(task.id).length + 1;
+      /** 同一提交批次冻结当前设置，所有仓库使用相同分支前缀。 */
+      const taskBranchPrefix = readTaskBranchPrefix();
       const preparations = registeredRepositories.map((registeredRepository, index) => ({
         registeredRepository,
         repository: repositoryContexts[index]!,
@@ -412,13 +421,13 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
           const requested = requestedById.get(registeredRepository.id);
           if (!requested) throw nativeApiError('ZEUS_TASK_REPOSITORY_SELECTION_INCOMPLETE', `Choose a source branch for ${registeredRepository.relativePath}.`);
           const requestedBranchName = typeof requested.branchName === 'string' ? requested.branchName.trim() : '';
-          const branchName = requestedBranchName || buildTaskBranchName(task.taskCode, task.title, sequence);
+          const branchName = requestedBranchName || buildTaskBranchName(task.taskCode, task.title, sequence, taskBranchPrefix);
           let sourceKind: 'local' | 'remote' = 'local';
           let sourceRef = branchName;
           let sourceBranch = branchName;
           let sourceRemoteName = '';
           if (adoptLocalBranch) {
-            if (!requestedBranchName || !requestedBranchName.startsWith(buildTaskBranchPrefix(task.taskCode)) || !repository.localBranches.includes(requestedBranchName)) {
+            if (!requestedBranchName || !requestedBranchName.startsWith(buildTaskBranchPrefix(task.taskCode, taskBranchPrefix)) || !repository.localBranches.includes(requestedBranchName)) {
               throw nativeApiError('ZEUS_TASK_LOCAL_BRANCH_INVALID', `Choose an existing local branch that belongs to ${task.taskCode}: ${registeredRepository.relativePath}.`);
             }
             if (repository.worktrees.some((worktree) => worktree.branch === requestedBranchName)) {
@@ -430,7 +439,9 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
             const remotePrefix = 'refs/remotes/';
             sourceKind = requestedSourceRef.startsWith(remotePrefix) ? 'remote' : 'local';
             sourceRef = requestedSourceRef.startsWith(localPrefix) ? requestedSourceRef.slice(localPrefix.length) : requestedSourceRef.startsWith(remotePrefix) ? requestedSourceRef.slice(remotePrefix.length) : '';
-            const sourceExists = sourceKind === 'remote' ? repository.remoteBranches.includes(sourceRef) : repository.localBranches.includes(sourceRef);
+            /** 当前 unborn 分支没有本地引用，但名称和工作目录都已经由 Git 确认。 */
+            const sourceUnborn = sourceKind === 'local' && !repository.detached && !repository.headSha && sourceRef === repository.branch;
+            const sourceExists = sourceKind === 'remote' ? repository.remoteBranches.includes(sourceRef) : repository.localBranches.includes(sourceRef) || sourceUnborn;
             if (!sourceRef || !sourceExists) {
               throw nativeApiError('ZEUS_TASK_SOURCE_BRANCH_INVALID', `Choose an available local or locally known remote branch for ${registeredRepository.relativePath}.`);
             }
@@ -455,12 +466,13 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
             taskTitle: task.title,
             workspaceId,
             branchName,
+            branchPrefix: taskBranchPrefix,
             sourceRef,
             sourceKind,
             sourceBranch,
             existingBranch: adoptLocalBranch,
             worktreePath: targetPath,
-            includeLocalChanges: !adoptLocalBranch && sourceKind === 'local' && requested.includeLocalChanges === true,
+            includeLocalChanges: !adoptLocalBranch && sourceKind === 'local' && (!repository.headSha || requested.includeLocalChanges === true),
             ignoredPaths: projectRepositoryIgnoredPaths(project.id, registeredRepository.id, registeredRepository.localPath),
           });
           preparedMembers.push({ repository: registeredRepository, prepared, remoteName });
@@ -772,7 +784,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       sourceRemoteVerified: Boolean(sourceLocalHeadSha && sourceRemoteHeadSha === sourceLocalHeadSha),
       primaryBranch: repository.branch || null,
       localBranches: repository.localBranches,
-      targetBranches: repository.localBranches,
+      targetBranches: !repository.detached && !repository.headSha && repository.branch && !repository.localBranches.includes(repository.branch) ? [repository.branch, ...repository.localBranches] : repository.localBranches,
       ...(review.error ? { reviewError: review.error } : {}),
       ...(comparison.error ? { comparisonError: comparison.error } : {}),
     };
@@ -1177,11 +1189,6 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       if (!workspace.worktreePath || workspace.state === 'discarded' || workspace.state === 'reclaimed') {
         return { publicResult: { ...base, status: 'skipped' as const, message: '任务工作区已关闭或不可用。' } };
       }
-      try {
-        assertNestedTaskWorktreesReclaimed(workspace);
-      } catch (error) {
-        return { publicResult: { ...base, status: 'failed' as const, message: error instanceof Error ? error.message : '嵌套仓库尚未回收。' } };
-      }
       const review = await readTaskWorkspaceReview(workspace);
       if (review.clean) return { publicResult: { ...base, status: 'skipped' as const, message: '工作区没有可提交的变化。' } };
       const selectedPaths = [...new Set([...review.stagedFiles, ...review.unstagedFiles, ...review.untrackedFiles].map((file) => file.path))];
@@ -1251,11 +1258,6 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
 
   async function executeSingleTaskWorkspaceCommit(opaque: WorkspaceGitPreparedOpaque, value: Record<string, unknown>): Promise<WorkspaceGitRouteExecution> {
     const { task, workspace } = requirePreparedWorkspace(opaque);
-    try {
-      assertNestedTaskWorktreesReclaimed(workspace);
-    } catch (error) {
-      workspaceGitReject(409, taskGitErrorCode(error), error instanceof Error ? error.message : '嵌套仓库尚未回收。');
-    }
     if (!workspace.worktreePath) workspaceGitReject(409, 'ZEUS_TASK_WORKTREE_UNAVAILABLE', 'Task worktree is not available.');
     if (value.message !== undefined && typeof value.message !== 'string') workspaceGitReject(400, 'ZEUS_GIT_COMMIT_MESSAGE_INVALID', 'message must be a string');
     if (value.selectedPaths !== undefined && (!Array.isArray(value.selectedPaths) || !value.selectedPaths.every((path) => typeof path === 'string'))) {
@@ -1360,10 +1362,10 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     /** Git 写出后不自动重试或删除目录，交由耐久命令保留未知结果。 */
     let writeStarted = false;
     try {
-      /** 来源只接受项目内真实仓库，且必须已有命名分支和首次提交。 */
+      /** 来源只接受项目内真实仓库；当前 unborn 命名分支同样可以补入任务环境。 */
       const context = await getGitRepositoryContext(repository.localPath);
-      if (!context.isRepository || context.detached || !context.headSha || (await realpath(context.topLevel)) !== (await realpath(repository.localPath)))
-        workspaceGitReject(409, 'ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', '请先为仓库建立首次提交并检出一个本地分支。');
+      if (!context.isRepository || context.detached || !context.branch || (await realpath(context.topLevel)) !== (await realpath(repository.localPath)))
+        workspaceGitReject(409, 'ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', '仓库需要检出一个本地命名分支。');
       /** 环境根与最近存在的父目录均复验，拒绝通过符号链接写入原项目或其他任务。 */
       const root = await realpath(environment.rootPath);
       /** 任务目录必须位于项目约定的隔离根内。 */
@@ -1397,6 +1399,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         taskTitle: task.title,
         workspaceId,
         branchName: branchName,
+        branchPrefix: null,
         sourceRef: context.branch,
         sourceKind: 'local',
         sourceBranch: context.branch,
@@ -1597,10 +1600,11 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     const repositoryPath = workspace.repositoryPath || project.localPath;
     const repository = await getGitRepositoryContext(repositoryPath);
     if (!repository.isRepository) workspaceGitReject(409, 'ZEUS_TARGET_BRANCH_UNAVAILABLE', 'Project repository is unavailable.');
-    /** 合入目标只能是已有本地命名分支，不能把任务分支自身或任意 Git 引用当作目标。 */
+    /** 合入目标只能是本地命名分支；当前 unborn 来源也允许完成首次交付。 */
     const targetBranch = typeof value.targetBranch === 'string' ? value.targetBranch.trim() : workspace.sourceBranch;
     if (!targetBranch || targetBranch === workspace.branchName) workspaceGitReject(400, 'ZEUS_TARGET_BRANCH_INVALID', '请选择与任务分支不同的本地目标分支。');
-    if (!repository.localBranches.includes(targetBranch)) workspaceGitReject(409, 'ZEUS_TARGET_BRANCH_UNAVAILABLE', '所选目标分支在本地不存在，请刷新后重新选择。');
+    const targetUnborn = workspace.sourceHeadSha === '' && !repository.detached && !repository.headSha && repository.branch === targetBranch && targetBranch === workspace.sourceBranch;
+    if (!repository.localBranches.includes(targetBranch) && !targetUnborn) workspaceGitReject(409, 'ZEUS_TARGET_BRANCH_UNAVAILABLE', '所选目标分支在本地不存在，请刷新后重新选择。');
     if (workspace.worktreePath) {
       const taskReview = await readTaskWorkspaceReview(workspace);
       if (taskReview.conflictFiles.length > 0) {
@@ -1636,8 +1640,8 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     }
     const mode = value.mode === 'squash' ? 'squash' : 'merge';
     const taskHeadSha = await getGitBranchHead(repositoryPath, workspace.branchName);
-    /** 使用目标当前提交建立并发基线，不将已删除的目标回退成来源提交。 */
-    const targetHeadSha = await getGitBranchHead(repositoryPath, targetBranch);
+    /** 使用目标当前提交建立并发基线；unborn 首次交付以空字符串表示尚无提交。 */
+    const targetHeadSha = targetUnborn ? '' : await getGitBranchHead(repositoryPath, targetBranch);
     const active = taskIntegrations.findActive(workspace.id, targetBranch);
     if (active) return workspaceGitResponse({ integration: await readTaskIntegrationSnapshot(active) }, active.state === 'conflicted' ? 202 : 409);
     const integrationId = `task_integration_${createHash('sha256').update(`workspace_git_integration\0${workspace.id}\0${targetBranch}\0${operationIdentity}`).digest('hex').slice(0, 24)}`;
@@ -1685,17 +1689,30 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         return workspaceGitResponse({ integration: updated }, 202);
       }
       const finalized = await finalizeTaskBranchIntegration({ repositoryPath, integrationPath: started.integrationPath, targetBranch, targetHeadSha: started.targetHeadSha, resultHeadSha: started.resultHeadSha! });
-      const pendingLocalSync = finalized.localSyncStatus === 'pending';
+      /** 来源草稿真实冲突优先进入既有冲突工作台，不再伪装成普通待同步。 */
+      const localConflict = finalized.conflictFiles.length > 0;
+      /** 没有可处理冲突但仍无法安全落地时才保留旧的待同步语义。 */
+      const pendingLocalSync = finalized.localSyncStatus === 'pending' && !localConflict;
       updated = taskIntegrations.update(integration.id, {
-        integrationPath: pendingLocalSync ? started.integrationPath : null,
+        integrationPath: pendingLocalSync || localConflict ? started.integrationPath : null,
         resultHeadSha: finalized.resultHeadSha,
-        state: pendingLocalSync ? 'pending_local_sync' : 'merged',
+        state: localConflict ? 'conflicted' : pendingLocalSync ? 'pending_local_sync' : 'merged',
         localSyncStatus: finalized.localSyncStatus,
         localHeadSha: finalized.localHeadSha,
         localWorktreePath: finalized.localWorktreePath,
-        conflictFiles: [],
+        conflictFiles: finalized.conflictFiles,
         lastError: null,
       });
+      if (localConflict) {
+        recordTaskEvent({
+          taskId: task.id,
+          eventType: 'task.git_integration.conflicted',
+          title: '来源工作区草稿与任务成果需要处理冲突',
+          payload: { integrationId: integration.id, workspaceId: workspace.id, targetBranch, conflictFiles: finalized.conflictFiles },
+        });
+        await db.save();
+        return workspaceGitResponse({ integration: updated, result: finalized }, 202);
+      }
       if (pendingLocalSync) {
         recordTaskEvent({
           taskId: task.id,
@@ -1776,7 +1793,12 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     try {
       await assertTaskIntegrationStillCurrent(resolved.project, resolved.workspace, resolved.integration);
     } catch (error) {
-      if (isStaleTaskIntegrationError(error)) workspaceGitReject(409, taskGitErrorCode(error), error instanceof Error ? error.message : 'Task integration became stale.');
+      if (isStaleTaskIntegrationError(error)) {
+        /** 释放过期候选的活跃唯一约束，让界面可以按最新分支重新建立候选。 */
+        taskIntegrations.update(resolved.integration.id, { state: 'failed', lastError: error instanceof Error ? error.message : 'Task integration became stale.' });
+        await db.save();
+        workspaceGitReject(409, taskGitErrorCode(error), error instanceof Error ? error.message : 'Task integration became stale.');
+      }
       throw error;
     }
     const result = await writeTaskIntegrationResolution(resolved.integration.integrationPath, path, value.content);
@@ -1793,6 +1815,9 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       await assertTaskIntegrationStillCurrent(project, workspace, integration);
     } catch (error) {
       if (isStaleTaskIntegrationError(error)) {
+        /** 过期候选不能继续占用活跃槽位；保留隔离现场，仅关闭其业务状态。 */
+        taskIntegrations.update(integration.id, { state: 'failed', lastError: error instanceof Error ? error.message : 'Task integration is no longer current.' });
+        await db.save();
         workspaceGitReject(409, taskGitErrorCode(error), error instanceof Error ? error.message : 'Task integration is no longer current.');
       }
       throw error;
@@ -1805,17 +1830,30 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       targetHeadSha: integration.targetHeadSha,
       resultHeadSha: commit.resultHeadSha,
     });
-    const pendingLocalSync = finalized.localSyncStatus === 'pending';
+    /** 冲突收尾时也可能首次发现来源草稿重叠，继续留在同一处理现场。 */
+    const localConflict = finalized.conflictFiles.length > 0;
+    /** 只有没有冲突文件的本地阻碍才显示待同步。 */
+    const pendingLocalSync = finalized.localSyncStatus === 'pending' && !localConflict;
     const updated = taskIntegrations.update(integration.id, {
-      integrationPath: pendingLocalSync ? integration.integrationPath : null,
+      integrationPath: pendingLocalSync || localConflict ? integration.integrationPath : null,
       resultHeadSha: finalized.resultHeadSha,
-      state: pendingLocalSync ? 'pending_local_sync' : 'merged',
+      state: localConflict ? 'conflicted' : pendingLocalSync ? 'pending_local_sync' : 'merged',
       localSyncStatus: finalized.localSyncStatus,
       localHeadSha: finalized.localHeadSha,
       localWorktreePath: finalized.localWorktreePath,
-      conflictFiles: [],
+      conflictFiles: finalized.conflictFiles,
       lastError: null,
     });
+    if (localConflict) {
+      recordTaskEvent({
+        taskId: task.id,
+        eventType: 'task.git_integration.conflicted',
+        title: '来源工作区草稿与任务成果需要继续处理冲突',
+        payload: { integrationId: integration.id, workspaceId: workspace.id, targetBranch: integration.targetBranch, conflictFiles: finalized.conflictFiles },
+      });
+      await db.save();
+      return workspaceGitResponse({ integration: updated, result: finalized }, 202);
+    }
     if (pendingLocalSync) {
       recordTaskEvent({
         taskId: task.id,
@@ -1940,6 +1978,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         taskHeadSha,
         mode: integration.mode,
         commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
+        ...(integration.integrationPath ? { localChangesFromPath: integration.integrationPath } : {}),
       });
 
       if (started.state === 'conflicted' && started.conflictFiles.includes(input.conflictPath)) {
@@ -1971,13 +2010,14 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
           : settings?.model
             ? { sourceId: null, modelId: settings.model, displayName: null }
             : input.model;
-      const serviceTierPlan = input.agentKind === 'codex' ? await resolveProjectModelServiceTierPlan(project, selectedModel) : null;
+      const serviceTierPlan = input.agentKind === 'codex' ? await resolveDefaultModelServiceTierPlan() : null;
       const prompt = buildTaskConflictAiPrompt({
         sourceBranch: integration.targetBranch,
         taskBranch: workspace.branchName,
         conflictBranch: conflictWorkspace.branchName,
         mode: integration.mode,
         commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
+        sourceLocalChanges: started.localChangesConflict === true,
       });
       const operation = await startNativeTaskConversationFromPlan({
         agentKind: input.agentKind,
@@ -2154,24 +2194,38 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         targetHeadSha: attempt.targetHeadSha,
         resultHeadSha: commit.resultHeadSha,
       });
-      const pendingLocalSync = finalized.localSyncStatus === 'pending';
+      /** AI 收尾后若来源草稿又形成新冲突，保留当前尝试作为下一轮处理现场。 */
+      const localConflict = finalized.conflictFiles.length > 0;
+      /** 无可处理冲突时才进入普通待同步。 */
+      const pendingLocalSync = finalized.localSyncStatus === 'pending' && !localConflict;
       if (integration.integrationPath && resolve(integration.integrationPath) !== resolve(attempt.worktreePath)) {
         await cleanupTaskIntegrationWorktree({ repositoryPath: workspace.repositoryPath || project.localPath, integrationPath: integration.integrationPath });
       }
       taskIntegrationAttempts.update(attempt.id, { state: 'completed', resultHeadSha: finalized.resultHeadSha, lastError: null });
       taskIntegrations.update(integration.id, {
-        integrationPath: pendingLocalSync ? attempt.worktreePath : null,
+        integrationPath: pendingLocalSync || localConflict ? attempt.worktreePath : null,
         resultHeadSha: finalized.resultHeadSha,
-        state: pendingLocalSync ? 'pending_local_sync' : 'merged',
+        state: localConflict ? 'conflicted' : pendingLocalSync ? 'pending_local_sync' : 'merged',
         localSyncStatus: finalized.localSyncStatus,
         localHeadSha: finalized.localHeadSha,
         localWorktreePath: finalized.localWorktreePath,
-        conflictFiles: [],
+        conflictFiles: finalized.conflictFiles,
         lastError: null,
       });
       for (const other of taskIntegrationAttempts.listByIntegration(integration.id)) {
         if (other.id === attempt.id || other.state === 'completed' || other.state === 'failed' || other.state === 'stale') continue;
         taskIntegrationAttempts.update(other.id, { state: 'stale', lastError: '另一条冲突处理尝试已先完成安全落地。' });
+      }
+      if (localConflict) {
+        recordTaskEvent({
+          taskId: task.id,
+          eventType: 'task.git_integration.conflicted',
+          title: '冲突处理：来源工作区草稿仍有冲突待处理',
+          payload: { integrationId: integration.id, attemptId: attempt.id, workspaceId: workspace.id, conversationId, targetBranch: integration.targetBranch, conflictFiles: finalized.conflictFiles },
+        });
+        await db.save();
+        publishRealtimeEvent('task.git_delivery.changed', { taskId: task.id, integrationId: integration.id, conversationId });
+        return;
       }
       if (pendingLocalSync) {
         recordTaskEvent({
@@ -2257,17 +2311,31 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         targetHeadSha: integration.targetHeadSha,
         resultHeadSha: commit.resultHeadSha,
       });
-      const pendingLocalSync = finalized.localSyncStatus === 'pending';
+      /** 旧 AI 记录也必须把来源草稿冲突投影成可继续处理的冲突态。 */
+      const localConflict = finalized.conflictFiles.length > 0;
+      /** 无冲突文件的安全阻碍继续使用待同步态。 */
+      const pendingLocalSync = finalized.localSyncStatus === 'pending' && !localConflict;
       taskIntegrations.update(integration.id, {
-        integrationPath: pendingLocalSync ? integration.integrationPath : null,
+        integrationPath: pendingLocalSync || localConflict ? integration.integrationPath : null,
         resultHeadSha: finalized.resultHeadSha,
-        state: pendingLocalSync ? 'pending_local_sync' : 'merged',
+        state: localConflict ? 'conflicted' : pendingLocalSync ? 'pending_local_sync' : 'merged',
         localSyncStatus: finalized.localSyncStatus,
         localHeadSha: finalized.localHeadSha,
         localWorktreePath: finalized.localWorktreePath,
-        conflictFiles: [],
+        conflictFiles: finalized.conflictFiles,
         lastError: null,
       });
+      if (localConflict) {
+        recordTaskEvent({
+          taskId: task.id,
+          eventType: 'task.git_integration.conflicted',
+          title: '冲突处理：来源工作区草稿仍有冲突待处理',
+          payload: { integrationId: integration.id, workspaceId: workspace.id, conversationId, targetBranch: integration.targetBranch, conflictFiles: finalized.conflictFiles },
+        });
+        await db.save();
+        publishRealtimeEvent('task.git_delivery.changed', { taskId: task.id, integrationId: integration.id, conversationId });
+        return;
+      }
       if (pendingLocalSync) {
         recordTaskEvent({
           taskId: task.id,

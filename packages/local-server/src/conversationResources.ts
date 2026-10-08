@@ -50,6 +50,8 @@ type ResourceCandidate = FileResourceCandidate | WebsiteResourceCandidate | Atta
 export interface NormalizeConversationResourcesInput {
   projectId: string;
   projectRoot: string;
+  /** 所属项目登记目录仅用于最终答复图片归档，普通文件仍受会话执行根约束。 */
+  registeredProjectRoot?: string;
   conversationId: string;
   turnId: string;
   item: ZeusConversationItemRecord;
@@ -89,16 +91,15 @@ const maximumArchivedAssistantImageBatchBytes = 64 * 1_024 * 1_024;
 
 /** 两条执行链共用资源识别、授权及落盘，实时事件与重新打开会话读取同一份资源。 */
 export function syncConversationResources(input: NormalizeConversationResourcesInput, resources: ConversationResourceRepository): ConversationResource[] {
-  return resources
-    .replaceForItem(input.item.id, normalizeConversationResources(input), input.now)
-    .map(toConversationResource)
-    .filter((resource): resource is ConversationResource => resource !== null);
+  /** Provider 的后续事件可能只带状态而省略资源字段；空投影不能删除已经展示的持久资源。 */
+  const normalized = normalizeConversationResources(input);
+  return (normalized.length > 0 ? resources.replaceForItem(input.item.id, normalized, input.now) : resources.listByItem(input.item.id)).map(toConversationResource).filter((resource): resource is ConversationResource => resource !== null);
 }
 
 export function normalizeConversationResources(input: NormalizeConversationResourcesInput): Array<Omit<ZeusConversationResourceRecord, 'createdAt' | 'updatedAt'>> {
   const candidates: ResourceCandidate[] = [];
   const assistantImageArchiveBudget = { remainingBytes: maximumArchivedAssistantImageBatchBytes };
-  const assistantImageSourceRoots = [input.projectRoot, ...input.trustedAttachmentRoots, input.generatedImageRoot, input.artifactsDirectory, tmpdir(), '/private/tmp']
+  const assistantImageSourceRoots = [input.projectRoot, input.registeredProjectRoot, ...input.trustedAttachmentRoots, input.generatedImageRoot, input.artifactsDirectory, tmpdir(), '/private/tmp']
     .filter((root): root is string => Boolean(root))
     .map(safeRealpath)
     .filter((root): root is string => Boolean(root));
@@ -112,6 +113,19 @@ export function normalizeConversationResources(input: NormalizeConversationResou
   });
   for (const generatedImage of generatedImages) {
     candidates.push(generatedImage);
+    sourceIndex += 1;
+  }
+
+  /** Codex 查看过的图片沿用会话资源授权，处理过程才能恢复与打开真实缩略图。 */
+  const viewedImage = normalizeViewedImageResource({
+    sourceIndex,
+    item: input.item,
+    payload: input.payload,
+    projectRoot: input.projectRoot,
+    trustedAttachmentRoots: input.trustedAttachmentRoots,
+  });
+  if (viewedImage) {
+    candidates.push(viewedImage);
     sourceIndex += 1;
   }
 
@@ -222,6 +236,21 @@ export function normalizeConversationResources(input: NormalizeConversationResou
       authorityJson: JSON.stringify(authorityForCandidate(candidate)),
     };
   });
+}
+
+/** 只登记 Provider 明确确认的 imageView 路径，并重新核对工作区或附件授权边界。 */
+function normalizeViewedImageResource(input: { sourceIndex: number; item: ZeusConversationItemRecord; payload: Record<string, unknown>; projectRoot: string; trustedAttachmentRoots: readonly string[] }): AttachmentResourceCandidate | null {
+  if (input.item.itemType !== 'imageView') return null;
+  const rawPath = stringValue(input.payload.path ?? input.payload.filePath);
+  if (!rawPath) return null;
+  const absolutePath = isAbsolute(rawPath) ? rawPath : resolve(input.projectRoot, rawPath);
+  const candidate = normalizeAttachmentResource({
+    sourceIndex: input.sourceIndex,
+    value: { localPath: absolutePath, name: basename(absolutePath) },
+    projectRoot: input.projectRoot,
+    trustedAttachmentRoots: input.trustedAttachmentRoots,
+  });
+  return candidate?.previewKind === 'image' ? candidate : null;
 }
 
 /**

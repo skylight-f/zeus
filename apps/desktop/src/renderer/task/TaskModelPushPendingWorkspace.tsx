@@ -161,6 +161,7 @@ export function failTaskModelPushPendingState(pending: TaskModelPushPendingState
       items: failedItems,
       transcriptRevision: pending.session.transcriptRevision + 1,
       queue: {
+        throughEventSeq: 0,
         state: { type: 'idle' },
         submissions: [],
       },
@@ -180,19 +181,24 @@ export function failTaskModelPushPendingState(pending: TaskModelPushPendingState
   };
 }
 
-/** 真实身份只替换读写目标，稳定导航身份和当前工作面内容保持不变。 */
+/** 真实身份接管读写目标并确认首条任务消息，稳定导航身份和当前工作面内容保持不变。 */
 export function attachTaskModelPushChoice(pending: TaskModelPushPendingState, choice: NativeConversationChoice): TaskModelPushPendingState {
   const projectedChoice = { ...choice, navigationId: pending.navigationId, taskPushCreating: true };
   return {
     ...pending,
     choice: projectedChoice,
-    session: remapPendingSession(pending.session, projectedChoice),
+    session: sessionReducer(remapPendingSession(pending.session, projectedChoice), {
+      type: 'send_accepted',
+      clientUserMessageId: pending.request.clientUserMessageId,
+      status: 'active',
+    }),
     status: 'submitting',
     error: null,
     retryProgress: null,
   };
 }
 
+/** 后续排队消息发送完成后结束任务推送过渡态。 */
 export function acceptTaskModelPushPendingState(pending: TaskModelPushPendingState): TaskModelPushPendingState {
   if (!taskModelPushHasRealChoice(pending)) {
     throw new Error('Task model push cannot be accepted before a real conversation and provider thread are attached.');
@@ -217,6 +223,21 @@ export function updateTaskModelPushRetryProgress(pending: TaskModelPushPendingSt
 
 export function taskModelPushHasRealChoice(pending: TaskModelPushPendingState): boolean {
   return pending.choice.id !== pending.navigationId && Boolean(pending.choice.providerThreadId);
+}
+
+/** 同一次推送只投影一个入口，临时导航身份不能覆盖已接纳的真实会话。 */
+export function projectTaskModelPushConversationChoices(pending: TaskModelPushPendingState | undefined, choices: NativeConversationChoice[]): NativeConversationChoice[] {
+  if (!pending) return choices;
+  /** 仅在同项目、同任务内合并临时入口、真实会话与同一创建操作的目录结果。 */
+  const isPendingChoice = (choice: NativeConversationChoice): boolean =>
+    choice.projectId === pending.task.projectId &&
+    choice.taskId === pending.task.id &&
+    (choice.id === pending.navigationId || choice.id === pending.choice.id || (Boolean(pending.operationIdentity) && choice.creationOperationIdentity === pending.operationIdentity));
+  /** 创建接纳后采用正式目录状态，目录中残留的临时入口始终没有接管资格。 */
+  const authoritativeChoice = pending.status === 'accepted' ? choices.find((choice) => choice.id !== pending.navigationId && isPendingChoice(choice)) : undefined;
+  /** 导航身份保持稳定，内部读写身份由真实会话接管。 */
+  const projectedChoice = authoritativeChoice ? { ...authoritativeChoice, navigationId: pending.navigationId } : pending.choice;
+  return [projectedChoice, ...choices.filter((choice) => !isPendingChoice(choice))];
 }
 
 export function updateTaskModelPushDraft(pending: TaskModelPushPendingState, draft: string): TaskModelPushPendingState {
@@ -249,6 +270,7 @@ export function enqueueTaskModelPushMessage(
       draft: '',
       attachments: [],
       queue: {
+        throughEventSeq: 0,
         state: { type: 'active', turnId: pending.session.activeTurnId ?? `${pending.navigationId}:turn`, phase: 'prework' },
         submissions: deferredMessages.filter((entry) => entry.status !== 'accepted').map(deferredMessageSubmission),
       },
@@ -264,6 +286,7 @@ export function updateTaskModelPushDeferredMessages(pending: TaskModelPushPendin
     session: {
       ...pending.session,
       queue: {
+        throughEventSeq: 0,
         state: { type: 'active', turnId: pending.session.activeTurnId ?? `${pending.navigationId}:turn`, phase: 'prework' },
         submissions: deferredMessages.filter((entry) => entry.status !== 'accepted').map(deferredMessageSubmission),
       },
@@ -330,7 +353,7 @@ function buildPendingTaskPushSession(choice: NativeConversationChoice, request: 
     providerThreadId: `${choice.id}:thread`,
     activeTurnId: turnId,
     startedTurnId: turnId,
-    queue: { state: { type: 'active', turnId, phase: 'prework' }, submissions: [] },
+    queue: { throughEventSeq: 0, state: { type: 'active', turnId, phase: 'prework' }, submissions: [] },
     providerSettings: {
       model: request.model,
       ...(request.effort ? { effort: request.effort } : {}),

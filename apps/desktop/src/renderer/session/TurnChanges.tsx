@@ -1,4 +1,5 @@
 import { FilePreview } from '../code/FilePreview.js';
+import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import { AnimatedSize } from '../ui/AnimatedSize.js';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
@@ -9,10 +10,8 @@ import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/Caret
 import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
 import { FilesIcon as Files } from '@phosphor-icons/react/dist/csr/Files';
 import { GitDiffIcon as GitDiff } from '@phosphor-icons/react/dist/csr/GitDiff';
-import { InfoIcon as Info } from '@phosphor-icons/react/dist/csr/Info';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import {
-  historicalTurnChangeUnavailableReason,
   type ConversationCodeComment,
   type ConversationCodeCommentPosition,
   type ConversationCodeCommentSide,
@@ -23,7 +22,7 @@ import {
 } from '@zeus/shared';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { CodeCommentPanel } from './CodeCommentPanel.js';
-import { useApplicationErrorDialog, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { TaskGitDiffTable } from '../task/TaskGitDiffTable.js';
 import type { TaskGitFileDiff } from './sessionTypes.js';
 
@@ -40,14 +39,15 @@ export function TurnChangeCard(props: {
   const [expanded, setExpanded] = useState(false);
   const [busy, setBusy] = useState<ChangeAction | null>(null);
   const [error, setError] = useState<unknown>(null);
-  useApplicationErrorDialog(error && error !== props.changeSet.conflict?.message && error !== props.changeSet.unavailableReason ? error : null, {
-    language: zh ? 'zh-CN' : 'en',
-  });
   const [optimisticChangeSet, setOptimisticChangeSet] = useState<TurnChangeSet | null>(null);
   const changeSet = optimisticChangeSet && optimisticChangeSet.id === props.changeSet.id && optimisticChangeSet.updatedAt >= props.changeSet.updatedAt ? optimisticChangeSet : props.changeSet;
   const visibleFiles = expanded ? changeSet.files : changeSet.files.slice(0, 3);
   const hiddenCount = Math.max(0, changeSet.files.length - visibleFiles.length);
   const action = availableAction(changeSet);
+  /** 普通摘要使用稳定标题，正在操作或发生冲突时保留明确的阶段反馈。 */
+  const title = ['applied', 'undone', 'unavailable'].includes(changeSet.state) ? (zh ? '文件更改' : 'File changes') : changeSetTitle(changeSet, props.language);
+  /** 只标记已经执行的撤销结果。 */
+  const availability = changeSet.state === 'undone' ? (zh ? '已撤销' : 'Undone') : null;
 
   async function operate(): Promise<void> {
     if (!action || !props.onOperate || busy) return;
@@ -71,16 +71,35 @@ export function TurnChangeCard(props: {
             <Files aria-hidden="true" weight="regular" />
           </span>
           <span>
-            <span className="session-turn-change-title">{changeSetTitle(changeSet, props.language)}</span>
-            <small>
+            <span className="session-turn-change-heading">
+              <span className="session-turn-change-title" title={changeSetTitle(changeSet, props.language)}>
+                {title}
+              </span>
+              {availability ? <span className="session-turn-change-availability">{availability}</span> : null}
+            </span>
+            <small
+              title={zh ? `${changeSet.fileCount} 个文件，新增 ${changeSet.addedLines} 行，删除 ${changeSet.deletedLines} 行` : `${changeSet.fileCount} files, ${changeSet.addedLines} added lines, ${changeSet.deletedLines} deleted lines`}
+            >
+              <span className="session-turn-change-total">{zh ? `${changeSet.fileCount} 个文件` : `${changeSet.fileCount} files`}</span>
               <span className="session-turn-change-stats">
                 <span className="session-change-added">+{changeSet.addedLines}</span> <span className="session-change-deleted">-{changeSet.deletedLines}</span>
               </span>
-              <span className="session-turn-change-view">{zh ? '查看更改' : 'View changes'}</span>
             </small>
           </span>
         </span>
         <nav aria-label={zh ? '文件变更操作' : 'File change actions'}>
+          {hiddenCount > 0 || (expanded && changeSet.files.length > 3) ? (
+            <button
+              type="button"
+              className="session-turn-change-more"
+              aria-expanded={expanded}
+              aria-label={expanded ? (zh ? '收起文件' : 'Show fewer files') : zh ? `再显示 ${hiddenCount} 个文件` : `Show ${hiddenCount} more files`}
+              title={expanded ? (zh ? '收起文件' : 'Show fewer files') : zh ? `再显示 ${hiddenCount} 个文件` : `Show ${hiddenCount} more files`}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              <CaretDown aria-hidden="true" data-expanded={expanded || undefined} />
+            </button>
+          ) : null}
           {action ? (
             <button
               type="button"
@@ -98,9 +117,15 @@ export function TurnChangeCard(props: {
           </button>
         </nav>
       </header>
-      {changeSet.conflict ? (
+      {/* 不可恢复只影响操作能力；真正的操作冲突才显示错误。 */}
+      {changeSet.conflict && changeSet.state !== 'unavailable' ? (
         <p className="session-turn-change-error" role="alert">
           <VisibleApplicationError error={changeSet.conflict} language={zh ? 'zh-CN' : 'en'} />
+        </p>
+      ) : null}
+      {error && error !== changeSet.conflict?.message && error !== changeSet.unavailableReason ? (
+        <p className="session-turn-change-error" role="alert">
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
       {visibleFiles.length ? (
@@ -109,6 +134,7 @@ export function TurnChangeCard(props: {
             {visibleFiles.map((file) => (
               <li key={file.id}>
                 <button type="button" onClick={() => props.onReview?.(changeSet, file.id)} disabled={!props.onReview}>
+                  <FileTypeIcon name={file.newPath ?? file.oldPath ?? ''} />
                   <span className="session-turn-change-path" title={displayPath(file)}>
                     {displayPath(file)}
                   </span>
@@ -121,12 +147,6 @@ export function TurnChangeCard(props: {
             ))}
           </ul>
         </AnimatedSize>
-      ) : null}
-      {hiddenCount > 0 || (expanded && changeSet.files.length > 3) ? (
-        <button type="button" className="session-turn-change-more" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-          <span>{expanded ? (zh ? '收起文件' : 'Show fewer files') : zh ? `再显示 ${hiddenCount} 个文件` : `Show ${hiddenCount} more files`}</span>
-          <CaretDown aria-hidden="true" data-expanded={expanded || undefined} />
-        </button>
       ) : null}
     </section>
   );
@@ -164,9 +184,6 @@ export function TurnDiffWorkspace(props: {
   const titleRef = useRef<HTMLSpanElement | null>(null);
   const [busy, setBusy] = useState<ChangeAction | null>(null);
   const [error, setError] = useState<unknown>(null);
-  useApplicationErrorDialog(error && error !== props.changeSet.conflict?.message && error !== props.changeSet.unavailableReason ? error : null, {
-    language: zh ? 'zh-CN' : 'en',
-  });
   const [optimisticChangeSet, setOptimisticChangeSet] = useState<TurnChangeSet | null>(null);
   const [draftPosition, setDraftPosition] = useState<ConversationCodeCommentPosition | null>(null);
   const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
@@ -357,15 +374,15 @@ export function TurnDiffWorkspace(props: {
           </button>
         </nav>
       </header>
-      {changeSet.conflict ? (
+      {/* 审核不展示撤销资格提示，实际操作冲突继续显示错误。 */}
+      {changeSet.conflict && changeSet.state !== 'unavailable' ? (
         <p className="session-turn-change-error session-turn-diff-error" role="alert">
           <VisibleApplicationError error={changeSet.conflict} language={zh ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
-      {!changeSet.conflict && changeSet.state === 'unavailable' && changeSet.unavailableReason ? (
-        <p className="session-turn-change-notice session-turn-diff-error" role="status">
-          <Info aria-hidden="true" />
-          <span>{unavailableReason(changeSet.unavailableReason, props.language)}</span>
+      {error && error !== changeSet.conflict?.message && error !== changeSet.unavailableReason ? (
+        <p className="session-turn-change-error session-turn-diff-error" role="alert">
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
       <div className="session-turn-diff-layout">
@@ -388,7 +405,9 @@ export function TurnDiffWorkspace(props: {
           {activeFile ? (
             <>
               <header>
-                <strong title={displayPath(activeFile)}>{displayPath(activeFile)}</strong>
+                <strong title={displayPath(activeFile)} data-file-status={activeFile.changeType === 'binary' ? 'modified' : activeFile.changeType}>
+                  {displayPath(activeFile)}
+                </strong>
                 <span>
                   <small>{localizedChangeType(activeFile, props.language)}</small>
                   {props.onOpenFile ? (
@@ -405,6 +424,7 @@ export function TurnDiffWorkspace(props: {
                 <FilePreview
                   request={{ kind: 'turn', projectId: changeSet.projectId, conversationId: changeSet.conversationId, turnId: changeSet.turnId, changeSetId: changeSet.id, fileId: activeFile.id }}
                   revision={changeSet.updatedAt}
+                  fileStatus={activeFile.changeType === 'binary' ? 'modified' : activeFile.changeType}
                   zh={zh}
                 >
                   {changeSet.contentProjection === 'summary' ? (
@@ -497,14 +517,6 @@ function availableAction(changeSet: TurnChangeSet): ChangeAction | null {
   return null;
 }
 
-/** 将恢复能力限制与审阅能力区分，并将旧记录中的快照错误转为可理解的提示。 */
-function unavailableReason(reason: string, language: SessionUiLanguage): string {
-  if (reason === 'The captured recovery snapshots do not reproduce the provider patch.')
-    return language === 'zh-CN' ? '无法确认这次修改前后的文件内容，暂不能安全撤销或重新应用；仍可审核已记录的差异。' : 'Recovery snapshots could not be verified, so Undo/Reapply is unavailable. Recorded changes can still be reviewed.';
-  if (reason !== historicalTurnChangeUnavailableReason) return reason;
-  return language === 'zh-CN' ? '缺少这次修改前后的文件内容，无法撤销或重新应用这些修改。' : 'The file contents before and after these changes are unavailable. These changes cannot be undone or reapplied.';
-}
-
 function changeSetTitle(changeSet: TurnChangeSet, language: SessionUiLanguage): string {
   const zh = language === 'zh-CN';
   const subject = changeSet.fileCount === 1 ? displayPath(changeSet.files[0]!) : zh ? `${changeSet.fileCount} 个文件` : `${changeSet.fileCount} files`;
@@ -513,7 +525,7 @@ function changeSetTitle(changeSet: TurnChangeSet, language: SessionUiLanguage): 
   if (changeSet.state === 'reapplying') return zh ? '正在重新应用文件变更' : 'Reapplying file changes';
   if (changeSet.state === 'undone') return zh ? `已撤销 ${subject}` : `Undid ${subject}`;
   if (changeSet.state === 'conflicted') return zh ? `无法安全更新 ${subject}` : `Could not safely update ${subject}`;
-  if (changeSet.state === 'unavailable') return zh ? '文件变更不可撤销' : 'File changes are not reversible';
+  if (changeSet.state === 'unavailable') return zh ? '文件更改' : 'File changes';
   return zh ? `已记录 ${subject}的变更` : `Recorded changes to ${subject}`;
 }
 

@@ -1628,3 +1628,39 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
     scroll-behavior: auto !important;
   }
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app .application-error-inline {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  vertical-align: middle;
+  color: var(--zeus-product-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.macos-ai-app .application-error-inline-summary {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macos-ai-app :is([role='alert'], [role='status'], .is-error):has(> span.application-error-inline) {
+  background: transparent;
+  color: var(--zeus-product-text);
+  min-inline-size: 0;
+}
+
+.macos-ai-app .is-error:has(> span.application-error-inline) {
+  border-color: transparent;
+}
+
+.macos-ai-app .application-error-inline-action {
+  flex: 0 0 auto;
+  margin-inline-start: 6px;
+}

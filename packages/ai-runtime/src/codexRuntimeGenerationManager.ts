@@ -2,6 +2,8 @@ import {
   type CodexAppServerEvent,
   type CodexAppServerManager,
   type CodexCapabilitiesSnapshot,
+  type CodexRuntimeActivationInput,
+  type CodexRuntimeMaintenanceControl,
   type CodexRpcRetryProgress,
   type CodexServerRequestResponse,
   type CodexTransportState,
@@ -38,14 +40,6 @@ interface RuntimeLease {
   entry: RuntimeEntry;
   release(): void;
 }
-
-type RuntimeActivationInput = {
-  commandPath: string;
-  externalAgentHome?: string;
-  remoteControl?: boolean;
-  /** 手动订阅登录要求本次新连接取得远端目录后再接替旧连接。 */
-  requireFreshModels?: boolean;
-};
 
 /** 只在真实配置声明了 node_repl 时覆盖其环境，避免凭空创建不完整的 MCP server。 */
 function nodeReplToolRuntimeFlags(codexHome: string | undefined, toolRuntimeCodexHome: string | undefined): string[] {
@@ -127,6 +121,14 @@ export function createCodexRuntimeGenerationManager(
   let remoteControlEnabled = false;
   /** 维护窗口只阻止写操作，账号和状态读取仍可完成。 */
   let maintenanceActive = false;
+  /** 已接收但尚未取得空闲窗口的维护请求；排队期间允许现有工作自然收口。 */
+  let maintenancePending = false;
+  /** 维护请求已经走完既有激活链，可以在运行态空闲时原子取得门禁。 */
+  let maintenanceReady = false;
+  /** 唤醒取得维护门禁的排队请求。 */
+  let resolveMaintenanceReady: (() => void) | null = null;
+  /** 关闭运行管理器时结束仍在等待的维护请求。 */
+  let rejectMaintenanceReady: ((error: Error) => void) | null = null;
   /** 只有当前连接定期读取目录，旧连接继续完成既有任务。 */
   let modelCatalogTimer: ReturnType<typeof setTimeout> | null = null;
   /** 后台每五分钟检查一次；登录和账号变化仍触发及时检查。 */
@@ -157,6 +159,32 @@ export function createCodexRuntimeGenerationManager(
   function requireActiveEntry(): RuntimeEntry {
     if (!activeEntry || preparingForShutdown) throw managerError('ZEUS_CODEX_NOT_READY', 'Codex runtime generation manager is not ready.');
     return activeEntry;
+  }
+
+  /** 只有真实写入、活动轮次、活动目标或待处理交互会占用运行世代。 */
+  function hasActiveWork(): boolean {
+    return [...entries].some((entry) => entry.inFlightWrites > 0 || entry.activeTurns.size > 0 || entry.activeGoals.size > 0 || entry.pendingRequests.size > 0);
+  }
+
+  /** 最后一份活动工作收口时同步取得维护门禁，避免新写入插入更新切换。 */
+  function acquireQueuedMaintenanceIfIdle(): boolean {
+    if (!maintenancePending || !maintenanceReady || maintenanceActive || hasActiveWork()) return false;
+    maintenanceActive = true;
+    /** 先清空回调，再唤醒请求，避免完成路径重复触发。 */
+    const resolveReady = resolveMaintenanceReady;
+    resolveMaintenanceReady = null;
+    rejectMaintenanceReady = null;
+    resolveReady?.();
+    return true;
+  }
+
+  /** 关闭期间拒绝排队维护，不能让调用方无限等待已退出的运行管理器。 */
+  function rejectQueuedMaintenance(error: Error): void {
+    /** 先清空回调，再把关闭原因交还唯一等待者。 */
+    const rejectReady = rejectMaintenanceReady;
+    resolveMaintenanceReady = null;
+    rejectMaintenanceReady = null;
+    rejectReady?.(error);
   }
 
   function rememberGeneration(entry: RuntimeEntry, generationId: string): void {
@@ -396,7 +424,7 @@ export function createCodexRuntimeGenerationManager(
     }
   }
 
-  async function activate(input: RuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
+  async function activate(input: CodexRuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
     if (preparingForShutdown) throw managerError('ZEUS_CODEX_CLOSED', 'Codex runtime generation manager is closing.');
     const requestedHome = input.externalAgentHome ?? null;
     const requestedRemoteControl = input.remoteControl ?? remoteControlEnabled;
@@ -497,6 +525,8 @@ export function createCodexRuntimeGenerationManager(
   }
 
   async function tryDrain(entry: RuntimeEntry): Promise<void> {
+    /** 排队更新优先取得刚释放的空闲窗口；活动目标仍可在终态前继续运行。 */
+    acquireQueuedMaintenanceIfIdle();
     if (entry === activeEntry || entry.inFlightWrites > 0 || entry.activeTurns.size > 0 || entry.activeGoals.size > 0 || entry.pendingRequests.size > 0) return;
     if (entry.closePromise) return entry.closePromise;
     entry.closing = true;
@@ -519,11 +549,17 @@ export function createCodexRuntimeGenerationManager(
     return entry.closePromise;
   }
 
-  function enqueueActivation(input: RuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
-    if (maintenanceActive) return Promise.reject(managerError('ZEUS_CODEX_MAINTENANCE_IN_PROGRESS', 'Codex 正在更新，请稍后重试。'));
+  /** 把世代切换串到唯一激活链，避免并发启动覆盖当前运行身份。 */
+  function appendActivation(input: CodexRuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
     const activation = activationChain.then(() => activate(input, forceFreshGeneration));
     activationChain = activation.catch(() => undefined);
     return activation;
+  }
+
+  /** 普通调用在维护窗口外进入世代切换链。 */
+  function enqueueActivation(input: CodexRuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
+    if (maintenanceActive) return Promise.reject(managerError('ZEUS_CODEX_MAINTENANCE_IN_PROGRESS', 'Codex 正在更新，请稍后重试。'));
+    return appendActivation(input, forceFreshGeneration);
   }
 
   function entryForGeneration(generationId: string): RuntimeEntry | null {
@@ -657,6 +693,10 @@ export function createCodexRuntimeGenerationManager(
     async compactThread(input) {
       await withThreadOwner(input.threadId, undefined, (entry) => entry.manager.compactThread(input));
     },
+    /** 线程协作模式必须写入该线程所属世代，不能跟随当前活动实例漂移。 */
+    async setThreadCollaborationMode(input) {
+      await withThreadOwner(input.threadId, input.cwd, (entry) => entry.manager.setThreadCollaborationMode(input));
+    },
     async startTurn(input) {
       return withThreadOwner(input.threadId, input.cwd, async (entry) => {
         const turn = await entry.manager.startTurn(input);
@@ -775,22 +815,46 @@ export function createCodexRuntimeGenerationManager(
         })
         .filter((snapshot): snapshot is NonNullable<typeof snapshot> => snapshot !== null);
     },
-    async runExclusiveMaintenance<Result>(operation: () => Promise<Result>): Promise<Result> {
-      if (maintenanceActive) throw managerError('ZEUS_CODEX_MAINTENANCE_IN_PROGRESS', 'Codex 正在更新，请等待当前更新完成。');
-      maintenanceActive = true;
+    async runExclusiveMaintenance<Result>(operation: (control: CodexRuntimeMaintenanceControl) => Promise<Result>): Promise<Result> {
+      if (maintenanceActive || maintenancePending) throw managerError('ZEUS_CODEX_MAINTENANCE_IN_PROGRESS', 'Codex 更新已经在处理或等待现有工作结束。');
+      maintenancePending = true;
       try {
         /** 已经开始的世代切换先完成；维护期间的新切换会被拒绝。 */
         await activationChain;
-        /** 已接纳的轮次、写请求和授权必须先收口，禁止更新过程中改变执行程序。 */
-        const busy = [...entries].some((entry) => entry.inFlightWrites > 0 || entry.activeTurns.size > 0 || entry.pendingRequests.size > 0);
-        if (busy) throw managerError('ZEUS_CODEX_UPDATE_BUSY', '仍有 Codex 任务或授权请求正在处理，请完成后再更新。');
-        return await operation();
+        if (preparingForShutdown) throw managerError('ZEUS_CODEX_CLOSED', 'Codex runtime generation manager is closing.');
+        maintenanceReady = true;
+        /** 已接纳的轮次、目标和授权自然收口；空闲瞬间由管理器原子阻止后续写入。 */
+        await new Promise<void>((resolveReady, rejectReady) => {
+          resolveMaintenanceReady = resolveReady;
+          rejectMaintenanceReady = rejectReady;
+          acquireQueuedMaintenanceIfIdle();
+        });
+        /** 维护控制器让升级链在门禁释放前完成新世代接管，其他调用仍会被拒绝。 */
+        const control: CodexRuntimeMaintenanceControl = {
+          async deactivateCurrentGeneration() {
+            /** 先摘除活动身份，再关闭管理器，确保断线不会触发旧程序自动重连。 */
+            const current = activeEntry;
+            if (!current) return;
+            activeEntry = null;
+            await tryDrain(current);
+          },
+          activateFreshGeneration(input) {
+            if (!maintenanceActive) return Promise.reject(managerError('ZEUS_CODEX_MAINTENANCE_ENDED', 'Codex 维护窗口已经结束。'));
+            return appendActivation(input, true);
+          },
+        };
+        return await operation(control);
       } finally {
         maintenanceActive = false;
+        maintenancePending = false;
+        maintenanceReady = false;
+        resolveMaintenanceReady = null;
+        rejectMaintenanceReady = null;
       }
     },
     async prepareForShutdown() {
       preparingForShutdown = true;
+      rejectQueuedMaintenance(managerError('ZEUS_CODEX_CLOSED', 'Codex runtime generation manager is closing.'));
       if (modelCatalogTimer) clearTimeout(modelCatalogTimer);
       modelCatalogTimer = null;
       await Promise.all([...entries].map((entry) => entry.manager.prepareForShutdown()));
@@ -799,6 +863,7 @@ export function createCodexRuntimeGenerationManager(
       if (closePromise) return closePromise;
       closePromise = (async () => {
         preparingForShutdown = true;
+        rejectQueuedMaintenance(managerError('ZEUS_CODEX_CLOSED', 'Codex runtime generation manager is closing.'));
         if (modelCatalogTimer) clearTimeout(modelCatalogTimer);
         modelCatalogTimer = null;
         await Promise.all([...entries].map((entry) => entry.manager.close()));

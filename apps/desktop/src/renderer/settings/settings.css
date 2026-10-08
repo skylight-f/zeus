@@ -2044,3 +2044,276 @@
 .macos-ai-app.zeus-shell.settings-dedicated-shell.project-navigation-rail-shell .settings-detail-pane {
   margin: 0;
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-block: 1px solid var(--zeus-product-border);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary > div {
+    display: grid;
+    gap: 4px;
+    min-inline-size: 0;
+    padding: 14px 18px 14px 0;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary > div + div {
+    padding-inline: 18px 0;
+    border-inline-start: 1px solid var(--zeus-product-border);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary span {
+    color: var(--zeus-product-muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary strong {
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    font-weight: 620;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary small {
+    color: var(--zeus-product-muted);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-runtime-summary [data-state='restart'] small {
+    color: var(--zeus-status-warning-text, #8a5b12);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group {
+    display: grid;
+    gap: 0;
+    padding-block: 10px 24px;
+    border-block-end: 1px solid var(--zeus-product-border);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group:last-of-type {
+    border-block-end: 0;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group-heading {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+    padding-block: 14px 4px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group-heading > span {
+    display: grid;
+    inline-size: 24px;
+    block-size: 24px;
+    place-items: center;
+    border-radius: 999px;
+    background: var(--zeus-product-selected);
+    color: var(--zeus-product-text-subtle);
+    font-size: 11px;
+    font-weight: 700;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group-heading h3 {
+    margin: 1px 0 3px;
+    color: var(--zeus-product-text);
+    font-size: 15px;
+    line-height: 1.35;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group-heading p {
+    margin: 0;
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-settings-group .native-control-row {
+    min-block-size: 64px;
+    padding-block: 12px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-check-row .native-control-slot > button {
+    min-block-size: 32px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-status {
+    display: grid;
+    gap: 8px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 0;
+    padding: 0;
+    border-block-start: 1px solid var(--zeus-product-border);
+    list-style: none;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results li {
+    display: grid;
+    gap: 5px;
+    min-inline-size: 0;
+    padding: 14px 0;
+    border-block-end: 1px solid var(--zeus-product-border);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results li:nth-child(odd) {
+    padding-inline-end: 16px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results li:nth-child(even) {
+    padding-inline-start: 16px;
+    border-inline-start: 1px solid var(--zeus-product-border);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results strong {
+    font-size: 13px;
+    font-weight: 600;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results :where(small, span) {
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-result {
+    display: grid;
+    gap: 3px;
+    padding-block-start: 4px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results [data-state='checking'] .network-model-result > span {
+    color: var(--zeus-product-muted);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results [data-state='success'] .network-model-result > span {
+    color: var(--zeus-product-success, #2f7d4a);
+    font-weight: 600;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .network-model-connection-results [data-state='failed'] .network-model-result > span {
+    color: var(--zeus-product-danger, #b42318);
+    font-weight: 600;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .codex-update-progress-copy {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .codex-update-progress-copy strong {
+    color: var(--zeus-product-text);
+    font-variant-numeric: tabular-nums;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .codex-update-progress-track {
+    position: relative;
+    overflow: hidden;
+    block-size: 4px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--zeus-product-accent) 16%, transparent);
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .codex-update-progress-track > span {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    border-radius: inherit;
+    background: var(--zeus-product-accent);
+    transition: inline-size 180ms ease-out;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  .codex-update-progress-track[data-indeterminate='true'] > span {
+    inline-size: 36%;
+    animation: codex-update-progress-indeterminate 1.1s ease-in-out infinite;
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  @media (max-width: 880px) {
+    .network-runtime-summary {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  @media (max-width: 880px) {
+    .network-runtime-summary > div + div {
+      padding-inline: 0;
+      border-inline-start: 0;
+      border-block-start: 1px solid var(--zeus-product-border);
+    }
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  @media (max-width: 880px) {
+    .network-model-connection-results {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  @media (max-width: 880px) {
+    .network-model-connection-results li:nth-child(n) {
+      padding-inline: 0;
+      border-inline-start: 0;
+    }
+  }
+}
+.macos-ai-app.zeus-shell .settings-reference-shell {
+  @media (max-width: 640px) {
+    .network-settings-group-heading {
+      grid-template-columns: 24px minmax(0, 1fr);
+      gap: 8px;
+    }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .codex-update-progress-track[data-indeterminate='true'] > span {
+    animation: none;
+    transform: none;
+  }
+}

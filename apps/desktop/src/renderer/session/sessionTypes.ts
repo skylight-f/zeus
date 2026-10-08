@@ -25,17 +25,7 @@ export type { ConversationResource, ConversationResourcePreview, TurnChangeSet, 
 export type TransportState = 'disconnected' | 'connecting' | 'hydrating' | 'ready' | 'reconnecting' | 'failed';
 
 export type ConversationState =
-  | 'legacy_readonly'
-  | 'native_loading'
-  | 'native_idle'
-  | 'starting_turn'
-  | 'active_prework'
-  | 'active_final_answer'
-  | 'waiting_approval'
-  | 'waiting_user_input'
-  | 'interrupt_confirm'
-  | 'interrupting'
-  | 'turn_failed';
+  'legacy_readonly' | 'native_loading' | 'native_idle' | 'starting_turn' | 'active_prework' | 'active_final_answer' | 'waiting_approval' | 'waiting_user_input' | 'interrupt_confirm' | 'interrupting' | 'turn_failed';
 
 export type ThreadFollowMode = 'static' | 'prework_watch' | 'prework_follow' | 'user_follow';
 export type NativePermissionMode = 'read-only' | 'auto' | 'auto-review' | 'full-access';
@@ -148,6 +138,8 @@ export interface NativeTurnFailureSnapshot {
 }
 
 export interface NativeItemSnapshot {
+  /** 用户原始创建时间，状态更新和模型确认不得改写。 */
+  messageCreatedAt?: string;
   id: string;
   turnId: string;
   providerItemId: string | null;
@@ -347,6 +339,8 @@ export type NativeQueueWaitReason =
   | 'dispatch_pending';
 
 export interface NativeQueueSnapshot {
+  /** 权威队列读取时的会话同步水位，不推进正文事件游标。 */
+  throughEventSeq: number;
   state: NativeConversationRunState;
   waitReason?: NativeQueueWaitReason;
   submissions: NativeQueuedSubmission[];
@@ -633,6 +627,15 @@ export interface NativeConversationSnapshotV2Turn {
 }
 
 export interface NativeConversationActiveItemV2 {
+  /** 已完成长命令沿用过程预览和不可变详情句柄。 */
+  commandDetail?: {
+    /** 命令身份独立于活动载荷的截断位置。 */
+    presentation: Record<string, unknown> | null;
+    /** 用户点击命令后才读取全文。 */
+    content: NativeBoundedContentProjection;
+  };
+  /** 用户原始创建时间，不跟随活动状态更新。 */
+  messageCreatedAt?: string;
   id: string;
   order: number;
   turnId: string;
@@ -720,6 +723,8 @@ export interface NativeConversationReadableSnapshot {
 }
 
 export interface NativeConversationModelHistoryV2Item {
+  /** 用户原始创建时间，状态更新和模型确认不得改写。 */
+  messageCreatedAt?: string;
   id: string;
   sequence: number;
   turnId: string;
@@ -1110,8 +1115,6 @@ export interface CodexChatGptLoginStatus {
 }
 
 export interface CodexTaskPushCapabilities {
-  /** 项目记住的上次容量选择。 */
-  projectContextCapacityTokens?: number | null;
   /** 本地仓库发现与模型加载分别表达；完成后的空清单才表示没有仓库。 */
   repositoryDiscovery: import('@zeus/shared').ProjectRepositoryDiscovery;
   generationId: string;
@@ -1130,6 +1133,8 @@ export interface CodexTaskPushCapabilities {
   relatedContextOptions: TaskPushRelatedContextOption[];
   /** 未配置模型和目录查询失败必须如实传递给推送确认。 */
   preferredModel: string | null;
+  /** 即使当前没有可用模型，也能区分已有连接和首次接入。 */
+  hasConfiguredProvider: boolean;
   available?: false;
   availabilityReason?: string;
   models: CodexTaskPushModelCapability[];
@@ -1415,8 +1420,6 @@ export interface TaskIntegrationConflictAiSession {
 export type TaskIntegrationConflictPermissionMode = Exclude<NativePermissionMode, 'read-only'>;
 
 export interface CodexConversationCapabilities {
-  /** 项目记住的上次容量选择。 */
-  projectContextCapacityTokens?: number | null;
   generationId: string;
   initializedAt: string;
   projectId: string;
@@ -1597,6 +1600,8 @@ export interface SendNativeMessageRequest {
 }
 
 export interface NativeOperationAcceptance {
+  /** 命令回执同时携带当前权威队列及会话同步水位。 */
+  queue?: NativeQueueSnapshot;
   operation: Record<string, unknown> & { status: string };
   conversation: Record<string, unknown> & { id: string };
   submission?: Record<string, unknown> & { id: string };
@@ -1692,7 +1697,20 @@ export interface NativeExpertExecutionProjection {
 }
 
 export type NativeConversationEvent =
-  | NativeEvent<'conversation.transport.changed', NativeEventIdentity & { transportKind?: string; providerState?: string; providerThreadId?: string }>
+  | NativeEvent<
+      'conversation.transport.changed',
+      NativeEventIdentity & {
+        transportKind?: string;
+        providerState?: string;
+        providerThreadId?: string;
+        /** Provider 断流后的后台核对阶段，不表示重新执行模型请求。 */
+        recoveryState?: 'reconnecting' | 'idle';
+        /** 当前只读核对次数；零表示没有正在进行的恢复。 */
+        reconnectAttempt?: number;
+        /** 本轮只读核对的最大次数。 */
+        reconnectAttempts?: number;
+      }
+    >
   | NativeEvent<'conversation.thread.changed', NativeEventIdentity & { providerThreadId?: string; providerState?: string }>
   | NativeEvent<'conversation.turn.started', NativeTurnEventPayload>
   | NativeEvent<'conversation.turn.completed', NativeTurnEventPayload>
@@ -1812,6 +1830,8 @@ export function isNativeConversationEvent(event: NativeRealtimeEventEnvelope): e
 }
 
 export interface NativeSessionItemBuffer {
+  /** 用户原始创建时间，状态更新和模型确认不得改写。 */
+  messageCreatedAt?: string;
   key: string;
   conversationId: string;
   threadId: string;
@@ -1862,6 +1882,12 @@ export interface NativeSessionState {
   transcriptInitializing?: boolean;
   transportState: TransportState;
   reconnectAttempt: number;
+  /** Provider 回复流断开后的当前只读核对次数。 */
+  providerReconnectAttempt: number;
+  /** Provider 回复流断开后的最大只读核对次数。 */
+  providerReconnectAttempts: number;
+  /** 正在核对的 Provider 轮次身份。 */
+  providerReconnectTurnId: string | null;
   conversationState: ConversationState;
   projectId: string | null;
   conversationId: string | null;

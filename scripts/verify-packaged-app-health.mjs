@@ -27,6 +27,14 @@ function verifyPackagedAppIdentity(appPath, variant) {
   if (basename(appPath) !== `${expected.name}.app` || actual.bundleId !== expected.bundleId || actual.name !== expected.name || actual.executable !== expected.executable || actual.version !== actual.buildVersion) {
     throw new Error(`Zeus 应用包身份不一致：variant=${variant} actual=${JSON.stringify(actual)}；请使用 pnpm package:mac 构建完整测试包。`);
   }
+  /** 只接受包内图标文件名，避免错误的元信息把校验指向包外资源。 */
+  const iconFile = readInfo('CFBundleIconFile');
+  if (basename(iconFile) !== iconFile) throw new Error('Zeus 应用包的 CFBundleIconFile 必须是资源文件名。');
+  /** 校验真实容器与声明长度，拦截把 PNG 改名为 ICNS 后直接打包的错误。 */
+  const icon = readFileSync(join(appPath, 'Contents', 'Resources', iconFile));
+  if (icon.length < 16 || icon.toString('ascii', 0, 4) !== 'icns' || icon.readUInt32BE(4) !== icon.length) {
+    throw new Error(`Zeus 应用图标不是完整的 ICNS 文件：${iconFile}；请用 iconutil 从源图生成，不能直接改扩展名。`);
+  }
   return actual;
 }
 
@@ -169,11 +177,54 @@ export function assertPackagedUpdateProgressHelper(appRoot) {
   return { helperPath };
 }
 
-/** 仅验证包身份与内容；成功不代表应用已启动或界面已连接。 */
-export function verifyPackagedApp(appPath) {
+/** 原生 SDK 必须从物理目录解析依赖，并真正完成 dlopen；文件存在不代表能加载。 */
+function assertPackagedComputerSdk(appRoot) {
+  /** 打包时固定解包 SDK 及绑定，避免官方解析器得到 ASAR 虚拟路径。 */
+  const unpacked = join(appRoot, 'Contents/Resources/app.asar.unpacked');
+  /** 校验当前构建架构的官方原生包与真实 SDK 入口。 */
+  const sdkEntry = join(unpacked, 'dist/native/cua-sdk/dist/index.js');
+  /** 完整打包必须带上主入口、权限入口、绑定依赖及本任务原生 worker。 */
+  const required = [
+    sdkEntry,
+    join(unpacked, 'dist/native/cua-sdk/dist/electron.js'),
+    join(unpacked, 'dist/native/cua-sdk/dist/native/node-runtime.js'),
+    join(unpacked, 'dist/native/node_modules/@ubjs/core/package.json'),
+    join(unpacked, 'dist/native/node_modules/@ubjs/node/typescript/dist/resolve-lib.js'),
+    join(unpacked, `dist/native/node_modules/@trycua/cua-driver-darwin-${process.arch}/libcua_driver_sdk.dylib`),
+    join(unpacked, `dist/native/node_modules/@trycua/cua-driver-darwin-${process.arch}/cua_driver_node_runtime.node`),
+    join(unpacked, 'dist/native/ZeusComputerWorker'),
+    join(unpacked, 'dist/native/cua-driver'),
+  ];
+  for (const path of required) if (!statSync(path).isFile()) throw new Error(`Computer Use 打包文件不完整：${path}`);
+  /** 仅加载候选包中的真实 SDK 并只读检查权限，不启动界面或请求授权。 */
+  const loaded = execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      `const sdk = await import(${JSON.stringify(pathToFileURL(sdkEntry).href)}); const status = sdk.currentMacOsPermissionStatus(); if (typeof status.accessibility !== 'boolean' || typeof status.screenRecording !== 'boolean') throw new Error('原生权限探针响应无效'); process.stdout.write('computer-sdk-loaded');`,
+    ],
+    {
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: { ...process.env, CUA_DRIVER_RS_TELEMETRY_ENABLED: 'false' },
+    },
+  );
+  if (loaded !== 'computer-sdk-loaded') throw new Error('Computer Use 原生 SDK 未完成加载验证。');
+  return { sdkEntry, nativeLibraryLoaded: true };
+}
+
+/** 验证包身份、内容及原生组件加载；成功不代表应用界面已启动或权限已授权。 */
+export function verifyPackagedApp(appPath, { expectedElectronVersion } = {}) {
   const appRoot = resolve(appPath);
   /** 正式产物与测试产物分别校验，拒绝改名的系统小程序样本。 */
   const identity = verifyPackagedAppIdentity(appRoot, basename(appRoot) === `${distributionPackageIdentity('test').name}.app` ? 'test' : 'release');
+  /** 校验实际装入包的运行时，依赖清单升级不能代替产物版本检查。 */
+  const electronVersion = execFileSync('/usr/bin/plutil', ['-extract', 'CFBundleVersion', 'raw', '-o', '-', join(appRoot, 'Contents/Frameworks/Electron Framework.framework/Resources/Info.plist')], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  }).trim();
+  if (expectedElectronVersion && electronVersion !== expectedElectronVersion) throw new Error(`Zeus 打包 Electron 版本不符：expected=${expectedElectronVersion} actual=${electronVersion}`);
   const asarPath = join(appRoot, 'Contents/Resources/app.asar');
   const renderer = assertPackagedRendererEntrypoint(asarPath);
   const preload = assertPackagedPreloadEntrypoint(asarPath);
@@ -184,15 +235,18 @@ export function verifyPackagedApp(appPath) {
   readAsarTextFile(asarPath, mainPackage.main);
   const codex = assertNoPackagedCodexRuntime(appRoot);
   const updateProgress = assertPackagedUpdateProgressHelper(appRoot);
+  const computerUse = assertPackagedComputerSdk(appRoot);
   return {
     appName: basename(appRoot, '.app'),
     version: identity.version,
+    electronVersion,
     assetCount: renderer.assetCount,
     main: mainPackage.main,
     preload: preload.preloadPath,
     browserPagePreload: preload.browserPagePreloadPath,
     codex,
     updateProgress,
+    computerUse,
   };
 }
 

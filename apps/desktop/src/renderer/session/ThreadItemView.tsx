@@ -23,7 +23,7 @@ import {
 } from '@zeus/shared';
 import { ConversationGeneratedImage, ConversationPendingAttachmentImages, ConversationResourceCards, isImageResource, isPendingImageAttachment } from './ConversationResources.js';
 import { ResponseSelectionActions } from './ResponseSelectionActions.js';
-import { useApplicationErrorDialog, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ConversationMarkdown, conversationMarkdownPhaseForStatus, type StructuredMessageToken } from './ConversationMarkdown.js';
 import { McpAppFrame, type McpAppToolCall, type McpAppToolResult } from './McpAppFrame.js';
 import { AnsweredRequestHistory, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
@@ -437,14 +437,8 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState('');
   const [editError, setEditError] = useState<unknown>(null);
-  useApplicationErrorDialog(editError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
   const [queuedAction, setQueuedAction] = useState<'steer' | 'delete' | null>(null);
   const [queuedActionError, setQueuedActionError] = useState<unknown>(null);
-  useApplicationErrorDialog(queuedActionError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
   const [submittingEdit, setSubmittingEdit] = useState(false);
   const [retryingExpert, setRetryingExpert] = useState(false);
   const [markdownSettled, setMarkdownSettled] = useState(false);
@@ -516,8 +510,8 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
   /** 状态与操作共同决定底栏；已确认未发送可只有操作，未知送达可只有状态。 */
   const showQueuedFooter = role === 'user' && Boolean(props.waitingInQueue && (optimisticStatus || showQueuedActions));
   const showMeta = !command && !recoveredRequestUserInput && (showVisibleRoleLabel || (!showQueuedFooter && Boolean(optimisticStatus)));
-  const messageTimestamp = formatMessageTimestamp(props.item, props.language);
-  const timestampSource = props.item.updatedAt ?? primitiveText(props.item.payload.createdAt);
+  const timestampSource = role === 'user' ? props.item.messageCreatedAt : props.item.updatedAt;
+  const messageTimestamp = formatMessageTimestamp(timestampSource, props.language);
   const canEdit = role === 'user' && props.isLatestUser && Boolean(props.onEdit) && !props.item.optimistic;
   const showRoleActions = role === 'user' || (role === 'assistant' && Boolean(props.showAssistantActions ?? props.isLatest));
   const remoteDeviceInput = role === 'user' && props.item.payload.inputOrigin === 'remote_device';
@@ -629,6 +623,11 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
             onChange={(event) => setEditDraft(event.currentTarget.value)}
             onKeyDown={handleEditKeyDown}
           />
+          {editError ? (
+            <span role="alert">
+              <VisibleApplicationError error={editError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+            </span>
+          ) : null}
           <footer>
             <span />
             <button type="button" onClick={cancelEditing} disabled={submittingEdit}>
@@ -846,6 +845,11 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
                 </button>
               ) : null}
             </div>
+          ) : null}
+          {queuedActionError ? (
+            <span role="alert">
+              <VisibleApplicationError error={queuedActionError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+            </span>
           ) : null}
         </div>
       ) : null}
@@ -1286,8 +1290,8 @@ function MessageTimestamp(props: { dateTime: string; value: string }) {
   );
 }
 
-function formatMessageTimestamp(item: NativeSessionItemBuffer, language: SessionUiLanguage): string | null {
-  const source = item.updatedAt ?? primitiveText(item.payload.createdAt);
+/** 只格式化已确定来源的时间，用户消息不以状态更新时间兜底。 */
+function formatMessageTimestamp(source: string | undefined, language: SessionUiLanguage): string | null {
   if (!source) return null;
   const date = new Date(source);
   if (Number.isNaN(date.getTime())) return null;
@@ -1424,10 +1428,12 @@ function conversationContextDraft(value: unknown): ConversationContextDraft | nu
   return record as unknown as ConversationContextDraft;
 }
 
+/** 识别结构化评论的摘要正文，历史记录的原有标题也交由评论卡片展示。 */
 function isConversationContextPlaceholder(value: string): boolean {
-  return /^(?:回答批注|代码评论|Response annotations \(\d+\)|Code comments \(\d+\))$/u.test(value.trim());
+  return /^(?:回答(?:批注|评论)|代码评论|Response (?:annotations|comments) \(\d+\)|Code comments \(\d+\))$/u.test(value.trim());
 }
 
+/** 历史消息统一展示评论名称，回答原文和代码来源继续保留。 */
 function UserConversationContextSummary(props: { draft: ConversationContextDraft; language: SessionUiLanguage }) {
   const annotations = props.draft.responseAnnotations;
   const comments = props.draft.codeComments.length;
@@ -1435,25 +1441,25 @@ function UserConversationContextSummary(props: { draft: ConversationContextDraft
   const zh = props.language === 'zh-CN';
   if (annotations.length > 0) {
     return (
-      <section className="session-message-context-summary" aria-label={zh ? '回答批注' : 'Response annotations'}>
+      <section className="session-message-context-summary" aria-label={zh ? '回答评论' : 'Response comments'}>
         <header>
-          <strong>{zh ? '回答批注' : 'Response annotations'}</strong>
+          <strong>{zh ? '回答评论' : 'Response comments'}</strong>
           <span>{annotations.length}</span>
         </header>
         <div className="session-message-response-annotations">
           {annotations.map((annotation, index) => (
             <article key={annotation.id}>
-              <span>{zh ? `批注 ${index + 1}` : `Annotation ${index + 1}`}</span>
+              <span>{zh ? `评论 ${index + 1}` : `Comment ${index + 1}`}</span>
               <blockquote>{annotation.anchor.selectedText}</blockquote>
               {annotation.note?.trim() ? <p>{annotation.note.trim()}</p> : null}
             </article>
           ))}
         </div>
-        {comments ? <small>{zh ? `${comments} 个代码评论` : `${comments} ${comments === 1 ? 'code comment' : 'code comments'}`}</small> : null}
+        {comments ? <small>{zh ? `${comments} 条代码评论` : `${comments} ${comments === 1 ? 'code comment' : 'code comments'}`}</small> : null}
       </section>
     );
   }
-  const label = zh ? `${comments} 个评论` : `${comments} ${comments === 1 ? 'comment' : 'comments'}`;
+  const label = zh ? `${comments} 条评论` : `${comments} ${comments === 1 ? 'comment' : 'comments'}`;
   return <span className="session-message-context-summary">{label}</span>;
 }
 function primitiveText(value: unknown): string | null {

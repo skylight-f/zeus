@@ -120,6 +120,15 @@ const modelHistoryProviderItemSql = `COALESCE(
     ELSE NULL
   END
 )`;
+/** 用户原始创建时间由提交或精确 Provider 消息身份取得，不使用确认/更新时间。 */
+const modelHistoryMessageCreatedAtSql = `CASE WHEN conversation_model_history.role = 'user' THEN COALESCE(
+  (SELECT created_at FROM conversation_submissions
+    WHERE id = conversation_model_history.submission_id AND conversation_id = conversation_model_history.conversation_id),
+  (SELECT created_at FROM conversation_messages
+    WHERE conversation_id = conversation_model_history.conversation_id AND role = 'user'
+      AND provider_item_id = CASE WHEN json_valid(content_json)
+        THEN json_extract(content_json, '$.providerItemId') END)
+) END`;
 const modelHistoryReasoningSummarySql = `CASE
   WHEN json_valid(reasoning_source_json)
    AND COALESCE(json_extract(reasoning_source_json, '$.readableSummary'), 0) = 1
@@ -180,6 +189,14 @@ const modelHistoryStageIdSql = `COALESCE(
     ELSE NULL
   END
 )`;
+/** 活动首屏与历史过程共用有界命令身份，数组参数也不读取或转发整段输出。 */
+const commandIdentityPresentationSql = `'command', CASE WHEN json_type(detail_json, '$.payload.command') = 'array' THEN
+  (SELECT substr(group_concat(part.value, ' '), 1, 4000) FROM
+    (SELECT substr(value, 1, 4000) AS value FROM json_each(detail_json, '$.payload.command') WHERE type = 'text' ORDER BY key LIMIT 32) AS part)
+  ELSE substr(json_extract(detail_json, '$.payload.command'), 1, 4000) END,
+  'cwd', substr(json_extract(detail_json, '$.payload.cwd'), 1, 2000),
+  'exitCode', COALESCE(json_extract(detail_json, '$.payload.exitCode'), json_extract(detail_json, '$.payload.result.details.exitCode'))`;
+
 // 过程页同样从冻结执行快照恢复旧记录的协议归属。
 const processProtocolFamilySql = `COALESCE(
   CASE WHEN json_valid(detail_json) THEN json_extract(detail_json, '$.protocolFamily') ELSE NULL END,
@@ -283,6 +300,15 @@ export interface ConversationSnapshotV2TurnSummary {
 }
 
 export interface ConversationSnapshotV2ActiveItem {
+  /** 已完成长命令复用过程的有界身份与不可变全文入口。 */
+  commandDetail?: {
+    /** 命令和目录不依赖截断的活动载荷。 */
+    presentation: Record<string, unknown> | null;
+    /** 点击命令时才读取完整详情。 */
+    content: BoundedContentProjection;
+  };
+  /** 用户消息原始创建时间，独立于条目进度更新。 */
+  messageCreatedAt?: string;
   id: string;
   order: number;
   turnId: string;
@@ -409,6 +435,8 @@ export interface ConversationTimelinePageItem {
 }
 
 export interface ConversationModelHistoryPageItem {
+  /** 用户原始创建时间；非用户条目不携带。 */
+  messageCreatedAt?: string;
   id: string;
   sequence: number;
   turnId: string;
@@ -580,6 +608,7 @@ interface TurnRow {
   error_message: string | null;
   error_provider_status: string | null;
   error_provider_info: string | null;
+  error_provider_http_status: number | null;
   error_additional_details: string | null;
   /** 读取已有原因记录，不修改历史数据。 */
   error_cause_json: string | null;
@@ -668,6 +697,7 @@ interface ModelHistoryProjectionRow {
   turn_id: string;
   submission_id: string | null;
   client_user_message_id: string | null;
+  message_created_at: string | null;
   provider_item_id: string | null;
   reasoning_summary: number;
   assistant_phase: string | null;
@@ -742,6 +772,7 @@ export class ConversationSnapshotV2Repository {
       turn_id: string;
       provider_turn_id: string | null;
       client_user_message_id: string | null;
+      message_created_at: string | null;
       provider_item_id: string | null;
       segment_id: string;
       role: string;
@@ -757,6 +788,7 @@ export class ConversationSnapshotV2Repository {
         conversation_model_history.turn_id, turn.provider_turn_id, turn.status,
         submission.client_message_id AS client_user_message_id,
         ${modelHistoryProviderItemSql} AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
         conversation_model_history.role, conversation_model_history.segment_id, conversation_model_history.confirmed_at,
         ${modelHistoryAssistantPhaseSql} AS assistant_phase,
         ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
@@ -810,7 +842,7 @@ export class ConversationSnapshotV2Repository {
           clientUserMessageId: row.client_user_message_id,
           providerItemId: row.provider_item_id,
           sequence: row.sequence,
-          occurredAt: row.confirmed_at,
+          occurredAt: row.message_created_at ?? row.confirmed_at,
           prompt: questionExcerpt ? redactSensitivePreview(questionExcerpt.prompt).text : conversationNavigationExcerpt(text, 160),
           response: questionExcerpt ? redactSensitivePreview(questionExcerpt.response).text : '',
           status: row.status,
@@ -1011,7 +1043,9 @@ export class ConversationSnapshotV2Repository {
       });
     let snapshotWithoutMetrics = buildSnapshot();
     while (snapshotWithoutMetrics.limits.responseBytes > byteLimit && activeItems.length > 0) {
-      activeItems.shift();
+      /** 响应超预算时先裁普通过程项，不能再次把阶段进展或当前动作挤出首屏。 */
+      const removableIndex = activeItems.findIndex((item) => !['agentMessage', 'assistantMessage', 'assistant', 'message', 'commentary', 'analysis'].includes(item.itemType) && item.status !== 'in_progress');
+      activeItems.splice(removableIndex < 0 ? 0 : removableIndex, 1);
       activeItemsTruncated = true;
       snapshotWithoutMetrics = buildSnapshot();
     }
@@ -1114,6 +1148,7 @@ export class ConversationSnapshotV2Repository {
                  FROM conversation_submissions
                  WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
                 ${modelHistoryProviderItemSql}                        AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
                 ${modelHistoryReasoningSummarySql}                    AS reasoning_summary,
                 ${modelHistoryAssistantPhaseSql}                      AS assistant_phase,
               ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
@@ -1161,6 +1196,7 @@ export class ConversationSnapshotV2Repository {
                FROM conversation_submissions
                WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
               ${modelHistoryProviderItemSql}                        AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
               ${modelHistoryReasoningSummarySql}                    AS reasoning_summary,
               ${modelHistoryAssistantPhaseSql}                      AS assistant_phase,
               ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
@@ -1203,6 +1239,7 @@ export class ConversationSnapshotV2Repository {
       `SELECT id, sequence, turn_id, submission_id,
               (SELECT client_message_id FROM conversation_submissions WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
               ${modelHistoryProviderItemSql} AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
               ${modelHistoryReasoningSummarySql} AS reasoning_summary,
               ${modelHistoryAssistantPhaseSql} AS assistant_phase,
               ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
@@ -1281,13 +1318,14 @@ export class ConversationSnapshotV2Repository {
                    /* 原生工具和 Pi 共用有界身份字段，长结果截断也不能丢失操作来源与终态。 */
                    WHEN kind IN ('tool', 'command') THEN
                      json_object('provider', json_extract(detail_json, '$.provider'), 'itemType', json_extract(detail_json, '$.itemType'), 'payload', json_object(
+                       /* 命令身份独立于长输出预览，全文沿用详情句柄。 */
+                       ${commandIdentityPresentationSql},
                        'toolName', substr(COALESCE(json_extract(detail_json, '$.payload.toolName'), json_extract(detail_json, '$.block.name')), 1, 256),
                        'tool', substr(json_extract(detail_json, '$.payload.tool'), 1, 256),
                        'name', substr(json_extract(detail_json, '$.payload.name'), 1, 256),
                        'namespace', substr(json_extract(detail_json, '$.payload.namespace'), 1, 256),
                        'status', substr(json_extract(detail_json, '$.payload.status'), 1, 64),
                        'success', json(CASE json_extract(detail_json, '$.payload.success') WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END),
-                       'exitCode', COALESCE(json_extract(detail_json, '$.payload.exitCode'), json_extract(detail_json, '$.payload.result.details.exitCode')),
                        'args', json_object(
                          'app', substr(COALESCE(json_extract(detail_json, '$.payload.arguments.app'), json_extract(detail_json, '$.payload.args.app'), json_extract(detail_json, '$.block.arguments.app')), 1, 1000),
                          'url', substr(COALESCE(json_extract(detail_json, '$.payload.arguments.url'), json_extract(detail_json, '$.payload.args.url'), json_extract(detail_json, '$.block.arguments.url')), 1, 2000),
@@ -1713,6 +1751,7 @@ export class ConversationSnapshotV2Repository {
         truncated: false,
       };
     }
+    /** 首屏名额优先保留用户可读进展和当前动作，避免长轮次的历史工具挤掉阶段边界。 */
     const rows = this.db.select<{
       id: string;
       provider_thread_id: string;
@@ -1730,11 +1769,15 @@ export class ConversationSnapshotV2Repository {
       delivery: string | null;
       protocol_family: string | null;
       stage_id: string | null;
+      total_count: number;
       started_at: string | null;
       completed_at: string | null;
       updated_at: string;
+      message_created_at: string | null;
     }>(
-      `SELECT id, provider_thread_id, native_item_id, provider_item_id, item_type, status, phase,
+      `SELECT *
+         FROM (
+         SELECT id, provider_thread_id, native_item_id, provider_item_id, item_type, status, phase,
               substr(text_projection, 1, ?) AS text_preview,
               length(CAST(text_projection AS BLOB)) AS text_bytes,
               substr(payload_projection_json, 1, ?) AS payload_preview,
@@ -1742,11 +1785,21 @@ export class ConversationSnapshotV2Repository {
               CASE WHEN json_valid(payload_projection_json) THEN json_extract(payload_projection_json, '$.delivery') ELSE NULL END AS delivery,
               CASE WHEN json_valid(payload_projection_json) THEN json_extract(payload_projection_json, '$.protocolFamily') ELSE NULL END AS protocol_family,
               CASE WHEN json_valid(payload_projection_json) THEN json_extract(payload_projection_json, '$.stageId') ELSE NULL END AS stage_id,
+              (SELECT message.created_at FROM conversation_messages AS message
+                WHERE message.conversation_id = conversation_provider_item_states.conversation_id
+                  AND message.provider_item_id = conversation_provider_item_states.provider_item_id
+                  AND message.role = 'user') AS message_created_at,
+              COUNT(*) OVER () AS total_count,
               projection_truncated, started_at, completed_at, updated_at
          FROM conversation_provider_item_states
         WHERE conversation_id = ? AND turn_id = ?
           AND (phase = 'prework' OR status = 'in_progress' OR (json_valid(payload_projection_json) AND json_extract(payload_projection_json, '$.delivery') = 'async'))
         ORDER BY
+          CASE
+            WHEN item_type IN ('agentMessage', 'assistantMessage', 'assistant', 'message', 'commentary', 'analysis') THEN 0
+            WHEN status = 'in_progress' THEN 1
+            ELSE 2
+          END,
           CASE
             WHEN COALESCE(native_item_id, provider_item_id) GLOB 'item-[0-9]*'
             THEN CAST(substr(COALESCE(native_item_id, provider_item_id), 6) AS INTEGER)
@@ -1755,10 +1808,59 @@ export class ConversationSnapshotV2Repository {
           COALESCE(started_at, updated_at) DESC,
           updated_at DESC,
           id DESC
-        LIMIT ?`,
-      [previewCharacterLimit, previewCharacterLimit, conversationId, turnId, activeTurnItemLimit + 1],
+        LIMIT ?
+        ) AS selected_active_items
+        ORDER BY
+          CASE
+            WHEN COALESCE(native_item_id, provider_item_id) GLOB 'item-[0-9]*'
+            THEN CAST(substr(COALESCE(native_item_id, provider_item_id), 6) AS INTEGER)
+            ELSE NULL
+          END DESC,
+          COALESCE(started_at, updated_at) DESC,
+          updated_at DESC,
+          id DESC`,
+      [previewCharacterLimit, previewCharacterLimit, conversationId, turnId, activeTurnItemLimit],
     );
-    const selected = rows.slice(0, activeTurnItemLimit).reverse();
+    const selected = rows.reverse();
+    /** 只补本次首屏选中的长命令，避免为展开入口读取整轮历史。 */
+    const commandSourceIds = selected
+      .filter((row) => row.item_type === 'commandExecution' && row.status !== 'in_progress' && (row.payload_bytes > Buffer.byteLength(row.payload_preview) || row.projection_truncated === 1))
+      .map((row) => `codex:item:${row.native_item_id ?? row.provider_item_id}`);
+    /** 同一条命令在活动首屏和历史回看中使用相同的详情句柄。 */
+    const commandDetails = new Map<string, NonNullable<ConversationSnapshotV2ActiveItem['commandDetail']>>();
+    if (commandSourceIds.length > 0) {
+      /** SQL 只返回有界身份、预览和大小，完整输出仍留在数据库中。 */
+      const commands = this.db.select<{ source_event_id: string; process_sequence: number; status: string; completed_at: string | null; detail_preview: string; detail_bytes: number; detail_characters: number; presentation_json: string }>(
+        `SELECT source_event_id, process_sequence, status, completed_at,
+                substr(detail_json, 1, ?) AS detail_preview,
+                length(CAST(detail_json AS BLOB)) AS detail_bytes, length(detail_json) AS detail_characters,
+                json_object('provider', json_extract(detail_json, '$.provider'), 'itemType', 'commandExecution',
+                  'payload', json_object(${commandIdentityPresentationSql})) AS presentation_json
+           FROM conversation_process_items
+          WHERE conversation_id = ? AND turn_id = ? AND kind = 'command' AND status <> 'in_progress'
+            AND source_event_id IN (${commandSourceIds.map(() => '?').join(', ')})`,
+        [previewCharacterLimit, conversationId, turnId, ...commandSourceIds],
+      );
+      for (const command of commands) {
+        commandDetails.set(command.source_event_id, {
+          presentation: parseJsonRecordOrNull(redactSensitivePreview(command.presentation_json).text),
+          content: boundedProjection(
+            command.detail_preview,
+            command.detail_bytes,
+            this.contentHandle({
+              kind: 'process_detail',
+              conversationId,
+              identity: String(command.process_sequence),
+              turnId,
+              revision: `${command.status}:${command.completed_at ?? ''}`,
+              totalCharacters: command.detail_characters,
+              totalBytes: command.detail_bytes,
+            }),
+            false,
+          ),
+        });
+      }
+    }
     return {
       items: selected.map((row, order) => ({
         id: row.id,
@@ -1766,6 +1868,8 @@ export class ConversationSnapshotV2Repository {
         turnId,
         providerItemId: row.provider_item_id,
         itemType: row.item_type,
+        ...(commandDetails.has(`codex:item:${row.native_item_id ?? row.provider_item_id}`) ? { commandDetail: commandDetails.get(`codex:item:${row.native_item_id ?? row.provider_item_id}`) } : {}),
+        ...(row.message_created_at ? { messageCreatedAt: row.message_created_at } : {}),
         status: row.status,
         phase: row.phase,
         protocolFamily: row.protocol_family,
@@ -1784,7 +1888,7 @@ export class ConversationSnapshotV2Repository {
           facet: providerFacet(row.item_type),
         }),
       })),
-      truncated: rows.length > activeTurnItemLimit,
+      truncated: (selected[0]?.total_count ?? 0) > activeTurnItemLimit,
     };
   }
 
@@ -1825,6 +1929,7 @@ export class ConversationSnapshotV2Repository {
       `SELECT id, sequence, turn_id, submission_id,
               (SELECT client_message_id FROM conversation_submissions WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
               ${modelHistoryProviderItemSql} AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
               0 AS reasoning_summary,
               NULL AS assistant_phase,
               NULL AS assistant_metadata_json,
@@ -1851,6 +1956,7 @@ export class ConversationSnapshotV2Repository {
       `SELECT id, sequence, turn_id, submission_id,
               (SELECT client_message_id FROM conversation_submissions WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
               ${modelHistoryProviderItemSql} AS provider_item_id,
+              ${modelHistoryMessageCreatedAtSql} AS message_created_at,
               ${modelHistoryReasoningSummarySql} AS reasoning_summary,
               ${modelHistoryAssistantPhaseSql} AS assistant_phase,
               ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
@@ -1969,6 +2075,7 @@ export class ConversationSnapshotV2Repository {
       role: row.role,
       toolPairId: row.tool_pair_id,
       confirmedAt: row.confirmed_at,
+      ...(row.message_created_at ? { messageCreatedAt: row.message_created_at } : {}),
       actorKind: row.actor_kind,
       actorId: row.actor_id,
       actor: parseJsonRecordOrNull(row.actor_snapshot_json),
@@ -2023,19 +2130,18 @@ export class ConversationSnapshotV2Repository {
     return { ...answer, ...(questions.length ? { questions } : {}) };
   }
 
-  /** 仅按问题、轮次和会话身份关联现有提交，不扫描正文或猜测回答。 */
+  /** 按问题、轮次和会话关联最新提交；终态身份保留给重答，不扫描正文猜测关联。 */
   private questionResponse(conversationId: string, providerItemId: string, turnId: string): AsyncQuestionResponse | undefined {
-    const row = this.db.get<{ status: string; answer: string }>(
-      `SELECT submission.status, json_extract(submission.input_json, '$.questionAnswer') AS answer
+    const row = this.db.get<{ submission_id: string; status: string; answer: string }>(
+      `SELECT submission.id AS submission_id, submission.status, json_extract(submission.input_json, '$.questionAnswer') AS answer
          FROM conversation_submissions AS submission
         WHERE submission.conversation_id = ? AND json_valid(submission.input_json)
           AND json_extract(submission.input_json, '$.questionAnswer.providerItemId') = ?
           AND json_extract(submission.input_json, '$.questionAnswer.providerTurnId') = (SELECT provider_turn_id FROM conversation_turns WHERE id = ?)
-          AND submission.status NOT IN ('failed', 'cancelled', 'deleted')
         ORDER BY submission.created_at DESC LIMIT 1`,
       [conversationId, providerItemId, turnId],
     );
-    return row ? { status: row.status, answer: JSON.parse(row.answer) as AsyncQuestionAnswer } : undefined;
+    return row ? { submissionId: row.submission_id, status: row.status, answer: JSON.parse(row.answer) as AsyncQuestionAnswer } : undefined;
   }
 
   private throughEventSeq(conversationId: string): number {
@@ -2240,6 +2346,16 @@ function turnSummarySelectSql(): string {
                    ELSE NULL
                  END AS error_provider_info,
                  CASE
+                   WHEN json_valid(error_json)
+                    AND json_type(error_json, '$.providerError.codexErrorInfo') = 'object'
+                     THEN (SELECT CASE
+                       WHEN json_type(value, '$.httpStatusCode') = 'integer'
+                         THEN json_extract(value, '$.httpStatusCode')
+                       ELSE NULL
+                     END FROM json_each(json_extract(error_json, '$.providerError.codexErrorInfo')) LIMIT 1)
+                   ELSE NULL
+                 END AS error_provider_http_status,
+                 CASE
                    WHEN json_valid(error_json) THEN
                      CASE
                        WHEN json_type(error_json, '$.providerError.additionalDetails') = 'text'
@@ -2278,6 +2394,7 @@ function turnSummarySelectSql(): string {
                  started_at, completed_at, created_at, updated_at, agent_kind`;
 }
 
+/** 把持久化轮次中的官方错误字段还原到统一的脱敏失败投影。 */
 function turnFailure(row: TurnRow): ConversationSnapshotV2TurnFailure | null {
   if (row.has_error !== 1) return null;
   return projectConversationTurnFailure({
@@ -2287,9 +2404,86 @@ function turnFailure(row: TurnRow): ConversationSnapshotV2TurnFailure | null {
     cause: parseJsonRecordOrNull(row.error_cause_json),
     providerError: {
       codexErrorInfo: row.error_provider_info,
+      httpStatusCode: row.error_provider_http_status,
       additionalDetails: row.error_additional_details,
     },
   });
+}
+
+/** Codex 明确表示外部服务暂不可继续的错误身份；这类失败只阻塞后续执行，不改写本轮失败事实。 */
+const providerBlockingErrorCodes = new Set([
+  'unauthorized',
+  'invalid_api_key',
+  'authentication_error',
+  'usageLimitExceeded',
+  'insufficient_quota',
+  'quota_exceeded',
+  'billing_hard_limit_reached',
+  'rateLimitExceeded',
+  'rate_limit_exceeded',
+  'rate_limit_error',
+  'tooManyRequests',
+  'model_not_found',
+  'modelUnavailable',
+  'serverOverloaded',
+  'internalServerError',
+  'httpConnectionFailed',
+  'responseStreamConnectionFailed',
+  'responseStreamDisconnected',
+  'responseTooManyFailedAttempts',
+]);
+
+/** 结构化 Provider 错误的内部判别结果，不进入公共协议。 */
+interface ProviderFailureIdentity {
+  code: string | null;
+  httpStatusCode: number | null;
+  structured: boolean;
+}
+
+/** 从字符串或对象形式的官方错误中读取判别字段与 HTTP 状态。 */
+function providerFailureIdentity(failure: Record<string, unknown>, providerError: Record<string, unknown>, rawMessage: string): ProviderFailureIdentity {
+  const codexErrorInfo = providerError.codexErrorInfo;
+  let code: string | null = null;
+  let httpStatusCode = boundedHttpStatusCode(providerError.httpStatusCode);
+  let structured = false;
+  if (typeof codexErrorInfo === 'string') {
+    structured = true;
+    code = boundedFailureIdentity(codexErrorInfo);
+  } else if (isRecord(codexErrorInfo)) {
+    structured = true;
+    const entry = Object.entries(codexErrorInfo)[0];
+    if (entry) {
+      code = boundedFailureIdentity(entry[0]);
+      if (isRecord(entry[1])) httpStatusCode = boundedHttpStatusCode(entry[1].httpStatusCode) ?? httpStatusCode;
+    }
+  }
+  if (!code && isRecord(failure.cause)) {
+    code = boundedFailureIdentity(typeof failure.cause.code === 'string' ? failure.cause.code : null);
+    structured = code !== null;
+  }
+  /** 历史 Codex 只上报 other 时，用官方稳定断流文案恢复原有安全语义。 */
+  if ((!code || code === 'other') && /stream disconnected before completion/iu.test(rawMessage)) code = 'responseStreamDisconnected';
+  return { code, httpStatusCode, structured };
+}
+
+/** 只接受有效 HTTP 状态码，避免任意 Provider 数据进入错误详情。 */
+function boundedHttpStatusCode(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
+}
+
+/** 判断官方结构化错误是否要求暂停会话与阻塞上层工作，禁止据此自动重发。 */
+export function isProviderBlockingTurnFailure(value: unknown): boolean {
+  const failure = isRecord(value) ? value : {};
+  const providerError = isRecord(failure.providerError) ? failure.providerError : {};
+  const rawMessage = (typeof failure.message === 'string' && failure.message.trim() ? failure.message : null) ?? (typeof providerError.message === 'string' && providerError.message.trim() ? providerError.message : null) ?? '';
+  const identity = providerFailureIdentity(failure, providerError, rawMessage);
+  return Boolean(
+    (identity.code && providerBlockingErrorCodes.has(identity.code)) ||
+    identity.httpStatusCode === 401 ||
+    identity.httpStatusCode === 403 ||
+    identity.httpStatusCode === 429 ||
+    (identity.httpStatusCode !== null && identity.httpStatusCode >= 500),
+  );
 }
 
 /** 实时事件与 Snapshot V2 共用同一个有界脱敏投影，未经脱敏的 Provider 错误不进入客户端协议。 */
@@ -2301,16 +2495,23 @@ export function projectConversationTurnFailure(value: unknown): ConversationSnap
     (typeof providerError.message === 'string' && providerError.message.trim() ? providerError.message : null) ??
     '智能体运行内核没有提供更具体的失败原因。';
   const message = sanitizeTurnFailureText(rawMessage);
-  const providerInfo = boundedFailureIdentity(typeof providerError.codexErrorInfo === 'string' ? providerError.codexErrorInfo : null);
-  const capacity = providerInfo === 'serverOverloaded' || /selected model is at capacity/iu.test(message);
+  const providerIdentity = providerFailureIdentity(failure, providerError, rawMessage);
+  const providerInfo = providerIdentity.code;
+  /** 新事件只按官方字段识别容量错误；没有结构化字段的历史记录保留原兼容判断。 */
+  const capacity = providerInfo === 'serverOverloaded' || (!providerIdentity.structured && /selected model is at capacity/iu.test(message));
   const detail = typeof providerError.additionalDetails === 'string' ? sanitizeTurnFailureText(providerError.additionalDetails) : '';
+  const diagnosticDetails = [providerIdentity.httpStatusCode ? `HTTP 状态：${providerIdentity.httpStatusCode}` : '', detail && detail !== message ? detail : ''].filter(Boolean);
   return {
-    ...(isRecord(failure.cause) && Object.keys(failure.cause).length > 0 ? { cause: userFacingErrorCause(failure.cause) } : providerInfo ? { cause: userFacingErrorCause({ code: providerInfo, message: detail || message }) } : {}),
-    category: capacity ? 'rate_limit' : classifyTurnFailure(message),
+    ...(isRecord(failure.cause) && Object.keys(failure.cause).length > 0
+      ? { cause: userFacingErrorCause(failure.cause) }
+      : providerInfo
+        ? { cause: userFacingErrorCause({ code: providerInfo, message, ...(diagnosticDetails.length > 0 ? { details: diagnosticDetails.join('\n') } : {}) }) }
+        : {}),
+    category: classifyTurnFailure(providerInfo, providerIdentity.httpStatusCode, message, !providerIdentity.structured),
     code: capacity ? 'ZEUS_CODEX_MODEL_AT_CAPACITY' : boundedFailureIdentity(typeof failure.code === 'string' ? failure.code : null),
     message,
     providerStatus: boundedFailureIdentity(typeof failure.providerStatus === 'string' ? failure.providerStatus : null),
-    additionalDetails: detail && detail !== message ? [detail] : [],
+    additionalDetails: diagnosticDetails,
   };
 }
 
@@ -2334,10 +2535,37 @@ function boundedFailureIdentity(value: string | null): string | null {
   return candidate && /^[A-Za-z0-9_.:-]{1,120}$/u.test(candidate) ? candidate : null;
 }
 
-function classifyTurnFailure(message: string): ConversationSnapshotV2TurnFailure['category'] {
+/** 优先按官方结构化字段分类，仅在字段缺失的历史记录上使用文案兼容规则。 */
+function classifyTurnFailure(code: string | null, httpStatusCode: number | null, message: string, allowLegacyMessageFallback: boolean): ConversationSnapshotV2TurnFailure['category'] {
+  if (code === 'unauthorized' || code === 'invalid_api_key' || code === 'authentication_error' || httpStatusCode === 401 || httpStatusCode === 403) return 'authentication';
+  if (
+    code === 'usageLimitExceeded' ||
+    code === 'insufficient_quota' ||
+    code === 'quota_exceeded' ||
+    code === 'billing_hard_limit_reached' ||
+    code === 'rateLimitExceeded' ||
+    code === 'rate_limit_exceeded' ||
+    code === 'rate_limit_error' ||
+    code === 'tooManyRequests' ||
+    code === 'serverOverloaded' ||
+    httpStatusCode === 429
+  )
+    return 'rate_limit';
+  if (
+    code === 'httpConnectionFailed' ||
+    code === 'responseStreamConnectionFailed' ||
+    code === 'responseStreamDisconnected' ||
+    code === 'responseTooManyFailedAttempts' ||
+    code === 'internalServerError' ||
+    (httpStatusCode !== null && httpStatusCode >= 500)
+  )
+    return 'network';
+  if (code === 'sandboxError' || code === 'permission_denied' || code === 'permission_error') return 'permission';
+  if (code === 'badRequest' || code === 'model_not_found' || code === 'modelUnavailable' || httpStatusCode === 400) return 'configuration';
+  if (!allowLegacyMessageFallback) return 'unknown';
   if (/\b(?:401|403)\b|auth(?:entication|orization)?|unauthori[sz]ed|api[-_ ]?key|登录|鉴权/iu.test(message)) return 'authentication';
   if (/\b429\b|rate[-_ ]?limit|too many requests|quota|capacity|overloaded|限流|配额|容量/iu.test(message)) return 'rate_limit';
-  if (/network|failed to fetch|connection|socket|timed?\s*out|timeout|dns|网络|连接|超时/iu.test(message)) return 'network';
+  if (/network|failed to fetch|connection|disconnected|socket|timed?\s*out|timeout|dns|网络|连接|超时/iu.test(message)) return 'network';
   if (/permission denied|sandbox|not allowed|forbidden|权限|沙箱/iu.test(message)) return 'permission';
   if (/\b400\b|invalid|unsupported|unknown model|model not found|reasoning_effort|参数|模型.*(?:不存在|不支持)/iu.test(message)) return 'configuration';
   return 'unknown';

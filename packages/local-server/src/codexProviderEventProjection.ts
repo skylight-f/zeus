@@ -1,8 +1,10 @@
 import { assistantMessageMetadata, classifyAssistantMessage } from '@zeus/shared';
 import type { CodexAppServerEvent, CodexThreadGoal } from '@zeus/ai-runtime';
-import { calculateCacheHitRate, parseCanonicalRequestUserInputQuestions, type ConversationResource, type NativeTokenUsageSnapshot } from '@zeus/shared';
+import { calculateCacheHitRate, codexUsageObservationIdentity, parseCanonicalRequestUserInputQuestions, type ConversationResource, type NativeTokenUsageSnapshot } from '@zeus/shared';
 import {
+  isProviderBlockingTurnFailure,
   projectConversationTurnFailure,
+  conversationModelRequestId,
   type ZeusConversationGoalRecord,
   type ZeusConversationItemRecord,
   type ZeusConversationPlanActionRecord,
@@ -33,6 +35,7 @@ import {
   hasSecretQuestion,
   integerValue,
   isRecord,
+  isProviderResponseStreamDisconnected,
   isToolResultItem,
   itemText,
   itemTypeFromMethod,
@@ -130,7 +133,14 @@ export interface CodexProviderEventProjectionDependencies {
     occurredAt: string;
   }): void;
 
-  projectProviderUserMessage(conversation: ZeusConversationWithMessagesRecord, turn: ZeusConversationTurnRecord, itemPayload: Record<string, unknown>, providerContent: string, providerItemId: string): NativeUserMessageProjection | null;
+  projectProviderUserMessage(
+    conversation: ZeusConversationWithMessagesRecord,
+    turn: ZeusConversationTurnRecord,
+    itemPayload: Record<string, unknown>,
+    providerContent: string,
+    providerItemId: string,
+    observedAt: string,
+  ): NativeUserMessageProjection | null;
 
   reconcileTerminalTurnSubmissions(
     conversation: ZeusConversationWithMessagesRecord,
@@ -150,6 +160,9 @@ export interface CodexProviderEventProjectionDependencies {
   ): Promise<{ request: ZeusConversationServerRequestRecord; recovery: CodexRolloutRequestUserInputRecovery }>;
 
   recoverExternallyResolvedRequestUserInputAnswers(conversation: ZeusConversationWithMessagesRecord, providerTurnId?: string): Promise<number>;
+
+  /** 回复流断开后只读核对 Provider 权威状态，不自动重放原轮次。 */
+  recoverProviderStreamFailure(conversationId: string, providerThreadId: string, providerTurnId: string): void;
 
   rejectTurnResultWaiters(key: string, error: Error): void;
 
@@ -196,6 +209,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     reconcileTerminalTurnSubmissions,
     recoverExternalRequestUserInputAnswer,
     recoverExternallyResolvedRequestUserInputAnswers,
+    recoverProviderStreamFailure,
     rejectTurnResultWaiters,
     resolveTurnResult,
     rememberProcessedProviderEvent,
@@ -215,6 +229,81 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
   const eventSegment = threadId ? options.execution.segmentByNativeSession(threadId) : undefined;
   const conversation = threadId ? (options.conversations.getByProviderThreadId(threadId) ?? (eventSegment ? options.conversations.getById(eventSegment.conversationId) : undefined)) : undefined;
   if (eventSegment?.state === 'sealed') {
+    /** sealed 分段只能收口自己已经拥有的轮次，不能重新绑定当前 Provider、队列或运行态。 */
+    const sealedProviderTurnId = providerTurnIdFrom(params);
+    /** Provider thread 与 turn 双重身份防止旧分段终态误写当前轮次。 */
+    const sealedTurn = threadId && sealedProviderTurnId ? options.turns.getByProvider(threadId, sealedProviderTurnId) : undefined;
+    if (event.method === 'turn/completed' && conversation && threadId && sealedProviderTurnId && sealedTurn) {
+      /** 重放终态只补收回执，不重复发布完成事件。 */
+      const alreadyTerminal = sealedTurn.status === 'completed' || sealedTurn.status === 'interrupted' || sealedTurn.status === 'failed';
+      /** 终态必须先持久化再发布，避免客户端在提交落盘前回读旧状态。 */
+      let sealedCompletionPayload: Record<string, unknown> | null = null;
+      /** 只有提交状态实际收口时才刷新队列。 */
+      let sealedQueueChanged = false;
+      if (!alreadyTerminal) {
+        /** 迟到终态沿用普通事件的 Provider 状态映射，但不触碰当前分段。 */
+        const terminalStatus = providerTurnTerminalStatus(params);
+        /** 失败详情只归属旧轮次及其提交记录。 */
+        const failure = terminalStatus === 'failed' ? providerTurnFailure(params, sealedProviderTurnId) : null;
+        /** 旧轮次终止后释放自己的请求计时，不影响当前 thread 的请求。 */
+        modelRequestTiming.clear(conversation.id, sealedTurn.id);
+        /** 精确关闭旧轮次，解除侧栏、Composer 与过程摘要对历史运行态的依赖。 */
+        const terminalTurn = options.turns.upsert({
+          ...sealedTurn,
+          status: terminalStatus,
+          ...(failure ? { error: providerTurnFailureRecord(params, failure) } : {}),
+          completedAt: event.receivedAt,
+          updatedAt: event.receivedAt,
+        });
+        /** 只收口实际投递到该 Provider turn 的提交，不推进当前队列。 */
+        const terminalReconciliation = reconcileTerminalTurnSubmissions(conversation, terminalTurn, event.receivedAt, failure ? providerTurnFailureRecord(params, failure) : undefined);
+        /** 等待旧轮次结果的内部调用仍应收到真实终态。 */
+        const resultKey = `${conversation.id}:${sealedProviderTurnId}`;
+        if (failure) {
+          failedTurnResults.set(resultKey, failure);
+          rejectTurnResultWaiters(resultKey, failure);
+        } else {
+          /** 最终正文已经由同一旧 thread 的消息事件持久化；这里仅读取，不接纳迟到正文。 */
+          const answer = [...(options.conversations.getById(conversation.id)?.messages ?? [])].reverse().find((message) => message.providerTurnId === sealedProviderTurnId && message.role === 'assistant')?.content ?? '';
+          resolveTurnResult({
+            conversationId: conversation.id,
+            providerThreadId: threadId,
+            providerTurnId: sealedProviderTurnId,
+            status: terminalStatus === 'interrupted' ? 'interrupted' : 'completed',
+            answer,
+          });
+        }
+        sealedCompletionPayload = {
+          conversationId: conversation.id,
+          projectId: conversation.projectId,
+          providerThreadId: threadId,
+          providerTurnId: sealedProviderTurnId,
+          status: terminalStatus,
+          completedAt: event.receivedAt,
+          ...(failure ? { error: projectConversationTurnFailure(providerTurnFailureRecord(params, failure)) } : {}),
+          hasUnreadAttention: options.conversations.getById(conversation.id)?.attentionUnread === true,
+          notificationEligible: false,
+          generationId: event.generationId,
+          sequence: event.sequence,
+        };
+        sealedQueueChanged = terminalReconciliation.reconciledCount > 0;
+      }
+      for (const receiptEvent of receiptEvents) {
+        const receiptIdentity = codexProviderEventIdentity(receiptEvent);
+        options.receipts.record(providerEventReceipt(receiptEvent, receiptIdentity));
+        maintainProviderReceiptGenerations(receiptEvent.generationId);
+        rememberProcessedProviderEvent(receiptEvent, receiptIdentity);
+      }
+      await options.db.save();
+      if (sealedCompletionPayload) options.broadcast('conversation.turn.completed', sealedCompletionPayload);
+      if (sealedQueueChanged) {
+        options.broadcast('conversation.queue.changed', {
+          conversationId: conversation.id,
+          providerThreadId: conversation.providerThreadId,
+        });
+      }
+      return;
+    }
     options.execution.persistWarning({
       conversationId: eventSegment.conversationId,
       warningKind: 'late_external_activity',
@@ -239,6 +328,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
   let queueChangedAfterTurn = false;
   let sessionMetricsChanged = false;
   let createdPlanImplementationRequest: ZeusConversationPlanActionRecord | null = null;
+  /** 当前事件需要在耐久失败记录发布后启动的只读连接恢复。 */
+  let providerStreamRecovery: { conversationId: string; providerThreadId: string; providerTurnId: string } | null = null;
 
   function broadcastLinkedFileApprovalChanges(providerItemId: string, providerTurnId: string): void {
     if (!conversation) return;
@@ -447,20 +538,19 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       }
       options.conversations.bindProvider(conversation.id, { providerId: 'codex', providerThreadId: threadId, providerModel: conversation.providerModel, providerState: 'active' });
       runStates.set(conversation.id, { type: 'active', turnId: providerTurnId, phase: 'prework' });
-      if (!existingTurn) {
-        broadcast = {
-          type: 'conversation.turn.started',
-          payload: {
-            conversationId: conversation.id,
-            projectId: conversation.projectId,
-            providerThreadId: threadId,
-            providerTurnId,
-            ...(turn.clientSubmissionId ? { submissionId: turn.clientSubmissionId } : {}),
-            status: 'running',
-            startedAt: turn.startedAt ?? timestamp,
-          },
-        };
-      }
+      /** 队列会预建持久轮次；是否已有数据库记录不能决定 Renderer 是否收到开始通知。 */
+      broadcast = {
+        type: 'conversation.turn.started',
+        payload: {
+          conversationId: conversation.id,
+          projectId: conversation.projectId,
+          providerThreadId: threadId,
+          providerTurnId,
+          ...(turn.clientSubmissionId ? { submissionId: turn.clientSubmissionId } : {}),
+          status: 'running',
+          startedAt: turn.startedAt ?? timestamp,
+        },
+      };
     }
   } else if (event.method === 'turn/plan/updated' && conversation && threadId) {
     const providerTurnId = providerTurnIdFrom(params);
@@ -503,6 +593,13 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     modelRequestTiming.clear(conversation.id, turn.id);
     sessionMetricsChanged = true;
     const failure = failed ? providerTurnFailure(params, providerTurnId) : null;
+    /** 同一份官方失败记录同时驱动落库、展示和会话阻塞判断。 */
+    const failureRecord = failure ? providerTurnFailureRecord(params, failure) : undefined;
+    /** 外部服务类错误暂停会话；本地 Runtime 与工具错误仍保持真实失败。 */
+    const providerBlocked = failureRecord ? isProviderBlockingTurnFailure(failureRecord) : false;
+    if (failure && isProviderResponseStreamDisconnected(failure)) {
+      providerStreamRecovery = { conversationId: conversation.id, providerThreadId: threadId, providerTurnId };
+    }
     const turnItems = options.providerItems.listByConversation(conversation.id).filter((item) => item.turnId === turn.id);
     const completedTurnItems = turnItems.filter((item) => item.status === 'completed');
     for (const streamedItem of turnItems.filter((item) => item.status === 'in_progress')) {
@@ -571,7 +668,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const terminalTurn = options.turns.upsert({
       ...turn,
       status: terminalStatus,
-      ...(failure ? { error: providerTurnFailureRecord(params, failure) } : {}),
+      ...(failureRecord ? { error: failureRecord } : {}),
       completedAt: timestamp,
       updatedAt: timestamp,
     });
@@ -580,9 +677,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     options.changeSets.seal({ conversation, turn, timestamp });
     const submissions = options.submissions.listByConversation(conversation.id);
     const internalContextCompaction = turn.clientSubmissionId === null && turnItems.some((item) => item.itemType === 'contextCompaction');
-    const terminalReconciliation = internalContextCompaction
-      ? { primarySubmission: undefined, recoveryRequired: [], reconciledCount: 0 }
-      : reconcileTerminalTurnSubmissions(conversation, terminalTurn, timestamp, failure ? providerTurnFailureRecord(params, failure) : undefined);
+    const terminalReconciliation = internalContextCompaction ? { primarySubmission: undefined, recoveryRequired: [], reconciledCount: 0 } : reconcileTerminalTurnSubmissions(conversation, terminalTurn, timestamp, failureRecord);
     const activeSubmission = terminalReconciliation.primarySubmission;
     const recoveryRequiredSubmissions = terminalReconciliation.recoveryRequired;
     for (const submission of recoveryRequiredSubmissions) {
@@ -614,7 +709,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       providerId: 'codex',
       providerThreadId: threadId,
       providerModel: conversation.providerModel,
-      providerState: internalContextCompaction ? 'ready' : failed ? 'failed' : recoveryRequiredSubmissions.length > 0 || (interrupted && hasInterruptedQueue) ? 'paused' : 'ready',
+      providerState: internalContextCompaction ? 'ready' : failed ? (providerBlocked ? 'paused' : 'failed') : recoveryRequiredSubmissions.length > 0 || (interrupted && hasInterruptedQueue) ? 'paused' : 'ready',
     });
     const ephemeral = contexts.get(conversation.id)?.ephemeral === true;
     const conversationGoal = options.goals.get(conversation.id);
@@ -662,7 +757,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
         providerTurnId,
         status: terminalStatus,
         completedAt: timestamp,
-        ...(failure ? { error: projectConversationTurnFailure(providerTurnFailureRecord(params, failure)) } : {}),
+        ...(failureRecord ? { error: projectConversationTurnFailure(failureRecord) } : {}),
         hasUnreadAttention: options.conversations.getById(conversation.id)?.attentionUnread === true,
         notificationEligible: !internalContextCompaction && !conversationGoal,
         ...(internalContextCompaction ? { internalOperation: 'context_compaction' } : {}),
@@ -681,8 +776,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     // 兼容 app-server 不发送 rawResponseItem/completed 的版本：模型一旦产出工具、命令、
     // 文件变更等非文本项，本次请求即不能用总输出 Token 计算纯文本生成速率。
     if (isNonTextModelRequestOutput(itemType)) modelRequestTiming.observe(conversation.id, turn.id, event.receivedAt, 'non_text');
-    const userMessageProjection = itemType === 'userMessage' ? projectProviderUserMessage(conversation, turn, presentedItemPayload, itemText(itemPayload), providerItemId) : null;
+    const userMessageProjection = itemType === 'userMessage' ? projectProviderUserMessage(conversation, turn, presentedItemPayload, itemText(itemPayload), providerItemId, event.receivedAt) : null;
     if (itemType === 'userMessage' && !userMessageProjection) return;
+    if (userMessageProjection) presentedItemPayload.messageCreatedAt = userMessageProjection.messageCreatedAt;
     const item = userMessageProjection
       ? options.providerItems.upsertProgress({
           conversationId: conversation.id,
@@ -959,8 +1055,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const presentedItemPayload = sanitizeConversationItemPayload(itemPayload.type === 'userMessage' ? { ...itemPayload, ...submissionPresentation(conversation.id, turn, itemPayload) } : itemPayload);
     const itemType = itemTypeFromValue(itemPayload.type);
     const existing = options.providerItems.getByProvider(threadId, providerItemId);
-    const userMessageProjection = itemType === 'userMessage' ? projectProviderUserMessage(conversation, turn, presentedItemPayload, itemText(itemPayload), providerItemId) : null;
+    const userMessageProjection = itemType === 'userMessage' ? projectProviderUserMessage(conversation, turn, presentedItemPayload, itemText(itemPayload), providerItemId, event.receivedAt) : null;
     if (itemType === 'userMessage' && !userMessageProjection) return;
+    if (userMessageProjection) presentedItemPayload.messageCreatedAt = userMessageProjection.messageCreatedAt;
     const completedProjection = userMessageProjection
       ? { ...completedItemProjection(existing, presentedItemPayload, itemType), textContent: userMessageProjection.content }
       : completedItemProjection(existing, presentedItemPayload, itemType);
@@ -1133,12 +1230,16 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     };
   } else if (event.method === 'thread/settings/updated' && conversation) {
     const settings = isRecord(params.threadSettings) ? params.threadSettings : params;
+    /** 原生通知报告完整协作配置，持久化时只保留稳定的模式枚举。 */
+    const collaborationMode: 'plan' | 'default' | undefined =
+      isRecord(settings.collaborationMode) && (settings.collaborationMode.mode === 'plan' || settings.collaborationMode.mode === 'default') ? settings.collaborationMode.mode : undefined;
     const snapshot = {
       generationId: event.generationId,
       sequence: event.sequence,
       model: requireString(settings.model, 'provider settings model'),
       ...(typeof settings.effort === 'string' ? { effort: settings.effort } : {}),
       ...(Object.prototype.hasOwnProperty.call(settings, 'serviceTier') && (settings.serviceTier === null || typeof settings.serviceTier === 'string') ? { serviceTier: settings.serviceTier } : {}),
+      ...(collaborationMode ? { collaborationMode } : {}),
     };
     options.conversations.upsertProviderSettingsSnapshot(conversation.id, snapshot);
     if (Object.prototype.hasOwnProperty.call(snapshot, 'serviceTier')) {
@@ -1172,7 +1273,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       }
     }
     const settings = options.conversations.getProviderSettingsSnapshot(conversation.id);
-    const model = context?.model ?? settings?.model ?? conversation.providerModel;
+    const model = typeof params.model === 'string' ? params.model : (context?.model ?? settings?.model ?? conversation.providerModel);
     if (!model) throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', 'Raw response event cannot resolve its model.');
     const usage = isRecord(params.usage) ? tokenUsageBreakdown(params.usage) : null;
     /** 原始响应按真实请求身份固定费用，后续累计通知不能重定价。 */
@@ -1186,30 +1287,30 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
             requestId: providerRequestId,
             model,
             modelSourceId: context?.modelSourceId ?? conversation.modelSourceId,
-            serviceTier: typeof params.serviceTier === 'string' ? params.serviceTier : (context?.serviceTier ?? settings?.serviceTier),
+            serviceTier: Object.prototype.hasOwnProperty.call(params, 'serviceTier') && (params.serviceTier === null || typeof params.serviceTier === 'string') ? params.serviceTier : (settings?.serviceTier ?? context?.serviceTier ?? null),
             usage,
             occurredAt: event.receivedAt,
           })
         : null;
-    const timing = modelRequestTiming.complete(conversation.id, turn.id);
-    const completedAt = event.receivedAt;
-    const measurementComplete = usage !== null && timing.firstTextOutputAt !== null && Date.parse(completedAt) > Date.parse(timing.firstTextOutputAt) && !timing.hasNonTextOutput;
     const recordedRequests = options.execution.listModelRequestsForTurn(conversation.id, turn.id);
-    const matchingFallback = usage
-      ? [...recordedRequests]
-          .reverse()
-          .find(
-            (request) =>
-              request.providerRequestId === null &&
-              request.inputTokens === usage.inputTokens &&
-              request.cachedInputTokens === usage.cachedInputTokens &&
-              request.cacheWriteInputTokens === usage.cacheWriteInputTokens &&
-              request.outputTokens === usage.outputTokens &&
-              request.reasoningOutputTokens === usage.reasoningOutputTokens &&
-              request.totalTokens === usage.totalTokens,
-          )
-      : undefined;
+    /** 费用账本已确认的内部身份同时用于请求观测；歧义不得另造一条请求。 */
+    const canonicalRequestId = requestEstimate ? requestEstimate.requestId : providerRequestId;
+    /** 老记录仍按真实响应身份识别，新记录按账本统一身份识别。 */
+    const observationIdentity = `codex-request:${threadId}:${canonicalRequestId}`;
+    /** 只按已确认的身份关联，避免用相同 Token 数覆盖另一请求的时序。 */
+    const matchingFallback = recordedRequests.find((request) => request.providerRequestId === providerRequestId || (canonicalRequestId !== null && request.id === conversationModelRequestId(conversation.id, observationIdentity)));
+    /** 迟到的另一类通知只补身份，不能清空已经开始的下一请求时序。 */
+    const timing = matchingFallback
+      ? { firstVisibleOutputAt: matchingFallback.firstVisibleOutputAt, firstTextOutputAt: matchingFallback.firstTextOutputAt, hasNonTextOutput: !matchingFallback.measurementComplete }
+      : canonicalRequestId === null
+        ? { firstVisibleOutputAt: null, firstTextOutputAt: null, hasNonTextOutput: true }
+        : modelRequestTiming.complete(conversation.id, turn.id);
+    /** 已观测请求保留其完成时间，重放不改变性能统计。 */
+    const completedAt = matchingFallback?.completedAt ?? event.receivedAt;
+    /** 仅纯文本且起止边界完整的请求可以参与速度统计。 */
+    const measurementComplete = usage !== null && timing.firstTextOutputAt !== null && Date.parse(completedAt) > Date.parse(timing.firstTextOutputAt) && !timing.hasNonTextOutput;
     if (matchingFallback) {
+      options.execution.enrichModelRequest(matchingFallback.id, { estimatedUsd: requestEstimate?.apiEquivalentUsd ?? null });
       options.execution.attachModelRequestMeasurement(matchingFallback.id, {
         providerRequestId,
         firstVisibleOutputAt: timing.firstVisibleOutputAt,
@@ -1217,14 +1318,14 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
         completedAt,
         measurementComplete,
       });
-    } else {
+    } else if (canonicalRequestId !== null) {
       const exactRequestCount = recordedRequests.filter((request) => request.providerRequestId !== null).length;
       options.execution.observeModelRequest({
         conversationId: conversation.id,
         turnId: turn.id,
         segmentId: segment.id,
         requestKind: exactRequestCount === 0 ? 'inference' : 'tool_continuation',
-        observationIdentity: `codex-response:${threadId}:${providerRequestId}`,
+        observationIdentity,
         modelId: model,
         contextWindow: null,
         inputTokens: usage?.inputTokens ?? null,
@@ -1262,16 +1363,37 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const settings = options.conversations.getProviderSettingsSnapshot(conversation.id);
     const eventServiceTier = Object.prototype.hasOwnProperty.call(tokenUsage, 'serviceTier') && (tokenUsage.serviceTier === null || typeof tokenUsage.serviceTier === 'string') ? tokenUsage.serviceTier : undefined;
     const actualServiceTier = eventServiceTier !== undefined ? eventServiceTier : settings && Object.prototype.hasOwnProperty.call(settings, 'serviceTier') ? (settings.serviceTier ?? null) : (context?.serviceTier ?? null);
-    const model = context?.model ?? settings?.model ?? conversation.providerModel;
+    const model = typeof tokenUsage.model === 'string' ? tokenUsage.model : (context?.model ?? settings?.model ?? conversation.providerModel);
     if (!model) throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', 'Token usage event cannot resolve its model.');
     const modelContextWindow = tokenUsage.modelContextWindow === null || tokenUsage.modelContextWindow === undefined ? null : requireNumber(tokenUsage.modelContextWindow, 'modelContextWindow');
+    /** 用原生线程和累计进度固化身份，容量通知和事件重放不能再产生新费用。 */
+    const observationId = codexUsageObservationIdentity(requireString(threadId, 'provider thread id'), providerTurnId, total);
+    /** 仅明确包含单请求用量的通知参与计价；累计量不能冒充一次请求。 */
+    const requestEstimate =
+      options.usage && isRecord(tokenUsage.last) && last.totalTokens > 0
+        ? await options.usage.recordRequest({
+            projectId: conversation.projectId,
+            conversationId: conversation.id,
+            providerThreadId: threadId!,
+            providerTurnId,
+            requestId: observationId,
+            observationId,
+            model,
+            modelSourceId: context?.modelSourceId ?? conversation.modelSourceId,
+            serviceTier: actualServiceTier,
+            usage: last,
+            occurredAt: event.receivedAt,
+          })
+        : null;
+    /** 有账本时以其关联结果为准；无账本时仅保留用量观测。 */
+    const canonicalRequestId = requestEstimate ? requestEstimate.requestId : isRecord(tokenUsage.last) && last.totalTokens > 0 ? observationId : null;
     const snapshot: NativeTokenUsageSnapshot = options.usage
       ? await options.usage.recordTurn({
           generationId: event.generationId,
           sequence: event.sequence,
           projectId: conversation.projectId,
           conversationId: conversation.id,
-          providerThreadId: requireString(conversation.providerThreadId, 'provider thread id'),
+          providerThreadId: requireString(threadId, 'provider thread id'),
           providerTurnId,
           model,
           modelSourceId: context?.modelSourceId ?? conversation.modelSourceId,
@@ -1300,24 +1422,16 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
         };
     options.conversations.upsertProviderTokenUsageSnapshot(conversation.id, snapshot);
     const segment = threadId ? options.execution.segmentByNativeSession(threadId, conversation.id) : undefined;
-    if (segment && turn) {
+    if (segment && turn && canonicalRequestId !== null) {
       const recordedRequests = options.execution.listModelRequestsForTurn(conversation.id, turn.id);
-      const latestRecordedRequest = recordedRequests.at(-1);
       // 用最近的模型产物划分请求边界；同轮曾经压缩不代表后续正常回答也是压缩。
       const turnModelItems = options.providerItems.listByConversation(conversation.id).filter((item) => item.turnId === turn.id && item.itemType !== 'userMessage');
       const latestModelItem = turnModelItems.reduce<ZeusConversationItemRecord | undefined>((latest, item) => (!latest || item.updatedAt > latest.updatedAt ? item : latest), undefined);
       const contextCompactionRequest = turnModelItems.some((item) => item.itemType === 'contextCompaction' && item.status === 'in_progress') || latestModelItem?.itemType === 'contextCompaction';
-      const exactRequest =
-        latestRecordedRequest &&
-        latestRecordedRequest.providerRequestId !== null &&
-        latestRecordedRequest.inputTokens === last.inputTokens &&
-        latestRecordedRequest.cachedInputTokens === last.cachedInputTokens &&
-        latestRecordedRequest.cacheWriteInputTokens === last.cacheWriteInputTokens &&
-        latestRecordedRequest.outputTokens === last.outputTokens &&
-        latestRecordedRequest.reasoningOutputTokens === last.reasoningOutputTokens &&
-        latestRecordedRequest.totalTokens === last.totalTokens
-          ? latestRecordedRequest
-          : undefined;
+      /** 复用两类事件已经对齐的内部请求身份。 */
+      const observationIdentity = `codex-request:${threadId}:${canonicalRequestId}`;
+      /** 重复累计通知只补信息，不清空下一请求的时序跟踪器。 */
+      const exactRequest = recordedRequests.find((request) => request.id === conversationModelRequestId(conversation.id, observationIdentity) || request.providerRequestId === canonicalRequestId);
       // 显式请求类型优先；兼容事件根据当前产物判别，压缩后的首次回答仍属于推理。
       const requestKind =
         tokenUsage.requestKind === 'context_compaction'
@@ -1334,7 +1448,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
                     ? 'tool_continuation'
                     : 'inference';
       if (exactRequest) {
-        options.execution.enrichModelRequest(exactRequest.id, { contextWindow: modelContextWindow, estimatedUsd: snapshot.lastApiEquivalentUsd });
+        options.execution.enrichModelRequest(exactRequest.id, { contextWindow: modelContextWindow, estimatedUsd: requestEstimate?.apiEquivalentUsd ?? null });
       } else {
         // 当前 Codex app-server 的兼容协议会在每个模型请求及其工具输出完成后发送
         // tokenUsage/updated，但不发送 rawResponse/completed。只有本段没有非文本输出时，
@@ -1348,7 +1462,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
           segmentId: segment.id,
           requestKind,
           // 老版本 app-server 没有 rawResponse 事件时仍保留精确用量，但不伪造请求时序。
-          observationIdentity: `codex:${providerTurnId}:${JSON.stringify([last.inputTokens, last.cachedInputTokens, last.cacheWriteInputTokens, last.outputTokens, last.reasoningOutputTokens, last.totalTokens, modelContextWindow])}`,
+          observationIdentity,
           modelId: model,
           contextWindow: modelContextWindow,
           inputTokens: last.inputTokens,
@@ -1357,7 +1471,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
           outputTokens: last.outputTokens,
           reasoningOutputTokens: last.reasoningOutputTokens,
           totalTokens: last.totalTokens,
-          estimatedUsd: snapshot.lastApiEquivalentUsd,
+          estimatedUsd: requestEstimate?.apiEquivalentUsd ?? null,
           usageComplete: true,
           providerRequestId: null,
           firstVisibleOutputAt: timing.firstVisibleOutputAt,
@@ -1607,6 +1721,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       conversationId: conversation.id,
       providerThreadId: conversation.providerThreadId,
     });
+  }
+  if (providerStreamRecovery) {
+    recoverProviderStreamFailure(providerStreamRecovery.conversationId, providerStreamRecovery.providerThreadId, providerStreamRecovery.providerTurnId);
   }
   if (drainAfterTurn && conversation) await drainQueuedSubmissions();
 }

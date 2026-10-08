@@ -11,7 +11,6 @@ import type {
   DigitalEmployeeAutomationRecord,
   DigitalEmployeeCollaborationProjection,
   DigitalEmployeeExecutionRecord,
-  DigitalEmployeeInput,
   DigitalEmployeeRecord,
   DigitalEmployeeStageDecisionInput,
   DigitalEmployeeTemplateInput,
@@ -51,13 +50,12 @@ export interface DigitalEmployeeApiClient {
   saveEmployeeTeamRecipe(input: EmployeeTeamRecipe): Promise<EmployeeTeamRecipe>;
   loadDigitalEmployeeCapabilities(): Promise<DigitalEmployeeCapabilitiesSnapshot>;
   loadDigitalEmployeeTemplates(): Promise<DigitalEmployeeTemplateRecord[]>;
+  /** 只读取已创建的跨项目员工，不包含内置模板。 */
+  loadGlobalDigitalEmployees(): Promise<DigitalEmployeeTemplateRecord[]>;
   createDigitalEmployeeTemplate(input: DigitalEmployeeTemplateInput): Promise<DigitalEmployeeTemplateRecord>;
   updateDigitalEmployeeTemplate(templateId: string, expectedRevision: number, input: Partial<DigitalEmployeeTemplateInput>): Promise<DigitalEmployeeTemplateRecord>;
   deleteDigitalEmployeeTemplate(templateId: string, expectedRevision: number): Promise<DigitalEmployeeTemplateRecord>;
-  loadProjectDigitalEmployees(projectId: string): Promise<DigitalEmployeeRecord[]>;
-  createProjectDigitalEmployee(projectId: string, input: { templateId: string; overrides?: Partial<DigitalEmployeeInput> } | DigitalEmployeeInput): Promise<DigitalEmployeeRecord>;
-  updateProjectDigitalEmployee(projectId: string, employeeId: string, expectedRevision: number, input: Partial<DigitalEmployeeInput>): Promise<DigitalEmployeeRecord>;
-  deleteProjectDigitalEmployee(projectId: string, employeeId: string, expectedRevision: number): Promise<DigitalEmployeeRecord>;
+  loadProjectDigitalEmployees(projectId: string, available?: boolean): Promise<DigitalEmployeeRecord[]>;
   loadDigitalEmployeeAutomations(projectId: string): Promise<DigitalEmployeeAutomationRecord[]>;
   createDigitalEmployeeAutomation(projectId: string, input: DigitalEmployeeAutomationInput): Promise<DigitalEmployeeAutomationRecord>;
   updateDigitalEmployeeAutomation(projectId: string, automationId: string, expectedRevision: number, input: Partial<Omit<DigitalEmployeeAutomationInput, 'employeeId'>>): Promise<DigitalEmployeeAutomationRecord>;
@@ -68,10 +66,7 @@ export interface DigitalEmployeeApiClient {
   loadTaskDigitalEmployeeCollaboration(taskId: string): Promise<DigitalEmployeeCollaborationProjection>;
   assignTaskToDigitalEmployee(taskId: string, employeeId: string): Promise<DigitalEmployeeExecutionRecord>;
   retryDigitalEmployeeExecution(executionId: string, taskId: string): Promise<DigitalEmployeeExecutionRecord>;
-  retryStagedDigitalEmployeeExecution(executionId: string, taskId: string, input: { targetEmployeeId: string; expectedExecutionRevision: number }): Promise<DigitalEmployeeExecutionRecord>;
   cancelDigitalEmployeeExecution(executionId: string, taskId: string): Promise<DigitalEmployeeExecutionRecord>;
-  handoffDigitalEmployeeExecution(executionId: string, taskId: string, input: DigitalEmployeeStageDecisionInput & { targetEmployeeId: string }): Promise<DigitalEmployeeExecutionRecord>;
-  reworkDigitalEmployeeExecution(executionId: string, taskId: string, input: DigitalEmployeeStageDecisionInput & { targetEmployeeId: string; reason: string }): Promise<DigitalEmployeeExecutionRecord>;
   finalizeDigitalEmployeeExecution(executionId: string, taskId: string, input: DigitalEmployeeStageDecisionInput): Promise<DigitalEmployeeExecutionRecord>;
   adoptLegacyDigitalEmployeeExecution(executionId: string, taskId: string, expectedExecutionRevision: number): Promise<DigitalEmployeeExecutionRecord>;
   loadDigitalEmployeeDeliverableContent(taskId: string, deliverableId: string): Promise<{ content: string }>;
@@ -79,7 +74,8 @@ export interface DigitalEmployeeApiClient {
   loadTaskWorkDeliverableContent(taskId: string, deliverableId: string): Promise<{ deliverableId: string; version: number; contentSha256: string; content: string }>;
   loadTaskWorkCommandEvidence(runId: string): Promise<CommandRunDetail>;
   previewTaskWorkItem(taskId: string, input: TaskWorkPreviewSelection): Promise<TaskWorkPreview>;
-  createTaskWorkItem(taskId: string, preview: TaskWorkPreview): Promise<{ item: TaskWorkItemRecord; run: TaskWorkItemRecord['runs'][number] }>;
+  /** 已配置项目流程时返回真实流程身份，否则返回独立工作运行。 */
+  createTaskWorkItem(taskId: string, preview: TaskWorkPreview): Promise<{ item: TaskWorkItemRecord; run: TaskWorkItemRecord['runs'][number] } | { workflowRunId: string }>;
   acceptTaskWorkDeliverable(taskId: string, deliverable: TaskWorkDeliverableRecord): Promise<unknown>;
   requestTaskWorkDeliverableChanges(taskId: string, deliverable: TaskWorkDeliverableRecord, reason: string): Promise<unknown>;
   retryTaskWorkItem(taskId: string, item: TaskWorkItemRecord): Promise<unknown>;
@@ -106,6 +102,7 @@ export function createDigitalEmployeeApiClient(transport: LocalApiTransport): Di
     },
     loadDigitalEmployeeCapabilities: () => transport.request('/api/digital-employee-capabilities'),
     loadDigitalEmployeeTemplates: () => transport.request('/api/digital-employee-templates'),
+    loadGlobalDigitalEmployees: () => transport.request('/api/digital-employees'),
     createDigitalEmployeeTemplate: async (input) => {
       const body = await command(workManagementClientCommandTypes.digitalEmployeeTemplateCreate, 'settings', () => 'digital-employee-templates', 'digital_employee_template_', input);
       return transport.request('/api/digital-employee-templates', jsonRequest('POST', body));
@@ -120,21 +117,7 @@ export function createDigitalEmployeeApiClient(transport: LocalApiTransport): Di
       const body = await command(workManagementClientCommandTypes.digitalEmployeeTemplateDelete, 'settings', () => `digital-employee-template:${templateId}`, 'digital_employee_template_delete_', value, expectedRevision);
       return transport.request(`/api/digital-employee-templates/${encodeURIComponent(templateId)}`, jsonRequest('DELETE', body));
     },
-    loadProjectDigitalEmployees: (projectId) => transport.request(`${projectPath(projectId)}/digital-employees`),
-    createProjectDigitalEmployee: async (projectId, input) => {
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeCreate, 'project', () => projectId, 'digital_employee_', input);
-      return transport.request(`${projectPath(projectId)}/digital-employees`, jsonRequest('POST', body));
-    },
-    updateProjectDigitalEmployee: async (projectId, employeeId, expectedRevision, input) => {
-      const value = { ...input, expectedRevision };
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeUpdate, 'project', () => projectId, 'digital_employee_update_', value, expectedRevision);
-      return transport.request(`${projectPath(projectId)}/digital-employees/${encodeURIComponent(employeeId)}`, jsonRequest('PATCH', body));
-    },
-    deleteProjectDigitalEmployee: async (projectId, employeeId, expectedRevision) => {
-      const value = { expectedRevision };
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeDelete, 'project', () => projectId, 'digital_employee_delete_', value, expectedRevision);
-      return transport.request(`${projectPath(projectId)}/digital-employees/${encodeURIComponent(employeeId)}`, jsonRequest('DELETE', body));
-    },
+    loadProjectDigitalEmployees: (projectId, available) => transport.request(`${projectPath(projectId)}/digital-employees${available ? '?available=true' : ''}`),
     loadDigitalEmployeeAutomations: (projectId) => transport.request(`${projectPath(projectId)}/digital-employee-automations`),
     createDigitalEmployeeAutomation: async (projectId, input) => {
       const body = await command(workManagementClientCommandTypes.digitalEmployeeAutomationCreate, 'project', () => projectId, 'digital_employee_automation_', input);
@@ -165,21 +148,9 @@ export function createDigitalEmployeeApiClient(transport: LocalApiTransport): Di
       const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionRetry, 'task', () => taskId, 'digital_employee_execution_retry_', {});
       return transport.request(`/api/digital-employee-executions/${encodeURIComponent(executionId)}/retry`, jsonRequest('POST', body));
     },
-    retryStagedDigitalEmployeeExecution: async (executionId, taskId, input) => {
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionRetry, 'task', () => taskId, 'digital_employee_stage_retry_', input, input.expectedExecutionRevision);
-      return transport.request(`${taskPath(taskId)}/digital-employee-executions/${encodeURIComponent(executionId)}/retries`, jsonRequest('POST', body));
-    },
     cancelDigitalEmployeeExecution: async (executionId, taskId) => {
       const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionCancel, 'task', () => taskId, 'digital_employee_execution_cancel_', {});
       return transport.request(`/api/digital-employee-executions/${encodeURIComponent(executionId)}/cancel`, jsonRequest('POST', body));
-    },
-    handoffDigitalEmployeeExecution: async (executionId, taskId, input) => {
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionHandoff, 'task', () => taskId, 'digital_employee_handoff_', input, input.expectedExecutionRevision);
-      return transport.request(`${taskPath(taskId)}/digital-employee-executions/${encodeURIComponent(executionId)}/handoffs`, jsonRequest('POST', body));
-    },
-    reworkDigitalEmployeeExecution: async (executionId, taskId, input) => {
-      const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionRework, 'task', () => taskId, 'digital_employee_rework_', input, input.expectedExecutionRevision);
-      return transport.request(`${taskPath(taskId)}/digital-employee-executions/${encodeURIComponent(executionId)}/reworks`, jsonRequest('POST', body));
     },
     finalizeDigitalEmployeeExecution: async (executionId, taskId, input) => {
       const body = await command(workManagementClientCommandTypes.digitalEmployeeExecutionFinalize, 'task', () => taskId, 'digital_employee_finalize_', input, input.expectedExecutionRevision);

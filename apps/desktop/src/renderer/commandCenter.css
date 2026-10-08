@@ -852,3 +852,369 @@
     animation: none;
   }
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+
+.command-run-details > summary::-webkit-details-marker,
+.command-parameter-help > summary::-webkit-details-marker {
+  display: none;
+}
+.command-run-details > summary > svg {
+  color: var(--zeus-control-muted-text);
+  flex: 0 0 auto;
+  height: 12px;
+  transform: rotate(-90deg);
+  transition: transform 120ms ease-out;
+  width: 12px;
+}
+.command-run-details[open] > summary > svg {
+  transform: rotate(0deg);
+}
+.command-run-details > summary:focus-visible,
+.command-parameter-help > summary:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--zeus-focus-line);
+  outline-offset: 2px;
+}
+.command-definition-management {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  min-width: 68px;
+}
+.command-definition-actions .command-definition-icon-action {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--zeus-control-muted-text);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  gap: 4px;
+  justify-content: center;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 6px;
+}
+.command-definition-icon-action > svg {
+  height: 16px;
+  width: 16px;
+}
+.command-definition-icon-action:hover:not(:disabled) {
+  background: var(--zeus-interaction-hover);
+}
+.command-definition-icon-action:disabled {
+  cursor: default;
+  opacity: 0.48;
+}
+.command-definition-icon-action[data-confirm='true'] {
+  color: var(--zeus-control-danger-text);
+}
+.command-definition-details {
+  color: var(--zeus-control-muted-text);
+  display: grid;
+  font-size: 12px;
+  gap: 10px;
+  line-height: 1.55;
+  min-width: 0;
+  padding: 10px 0 4px 20px;
+}
+.command-definition-details > code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.command-definition-details dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0;
+}
+.command-definition-details dl > div {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+.command-definition-details dd {
+  color: var(--zeus-control-text);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.command-run-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.command-run-detail-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+}
+.command-run-failure-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.command-run-disclosure-label {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 11px;
+  gap: 4px;
+}
+.command-run-failure[open] .command-run-disclosure-label > svg {
+  transform: rotate(180deg);
+}
+.command-run-log-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+.command-run-log-action {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: #cbd5e1;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  gap: 6px;
+  justify-content: center;
+  min-block-size: 28px;
+  padding: 4px 7px;
+}
+.command-run-log-action:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--zeus-interaction-hover);
+  border-color: var(--zeus-interaction-line);
+  color: #f8fafc;
+}
+.command-run-log-action:active:not(:disabled) {
+  background: var(--zeus-interaction-pressed);
+}
+.command-run-log-action:focus-visible {
+  box-shadow: var(--zeus-control-focus);
+  outline: 0;
+}
+.command-run-log-action:disabled {
+  cursor: default;
+  opacity: 0.48;
+}
+.command-run-log-action[data-copy-state='copied'] {
+  /* 日志工具栏始终为深色，复制成功采用品牌亮色。 */
+  color: color-mix(in srgb, var(--zeus-brand-highlight) 80%, white) !important;
+}
+.command-run-log-action:is([data-copy-state='too_large'], [data-copy-state='failed']) {
+  color: #fecaca !important;
+}
+.command-run-log-action svg {
+  block-size: 15px;
+  flex: 0 0 auto;
+  inline-size: 15px;
+}
+.command-run-file-menu {
+  background: var(--zeus-solid-surface-bg);
+  border: 1px solid var(--zeus-control-border);
+  border-radius: 10px;
+  box-sizing: border-box;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 18%);
+  color: var(--zeus-control-text);
+  font-size: 12px;
+  padding: 5px;
+  pointer-events: auto;
+  position: fixed;
+  z-index: 1;
+}
+.command-run-file-menu > button {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  gap: 9px;
+  min-height: 46px;
+  padding: 7px 9px;
+  text-align: left;
+  width: 100%;
+}
+.command-run-file-menu > button:is(:hover, :focus-visible):not(:disabled) {
+  background: var(--zeus-source-list-selected);
+  outline: 0;
+}
+.command-run-file-menu > button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.command-run-file-menu > button > svg {
+  flex: 0 0 auto;
+  height: 16px;
+  width: 16px;
+}
+.command-run-file-menu > button > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.command-run-file-menu strong {
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.command-run-file-menu small {
+  color: var(--zeus-control-muted-text);
+  font-size: 11px;
+}
+.command-run-file-menu > p {
+  color: var(--zeus-control-danger-text);
+  font-size: 11px;
+  padding: 7px 9px;
+}
+.command-run-modal.command-modal {
+  width: min(520px, calc(100vw - 40px));
+}
+.command-run-modal h3 {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.command-run-body {
+  gap: 20px;
+  padding-top: 6px;
+}
+.command-run-context {
+  align-items: center;
+  color: var(--zeus-control-muted-text);
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.command-run-context > svg {
+  flex: 0 0 auto;
+  height: 16px;
+  width: 16px;
+}
+.command-run-context > span {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.command-run-context > small {
+  flex: 0 0 auto;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.command-run-parameters {
+  display: grid;
+  gap: 14px;
+}
+.command-run-parameters:empty {
+  display: none;
+}
+.command-run-parameter {
+  display: grid;
+  gap: 5px;
+}
+.command-run-parameter-heading {
+  min-height: 24px;
+  padding-right: 28px;
+  position: relative;
+}
+.command-run-parameter-heading > label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  padding-top: 3px;
+}
+.command-run-required {
+  color: var(--zeus-control-danger-text);
+}
+.command-parameter-help > summary {
+  align-items: center;
+  color: var(--zeus-control-muted-text);
+  cursor: pointer;
+  display: flex;
+  height: 24px;
+  justify-content: center;
+  list-style: none;
+  min-block-size: 24px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 24px;
+}
+.command-parameter-help > summary > svg {
+  height: 15px;
+  width: 15px;
+}
+.command-parameter-help > div {
+  color: var(--zeus-control-muted-text);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding-top: 6px;
+}
+.command-parameter-help code {
+  font-size: 10px;
+}
+.command-parameter-help p {
+  margin-top: 3px;
+}
+.command-run-parameter[data-type='boolean'] {
+  align-items: start;
+  grid-template-columns: minmax(0, 1fr) 18px;
+}
+.command-run-parameter[data-type='boolean'] > input {
+  margin: 3px 0 0;
+}
+.command-run-details > summary {
+  align-items: center;
+  color: var(--zeus-control-muted-text);
+  cursor: pointer;
+  display: flex;
+  font-size: 12px;
+  gap: 7px;
+  list-style: none;
+}
+.command-run-risk {
+  align-items: flex-start;
+  color: var(--zeus-control-danger-text);
+  display: flex;
+  font-size: 12px;
+  gap: 7px;
+  line-height: 1.5;
+}
+.command-run-risk > svg {
+  flex: 0 0 auto;
+  height: 16px;
+  margin-top: 1px;
+  width: 16px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .command-run-details > summary > svg {
+    transition: none;
+  }
+}

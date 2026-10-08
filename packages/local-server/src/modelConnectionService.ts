@@ -12,6 +12,7 @@ import {
   normalizeStoredModelConnections,
   auditConfiguredModelReasoningLevels,
   probeConfiguredModel,
+  probeConfiguredModelConnectivity,
   generateConfiguredModelText,
   syncDiscoveredModels,
   isPiThinkingLevel,
@@ -59,10 +60,14 @@ export interface ModelConnectionDiagnostic {
   /** 检查失败保留底层原因，不改变检查结果或错误码。 */
   cause?: UserFacingErrorCause;
   ok: boolean;
-  stage: 'configuration' | 'credential' | 'catalog';
+  stage: 'configuration' | 'credential' | 'inference';
   code: string;
   message: string;
+  /** 从诊断开始到真实模型请求完成或失败的毫秒数。 */
+  latencyMs: number;
   checkedAt: string;
+  /** 本次真实请求选择的模型；未进入请求阶段时为空。 */
+  testedModelId: string | null;
   discoveredModelCount: number | null;
 }
 
@@ -99,6 +104,11 @@ const modelConnectionsSettingKey = 'models.connections';
 const maximumProbeModelCount = 12;
 /** 探测并发上限：兼顾墙钟时间与供应商限流，避免一次点击把并发全部打满。 */
 const probeConcurrency = 3;
+
+/** 诊断耗时使用单调时钟，系统时间调整不会产生负数。 */
+function diagnosticLatency(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
 
 /** 模型连接元数据进 SQLite settings，API Key 只进 SecretStore。 */
 export function createModelConnectionService(options: {
@@ -320,19 +330,72 @@ export function createModelConnectionService(options: {
       return { connection: updated, results, skippedModelIds: enabledModels.slice(maximumProbeModelCount).map((model) => model.id), checkedAt: now() };
     },
     async diagnose(id) {
+      /** 延迟覆盖连接读取、钥匙串读取和真实模型请求。 */
+      const startedAt = performance.now();
       const checkedAt = now();
       let connection: ModelConnectionRecord;
       try {
         connection = await requireConnection(id);
       } catch (error) {
-        return { ok: false, stage: 'configuration', code: readServiceCode(error), cause: userFacingErrorCause(error), message: error instanceof Error ? error.message : '连接配置无效。', checkedAt, discoveredModelCount: null };
+        return {
+          ok: false,
+          stage: 'configuration',
+          code: readServiceCode(error),
+          cause: userFacingErrorCause(error),
+          message: error instanceof Error ? error.message : '连接配置无效。',
+          latencyMs: diagnosticLatency(startedAt),
+          checkedAt,
+          testedModelId: null,
+          discoveredModelCount: null,
+        };
       }
-      if (!connection.apiKeyConfigured) return { ok: false, stage: 'credential', code: 'ZEUS_MODEL_API_KEY_REQUIRED', message: '连接配置有效，但尚未配置 API Key。', checkedAt, discoveredModelCount: null };
+      const model = connection.models.find((candidate) => candidate.enabled);
+      if (!model)
+        return { ok: false, stage: 'configuration', code: 'ZEUS_MODEL_ENABLED_REQUIRED', message: '请先为该连接启用至少一个模型。', latencyMs: diagnosticLatency(startedAt), checkedAt, testedModelId: null, discoveredModelCount: null };
+      /** 钥匙串读取失败属于当前连接结论，不应把整条本地命令留在结果未知。 */
+      let apiKey: string | null | undefined;
       try {
-        const modelIds = await fetchModelIds(connection);
-        return { ok: true, stage: 'catalog', code: 'ZEUS_MODEL_CATALOG_AVAILABLE', message: `连接成功并发现 ${modelIds.length} 个模型 ID；这不代表工具调用等能力已经通过。`, checkedAt, discoveredModelCount: modelIds.length };
+        apiKey = connection.apiKeyConfigured ? await options.secretStore.getSecret(modelConnectionSecretAccount(id)) : null;
       } catch (error) {
-        return { ok: false, stage: 'catalog', code: readServiceCode(error), cause: userFacingErrorCause(error), message: error instanceof Error ? error.message : '模型目录请求失败。', checkedAt, discoveredModelCount: null };
+        return {
+          ok: false,
+          stage: 'credential',
+          code: readServiceCode(error),
+          cause: userFacingErrorCause(error),
+          message: error instanceof Error ? error.message : '无法读取已保存的 API Key。',
+          latencyMs: diagnosticLatency(startedAt),
+          checkedAt,
+          testedModelId: null,
+          discoveredModelCount: null,
+        };
+      }
+      if (!apiKey)
+        return { ok: false, stage: 'credential', code: 'ZEUS_MODEL_API_KEY_REQUIRED', message: '连接配置有效，但尚未配置 API Key。', latencyMs: diagnosticLatency(startedAt), checkedAt, testedModelId: null, discoveredModelCount: null };
+      try {
+        /** 只测第一个启用模型；一次连接检查只产生一次最小真实请求。 */
+        const result = await probeConfiguredModelConnectivity({ connection, model, apiKey, ...(options.fetch ? { fetch: options.fetch } : {}) });
+        return {
+          ok: result.ok,
+          stage: 'inference',
+          code: result.ok ? 'ZEUS_MODEL_INFERENCE_AVAILABLE' : 'ZEUS_MODEL_INFERENCE_FAILED',
+          message: result.ok ? `${result.message} 这证明当前连接可发起对话，不代表图片或工具调用可用。` : result.message,
+          latencyMs: diagnosticLatency(startedAt),
+          checkedAt,
+          testedModelId: result.servedModelId ?? model.id,
+          discoveredModelCount: null,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          stage: 'inference',
+          code: readServiceCode(error),
+          cause: userFacingErrorCause(error),
+          message: error instanceof Error ? error.message : '真实模型请求失败。',
+          latencyMs: diagnosticLatency(startedAt),
+          checkedAt,
+          testedModelId: model.id,
+          discoveredModelCount: null,
+        };
       }
     },
     async listSelectableModels() {

@@ -253,6 +253,8 @@ export interface ConversationProviderSettingsSnapshot extends ProviderSequenceSn
   model: string;
   effort?: string;
   serviceTier?: string | null;
+  /** Provider 线程最近明确回报的实际协作模式。 */
+  collaborationMode?: 'plan' | 'default';
 }
 
 export interface ConversationProviderTokenUsageSnapshot extends ProviderSequenceSnapshot {
@@ -603,8 +605,10 @@ export function deriveConversationStageProjection(db: ZeusDatabasePort, conversa
     transport_kind: ConversationTransportKind;
     status: string;
     provider_state: ConversationProviderState;
+    provider_thread_id: string | null;
+    agent_kind: ConversationAgentKind | null;
     created_at: string;
-  }>(`SELECT archived, transport_kind, status, provider_state, created_at FROM conversations WHERE id = ?`, [conversationId]);
+  }>(`SELECT archived, transport_kind, status, provider_state, provider_thread_id, agent_kind, created_at FROM conversations WHERE id = ?`, [conversationId]);
   if (!conversation) return null;
   if (conversation.archived === 1 || conversation.provider_state === 'archived') return { stage: 'archived', evidenceAt: conversation.created_at };
 
@@ -622,12 +626,33 @@ export function deriveConversationStageProjection(db: ZeusDatabasePort, conversa
     };
   }
 
-  const activeTurn = db.get<{ started_at: string | null; updated_at: string }>(`SELECT started_at, updated_at FROM conversation_turns WHERE conversation_id = ? AND status = 'running' ORDER BY updated_at DESC, id DESC LIMIT 1`, [
-    conversationId,
-  ]);
+  /** Codex 只以当前 Provider thread 的轮次计算阶段，sealed thread 仅保留历史。 */
+  const activeTurn = db.get<{ started_at: string | null; updated_at: string }>(
+    `SELECT started_at, updated_at
+       FROM conversation_turns
+      WHERE conversation_id = ? AND status = 'running'
+        AND (? <> 'codex' OR ? IS NULL OR provider_thread_id = ?)
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1`,
+    [conversationId, conversation.agent_kind, conversation.provider_thread_id, conversation.provider_thread_id],
+  );
+  /** 已绑定旧 turn 的活动提交同样不能让当前会话继续显示运行中。 */
   const activeSubmission = db.get<{ dispatched_at: string | null; updated_at: string }>(
-    `SELECT dispatched_at, updated_at FROM conversation_submissions WHERE conversation_id = ? AND status = 'active' ORDER BY updated_at DESC, id DESC LIMIT 1`,
-    [conversationId],
+    `SELECT submission.dispatched_at, submission.updated_at
+       FROM conversation_submissions AS submission
+      WHERE submission.conversation_id = ? AND submission.status = 'active'
+        AND (
+          ? <> 'codex' OR ? IS NULL OR submission.provider_turn_id IS NULL OR EXISTS (
+            SELECT 1
+              FROM conversation_turns AS turn
+             WHERE turn.conversation_id = submission.conversation_id
+               AND turn.provider_turn_id = submission.provider_turn_id
+               AND turn.provider_thread_id = ?
+          )
+        )
+      ORDER BY submission.updated_at DESC, submission.id DESC
+      LIMIT 1`,
+    [conversationId, conversation.agent_kind, conversation.provider_thread_id, conversation.provider_thread_id],
   );
   if (activeTurn || activeSubmission) {
     return {
@@ -2332,6 +2357,22 @@ export class ConversationSubmissionRepository {
       .map(mapConversationSubmissionRow);
   }
 
+  /** 展示交接包含尚在发送中的提交和未接纳的失败项，调度队首仍使用独立的可调度队列。 */
+  listQueueProjectionByConversation(conversationId: string): ZeusConversationSubmissionRecord[] {
+    return this.db
+      .select<DbConversationSubmissionRow>(
+        `SELECT * FROM conversation_submissions WHERE conversation_id = ?
+       AND (status IN ('queued', 'paused', 'dispatching') OR (status = 'failed' AND provider_turn_id IS NULL)
+         OR (status = 'active' AND NOT EXISTS (SELECT 1 FROM conversation_messages AS message
+           WHERE message.conversation_id = conversation_submissions.conversation_id AND message.role = 'user'
+             AND message.client_message_id = conversation_submissions.client_message_id)))
+       AND COALESCE(json_extract(input_json, '$.expertRound'), 0) <> 1
+       ORDER BY queue_position, created_at, id`,
+        [conversationId],
+      )
+      .map(mapConversationSubmissionRow);
+  }
+
   /** Provider 与专家路由共用的权威队列；展示层仍通过 listQueueByConversation 隐藏内部专家提交。 */
   listDispatchQueueByConversation(conversationId: string): ZeusConversationSubmissionRecord[] {
     return this.db
@@ -2943,12 +2984,13 @@ function validateProviderSettingsSnapshot(snapshot: unknown): asserts snapshot i
   assertProviderSequenceSnapshot(snapshot);
   const candidate = snapshot as ProviderSequenceSnapshot & Record<string, unknown>;
   assertNoSecretLikeProviderKeys(candidate);
-  assertOnlyKeys(candidate, ['generationId', 'sequence', 'model', 'effort', 'serviceTier'], 'provider settings snapshot');
+  assertOnlyKeys(candidate, ['generationId', 'sequence', 'model', 'effort', 'serviceTier', 'collaborationMode'], 'provider settings snapshot');
   if (
     typeof candidate.model !== 'string' ||
     !candidate.model.trim() ||
     (candidate.effort !== undefined && typeof candidate.effort !== 'string') ||
-    (candidate.serviceTier !== undefined && candidate.serviceTier !== null && typeof candidate.serviceTier !== 'string')
+    (candidate.serviceTier !== undefined && candidate.serviceTier !== null && typeof candidate.serviceTier !== 'string') ||
+    (candidate.collaborationMode !== undefined && candidate.collaborationMode !== 'plan' && candidate.collaborationMode !== 'default')
   ) {
     throw new Error('Invalid provider settings snapshot');
   }

@@ -1,11 +1,12 @@
-import { modelSetupRequestedEvent, reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
-import { useCallback, useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { formatVisibleApplicationError, modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
+import { useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { cloneTaskManagementStatusConfig, type TaskManagementStatusConfig } from '@zeus/shared';
 import { notifyMainAppShellSettingsChanged, recordManualUpdateCheckInMain } from '../../appShellBridge.js';
 import { ConnectedSessionWorkspace, SessionWorkspace, NewConversationComposer, type NewConversationDraftStore } from '../../session/SessionWorkspace.js';
 import type { SessionTerminalClient } from '../../session/SessionTerminal.js';
 import { selectHasConfirmedUserMessage } from '../../session/sessionSelectors.js';
 import { TaskDetailPaneContent } from '../../task/TaskDetailPaneContent.js';
+import { TaskDigitalTeamProgress } from '../digital-teams/TaskDigitalTeamProgress.js';
 import { writeTaskModelPushPreferences } from '../../task/TaskModelPushModal.js';
 import { taskModelPushHasRealChoice } from '../../task/TaskModelPushPendingWorkspace.js';
 import { normalizeTaskTableColumnPreferences, normalizeTaskTableEnumSortOrders, resolveTaskManagementStatus } from '../../task/taskWorkspaceModel.js';
@@ -37,7 +38,7 @@ import {
   mergeAppShellSettingsSaveResponse,
   normalizeProjectSidebarPreferredWidth,
   normalizeRendererAppShellSettings,
-  normalizeTaskStatusFilterByProject,
+  normalizeTaskStatusFilter,
   persistProjectSidebarPreferredWidth,
   PROJECT_SIDEBAR_DEFAULT_WIDTH,
   PROJECT_SIDEBAR_MAX_WIDTH,
@@ -45,7 +46,8 @@ import {
   type ProjectSidebarDragState,
   type ProjectWorkspaceSection,
   resolveTaskManagementStatusConfig,
-  resolveTaskTableColumnsForProject,
+  resolveTaskTableColumns,
+  taskTableColumnPreferencesEqual,
   toAppShellSettingsSavePayload,
   transitionProjectSidebarDrag,
   type WorkspaceViewId,
@@ -55,6 +57,10 @@ import type { WorkspaceDomainActions } from './useWorkspaceDomainActions.js';
 
 export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions: WorkspaceDomainActions) {
   const {
+    digitalTeamTask,
+    setDigitalTeamTask,
+    digitalTeamEntrySelection,
+    setDigitalTeamEntrySelection,
     actionState,
     activeNavTarget,
     activeProjectId,
@@ -187,7 +193,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setTaskTableLayoutDraft,
     setTaskTableLayoutLeaveDialogOpen,
     setTaskTableLayoutSaveBusy,
-    setTaskTableLayoutScopeDialogOpen,
     setTaskTemplates,
     setTelegramAllowedUserIdsInput,
     setTelegramNotificationChatIdsInput,
@@ -210,6 +215,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     taskPageViewMode,
     taskStatusFilter,
     taskTableLayoutDirty,
+    taskTableLayoutDraftRef,
+    taskTableLayoutSaveBusy,
     taskWorkspaceCopy,
     telegramAllowedUserIdsInput,
     telegramNotificationChatIdsInput,
@@ -222,8 +229,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     visibleTasks,
     workspaceScrollRef,
   } = state;
-  /** 讨论成员配置读取同一任务安排，避免展示员工默认却实际使用任务覆盖。 */
-  const loadTaskWorkSettings = useCallback(async (taskId: string) => (await props.commandClient?.loadTaskWorkManagement(taskId))?.plan?.settings ?? {}, [props.commandClient]);
   // 返回新会话只重新聚焦输入框；未发送草稿随工作区保留，由发送成功负责清理。
   const [newConversationDrafts] = useState<NewConversationDraftStore>(() => new Map());
   const sessionTerminalClient = useMemo<SessionTerminalClient | undefined>(() => {
@@ -272,11 +277,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             enableProjectShell: async (projectId: string) => {
               const config = await onLoadProjectConfig(projectId);
               const saved = await onSaveProjectConfig(projectId, {
-                defaultWorkMode: config.defaultWorkMode,
-                language: config.language,
-                dependencies: config.dependencies,
                 database: config.database,
-                telegram: config.telegram,
                 security: { ...config.security, allowShell: true },
               });
               const normalized = normalizeProjectConfig(saved, projectId);
@@ -306,7 +307,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   ]);
   const {
     chooseNativeConversationAttachments,
-    effectiveTaskStatusSettingsTargetId,
     executeNewConversationProjectGit,
     openTaskConversation,
     openTaskConversationInline,
@@ -591,7 +591,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     try {
       setCodexConfigImportPreview(await props.onInspectCodexConfigImport());
     } catch (error) {
-      setCodexConfigImportError(reportApplicationError(error, { language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en' }));
+      setCodexConfigImportError(formatVisibleApplicationError(error, appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en'));
     } finally {
       setCodexConfigImportLoading(false);
     }
@@ -607,7 +607,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       setCodexConfigImportPreview(result);
       if (result.runtimeError) setCodexConfigImportError(result.runtimeError);
     } catch (error) {
-      setCodexConfigImportError(reportApplicationError(error, { language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en' }));
+      setCodexConfigImportError(formatVisibleApplicationError(error, appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en'));
     } finally {
       setCodexConfigImportLoading(false);
     }
@@ -621,7 +621,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       const activation = await props.onActivateCodexConfig();
       setCodexConfigImportResult((current) => (current ? { ...current, ...activation, runtimeError: null } : current));
     } catch (error) {
-      setCodexConfigImportError(reportApplicationError(error, { language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en' }));
+      setCodexConfigImportError(formatVisibleApplicationError(error, appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en'));
     } finally {
       setCodexConfigImportLoading(false);
     }
@@ -669,23 +669,11 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
 
   function updateTaskManagementStatusConfigDraft(config: TaskManagementStatusConfig, deletion?: { removedStatusId: string; replacementStatusId?: string }): void {
     const nextConfig = cloneTaskManagementStatusConfig(config);
-    setAppShellSettings((current) => {
-      if (effectiveTaskStatusSettingsTargetId === '__template__') return { ...current, taskManagementStatusTemplate: nextConfig };
-      return {
-        ...current,
-        taskManagementStatusByProject: {
-          ...(current.taskManagementStatusByProject ?? {}),
-          [effectiveTaskStatusSettingsTargetId]: nextConfig,
-        },
-      };
-    });
-    if (effectiveTaskStatusSettingsTargetId !== '__template__' && deletion?.replacementStatusId) {
+    setAppShellSettings((current) => ({ ...current, taskManagementStatusTemplate: nextConfig }));
+    if (deletion?.replacementStatusId) {
       setTaskManagementStatusReplacements((current) => ({
         ...current,
-        [effectiveTaskStatusSettingsTargetId]: {
-          ...(current[effectiveTaskStatusSettingsTargetId] ?? {}),
-          [deletion.removedStatusId]: deletion.replacementStatusId!,
-        },
+        __global__: { ...current.__global__, [deletion.removedStatusId]: deletion.replacementStatusId! },
       }));
     }
   }
@@ -722,13 +710,10 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   }
 
   async function saveTaskStatusFilter(filter: TaskStatusFilter): Promise<void> {
-    if (!activeProjectId || filter === taskStatusFilter) return;
+    if (filter === taskStatusFilter) return;
     const nextSettings = normalizeRendererAppShellSettings({
       ...appShellSettings,
-      taskStatusFilterByProject: {
-        ...(appShellSettings.taskStatusFilterByProject ?? {}),
-        [activeProjectId]: filter,
-      },
+      taskStatusFilter: filter,
     });
     setAppShellSettings(nextSettings);
     if (!props.onSaveAppShellSettings) return;
@@ -746,16 +731,13 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   }
 
   async function saveTaskPageViewMode(pageViewMode: TaskPageViewMode): Promise<void> {
-    if (!activeProjectId || pageViewMode === taskPageViewMode) return;
+    if (pageViewMode === taskPageViewMode) return;
     const nextSettings = normalizeRendererAppShellSettings({
       ...appShellSettings,
-      taskPageViewByProject: {
-        ...(appShellSettings.taskPageViewByProject ?? {}),
-        [activeProjectId]: pageViewMode,
-      },
+      taskPageView: pageViewMode,
     });
     setAppShellSettings(nextSettings);
-    if (pageViewMode === 'board' && !taskBoardSnapshots[activeProjectId]) void loadTaskBoard(activeProjectId);
+    if (pageViewMode === 'board' && activeProjectId && !taskBoardSnapshots[activeProjectId]) void loadTaskBoard(activeProjectId);
     if (!props.onSaveAppShellSettings) return;
     try {
       const savedSettings = await props.onSaveAppShellSettings(toAppShellSettingsSavePayload(nextSettings, taskManagementStatusReplacements));
@@ -809,40 +791,21 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     }
   }
 
-  async function saveTaskTableLayout(scope: 'project' | 'global'): Promise<boolean> {
-    if (scope === 'project' && !activeProjectId) return false;
+  /** 表格布局统一保存到全局，失败时保留原草稿与离开保护。 */
+  async function saveTaskTableLayout(): Promise<boolean> {
+    if (taskTableLayoutSaveBusy) return false;
     const normalizedDraft = normalizeTaskTableColumnPreferences(activeTaskTableColumns);
-    const nextSettings = normalizeRendererAppShellSettings(
-      scope === 'global'
-        ? {
-            ...appShellSettings,
-            taskTableColumns: normalizedDraft,
-            // “全部项目”表示重建统一基线，旧项目覆盖必须清空，否则它们仍会遮蔽新的全局设置。
-            taskTableColumnsByProject: {},
-          }
-        : {
-            ...appShellSettings,
-            taskTableColumnsByProject: {
-              ...(appShellSettings.taskTableColumnsByProject ?? {}),
-              [activeProjectId!]: normalizedDraft,
-            },
-          },
-    );
+    const nextSettings = normalizeRendererAppShellSettings({ ...appShellSettings, taskTableColumns: normalizedDraft });
     setTaskTableLayoutSaveBusy(true);
     try {
       const savedSettings = props.onSaveAppShellSettings ? normalizeRendererAppShellSettings(await props.onSaveAppShellSettings(toAppShellSettingsSavePayload(nextSettings, taskManagementStatusReplacements))) : nextSettings;
-      setAppShellSettings((currentSettings) => ({
-        ...savedSettings,
-        // 布局保存期间的漏斗修改由独立写入负责，保留界面最新选择。
-        sidebarConversationFilters: currentSettings.sidebarConversationFilters,
-        taskStatusFilterByProject: currentSettings.taskStatusFilterByProject,
-        taskViewModeByProject: currentSettings.taskViewModeByProject,
-        taskPageViewByProject: currentSettings.taskPageViewByProject,
-        taskExpandedIdsByProject: currentSettings.taskExpandedIdsByProject,
-      }));
-      const savedPreferences = resolveTaskTableColumnsForProject(savedSettings, activeProjectId);
-      setTaskTableLayoutDraft({ projectId: activeProjectId, preferences: savedPreferences });
-      setTaskTableLayoutScopeDialogOpen(false);
+      // 布局回执只确认布局，不能覆盖保存期间改变的其他全局设置或实体选择。
+      setAppShellSettings((currentSettings) => ({ ...currentSettings, taskTableColumns: savedSettings.taskTableColumns }));
+      const savedPreferences = resolveTaskTableColumns(savedSettings);
+      /** 较晚的成功回执不能覆盖保存期间继续编辑的新草稿。 */
+      const draftUnchanged = taskTableColumnPreferencesEqual(taskTableLayoutDraftRef.current.preferences, normalizedDraft);
+      setTaskTableLayoutDraft((current) => (taskTableColumnPreferencesEqual(current.preferences, normalizedDraft) ? { preferences: savedPreferences } : current));
+      if (saveTaskTableLayoutThenLeaveRef.current && !draftUnchanged) return false;
       if (saveTaskTableLayoutThenLeaveRef.current) {
         saveTaskTableLayoutThenLeaveRef.current = false;
         const leave = pendingTaskTableLayoutLeaveRef.current;
@@ -872,12 +835,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   }
 
   function requestWorkspaceLeave(leave: () => void, cancel?: () => void, kind: 'navigation' | 'close' = 'navigation'): void {
-    // 数字团队草稿自行提供保存和重开；导航只负责阻止静默卸载，窗口关闭仍由 beforeunload 保护。
-    if (kind === 'navigation' && document.querySelector('[data-digital-team-dirty="true"]')) {
-      window.dispatchEvent(new Event('zeus:digital-team-unsaved-leave'));
-      cancel?.();
-      return;
-    }
+    // 数字团队草稿由编辑页同步暂存；导航不再依赖流程完整或服务端保存成功。
     const pendingKind = pendingWorkspaceLeaveKindRef.current;
     if (pendingKind) {
       // 只保留第一次离开意图；后到的操作收到取消，重复关闭请求则等待第一次关闭响应，不能向 Main 重复回传。
@@ -940,12 +898,11 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     pendingWorkspaceLeaveKindRef.current = null;
     saveTaskTableLayoutThenLeaveRef.current = false;
     setTaskTableLayoutLeaveDialogOpen(false);
-    setTaskTableLayoutScopeDialogOpen(false);
     cancel?.();
   }
 
   function discardTaskTableLayoutAndLeave(): void {
-    setTaskTableLayoutDraft({ projectId: activeProjectId, preferences: persistedTaskTableColumns });
+    setTaskTableLayoutDraft({ preferences: persistedTaskTableColumns });
     setTaskTableLayoutLeaveDialogOpen(false);
     const leave = pendingTaskTableLayoutLeaveRef.current;
     pendingTaskTableLayoutLeaveRef.current = null;
@@ -954,18 +911,14 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     leave?.();
   }
 
-  function beginSaveTaskTableLayoutAndLeave(): void {
+  /** 保存并离开直接提交全局布局，失败继续展示原离开确认。 */
+  async function beginSaveTaskTableLayoutAndLeave(): Promise<void> {
     saveTaskTableLayoutThenLeaveRef.current = true;
     setTaskTableLayoutLeaveDialogOpen(false);
-    setTaskTableLayoutScopeDialogOpen(true);
-  }
-
-  function cancelTaskTableLayoutScopeDialog(): void {
-    if (saveTaskTableLayoutThenLeaveRef.current) {
-      cancelTaskTableLayoutLeave();
-      return;
+    if (!(await saveTaskTableLayout())) {
+      saveTaskTableLayoutThenLeaveRef.current = false;
+      setTaskTableLayoutLeaveDialogOpen(true);
     }
-    setTaskTableLayoutScopeDialogOpen(false);
   }
 
   async function clearNetworkCache(): Promise<void> {
@@ -1025,11 +978,11 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
                   defaultModel: appShellSettings.defaultModel,
                   defaultTaskTemplateId: appShellSettings.defaultTaskTemplateId,
                   taskTableColumns: normalizeTaskTableColumnPreferences(appShellSettings.taskTableColumns),
-                  taskTableColumnsByProject: Object.fromEntries(Object.entries(appShellSettings.taskTableColumnsByProject ?? {}).map(([projectId, preferences]) => [projectId, normalizeTaskTableColumnPreferences(preferences)])),
                   taskTableEnumSortOrders: normalizeTaskTableEnumSortOrders(appShellSettings.taskTableEnumSortOrders),
                   taskManagementStatusTemplate: resolveTaskManagementStatusConfig(appShellSettings),
-                  taskManagementStatusByProject: appShellSettings.taskManagementStatusByProject ?? {},
-                  taskStatusFilterByProject: normalizeTaskStatusFilterByProject(appShellSettings.taskStatusFilterByProject),
+                  taskStatusFilter: normalizeTaskStatusFilter(appShellSettings.taskStatusFilter),
+                  taskViewMode: appShellSettings.taskViewMode,
+                  taskPageView: appShellSettings.taskPageView,
                 },
                 runtime: runtimeSettings,
                 telegramNotification: telegramNotificationSettings,
@@ -1508,11 +1461,11 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   }
 
   /** 任务入口上下文只在数字团队页面使用，不改变任务和项目归属。 */
-  const [digitalTeamTask, setDigitalTeamTask] = useState<TaskRecord | undefined>();
 
   function handleMainNavigate(target: WorkspaceViewId, onNavigated?: () => void): void {
     const navigate = () => {
       setDigitalTeamTask(undefined);
+      setDigitalTeamEntrySelection(undefined);
       setActiveNavTarget(target);
       if (typeof window !== 'undefined') {
         // 只更新地址栏语义，不触发浏览器原生锚点滚动，避免左栏和主工作区一起跳到底部。
@@ -1668,7 +1621,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   } as CSSProperties;
   const workspaceDrawerPortalStyle = {
     // 会话抽屉避开活动栏与来源列表；其他模式只避开固定活动栏。
-    '--zeus-drawer-sidebar-inline-size': `${activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions' ? projectSidebarWidth + 49 : 49}px`,
+    '--zeus-drawer-sidebar-inline-size': `${activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-employees' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations' && activeProjectSection === 'sessions' ? projectSidebarWidth + 49 : 49}px`,
   } as CSSProperties;
   const projectDrawerVisualProps = projectPanel === 'config' ? ({ presentation: 'floating', backdrop: 'dimmed', size: 'wide' } as const) : ({ presentation: 'sheet', backdrop: 'dimmed', size: 'wide' } as const);
 
@@ -1772,7 +1725,47 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     target.addEventListener('lostpointercapture', cancelProjectSidebarResize);
   }
 
+  /** 完整页与内嵌页共用当前会话的团队进展，任务历史由原选择入口保留。 */
   function renderNativeConversationWorkspace(onOpenTaskDetail: (taskId: string) => void, embeddedInTask = false): ReactNode {
+    /** 原会话阅读与输入保持同一控制器，不因后台团队状态重读重新创建。 */
+    const workspace = renderNativeConversationWorkspaceContent(onOpenTaskDetail, embeddedInTask);
+    /** 完整页和任务内嵌页共用准确会话关联，不能由外层任务另取一份旧运行。 */
+    if (!nativeSessionTask || !selectedNativeConversation || !props.commandClient) return workspace;
+    return (
+      <div className="task-conversation-with-team-progress">
+        <TaskDigitalTeamProgress
+          key={`${nativeSessionTask.id}:${selectedNativeConversation.id}`}
+          task={nativeSessionTask}
+          conversationId={selectedNativeConversation.id}
+          language={appShellSettings.appLanguage}
+          client={props.commandClient}
+          subscribe={props.onSubscribeRealtimeEvents}
+          onOpenRun={async (runId) => {
+            try {
+              /** 完整任务可能尚未进入列表，缺少时读取真实任务，不能让可见入口静默失效。 */
+              const task = snapshot.tasks.find((candidate) => candidate.id === nativeSessionTask.id) ?? (await props.commandClient!.loadTask(nativeSessionTask.id));
+              /** 任务入口保留准确运行选择；全局导航会清除该选择，不能复用。 */
+              requestWorkspaceLeave(() => {
+                /** 内嵌入口先关闭任务详情，不能让原弹层覆盖已打开的运行记录。 */
+                if (embeddedInTask) closeTaskDetail();
+                setDigitalTeamTask(task);
+                setDigitalTeamEntrySelection({ kind: 'run', runId });
+                setActiveNavTarget('digital-teams');
+                window.history.replaceState(null, '', '#digital-teams');
+                workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+              });
+            } catch (cause) {
+              recordLocalError('open-task-digital-team-run', cause);
+            }
+          }}
+        />
+        {workspace}
+      </div>
+    );
+  }
+
+  /** 保留既有会话控制器与新建、重试、归档阅读的实际入口。 */
+  function renderNativeConversationWorkspaceContent(onOpenTaskDetail: (taskId: string) => void, embeddedInTask = false): ReactNode {
     const taskReadOnlyGate =
       nativeSessionTaskReadOnly && nativeSessionTask && selectedNativeConversation
         ? {
@@ -1830,7 +1823,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onStartProjectConversation={startProjectConversation}
           onLoadSkills={props.nativeConversationClient.loadSkills}
           onLoadDigitalEmployees={props.commandClient?.loadProjectDigitalEmployees}
-          onLoadTaskWorkSettings={loadTaskWorkSettings}
           onOpenAiSettings={(section) => {
             window.dispatchEvent(new CustomEvent(modelSetupRequestedEvent, { detail: section === 'runtime' ? 'codex' : 'choose' }));
           }}
@@ -1838,8 +1830,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             setSettingsCategory('browser');
             handleMainNavigate('settings');
           }}
-          onLoadProjectConfig={props.onLoadProjectConfig}
-          onSaveProjectModelServiceTierPreference={props.onSaveProjectModelServiceTierPreference}
           onOpenTaskDetail={onOpenTaskDetail}
           onTaskManagementStatusChange={(taskId, status) => updateTaskManagementStatus(taskId, status)}
           onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
@@ -1901,7 +1891,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onStartProjectConversation={startProjectConversation}
           onLoadSkills={props.nativeConversationClient.loadSkills}
           onLoadDigitalEmployees={props.commandClient?.loadProjectDigitalEmployees}
-          onLoadTaskWorkSettings={loadTaskWorkSettings}
           onOpenAiSettings={(section) => {
             window.dispatchEvent(new CustomEvent(modelSetupRequestedEvent, { detail: section === 'runtime' ? 'codex' : 'choose' }));
           }}
@@ -1909,8 +1898,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             setSettingsCategory('browser');
             handleMainNavigate('settings');
           }}
-          onLoadProjectConfig={props.onLoadProjectConfig}
-          onSaveProjectModelServiceTierPreference={props.onSaveProjectModelServiceTierPreference}
           onOpenTaskDetail={onOpenTaskDetail}
           onTaskManagementStatusChange={(taskId, status) => updateTaskManagementStatus(taskId, status)}
           onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
@@ -1929,6 +1916,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         newConversationDrafts={newConversationDrafts}
         key={selectedNativeConversation ? `${selectedNativeConversation.projectId}:${selectedNativeConversation.navigationId ?? selectedNativeConversation.id}` : `new-conversation-${newConversationFocusRequest}`}
         language={appShellSettings.appLanguage}
+        taskBranchPrefix={appShellSettings.taskBranchPrefix}
         state={null}
         conversation={selectedNativeConversation}
         historyOnly={Boolean(selectedNativeConversation && selectedNativeConversationPresentation === 'history')}
@@ -1962,7 +1950,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onLoadCapabilities: props.nativeConversationClient?.loadCodexConversationCapabilities,
           onLoadSkills: props.nativeConversationClient?.loadSkills,
           onLoadDigitalEmployees: props.commandClient?.loadProjectDigitalEmployees,
-          onLoadTaskWorkSettings: loadTaskWorkSettings,
           onOpenAiSettings: (section) => {
             window.dispatchEvent(new CustomEvent(modelSetupRequestedEvent, { detail: section === 'runtime' ? 'codex' : 'choose' }));
           },
@@ -1970,8 +1957,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             setSettingsCategory('browser');
             handleMainNavigate('settings');
           },
-          onLoadProjectConfig: props.onLoadProjectConfig,
-          onSaveProjectModelServiceTierPreference: props.onSaveProjectModelServiceTierPreference,
           onSelectNewConversationProject: selectNewConversationProject,
           onLoadNewConversationProjectGit: props.nativeConversationClient?.loadProjectGitWorkbench,
           onExecuteNewConversationProjectGit: props.nativeConversationClient ? executeNewConversationProjectGit : undefined,
@@ -2011,13 +1996,14 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           resolveTaskManagementStatus(taskDetailPaneTask) === activeTaskManagementStatusConfig.roles.completedStatusId ||
           resolveTaskManagementStatus(taskDetailPaneTask) === activeTaskManagementStatusConfig.roles.cancelledStatusId
         }
-        onUseDigitalTeam={() => {
+        onUseDigitalTeam={(selection) => {
           setDigitalTeamTask(taskDetailPaneTask);
+          setDigitalTeamEntrySelection(selection);
           closeTaskDetail();
           setActiveNavTarget('digital-teams');
         }}
+        digitalTeamClient={props.commandClient ?? null}
         digitalEmployeeClient={props.commandClient ?? null}
-        digitalEmployeeSkillClient={props.nativeConversationClient ?? null}
         conversations={taskDetailPaneConversations}
         conversationsLoading={taskDetailPaneConversationState?.status === 'loading' && !taskDetailPaneConversationState.choicesKnown}
         conversationsError={taskDetailPaneConversationState?.status === 'error' ? taskDetailPaneConversationState.error : null}
@@ -2029,11 +2015,9 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         }
         onOpenConversation={(taskId, conversationId) => void openTaskConversation(taskId, conversationId)}
         onManageEmployees={() => {
-          /** 任务所属项目是员工管理的唯一目标。 */
-          const project = snapshot.projects.find((candidate) => candidate.id === taskDetailPaneTask.projectId);
-          if (!project) return;
+          /** 员工统一维护，任务指派自动建立项目参与关系。 */
           closeTaskDetail();
-          openProjectSection(project, 'project-settings');
+          handleMainNavigate('digital-employees');
         }}
         onSelectConversation={openTaskConversationInline}
         activeConversationId={selectedNativeConversation?.taskId === taskDetailPaneTask.id ? selectedNativeConversation.id : null}
@@ -2053,12 +2037,10 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
                 taskTitle: taskDetailPaneTask.title,
               }}
               task={createSessionWorkspaceTask(taskDetailPaneTask, appShellSettings, appShellSettings.appLanguage)}
-              serviceTierPreferences={[]}
               onStartTask={startNativeConversation}
               onLoadCapabilities={props.nativeConversationClient.loadCodexConversationCapabilities}
               onLoadSkills={props.nativeConversationClient.loadSkills}
               onLoadDigitalEmployees={props.commandClient?.loadProjectDigitalEmployees}
-              onLoadTaskWorkSettings={loadTaskWorkSettings}
               onChooseAttachments={props.onChooseConversationResources ? chooseNativeConversationAttachments : undefined}
               onOpenComputerSettings={() => {
                 setSettingsCategory('browser');
@@ -2121,19 +2103,20 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     );
   }
   return {
+    digitalTeamEntrySelection,
     digitalTeamTask,
     returnFromDigitalTeam: () => {
       if (!digitalTeamTask) return;
       setActiveNavTarget('projects');
       setTaskDetail(digitalTeamTask);
       setDigitalTeamTask(undefined);
+      setDigitalTeamEntrySelection(undefined);
     },
     activateCodexConfig,
     archiveRuntimeSession,
     beginSaveTaskTableLayoutAndLeave,
     cancelSourceWorkspaceLeave,
     cancelTaskTableLayoutLeave,
-    cancelTaskTableLayoutScopeDialog,
     checkReleaseUpdate,
     checkRuntimeAdapter,
     clearExternalApiKey,

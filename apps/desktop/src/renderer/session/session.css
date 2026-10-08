@@ -12959,3 +12959,327 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   flex: 1;
   min-height: 0;
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+
+.session-codex-parity-v1 .session-queued-message-state {
+  color: var(--session-text-muted);
+  flex: 0 0 auto;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.session-codex-parity-v1 .session-queued-message-preview {
+  color: var(--session-text);
+  flex: 1 1 auto;
+  font-size: 12px;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachment-summary {
+  align-items: center;
+  color: var(--session-text-muted);
+  display: inline-flex;
+  flex: 0 1 42%;
+  font-size: 11px;
+  gap: 4px;
+  min-inline-size: 0;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachment-summary[data-attachment-only='true'] {
+  color: var(--session-text);
+  flex: 1 1 auto;
+  font-size: 12px;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachment-summary > svg {
+  block-size: 14px;
+  flex: 0 0 auto;
+  inline-size: 14px;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachment-summary > span {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-codex-parity-v1 .session-queued-message-actions .session-queued-message-delete {
+  color: var(--session-danger);
+}
+
+.session-codex-parity-v1 .session-queued-message-actions .session-queued-message-delete:hover:not(:disabled),
+.session-codex-parity-v1 .session-queued-message-actions .session-queued-message-delete:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--session-danger) 9%, transparent);
+  color: var(--session-danger);
+}
+
+.session-codex-parity-v1 .session-queued-message-attachments {
+  gap: 6px;
+  padding: 0;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachments .pending-resource-card {
+  block-size: 40px;
+  border-radius: 8px;
+  flex-basis: min(200px, calc(100vw - 80px));
+  grid-template-columns: 22px minmax(0, 1fr);
+  padding: 5px 8px;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachments .pending-resource-visual {
+  block-size: 22px;
+  inline-size: 22px;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachments .pending-resource-card[data-resource-kind='image'] {
+  block-size: 40px;
+  flex-basis: 40px;
+  inline-size: 40px;
+}
+
+.session-codex-parity-v1 .session-queued-message-attachments .pending-resource-card[data-resource-kind='image'] .pending-resource-visual {
+  block-size: 40px;
+  border-radius: 8px;
+  inline-size: 40px;
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-cancel,
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save {
+  min-block-size: 30px;
+  min-inline-size: auto;
+  padding-inline: 11px;
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save {
+  background: var(--zeus-brand-primary);
+  color: white;
+  font-weight: 620;
+  padding-inline: 14px;
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save:hover:not(:disabled),
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save:focus-visible:not(:disabled) {
+  background: var(--zeus-interaction-primary-hover);
+  color: white;
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save:active:not(:disabled) {
+  background: var(--zeus-interaction-primary-pressed);
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--zeus-brand-primary) 20%, transparent);
+  outline: 0;
+}
+
+.session-codex-parity-v1 .session-queued-message-editor .session-queued-message-editor-save:disabled {
+  background: color-mix(in srgb, var(--zeus-brand-primary) 14%, var(--session-canvas));
+  color: color-mix(in srgb, var(--zeus-brand-primary) 58%, var(--session-text-muted));
+}
+
+.session-codex-parity-v1 .session-context-draft-chip > .session-context-draft-preview-trigger {
+  block-size: auto;
+  color: inherit;
+  display: inline-flex;
+  font: inherit;
+  gap: 8px;
+  inline-size: auto;
+  max-inline-size: 100%;
+  padding: 0;
+}
+
+.session-codex-parity-v1 .session-context-draft-preview-trigger > svg {
+  block-size: 18px;
+  color: var(--session-text-muted);
+  flex: 0 0 auto;
+  inline-size: 18px;
+}
+
+.session-codex-parity-v1 .session-context-draft-preview-trigger > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-codex-parity-v1 .session-context-draft-preview {
+  background: var(--session-canvas);
+  border: 1px solid var(--session-line);
+  border-radius: 12px;
+  bottom: calc(100% + 6px);
+  box-shadow: var(--zeus-card-shadow);
+  box-sizing: border-box;
+  color: var(--session-text);
+  display: grid;
+  gap: 9px;
+  inline-size: min(420px, calc(100vw - 32px));
+  inset-inline-start: 0;
+  max-block-size: min(320px, 50vh);
+  opacity: 0;
+  overflow: auto;
+  padding: 12px;
+  pointer-events: none;
+  position: absolute;
+  transform: translateY(4px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease,
+    visibility 0s linear 100ms;
+  visibility: hidden;
+  z-index: 12;
+}
+
+.session-codex-parity-v1 .session-composer-context-draft:hover > .session-context-draft-preview,
+.session-codex-parity-v1 .session-composer-context-draft:focus-within > .session-context-draft-preview {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 0s;
+  visibility: visible;
+}
+
+.session-codex-parity-v1 .session-context-draft-preview > header {
+  align-items: center;
+  display: flex;
+  font-size: 12px;
+  justify-content: space-between;
+  line-height: 17px;
+}
+
+.session-codex-parity-v1 .session-context-draft-preview > header > span {
+  color: var(--session-text-muted);
+  font-size: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-codex-parity-v1 .session-context-draft-preview {
+    transition: none;
+  }
+}
+
+.session-codex-parity-v1 .session-creation-status:is(.is-creating, .is-retrying) {
+  color: var(--session-text-muted);
+  font-size: 14px;
+}
+
+.session-codex-parity-v1 .session-composer-stack {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 6px;
+  inline-size: min(var(--session-composer-max), calc(100% - (2 * var(--session-gutter))));
+  margin: 0 auto 16px;
+  min-inline-size: 0;
+  position: relative;
+  z-index: 5;
+}
+
+.session-codex-parity-v1 .session-composer-stack > .session-composer-shell {
+  inline-size: 100%;
+  margin: 0;
+}
+
+.session-codex-parity-v1 .session-composer-stack > .session-queued-messages {
+  border-radius: 12px 12px 7px 7px;
+  inline-size: calc(100% - 16px);
+  margin: 0 8px -2px;
+}
+
+@media (max-width: 759px) {
+
+  .session-codex-parity-v1 .session-composer-stack {
+    margin-block-end: max(10px, env(safe-area-inset-bottom, 0px));
+  }
+}
+
+@media (max-width: 759px) {
+
+  .session-codex-parity-v1 .session-composer-stack > .session-composer-shell {
+    margin-block-end: 0;
+  }
+}
+
+.session-codex-parity-v1 .session-turn-change-heading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-inline-size: 0;
+}
+
+.session-codex-parity-v1 .session-turn-change-availability {
+  color: var(--session-text-muted);
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.session-codex-parity-v1 .session-turn-change-total {
+  margin-inline-end: 10px;
+}
+
+.session-codex-parity-v1 .session-turn-change-card .session-turn-change-files svg.file-type-icon {
+  color: var(--session-text-muted);
+}
+
+.session-codex-parity-v1 .session-approval-grant-menu-row {
+  align-items: center;
+  border-radius: 8px;
+  display: flex;
+  inline-size: 100%;
+}
+
+.session-codex-parity-v1 .session-approval-grant-menu-row:is(:hover, :focus-within) {
+  background: var(--zeus-interaction-hover);
+}
+
+.session-codex-parity-v1 .session-approval-grant-menu-row:has(> button[data-danger]):is(:hover, :focus-within) {
+  background: var(--zeus-control-danger-bg-hover);
+}
+
+.macos-ai-app .session-codex-parity-v1 .session-approval-grant-menu-row button:is(:hover, :focus-visible, :active):not(:disabled):not([aria-disabled='true']) {
+  background: transparent;
+}
+
+.macos-ai-app .session-codex-parity-v1 .session-approval-grant-menu-row:has(> button:focus-visible) {
+  outline: 2px solid var(--zeus-focus-line);
+  outline-offset: -2px;
+}
+
+.macos-ai-app .session-codex-parity-v1 .session-approval-grant-menu-row > button:focus-visible {
+  box-shadow: none;
+  outline: none;
+}
+
+.session-codex-parity-v1 .session-approval-grant-menu-row:has(.session-approval-grant-info) > button {
+  padding-inline-end: 0;
+}
+
+.session-codex-parity-v1 .session-approval-grant-help {
+  background: var(--session-sidebar);
+  border: 1px solid var(--session-line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px var(--session-shadow-soft);
+  color: var(--session-text-muted);
+  font-size: 12px;
+  inline-size: max-content;
+  line-height: 1.5;
+  margin: 8px 0;
+  max-inline-size: min(320px, calc(100vw - 32px));
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+  position-area: top span-left;
+  position-try-fallbacks: flip-block, flip-inline;
+  white-space: normal;
+}
+
+.session-codex-parity-v1 .session-turn-process-page-sentinel {
+  block-size: 1px;
+  display: block;
+  inline-size: 1px;
+  pointer-events: none;
+}

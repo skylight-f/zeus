@@ -23823,3 +23823,227 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   background: color-mix(in oklch, var(--zeus-control-danger-bg, #3d1d1d) 90%, transparent);
   color: var(--zeus-control-danger-text, #ff6b6b);
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.macos-ai-app :where(.zeus-object-toolbar, .project-code-mode-toolbar, .session-toolbar, .session-source-search-row, .settings-section-nav, .task-table-primary-toolbar, .digital-employee-page-heading > .digital-employee-actions) {
+  app-region: no-drag;
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
+  position: relative;
+  z-index: 31;
+}
+
+.macos-ai-app
+  :where(.zeus-object-toolbar, .project-code-mode-toolbar, .session-toolbar, .session-source-search-row, .settings-section-nav, .task-table-primary-toolbar, .digital-employee-page-heading > .digital-employee-actions)
+  :where(button, a, input, select, textarea, label) {
+  pointer-events: auto;
+}
+
+.macos-ai-app .session-conversation-row-error {
+  color: var(--zeus-danger);
+  font-size: 11px;
+  grid-column: 1 / -1;
+  padding: 0 8px 4px 32px;
+}
+
+.macos-ai-app .task-git-delivery-directory[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.macos-ai-app .task-git-delivery-entry-icon {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  inline-size: 16px;
+  block-size: 16px;
+  color: var(--zeus-product-muted);
+}
+
+.macos-ai-app .task-git-delivery-repository > summary .task-git-delivery-entry-icon {
+  color: #638ad8;
+}
+
+.macos-ai-app .task-git-delivery-diff-main .file-preview-icon-button {
+  flex: 0 0 24px;
+  inline-size: 24px;
+  block-size: 24px;
+  min-inline-size: 24px;
+  min-block-size: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  box-shadow: none;
+  background: transparent;
+  color: var(--zeus-product-muted);
+}
+
+.macos-ai-app .task-git-delivery-diff-main .file-preview-icon-button[aria-pressed='true'],
+.macos-ai-app .task-git-delivery-diff-main .file-preview-icon-button:hover {
+  background: var(--zeus-source-list-hover);
+  color: var(--zeus-product-text);
+}
+
+.macos-ai-app .task-git-delivery-diff-main .file-preview-icon-button svg {
+  inline-size: 16px;
+  block-size: 16px;
+}
+
+.macos-ai-app .task-git-delivery-diff-main:has(> .file-preview > .project-git-diff-preview) {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.macos-ai-app .task-git-delivery-diff-main:has(> .file-preview > .project-git-diff-preview) > .task-git-review-pane-title {
+  display: none;
+}
+
+.macos-ai-app .task-git-delivery-diff-main > .file-preview:has(> .project-git-diff-preview) {
+  display: grid;
+  grid-template-rows: 36px minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.macos-ai-app .task-git-delivery-diff-main > .file-preview:has(> .project-git-diff-preview) > .file-preview-toolbar {
+  z-index: 1;
+  grid-area: 1 / 1;
+  align-self: center;
+  justify-self: start;
+  padding: 3px 8px;
+}
+
+.macos-ai-app .task-git-delivery-diff-main > .file-preview:has(> .project-git-diff-preview) > .project-git-diff-preview {
+  display: grid;
+  grid-area: 1 / 1 / 3;
+  grid-template-rows: 36px minmax(0, 1fr);
+}
+
+.macos-ai-app .task-git-delivery-diff-main > .file-preview:has(> .project-git-diff-preview) > .project-git-diff-preview > header {
+  min-inline-size: 0;
+  padding-inline-start: 98px;
+}
+
+.macos-ai-app .task-git-delivery-step-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.macos-ai-app .task-git-merge-header.has-results > span {
+  flex: 1;
+  min-inline-size: 0;
+}
+
+.macos-ai-app .task-git-merge-header.has-results > span > strong,
+.macos-ai-app .task-git-merge-header.has-results > span > small {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.macos-ai-app .task-git-delivery-result-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--zeus-product-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.macos-ai-app .task-git-delivery-result-trigger:hover {
+  background: var(--zeus-interaction-hover);
+  color: var(--zeus-product-text);
+}
+
+.macos-ai-app .task-git-delivery-result-trigger:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.macos-ai-app .task-git-delivery-result-popover {
+  position: fixed;
+  inset: auto;
+  top: anchor(bottom);
+  right: anchor(right);
+  position-try-fallbacks: flip-block;
+  box-sizing: border-box;
+  inline-size: min(460px, calc(100vw - 24px));
+  margin: 6px 0 0;
+  padding: 8px;
+  border: 1px solid var(--zeus-product-line);
+  border-radius: 8px;
+  background: var(--zeus-product-panel);
+  color: var(--zeus-product-text);
+  box-shadow: var(--zeus-popover-shadow);
+}
+
+.macos-ai-app .task-git-delivery-result-popover .task-git-delivery-batch-result {
+  max-block-size: min(320px, calc(100vh - 120px));
+  padding: 4px 6px;
+}
+
+.macos-ai-app .task-git-delivery-result-popover .task-git-delivery-batch-result li {
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 10px;
+}
+
+.macos-ai-app .task-git-delivery-result-popover .task-git-delivery-batch-result li > small {
+  grid-column: 2;
+  color: var(--zeus-product-muted);
+}
+
+@media (max-width: 600px) {
+  .macos-ai-app .task-git-delivery-result-trigger > span {
+    max-inline-size: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@media (max-width: 600px) {
+
+  .macos-ai-app .task-git-delivery-result-popover {
+    inset-inline: 12px;
+    inline-size: auto;
+  }
+}
+
+.macos-ai-app .task-digital-team-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-inline-size: 0;
+}
+
+.macos-ai-app .task-digital-team-selector > .zeus-select {
+  min-inline-size: 220px;
+}
+
+.macos-ai-app .task-detail-properties > .task-detail-tags .task-detail-section-heading {
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+@container task-detail (max-width: 560px) {
+
+  .macos-ai-app .task-digital-team-selector,
+.macos-ai-app .task-digital-team-selector > .zeus-select {
+    min-inline-size: 0;
+  }
+}
+
+@container task-detail (max-width: 560px) {
+
+  .macos-ai-app .task-digital-team-selector > .zeus-select {
+    inline-size: 100%;
+  }
+}

@@ -74,3 +74,9 @@
   background: var(--zeus-product-accent);
   color: #fff;
 }
+
+/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
+
+.code-diff-view.is-single-side {
+  grid-template-columns: minmax(0, 1fr);
+}

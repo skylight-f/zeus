@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom';
 import { calculateUncachedInputTokens, type CodexLocalUsageDay, type CodexLocalUsageGroup, type CodexOfficialUsageSnapshot, type CodexUsageRange, type UsageAnalyticsSnapshot, type UsageProviderAnalytics } from '@zeus/shared';
 import { CalendarDotsIcon as CalendarDots } from '@phosphor-icons/react/dist/csr/CalendarDots';
 import { GaugeIcon as Gauge } from '@phosphor-icons/react/dist/csr/Gauge';
-import { useApplicationErrorDialog, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { SettingsPagination, settingsPage, settingsPageSize } from './SettingsPagination.js';
 
 type UsageClient = {
@@ -18,6 +18,20 @@ const text = {
     title: '用量详情',
     official: 'Codex 账户总览',
     officialHelp: '全部 Codex 客户端的官方账户数据，不与 Zeus 本地明细相加。',
+    /** 官方余额和可用状态与本地费用估算分别展示。 */
+    creditBalance: '点数余额（Credits）',
+    /** 可用状态直接使用官方回包，不从余额推断。 */
+    creditStatus: '点数状态',
+    /** 官方明确返回有可用点数。 */
+    creditsAvailable: '可用',
+    /** 官方明确返回没有可用点数。 */
+    noCredits: '无点数',
+    /** 官方返回无限点数时不展示有限余额。 */
+    unlimitedCredits: '无限',
+    /** 缺少官方点数字段时保留未知状态。 */
+    unknownCredits: '未知',
+    /** 仅解释官方扣费规则，不保证所有限制都能用点数解除。 */
+    creditsHelp: '订阅额度用完后，可用点数可按 OpenAI 的规则继续使用；实际扣费和使用限制以官方账户为准。',
     local: '供应商本地使用明细',
     localHelp: '按供应商分别展示 Zeus 采集的逐轮数据。Credits 和美元均为估算，不是实际账单。',
     allClients: '全部 Codex 客户端',
@@ -35,7 +49,7 @@ const text = {
     unavailable: '不可用',
     signedOut: '尚未登录 Codex ChatGPT 账户。',
     unsupported: '当前登录方式不提供 ChatGPT 官方账户统计；本地 Zeus 明细仍可用。',
-    stale: '离线或刷新失败，当前显示上次成功数据。',
+    stale: '本次刷新未完成，当前显示上次成功读取的数据。',
     empty: '尚无可展示的用量数据。',
     noPrice: '暂无官方价格',
     range: '时间范围',
@@ -48,6 +62,20 @@ const text = {
     title: 'Usage details',
     official: 'Codex account overview',
     officialHelp: 'Official account data across all Codex clients. It is never added to Zeus-local usage.',
+    /** 英文界面沿用相同的官方点数口径。 */
+    creditBalance: 'Credit balance',
+    /** 英文点数状态标签。 */
+    creditStatus: 'Credit status',
+    /** 英文可用点数状态。 */
+    creditsAvailable: 'Available',
+    /** 英文无点数状态。 */
+    noCredits: 'No credits',
+    /** 英文无限点数状态。 */
+    unlimitedCredits: 'Unlimited',
+    /** 英文未知点数状态。 */
+    unknownCredits: 'Unknown',
+    /** 英文官方点数扣费说明。 */
+    creditsHelp: 'After included limits are reached, available credits can extend usage under OpenAI rules. Official account billing and usage limits apply.',
     local: 'Provider-local usage details',
     localHelp: 'Turn-level data collected by Zeus, shown independently for each provider. Credits and USD are estimates, not an actual bill.',
     allClients: 'All Codex clients',
@@ -65,7 +93,7 @@ const text = {
     unavailable: 'Unavailable',
     signedOut: 'No Codex ChatGPT account is signed in.',
     unsupported: 'This sign-in method does not provide official ChatGPT account analytics. Zeus-local detail remains available.',
-    stale: 'Offline or refresh failed. Showing the last successful snapshot.',
+    stale: 'Refresh did not complete. Showing the last successful snapshot.',
     empty: 'No usage data is available yet.',
     noPrice: 'No official price available',
     range: 'Range',
@@ -76,6 +104,7 @@ const text = {
   },
 } as const;
 
+/** 用量读取失败只影响本页；保留旧数据、刷新入口和可主动查看的错误详情。 */
 export function CodexUsageSettingsPane(props: { client: UsageClient | null; language: Language; refreshRevision: number }) {
   const copy = text[props.language];
   const [range, setRange] = useState<CodexUsageRange>('30d');
@@ -86,9 +115,6 @@ export function CodexUsageSettingsPane(props: { client: UsageClient | null; lang
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
   const loadRevision = useRef(0);
-  useApplicationErrorDialog(error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
   const [filterOptions, setFilterOptions] = useState<{ projects: CodexLocalUsageGroup[]; models: CodexLocalUsageGroup[] }>({ projects: [], models: [] });
 
   const load = useCallback(async () => {
@@ -143,6 +169,12 @@ export function CodexUsageSettingsPane(props: { client: UsageClient | null; lang
       {loading && !snapshot ? (
         <p className="codex-usage-state" role="status">
           {copy.loading}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="codex-usage-state" role="status">
+          {snapshot ? <span>{copy.stale} </span> : null}
+          <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
       {snapshot ? (
@@ -241,7 +273,7 @@ function AllProvidersOverview(props: { providers: UsageProviderAnalytics[]; lang
             <MetricGrid
               language={props.language}
               items={[
-                [copy.today, formatTokens(analytics.provider.todayLocal.totalTokens, props.language)],
+                [copy.today, formatTokens(analytics.provider.overviewRanges.today.local.totalTokens, props.language)],
                 [copy.selectedRange, formatTokens(analytics.local.totals.totalTokens, props.language)],
                 [props.language === 'zh-CN' ? '轮次数' : 'Turns', String(analytics.local.totals.turnCount)],
                 [props.language === 'zh-CN' ? '费用估算' : 'Estimated cost', formatEstimatedCosts(analytics.local.totals.costs, analytics.local.totals.apiEquivalentUsd)],
@@ -264,7 +296,7 @@ function LocalProviderOverview(props: { analytics: UsageProviderAnalytics; langu
           language={props.language}
           items={[
             [props.language === 'zh-CN' ? '供应商类型' : 'Provider type', props.language === 'zh-CN' ? 'API 供应商' : 'API provider'],
-            [props.language === 'zh-CN' ? '今日 Token' : 'Today tokens', formatTokens(props.analytics.provider.todayLocal.totalTokens, props.language)],
+            [props.language === 'zh-CN' ? '今日 Token' : 'Today tokens', formatTokens(props.analytics.provider.overviewRanges.today.local.totalTokens, props.language)],
             [props.language === 'zh-CN' ? '当前范围 Token' : 'Range tokens', formatTokens(totals.totalTokens, props.language)],
             [props.language === 'zh-CN' ? '轮次数' : 'Turns', String(totals.turnCount)],
             [props.language === 'zh-CN' ? '缓存命中率' : 'Cache hit rate', formatPercent(totals.cacheHitRate, props.language)],
@@ -329,11 +361,11 @@ function UsageSection(props: { title: string; description: string; badge: string
   );
 }
 
+/** 官方统计不可用时在原位置说明，不因切换供应商或后台刷新弹出全局错误。 */
 function OfficialOverview(props: { snapshot: CodexOfficialUsageSnapshot; language: Language }) {
   const copy = text[props.language];
-  useApplicationErrorDialog(props.snapshot.state === 'unavailable' ? props.snapshot.error : null, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
+  /** 可用性只采用官方标志；无限点数优先，缺失标志保留未知。 */
+  const creditStatus = props.snapshot.creditsUnlimited ? copy.unlimitedCredits : props.snapshot.hasCredits === true ? copy.creditsAvailable : props.snapshot.hasCredits === false ? copy.noCredits : copy.unknownCredits;
   if (props.snapshot.state === 'signed_out') return <p className="codex-usage-state">{copy.signedOut}</p>;
   if (props.snapshot.state === 'unsupported') return <p className="codex-usage-state">{copy.unsupported}</p>;
   if (props.snapshot.state === 'unavailable' && !props.snapshot.fetchedAt)
@@ -350,6 +382,8 @@ function OfficialOverview(props: { snapshot: CodexOfficialUsageSnapshot; languag
           language={props.language}
           items={[
             [props.language === 'zh-CN' ? '计划' : 'Plan', props.snapshot.planType ?? copy.unavailable],
+            [copy.creditBalance, props.snapshot.creditsUnlimited ? copy.unlimitedCredits : (props.snapshot.creditBalance ?? copy.unknownCredits)],
+            [copy.creditStatus, creditStatus],
             [props.language === 'zh-CN' ? '累计 Token' : 'Lifetime tokens', formatTokens(props.snapshot.lifetimeTokens, props.language)],
             [props.language === 'zh-CN' ? '日峰值' : 'Peak day', formatTokens(props.snapshot.peakDailyTokens, props.language)],
             [props.language === 'zh-CN' ? '最长运行' : 'Longest turn', formatDuration(props.snapshot.longestRunningTurnSec, props.language)],
@@ -386,6 +420,7 @@ function OfficialOverview(props: { snapshot: CodexOfficialUsageSnapshot; languag
           ) : (
             <p className="codex-usage-state">{props.language === 'zh-CN' ? '当前没有可展示的限额窗口。' : 'No usage-limit windows are available.'}</p>
           )}
+          <p className="codex-usage-state">{copy.creditsHelp}</p>
         </section>
       </div>
     </>
@@ -525,8 +560,7 @@ function MetricGrid(props: { items: Array<[string, string]>; language: Language 
 }
 
 type UsageCalendarCardProps = { label: string; language: Language; runtimeName?: string } & (
-  | { days: CodexLocalUsageDay[]; local: true; range: CodexUsageRange }
-  | { days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>; local?: false; range?: never }
+  { days: CodexLocalUsageDay[]; local: true; range: CodexUsageRange } | { days: Array<Pick<CodexLocalUsageDay, 'date' | 'totalTokens'>>; local?: false; range?: never }
 );
 
 /** 官方账户和本地明细共用日历布局，分别保留其数据口径和筛选范围。 */

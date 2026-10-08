@@ -1,21 +1,27 @@
 import { MotionPresence } from './ui/MotionPresence.js';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { ClockCounterClockwiseIcon as ClockCounterClockwise } from '@phosphor-icons/react/dist/csr/ClockCounterClockwise';
 import { CheckIcon as CheckGlyph } from '@phosphor-icons/react/dist/csr/Check';
 import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
+import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
-import { GlobeIcon as Globe } from '@phosphor-icons/react/dist/csr/Globe';
+import { DownloadSimpleIcon as DownloadSimple } from '@phosphor-icons/react/dist/csr/DownloadSimple';
+import { FolderSimpleIcon as FolderSimple } from '@phosphor-icons/react/dist/csr/FolderSimple';
+import { QuestionIcon as Question } from '@phosphor-icons/react/dist/csr/Question';
 import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
 import { PlayIcon as Play } from '@phosphor-icons/react/dist/csr/Play';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { StopIcon as Stop } from '@phosphor-icons/react/dist/csr/Stop';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
+import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import { commandNeedsHighRiskConfirmation, type CommandRiskFlags } from '@zeus/shared';
 import { projectTerminalOutput } from '@zeus/shared';
 import {
   isLikelyLocalServerConnectionError,
   ZeusApiError,
+  type CommandArtifact,
   type CommandDefinition,
   type CommandDefinitionInput,
   type CommandParameterDefinition,
@@ -29,7 +35,8 @@ import {
 } from './apiClient.js';
 import { Button } from './ui/Button.js';
 import { ModalPortal } from './ui/ModalPortal.js';
-import { useApplicationErrorDialog } from './ui/ApplicationErrorDialog.js';
+import { MenuSurface } from './ui/MenuSurface.js';
+import { VisibleApplicationError } from './ui/ApplicationErrorDialog.js';
 import './commandCenter.css';
 import { ProjectTerminalPanel } from './features/runtime/ProjectTerminalPanel.js';
 
@@ -82,6 +89,11 @@ const COMMAND_RUN_SYNC_STALE_MS = 3_000;
 const COMMAND_RUN_EVENT_REFRESH_DELAY_MS = 100;
 const UTF8_ENCODER = new TextEncoder();
 
+/** 两份系统归档日志使用导出入口，其他文件使用输出文件入口。 */
+const COMMAND_RUN_LOG_ARTIFACT_PATHS = new Set(['logs/terminal.raw.log', 'logs/terminal.normalized.log']);
+/** 菜单按同一宽度对齐触发按钮，实际窗口边缘由共用菜单组件校正。 */
+const COMMAND_RUN_FILE_MENU_WIDTH_PX = 280;
+
 type CommandRunSyncState = 'syncing' | 'live' | 'stale';
 
 function CommandRunDurationValue(props: { run: CommandRun; zh: boolean }) {
@@ -125,10 +137,146 @@ function beginCommandRunLogSelection(event: ReactPointerEvent<HTMLPreElement>): 
   window.addEventListener('pointercancel', cancel, { capture: true, once: true });
 }
 
-function CommandRunLog(props: { runId: string; content: string; ariaLabel: string; hasLogs: boolean; client: DashboardClient; zh: boolean }) {
+/** 文件操作按需展开，不占用终端正文；复用菜单的关闭、定位和键盘规则。 */
+function CommandRunFileActions(props: { artifacts: CommandArtifact[]; client: DashboardClient; zh: boolean }) {
+  /** 原始输出与整理日志均可独立导出，避免丢失排查所需信息。 */
+  const logArtifacts = props.artifacts.filter((artifact) => COMMAND_RUN_LOG_ARTIFACT_PATHS.has(artifact.relativePath));
+  /** 命令显式生成的文件使用独立入口，数量不包含系统日志。 */
+  const outputArtifacts = props.artifacts.filter((artifact) => !COMMAND_RUN_LOG_ARTIFACT_PATHS.has(artifact.relativePath));
+  /** 菜单定位同时记录所属入口，切换记录时随终端一起重建。 */
+  const [menu, setMenu] = useState<{ kind: 'logs' | 'files'; left: number; top: number } | null>(null);
+  /** 菜单留在当前弹窗的门户根内，避免被终端裁切或被焦点隔离排除。 */
+  const menuHostRef = useRef<HTMLElement | null>(null);
+  /** 同一菜单的触发器与读屏名称共享稳定标识。 */
+  const menuId = useId();
+  /** 读取文件期间禁止重复提交，失败后保留原选项供重试。 */
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  /** 文件读取失败直接在菜单内显示，不改变运行状态或打开新弹窗。 */
+  const [downloadFailed, setDownloadFailed] = useState(false);
+  /** 当前入口只呈现对应文件，不为每次打开重复请求列表。 */
+  const visibleArtifacts = menu?.kind === 'logs' ? logArtifacts : outputArtifacts;
+
+  /** 按按钮位置打开菜单，首次打开才创建浮层。 */
+  function openMenu(kind: 'logs' | 'files', trigger: HTMLButtonElement): void {
+    if (menu?.kind === kind) {
+      setMenu(null);
+      return;
+    }
+    /** 优先复用所属弹窗的门户，确保菜单仍在当前模态操作范围内。 */
+    menuHostRef.current = trigger.closest<HTMLElement>('.zeus-modal-portal-root') ?? document.body;
+    /** 浮层宽度与定位使用同一配置。 */
+    const bounds = trigger.getBoundingClientRect();
+    setDownloadFailed(false);
+    setMenu({ kind, left: bounds.right - COMMAND_RUN_FILE_MENU_WIDTH_PX, top: bounds.bottom + 6 });
+  }
+
+  /** 下载归档的完整文件，不使用当前界面截取的日志内容。 */
+  async function downloadArtifact(artifact: CommandArtifact): Promise<void> {
+    if (downloadingId) return;
+    setDownloadingId(artifact.id);
+    setDownloadFailed(false);
+    try {
+      /** 现有内容接口保留文件授权、类型和原始字节。 */
+      const blob = await props.client.loadCommandArtifact(artifact.id);
+      /** 临时地址只服务本次下载，不在历史记录中累积缓存。 */
+      const url = URL.createObjectURL(blob);
+      try {
+        /** 浏览器和 Electron 使用原生下载流程，文件名保留原始扩展名。 */
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = artifact.relativePath.split('/').at(-1) || artifact.relativePath;
+        anchor.click();
+      } finally {
+        // 下一轮事件循环释放地址，让原生下载有机会接管文件。
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      }
+      setMenu(null);
+    } catch {
+      setDownloadFailed(true);
+    } finally {
+      setDownloadingId(null);
+    }
+  }
+
+  return (
+    <>
+      {logArtifacts.length > 0 ? (
+        <button
+          type="button"
+          className="command-run-log-action"
+          aria-haspopup="menu"
+          aria-expanded={menu?.kind === 'logs'}
+          aria-controls={menu?.kind === 'logs' ? menuId : undefined}
+          disabled={Boolean(downloadingId)}
+          onClick={(event) => openMenu('logs', event.currentTarget)}
+        >
+          <DownloadSimple aria-hidden="true" />
+          <span>{props.zh ? '导出日志' : 'Export logs'}</span>
+          <CaretDown aria-hidden="true" />
+        </button>
+      ) : null}
+      {outputArtifacts.length > 0 ? (
+        <button
+          type="button"
+          className="command-run-log-action"
+          aria-haspopup="menu"
+          aria-expanded={menu?.kind === 'files'}
+          aria-controls={menu?.kind === 'files' ? menuId : undefined}
+          disabled={Boolean(downloadingId)}
+          onClick={(event) => openMenu('files', event.currentTarget)}
+        >
+          <span>
+            {props.zh ? '输出文件' : 'Output files'} ({outputArtifacts.length})
+          </span>
+          <CaretDown aria-hidden="true" />
+        </button>
+      ) : null}
+      <MotionPresence>
+        {menu && menuHostRef.current
+          ? createPortal(
+              <MenuSurface
+                id={menuId}
+                className="command-run-file-menu"
+                aria-label={menu.kind === 'logs' ? (props.zh ? '导出日志' : 'Export logs') : props.zh ? '输出文件' : 'Output files'}
+                style={{ left: menu.left, top: menu.top, width: COMMAND_RUN_FILE_MENU_WIDTH_PX }}
+                onClose={() => setMenu(null)}
+              >
+                {visibleArtifacts.map((artifact) => (
+                  <button
+                    key={artifact.id}
+                    type="button"
+                    role="menuitem"
+                    disabled={Boolean(downloadingId)}
+                    aria-busy={downloadingId === artifact.id || undefined}
+                    title={artifact.relativePath}
+                    onClick={() => void downloadArtifact(artifact)}
+                  >
+                    {downloadingId === artifact.id ? <CircleNotch className="command-run-copy-spinner" aria-hidden="true" /> : <DownloadSimple aria-hidden="true" />}
+                    <span>
+                      <strong>{menu.kind === 'logs' ? (artifact.relativePath === 'logs/terminal.raw.log' ? (props.zh ? '原始日志' : 'Raw logs') : props.zh ? '整理日志' : 'Formatted logs') : artifact.relativePath}</strong>
+                      <small>{downloadingId === artifact.id ? (props.zh ? '正在导出…' : 'Exporting…') : formatBytes(artifact.byteLength)}</small>
+                    </span>
+                  </button>
+                ))}
+                {downloadFailed ? <p role="alert">{props.zh ? '导出失败，请重试。' : 'Export failed. Please try again.'}</p> : null}
+              </MenuSurface>,
+              menuHostRef.current,
+            )
+          : null}
+      </MotionPresence>
+    </>
+  );
+}
+
+/** 运行说明并入终端，正文保留独立滚动、尾部跟随、完整复制与文件导出。 */
+function CommandRunLog(props: { runId: string; content: string; ariaLabel: string; hasLogs: boolean; failureReason: string | null; artifacts: CommandArtifact[]; client: DashboardClient; zh: boolean }) {
+  /** 正文容器只负责日志滚动和选区。 */
   const containerRef = useRef<HTMLPreElement>(null);
+  /** 切换记录时重新定位到日志尾部。 */
   const followedRunIdRef = useRef(props.runId);
+  /** 用户上滚后暂停跟随，回到底部时恢复。 */
   const shouldFollowLatestRef = useRef(true);
+  /** 复制反馈独立于运行状态。 */
   const [copyState, setCopyState] = useState<CommandRunCopyState>('idle');
 
   useEffect(() => {
@@ -147,6 +295,19 @@ function CommandRunLog(props: { runId: string; content: string; ariaLabel: strin
     if (shouldFollowLatestRef.current) container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
   }, [props.content, props.runId]);
 
+  useEffect(() => {
+    /** 窗口和折叠内容改变终端尺寸时，延续用户当前的尾部跟随选择。 */
+    const container = containerRef.current;
+    if (!container) return;
+    /** 观察实际正文尺寸，覆盖折叠动画和窗口缩放。 */
+    const resizeObserver = new ResizeObserver(() => {
+      if (shouldFollowLatestRef.current) container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
+    });
+    resizeObserver.observe(container);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  /** 按复制状态展示可访问名称和明确的恢复提示。 */
   const copyLabel =
     copyState === 'copying'
       ? props.zh
@@ -168,6 +329,7 @@ function CommandRunLog(props: { runId: string; content: string; ariaLabel: strin
               ? '复制全部日志'
               : 'Copy all logs';
 
+  /** 复制服务端完整输出，不把当前展示预算当作完整日志。 */
   async function copyCompleteLog(): Promise<void> {
     if (!props.hasLogs || copyState === 'copying') return;
     setCopyState('copying');
@@ -183,34 +345,55 @@ function CommandRunLog(props: { runId: string; content: string; ariaLabel: strin
   return (
     <section className="command-run-log-shell" aria-label={props.ariaLabel}>
       <header className="command-run-log-toolbar">
-        <strong>{props.ariaLabel}</strong>
-        <button
-          className="command-run-copy-action"
-          type="button"
-          disabled={!props.hasLogs || copyState === 'copying'}
-          aria-busy={copyState === 'copying' || undefined}
-          data-copy-state={copyState}
-          aria-label={copyLabel}
-          title={copyLabel}
-          onClick={() => void copyCompleteLog()}
-        >
-          {copyState === 'copying' ? (
-            <CircleNotch className="command-run-copy-spinner" aria-hidden="true" />
-          ) : copyState === 'copied' ? (
-            <CheckGlyph aria-hidden="true" />
-          ) : copyState === 'too_large' || copyState === 'failed' ? (
-            <WarningCircle aria-hidden="true" />
-          ) : (
-            <Copy aria-hidden="true" />
-          )}
-        </button>
+        <strong>
+          <TerminalWindow aria-hidden="true" />
+          {props.ariaLabel}
+        </strong>
+        <div className="command-run-log-actions">
+          <button
+            className="command-run-log-action"
+            type="button"
+            disabled={!props.hasLogs || copyState === 'copying'}
+            aria-busy={copyState === 'copying' || undefined}
+            data-copy-state={copyState}
+            aria-label={copyLabel}
+            title={copyLabel}
+            onClick={() => void copyCompleteLog()}
+          >
+            {copyState === 'copying' ? (
+              <CircleNotch className="command-run-copy-spinner" aria-hidden="true" />
+            ) : copyState === 'copied' ? (
+              <CheckGlyph aria-hidden="true" />
+            ) : copyState === 'too_large' || copyState === 'failed' ? (
+              <WarningCircle aria-hidden="true" />
+            ) : (
+              <Copy aria-hidden="true" />
+            )}
+            <span>{copyState === 'idle' ? (props.zh ? '复制日志' : 'Copy logs') : copyLabel}</span>
+          </button>
+          <CommandRunFileActions artifacts={props.artifacts} client={props.client} zh={props.zh} />
+        </div>
       </header>
+      {props.failureReason ? (
+        <details className="command-run-failure">
+          <summary>
+            <WarningCircle aria-hidden="true" />
+            <span className="command-run-failure-preview">{props.failureReason}</span>
+            <span className="command-run-disclosure-label">
+              {props.zh ? '详情' : 'Details'}
+              <CaretDown aria-hidden="true" />
+            </span>
+          </summary>
+          <pre tabIndex={0}>{props.failureReason}</pre>
+        </details>
+      ) : null}
       <span className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
         {copyState === 'idle' ? '' : copyLabel}
       </span>
       <pre
         ref={containerRef}
         className="command-run-log"
+        tabIndex={0}
         onPointerDown={beginCommandRunLogSelection}
         onScroll={(event) => {
           const container = event.currentTarget;
@@ -250,9 +433,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  useApplicationErrorDialog(error, {
-    language: zh ? 'zh-CN' : 'en',
-  });
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState<CommandDefinition | 'new' | null>(null);
   const [draft, setDraft] = useState<CommandDraft>(emptyDraft);
@@ -264,8 +444,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<CommandRunDetail | null>(null);
   const [runSyncState, setRunSyncState] = useState<CommandRunSyncState>('syncing');
-  const [artifactPreviewUrls, setArtifactPreviewUrls] = useState<Record<string, string>>({});
-  const artifactPreviewUrlsRef = useRef<Record<string, string>>({});
   const runLogCursorRef = useRef<{ runId: string | null; nextSeq: number }>({ runId: null, nextSeq: 0 });
   const historyCommandIdRef = useRef<string | null>(null);
 
@@ -433,17 +611,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       unsubscribe?.();
     };
   }, [props.client, selectedRunId, selectedRunIsActive, selectedRuntimeSessionId]);
-
-  useEffect(() => {
-    artifactPreviewUrlsRef.current = artifactPreviewUrls;
-  }, [artifactPreviewUrls]);
-
-  useEffect(
-    () => () => {
-      for (const url of Object.values(artifactPreviewUrlsRef.current)) URL.revokeObjectURL(url);
-    },
-    [],
-  );
 
   async function reloadCommands(): Promise<void> {
     const items = props.mode === 'global' ? await props.client.loadGlobalCommands() : props.project ? await props.client.loadProjectCommands(props.project.id) : [];
@@ -651,17 +818,8 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
     }
   }
 
-  async function previewArtifact(artifactId: string): Promise<void> {
-    if (artifactPreviewUrls[artifactId]) return;
-    try {
-      const blob = await props.client.loadCommandArtifact(artifactId);
-      setArtifactPreviewUrls((current) => ({ ...current, [artifactId]: URL.createObjectURL(blob) }));
-    } catch (previewError) {
-      setError(previewError);
-    }
-  }
-
-  const heading = props.mode === 'global' ? (zh ? '全局命令' : 'Global commands') : zh ? `${props.project?.name ?? '项目'}命令` : `${props.project?.name ?? 'Project'} commands`;
+  /** 项目已由工作区导航标明，页面标题只说明当前操作。 */
+  const heading = props.mode === 'global' ? (zh ? '全局命令' : 'Global commands') : zh ? '命令' : 'Commands';
 
   return (
     <div className="command-center-workspace">
@@ -669,15 +827,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         <header className="command-center-header">
           <span>
             <h2 id="command-center-title">{heading}</h2>
-            <p>
-              {props.mode === 'global'
-                ? zh
-                  ? '内置微信上传、预览和真机调试，也可添加自己的脚本。在项目命令中运行。'
-                  : 'Built-in WeChat upload, preview and device debugging. Add your own scripts and run commands from a project.'
-                : zh
-                  ? '全局命令只读展示；项目命令可在这里维护和执行。'
-                  : 'Global commands are read-only here; project commands can be maintained and run.'}
-            </p>
+            {props.mode === 'global' ? <p>{zh ? '在项目中运行' : 'Run from a project'}</p> : null}
           </span>
           <div className="command-center-header-actions">
             {props.mode === 'project' && props.project ? <ProjectTerminalPanel dockHost={terminalHost} key={props.project.id} project={props.project} client={props.client} language={props.language} /> : null}
@@ -691,6 +841,11 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         <div className="command-center-live" role="status" aria-live="polite">
           {notice ? <span>{notice}</span> : null}
         </div>
+        {error ? (
+          <p className="command-center-empty" role="alert">
+            <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+          </p>
+        ) : null}
 
         <section className="command-definition-list" aria-label={zh ? '命令定义列表' : 'Command definitions'}>
           {loading ? (
@@ -699,59 +854,58 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
             <p className="command-center-empty">{zh ? '尚未配置命令。' : 'No commands configured.'}</p>
           ) : (
             commands.map((command) => {
+              /** 项目页只允许维护项目命令，全局页维护全局命令。 */
               const editable = props.mode === 'global' ? command.scope === 'global' : command.scope === 'project';
               return (
                 <article className="command-definition-row" key={command.id} data-enabled={command.enabled ? 'true' : 'false'}>
-                  <span className="command-definition-leading" aria-hidden="true">
-                    {command.scope === 'global' ? <Globe /> : <span>⌘</span>}
-                  </span>
-                  <span className="command-definition-copy">
-                    <span className="command-definition-title">
+                  <details className="command-definition-copy">
+                    <summary className="command-definition-title">
+                      <CaretDown aria-hidden="true" />
                       <strong>{command.title}</strong>
-                      <code>{command.name}</code>
                       <small>{command.scope === 'global' ? (zh ? '全局' : 'Global') : zh ? '项目' : 'Project'}</small>
-                    </span>
-                    <span>{command.description || command.command}</span>
-                    <small>
-                      {command.aliases.length > 0 ? `${zh ? '别名' : 'Aliases'}: ${command.aliases.join(', ')} · ` : ''}
-                      {command.timeoutSeconds}s · {command.telegramEnabled ? 'Telegram on' : 'Telegram off'} · {command.enabled ? (zh ? '已启用' : 'Enabled') : zh ? '已停用' : 'Disabled'}
-                    </small>
-                  </span>
+                      {!command.enabled ? <small>{zh ? '已停用' : 'Disabled'}</small> : null}
+                    </summary>
+                    <CommandDefinitionDetails command={command} zh={zh} />
+                  </details>
                   <span className="command-definition-actions">
                     {props.mode === 'project' ? (
                       <>
-                        <Button
-                          size="compact"
+                        <button
+                          type="button"
+                          className="command-definition-icon-action"
                           onClick={() => void openRunHistory(command)}
                           disabled={!props.project || busy}
                           aria-label={`${zh ? '查看执行历史' : 'View run history'} ${command.title}`}
                           title={zh ? '执行历史' : 'Run history'}
                         >
                           <ClockCounterClockwise aria-hidden="true" />
-                        </Button>
-                        <Button size="compact" onClick={() => void openRun(command)} disabled={!command.enabled || !props.project || busy}>
+                        </button>
+                        <Button size="compact" onClick={() => void openRun(command)} disabled={!command.enabled || !props.project || busy} aria-label={`${zh ? '运行' : 'Run'} ${command.title}`}>
                           <Play aria-hidden="true" />
                           {zh ? '运行' : 'Run'}
                         </Button>
                       </>
                     ) : null}
-                    {editable ? (
-                      <>
-                        <Button size="compact" onClick={() => openEdit(command)} disabled={busy} aria-label={`${zh ? '编辑' : 'Edit'} ${command.title}`}>
-                          <PencilSimple aria-hidden="true" />
-                        </Button>
-                        <Button
-                          size="compact"
-                          variant={pendingDeleteId === command.id ? 'danger' : 'secondary'}
-                          onClick={() => void removeCommand(command)}
-                          disabled={busy}
-                          aria-label={`${pendingDeleteId === command.id ? (zh ? '确认删除' : 'Confirm delete') : zh ? '删除' : 'Delete'} ${command.title}`}
-                        >
-                          <Trash aria-hidden="true" />
-                          {pendingDeleteId === command.id ? (zh ? '确认' : 'Confirm') : null}
-                        </Button>
-                      </>
-                    ) : null}
+                    <span className="command-definition-management">
+                      {editable ? (
+                        <>
+                          <button type="button" className="command-definition-icon-action" onClick={() => openEdit(command)} disabled={busy} aria-label={`${zh ? '编辑' : 'Edit'} ${command.title}`}>
+                            <PencilSimple aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            className="command-definition-icon-action"
+                            data-confirm={pendingDeleteId === command.id ? 'true' : undefined}
+                            onClick={() => void removeCommand(command)}
+                            disabled={busy}
+                            aria-label={`${pendingDeleteId === command.id ? (zh ? '确认删除' : 'Confirm delete') : zh ? '删除' : 'Delete'} ${command.title}`}
+                          >
+                            <Trash aria-hidden="true" />
+                            {pendingDeleteId === command.id ? (zh ? '确认' : 'Confirm') : null}
+                          </button>
+                        </>
+                      ) : null}
+                    </span>
                   </span>
                 </article>
               );
@@ -805,14 +959,12 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
               runDetail={runDetail}
               syncState={runSyncState}
               projectedRunLogContent={projectedRunLogContent}
-              artifactPreviewUrls={artifactPreviewUrls}
               client={props.client}
               busy={busy}
               language={props.language}
               onClose={closeRunHistory}
               onSelectRun={selectHistoryRun}
               onStopRun={(run) => void stopRun(run)}
-              onPreviewArtifact={(artifactId) => void previewArtifact(artifactId)}
             />
           ) : null}
         </MotionPresence>
@@ -822,6 +974,37 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   );
 }
 
+/** 完整说明与技术配置按需展开，列表和运行确认共用一处展示。 */
+function CommandDefinitionDetails(props: { command: CommandDefinition; zh: boolean }) {
+  return (
+    <div className="command-definition-details">
+      {props.command.description ? <p>{props.command.description}</p> : null}
+      <code>{props.command.command}</code>
+      <dl>
+        <div>
+          <dt>{props.zh ? '名称' : 'Name'}</dt>
+          <dd>{props.command.name}</dd>
+        </div>
+        {props.command.aliases.length > 0 ? (
+          <div>
+            <dt>{props.zh ? '别名' : 'Aliases'}</dt>
+            <dd>{props.command.aliases.join(', ')}</dd>
+          </div>
+        ) : null}
+        <div>
+          <dt>{props.zh ? '超时' : 'Timeout'}</dt>
+          <dd>{props.command.timeoutSeconds}s</dd>
+        </div>
+        <div>
+          <dt>Telegram</dt>
+          <dd>{props.command.telegramEnabled ? (props.zh ? '开启' : 'On') : props.zh ? '关闭' : 'Off'}</dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
+/** 历史列表与终端分别滚动，运行说明随终端展示。 */
 function CommandRunHistoryModal(props: {
   command: CommandDefinition;
   project: ProjectRecord;
@@ -831,18 +1014,21 @@ function CommandRunHistoryModal(props: {
   runDetail: CommandRunDetail | null;
   syncState: CommandRunSyncState;
   projectedRunLogContent: string;
-  artifactPreviewUrls: Record<string, string>;
   client: DashboardClient;
   busy: boolean;
   language: 'zh-CN' | 'en-US';
   onClose: () => void;
   onSelectRun: (runId: string) => void;
   onStopRun: (run: CommandRun) => void;
-  onPreviewArtifact: (artifactId: string) => void;
 }) {
+  /** 文案跟随当前界面语言。 */
   const zh = props.language === 'zh-CN';
+  /** 运行中的命令保留真实连接状态。 */
   const activeRunSyncState = props.runDetail?.run.status === 'running' ? props.syncState : 'live';
+  /** 未确认实时状态时禁止停止，避免提交结果不明确的操作。 */
   const stopUnavailable = activeRunSyncState !== 'live';
+  /** 当前记录的状态在详情标题旁展示，避免重复占用统计卡片。 */
+  const selectedStatus = props.runDetail ? commandRunStatusPresentation(props.runDetail.run, props.runDetail.run.id, props.syncState, zh) : null;
   return (
     <ModalPortal rootClassName="command-modal-portal-root" backdropClassName="command-modal-backdrop" dismissDisabled={props.busy} onDismiss={props.onClose} role="dialog" aria-labelledby="command-history-modal-title">
       <div className="command-modal command-history-modal zeus-solid-form-surface" data-modal-surface="dialog">
@@ -863,43 +1049,49 @@ function CommandRunHistoryModal(props: {
             <p className="command-center-empty">{zh ? '此命令在当前项目中尚无执行记录。' : 'This command has no run history in the current project.'}</p>
           ) : (
             <div className="command-run-layout">
-              <ul className="command-run-list" aria-label={zh ? '执行记录' : 'Run records'}>
-                {props.runs.map((run) => {
-                  const status = commandRunStatusPresentation(run, props.selectedRunId, props.syncState, zh);
-                  return (
-                    <li key={run.id}>
-                      <button type="button" aria-pressed={props.selectedRunId === run.id} className={props.selectedRunId === run.id ? 'selected' : ''} onClick={() => props.onSelectRun(run.id)}>
-                        <span>
-                          <strong>{formatRunTime(run.createdAt)}</strong>
-                          <small>
-                            {zh ? '耗时' : 'Duration'} <CommandRunDurationValue run={run} zh={zh} />
-                          </small>
-                        </span>
-                        <span className={`command-run-status ${status.className}`}>{status.label}</span>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
+              <aside className="command-run-sidebar">
+                <ul className="command-run-list" aria-label={zh ? '执行记录' : 'Run records'}>
+                  {props.runs.map((run) => {
+                    /** 历史记录同步展示运行状态与连接状态。 */
+                    const status = commandRunStatusPresentation(run, props.selectedRunId, props.syncState, zh);
+                    return (
+                      <li key={run.id}>
+                        <button type="button" aria-pressed={props.selectedRunId === run.id} className={props.selectedRunId === run.id ? 'selected' : ''} onClick={() => props.onSelectRun(run.id)}>
+                          <span>
+                            <strong>{formatRunTime(run.createdAt)}</strong>
+                            <small>
+                              {zh ? '耗时' : 'Duration'} <CommandRunDurationValue run={run} zh={zh} />
+                            </small>
+                          </span>
+                          <span className={`command-run-status ${status.className}`}>{status.label}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </aside>
               {props.runDetail ? (
                 <section className="command-run-detail" aria-label={zh ? '执行详情' : 'Run details'}>
                   <header>
                     <span>
-                      <strong>{props.runDetail.run.commandSnapshot.title}</strong>
-                      <small>{props.runDetail.run.cwd}</small>
+                      <strong>{formatRunTime(props.runDetail.run.createdAt)}</strong>
+                      <small title={props.runDetail.run.cwd}>{props.runDetail.run.cwd}</small>
                     </span>
-                    {props.runDetail.run.status === 'running' ? (
-                      <Button
-                        variant="danger"
-                        size="compact"
-                        onClick={() => props.onStopRun(props.runDetail!.run)}
-                        disabled={props.busy || stopUnavailable}
-                        title={stopUnavailable ? (zh ? '连接恢复并确认命令状态后才能停止。' : 'Stop is available after the connection recovers and the run state is confirmed.') : undefined}
-                      >
-                        <Stop aria-hidden="true" />
-                        {zh ? '停止' : 'Stop'}
-                      </Button>
-                    ) : null}
+                    <div className="command-run-detail-actions">
+                      {selectedStatus ? <span className={`command-run-status ${selectedStatus.className}`}>{selectedStatus.label}</span> : null}
+                      {props.runDetail.run.status === 'running' ? (
+                        <Button
+                          variant="danger"
+                          size="compact"
+                          onClick={() => props.onStopRun(props.runDetail!.run)}
+                          disabled={props.busy || stopUnavailable}
+                          title={stopUnavailable ? (zh ? '连接恢复并确认命令状态后才能停止。' : 'Stop is available after the connection recovers and the run state is confirmed.') : undefined}
+                        >
+                          <Stop aria-hidden="true" />
+                          {zh ? '停止' : 'Stop'}
+                        </Button>
+                      ) : null}
+                    </div>
                   </header>
                   {activeRunSyncState === 'stale' ? (
                     <p className="command-run-sync-warning" role="status" aria-live="polite">
@@ -911,10 +1103,6 @@ function CommandRunHistoryModal(props: {
                     </p>
                   ) : null}
                   <dl>
-                    <div>
-                      <dt>{zh ? '状态' : 'Status'}</dt>
-                      <dd>{commandRunStatusPresentation(props.runDetail.run, props.runDetail.run.id, props.syncState, zh).label}</dd>
-                    </div>
                     <div>
                       <dt>{zh ? '实际耗时' : 'Duration'}</dt>
                       <dd>
@@ -930,32 +1118,20 @@ function CommandRunHistoryModal(props: {
                       <dd>{props.runDetail.run.exitCode ?? '—'}</dd>
                     </div>
                   </dl>
-                  {props.runDetail.run.failureReason ? <p className="command-run-failure">{props.runDetail.run.failureReason}</p> : null}
                   <CommandRunLog
                     key={props.runDetail.run.id}
                     runId={props.runDetail.run.id}
                     ariaLabel={zh ? '终端日志' : 'Terminal logs'}
                     content={props.runDetail.logs.length > 0 ? props.projectedRunLogContent : zh ? '暂无日志。' : 'No logs yet.'}
                     hasLogs={props.runDetail.logTotal > 0}
+                    failureReason={props.runDetail.run.failureReason}
+                    artifacts={props.runDetail.artifacts}
                     client={props.client}
                     zh={zh}
                   />
-                  {props.runDetail.artifacts.length > 0 ? (
-                    <section className="command-artifacts" aria-label={zh ? '命令产物' : 'Command artifacts'}>
-                      <strong>{zh ? '产物' : 'Artifacts'}</strong>
-                      {props.runDetail.artifacts.map((artifact) => (
-                        <div key={artifact.id}>
-                          <button type="button" onClick={() => props.onPreviewArtifact(artifact.id)}>
-                            {artifact.relativePath} · {formatBytes(artifact.byteLength)}
-                          </button>
-                          {artifact.mimeType?.startsWith('image/') && props.artifactPreviewUrls[artifact.id] ? <img src={props.artifactPreviewUrls[artifact.id]} alt={artifact.relativePath} /> : null}
-                        </div>
-                      ))}
-                    </section>
-                  ) : null}
                 </section>
               ) : (
-                <p className="command-center-empty">{zh ? '选择一条记录查看终端日志与产物。' : 'Select a run to view logs and artifacts.'}</p>
+                <p className="command-center-empty">{zh ? '选择一条记录查看执行详情。' : 'Select a run to view its details.'}</p>
               )}
             </div>
           )}
@@ -1160,7 +1336,7 @@ function CommandPermissionModal(props: { request: CommandPermissionRequest; proj
               </li>
             ) : null}
           </ul>
-          <p className="command-permission-next-step">{zh ? '开启后仍会进入本次运行确认；只有再次点击“确认并运行”才会执行。' : 'After enabling, you will still review this run. It executes only after you select “Confirm and run”.'}</p>
+          <p className="command-permission-next-step">{zh ? '开启后还需确认运行。' : 'Confirm the run after enabling.'}</p>
         </div>
         <footer className="command-modal-footer">
           <Button autoFocus onClick={props.onClose} disabled={props.busy}>
@@ -1175,6 +1351,7 @@ function CommandPermissionModal(props: { request: CommandPermissionRequest; proj
   );
 }
 
+/** 运行确认只填写必填参数，技术配置与字段说明按需查看。 */
 function CommandRunModal(props: {
   command: CommandDefinition;
   project: ProjectRecord;
@@ -1185,77 +1362,116 @@ function CommandRunModal(props: {
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
+  /** 当前界面的显示语言。 */
   const zh = props.language === 'zh-CN';
+  /** 高风险命令保留醒目的运行按钮和具体影响。 */
   const highRisk = commandNeedsHighRiskConfirmation(props.command.riskFlags);
+  /** 仅展示本次命令实际声明的风险范围。 */
   const riskLabels = commandRiskLabels(props.command.riskFlags, zh);
+  /** 只渲染必须填写的参数，完整参数值仍沿用既有初始化和提交链路。 */
+  const requiredParameters = props.command.parameters.filter((parameter) => parameter.required);
+  /** 控件和说明使用同一弹窗内的唯一标识建立可访问关联。 */
+  const fieldPrefix = useId();
+  /** 整分钟超时使用易读单位，其余仍显示精确秒数。 */
+  const timeoutLabel = props.command.timeoutSeconds % 60 === 0 ? `${props.command.timeoutSeconds / 60}${zh ? ' 分钟' : ' min'}` : `${props.command.timeoutSeconds}${zh ? ' 秒' : ' s'}`;
   return (
-    <ModalPortal rootClassName="command-modal-portal-root" backdropClassName="command-modal-backdrop" dismissDisabled={props.busy} onDismiss={props.onClose} role="dialog" aria-labelledby="command-run-modal-title">
+    <ModalPortal
+      rootClassName="command-modal-portal-root"
+      backdropClassName="command-modal-backdrop"
+      dismissDisabled={props.busy}
+      onDismiss={props.onClose}
+      role="dialog"
+      aria-labelledby="command-run-modal-title"
+      aria-describedby={highRisk ? `${fieldPrefix}-risk` : undefined}
+    >
       <form className="command-modal command-run-modal command-run-form zeus-solid-form-surface" onSubmit={props.onSubmit} data-modal-surface="dialog">
         <header className="command-modal-header">
           <span>
             <h3 id="command-run-modal-title">{props.command.title}</h3>
-            <code>{props.command.command}</code>
           </span>
           <button type="button" aria-label={zh ? '关闭' : 'Close'} onClick={props.onClose} disabled={props.busy}>
             ×
           </button>
         </header>
-        <div className="command-modal-body" inert={props.busy} aria-busy={props.busy || undefined}>
-          <dl>
-            <div>
-              <dt>{zh ? '项目目录' : 'Project directory'}</dt>
-              <dd>{props.project.localPath}</dd>
-            </div>
-            <div>
-              <dt>{zh ? '超时' : 'Timeout'}</dt>
-              <dd>{props.command.timeoutSeconds}s</dd>
-            </div>
-            <div>
-              <dt>{zh ? '风险' : 'Risk'}</dt>
-              <dd>{highRisk ? (zh ? '高风险' : 'High risk') : zh ? '普通' : 'Normal'}</dd>
-            </div>
-          </dl>
-          {props.command.parameters.map((parameter, index) => (
-            <label key={parameter.key}>
-              {parameter.label}
-              <small>
-                {parameter.key}
-                {parameter.required ? (zh ? ' · 必填' : ' · required') : ''}
-              </small>
-              {parameter.type === 'boolean' ? (
-                <input autoFocus={index === 0} type="checkbox" checked={Boolean(props.values[parameter.key])} onChange={(event) => props.onValuesChange({ ...props.values, [parameter.key]: event.currentTarget.checked })} />
-              ) : (
-                <input
-                  autoFocus={index === 0}
-                  required={parameter.required}
-                  type={parameter.sensitive ? 'password' : parameter.type === 'number' ? 'number' : 'text'}
-                  step={parameter.type === 'number' ? 'any' : undefined}
-                  value={String(props.values[parameter.key] ?? '')}
-                  onChange={(event) => props.onValuesChange({ ...props.values, [parameter.key]: parameter.type === 'number' && event.currentTarget.value !== '' ? Number(event.currentTarget.value) : event.currentTarget.value })}
-                />
-              )}
-              {parameter.description ? <small>{parameter.description}</small> : null}
-            </label>
-          ))}
+        <div className="command-modal-body command-run-body" inert={props.busy} aria-busy={props.busy || undefined}>
+          <div className="command-run-context">
+            <FolderSimple aria-hidden="true" />
+            <span title={props.project.localPath} aria-label={`${zh ? '项目目录' : 'Project directory'} ${props.project.localPath}`}>
+              {props.project.localPath}
+            </span>
+            <small title={zh ? '超时上限' : 'Timeout limit'}>{timeoutLabel}</small>
+          </div>
+          <div className="command-run-parameters">
+            {requiredParameters.map((parameter, index) => (
+              <div className="command-run-parameter" data-type={parameter.type} key={parameter.key}>
+                <div className="command-run-parameter-heading">
+                  <label htmlFor={`${fieldPrefix}-${index}`}>
+                    {parameter.label}
+                    {parameter.required ? (
+                      <span className="command-run-required" aria-label={zh ? '必填' : 'Required'}>
+                        {' '}
+                        *
+                      </span>
+                    ) : null}
+                  </label>
+                  <details className="command-parameter-help">
+                    <summary aria-label={`${zh ? '查看说明' : 'View help'} ${parameter.label}`}>
+                      <Question aria-hidden="true" />
+                    </summary>
+                    <div id={`${fieldPrefix}-${index}-help`}>
+                      <code>{parameter.key}</code>
+                      {parameter.description ? <p>{parameter.description}</p> : null}
+                    </div>
+                  </details>
+                </div>
+                {parameter.type === 'boolean' ? (
+                  <input
+                    id={`${fieldPrefix}-${index}`}
+                    aria-describedby={`${fieldPrefix}-${index}-help`}
+                    autoFocus={index === 0}
+                    type="checkbox"
+                    checked={Boolean(props.values[parameter.key])}
+                    onChange={(event) => props.onValuesChange({ ...props.values, [parameter.key]: event.currentTarget.checked })}
+                  />
+                ) : (
+                  <input
+                    id={`${fieldPrefix}-${index}`}
+                    aria-describedby={`${fieldPrefix}-${index}-help`}
+                    autoFocus={index === 0}
+                    required={parameter.required}
+                    type={parameter.sensitive ? 'password' : parameter.type === 'number' ? 'number' : 'text'}
+                    step={parameter.type === 'number' ? 'any' : undefined}
+                    value={String(props.values[parameter.key] ?? '')}
+                    onChange={(event) => props.onValuesChange({ ...props.values, [parameter.key]: parameter.type === 'number' && event.currentTarget.value !== '' ? Number(event.currentTarget.value) : event.currentTarget.value })}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+          <details className="command-run-details">
+            <summary>
+              <CaretDown aria-hidden="true" />
+              {zh ? '命令详情' : 'Command details'}
+            </summary>
+            <CommandDefinitionDetails command={props.command} zh={zh} />
+          </details>
           {highRisk ? (
-            <section className="command-high-risk-summary" aria-label={zh ? '高风险操作说明' : 'High-risk operation details'}>
-              <strong>{zh ? '本次运行包含高风险操作' : 'This run includes high-risk operations'}</strong>
-              <ul>
-                {riskLabels.map((label) => (
-                  <li key={label}>{label}</li>
-                ))}
-              </ul>
-              <p>{zh ? '请核对命令、项目目录和参数；点击确认按钮即授权本次执行。' : 'Review the command, project directory, and parameters. Selecting the confirmation button authorizes this run.'}</p>
-            </section>
+            <p className="command-run-risk" id={`${fieldPrefix}-risk`}>
+              <WarningCircle aria-hidden="true" />
+              <span>
+                {zh ? '涉及：' : 'Includes: '}
+                {riskLabels.join(zh ? '、' : ', ')}
+              </span>
+            </p>
           ) : null}
         </div>
         <footer className="command-modal-footer">
           <Button onClick={props.onClose} disabled={props.busy}>
             {zh ? '取消' : 'Cancel'}
           </Button>
-          <Button autoFocus={props.command.parameters.length === 0} type="submit" variant={highRisk ? 'danger' : 'primary'} busy={props.busy}>
+          <Button autoFocus={requiredParameters.length === 0} type="submit" variant={highRisk ? 'danger' : 'primary'} busy={props.busy}>
             <Play aria-hidden="true" />
-            {zh ? '确认并运行' : 'Confirm and run'}
+            {zh ? '运行' : 'Run'}
           </Button>
         </footer>
       </form>
@@ -1296,11 +1512,7 @@ function draftToInput(draft: CommandDraft): CommandDefinitionInput {
 
 function projectConfigWithCommandPermissions(config: ProjectConfig, command: CommandDefinition): SaveProjectConfigRequest {
   return {
-    defaultWorkMode: config.defaultWorkMode,
-    language: config.language,
-    dependencies: config.dependencies,
     database: config.database,
-    telegram: config.telegram,
     security: {
       allowShell: true,
       allowGitWrite: config.security.allowGitWrite || command.riskFlags.gitWrite,

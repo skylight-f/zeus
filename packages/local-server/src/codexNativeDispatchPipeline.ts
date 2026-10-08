@@ -1,5 +1,5 @@
-import { frozenNativeSkillCatalogPrompt } from './nativeConversationSubmissionInputs.js';
-import { type CodexThreadGoal, toCodexWireReasoningEffort } from '@zeus/ai-runtime';
+import { readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
+import { type CodexCollaborationMode, type CodexThreadGoal, toCodexWireReasoningEffort } from '@zeus/ai-runtime';
 import type { ConversationCollaborationMode, ConversationNextTurnSettings, ConversationRepository, ZeusConversationGoalRecord, ZeusConversationSubmissionRecord, ZeusConversationWithMessagesRecord } from '@zeus/storage';
 import { ensureInitialCodexGoal } from './codexGoalApplication.js';
 import type {
@@ -16,6 +16,7 @@ import type {
 import {
   conversationSubmissionDispatchEnvelope,
   coordinatorError,
+  defaultModeDeveloperInstructions,
   developerInstructionsFor,
   isProviderThreadArchivedError,
   parseJsonRecord,
@@ -298,7 +299,10 @@ export function createCodexNativeDispatchPipeline(dependencies: CodexNativeDispa
         source: providerThreadId ? 'resume' : 'startup',
         ...(providerThreadId ? {} : { prompt: submissionText(submission) }),
       });
+      /** 线程级指令只保存跨模式稳定规则，不能把执行清单永久带进后续计划轮。 */
       const developerInstructions = [developerInstructionsFor(context, options.browserAutomation !== undefined), pluginPreparation?.developerInstructions ?? ''].filter(Boolean).join('\n');
+      /** 默认轮补充执行清单规则；计划轮必须把协作模板完全交还 app-server。 */
+      const turnDeveloperInstructions = context.workMode === 'default' ? [developerInstructions, defaultModeDeveloperInstructions()].filter(Boolean).join('\n') : null;
       const dynamicTools = [...conversationToolResultDynamicTools(), ...(zeusToolBroker ? zeusToolBroker.registry.codexTools : []), ...(pluginPreparation?.codexDynamicTools ?? [])];
       const providerBootstrapUtf8Bytes = Buffer.byteLength(
         JSON.stringify({
@@ -410,10 +414,14 @@ export function createCodexNativeDispatchPipeline(dependencies: CodexNativeDispa
           providerGenerationId: commandProviderGenerationId,
         });
       }
+      /** 显式选择读取冻结副本；自动选择继续由 App Server 原生 Skill 目录按上下文预算处理。 */
       const skillCatalog = (await options.loadSkills?.(context.projectLocalPath, submission.id)) ?? [];
-      const providerInput = submissionProviderInput(submission, context, skillCatalog);
-      const skillCatalogPrompt = frozenNativeSkillCatalogPrompt(skillCatalog);
-      if (skillCatalogPrompt) providerInput.push({ type: 'text', text: skillCatalogPrompt });
+      const providerInput = submissionProviderInput(submission, context).map((item) => {
+        if (item.type !== 'skill') return item;
+        const selected = readNativeSubmissionSkills(submission).find((skill) => skill.path === item.path && skill.name === item.name);
+        const frozen = skillCatalog.find((skill) => skill.id === selected?.id);
+        return frozen ? { ...item, path: frozen.path } : item;
+      });
       const pluginPromptContext = await options.plugins?.beforeUserPrompt({
         conversationId: conversation.id,
         prompt: providerInput,
@@ -422,6 +430,17 @@ export function createCodexNativeDispatchPipeline(dependencies: CodexNativeDispa
       const profile = providerPermissionProfile(context);
       const serializedAt = now();
       const wireEffort = toCodexWireReasoningEffort(context.effort) ?? null;
+      /** 线程设置与当前轮次共用同一份冻结模式，禁止两次序列化产生漂移。 */
+      const collaborationMode: CodexCollaborationMode = {
+        mode: context.workMode,
+        settings: {
+          model: context.model,
+          reasoning_effort: wireEffort,
+          /** 计划轮必须由 app-server 注入原生模板；稳定宿主规则已经通过 thread/start 交付。 */
+          developer_instructions: turnDeveloperInstructions,
+        },
+      };
+      segmentLifecycle?.adapterSerialized({ collaborationMode: collaborationMode.mode }, { adapter: 'codex_app_server', method: 'thread/settings/update', protocol: 'openai_responses' }, serializedAt);
       segmentLifecycle?.adapterSerialized(
         {
           model: context.model,
@@ -534,30 +553,28 @@ export function createCodexNativeDispatchPipeline(dependencies: CodexNativeDispa
       providerWriteStarted = true;
       lease.contentWriteStarted = true;
       markDispatchRpcStarted(lease, submission.id);
+      /** 第一条 Provider 写入既可能是线程设置，也可能是轮次启动，两者共用真实写出回执。 */
+      const requestWritten = segmentLifecycle ? () => segmentLifecycle.markProviderWriteStarted() : undefined;
+      await options.manager.setThreadCollaborationMode({
+        threadId: providerThreadId,
+        cwd: context.projectLocalPath,
+        collaborationMode,
+        traceIdentity: commandTraceIdentity,
+        ...(requestWritten ? { requestWritten } : {}),
+      });
+      assertSubmissionDispatchable(submission.id);
       const turn = await options.manager.startTurn({
         threadId: providerThreadId,
         traceIdentity: commandTraceIdentity,
         clientUserMessageId: submission.clientMessageId,
         input: providerInput,
         ...(additionalContext ? { additionalContext } : {}),
-        ...(segmentLifecycle ? { requestWritten: () => segmentLifecycle.markProviderWriteStarted() } : {}),
+        ...(requestWritten ? { requestWritten } : {}),
         model: context.model,
         ...(wireEffort ? { effort: wireEffort } : {}),
         ...(Object.prototype.hasOwnProperty.call(context, 'serviceTier') ? { serviceTier: context.serviceTier } : {}),
         summary: 'auto',
-        ...(context.workMode
-          ? {
-              collaborationMode: {
-                mode: context.workMode,
-                settings: {
-                  model: context.model,
-                  reasoning_effort: wireEffort,
-                  /** 每轮重申当前宿主与插件规则，保证已存在的 Provider 线程也接收最新交付约定。 */
-                  developer_instructions: developerInstructions,
-                },
-              },
-            }
-          : {}),
+        collaborationMode,
         cwd: context.projectLocalPath,
         approvalPolicy: profile.approvalPolicy,
         approvalsReviewer: profile.approvalsReviewer,

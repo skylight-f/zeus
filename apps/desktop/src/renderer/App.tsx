@@ -1,7 +1,7 @@
 import { type ComponentProps, useCallback, useEffect, useRef, useState } from 'react';
 import { RendererErrorBoundary } from './ErrorBoundary.js';
 import { reportApplicationError } from './ui/ApplicationErrorDialog.js';
-import { type MainNavTarget, type SettingsCategory, WorkspacePage } from './WorkspacePage.js';
+import { type MainNavTarget, type SettingsCategory, SETTINGS_CATEGORIES, WorkspacePage } from './WorkspacePage.js';
 
 export { buildProjectDirectoryResolution, buildTemplateTaskDraft } from './WorkspacePage.js';
 
@@ -97,12 +97,14 @@ function initialSettingsCategory(props: AppProps): SettingsCategory {
   return 'general';
 }
 
+/** 地址导航与首页入口使用同一组全局工作区身份。 */
 function routeFromHash(hash: string | undefined): MainNavTarget {
   const target = hash?.replace(/^#/, '');
   if (!target) return 'conversations';
   if (target === 'dashboard' || target === 'tasks' || target === 'runtime' || target === 'conversations') return 'conversations';
   if (target === 'git-diff' || target === 'projects' || target === 'project-commands' || target.startsWith('project-code')) return 'projects';
   if (target === 'skills') return 'skills';
+  if (target === 'digital-employees') return 'digital-employees';
   if (target === 'digital-teams') return 'digital-teams';
   if (target === 'automations') return 'automations';
   if (target === 'telegram' || target === 'settings' || target.startsWith('settings-')) return 'settings';
@@ -115,7 +117,5 @@ function settingsCategoryFromHash(hash: string | undefined): SettingsCategory | 
     if (typeof window !== 'undefined') window.history.replaceState(null, '', '#settings-im');
     return 'im';
   }
-  return settingsCategories.includes(target as SettingsCategory) ? (target as SettingsCategory) : undefined;
+  return SETTINGS_CATEGORIES.includes(target as SettingsCategory) ? (target as SettingsCategory) : undefined;
 }
-
-const settingsCategories = ['general', 'usage', 'memory', 'agents', 'tasks', 'employees', 'runtime', 'models', 'browser', 'terminal', 'im', 'zentao', 'commands', 'release', 'data'] as const satisfies readonly SettingsCategory[];

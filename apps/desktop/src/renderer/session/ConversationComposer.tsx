@@ -1,6 +1,5 @@
-import { contextCapacitySelectionOptions, contextCapacitySelectionValue, contextCapacitySelectionFromValue } from './contextCapacitySelection.js';
 import { classifyAssistantMessage } from '@zeus/shared';
-import { type KeyboardEvent, type RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type KeyboardEvent, type RefObject, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { BrowserCommentPreview } from './BrowserCommentPreview.js';
@@ -9,7 +8,6 @@ import { SquareIcon as Square } from '@phosphor-icons/react/dist/csr/Square';
 import { TargetIcon as Target } from '@phosphor-icons/react/dist/csr/Target';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import type { ConversationContextDraft, ZeusBrowserPreparedSubmission } from '@zeus/shared';
-import type { ProjectModelServiceTierPreference } from '../apiClient.js';
 import type {
   CodexConversationCapabilities,
   NativeCollaborationMode,
@@ -32,8 +30,8 @@ import { resolveModelCapability } from './modelSelection.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
 import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
-import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
-import { findProjectModelServiceTierPreference, projectModelServiceTierSelection } from './projectServiceTierPreferences.js';
+
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import type { ComposerInputHandle } from './MarkdownComposerEditor.js';
 
@@ -54,8 +52,6 @@ export interface ConversationComposerProps {
   language: SessionUiLanguage;
   textareaRef?: RefObject<ComposerInputHandle | null>;
   capabilities?: CodexConversationCapabilities | null;
-  serviceTierPreferences?: readonly ProjectModelServiceTierPreference[];
-  onServiceTierPreferenceChange?: (model: NonNullable<CodexConversationCapabilities['models'][number]>, selection: NativeServiceTierSelection) => void | Promise<void>;
   onDraftChange: (draft: string) => void;
   onSubmit: (delivery: 'queue' | 'steer_now', settings?: NativeTurnSettingsSelection) => void | Promise<void>;
   onInterrupt: (turnId: string) => void | Promise<void>;
@@ -67,8 +63,6 @@ export interface ConversationComposerProps {
   projectId?: string;
   /** 讨论归属任务，用于读取成员实际继承配置。 */
   taskId?: string;
-  /** 复用正式工作安排读取入口。 */
-  onLoadTaskWorkSettings?: (taskId: string) => Promise<import('@zeus/shared').EmployeeWorkSettings>;
   onLoadExtensions?: (projectId?: string, forceReload?: boolean) => Promise<import('../features/codex/codexContracts.js').SkillCatalog>;
   onLoadEmployees?: (projectId: string) => Promise<import('../features/digital-employees/digitalEmployeeContracts.js').DigitalEmployeeRecord[]>;
   onOpenComputerSettings?: () => void;
@@ -136,11 +130,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const copy = labels[props.language];
   const initialModel = resolveComposerModel(props.capabilities, props.runtimeSettings?.model ?? props.state.providerSettings?.model);
   const initialEffort = resolveComposerEffort(props.capabilities, initialModel, props.runtimeSettings?.effort ?? props.state.providerSettings?.effort);
-  const initialCapability = resolveModelCapability(props.capabilities?.models, initialModel);
-  const initialPreference = findProjectModelServiceTierPreference(props.serviceTierPreferences, initialCapability);
-  const initialServiceTier = initialPreference
-    ? projectModelServiceTierSelection(props.serviceTierPreferences, initialCapability)
-    : selectionFromEffectiveServiceTier(props.runtimeSettings && Object.prototype.hasOwnProperty.call(props.runtimeSettings, 'serviceTier') ? props.runtimeSettings.serviceTier : null);
+  /** 服务档位只使用当前会话的显式选择。 */
+  const initialServiceTier = selectionFromEffectiveServiceTier(props.runtimeSettings && Object.prototype.hasOwnProperty.call(props.runtimeSettings, 'serviceTier') ? props.runtimeSettings.serviceTier : null);
   const fallbackRef = useRef<ComposerInputHandle | null>(null);
   const textareaRef = props.textareaRef ?? fallbackRef;
   const composingRef = useRef(false);
@@ -151,9 +142,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const [goalDraft, setGoalDraft] = useState('');
   const [goalSubmitting, setGoalSubmitting] = useState(false);
   const [inputResourceError, setInputResourceError] = useState<unknown>(null);
-  useApplicationErrorDialog(inputResourceError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
   const [selectedModel, setSelectedModel] = useState(initialModel);
   /** 已持久化的下一轮容量；正在执行的请求保持原容量。 */
   const selectedCapacity = props.runtimeSettings?.contextCapacityTokens !== undefined ? props.runtimeSettings.contextCapacityTokens : (props.state.snapshot?.contextCapacityTokens ?? null);
@@ -182,6 +170,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const selectedModelLabel = modelPresentation.triggerLabel || copy.unsynced;
   const effortOptions = selectedCapability?.supportedReasoningEfforts.map((effort) => ({ value: effort, label: effort })) ?? [];
   const inputResources = useConversationInputResources({
+    attachments: props.state.attachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef,
     text: props.state.draft,
@@ -197,31 +186,17 @@ export function ConversationComposer(props: ConversationComposerProps) {
   useEffect(() => {
     const nextModel = resolveComposerModel(props.capabilities, props.runtimeSettings?.model ?? props.state.snapshot?.nextTurnSettings?.model ?? props.state.providerSettings?.model);
     const nextEffort = resolveComposerEffort(props.capabilities, nextModel, props.runtimeSettings?.effort ?? props.state.snapshot?.nextTurnSettings?.effort ?? props.state.providerSettings?.effort);
-    const nextCapability = resolveModelCapability(props.capabilities?.models, nextModel);
-    const nextPreference = findProjectModelServiceTierPreference(props.serviceTierPreferences, nextCapability);
-    const nextServiceTier = nextPreference
-      ? projectModelServiceTierSelection(props.serviceTierPreferences, nextCapability)
-      : selectionFromEffectiveServiceTier(
-          props.runtimeSettings && Object.prototype.hasOwnProperty.call(props.runtimeSettings, 'serviceTier')
-            ? props.runtimeSettings.serviceTier
-            : props.state.snapshot?.nextTurnSettings && Object.prototype.hasOwnProperty.call(props.state.snapshot.nextTurnSettings, 'serviceTier')
-              ? props.state.snapshot.nextTurnSettings.serviceTier
-              : null,
-        );
+    const nextServiceTier = selectionFromEffectiveServiceTier(
+      props.runtimeSettings && Object.prototype.hasOwnProperty.call(props.runtimeSettings, 'serviceTier')
+        ? props.runtimeSettings.serviceTier
+        : props.state.snapshot?.nextTurnSettings && Object.prototype.hasOwnProperty.call(props.state.snapshot.nextTurnSettings, 'serviceTier')
+          ? props.state.snapshot.nextTurnSettings.serviceTier
+          : null,
+    );
     if (nextModel !== selectedModel) setSelectedModel(nextModel);
     if (nextEffort !== selectedEffort) setSelectedEffort(nextEffort);
     if (serviceTierSelectionValue(nextServiceTier) !== serviceTierSelectionValue(selectedServiceTier)) setSelectedServiceTier(nextServiceTier);
-  }, [
-    props.capabilities,
-    props.runtimeSettings,
-    props.serviceTierPreferences,
-    props.state.snapshot?.nextTurnSettings,
-    props.state.providerSettings?.effort,
-    props.state.providerSettings?.model,
-    selectedEffort,
-    selectedModel,
-    selectedServiceTier,
-  ]);
+  }, [props.capabilities, props.runtimeSettings, props.state.snapshot?.nextTurnSettings, props.state.providerSettings?.effort, props.state.providerSettings?.model, selectedEffort, selectedModel, selectedServiceTier]);
 
   useLayoutEffect(() => {
     if (textareaRef.current instanceof HTMLTextAreaElement) autosizeTextarea(textareaRef.current);
@@ -249,6 +224,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
   }, [textareaRef]);
 
   function submit(nextDelivery: 'queue' | 'steer_now'): void {
+    // 附件尚在导入时不能提交，避免正文先发出而附件随后落回草稿。
+    if (inputResources.processing) return;
     if (nextDelivery === 'queue' && !selectedCapability) return;
     const structured = structuredSelectionRef.current;
     const settings =
@@ -382,6 +359,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
     <section
       className="session-composer-shell"
       aria-label={inputLabel}
+      aria-busy={busy || inputResources.processing || undefined}
       data-active={active ? 'true' : 'false'}
       data-goal-input={goalInputActive ? 'true' : 'false'}
       data-input-blocked={props.inputBlocked ? 'true' : 'false'}
@@ -397,6 +375,11 @@ export function ConversationComposer(props: ConversationComposerProps) {
       {!goalInputActive && (props.state.contextDraft.responseAnnotations.length || props.state.contextDraft.codeComments.length) ? (
         <ContextDraftAttachment draft={props.state.contextDraft} language={props.language} disabled={!inputWritable || busy} onRemove={() => props.onContextDraftChange?.({ responseAnnotations: [], codeComments: [] })} />
       ) : null}
+      {inputResourceError ? (
+        <p className="session-new-conversation-error" role="alert">
+          <VisibleApplicationError error={inputResourceError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+        </p>
+      ) : null}
       <div className="session-composer-input-frame" data-goal-input={goalInputActive ? 'true' : 'false'}>
         {goalInputActive ? (
           <div className="session-goal-compose-context">
@@ -411,6 +394,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
         ) : null}
         <ConversationComposerAttachments
           attachments={props.state.attachments}
+          pendingResources={inputResources.pendingResources}
           language={props.language}
           disabled={!inputWritable || busy || inputResources.processing}
           onRemove={(attachment) => props.onRemoveAttachment?.(attachment)}
@@ -436,7 +420,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
           />
         ) : (
           <StructuredComposerInput
-            models={props.capabilities?.models}
             value={editorValue}
             onValueChange={(nextValue) => {
               setEditorValue(nextValue);
@@ -454,8 +437,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
             placeholder={props.inputBlocked ? copy.recoveredInputBlocked : copy.placeholder}
             loadCatalog={props.onLoadExtensions}
             loadEmployees={props.onLoadEmployees}
-            taskId={props.taskId}
-            loadTaskSettings={props.onLoadTaskWorkSettings}
             goalAvailable={props.goalAvailable}
             onPlanMode={() =>
               props.onRuntimeSettingsChange?.({
@@ -528,6 +509,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             <CollaborationModeControl
               language={props.language}
               value={props.collaborationMode}
+              formalPlanReady={props.state.planImplementationRequests.length > 0}
               disabled={props.readOnly === true || props.inputBlocked === true || !props.onRuntimeSettingsChange}
               onChange={(collaborationMode) =>
                 props.onRuntimeSettingsChange?.({
@@ -564,24 +546,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
           </span>
           <span className="session-composer-trailing-actions">
             <span className="session-composer-runtime-settings">
-              <ComposerDropdown
-                className="session-composer-capacity-dropdown"
-                label={props.language === 'zh-CN' ? '上下文容量' : 'Context capacity'}
-                value={contextCapacitySelectionValue(selectedCapacity)}
-                options={contextCapacitySelectionOptions(selectedCapability?.contextCapacity, props.language === 'zh-CN')}
-                disabled={props.readOnly === true || props.inputBlocked === true || !props.onRuntimeSettingsChange}
-                title={props.language === 'zh-CN' ? '下一轮生效；Codex 切换容量可能需约一分钟' : 'Applies next turn; Codex may take about a minute'}
-                onChange={(value) =>
-                  props.onRuntimeSettingsChange?.({
-                    model: effectiveModel,
-                    effort: effectiveEffort,
-                    ...serviceTierWireOverride(selectedServiceTier),
-                    permissionMode: props.permissionMode,
-                    collaborationMode: props.collaborationMode,
-                    contextCapacityTokens: contextCapacitySelectionFromValue(value),
-                  })
-                }
-              />
               <ContextUsageIndicator contextCapacityEvidence={props.state.snapshot?.contextCapacityEvidence} contextCapacityTokens={selectedCapacity} unifiedUsage={props.state.unifiedUsage} language={props.language} />
               <ServiceTierToggle
                 language={props.language}
@@ -598,7 +562,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
                     permissionMode: props.permissionMode,
                     collaborationMode: props.collaborationMode,
                   });
-                  if (selectedCapability) void props.onServiceTierPreferenceChange?.(selectedCapability, selection);
                 }}
               />
               <ComposerDropdown
@@ -616,7 +579,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 onChange={(model) => {
                   const capability = resolveModelCapability(props.capabilities?.models, model);
                   const effort = capability?.defaultReasoningEffort ?? capability?.supportedReasoningEfforts[0] ?? '';
-                  const normalizedTier = normalizeServiceTierSelection(projectModelServiceTierSelection(props.serviceTierPreferences, capability), capability);
+                  const normalizedTier = normalizeServiceTierSelection({ type: 'standard' }, capability);
                   setSelectedModel(model);
                   setSelectedEffort(effort);
                   setSelectedServiceTier(normalizedTier.selection);
@@ -659,10 +622,10 @@ export function ConversationComposer(props: ConversationComposerProps) {
                   className="session-send-button"
                   aria-label={goalInputActive ? copy.createGoal : copy.send}
                   onClick={() => (goalInputActive ? void setGoalObjective(goalDraft) : submit('queue'))}
-                  disabled={!inputWritable || !settingsWritable || busy || goalOperationBusy || (goalInputActive ? !goalDraftValid : !hasDraft)}
-                  aria-busy={busy || goalOperationBusy || undefined}
+                  disabled={!inputWritable || !settingsWritable || busy || goalOperationBusy || inputResources.processing || (goalInputActive ? !goalDraftValid : !hasDraft)}
+                  aria-busy={busy || goalOperationBusy || inputResources.processing || undefined}
                 >
-                  {busy || goalOperationBusy ? <span className="session-command-spinner" aria-hidden="true" /> : <ArrowUp aria-hidden="true" weight="bold" />}
+                  {busy || goalOperationBusy || inputResources.processing ? <span className="session-command-spinner" aria-hidden="true" /> : <ArrowUp aria-hidden="true" weight="bold" />}
                 </button>
               ) : (
                 <button
@@ -684,22 +647,49 @@ export function ConversationComposer(props: ConversationComposerProps) {
   );
 }
 
+/** 待发送评论统一计数，悬停或聚焦时展示原文、来源与内容。 */
 function ContextDraftAttachment(props: { draft: ConversationContextDraft; language: SessionUiLanguage; disabled: boolean; onRemove?: () => void }) {
-  const annotations = props.draft.responseAnnotations.length;
-  const comments = props.draft.codeComments.length;
+  /** 回答和代码评论在摘要中合计，详情继续保留各自来源。 */
+  const count = props.draft.responseAnnotations.length + props.draft.codeComments.length;
   const zh = props.language === 'zh-CN';
-  const label = zh
-    ? [comments ? `${comments} 个评论` : '', annotations ? `${annotations} 条注释` : ''].filter(Boolean).join('、')
-    : [comments ? `${comments} ${comments === 1 ? 'comment' : 'comments'}` : '', annotations ? `${annotations} ${annotations === 1 ? 'annotation' : 'annotations'}` : ''].filter(Boolean).join(', ');
+  /** 唯一标识用于把摘要按钮与只读详情浮层关联。 */
+  const previewId = useId();
+  const label = zh ? `${count} 条评论` : `${count} ${count === 1 ? 'comment' : 'comments'}`;
   return (
-    <section className="session-composer-context-draft" aria-label={zh ? '待发送评论与注释' : 'Pending comments and annotations'}>
+    <section className="session-composer-context-draft" aria-label={zh ? '待发送评论' : 'Pending comments'}>
       <span className="session-context-draft-chip">
-        <ChatCircle aria-hidden="true" weight="regular" />
-        <strong>{label}</strong>
-        <button type="button" aria-label={zh ? '移除评论与注释' : 'Remove comments and annotations'} onClick={props.onRemove} disabled={props.disabled || !props.onRemove}>
+        <button type="button" className="session-context-draft-preview-trigger" aria-describedby={previewId}>
+          <ChatCircle aria-hidden="true" weight="regular" />
+          <strong>{label}</strong>
+        </button>
+        <button type="button" aria-label={zh ? '移除评论' : 'Remove comments'} onClick={props.onRemove} disabled={props.disabled || !props.onRemove}>
           <span aria-hidden="true">×</span>
         </button>
       </span>
+      <aside id={previewId} className="session-context-draft-preview" role="tooltip">
+        <header>
+          <strong>{zh ? '待发送详情' : 'Pending details'}</strong>
+          <span>{label}</span>
+        </header>
+        <div className="session-message-response-annotations">
+          {props.draft.codeComments.map((comment, index) => (
+            <article key={comment.id}>
+              <span>
+                {zh ? `代码评论 ${index + 1}` : `Code comment ${index + 1}`} · {comment.position.path}:
+                {comment.position.startLine && comment.position.startLine !== comment.position.line ? `${comment.position.startLine}-${comment.position.line}` : comment.position.line}
+              </span>
+              <p>{comment.body}</p>
+            </article>
+          ))}
+          {props.draft.responseAnnotations.map((annotation, index) => (
+            <article key={annotation.id}>
+              <span>{zh ? `回答评论 ${index + 1}` : `Response comment ${index + 1}`}</span>
+              <blockquote>{annotation.anchor.selectedText}</blockquote>
+              {annotation.note?.trim() ? <p>{annotation.note}</p> : null}
+            </article>
+          ))}
+        </div>
+      </aside>
     </section>
   );
 }

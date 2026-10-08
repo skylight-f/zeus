@@ -47,6 +47,13 @@ export default defineConfig(({ command }) => ({
               priority: 100,
             },
             {
+              // 拖拽库内部存在循环引用；整体分块避免键盘方向枚举在模块初始化前被读取。
+              name: 'dnd-kit-runtime',
+              test: /node_modules[\\/]@dnd-kit[\\/][^\\/]+[\\/]/u,
+              priority: 99,
+              maxSize: 2 * 1024 * 1024,
+            },
+            {
               // 会话正文与文件预览共用同一 Markdown 运行时，保持其内部模块在同一代码包中。
               name: 'markdown-runtime',
               test: /node_modules[\\/](?:markstream-react|markstream-core|stream-markdown-parser|markdown-it(?:-[^\\/]+)?|linkify-it|mdurl|uc\.micro|entities|punycode\.js|@floating-ui[\\/][^\\/]+|clsx)[\\/]/u,

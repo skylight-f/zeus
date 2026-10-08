@@ -54,6 +54,16 @@ export interface DigitalEmployeeDeliveryGrants {
 }
 
 export interface DigitalEmployeeTemplateRecord {
+  /** 内置创建模板与用户已经创建的跨项目员工严格区分。 */
+  identityKind?: 'template' | 'employee';
+  /** 全局经验读取偏好。 */
+  memoryEnabled?: boolean;
+  /** 员工默认允许源码修改。 */
+  allowCodeChanges?: boolean;
+  /** 员工默认允许运行已有检查。 */
+  allowTests?: boolean;
+  /** 各交付动作独立授权。 */
+  deliveryGrants?: DigitalEmployeeDeliveryGrants;
   id: string;
   name: string;
   description: string;
@@ -83,6 +93,8 @@ export interface DigitalEmployeeTaskFilter {
 }
 
 export interface DigitalEmployeeRecord extends Omit<DigitalEmployeeTemplateRecord, 'builtIn'> {
+  /** 跨项目员工身份，历史仅项目员工保留为空。 */
+  globalEmployeeId?: string | null;
   /** 新工作读取个人经验的偏好。 */
   memoryEnabled?: boolean;
   projectId: string;
@@ -164,20 +176,15 @@ export interface DigitalEmployeeStageDecisionInput {
 }
 
 export interface DigitalEmployeeTemplateInput {
+  /** 默认经验读取偏好。 */
+  memoryEnabled?: boolean;
   name: string;
   description?: string;
   role: string;
   domain?: string;
   /** 预置头像的稳定身份。 */
   avatarId?: DigitalEmployeeAvatarId | null;
-  skillIds?: string[];
   prompt: string;
-  agentKind?: DigitalEmployeeAgentKind;
-  model?: string | null;
-  reasoningEffort?: string | null;
-  serviceTier?: string | null;
-  permissionMode?: DigitalEmployeePermissionMode;
-  workMode?: DigitalEmployeeWorkMode;
 }
 
 export interface DigitalEmployeeCapabilitiesSnapshot {
@@ -188,21 +195,6 @@ export interface DigitalEmployeeCapabilitiesSnapshot {
   models: CodexTaskPushModelCapability[];
   available?: false;
   availabilityReason?: string;
-}
-
-export interface DigitalEmployeeInput extends DigitalEmployeeTemplateInput {
-  /** 是否读取个人经验。 */
-  memoryEnabled?: boolean;
-  enabled?: boolean;
-  autoClaim?: boolean;
-  autonomousExploration?: boolean;
-  maxConcurrency?: number;
-  taskFilter?: Partial<DigitalEmployeeTaskFilter>;
-  allowCodeChanges?: boolean;
-  allowTests?: boolean;
-  deliveryGrants?: Partial<DigitalEmployeeDeliveryGrants>;
-  deployCommandId?: string | null;
-  entrypoint?: AgentEntrypointV2 | null;
 }
 
 export type TaskWorkItemStatus = 'queued' | 'active' | 'waiting_manager' | 'completed' | 'blocked' | 'failed' | 'cancelled';
@@ -401,7 +393,8 @@ export interface TaskWorkPreview {
   expectedTaskRevision: string;
   expectedEmployeeRevision: number;
   selection: TaskWorkPreviewSelection;
-  employee: { id: string; name: string; role: string; domain: string; revision: number };
+  /** 服务端用于核对全局与项目合成配置，界面不维护另一份员工配置。 */
+  employee: { id: string; name: string; role: string; domain: string; revision: number; configurationSha256: string };
   entrypoint: Record<string, unknown> | null;
   model: Record<string, unknown> | null;
   skills: Array<
@@ -461,6 +454,8 @@ export interface TaskWorkReviewNote {
 
 /** 经验建议经用户审查后才进入个人经验。 */
 export interface EmployeeMemoryProposal {
+  /** 冲突建议继续待处理，现行经验不会被隐式覆盖。 */
+  conflictReason?: string;
   id: string;
   projectId: string;
   employeeId: string;

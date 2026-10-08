@@ -32,6 +32,8 @@ export interface DigitalTeamRunCreateInput {
   taskId?: string;
   /** 已有任务的读取时间戳，拒绝使用过期任务内容。 */
   expectedTaskUpdatedAt?: string;
+  /** 用户明确允许本任务开发、检查与本地提交，由创建运行的同一命令原子保存任务授权。 */
+  grantTaskCodeAuthority?: boolean;
   /** 已保存模板身份。 */
   templateId: string;
   /** 用户看到的模板修订。 */
@@ -46,14 +48,14 @@ export interface DigitalTeamRunCreateInput {
 
 /** 数字团队页面使用的真实本地 API。 */
 export interface DigitalTeamApiClient {
-  /** 读取项目模板。 */
-  loadDigitalTeamTemplates(projectId: string): Promise<DigitalTeamWorkflowTemplateRecord[]>;
+  /** 读取全局团队模板。 */
+  loadDigitalTeamTemplates(): Promise<DigitalTeamWorkflowTemplateRecord[]>;
   /** 新建或按修订保存模板。 */
-  saveDigitalTeamTemplate(projectId: string, input: DigitalTeamTemplateSaveInput): Promise<DigitalTeamWorkflowTemplateRecord>;
+  saveDigitalTeamTemplate(input: DigitalTeamTemplateSaveInput): Promise<DigitalTeamWorkflowTemplateRecord>;
   /** 按修订删除模板。 */
-  deleteDigitalTeamTemplate(projectId: string, templateId: string, expectedRevision: number): Promise<DigitalTeamWorkflowTemplateRecord>;
-  /** 读取项目运行列表。 */
-  loadDigitalTeamRuns(projectId: string, taskId?: string): Promise<DigitalTeamWorkflowRunRecord[]>;
+  deleteDigitalTeamTemplate(templateId: string, expectedRevision: number): Promise<DigitalTeamWorkflowTemplateRecord>;
+  /** 读取项目或任务运行；会话入口只返回实际绑定该会话的流程。 */
+  loadDigitalTeamRuns(projectId: string, taskId?: string, conversationId?: string): Promise<DigitalTeamWorkflowRunRecord[]>;
   /** 读取单个运行完整投影。 */
   loadDigitalTeamRun(runId: string): Promise<DigitalTeamRunProjection>;
   /** 原子创建任务并冻结运行。 */
@@ -96,32 +98,40 @@ export function createDigitalTeamApiClient(transport: LocalApiTransport): Digita
   };
 
   return {
-    loadDigitalTeamTemplates: (projectId) => transport.request(digitalTeamTemplatesPath(projectId)),
-    saveDigitalTeamTemplate: async (projectId, input) => {
+    loadDigitalTeamTemplates: () => transport.request('/api/digital-team-templates'),
+    saveDigitalTeamTemplate: async (input) => {
       const body = await buildWorkManagementCommandRequest({
         commandType: workManagementClientCommandTypes.digitalTeamTemplateSave,
-        scopeKind: 'project',
-        scopeId: () => projectId,
+        scopeKind: 'settings',
+        scopeId: () => 'digital-team-templates',
         operationPrefix: 'digital_team_template_save_',
         value: input,
         expectedRevision: input.expectedRevision,
       });
-      const path = input.id ? `${digitalTeamTemplatesPath(projectId)}/${encodeURIComponent(input.id)}` : digitalTeamTemplatesPath(projectId);
+      const collectionPath = '/api/digital-team-templates';
+      const path = input.id ? `${collectionPath}/${encodeURIComponent(input.id)}` : collectionPath;
       return transport.request(path, jsonRequest(input.id ? 'PUT' : 'POST', body));
     },
-    deleteDigitalTeamTemplate: async (projectId, templateId, expectedRevision) => {
+    deleteDigitalTeamTemplate: async (templateId, expectedRevision) => {
       const value = { expectedRevision };
       const body = await buildWorkManagementCommandRequest({
         commandType: workManagementClientCommandTypes.digitalTeamTemplateDelete,
-        scopeKind: 'project',
-        scopeId: () => projectId,
+        scopeKind: 'settings',
+        scopeId: () => 'digital-team-templates',
         operationPrefix: 'digital_team_template_delete_',
         value,
         expectedRevision,
       });
-      return transport.request(`${digitalTeamTemplatesPath(projectId)}/${encodeURIComponent(templateId)}`, jsonRequest('DELETE', body));
+      const collectionPath = '/api/digital-team-templates';
+      return transport.request(`${collectionPath}/${encodeURIComponent(templateId)}`, jsonRequest('DELETE', body));
     },
-    loadDigitalTeamRuns: async (projectId, taskId) => rememberRuns(await transport.request<DigitalTeamWorkflowRunRecord[]>(`${digitalTeamRunsPath(projectId)}${taskId ? `?taskId=${encodeURIComponent(taskId)}` : ''}`)),
+    loadDigitalTeamRuns: async (projectId, taskId, conversationId) => {
+      /** 查询参数只携带准确身份，缺少关联不会退回任务最新失败记录。 */
+      const query = new URLSearchParams();
+      if (taskId) query.set('taskId', taskId);
+      if (conversationId) query.set('conversationId', conversationId);
+      return rememberRuns(await transport.request<DigitalTeamWorkflowRunRecord[]>(`${digitalTeamRunsPath(projectId)}${query.size ? `?${query}` : ''}`));
+    },
     loadDigitalTeamRun: async (runId) => {
       const projection = normalizeRunProjection(await transport.request<unknown>(digitalTeamRunPath(runId)));
       rememberRun(projection.run);
@@ -166,11 +176,6 @@ function normalizeRunProjection(value: unknown): DigitalTeamRunProjection {
 /** 判断普通 JSON 对象。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** 项目模板集合路径。 */
-function digitalTeamTemplatesPath(projectId: string): string {
-  return `/api/projects/${encodeURIComponent(projectId)}/digital-team-templates`;
 }
 
 /** 项目运行集合路径。 */

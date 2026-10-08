@@ -5,12 +5,14 @@ import type { AutomaticUpdateIndicatorState } from './appShellBridge.js';
 import type { DashboardClientOptions, LocalBusinessDataSnapshot, LocalSettingsExportSnapshot } from './apiClient.js';
 import type {
   NetworkProxySettings,
-  NetworkProxyCheckResult,
+  NetworkProxyCheckTarget,
+  NetworkProxyConnectionResult,
   ConversationFileLocation,
   ConversationOpenTarget,
   ConversationResourceOpenTarget,
   CreateProjectSourceEntryInput,
   MoveProjectSourceEntryInput,
+  UsageModelCostBreakdown,
   ProjectSourceDirectorySnapshot,
   ProjectSourceContentSearchResult,
   ProjectSourceTextSearchInput,
@@ -54,6 +56,8 @@ type TaskInputResourceBridge = {
   previewUrl?: string;
   restorableText?: string;
 };
+
+/** 菜单栏主体与独立透明费用窗口之间共享的纯展示数据。 */
 
 declare global {
   interface Window {
@@ -110,12 +114,18 @@ declare global {
         checkedAt: string;
         restartScheduled: true;
       }>;
-      openTaskGitDeliveryWindow: (input: { taskId: string; workspaceId?: string | null }) => Promise<{ opened: true; reused: boolean; taskId: string }>;
-      closeTaskGitDeliveryWindow: () => Promise<{ closed: true; taskId: string }>;
+      /** 任务与普通会话的代码交付按钮共用同一原生窗口入口。 */
+      openTaskGitDeliveryWindow: (
+        input: { taskId: string; workspaceId?: string | null; projectId?: never; conversationId?: never } | { taskId?: never; workspaceId?: never; projectId: string; conversationId: string },
+      ) => Promise<{ opened: true; reused: boolean; taskId?: string; projectId?: string; conversationId?: string }>;
+      /** 两种范围都关闭当前真实交付窗口。 */
+      closeTaskGitDeliveryWindow: () => Promise<{ closed: true; taskId?: string; projectId?: string; conversationId?: string }>;
       getTaskGitDeliveryCurrentContext: () => Promise<{ taskId: string | null; workspaceId: string | null }>;
       notifyTaskGitDeliveryCurrentContext: (context: { taskId: string | null; workspaceId: string | null }) => void;
       notifyTaskGitDeliveryChanged: (taskId: string) => void;
       openTaskGitDeliveryConversation: (input: { taskId: string; conversationId: string }) => Promise<{ opened: true }>;
+      /** 任务工作区文件在独立窗口中只读查看。 */
+      openTaskGitDiffWindow: (input: Extract<import('@zeus/shared').FilePreviewRequest, { kind: 'task-git' }>) => Promise<{ opened: true }>;
       openProjectGitDiffWindow: (input: {
         projectId: string;
         repositoryId: string;
@@ -255,8 +265,8 @@ declare global {
         snapshot?: LocalBusinessDataSnapshot;
       }>;
       clearNetworkCache: () => Promise<{ cleared: boolean; clearedAt: string }>;
-      /** 使用当前草稿分别检查浏览器与模型宿主的网络。 */
-      checkNetworkProxyConnection: (settings: NetworkProxySettings, address: string) => Promise<NetworkProxyCheckResult>;
+      /** 使用当前草稿检查指定的浏览器或模型宿主网络。 */
+      checkNetworkProxyConnection: (settings: NetworkProxySettings, address: string, checkTarget: NetworkProxyCheckTarget) => Promise<NetworkProxyConnectionResult>;
       exportPatchToFile: (patch: unknown) => Promise<{ saved: boolean; filePath: string | null }>;
       openSource: (source: { projectRoot?: string; sourceRef: string; lineStart?: number }) => Promise<{
         opened: boolean;
@@ -353,14 +363,14 @@ declare global {
       restoreRetiredNativeRuntimes: () => Promise<ZeusRetiredNativeRuntimeState>;
       getComputerSettings: () => Promise<ZeusComputerSettings>;
       /** 仅返回该会话正在进行的控制预览。 */
-      getComputerPreview: (conversationId: string) => Promise<ZeusComputerPreview | null>;
+      getComputerPreview: (conversationId: string, imageId?: string | null) => Promise<ZeusComputerPreview | null>;
+      /** 订阅轻量变化通知，离开会话时取消监听。 */
+      onComputerPreviewChanged: (listener: (conversationId: string) => void) => () => void;
       updateComputerSettings: (input: Pick<ZeusComputerSettings, 'enabled'>) => Promise<ZeusComputerSettings>;
       requestComputerPermissions: () => Promise<ZeusComputerSettings>;
       openComputerPermissionSettings: (input: { permission: 'accessibility' | 'screen_capture' }) => Promise<{ opened: true; permission: 'accessibility' | 'screen_capture' }>;
       /** 会话内停止须携带控制身份；无参数为设置页全局停止。 */
       stopComputerUse: (input?: ZeusComputerControlIdentity) => Promise<ZeusComputerSettings>;
-      /** 用户恢复暂停，随后模型必须重新观察。 */
-      resumeComputerUse: (input: ZeusComputerControlIdentity) => Promise<{ resumed: true }>;
       onBrowserEvent: (listener: (event: ZeusBrowserEvent) => void) => () => void;
     };
   }

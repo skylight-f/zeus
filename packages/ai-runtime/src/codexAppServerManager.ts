@@ -253,8 +253,30 @@ export interface CodexThreadSnapshot {
     model: string;
     effort?: string;
     serviceTier?: string | null;
+    /** Provider 当前实际采用的线程协作模式。 */
+    collaborationMode?: 'plan' | 'default';
   };
   [key: string]: unknown;
+}
+
+/** Codex 原生线程与轮次共用的协作模式配置。 */
+export interface CodexCollaborationMode {
+  mode: 'plan' | 'default';
+  settings: {
+    model: string;
+    reasoning_effort: string | null;
+    developer_instructions: string | null;
+  };
+}
+
+/** 幂等同步原生线程协作模式所需的完整上下文。 */
+export interface CodexThreadCollaborationModeInput extends CodexPerformanceTraceContext {
+  threadId: string;
+  /** 只供多世代管理器在重新接管线程时恢复正确工作目录，不进入线协议。 */
+  cwd?: string;
+  /** 仅供适配器确认线程设置 RPC 已写入传输层，不进入线协议。 */
+  requestWritten?: () => void;
+  collaborationMode: CodexCollaborationMode;
 }
 
 export interface CodexTurnStartInput extends CodexPerformanceTraceContext {
@@ -264,7 +286,7 @@ export interface CodexTurnStartInput extends CodexPerformanceTraceContext {
   additionalContext?: CodexBootstrapAdditionalContext;
   /** 仅供适配器确认 JSON-RPC 帧已经成功写入传输层，不进入线协议。 */
   requestWritten?: () => void;
-  collaborationMode?: { mode: 'plan' | 'default'; settings: { model: string; reasoning_effort: string | null; developer_instructions: string | null } };
+  collaborationMode?: CodexCollaborationMode;
   model?: string;
   effort?: string;
   serviceTier?: string | null;
@@ -426,11 +448,7 @@ export function runWithCodexRpcRetryContext<T>(context: CodexRpcRetryContext, op
 }
 
 export type CodexTransportState =
-  | { type: 'idle' }
-  | { type: 'starting'; generationId: string }
-  | { type: 'ready'; generationId: string; capabilities: CodexCapabilitiesSnapshot }
-  | { type: 'restarting'; generationId: string; attempt: number }
-  | { type: 'closed' };
+  { type: 'idle' } | { type: 'starting'; generationId: string } | { type: 'ready'; generationId: string; capabilities: CodexCapabilitiesSnapshot } | { type: 'restarting'; generationId: string; attempt: number } | { type: 'closed' };
 
 export interface CodexRuntimeGenerationSnapshot {
   generationId: string;
@@ -439,6 +457,26 @@ export interface CodexRuntimeGenerationSnapshot {
   active: boolean;
   activeThreadCount: number;
   pendingRequestCount: number;
+}
+
+/** 描述一次 Codex 运行世代切换所需的完整配置。 */
+export interface CodexRuntimeActivationInput {
+  /** 本世代实际启动的 Codex 可执行文件绝对路径。 */
+  commandPath: string;
+  /** 可选的外部 Agent 配置根目录。 */
+  externalAgentHome?: string;
+  /** 是否通过官方 Remote Control 守护进程建立连接。 */
+  remoteControl?: boolean;
+  /** 登录后的新连接须等到本次远端目录更新完成，不能接受启动时的旧缓存。 */
+  requireFreshModels?: boolean;
+}
+
+/** 维护窗口内唯一允许执行的运行世代切换入口。 */
+export interface CodexRuntimeMaintenanceControl {
+  /** 关闭当前空闲世代，阻止旧程序在外部守护进程退出后自动重连。 */
+  deactivateCurrentGeneration(): Promise<void>;
+  /** 在新写入仍被拦截时激活并验证指定 Codex 运行世代。 */
+  activateFreshGeneration(input: CodexRuntimeActivationInput): Promise<CodexCapabilitiesSnapshot>;
 }
 
 export type CodexRemoteControlConnectionStatus = 'disabled' | 'connecting' | 'connected' | 'errored';
@@ -474,15 +512,9 @@ export interface CodexRemoteControlClientsPage {
 }
 
 export interface CodexAppServerManager {
-  ensureReady(input: {
-    commandPath: string;
-    externalAgentHome?: string;
-    remoteControl?: boolean;
-    /** 登录后的新连接须等到本次远端目录更新完成，不能接受启动时的旧缓存。 */
-    requireFreshModels?: boolean;
-  }): Promise<CodexCapabilitiesSnapshot>;
+  ensureReady(input: CodexRuntimeActivationInput): Promise<CodexCapabilitiesSnapshot>;
   /** 在运行身份不变时也激活新世代；多世代管理器保留旧活动轮次并让其自然排空。 */
-  activateFreshGeneration?(input: { commandPath: string; externalAgentHome?: string; remoteControl?: boolean; requireFreshModels?: boolean }): Promise<CodexCapabilitiesSnapshot>;
+  activateFreshGeneration?(input: CodexRuntimeActivationInput): Promise<CodexCapabilitiesSnapshot>;
   /** 刷新既有连接的完整目录，不重启进程或重放任何模型请求。 */
   refreshModels(): Promise<CodexCapabilitiesSnapshot>;
   readAccount(input?: { refreshToken?: boolean; allowCachedOnTransportFailure?: boolean; preferCached?: boolean; cachedOnly?: boolean }): Promise<CodexAccountSnapshot>;
@@ -518,6 +550,8 @@ export interface CodexAppServerManager {
   listThreadItems(input: { threadId: string; turnId: string; cursor?: string | null; limit?: number; sortDirection?: 'asc' | 'desc'; priority?: 'control' }): Promise<CodexThreadItemsPage>;
   listSkills(input: { cwds?: string[]; forceReload?: boolean }): Promise<CodexSkillsListEntry[]>;
   compactThread(input: CodexThreadCompactInput): Promise<void>;
+  /** 在新轮开始前更新 Provider 持久保存的线程协作模式。 */
+  setThreadCollaborationMode(input: CodexThreadCollaborationModeInput): Promise<void>;
   startTurn(input: CodexTurnStartInput): Promise<CodexTurnSnapshot>;
   steerTurn(input: CodexTurnSteerInput): Promise<{ turnId: string }>;
   interruptTurn(input: { threadId: string; turnId: string } & CodexPerformanceTraceContext): Promise<void>;
@@ -541,8 +575,8 @@ export interface CodexAppServerManager {
   capabilitiesForGeneration(generationId: string): CodexCapabilitiesSnapshot | null;
   generationForThread(threadId: string): string | null;
   listRuntimeGenerations(): CodexRuntimeGenerationSnapshot[];
-  /** 在没有活动写入时暂时阻止新写入，用于安全替换 Codex 程序。 */
-  runExclusiveMaintenance?<Result>(operation: () => Promise<Result>): Promise<Result>;
+  /** 等待既有活动工作自然收口，再原子阻止新写入并安全替换 Codex 程序。 */
+  runExclusiveMaintenance?<Result>(operation: (control: CodexRuntimeMaintenanceControl) => Promise<Result>): Promise<Result>;
   prepareForShutdown(): Promise<void>;
   close(): Promise<void>;
 }
@@ -902,10 +936,17 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
 
   /** 新连接会由官方组件预取远端目录；等待其落地后再读取，避免抢到旧名单。 */
   async function waitForFreshSubscriptionModels(generationId: string, providerVersion: string | null, freshSince: number): Promise<void> {
-    /** 同一连接可能再次发生账号通知，不能接纳切换前的读取。 */
-    const accountRevision = modelAccountRevision;
-    /** 登录身份与目录准备分别确认。 */
-    const account = parseAccountSnapshot(await retryableReadRpc(generationId, 'account/read', { refreshToken: false }), generationId, accountFingerprintSalt);
+    /** 登录身份必须在有界时间内稳定，避免通知风暴造成无界等待。 */
+    const accountDeadline = Date.now() + MODEL_CATALOG_SYNC_TIMEOUT_MS;
+    /** 账号读取与通知可能并发；只用同一修订前后都稳定的快照作为同步身份。 */
+    let accountRevision: number;
+    /** 稳定账号用于区分同一账号的重复通知和真实账号切换。 */
+    let account: CodexAccountSnapshot;
+    do {
+      accountRevision = modelAccountRevision;
+      account = parseAccountSnapshot(await retryableReadRpc(generationId, 'account/read', { refreshToken: false }), generationId, accountFingerprintSalt);
+      if (Date.now() >= accountDeadline && modelAccountRevision !== accountRevision) throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '账号状态持续变化，无法确认订阅模型目录。');
+    } while (modelAccountRevision !== accountRevision);
     if (!account.signedIn || account.accountType !== 'chatgpt') throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '当前连接尚未确认订阅账号，无法同步订阅模型。');
     /** 显式固定目录不会访问远端，必须给出可操作的原因。 */
     const configResponse = asRecord(await retryableReadRpc(generationId, 'config/read', { includeLayers: false }));
@@ -922,12 +963,23 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
         await catalogReader.close();
       }
     }
-    /** 等待期间持续核对连接所有权。 */
+    /** 独立目录读取完成后仍保留原有完整等待窗口。 */
     const deadline = Date.now() + MODEL_CATALOG_SYNC_TIMEOUT_MS;
+    /** 等待期间持续核对连接所有权；同一账号的重复通知只更新修订，不误报失败。 */
     while (Date.now() < deadline) {
-      if (preparingForShutdown || generationId !== currentGenerationId() || modelAccountRevision !== accountRevision) throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '目录同步期间连接或账号已改变，请重试。');
+      if (preparingForShutdown || generationId !== currentGenerationId()) throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '目录同步期间连接已改变，请重试。');
+      if (modelAccountRevision !== accountRevision) {
+        /** 账号通知本身不代表换号；重新读取并比较脱敏身份后继续等待。 */
+        const revisedAt = modelAccountRevision;
+        const revisedAccount = parseAccountSnapshot(await retryableReadRpc(generationId, 'account/read', { refreshToken: false }), generationId, accountFingerprintSalt);
+        if (modelAccountRevision !== revisedAt) continue;
+        if (!revisedAccount.signedIn || revisedAccount.accountType !== 'chatgpt' || revisedAccount.accountScopeId !== account.accountScopeId) {
+          throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '目录同步期间账号已改变，请重试。');
+        }
+        accountRevision = revisedAt;
+      }
       const cache = readCodexModelCatalogCache(codexHome, providerVersion);
-      if (cache && cache.fetchedAtMs >= freshSince) return;
+      if (cache && cache.fetchedAtMs >= freshSince && modelAccountRevision === accountRevision) return;
       await waitFor(100);
     }
     throw managerError('ZEUS_CODEX_MODEL_SYNC_FAILED', '账号已登录，但本次模型目录更新超时；旧目录未被当作同步成功。');
@@ -1397,6 +1449,19 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
     return model;
   }
 
+  /** 在线程设置与轮次启动前统一验证协作模式引用的模型和推理强度。 */
+  function validateCodexCollaborationMode(capabilities: CodexCapabilitiesSnapshot, collaborationMode: CodexCollaborationMode): void {
+    /** 协作模式可以显式选择模型，必须按 Provider 当前目录重新校验。 */
+    const collaborationModel = requireModel(capabilities, collaborationMode.settings.model);
+    /** null 表示沿用该模式的默认推理强度。 */
+    const collaborationEffort = collaborationMode.settings.reasoning_effort;
+    if (collaborationEffort === null || collaborationModel.supportedReasoningEfforts.includes(collaborationEffort)) return;
+    throw Object.assign(new Error(`Configured Codex effort is unavailable: ${collaborationEffort}`), {
+      code: 'ZEUS_CODEX_EFFORT_UNAVAILABLE',
+      supportedEfforts: [...collaborationModel.supportedReasoningEfforts],
+    });
+  }
+
   return {
     refreshModels,
     ensureReady(input) {
@@ -1454,14 +1519,23 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
       if (!request) {
         request = (async () => {
           const accountRead = refreshToken ? rpc : retryableReadRpc;
-          const snapshot = parseAccountSnapshot(
-            await accountRead(capabilities.generationId, 'account/read', { refreshToken }, { ...(refreshToken ? {} : { timeoutMs: Math.min(requestTimeoutMs, 8_000) }) }),
-            capabilities.generationId,
-            accountFingerprintSalt,
-          );
-          if (accountRevision !== modelAccountRevision) throw managerError('ZEUS_CODEX_ACCOUNT_CHANGED', '账户状态已变化，请重新检查。');
-          lastAccountSnapshot = { value: snapshot, cachedAt: Date.now() };
-          return snapshot;
+          /** 账户通知可能与首次读取并发；只读请求再确认一次，拒绝持续变化或刷新凭据的旧回包。 */
+          let revision = accountRevision;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            /** 每次都读取当前账户，不沿用变化前的缓存或响应。 */
+            const snapshot = parseAccountSnapshot(
+              await accountRead(capabilities.generationId, 'account/read', { refreshToken }, { ...(refreshToken ? {} : { timeoutMs: Math.min(requestTimeoutMs, 8_000) }) }),
+              capabilities.generationId,
+              accountFingerprintSalt,
+            );
+            if (revision === modelAccountRevision) {
+              lastAccountSnapshot = { value: snapshot, cachedAt: Date.now() };
+              return snapshot;
+            }
+            if (refreshToken) break;
+            revision = modelAccountRevision;
+          }
+          throw managerError('ZEUS_CODEX_ACCOUNT_CHANGED', '账户状态已变化，请重新检查。');
         })();
         accountReadInFlight.set(flightKey, request);
         const clearFlight = () => {
@@ -1584,6 +1658,8 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
               'agents.max_depth': 2,
               // 普通模式也使用原生问题卡，避免切换模型后只能在计划模式提问。
               'features.default_mode_request_user_input': true,
+              // 只为 Zeus 管理的线程开启原生步骤计划，不修改用户终端的 Codex 配置。
+              'tools.update_plan.enabled': true,
             },
           }),
           { traceIdentity: input.traceIdentity },
@@ -1642,6 +1718,8 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
               'features.multi_agent_v2.max_concurrent_threads_per_session': 5,
               'agents.max_depth': 2,
               'features.default_mode_request_user_input': true,
+              // 既有线程恢复时同样开启原生计划，沿用 thread/start 的宿主配置。
+              'tools.update_plan.enabled': true,
             },
           }),
           // 恢复耗时随完整历史增长，固定超时无法区分“仍在加载”和“已经失败”。
@@ -1756,20 +1834,28 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
       const capabilities = await awaitCapabilities();
       await rpc(capabilities.generationId, 'thread/compact/start', { threadId: input.threadId }, { requestWritten: input.requestWritten, traceIdentity: input.traceIdentity });
     },
+    async setThreadCollaborationMode(input) {
+      /** 线程设置与轮次启动必须使用完全相同的线协议转换和模型能力校验。 */
+      const capabilities = await awaitCapabilities();
+      /** 原生协议使用 `none` 表示关闭推理，产品层继续保留 `off` 术语。 */
+      const collaborationMode = toCodexWireCollaborationMode(input.collaborationMode);
+      validateCodexCollaborationMode(capabilities, collaborationMode);
+      await rpc(
+        capabilities.generationId,
+        'thread/settings/update',
+        {
+          threadId: input.threadId,
+          collaborationMode,
+        },
+        { requestWritten: input.requestWritten, traceIdentity: input.traceIdentity },
+      );
+    },
     async startTurn(input) {
       const capabilities = await awaitCapabilities();
       const modelName = input.model ?? threadModels.get(input.threadId);
       const model = modelName ? requireModel(capabilities, modelName) : null;
       const wireEffort = toCodexWireReasoningEffort(input.effort);
-      const wireCollaborationMode = input.collaborationMode
-        ? {
-            ...input.collaborationMode,
-            settings: {
-              ...input.collaborationMode.settings,
-              reasoning_effort: toCodexWireReasoningEffort(input.collaborationMode.settings.reasoning_effort) ?? null,
-            },
-          }
-        : undefined;
+      const wireCollaborationMode = input.collaborationMode ? toCodexWireCollaborationMode(input.collaborationMode) : undefined;
       if (typeof wireEffort === 'string') {
         const supportedEfforts = model?.supportedReasoningEfforts ?? [];
         if (!model || !supportedEfforts.includes(wireEffort)) {
@@ -1783,16 +1869,7 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
         if (!model) throw managerError('ZEUS_CODEX_MODEL_UNAVAILABLE', 'Codex service tier validation requires a known model.');
         validateServiceTier(model, input.serviceTier);
       }
-      if (wireCollaborationMode) {
-        const collaborationModel = requireModel(capabilities, wireCollaborationMode.settings.model);
-        const collaborationEffort = wireCollaborationMode.settings.reasoning_effort;
-        if (collaborationEffort !== null && !collaborationModel.supportedReasoningEfforts.includes(collaborationEffort)) {
-          throw Object.assign(new Error(`Configured Codex effort is unavailable: ${collaborationEffort}`), {
-            code: 'ZEUS_CODEX_EFFORT_UNAVAILABLE',
-            supportedEfforts: [...collaborationModel.supportedReasoningEfforts],
-          });
-        }
-      }
+      if (wireCollaborationMode) validateCodexCollaborationMode(capabilities, wireCollaborationMode);
       const sandboxPolicy = input.sandboxPolicy === undefined ? undefined : normalizeTurnSandbox(input.sandboxPolicy);
       const response = asRecord(
         await rpc(
@@ -2295,10 +2372,30 @@ function validateServiceTier(model: CodexModelCapability, serviceTier: string | 
   });
 }
 
+/** 把产品层协作模式转换成 Codex app-server 接受的线协议取值。 */
+function toCodexWireCollaborationMode(collaborationMode: CodexCollaborationMode): CodexCollaborationMode {
+  return {
+    ...collaborationMode,
+    settings: {
+      ...collaborationMode.settings,
+      reasoning_effort: toCodexWireReasoningEffort(collaborationMode.settings.reasoning_effort) ?? null,
+    },
+  };
+}
+
+/** 只接收 Provider 明确报告的协作模式，不根据开发者指令内容反推。 */
+function providerCollaborationMode(response: Record<string, unknown>): 'plan' | 'default' | undefined {
+  /** thread/start 与 thread/resume 都把有效协作模式放在顶层配置字段。 */
+  const collaborationMode = isRecord(response.collaborationMode) ? response.collaborationMode : null;
+  if (!collaborationMode) return undefined;
+  return collaborationMode.mode === 'plan' || collaborationMode.mode === 'default' ? collaborationMode.mode : undefined;
+}
+
 function attachThreadProviderSettings(thread: CodexThreadSnapshot, generationId: string, response: Record<string, unknown>, model: string): CodexThreadSnapshot {
   const effort = typeof response.effort === 'string' ? response.effort : typeof response.reasoningEffort === 'string' ? response.reasoningEffort : undefined;
   const hasServiceTier = Object.prototype.hasOwnProperty.call(response, 'serviceTier');
   const serviceTier = typeof response.serviceTier === 'string' || response.serviceTier === null ? response.serviceTier : undefined;
+  const collaborationMode = providerCollaborationMode(response);
   return {
     ...thread,
     providerSettings: {
@@ -2307,6 +2404,7 @@ function attachThreadProviderSettings(thread: CodexThreadSnapshot, generationId:
       model,
       ...(effort ? { effort } : {}),
       ...(hasServiceTier && serviceTier !== undefined ? { serviceTier } : {}),
+      ...(collaborationMode ? { collaborationMode } : {}),
     },
   };
 }

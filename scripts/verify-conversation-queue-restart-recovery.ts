@@ -3,7 +3,17 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CodexAccountSnapshot, CodexAppServerEvent, CodexAppServerManager, CodexCapabilitiesSnapshot, CodexThreadSnapshot, CodexTurnSnapshot, CodexTurnStartInput, CodexTurnSteerInput } from '@zeus/ai-runtime';
+import type {
+  CodexAccountSnapshot,
+  CodexAppServerEvent,
+  CodexAppServerManager,
+  CodexCapabilitiesSnapshot,
+  CodexThreadCollaborationModeInput,
+  CodexThreadSnapshot,
+  CodexTurnSnapshot,
+  CodexTurnStartInput,
+  CodexTurnSteerInput,
+} from '@zeus/ai-runtime';
 import { ConversationRepository, ConversationServerRequestRepository, ConversationSubmissionRepository, ConversationTurnRepository, createZeusDatabase } from '../packages/storage/src/index.js';
 import { conversationDispatchInputSha256 } from '../packages/local-server/src/conversationDispatchCommandApplication.js';
 import { conversationStartInputSha256 } from '../packages/local-server/src/conversationStartCommandApplication.js';
@@ -15,6 +25,8 @@ type JsonObject = Record<string, unknown>;
 
 const probeRoot = await mkdtemp(join(tmpdir(), 'zeus-conversation-queue-restart-'));
 const dataRoot = join(probeRoot, 'data-root');
+/** 隔离 Skill 目录必须非空，才能覆盖目录不得混入用户正文的回归。 */
+const codexHome = join(dataRoot, 'providers', 'codex');
 const projectRoot = join(probeRoot, 'project');
 const databasePath = join(dataRoot, 'data', 'zeus.db');
 const apiToken = 'conversation-queue-restart-probe-token';
@@ -47,6 +59,10 @@ ContextDispatchApplicationService.prototype.compileForDispatch = async function 
 
 try {
   await mkdir(projectRoot, { recursive: true });
+  /** 本地 Skill 不依赖 Provider 目录，确保冻结结果真实非空。 */
+  const promptLayeringSkill = join(codexHome, 'skills', 'prompt-layering');
+  await mkdir(promptLayeringSkill, { recursive: true });
+  await writeFile(join(promptLayeringSkill, 'SKILL.md'), '---\nname: prompt-layering\ndescription: 验证 Skill 目录不会混入用户正文。\n---\n\n# 提示词分层\n', 'utf8');
   const firstProvider = createRestartProbeManager({
     providerThreadId,
     turnIds: [firstProviderTurnId],
@@ -105,6 +121,7 @@ try {
     ]);
     throw new Error(`${error instanceof Error ? error.message : String(error)}\nsnapshot=${JSON.stringify(snapshot.body, null, 2)}\nqueue=${JSON.stringify(queueState.body, null, 2)}`);
   }
+  assertBehavior(JSON.stringify(firstProvider.startTurnInputs[0]!.input) === JSON.stringify([{ type: 'text', text: firstConversationInput.content }]), '普通 Skill 目录被错误追加到用户正文。');
 
   await runningServer.prepareForShutdown();
   await runningServer.close();
@@ -276,6 +293,14 @@ try {
     const failedQueue = await requestJson(runningServer!, `/api/projects/${projectId}/conversations/${conversationId}/queue-state`);
     return isRecord(failedQueue.body.state) && (failedQueue.body.state.type === 'idle' || failedQueue.body.state.type === 'paused');
   }, '服务尚未收口额度失败轮次。');
+  /** 服务类官方错误必须暂停原会话，并且不会自行重发刚失败的消息。 */
+  const serviceFailureInspection = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assertBehavior(serviceFailureInspection.prepare('SELECT provider_state FROM conversations WHERE id = ?').get(conversationId)?.provider_state === 'paused', '额度失败后会话没有保持暂停。');
+    assertBehavior(restartedProvider.startTurnInputs.length === 1, '服务类失败后旧消息被自动重发。');
+  } finally {
+    serviceFailureInspection.close();
+  }
   /** 用户额度恢复后明确提交的下一条消息。 */
   const continueClientMessageId = `message_${randomUUID().replaceAll('-', '')}`;
   /** 沿用正常消息入口及真实统一队列，只控制外部 Provider 回执。 */
@@ -304,6 +329,36 @@ try {
   }
   assertBehavior(restartedProvider.startTurnInputs[1]?.clientUserMessageId === continueClientMessageId, '额度恢复后重发了旧消息。');
   assertBehavior(restartedProvider.startTurnInputs[1]?.threadId === providerThreadId, '额度恢复后丢失了原线程身份。');
+
+  /** 沙箱错误属于本地 Runtime 失败，不能伪装成 Provider 暂停。 */
+  await restartedProvider.failLatestTurn({ message: 'Sandbox command failed.', codexErrorInfo: 'sandboxError' });
+  await waitFor(async () => {
+    const failedQueue = await requestJson(runningServer!, `/api/projects/${projectId}/conversations/${conversationId}/queue-state`);
+    return isRecord(failedQueue.body.state) && failedQueue.body.state.type === 'idle';
+  }, '沙箱失败没有按真实执行失败收口。');
+  const runtimeFailureInspection = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    assertBehavior(runtimeFailureInspection.prepare('SELECT provider_state FROM conversations WHERE id = ?').get(conversationId)?.provider_state === 'failed', '沙箱错误被误判为 Provider 暂停。');
+  } finally {
+    runtimeFailureInspection.close();
+  }
+  /** 明确的新消息用于恢复后续探针现场，失败轮次本身仍不重放。 */
+  const runtimeContinueClientMessageId = `message_${randomUUID().replaceAll('-', '')}`;
+  const runtimeContinueInput = { content: '沙箱问题已处理，继续', idempotencyKey: `queue_${randomUUID().replaceAll('-', '')}`, clientUserMessageId: runtimeContinueClientMessageId, delivery: 'queue' };
+  const runtimeContinued = await requestJson(runningServer, `/api/projects/${projectId}/conversations/${conversationId}/messages`, {
+    method: 'POST',
+    body: commandRequest({
+      commandType: 'conversation.message.submit',
+      scopeKind: 'product_conversation',
+      scopeId: conversationId,
+      operationIdentity: runtimeContinueClientMessageId,
+      input: runtimeContinueInput,
+      inputSha256: conversationDispatchInputSha256(runtimeContinueInput),
+    }),
+  });
+  assertBehavior(runtimeContinued.status === 202, `沙箱失败后的新消息接纳失败：${runtimeContinued.status}`);
+  await waitFor(() => restartedProvider.startTurnInputs.length === 3, '沙箱失败后明确提交的新消息没有进入下一轮。', 8_000);
+  assertBehavior(restartedProvider.startTurnInputs[2]?.clientUserMessageId === runtimeContinueClientMessageId, '沙箱失败后重发了旧轮次。');
 
   /** 连续排队的附件始终使用本探针项目中的原资源。 */
   const queuedAttachmentPath = join(projectRoot, '排队附件.md');
@@ -398,7 +453,8 @@ try {
         preparingDispatchSurvivesHistoryCheck: true,
         preparingDispatchSurvivesThreadStatusNotification: true,
         threeIdenticalQueuedMessagesWithAttachment: true,
-        quotaFailureCanContinue: true,
+        providerFailurePausedWithoutReplay: true,
+        runtimeFailureRemainsFailed: true,
         temporaryDatabaseCleanup: 'finally',
       },
       null,
@@ -652,7 +708,7 @@ async function startProbeServer(manager: CodexAppServerManager, instanceId: stri
     codexAppServerManager: manager,
     codexNativeEnabled: true,
     codexRuntimeCommandPath: '/usr/bin/true',
-    codexHome: join(dataRoot, 'providers', 'codex'),
+    codexHome,
     telegramToken: '',
     executionHost: {
       instanceId: `conversation-queue-restart-${instanceId}`,
@@ -682,7 +738,7 @@ function createRestartProbeManager(input: { providerThreadId: string; turnIds: s
   /** 结束活动轮以唤醒下一条消息。 */
   completeTurn(index: number): Promise<void>;
   /** 控制真实服务收到的失败终态通知，不调用付费模型。 */
-  failLatestTurn(): Promise<void>;
+  failLatestTurn(error?: { message: string; codexErrorInfo: 'usageLimitExceeded' | 'sandboxError' }): Promise<void>;
 } {
   const generationId = `generation_${randomUUID().replaceAll('-', '')}`;
   const capabilities: CodexCapabilitiesSnapshot = {
@@ -724,6 +780,8 @@ function createRestartProbeManager(input: { providerThreadId: string; turnIds: s
     accountScopeId: 'conversation-queue-restart-probe',
   };
   const listeners = new Set<(event: CodexAppServerEvent) => void | Promise<void>>();
+  /** 每次轮次启动前必须先收到同一线程、同一模式的持久设置更新。 */
+  const collaborationModeInputs: CodexThreadCollaborationModeInput[] = [];
   const startTurnInputs: CodexTurnStartInput[] = [];
   /** 引导接纳与历史回显分开，复现真实 Provider 的输入缓冲。 */
   const steerTurnInputs: CodexTurnSteerInput[] = [];
@@ -790,7 +848,15 @@ function createRestartProbeManager(input: { providerThreadId: string; turnIds: s
     },
     listThreads: async () => ({ data: [threadSnapshot()], nextCursor: null }),
     listSkills: async ({ cwds }: { cwds?: string[] }) => (cwds ?? []).map((cwd) => ({ cwd, skills: [], errors: [] })),
+    setThreadCollaborationMode: async (collaborationInput: CodexThreadCollaborationModeInput) => {
+      collaborationInput.requestWritten?.();
+      collaborationModeInputs.push(collaborationInput);
+    },
     startTurn: async (turnInput: CodexTurnStartInput) => {
+      /** 同步缺失、顺序错误或模式漂移都必须在现有重启探针中立即失败。 */
+      const collaborationInput = collaborationModeInputs[startTurnInputs.length];
+      assertBehavior(collaborationInput?.threadId === turnInput.threadId, 'turn/start 前没有同步同一 Provider 线程的协作模式。');
+      assertBehavior(collaborationInput.collaborationMode.mode === turnInput.collaborationMode?.mode, '线程设置与 turn/start 的协作模式发生漂移。');
       turnInput.requestWritten?.();
       startTurnInputs.push(turnInput);
       const turnId = input.turnIds[startTurnInputs.length - 1];
@@ -872,13 +938,13 @@ function createRestartProbeManager(input: { providerThreadId: string; turnIds: s
     },
     completeTurn,
     /** 失败与回显共用递增序号，避免后续事件被当作重复通知。 */
-    async failLatestTurn() {
+    async failLatestTurn(error = { message: '账户额度已用尽', codexErrorInfo: 'usageLimitExceeded' }) {
       /** 故障只结束最新轮次，旧历史和线程身份保持真实关联。 */
       const turn = turns.at(-1);
       assertBehavior(turn, '没有可结束的 Provider 轮次。');
       turn.status = 'failed';
       turn.completedAt = new Date().toISOString();
-      turn.error = { message: '账户额度已用尽', codexErrorInfo: 'usageLimitExceeded' };
+      turn.error = error;
       await emit('turn/completed', { threadId: input.providerThreadId, turn });
     },
     get readThreadCalls() {

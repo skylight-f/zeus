@@ -2,7 +2,6 @@ import { classifyAssistantMessage } from '@zeus/shared';
 import { userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
-import { effectiveToolPermission } from './conversationToolPolicy.js';
 import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 import { type CodexAppServerEvent, type CodexCommandApprovalDecision, type CodexSandboxPolicy, type CodexServerRequestResponse, type CodexThreadSnapshot } from '@zeus/ai-runtime';
 import { commandEnvelopeSchemaGeneration, parseCommandEnvelope, type CommandEnvelope, type TokenUsageBreakdown } from '@zeus/shared';
@@ -51,7 +50,6 @@ interface ConversationDispatchContext {
 }
 
 export function providerPermissionProfile(context: ConversationDispatchContext): { sandbox: CodexSandboxPolicy; approvalPolicy: 'on-request' | 'never'; approvalsReviewer: 'user' | 'auto_review' } {
-  context = { ...context, permissionMode: effectiveToolPermission(context.permissionMode, context.workMode) };
   if (context.permissionMode === 'full-access') return { sandbox: { type: 'dangerFullAccess' }, approvalPolicy: 'never', approvalsReviewer: 'user' };
   if (context.permissionMode === 'auto' || context.permissionMode === 'auto-review') {
     return {
@@ -183,6 +181,11 @@ export function developerInstructionsFor(context: ConversationDispatchContext, b
   return instructions.join('\n');
 }
 
+/** 默认执行模式的过程清单规则；不得写入线程级指令或计划模式模板。 */
+export function defaultModeDeveloperInstructions(): string {
+  return '当前轮次为默认执行模式，Plan Mode 已明确结束，可以按用户要求实施。任务包含两个及以上有意义的实施或验证步骤时，使用 update_plan 维护本轮开发计划：开始前列出步骤，进展后及时更新，仅把实际完成的步骤标记为 completed，未完成步骤保持真实状态；单步任务不要创建计划。';
+}
+
 export function permissionModeFromValue(value: unknown, fallback: ConversationPermissionMode): ConversationPermissionMode {
   return value === 'read-only' || value === 'auto' || value === 'auto-review' || value === 'full-access' ? value : fallback;
 }
@@ -261,6 +264,11 @@ export function providerTurnFailure(params: Record<string, unknown>, providerTur
   const message =
     typeof providerError?.message === 'string' && providerError.message.trim() ? providerError.message : providerStatus === 'failed' ? 'Codex provider turn failed.' : `Codex provider emitted unsupported terminal status: ${providerStatus}.`;
   return Object.assign(coordinatorError('ZEUS_CODEX_TURN_FAILED', message), { providerTurnId, providerStatus });
+}
+
+/** 仅识别 Provider 明确报告的回复流提前断开，其他失败不得进入连接恢复重试。 */
+export function isProviderResponseStreamDisconnected(failure: Error): boolean {
+  return /stream disconnected before completion/iu.test(failure.message);
 }
 
 export function providerTurnFailureRecord(params: Record<string, unknown>, failure: Error & { code: string }): Record<string, unknown> {
@@ -1264,11 +1272,6 @@ export function isProviderThreadArchivedError(error: unknown): boolean {
 
 export function isProviderThreadAlreadyAvailableError(error: unknown): boolean {
   return /\bno archived rollout found for thread id\b/i.test(error instanceof Error ? error.message : String(error));
-}
-
-export function isRejectedHistoricalFileChangeError(error: unknown): boolean {
-  const code = isRecord(error) && typeof error.code === 'string' ? error.code : null;
-  return code === 'ZEUS_TURN_CHANGE_SET_PATH_FORBIDDEN' || code === 'ZEUS_TURN_CHANGE_SET_PATH_INVALID';
 }
 
 export function isProviderTurnAlreadyEndedSteerError(error: unknown): boolean {

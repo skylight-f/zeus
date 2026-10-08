@@ -21,9 +21,10 @@ import {
 import { registerConversationSnapshotV2Api } from '../packages/local-server/src/conversationSnapshotV2Api.js';
 import { initializeConversationTranscriptIndexes, stopConversationTranscriptInitialization } from '../packages/storage/src/conversationTranscriptStore.js';
 import { mergeConversationProcessV2, mergeConversationTurnHistoryV2 } from '../apps/desktop/src/renderer/session/conversationSnapshotV2Adapter.js';
-import { createHydratedSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.js';
+import { createInitialSessionState, createHydratedSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.js';
 import { createTranscriptProjection, reuseTranscriptRows, reuseTranscriptTurnRows, updateTranscriptProjection } from '../apps/desktop/src/renderer/session/transcriptProjection.js';
 import { reconcileTranscriptItems } from '../apps/desktop/src/renderer/session/transcriptReconciliation.js';
+import { buildPersistedSessionViewCache, initialSessionHotCache, primePersistedSessionViewCache } from '../apps/desktop/src/renderer/session/sessionHotCache.js';
 import { mergeNavigationEntries, navigationRowKey } from '../apps/desktop/src/renderer/session/ConversationNavigation.js';
 import { createThreadScrollController } from '../apps/desktop/src/renderer/session/useThreadScrollController.js';
 import type { ConversationNavigationSnapshot } from '@zeus/shared';
@@ -53,7 +54,7 @@ registerHooks({
 /** tsx 探针不经过 Vite 的 JSX 自动运行时，显式提供组件模块需要的 React 命名空间。 */
 (globalThis as typeof globalThis & { React: typeof import('react') }).React = await import('react');
 /** 将历史过程分页串联到正式行编号和轮次分组，覆盖同轮多段思考。 */
-const { projectTranscriptRows, projectTranscriptTurnRows, projectTranscriptFailureRows } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
+const { projectTranscriptRows, projectTranscriptTurnRows, projectTranscriptFailureRows, projectQueuedSubmissionItems } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
 /** 工作面入口也引用组件样式，必须在样式加载钩子安装后导入。 */
 const { resolveConversationNavigationId, resolveSelectedNativeConversationForProject } = await import('../apps/desktop/src/renderer/features/workspace/workspaceSupport.js');
 
@@ -88,6 +89,20 @@ function probeTranscript(entryId: string, order: number, openingInputId: string 
     placement: { entryId, order, orderEpoch: 1, placementRevision: revision, turnId: 'turn', openingInputId, displayStageId },
     sources: [{ domain: 'probe', scope: 'turn', sourceId: entryId, facet: 'body', revision, contentRevision: revision }],
   };
+}
+
+/** 仅检查同持久身份的来源接管，避免无关历史探针阻断本次运行验收。 */
+if (process.argv.includes('--source-aliases-only')) {
+  verifyTranscriptSourceAliases();
+  console.log('transcript-source-aliases=passed');
+  process.exit(0);
+}
+
+/** 独立检查异步答题恢复，不依赖长历史与思考展示场景。 */
+if (process.argv.includes('--async-question-recovery')) {
+  verifyAsyncQuestionRecovery();
+  console.log('async-question-recovery=passed');
+  process.exit(0);
 }
 
 /** 失败记录必须早于后续发言，不能随缺页、排队或重复身份移动到底部。 */
@@ -190,14 +205,14 @@ for (const protocolFamily of ['openai_completions', 'openai_responses', 'anthrop
       const reasoningItems = buffered.map((item) =>
         item.key === 'codex-summary' || presentation === 'process_text' ? item : { ...item, payload: { ...item.payload, reasoningPresentation: undefined, detail: { reasoningPresentation: presentation } } },
       );
-      /** 流式摘要换条目后仍使用同一轮次编号，正文编号保持原值。 */
+      /** 流式状态摘要换条目后不进入过程行，持久正文编号保持原值。 */
       const replacementSummary = { ...reasoningItems.find((item) => item.key === 'codex-summary')!, key: 'codex-summary-next', itemId: 'codex-summary-next', text: '继续核对结果', status: 'in_progress' };
       for (const historyOnly of [false, true]) {
-        /** 两段正文和最新摘要共存；历史模式只隐藏状态摘要。 */
+        /** 最新摘要由运行状态单独展示，活动与历史过程均只投影两段持久正文。 */
         const rows = projectTranscriptRows([...reasoningItems, replacementSummary], [], 'turn', historyOnly);
         assertProbe(
-          rows.map((row) => row.key).join('|') === (historyOnly ? 'transcript:thinking|transcript:thinking-next' : 'transcript:thinking|transcript:thinking-next|reasoning-summary:turn'),
-          `思考正文须各自保留，最新状态摘要独立且编号稳定：${protocolFamily}/${presentation}/${historyOnly}/${rows.map((row) => row.key).join('|')}`,
+          rows.map((row) => row.key).join('|') === 'transcript:thinking|transcript:thinking-next',
+          `思考正文须各自保留，状态摘要不能成为过程分组边界：${protocolFamily}/${presentation}/${historyOnly}/${rows.map((row) => row.key).join('|')}`,
         );
         /** 同时核对未分组和已结束轮次，重复编号不能进入布局索引。 */
         for (const terminalTurns of [{}, { turn: 'completed' as const }]) {
@@ -248,28 +263,22 @@ assertProbe(nativeActivityTool({ toolName: 'plugin_zeus_browser_open' }) === nul
 /** 使用原生观察的应用名称，禁止从内部标识猜测产品。 */
 const desktopPresentation = conversationProcessPresentation('tool', {
   itemType: 'dynamicToolCall',
-  payload: { namespace: 'zeus_computer', tool: 'get_app_state', arguments: { app: 'com.github.electron' }, contentItems: [{ type: 'inputText', text: JSON.stringify({ application: { name: 'Zeus Test' } }) }], success: true },
+  payload: { namespace: 'zeus_computer', tool: 'get_window_state', arguments: { pid: 42, window_id: 7 }, contentItems: [{ type: 'inputText', text: JSON.stringify({ app_name: 'Zeus Test' }) }], success: true },
 });
 assertProbe(nativeActivityTitle({ status: 'completed', payload: desktopPresentation.payload }, true)?.includes('Zeus Test') === true, '历史投影必须保留工具身份和真实应用元信息。');
+assertProbe(!nativeActivityTitle({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'get_window_state', arguments: { pid: 42, window_id: 7 } } }, true)?.includes('window_id'), '缺少真实名称时不得在摘要暴露内部标识。');
+/** CUA 动作结果未知不能被已完成调用覆盖。 */
 assertProbe(
-  !nativeActivityTitle({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'get_app_state', arguments: { app: 'com.github.electron' } } }, true)?.includes('com.github.electron'),
-  '缺少真实名称时不得在摘要暴露内部标识。',
+  activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', contentItems: [{ type: 'inputText', text: JSON.stringify({ action: { outcome: 'unknown' } }) }] } }) === 'unknown',
+  '调用已返回不能覆盖 CUA 未确认结果。',
 );
-/** 已完成返回、用户接管与动作结果未知是不同的展示状态。 */
-for (const [result, expected] of [
-  [{ status: 'waiting_for_user' }, 'waiting'],
-  [{ status: 'user_control_resumed' }, 'observe'],
-  [{ action: { outcome: 'unknown' } }, 'unknown'],
-] as const) {
-  assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] } }) === expected, '调用已返回不能覆盖实际接管或未确认结果。');
-}
 assertProbe(activityOutcome({ status: 'completed', payload: { success: false } }) === 'failed' && activityOutcome({ status: 'completed', payload: { status: 'cancelled' } }) === 'cancelled', '结束记录仍保留失败与取消的真实状态。');
 assertProbe(activityOutcome({ status: 'completed', payload: failedCommand.payload }) === 'failed', '非零退出码不能显示已完成。');
-assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', v2ContentTruncated: true } }) === 'unknown', '桌面结果截断时不能丢失潜在的接管状态并误报完成。');
+assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', v2ContentTruncated: true } }) === 'unknown', 'CUA 结果截断时不能丢失动作状态并误报完成。');
 /** 工具展示可单独检查，不依赖后续长历史游标与数据库场景。 */
 if (process.argv.includes('--activity-presentation')) {
   await probeNavigation();
-  console.log('工具展示探针通过：原生身份、应用名称、失败、取消、接管与未确认结果。');
+  console.log('工具展示探针通过：原生身份、应用名称、失败、取消与 CUA 未确认结果。');
   process.exit(0);
 }
 assertProbe(
@@ -339,6 +348,31 @@ for (const status of ['paused', 'failed']) {
   );
 }
 assertProbe(orderTranscriptItemsWithQueue([confirmedHistory[1]!, confirmedHistory[0]!], null)[0]!.key === 'history-second', '排序补队列不能再次按时间改排持久历史。');
+
+/** 冷开等待回执的异步回答必须携带原题、答案和附件分组。 */
+function verifyAsyncQuestionRecovery(): void {
+  /** 独立的规范提交只包含本场景需要的持久字段。 */
+  const submission: NativeQueuedSubmission = {
+    id: 'async-answer',
+    content: '自己去查',
+    position: 1,
+    status: 'dispatching',
+    delivery: 'steer_now',
+    pausedReason: null,
+    questionAnswer: {
+      providerTurnId: 'question-turn',
+      providerItemId: 'question-source',
+      questions: [{ id: 'choice', header: '用户选择', question: '继续查找？', isOther: true, isSecret: false, options: [{ label: '自己去查', description: '' }] }],
+      answers: { choice: { answers: ['自己去查'] } },
+      answerAttachmentIndices: { choice: [0] },
+    },
+  };
+  /** 直接运行生产队列恢复和问答投影，不建立第二套恢复规则。 */
+  const restored = projectQueuedSubmissionItems(createInitialSessionState(), [submission], []);
+  assertProbe(restored[0]?.payload.questionAnswer === submission.questionAnswer, '队列恢复不能丢失结构化回答。');
+  assertProbe(projectTranscriptRows(restored).filter((row) => row.kind === 'item' && row.questionAnswer).length === 1, '冷开必须生成一张结构化回答卡片。');
+}
+verifyAsyncQuestionRecovery();
 
 const rowCount = 100_000;
 const rowKeys = Array.from({ length: rowCount }, (_, index) => `row-${index}`);
@@ -512,6 +546,84 @@ assertProbe(rebuiltRows.every((row, index) => row === beforeRows[index]) && rebu
 const changedPosition = { ...completeBody, transcript: { ...completeBody.transcript, placement: { ...completeBody.transcript.placement, order: 5, orderEpoch: 2, placementRevision: 20 } } };
 const movedHydrated = sessionReducer(beforeContent, { type: 'snapshot_hydrated', snapshot: { ...probeSnapshot, items: [changedPosition] } });
 assertProbe(movedHydrated.items[beforeContent.itemOrder[0]!]!.transcript?.placement.orderEpoch === 2, '纯位置快照不能被内容对象复用规则丢弃');
+
+/** 同一回复的历史轮次、实时轮次与缓存别名必须收敛到一个持久身份。 */
+function verifyTranscriptSourceAliases(): void {
+  /** 最小正文具有明确持久身份与内容修订，不依赖时间或文字猜测关联。 */
+  const completeBody = {
+    id: 'body',
+    turnId: 'turn',
+    providerItemId: 'body',
+    type: 'agentMessage',
+    status: 'in_progress',
+    phase: 'final_answer',
+    text: '完整的新正文',
+    payload: {},
+    resources: [],
+    startedAt: '2026-01-01T00:00:00Z',
+    completedAt: null,
+    updatedAt: '2026-01-01T00:00:01Z',
+    transcript: probeTranscript('body', 1, 'probe-input', null, 10),
+  };
+  /** 正式归约入口只需本任务的一条正文，不访问正式数据库。 */
+  const probeSnapshot = {
+    id: 'source-aliases',
+    projectId: 'project',
+    providerThreadId: 'thread',
+    items: [completeBody],
+    turns: [],
+    messages: [],
+    requests: [],
+    submissions: [],
+    queue: { state: { type: 'idle' }, submissions: [] },
+    throughEventSeq: 1,
+  } as unknown as NativeConversationSnapshot;
+  /** 完成事件补全 Provider 轮次编号，持久身份与历史来源一致。 */
+  const contentEvent = {
+    id: 'source-alias-change',
+    type: 'conversation.item.completed',
+    createdAt: '2026-09-30T00:00:00Z',
+    payload: {
+      projectId: 'project',
+      conversationId: probeSnapshot.id,
+      threadId: 'thread',
+      turnId: 'provider-history-turn',
+      itemId: 'body',
+      itemType: 'agentMessage',
+      textContent: '完整的新正文追加',
+      transcript: probeTranscript('body', 1, 'probe-input', null, 12),
+    },
+  } as const;
+  /** 历史首屏尚未取得 Provider 身份，但正文已具有持久显示位置。 */
+  const historicalBody = { ...completeBody, id: 'history-row', turnId: 'local-history-turn', providerItemId: null, status: 'completed', payload: { v2ContentKind: 'model_history' } };
+  /** 只使用一条历史正文，便于核对是否意外生成第二个界面条目。 */
+  const history = createHydratedSessionState({ ...probeSnapshot, items: [historicalBody] });
+  /** 实时完成事件使用不同轮次编号，正文身份保持不变。 */
+  const eventState = sessionReducer(history, { type: 'event_received', event: { ...contentEvent, type: 'conversation.item.completed', payload: { ...contentEvent.payload, turnId: 'provider-history-turn' } } });
+  assertProbe(eventState.itemOrder.length === 1 && eventState.itemOrder[0] === history.itemOrder[0] && eventState.items[eventState.itemOrder[0]!]!.text === contentEvent.payload.textContent, '实时回复必须接管同持久身份历史条目并保留可见键');
+  /** 模拟旧窗口按技术键保留的别名；持久身份仍指向同一正文。 */
+  const alias = { ...history.items[history.itemOrder[0]!]!, key: 'old-alias', localItemId: 'old-history-row', turnId: 'old-history-turn' };
+  /** 旧缓存包含两个来源副本，权威刷新和补页都必须消除它。 */
+  const duplicated = { ...history, items: { ...history.items, [alias.key]: alias }, itemOrder: [...history.itemOrder, alias.key] };
+  for (const type of ['snapshot_hydrated', 'snapshot_v2_page_merged'] as const) {
+    /** 完整来源条目与旧页使用不同技术编号。 */
+    const refreshed = sessionReducer(duplicated, { type, snapshot: { ...probeSnapshot, items: [{ ...completeBody, turnId: 'provider-history-turn' }] } });
+    assertProbe(refreshed.itemOrder.length === 1 && Object.keys(refreshed.items).length === 1, '快照刷新和历史补页必须只保留一份持久正文');
+    new TranscriptViewportLayout().syncKeys(
+      projectTranscriptTurnRows(projectTranscriptRows(refreshed.itemOrder.map((key) => refreshed.items[key]!))).map((row) => row.key),
+      new TranscriptRowMeasurementCache(),
+    );
+  }
+  /** 旧副本正文修订更低、位置完全相同，去重仍不能返回原来的重复数组。 */
+  const staleAlias = { ...completeBody, text: '旧正文', transcript: { ...probeTranscript('body', 1, 'probe-input', null, 4), placement: completeBody.transcript.placement } };
+  assertProbe(reconcileTranscriptItems([completeBody, staleAlias], []).items.length === 1, '正文未变化的重复来源也必须完成结构去重');
+  /** 缓存读写边界拒绝重复身份，正常单条缓存仍可恢复。 */
+  const persisted = buildPersistedSessionViewCache(new Map([[history.conversationId!, { state: history, estimatedBytes: 1, cachedAt: Date.now() }]]));
+  assertProbe(persisted.entries.length === 1, '合法显示缓存必须继续可用');
+  primePersistedSessionViewCache({ ...persisted, entries: [{ ...persisted.entries[0]!, state: duplicated }] });
+  assertProbe(initialSessionHotCache().size === 0, '重复身份显示缓存不能进入首次渲染');
+}
+verifyTranscriptSourceAliases();
 
 /** 真实磁盘子进程崩溃、损坏断点和阶段续做的恢复核验。 */
 async function verifyTranscriptDurableRecovery(): Promise<void> {

@@ -1,7 +1,7 @@
 appId: dev.hypha.zeus
 productName: Zeus
 artifactName: Zeus-${version}-${arch}.${ext}
-electronVersion: 42.4.0
+# Electron 版本由根 package.json 指定，打包入口显式传递，避免产物继续使用旧版本。
 electronLanguages:
   - en
   - en_GB
@@ -22,11 +22,7 @@ files:
   - '!node_modules/**/{coverage,example,examples,test,tests}/**'
   - '!node_modules/*/{doc,docs}/**'
   - '!node_modules/@*/*/{doc,docs}/**'
-  - '!node_modules/@earendil-works/pi-coding-agent/dist/cli.js'
-  - '!node_modules/@earendil-works/pi-coding-agent/dist/core/export-html/**'
-  - '!node_modules/@earendil-works/pi-coding-agent/dist/modes/**'
-  - '!node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js'
-  - '!dist/native/Zeus Computer Service.app/**'
+  # 官方 Pi SDK 的导入链包含终端模块，保留完整运行文件以避免打包后缺失依赖。
   - '!node_modules/node-pty/binding.gyp'
   - '!node_modules/node-pty/{deps,scripts,src,typings}/**'
   - '!node_modules/node-pty/prebuilds/!(darwin-${arch})/**'
@@ -34,9 +30,12 @@ files:
   - '!node_modules/node-pty/lib/testUtils.test.js'
 asarUnpack:
   - dist/native/**
-extraFiles:
-  - from: dist/native/Zeus Computer Service.app
-    to: Helpers/Zeus Computer Service.app
+  # CUA 原生渲染器直接读取已编译主题，需要真实文件路径。
+  - assets/computer-cursor/*.cua-theme
+  # SDK 与绑定从物理目录解析依赖，原生 dlopen 不能使用 ASAR 虚拟路径。
+  - node_modules/@trycua/cua-driver/**
+  - node_modules/@trycua/cua-driver-*/**
+  - node_modules/@ubjs/**
 mac:
   category: public.app-category.developer-tools
   icon: dist/branding/icon.icns

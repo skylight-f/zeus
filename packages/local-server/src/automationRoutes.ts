@@ -8,6 +8,8 @@ export interface RegisterAutomationRoutesOptions {
   tasks: AutomationTaskRepository;
   runs: AutomationRunRepository;
   db: ZeusDatabasePort;
+  /** 无项目触发在写运行前按需创建托管工作区。 */
+  ensureTemporaryWorkspace(runIdentity: string): { id: string };
   kick(): void;
   now(): string;
 }
@@ -64,18 +66,24 @@ export function registerAutomationRoutes(options: RegisterAutomationRoutesOption
       if (!task) throw new Error('ZEUS_AUTOMATION_CONFIG_NOT_FOUND: 自动化任务不存在。');
       const scheduledAt = options.now();
       const nonce = request.headers['idempotency-key'];
-      const items = tasks
+      /** 手动触发冻结当前启用项目，并只创建一条运行。 */
+      const projectIds = tasks
         .listTargets(task.id)
         .filter((target) => target.enabled)
-        .map((target) =>
-          runs.enqueue({
-            automationId: task.id,
-            projectId: target.projectId,
-            triggerKind: 'manual',
-            triggerIdentity: `manual:${nonce}`,
-            scheduledAt,
-          }),
-        );
+        .map((target) => target.projectId);
+      /** 先满足回执外键，再以空 projectIds 保留真实业务语义。 */
+      const projectId = projectIds[0] ?? options.ensureTemporaryWorkspace(`manual:${String(nonce)}`).id;
+      /** 响应仍保留 items 结构，但一次触发只含一个运行。 */
+      const items = [
+        runs.enqueue({
+          automationId: task.id,
+          projectIds,
+          projectId,
+          triggerKind: 'manual',
+          triggerIdentity: `manual:${nonce}`,
+          scheduledAt,
+        }),
+      ];
       return { statusCode: 202, body: { items } };
     });
   });
@@ -83,9 +91,13 @@ export function registerAutomationRoutes(options: RegisterAutomationRoutesOption
   server.post('/api/automations/:automationId/status', async (request: FastifyRequest<{ Params: { automationId: string }; Body: { status?: string } }>, reply) => {
     return mutate(request, reply, () => {
       if (request.body.status !== 'active' && request.body.status !== 'paused') throw new Error('ZEUS_AUTOMATION_CONFIG_STATUS_INVALID: status 必须是 active 或 paused。');
+      const previous = tasks.getById(request.params.automationId);
+      if (!previous) throw new Error('ZEUS_AUTOMATION_CONFIG_NOT_FOUND: 自动化任务不存在。');
+      /** 恢复排程从当前时间重新计算，避免把暂停期间错过的时间点当成立即执行。 */
+      const nextRunAt = request.body.status === 'active' && previous.status === 'paused' ? computeNextRun(previous, new Date(options.now())) : previous.nextRunAt;
       const updated = tasks.setStatus(request.params.automationId, request.body.status);
-      if (updated.status === 'active' && !updated.nextRunAt) tasks.setNextRun(updated.id, computeNextRun(updated, new Date(options.now())));
-      return { statusCode: 200, body: updated };
+      if (updated.status === 'active' && previous.status === 'paused') tasks.setNextRun(updated.id, nextRunAt);
+      return { statusCode: 200, body: tasks.getById(updated.id)! };
     });
   });
 
@@ -102,6 +114,11 @@ export function registerAutomationRoutes(options: RegisterAutomationRoutesOption
       tasks.delete(request.params.automationId);
       return { statusCode: 204, body: null };
     });
+  });
+
+  /** 明确恢复沿原冻结目标继续，不创建新的触发身份或重跑已接纳项目。 */
+  server.post('/api/automation-runs/:runId/resume', async (request: FastifyRequest<{ Params: { runId: string } }>, reply) => {
+    return mutate(request, reply, () => ({ statusCode: 202, body: runs.resumeDispatch(request.params.runId) }));
   });
 
   server.post('/api/automation-runs/:runId/read', async (request: FastifyRequest<{ Params: { runId: string } }>, reply) => {

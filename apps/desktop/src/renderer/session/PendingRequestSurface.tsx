@@ -1,9 +1,10 @@
 import { type CSSProperties, type KeyboardEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRightIcon as ArrowRight } from '@phosphor-icons/react/dist/csr/ArrowRight';
 import { BookOpenIcon as BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
+import { InfoIcon as Info } from '@phosphor-icons/react/dist/csr/Info';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
-import { InfoIcon as Info } from '@phosphor-icons/react/dist/csr/Info';
+
 import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
 import { PaperclipIcon as Paperclip } from '@phosphor-icons/react/dist/csr/Paperclip';
 import { QuestionIcon as Question } from '@phosphor-icons/react/dist/csr/Question';
@@ -13,7 +14,7 @@ import { parseCanonicalRequestUserInputQuestions } from '@zeus/shared';
 import { openExternalHttpsUrlInMain } from '../appShellBridge.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { FullAccessConfirmation } from './PermissionModeControl.js';
-import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { NativeConversationAttachment, NativePendingRequest, NativePermissionMode } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { autosizeTextarea } from './textareaAutosize.js';
@@ -104,7 +105,7 @@ const labels = {
     moreFiles: (count: number) => `另有 ${count} 个文件`,
     grantOptions: '授权选项',
     similarCommandRule: '适用规则',
-    fullAccess: '允许所有（完全访问）',
+    fullAccess: '完全访问权限',
     fullAccessScope: '允许本次，完全访问从下一轮生效',
     fullAccessScopePi: '允许本次及当前轮次后续新工具调用，后续轮次继续完全访问',
     allEditScope: '把本次文件授权交给 Codex，并允许它在本会话中沿用。请先核对上方显示的访问范围。',
@@ -152,7 +153,7 @@ const labels = {
     moreFiles: (count: number) => `${count} more file${count === 1 ? '' : 's'}`,
     grantOptions: 'Grant options',
     similarCommandRule: 'Applies to',
-    fullAccess: 'Allow all (full access)',
+    fullAccess: 'Full access',
     fullAccessScope: 'Allow this request; full access starts next turn',
     fullAccessScopePi: 'Allow this request and new tool calls in this turn; full access continues next turn',
     allEditScope: 'Send this file grant to Codex and allow it to reuse the decision during this session. Review the displayed scope first.',
@@ -170,16 +171,6 @@ export function PendingRequestSurface(props: PendingRequestSurfaceProps) {
   const hasDetails = isRui ? questions.length > 0 : hasPendingRequestDetails(props.request);
   const decisions = supportedRequestDecisions(props.request);
   const autofocusDecision = defaultAutofocusDecision(decisions);
-
-  useApplicationErrorDialog(props.error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(mcpUrlError, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(kind === 'unknown' ? copy.unsupportedHelp : null, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
 
   useEffect(() => {
     if (props.autoFocus === false) return;
@@ -266,6 +257,11 @@ export function PendingRequestSurface(props: PendingRequestSurfaceProps) {
               <span>{copy.invalidMcpHelp}</span>
             </p>
           ) : null}
+          {props.error || mcpUrlError ? (
+            <p className="session-request-invalid" role="alert">
+              <VisibleApplicationError error={props.error ?? mcpUrlError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+            </p>
+          ) : null}
           <div className="session-request-actions">
             {decisions.map((decision) => (
               <button
@@ -307,13 +303,13 @@ interface CompactApprovalPanelProps {
 
 function CompactApprovalPanel(props: CompactApprovalPanelProps) {
   const copy = labels[props.language];
+  const menuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   /** 确认完全访问前保持请求待审批。 */
   const [confirmingFullAccess, setConfirmingFullAccess] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const failClosedRef = useRef<HTMLButtonElement | null>(null);
-  const menuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const grantDecisions = props.decisions.filter((decision) => !isFailClosedDecision(decision));
   const hasAllowOnce = grantDecisions.includes('accept');
   const amendment = advertisedExecpolicyAmendmentDecision(props.request);
@@ -342,7 +338,7 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
 
   function openMenu(): void {
     setMenuOpen(true);
-    window.requestAnimationFrame(() => menuItemRefs.current[0]?.focus());
+    window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus());
   }
 
   function choose(decision: SupportedRequestDecision): void {
@@ -358,7 +354,8 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
       return;
     }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
-    const items = menuItemRefs.current.filter((item): item is HTMLButtonElement => Boolean(item));
+    /** 说明按钮与授权按钮共用键盘导航，避免焦点进入说明后跳错选项。 */
+    const items = Array.from(rootRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
     if (items.length === 0) return;
     event.preventDefault();
     const current = items.indexOf(document.activeElement as HTMLButtonElement);
@@ -561,6 +558,8 @@ function approvalPathParts(path: string): { directory: string; name: string } {
 }
 
 interface RequestUserInputActionsProps {
+  /** 资源导入期间不切题或关闭表单，正文输入保持可用。 */
+  resourcesProcessing?: boolean;
   language: SessionUiLanguage;
   questionIndex: number;
   questionCount: number;
@@ -582,11 +581,11 @@ function RequestUserInputActions(props: RequestUserInputActionsProps) {
   return (
     <div className="session-rui-inline-actions" role="group" aria-label={zh ? '询问操作' : 'Question actions'} style={props.style}>
       {props.questionIndex > 0 ? (
-        <button type="button" onClick={props.onPrevious}>
+        <button type="button" disabled={props.resourcesProcessing} onClick={props.onPrevious}>
           {zh ? '上一个' : 'Previous'}
         </button>
       ) : null}
-      <button type="button" onClick={props.onSkip}>
+      <button type="button" disabled={props.resourcesProcessing} onClick={props.onSkip}>
         {props.dismissLabel ?? (zh ? '跳过' : 'Skip')}
       </button>
       {props.showSubmit ? (
@@ -644,11 +643,8 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   /** 单选预设答案点击即提交；自由输入和多选仍保留提交按钮。 */
   const showSubmitAction = currentQuestion.kind !== 'single' || otherSelected;
 
-  useApplicationErrorDialog(resourceError, {
-    language: zh ? 'zh-CN' : 'en',
-  });
-
   const inputResources = useConversationInputResources({
+    attachments: currentAttachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef: attachmentTextareaRef,
     text: currentQuestion.kind === 'freeform' ? (selectedValues[0] ?? '') : currentOtherAnswer,
@@ -724,7 +720,7 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   }
 
   async function finish(nextAnswers = answers, nextOtherAnswers = otherAnswers, nextAttachments = answerAttachments): Promise<void> {
-    if (responding) return;
+    if (responding || inputResources.processing) return;
     setLocallyResponding(true);
     try {
       await (snoozePromiseRef.current ?? Promise.resolve());
@@ -740,6 +736,8 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   }
 
   function advance(nextAnswers = answers, nextOtherAnswers = otherAnswers, nextAttachments = answerAttachments): void {
+    // 导入期间不能切题，否则完成的附件可能被放到另一题。
+    if (inputResources.processing) return;
     if (questionIndex < props.questions.length - 1) setQuestionIndex((value) => value + 1);
     else if (areRequiredRequestAnswersComplete(props.questions, nextAnswers, nextOtherAnswers, nextAttachments)) void finish(nextAnswers, nextOtherAnswers, nextAttachments);
   }
@@ -854,7 +852,7 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   }
 
   async function skip(): Promise<void> {
-    if (responding) return;
+    if (responding || inputResources.processing) return;
     if (props.onDismiss) {
       props.onDismiss();
       return;
@@ -879,17 +877,19 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   function renderActions(style?: CSSProperties) {
     return (
       <RequestUserInputActions
+        resourcesProcessing={inputResources.processing}
         language={props.language}
         questionIndex={questionIndex}
         questionCount={props.questions.length}
         responding={responding}
-        currentComplete={currentComplete}
+        currentComplete={currentComplete && !inputResources.processing}
         allComplete={allComplete}
         showSubmit={showSubmitAction}
         submitLabel={props.submitLabel}
         dismissLabel={props.onDismiss ? (zh ? '稍后回答' : 'Answer later') : undefined}
         style={style}
         onPrevious={() => {
+          if (inputResources.processing) return;
           void snooze();
           setQuestionIndex((value) => Math.max(0, value - 1));
         }}
@@ -910,6 +910,11 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
         ) : null}
         {remainingMs !== null && !snoozedRef.current ? <small>{zh ? `${Math.max(0, Math.ceil(remainingMs / 1_000))} 秒后自动跳过` : `Auto-skip in ${Math.max(0, Math.ceil(remainingMs / 1_000))}s`}</small> : null}
       </p>
+      {props.error || resourceError ? (
+        <p className="session-request-invalid" role="alert">
+          <VisibleApplicationError error={props.error ?? resourceError} language={zh ? 'zh-CN' : 'en'} />
+        </p>
+      ) : null}
       <form
         className="session-question-panel session-rui-request"
         aria-busy={responding || undefined}
@@ -1036,6 +1041,7 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                     />
                     <ConversationComposerAttachments
                       attachments={currentAttachments}
+                      pendingResources={inputResources.pendingResources}
                       language={props.language}
                       disabled={responding || inputResources.processing}
                       className="session-question-answer-attachments"
@@ -1106,6 +1112,7 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                   />
                   <ConversationComposerAttachments
                     attachments={currentAttachments}
+                    pendingResources={inputResources.pendingResources}
                     language={props.language}
                     disabled={responding || inputResources.processing}
                     className="session-question-answer-attachments"

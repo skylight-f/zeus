@@ -13,6 +13,10 @@ import type {
 } from '../apps/desktop/src/renderer/session/sessionTypes.ts';
 import { orderTranscriptItemsWithQueue } from '../apps/desktop/src/renderer/session/conversationQueuePresentation.ts';
 import { mergeTranscriptItem } from '../apps/desktop/src/renderer/session/transcriptReconciliation.ts';
+
+import { composerQueuedSubmissions } from '../apps/desktop/src/renderer/session/conversationQueuePresentation.ts';
+import { createConversationQueueStateSelector } from '../apps/desktop/src/renderer/session/sessionStateSlices.ts';
+import { attachTaskModelPushChoice, projectTaskModelPushConversationChoices, type TaskModelPushPendingState } from '../apps/desktop/src/renderer/task/TaskModelPushPendingWorkspace.tsx';
 import type { TurnChangeSet } from '../packages/shared/src/conversationResources.ts';
 import type { ConversationTranscriptEnvelope } from '../packages/shared/src/conversationTranscriptWire.ts';
 
@@ -266,7 +270,7 @@ function createHarness(
 }
 
 /** 反复收到有界首屏时，已读正文和分页状态不得被反复清空。 */
-function verifyStableHydrationPages() {
+async function verifyStableHydrationPages() {
   /** 首屏省略更早的已读过程项。 */
   const fresh = adaptConversationSnapshotV2({ snapshot: snapshotV2, history: historyV2, queue, requests: [], planImplementationRequests: [], choice, goal });
   /** 模拟已读取的完整过程正文，与既有接口的条目结构一致。 */
@@ -299,7 +303,38 @@ function verifyStableHydrationPages() {
   /** 重连只释放已经失效的请求标记，保留已完成进度。 */
   const resumed = resumeCachedConversationSnapshot({ ...cached, v2Paging: { ...cached.v2Paging, processByTurn: { turn: { ...page, loading: true } } } });
   assert(resumed.v2Paging?.processByTurn.turn?.loading === false && resumed.v2Paging.processByTurn.turn.loaded, '重连不能保留旧请求的忙碌状态。');
-  return { refreshes: 20, stableItemIdentity: true, retainedPages: true };
+  /** 分页元数据走真实 reducer，但不能改动消息对象、顺序、轮次归属和内容修订。 */
+  for (const loading of [true, false]) {
+    /** 记录此次分页状态变化之前的所有结构引用。 */
+    const before = state;
+    state = sessionReducer(state, { type: 'snapshot_v2_page_merged', snapshot: { ...state.snapshot!, v2Paging: { ...state.snapshot!.v2Paging!, processByTurn: { turn: { ...page, loading, error: loading ? null : '读取失败' } } } } });
+    assert(state.items === before.items && state.itemOrder === before.itemOrder && state.turnsByProviderId === before.turnsByProviderId && state.transcriptRevision === before.transcriptRevision, '加载或失败状态不得重新构造已确认消息。');
+  }
+  /** 已加载末页仍有更早内容；完成态从头阅读请求不能覆盖这个连续范围。 */
+  const partial = { ...cached, v2Paging: { ...cached.v2Paging, processByTurn: { turn: { ...page, direction: 'tail' as const, nextCursor: 'earlier-process', hasMore: true } } } };
+  /** 控制器使用隔离状态，不连接真实 Provider 或读取正式用户数据。 */
+  const harness = createHarness(undefined, 0, false, [], null, undefined, undefined, createHydratedSessionState(partial));
+  /** 真实控制器的请求参数决定是否保留方向与游标。 */
+  const requests: Array<{ cursor?: string; direction?: string }> = [];
+  harness.client.loadNativeConversationProcessV2 = async (_project, _conversation, _turn, options) => {
+    requests.push(options ?? {});
+    if (requests.length === 1) throw new Error('隔离探针模拟首次补页失败');
+    return { ...historyV2, kind: 'process', items: [] };
+  };
+  try {
+    /** 失败不丢弃之前可见的过程，再次读取仍使用同一游标。 */
+    await harness.controller.loadTurnProcess('turn', true).catch(() => undefined);
+    assert(
+      harness.controller.getState().snapshot?.items.some((entry) => entry.id === item.id),
+      '补页失败不能删除已加载过程。',
+    );
+    await harness.controller.loadTurnProcess('turn', true);
+    await harness.controller.loadTurnProcess('turn', true);
+    assert(requests.length === 2 && requests.every((request) => request.direction === 'tail' && request.cursor === 'earlier-process'), '完成态展开与重试必须延续末页游标，完成后再次读取不得发请求。');
+  } finally {
+    harness.controller.dispose();
+  }
+  return { refreshes: 20, stableItemIdentity: true, retainedPages: true, metadataPreservesStructure: true, continuedTailRequests: requests.length };
 }
 
 /** 用户重试只在核对未送达后重发，重复点击共用一次操作。 */
@@ -327,12 +362,9 @@ async function verifyQueuedRetryReconciliation() {
     assert(harness.connectedAfterSequences.length === 1, '空闲会话重试后必须恢复实时连接，接收正文和后续进展。');
     assert(!Object.values(harness.controller.getState().items).some((item) => item.payload.submissionId === submission.id), '替换成功后不得遗留旧失败气泡。');
     recovered = { ...queue, submissions: [{ ...submission, status: 'paused', pausedReason: 'outcome_unknown' }] };
-    /** 仍未知必须保留错误，不得调用重试接口。 */
-    const unknown = await harness.controller.retryQueuedSubmission(submission.id).then(
-      () => null,
-      (error: Error) => error,
-    );
-    assert(unknown?.message.includes('ZEUS_NATIVE_SUBMISSION_OUTCOME_UNKNOWN') === true && retries === 1, '未知结果不得再次发送。');
+    /** 核对仍未知时返回原权威队列，不得调用重试接口或移除暂停状态。 */
+    const unknown = await harness.controller.retryQueuedSubmission(submission.id);
+    assert(unknown.submissions[0]?.pausedReason === 'outcome_unknown' && retries === 1, '未知结果必须保留原暂停队列，不得再次发送。');
     recovered = { ...queue, submissions: [{ ...submission, providerTurnId: 'accepted-turn' }] };
     /** 已送达分支仍须独立补齐权威正文。 */
     const readsBeforeAccepted = harness.snapshotReads();
@@ -661,20 +693,22 @@ function verifyRestoredSubmissionOrder() {
         steered.queue,
       )
         .map((item) => item.text)
-        .join('|') === '回复 1|第一次引导|回复 3|回复 5',
-      '迟到的引导接纳必须插回对应回复之前。',
+        .join('|') === '回复 1|回复 3|回复 5|第一次引导',
+      '尚无持久位置的引导不得按时间猜测插入权威正文。',
     );
     for (const action of [
       { type: 'queue_hydrated' as const, queue: lateQueue },
       { type: 'event_received' as const, event: conversationEvent(1, 'conversation.queue.changed', { queue: lateQueue }) },
     ]) {
-      /** 不允许依赖切换会话或完整快照的重新排序。 */
-      const live = sessionReducer(repliesOnly, action);
+      /** 队列不再生成正文副本；后续持久输入按服务端位置接管。 */
+      const queuedState = sessionReducer(repliesOnly, action);
+      assert(queuedState.itemOrder.map((key) => queuedState.items[key]!.text).join('|') === '回复 1|回复 3|回复 5', '队列接管不得推断或复制已接纳的正文。');
+      const live = sessionReducer(queuedState, { type: 'snapshot_hydrated', snapshot: { ...snapshot, queue: lateQueue } });
       const ordered = orderTranscriptItemsWithQueue(
         live.itemOrder.map((key) => live.items[key]!),
         live.queue,
       );
-      assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5|待发消息', '实时补回的首发和引导必须立即归位，不能等待切换会话。');
+      assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5', '持久输入补回后首发与引导必须按权威位置归位，待发消息留在输入框队列。');
       /** 内容增量更新不能用更新时间把回复挪到后续输入之后。 */
       const updated = ordered.map((item) => (item.text === '回复 1' ? { ...item, updatedAt: at(30) } : item));
       assert(
@@ -696,14 +730,14 @@ function verifyRestoredSubmissionOrder() {
       state.itemOrder.map((key) => state.items[key]!),
       state.queue,
     );
-    assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5|待发消息', '切回会话后，任务首发和多次引导必须留在对应回复之前。');
+    assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5', '切回会话后，任务首发和多次引导必须留在对应回复之前。');
     for (const status of ['completed', 'resolved']) {
       /** 终态已确认但原生身份仍未补齐的分页合并结果也不能进入队尾。 */
       const terminal = ordered.map((item) => (item.clientUserMessageId === submissions[0]!.clientUserMessageId ? { ...item, status } : item));
       assert(orderTranscriptItemsWithQueue(terminal, state.queue)[0]?.text === '任务推送提示词', '终态消息不能因保留乐观标记被误当成待发送消息。');
     }
   }
-  return { coldAndWarmRestoration: true, lateHttpAndRealtimeSubmissions: true, stableDeltaOrder: true, steeringMessages: 2, queuedMessages: 1, acceptedWithoutNativeEcho: true };
+  return { coldAndWarmRestoration: true, authoritativeInputRestoration: true, queueDoesNotCopyTranscript: true, stableDeltaOrder: true, steeringMessages: 2, queuedMessages: 1, acceptedWithoutNativeEcho: true };
 }
 
 function verifyInternalPayloadsStayOutOfTranscript() {
@@ -1125,6 +1159,46 @@ async function verifyIdleTransitionReleasesSubscription() {
   return { socketClosed: 1, connections: harness.connectedAfterSequences.length, transportState: 'ready' };
 }
 
+/** 验证 Provider 断流核对期间保留实时订阅，并向会话状态投影五次计数。 */
+async function verifyProviderStreamRecoveryStatus() {
+  /** 活跃探针先建立实时订阅，再模拟轮次失败后的只读恢复事件。 */
+  const harness = createHarness();
+  await harness.controller.start();
+  harness.emit(
+    conversationEvent(1, 'conversation.transport.changed', {
+      providerThreadId: threadId,
+      providerTurnId: 'stream-failed-turn',
+      providerState: 'failed',
+      recoveryState: 'reconnecting',
+      reconnectAttempt: 1,
+      reconnectAttempts: 5,
+    }),
+  );
+  /** 恢复计数必须进入生产状态，并使用会话时间线的重连展示。 */
+  const recovering = harness.controller.getState();
+  assert(recovering.providerReconnectAttempt === 1 && recovering.providerReconnectAttempts === 5, 'Provider stream recovery must expose the current attempt and five-attempt limit.');
+  assert(recovering.providerReconnectTurnId === 'stream-failed-turn', 'Provider stream recovery must bind the failed turn for transcript presentation.');
+  harness.emit(conversationEvent(2, 'conversation.queue.changed', { queue }));
+  /** 空队列不能在后台核对结束前关闭事件流。 */
+  assert(harness.sockets[0]?.closeCount === 0, 'Provider stream recovery must keep realtime synchronization subscribed.');
+  harness.emit(
+    conversationEvent(3, 'conversation.transport.changed', {
+      providerThreadId: threadId,
+      providerTurnId: 'stream-failed-turn',
+      providerState: 'idle',
+      recoveryState: 'idle',
+      reconnectAttempt: 0,
+      reconnectAttempts: 5,
+    }),
+  );
+  await waitUntil(() => harness.sockets[0]?.closeCount === 1, 'provider stream recovery realtime release');
+  /** 恢复完成后计数归零，空闲会话可释放实时订阅。 */
+  const recovered = harness.controller.getState();
+  assert(recovered.providerReconnectAttempt === 0 && recovered.providerReconnectTurnId === null, 'Provider stream recovery completion must clear transient retry state.');
+  harness.controller.dispose();
+  return { attempt: 1, attempts: 5, subscribedDuringRecovery: true, releasedAfterRecovery: true };
+}
+
 function conversationEvent(sequence: number, type: string, fields: Record<string, unknown> = {}): NativeRealtimeEventEnvelope {
   return {
     id: `event-${sequence}`,
@@ -1480,6 +1554,137 @@ async function verifyTranscriptInitializationRecovery() {
   return { normalReads: reads, choices, queueReads, cancelledReads, failedReads, disposedReads, budgetReads, budgetCancelled: aborted };
 }
 
+/** 复核活跃轮次后的普通发送从首帧开始只进入输入框排队区。 */
+async function verifyActiveTurnQueueProjection() {
+  /** 活跃队列代表当前回复仍在生成，新消息必须等待本轮结束。 */
+  const activeQueue: NativeQueueSnapshot = { state: { type: 'active', turnId: 'active-turn', phase: 'prework' }, waitReason: 'current_turn', submissions: [] };
+  /** 最小活跃会话只保留本次投影需要的身份和队列事实。 */
+  const activeState: NativeSessionState = {
+    ...createInitialSessionState(),
+    projectId,
+    conversationId,
+    providerThreadId: threadId,
+    conversationState: 'active_prework',
+    queue: activeQueue,
+  };
+  /** 本地发送动作必须在 HTTP 回执前建立排队卡片。 */
+  const pendingState = sessionReducer(activeState, {
+    type: 'send_started',
+    clientUserMessageId: 'queued-client-message',
+    durableClientUserMessageId: 'queued-client-message',
+    draft: '排队补充消息',
+    attachments: [],
+    submittedAttachments: [],
+    browserSubmission: null,
+    contextDraft: { responseAnnotations: [], codeComments: [] },
+    browserComments: [],
+    delivery: 'queue',
+    previousConversationState: 'active_prework',
+    startedAt: occurredAt,
+  });
+  /** 本地卡片是唯一首帧投影，且权威身份到达前不可操作。 */
+  const pendingCards = composerQueuedSubmissions(pendingState);
+  assert(pendingCards.length === 1 && pendingCards[0]?.clientUserMessageId === 'queued-client-message' && pendingCards[0]?.localOnly, '活跃轮次后的本地消息必须立即进入不可操作的排队卡片。');
+  /** 组件真实使用的独立状态切片也必须保留本地消息，不能等服务端队列回执。 */
+  const pendingQueueSlice = createConversationQueueStateSelector()(pendingState);
+  /** 选择器投影后的首帧仍应立即得到同一张本地排队卡片。 */
+  const pendingSliceCards = composerQueuedSubmissions(pendingQueueSlice);
+  assert(pendingSliceCards.length === 1 && pendingSliceCards[0]?.clientUserMessageId === 'queued-client-message' && pendingSliceCards[0]?.localOnly, '排队区状态切片必须保留首帧本地卡片。');
+  /** 时间线过滤使用同一客户端身份，不允许先渲染成会话气泡。 */
+  const pendingItem = pendingState.items[pendingState.itemOrder.at(-1)!]!;
+  assert(
+    pendingCards.some((submission) => submission.clientUserMessageId === pendingItem.clientUserMessageId),
+    '排队卡片必须接管同一条 optimistic 消息身份。',
+  );
+  /** 权威队列回显应原位替换本地卡片，并开放既有队列操作。 */
+  const durableState = sessionReducer(pendingState, {
+    type: 'queue_hydrated',
+    queue: {
+      ...activeQueue,
+      submissions: [
+        {
+          id: 'queued-submission',
+          conversationId,
+          clientUserMessageId: 'queued-client-message',
+          content: '排队补充消息',
+          composerDraft: '排队补充消息',
+          status: 'queued',
+          delivery: 'queue',
+          position: 1,
+          providerTurnId: null,
+          pausedReason: null,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        },
+      ],
+    },
+  });
+  /** 去重后仍只保留一个权威卡片。 */
+  const durableCards = composerQueuedSubmissions(durableState);
+  assert(durableCards.length === 1 && durableCards[0]?.id === 'queued-submission' && !durableCards[0]?.localOnly, '权威队列必须无闪烁替换本地卡片。');
+  /** 纯附件发送最容易发生在首轮仍处于 starting_turn 的接纳窗口。 */
+  const attachment = { name: '排队附件.png', mime: 'image/png', size: 2048, kind: 'image' as const, localPath: '/tmp/排队附件.png' };
+  /** 即使正文为空，附件也必须在首帧由排队卡片接管。 */
+  const attachmentOnlyState = sessionReducer(
+    { ...activeState, conversationState: 'starting_turn', queue: { state: { type: 'idle' }, submissions: [] } },
+    {
+      type: 'send_started',
+      clientUserMessageId: 'queued-attachment-only',
+      durableClientUserMessageId: 'queued-attachment-only',
+      draft: '',
+      attachments: [attachment],
+      submittedAttachments: [attachment],
+      browserSubmission: null,
+      contextDraft: { responseAnnotations: [], codeComments: [] },
+      browserComments: [],
+      delivery: 'queue',
+      previousConversationState: 'starting_turn',
+      startedAt: occurredAt,
+    },
+  );
+  /** 排队卡片保留附件且不制造伪正文，避免退化成会话中的引导气泡。 */
+  const attachmentOnlyCards = composerQueuedSubmissions(attachmentOnlyState);
+  assert(
+    attachmentOnlyCards.length === 1 && attachmentOnlyCards[0]?.content === '' && attachmentOnlyCards[0]?.attachments?.[0]?.name === attachment.name && attachmentOnlyCards[0]?.localOnly,
+    'starting_turn 中的纯附件消息必须直接进入排队卡片。',
+  );
+  /** 真实控制器入口同时验证纯附件不会被补成“回答批注”伪正文。 */
+  const attachmentHarness = createHarness(undefined, 0, true);
+  try {
+    await attachmentHarness.controller.start();
+    attachmentHarness.controller.setAttachments([attachment]);
+    await attachmentHarness.controller.send('queue');
+    /** 服务端请求保留空正文和附件，并且不发送虚构 displayText。 */
+    const attachmentRequest = attachmentHarness.sentMessages[0];
+    assert(
+      attachmentHarness.sendCalls() === 1 && attachmentRequest?.content === '' && attachmentRequest.displayText === undefined && Array.isArray(attachmentRequest.attachments) && attachmentRequest.attachments.length === 1,
+      '纯附件请求不得携带伪造的回答批注正文。',
+    );
+  } finally {
+    attachmentHarness.controller.dispose();
+  }
+  /** 空闲会话的首条消息仍属于正式时间线，不能被本次规则误收进排队区。 */
+  const firstTurnState = sessionReducer(
+    { ...activeState, conversationState: 'native_idle', queue: { state: { type: 'idle' }, submissions: [] } },
+    {
+      type: 'send_started',
+      clientUserMessageId: 'first-turn-message',
+      durableClientUserMessageId: 'first-turn-message',
+      draft: '首轮消息',
+      attachments: [],
+      submittedAttachments: [],
+      browserSubmission: null,
+      contextDraft: { responseAnnotations: [], codeComments: [] },
+      browserComments: [],
+      delivery: 'queue',
+      previousConversationState: 'native_idle',
+      startedAt: occurredAt,
+    },
+  );
+  assert(composerQueuedSubmissions(firstTurnState).length === 0, '空闲会话首条消息不得进入输入框排队区。');
+  return { pendingCardImmediate: true, queueSliceImmediate: true, transcriptIdentityClaimed: true, durableReplacement: true, attachmentOnlyStartingTurnQueued: true, attachmentOnlyRequestTextPreserved: true, firstTurnPreserved: true };
+}
+
 /** 复核首条任务提示词在实时、队列和局部历史之间保持同一位置，旧缺位输入能一次恢复。 */
 async function verifyTaskPushPlacement() {
   /** 使用正式快照适配器建立与控制器缓存一致的空会话。 */
@@ -1511,6 +1716,42 @@ async function verifyTaskPushPlacement() {
     updatedAt: occurredAt,
     transcript: transcript('reply', 2048),
   };
+  /** 创建期工作面使用正式发送状态机建立首条任务卡。 */
+  const pendingSession = sessionReducer(
+    { ...createInitialSessionState(), projectId, conversationId, providerThreadId: threadId, conversationState: 'active_prework' },
+    {
+      type: 'send_started',
+      clientUserMessageId: 'task-first',
+      durableClientUserMessageId: 'task-first',
+      draft: '首条任务提示词',
+      attachments: [],
+      submittedAttachments: [],
+      browserSubmission: null,
+      contextDraft: { responseAnnotations: [], codeComments: [] },
+      browserComments: [],
+      delivery: 'queue',
+      previousConversationState: 'active_prework',
+      startedAt: occurredAt,
+      taskPushLayout: { kind: 'task_push', blocks: [], supplementalInfo: '', supplementalAttachments: [] },
+    },
+  );
+  /** 任务推送是新会话首条消息，即使创建期工作面可交互，也不能被普通后续排队投影接管。 */
+  const pendingOpening = pendingSession.items[pendingSession.itemOrder[0]!]!;
+  assert(pendingOpening.payload.queuedForActiveTurn !== true && composerQueuedSubmissions(pendingSession).length === 0, '创建期首条任务提示词必须直接留在会话正文。');
+  /** 任务推送状态只读取这些真实交接字段，其余内容不参与本次位置断言。 */
+  const pendingTaskPush = {
+    navigationId: 'task-push:probe',
+    choice: { ...choice, id: 'task-push:probe', navigationId: 'task-push:probe', providerThreadId: null },
+    request: { clientUserMessageId: 'task-first' },
+    session: pendingSession,
+    status: 'submitting',
+  } as unknown as TaskModelPushPendingState;
+  /** 真实身份绑定已经代表首条消息耐久接纳，无需等待后续队列排空。 */
+  const attachedTaskPush = attachTaskModelPushChoice(pendingTaskPush, choice);
+  /** 接管后的首条消息用于同时核对发送状态与可见顺序。 */
+  const attachedOpening = attachedTaskPush.session.items[attachedTaskPush.session.itemOrder[0]!]!;
+  assert(attachedOpening.status === 'active' && attachedOpening.optimistic === true, '真实会话接管必须确认首条任务消息，同时保留 Provider 回显核对。');
+  assert(orderTranscriptItemsWithQueue([attachedOpening, reply], null)[0] === attachedOpening, '已接纳任务提示词不能再被队列展示规则移到回复之后。');
   /** 先接收正式用户回显，再补入只包含回复的历史页。 */
   let state = sessionReducer(createHydratedSessionState(snapshot), { type: 'event_received', event: userEvent as NativeConversationEvent });
   state = sessionReducer(state, { type: 'snapshot_v2_page_merged', snapshot: { ...snapshot, items: [reply] } });
@@ -1596,6 +1837,7 @@ async function verifyTaskPushPlacement() {
     /** 没有正式位置的后续事件必须进入恢复，不能再污染消息列表。 */
     recovered.emit(conversationEvent(1, 'conversation.item.started', { turnId: 'turn', itemId: 'missing-position', itemType: 'agentMessage', textContent: '不得投影' }));
     assert(!Object.values(recovered.controller.getState().items).some((item) => item.itemId === 'missing-position'), '缺少位置的实时消息不得进入列表。');
+    return { taskPromptFirst: true, acceptedHandoffPreserved: true, queuePreserved: true, steeringPreserved: true, removalPreserved: true, coldOpenPreserved: true, recoveredInputReads: reads, missingLivePositionRejected: true };
   } finally {
     recovered.controller.dispose();
   }
@@ -2040,6 +2282,147 @@ async function verifySessionDefectRecovery() {
   };
 }
 
+/** 异步答案从实时消息交接到缺少客户端身份的历史预览时，只保留一条正式输入。 */
+function verifyAnsweredInputHandoff() {
+  /** 复用正式首屏适配器与既有会话样本。 */
+  const snapshot = adaptConversationSnapshotV2({ snapshot: snapshotV2, history: historyV2, queue, requests: [], planImplementationRequests: [], choice, goal });
+  /** 原轮次结束后作为新消息发送的回答，仍携带完整原题。 */
+  const questionAnswer = {
+    providerTurnId: 'question-turn',
+    providerItemId: 'question-provider',
+    asNewMessage: true,
+    questions: [{ id: 'question_1', header: '存储配置', question: '请提供客服媒体存储配置。', isOther: false, isSecret: false, options: null }],
+    answers: { question_1: { answers: ['已提供存储配置'] } },
+  };
+  /** 答案附件与同一条消息一起保留。 */
+  const attachments = [{ name: '配置说明.txt', mime: 'text/plain', size: 4, localPath: '/tmp/answer-config.txt' }];
+  /** 实时开始事件先使用 Provider 显示身份。 */
+  const started = conversationEvent(1, 'conversation.item.started', {
+    turnId: 'turn',
+    itemId: 'answer-provider',
+    itemType: 'userMessage',
+    status: 'in_progress',
+    textContent: '已提供存储配置',
+    itemPayload: { clientId: 'answer-client', questionAnswer, attachments },
+    transcript: transcript('provider-answer-preview', 2048, 'answer-provider'),
+  });
+  /** 实时完成事件切换为用户消息的正式显示身份。 */
+  const completed = conversationEvent(2, 'conversation.item.completed', {
+    ...started.payload,
+    status: 'completed',
+    transcript: transcript('user-message:answer-client', 1024, 'answer-provider'),
+  });
+  /** 历史模型正文保留完整回答与客户端身份。 */
+  const canonical = {
+    id: 'user-message:answer-client',
+    providerItemId: 'answer-provider',
+    turnId: 'turn',
+    type: 'userMessage',
+    status: 'completed',
+    phase: 'prework',
+    text: '已提供存储配置',
+    payload: { clientId: 'answer-client', questionAnswer, attachments },
+    resources: [],
+    updatedAt: occurredAt,
+    transcript: transcript('user-message:answer-client', 1024, 'answer-provider'),
+  };
+  /** 活动预览缺少客户端身份，但保留同一 Provider 消息身份。 */
+  const preview = { ...canonical, id: 'provider-answer-preview', payload: { questionAnswer }, transcript: started.payload.transcript! };
+  for (const items of [
+    [canonical, preview],
+    [preview, canonical],
+  ]) {
+    /** 两种到达顺序都经过实时、水合与分页的正式归约入口。 */
+    let state = sessionReducer(createHydratedSessionState(snapshot), { type: 'event_received', event: started as NativeConversationEvent });
+    state = sessionReducer(state, { type: 'event_received', event: completed as NativeConversationEvent });
+    state = sessionReducer(state, { type: 'snapshot_hydrated', snapshot: { ...snapshot, items } });
+    state = sessionReducer(state, { type: 'snapshot_v2_page_merged', snapshot: { ...snapshot, items } });
+    assert(state.itemOrder.length === 1 && Object.keys(state.items).length === 1, '同一答案的实时消息与历史预览只能占一个正文位置。');
+    assert(state.items[state.itemOrder[0]!]!.payload.questionAnswer === questionAnswer && (state.items[state.itemOrder[0]!]!.payload.attachments as unknown[]).length === 1, '交接必须保留原题、回答及附件。');
+  }
+  /** 相同正文的独立输入拥有不同持久身份，必须继续保留。 */
+  const independent = {
+    ...canonical,
+    id: 'user-message:second-client',
+    providerItemId: 'second-provider',
+    payload: { ...canonical.payload, clientId: 'second-client' },
+    transcript: transcript('user-message:second-client', 3072, 'second-provider'),
+  };
+  /** 冷开读取正式身份，不能按答案文字合并真实的独立输入。 */
+  const cold = createHydratedSessionState({ ...snapshot, items: [canonical, independent] });
+  assert(cold.itemOrder.length === 2, '相同正文的两次独立输入必须保留两个正文位置。');
+  /** Provider 条目编号在别的轮次复用时，不得借用上一轮的客户端身份。 */
+  const otherTurn = { ...preview, id: 'other-turn-input', turnId: 'other-turn', transcript: transcript('other-turn-input', 4096, 'answer-provider', 'other-turn') };
+  /** 当前轮次身份也必须参与正式水合交接。 */
+  const separateTurns = sessionReducer(createHydratedSessionState({ ...snapshot, items: [canonical] }), { type: 'snapshot_hydrated', snapshot: { ...snapshot, items: [canonical, otherTurn] } });
+  assert(separateTurns.itemOrder.length === 2, '不同轮次复用 Provider 编号不能合并两条输入。');
+  return { singleAnswerPosition: true, bothArrivalOrders: true, answerAttachmentsPreserved: true, independentInputsPreserved: true };
+}
+
+/** 重放临时入口进入目录后，真实会话接管同一导航身份的场景。 */
+function verifyTaskPushChoiceHandoff() {
+  /** 同一次创建的正式会话元数据。 */
+  const canonical = { ...choice, taskId: 'choice-handoff-task', creationOperationIdentity: 'choice-handoff-operation' };
+  /** 创建期入口只有导航身份，不能作为正式读取目标。 */
+  const temporary = { ...canonical, id: 'task-push:choice-handoff', navigationId: 'task-push:choice-handoff', providerThreadId: null, creationOperationIdentity: null };
+  /** 创建已接纳，目录可能仍夹带早先选中时写入的临时入口。 */
+  const pending = {
+    task: { id: canonical.taskId, projectId },
+    navigationId: temporary.id,
+    choice: { ...canonical, navigationId: temporary.id },
+    operationIdentity: canonical.creationOperationIdentity,
+    status: 'accepted',
+  } as unknown as TaskModelPushPendingState;
+  /** 同名但不同创建操作的历史必须保留。 */
+  const sibling = { ...canonical, id: 'choice-handoff-sibling', creationOperationIdentity: 'another-operation' };
+  for (const directory of [
+    [temporary, canonical, sibling],
+    [canonical, temporary, sibling],
+    [temporary, sibling],
+  ]) {
+    /** 正式工作区使用的共享投影结果。 */
+    const projected = projectTaskModelPushConversationChoices(pending, directory);
+    /** 复现工作区按稳定导航身份构建目录的实际合并边界。 */
+    const navigation = new Map(projected.map((item) => [item.navigationId ?? item.id, item]));
+    assert(projected.length === 2 && navigation.get(temporary.id)?.id === canonical.id, '真实会话必须接管导航入口，临时目录项不得把读取目标改回不存在的编号。');
+    assert(
+      projected.some((item) => item.id === sibling.id),
+      '同名历史会话不能被本次创建吞并。',
+    );
+  }
+  /** 接纳前，即使目录先返回正式会话，也继续显示原创建工作面。 */
+  const creating = projectTaskModelPushConversationChoices({ ...pending, choice: temporary, status: 'submitting' }, [canonical, temporary, sibling]);
+  assert(creating.length === 2 && creating[0]?.id === temporary.id, '目录先到不能绕过创建接纳流程。');
+  /** 相同身份在其他项目或任务内不能被本次推送合并。 */
+  const foreign = { ...temporary, projectId: 'another-project', taskId: 'another-task' };
+  assert(projectTaskModelPushConversationChoices(pending, [canonical, foreign]).includes(foreign), '推送入口合并必须遵守项目和任务边界。');
+  return { arrivalOrders: 3, canonicalConversationId: canonical.id, retainedHistory: sibling.id };
+}
+
+/** 创建身份专项复用现有探针，不引入新的验证体系。 */
+if (process.argv.includes('--task-push-choice-handoff-only')) {
+  console.log(JSON.stringify({ taskPushChoiceHandoff: verifyTaskPushChoiceHandoff() }));
+  process.exit(0);
+}
+
+/** 答案交接专项复用现有探针，不引入额外运行入口或依赖。 */
+if (process.argv.includes('--answered-input-handoff-only')) {
+  console.log(JSON.stringify({ answeredInputHandoff: verifyAnsweredInputHandoff() }));
+  process.exit(0);
+}
+
+/** 排队首帧专项只运行本地投影与权威接管检查。 */
+/** 结构专项直接运行分页控制器与 reducer，不受无关队列探针前置条件影响。 */
+if (process.argv.includes('--process-structure-only')) {
+  console.log(JSON.stringify({ processStructure: await verifyStableHydrationPages(), terminalPreservation: verifyProcessPageDoesNotDowngradeLiveTerminalState() }));
+  process.exit(0);
+}
+
+if (process.argv.includes('--active-queue-projection-only')) {
+  console.log(JSON.stringify({ activeTurnQueueProjection: await verifyActiveTurnQueueProjection() }));
+  process.exit(0);
+}
+
 /** 专项入口复用现有脚本，避免与历史待发送重放断言混淆。 */
 if (process.argv.includes('--task-push-placement-only')) {
   console.log(JSON.stringify({ taskPushPlacement: await verifyTaskPushPlacement(), placementTakeover: await verifyPlacementEpochTakeover() }));
@@ -2057,6 +2440,12 @@ if (process.argv.includes('--session-defects-only')) {
   process.exit(0);
 }
 
+/** 回复流恢复专项仅运行本次状态与订阅检查，避开无关历史队列场景。 */
+if (process.argv.includes('--provider-stream-recovery-only')) {
+  console.log(JSON.stringify({ providerStreamRecoveryStatus: await verifyProviderStreamRecoveryStatus() }));
+  process.exit(0);
+}
+
 const placementTakeover = await verifyPlacementEpochTakeover();
 console.log(JSON.stringify({ placementTakeover }));
 
@@ -2064,7 +2453,7 @@ const turnChangeReview = await verifyTurnChangeReviewHydration();
 /** 重试专项可单独核验，不受其他既有投影断言影响。 */
 const queuedRetryReconciliation = await verifyQueuedRetryReconciliation();
 /** 补读与答题刷新共用同一稳定性核验。 */
-const stableHydrationPages = verifyStableHydrationPages();
+const stableHydrationPages = await verifyStableHydrationPages();
 /** 会话恢复专项同时核对已接纳消息与待发队列的边界。 */
 const restoredSubmissionOrder = verifyRestoredSubmissionOrder();
 /** 默认仍执行既有全量入口；专项参数只缩小本地验收范围。 */
@@ -2075,8 +2464,10 @@ const result =
       ? { turnChangeReview }
       : {
           turnChangeReview,
+          stableHydrationPages,
           budget: sessionRealtimeBufferBudget,
           restoredSubmissionOrder,
+          answeredInputHandoff: verifyAnsweredInputHandoff(),
           truncatedTaskPushIdentity: verifyTruncatedTaskPushIdentityCoalescing(),
           internalPayloadVisibility: verifyInternalPayloadsStayOutOfTranscript(),
           processPageTerminalPreservation: verifyProcessPageDoesNotDowngradeLiveTerminalState(),
@@ -2089,6 +2480,7 @@ const result =
           queuedRetryReconciliation,
           activeSnapshotWatermarkSubscription: await verifyActiveSnapshotWatermarkSubscription(),
           idleTransitionReleasesSubscription: await verifyIdleTransitionReleasesSubscription(),
+          providerStreamRecoveryStatus: await verifyProviderStreamRecoveryStatus(),
           renderDeltaOverflow: await verifyRenderDeltaOverflow(),
           syncGapByteOverflow: await verifyGapByteOverflow(),
           contiguousGapReplay: await verifyContiguousGapReplay(),

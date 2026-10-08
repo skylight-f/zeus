@@ -19,6 +19,8 @@ interface CreateAutomaticUpdateSchedulerOptions {
   controller: HomebrewUpdateController;
   onIndicatorChange: (state: HomebrewUpdateIndicatorState) => void;
   notifyReady: (latestVersion: string, showProgress: () => void) => boolean;
+  /** 与 Zeus 检测共用到期触发，只检查配套程序，不授权安装。 */
+  checkCompanionUpdate?: () => Promise<void>;
 }
 
 interface PersistedAutomaticUpdateState {
@@ -80,7 +82,11 @@ export function createAutomaticUpdateScheduler(options: CreateAutomaticUpdateSch
     }
     checking = true;
     try {
-      const loaded = await options.controller.checkAutomatically({ blockedPrepareVersion: persisted.blockedPrepareVersion });
+      /** 两类更新从同一个到期点开始，任一失败都不阻断另一类。 */
+      const [zeusResult, companionResult] = await Promise.allSettled([options.controller.checkAutomatically({ blockedPrepareVersion: persisted.blockedPrepareVersion }), options.checkCompanionUpdate?.()]);
+      const loaded = zeusResult.status === 'fulfilled' ? zeusResult.value : false;
+      if (zeusResult.status === 'rejected') console.warn('Zeus 自动更新检测失败。', zeusResult.reason);
+      if (companionResult.status === 'rejected') console.warn('Codex 后台更新检查失败。', companionResult.reason);
       if (!loaded && !stopped) scheduleAt(Date.now() + (options.failedCheckRetryMs ?? defaultFailedCheckRetryMs));
     } finally {
       checking = false;

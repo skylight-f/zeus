@@ -3,7 +3,7 @@ import { SettingsSaveStatus } from './useSettingsAutosave.js';
 import { useEffect, useState, type ReactNode } from 'react';
 import type { ZeusBrowserSettings, ZeusComputerSettings, ZeusRetiredNativeRuntimeState } from '@zeus/shared';
 import { Button } from '../ui/Button.js';
-import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 
 interface BrowserSettingsPaneProps {
   language: 'zh-CN' | 'en-US';
@@ -16,7 +16,7 @@ const copy = {
     unavailable: '此处无法使用内置浏览器设置。',
     loading: '正在读取浏览器设置…',
     enabled: '启用内置浏览器',
-    enabledHelp: '在对话中打开和批注网页，AI 可直接访问网站和操作页面，无需逐次确认。',
+    enabledHelp: '在对话中打开网页并添加评论，AI 可直接访问网站和操作页面，无需逐次确认。',
     webLinks: '普通网页默认打开方式',
     webLinksHelp: '选择点击对话中的网页链接或网站卡片时使用的浏览器。',
     localWeb: '本地网页默认打开方式',
@@ -27,8 +27,8 @@ const copy = {
     externalBrowser: '系统默认浏览器',
     zeusPreview: 'Zeus 预览',
     systemDefault: '系统默认应用',
-    screenshots: '批注截图',
-    screenshotsHelp: '“始终”会为每条批注附图；“必要时”只为区域或 Adjust 变更附图。',
+    screenshots: '评论截图',
+    screenshotsHelp: '“始终”会为每条评论附图；“必要时”只为区域或 Adjust 变更附图。',
     always: '始终',
     necessary: '必要时',
     downloads: '下载目录',
@@ -40,22 +40,25 @@ const copy = {
     // 单个开关保存不能暗示页面中的其他草稿也已保存。
     switchSaved: '开关设置已保存。',
     clear: '清除浏览器数据',
-    clearHelp: '清除 Cookie、缓存、站点存储、站点授权和页面批注，并把现有标签重置为空白页。',
+    clearHelp: '清除 Cookie、缓存、站点存储、站点授权和页面评论，并把现有标签重置为空白页。',
     cleared: '浏览器数据已清除。',
-    clearConfirm: '将清除独立浏览器 Profile 中的登录态、站点数据、授权和批注。此操作不可撤销，确定继续吗？',
+    clearConfirm: '将清除独立浏览器 Profile 中的登录态、站点数据、授权和评论。此操作不可撤销，确定继续吗？',
     computerTitle: 'Computer Use',
     // 全局启用后会话即可按需使用，无需逐条消息选择。
-    computerHelp: '在此启用并完成 macOS 辅助功能和录屏授权后，AI 可在会话中操作其他应用，使用过程中无需再次授权。权限失效时，请回到此处补齐；可随时关闭或停止控制。',
+    computerHelp: '通过内置 CUA Driver 操作已明确观察的应用窗口。Zeus 只使用后台投递，不会自动切到前台；应用不支持后台操作时会直接失败。首次授权后请重新启动 Zeus。',
     computerEnable: '启用 Computer Use',
     computerStop: '立即停止控制',
     computerAccessibility: '辅助功能',
     computerScreenCapture: '屏幕与系统音频录制',
     computerGranted: '已授权',
     computerMissing: '待授权',
+    // 未完成探针时不引导用户反复授权。
+    computerUnchecked: '尚未检查',
+    computerUnavailable: '无法检查（组件错误）',
     computerRequestPermissions: '申请或重新检查权限',
     computerOpenAccessibility: '打开辅助功能设置',
     computerOpenScreenCapture: '打开录屏设置',
-    computerSettingsOpened: '已打开对应的 macOS 隐私设置；授权后请重新检查权限。',
+    computerSettingsOpened: '已打开对应的 macOS 隐私设置；授权后请重新启动 Zeus。',
     chromeEnable: '连接 Chrome 测试扩展',
     chromeHelp: '连接后，AI 可以在你授权的 Chrome 标签页中读取内容和操作页面。',
     edgeEnable: '连接 Edge 预览扩展',
@@ -79,7 +82,7 @@ const copy = {
     unavailable: 'Built-in browser settings are unavailable here.',
     loading: 'Loading browser settings…',
     enabled: 'Enable built-in browser',
-    enabledHelp: 'Open and annotate web pages in conversations. The AI can access sites and operate pages without per-action confirmation.',
+    enabledHelp: 'Open web pages and add comments in conversations. The AI can access sites and operate pages without per-action confirmation.',
     webLinks: 'Default for web links',
     webLinksHelp: 'Choose the browser used when you open a web link or website card in a conversation.',
     localWeb: 'Default for local websites',
@@ -109,17 +112,20 @@ const copy = {
     computerTitle: 'Computer Use',
     // 英文同步说明全局开关生效后的会话能力。
     computerHelp:
-      'Enable this and grant macOS Accessibility and Screen Recording permissions here. The AI can then operate other apps without further authorization during use. Return here if permissions become unavailable; you can disable access or stop control at any time.',
+      'Use the embedded CUA Driver only on explicitly observed app windows. Zeus forces background delivery and never falls back to foreground activation; unsupported apps fail explicitly. Restart Zeus after the first permission grant.',
     computerEnable: 'Enable Computer Use',
     computerStop: 'Stop control now',
     computerAccessibility: 'Accessibility',
     computerScreenCapture: 'Screen & System Audio Recording',
     computerGranted: 'Granted',
     computerMissing: 'Required',
+    // 组件失败与系统权限缺失分别显示。
+    computerUnchecked: 'Not checked',
+    computerUnavailable: 'Unavailable (component error)',
     computerRequestPermissions: 'Request or recheck permissions',
     computerOpenAccessibility: 'Open Accessibility settings',
     computerOpenScreenCapture: 'Open Screen Recording settings',
-    computerSettingsOpened: 'The matching macOS privacy settings are open. Recheck permissions after granting access.',
+    computerSettingsOpened: 'The matching macOS privacy settings are open. Restart Zeus after granting access.',
     chromeEnable: 'Connect Chrome test extension',
     chromeHelp: 'Once connected, the AI can read and operate Chrome tabs you authorize.',
     edgeEnable: 'Connect Edge preview extension',
@@ -146,9 +152,6 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
-  useApplicationErrorDialog(error, {
-    language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
-  });
 
   useEffect(() => {
     let active = true;
@@ -331,8 +334,8 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     return (
       <section className="settings-product-pane browser-settings-product-pane" aria-label={labels.title}>
         <h2 className="settings-page-title">{labels.title}</h2>
-        <p className="browser-settings-status" role="status">
-          {labels.loading}
+        <p className="browser-settings-status" role={error ? 'alert' : 'status'}>
+          {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : labels.loading}
         </p>
       </section>
     );
@@ -439,22 +442,36 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
               </span>
               {computerSettings.enabled ? (
                 <span className="computer-permission-details" role="status" aria-live="polite">
-                  <span className={computerSettings.accessibilityTrusted ? 'granted' : 'missing'}>
-                    {labels.computerAccessibility}：{computerSettings.accessibilityTrusted ? labels.computerGranted : labels.computerMissing}
+                  <span className={computerSettings.permissionCheckState !== 'checked' ? undefined : computerSettings.accessibilityTrusted ? 'granted' : 'missing'}>
+                    {labels.computerAccessibility}：
+                    {computerSettings.permissionCheckState === 'error'
+                      ? labels.computerUnavailable
+                      : computerSettings.permissionCheckState !== 'checked'
+                        ? labels.computerUnchecked
+                        : computerSettings.accessibilityTrusted
+                          ? labels.computerGranted
+                          : labels.computerMissing}
                   </span>
-                  <span className={computerSettings.screenCaptureAvailable ? 'granted' : 'missing'}>
-                    {labels.computerScreenCapture}：{computerSettings.screenCaptureAvailable ? labels.computerGranted : labels.computerMissing}
+                  <span className={computerSettings.permissionCheckState !== 'checked' ? undefined : computerSettings.screenCaptureAvailable ? 'granted' : 'missing'}>
+                    {labels.computerScreenCapture}：
+                    {computerSettings.permissionCheckState === 'error'
+                      ? labels.computerUnavailable
+                      : computerSettings.permissionCheckState !== 'checked'
+                        ? labels.computerUnchecked
+                        : computerSettings.screenCaptureAvailable
+                          ? labels.computerGranted
+                          : labels.computerMissing}
                   </span>
                   <span className="browser-settings-actions">
                     <Button variant="secondary" size="compact" onClick={() => void requestComputerPermissions()} busy={busy}>
                       {labels.computerRequestPermissions}
                     </Button>
-                    {!computerSettings.accessibilityTrusted ? (
+                    {computerSettings.permissionCheckState === 'checked' && !computerSettings.accessibilityTrusted ? (
                       <Button variant="secondary" size="compact" onClick={() => void openComputerPermissionSettings('accessibility')} busy={busy}>
                         {labels.computerOpenAccessibility}
                       </Button>
                     ) : null}
-                    {!computerSettings.screenCaptureAvailable ? (
+                    {computerSettings.permissionCheckState === 'checked' && !computerSettings.screenCaptureAvailable ? (
                       <Button variant="secondary" size="compact" onClick={() => void openComputerPermissionSettings('screen_capture')} busy={busy}>
                         {labels.computerOpenScreenCapture}
                       </Button>
@@ -489,6 +506,11 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
       {status && status !== labels.saved && status !== labels.switchSaved ? (
         <p className="browser-settings-status" role="status">
           {status}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="browser-settings-status" role="alert">
+          <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
       <p className="browser-settings-clear-help">{labels.clearHelp}</p>

@@ -1,7 +1,8 @@
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { useAttentionWorkspace } from '../attention/attentionContext.js';
 import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
-import { ArrowsClockwiseIcon as ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
+
+import { modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
 import { CaretRightIcon } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
@@ -15,12 +16,10 @@ import { TaskPushSupplementalAttachmentCards } from '../../task/TaskPushSuppleme
 import { Button } from '../../ui/Button.js';
 import { ModalPortal } from '../../ui/ModalPortal.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
-import { AgentExecutionConfigFields, type AgentExecutionConfigValue } from './AgentExecutionConfigFields.js';
 import type { DigitalEmployeeApiClient } from './digitalEmployeeApiClient.js';
 import type { CommandRunDetail } from '../runtime/runtimeContracts.js';
 import type { DigitalEmployeeRecord, TaskWorkConversationRequestRecord, TaskWorkDecisionRecord, TaskWorkDeliverableRecord, TaskWorkItemRecord, TaskWorkManagementProjection, TaskWorkPreview } from './digitalEmployeeContracts.js';
 import { errorMessage, formatDateTime, type DigitalEmployeeLanguage } from './digitalEmployeeUiSupport.js';
-import type { NativeConversationAppClient } from '../workspace/workspaceSupport.js';
 import { codexCapabilitiesChangedEvent } from '../codex/codexApiClient.js';
 import { DigitalEmployeeAvatar } from './DigitalEmployeeAvatar.js';
 import { TaskConversationPane } from './TaskConversationPane.js';
@@ -29,11 +28,9 @@ import { TaskWorkReviewPanel } from './TaskWorkReviewPanel.js';
 import { TaskWorkPlanPanel } from './TaskWorkPlanPanel.js';
 import './digitalEmployees.css';
 
-export type TaskDigitalEmployeeSkillClient = Pick<NativeConversationAppClient, 'loadSkills'>;
-
 export interface TaskDigitalEmployeePanelProps {
-  /** 工作安排复用项目技能目录。 */
-  skillClient?: TaskDigitalEmployeeSkillClient | null;
+  /** 新协作统一进入数字团队，已有安排只保留运行与历史。 */
+  onArrangeTeam?(): void;
   /** 当前任务会话使用原始身份，不复制消息。 */
   conversations?: NativeConversationChoice[];
   /** 会话列表读取状态。 */
@@ -61,6 +58,8 @@ export interface TaskDigitalEmployeePanelProps {
 
 export interface TaskDigitalEmployeeManagement {
   employees: DigitalEmployeeRecord[];
+  /** 正式全局员工可直接指派，项目绑定由实际接纳透明建立。 */
+  assignableEmployees: DigitalEmployeeRecord[];
   projection: TaskWorkManagementProjection | null;
   loadState: 'loading' | 'ready' | 'failed';
   busy: string | null;
@@ -74,6 +73,8 @@ export interface TaskDigitalEmployeeManagement {
 export function useTaskDigitalEmployeeManagement(props: Pick<TaskDigitalEmployeePanelProps, 'taskId' | 'projectId' | 'client' | 'language'>): TaskDigitalEmployeeManagement {
   const zh = props.language === 'zh-CN';
   const [employees, setEmployees] = useState<DigitalEmployeeRecord[]>([]);
+  /** 目录包含已有正式全局员工，内置模板本身不是执行人。 */
+  const [assignableEmployees, setAssignableEmployees] = useState<DigitalEmployeeRecord[]>([]);
   const [projection, setProjection] = useState<TaskWorkManagementProjection | null>(null);
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'failed'>('loading');
   const [busy, setBusy] = useState<string | null>(null);
@@ -93,10 +94,15 @@ export function useTaskDigitalEmployeeManagement(props: Pick<TaskDigitalEmployee
     const generation = ++readGeneration.current;
     if (!hasLoaded.current) setLoadState('loading');
     try {
-      const [nextEmployees, nextProjection] = await Promise.all([props.client.loadProjectDigitalEmployees(props.projectId), props.client.loadTaskWorkManagement(props.taskId)]);
+      const [nextEmployees, nextAssignableEmployees, nextProjection] = await Promise.all([
+        props.client.loadProjectDigitalEmployees(props.projectId),
+        props.client.loadProjectDigitalEmployees(props.projectId, true),
+        props.client.loadTaskWorkManagement(props.taskId),
+      ]);
       if (generation !== readGeneration.current) return;
       hasLoaded.current = true;
       setEmployees(nextEmployees);
+      setAssignableEmployees(nextAssignableEmployees);
       setProjection(nextProjection);
       errorOperation.current = null;
       setError(null);
@@ -113,6 +119,7 @@ export function useTaskDigitalEmployeeManagement(props: Pick<TaskDigitalEmployee
     hasLoaded.current = false;
     setProjection(null);
     setEmployees([]);
+    setAssignableEmployees([]);
     setError(null);
     void load();
     return () => {
@@ -170,7 +177,7 @@ export function useTaskDigitalEmployeeManagement(props: Pick<TaskDigitalEmployee
     setError(null);
   }, []);
 
-  return { employees, projection, loadState, busy, error, load, act, dismissOperationError };
+  return { employees, assignableEmployees, projection, loadState, busy, error, load, act, dismissOperationError };
 }
 
 type ManagementTab = 'collaboration' | 'work' | 'deliverables' | 'evidence';
@@ -187,10 +194,6 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
   const [conversationRequest, setConversationRequest] = useState<{ conversationId: string } | null>(null);
   /** 正式成果保留独立全文阅读状态。 */
   const [readingDeliverable, setReadingDeliverable] = useState<TaskWorkDeliverableRecord | null>(null);
-  /** 页签和内容区域共享无障碍身份。 */
-  const panelId = useId();
-  /** 固定页签顺序用于键盘导航。 */
-  const tabs = ['collaboration', 'work', 'deliverables', 'evidence'] as const;
   /** 选中的待处理事项继续使用原有确认弹窗。 */
   const [decisionOpen, setDecisionOpen] = useState<TaskWorkDecisionRecord | null>(null);
   useEffect(() => {
@@ -206,7 +209,7 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
   const [commandEvidenceRunId, setCommandEvidenceRunId] = useState<string | null>(null);
 
   if (!props.client) return <p className="task-conversation-feedback">{zh ? '工作服务未连接，任务说明仍可编辑。' : 'The work service is disconnected. Task requirements remain editable.'}</p>;
-  const { projection, loadState, busy, error, load, act } = props.management;
+  const { projection, loadState, busy, error, act } = props.management;
   const pendingDecisions = projection?.managerDecisions.filter((decision) => decision.status === 'pending') ?? [];
   const pendingConversationRequests = projection?.conversationRequests ?? [];
 
@@ -221,45 +224,9 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
   }
   return (
     <section className="task-work-cockpit" aria-label={zh ? '任务内容与协作' : 'Task content and collaboration'}>
-      <header className="task-work-cockpit-header">
-        <nav role="tablist" aria-label={zh ? '任务详情页签' : 'Task detail tabs'}>
-          {tabs.map((value) => (
-            <button
-              key={value}
-              id={`${panelId}-${value}-tab`}
-              type="button"
-              role="tab"
-              aria-controls={`${panelId}-${value}`}
-              tabIndex={tab === value ? 0 : -1}
-              className={tab === value ? 'is-active' : undefined}
-              aria-selected={tab === value}
-              onClick={() => setTab(value)}
-              onKeyDown={(event) => {
-                /** 方向键、首尾键只切换页签，不影响正文草稿。 */
-                const index = tabs.indexOf(value);
-                /** 仅处理页签导航按键。 */
-                const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : null;
-                if (next === null) return;
-                event.preventDefault();
-                setTab(tabs[next]!);
-                document.getElementById(`${panelId}-${tabs[next]}-tab`)?.focus();
-              }}
-            >
-              {tabLabel(value, props.language)}
-              {value === 'deliverables' && projection?.deliverables.length ? <small>{projection.deliverables.length}</small> : null}
-            </button>
-          ))}
-        </nav>
-        <span>
-          <Button variant="secondary" size="compact" busy={loadState === 'loading'} aria-label={zh ? '刷新工作管理' : 'Refresh work management'} onClick={() => void load()}>
-            <ArrowsClockwise size={16} aria-hidden="true" />
-          </Button>
-        </span>
-      </header>
-
       {error ? (
         <p className="digital-employee-feedback is-error" role="alert">
-          {error}
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
 
@@ -282,8 +249,8 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
           </small>
         </button>
       ) : null}
-      {/* 隐藏而不卸载正文，切换页签后仍能继续处理未保存的内容。 */}
-      <div id={`${panelId}-collaboration`} role="tabpanel" aria-labelledby={`${panelId}-collaboration-tab`} className="task-work-conversation-panel" hidden={tab !== 'collaboration'}>
+      {/* 沟通是任务详情默认正文；待办和已有工作仍可按上下文进入。 */}
+      <div role="region" aria-label={zh ? '沟通' : 'Conversation'} className="task-work-conversation-panel" hidden={tab !== 'collaboration'}>
         {projection && (pendingConversationRequests.length > 0 || pendingDecisions.length > 0) ? (
           <Button
             className="task-conversation-inbox"
@@ -292,7 +259,6 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
             onClick={() => {
               // 待办集中在工作页处理，聊天保留原会话及草稿。
               setTab('work');
-              document.getElementById(`${panelId}-work-tab`)?.focus();
             }}
           >
             {zh ? '待我处理' : 'Needs my attention'} · {pendingConversationRequests.length + pendingDecisions.length} · {zh ? '查看待办' : 'View pending items'}
@@ -315,11 +281,11 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
         />
       </div>
       {tab === 'work' && projection ? (
-        <div id={`${panelId}-work`} role="tabpanel" aria-labelledby={`${panelId}-work-tab`} className="task-work-collaboration">
+        <div role="region" aria-label={zh ? '工作' : 'Work'} className="task-work-collaboration">
           {pendingConversationRequests.length + pendingDecisions.length > 0 ? (
             <ManagerInbox requests={pendingConversationRequests} decisions={pendingDecisions} language={props.language} onOpenConversation={openConversation} onSelect={setDecisionOpen} />
           ) : null}
-          <TaskWorkPlanPanel taskId={props.taskId} projectId={props.projectId} client={props.client} skillClient={props.skillClient ?? null} management={props.management} readOnly={props.terminalReadOnly} />
+          <TaskWorkPlanPanel onArrangeTeam={props.onArrangeTeam} taskId={props.taskId} client={props.client} management={props.management} readOnly={props.terminalReadOnly} />
           {projection.workItems.some((item) => !item.arrangement || item.currentRunId) ? (
             <WorkItemBoard
               items={projection.workItems.filter((item) => !item.arrangement || item.currentRunId)}
@@ -336,12 +302,12 @@ export function TaskDigitalEmployeePanel(props: TaskDigitalEmployeePanelProps) {
         </div>
       ) : null}
       {tab === 'deliverables' && projection ? (
-        <div id={`${panelId}-deliverables`} role="tabpanel" aria-labelledby={`${panelId}-deliverables-tab`}>
+        <div role="region" aria-label={zh ? '成果' : 'Deliverables'}>
           <DeliverablesView deliverables={projection?.deliverables ?? []} language={props.language} onOpen={setReadingDeliverable} />
         </div>
       ) : null}
       {tab === 'evidence' && projection ? (
-        <div id={`${panelId}-evidence`} role="tabpanel" aria-labelledby={`${panelId}-evidence-tab`}>
+        <div role="region" aria-label={zh ? '运行记录' : 'Activity'}>
           <EvidenceView items={projection?.workItems ?? []} refs={projection?.evidenceRefs ?? []} language={props.language} onOpenConversation={openConversation} onOpenCommand={setCommandEvidenceRunId} />
         </div>
       ) : null}
@@ -639,11 +605,10 @@ export function TaskDigitalEmployeeExecutor(props: {
   projectId: string;
   terminalReadOnly: boolean;
   client: DigitalEmployeeApiClient | null;
-  skillClient: TaskDigitalEmployeeSkillClient | null;
   language: DigitalEmployeeLanguage;
   management: TaskDigitalEmployeeManagement;
   onLoadCapabilities?: () => Promise<CodexTaskPushCapabilities>;
-  /** 缺少员工时直接进入该项目员工管理。 */
+  /** 缺少员工时进入统一的数字员工管理。 */
   onManageEmployees?(): void;
 }) {
   const zh = props.language === 'zh-CN';
@@ -658,7 +623,7 @@ export function TaskDigitalEmployeeExecutor(props: {
       props.management.projection?.plan?.stages.some((stage) => stage.items.some((item) => item.employeeId === employee.id && item.status !== 'cancelled')),
   );
   /** 停用员工保留历史身份，但不能成为新指派候选。 */
-  const runnableEmployees = props.management.employees.filter((employee) => employee.enabled && employee.entrypointMigrationState === 'ready' && employee.entrypoint?.kind === 'agent');
+  const runnableEmployees = props.management.assignableEmployees.filter((employee) => employee.enabled && employee.entrypointMigrationState === 'ready' && employee.entrypoint?.kind === 'agent');
   const options = [
     ...runnableEmployees.map((employee) => ({ value: employee.id, label: `${employee.name} · ${employee.role}`, icon: <DigitalEmployeeAvatar {...employee} />, searchText: `${employee.name} ${employee.role} ${employee.domain}` })),
   ];
@@ -689,7 +654,7 @@ export function TaskDigitalEmployeeExecutor(props: {
           emptyLabel={zh ? '没有匹配的数字员工' : 'No matching digital employees'}
           disabled={props.terminalReadOnly || props.management.loadState === 'loading' || props.management.busy !== null || runnableEmployees.length === 0}
           onChange={(employeeId) => {
-            const employee = props.management.employees.find((candidate) => candidate.id === employeeId);
+            const employee = props.management.assignableEmployees.find((candidate) => candidate.id === employeeId);
             if (employee) setSelectedEmployee(employee);
           }}
           triggerLabel={assignedEmployees.length ? (zh ? '指派工作' : 'Assign work') : zh ? '选择执行人' : 'Choose an employee'}
@@ -702,10 +667,10 @@ export function TaskDigitalEmployeeExecutor(props: {
         </Button>
       ) : props.onManageEmployees ? (
         <Button variant="secondary" size="compact" onClick={props.onManageEmployees}>
-          {zh ? '配置数字员工' : 'Set up employees'}
+          {zh ? '添加数字员工' : 'Add digital employees'}
         </Button>
       ) : (
-        <span>{zh ? '项目尚无可指派员工' : 'No employees available'}</span>
+        <span>{zh ? '尚无可指派员工' : 'No employees available'}</span>
       )}
       {activeCount > 0 ? <small className="task-digital-employee-executor-status">{zh ? `${activeCount} 项工作进行中` : `${activeCount} active ${activeCount === 1 ? 'work item' : 'work items'}`}</small> : null}
       <MotionPresence>
@@ -717,11 +682,9 @@ export function TaskDigitalEmployeeExecutor(props: {
             employee={selectedEmployee}
             acceptedDeliverables={props.management.projection?.deliverables.filter((deliverable) => deliverable.status === 'accepted') ?? []}
             client={props.client}
-            skillClient={props.skillClient}
             language={props.language}
             busy={props.management.busy === 'start-executor'}
             operationError={props.management.error}
-            onOpenProjectSettings={props.onManageEmployees}
             onLoadCapabilities={props.onLoadCapabilities}
             onDismiss={() => setSelectedEmployee(null)}
             onSubmit={async (preview) => {
@@ -742,13 +705,11 @@ function TaskEmployeeRunDialog(props: {
   employee: DigitalEmployeeRecord;
   acceptedDeliverables: TaskWorkDeliverableRecord[];
   client: DigitalEmployeeApiClient;
-  skillClient: TaskDigitalEmployeeSkillClient | null;
   language: DigitalEmployeeLanguage;
   busy: boolean;
   operationError: string | null;
   onLoadCapabilities?: () => Promise<CodexTaskPushCapabilities>;
-  /** 没有可运行模型时提供真实项目设置入口。 */
-  onOpenProjectSettings?(): void;
+  /** 关闭预览时清理当前指派选择。 */
   onDismiss(): void;
   onSubmit(preview: TaskWorkPreview): Promise<boolean>;
 }) {
@@ -761,7 +722,6 @@ function TaskEmployeeRunDialog(props: {
   const [workspaceMode, setWorkspaceMode] = useState<'create' | 'continue' | null>(null);
   const [workspaceTarget, setWorkspaceTarget] = useState('');
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
-  const [config, setConfig] = useState<AgentExecutionConfigValue>(() => initialRunConfig(props.employee));
   const [supplementalInfo, setSupplementalInfo] = useState('');
   const [supplementalAttachments, setSupplementalAttachments] = useState<TaskPushSupplementalAttachmentDraft[]>([]);
   const [supplementalResourceError, setSupplementalResourceError] = useState<string | null>(null);
@@ -777,6 +737,7 @@ function TaskEmployeeRunDialog(props: {
   const modelRevisionRef = useRef(0);
   loadCapabilitiesRef.current = props.onLoadCapabilities;
   const inputResources = useConversationInputResources({
+    attachments: supplementalAttachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
     textareaRef: supplementalTextareaRef,
     text: supplementalInfo,
@@ -810,20 +771,6 @@ function TaskEmployeeRunDialog(props: {
         setWorkspaceMode(initialWorkspace?.mode === 'create' ? 'create' : initialWorkspace ? 'continue' : null);
         setWorkspaceTarget(initialWorkspace?.mode === 'existing' ? `environment:${initialWorkspace.environmentId}` : initialWorkspace?.mode === 'local' ? `local:${initialWorkspace.branchName}` : '');
         if (modelRevision === modelRevisionRef.current) setModels(nextCapabilities.models);
-        setConfig((current) => {
-          if (current.model) return current;
-          const model =
-            nextCapabilities.models.find((candidate) => candidate.id === ('preferredModel' in nextCapabilities ? nextCapabilities.preferredModel : '')) ?? nextCapabilities.models.find((candidate) => candidate.available !== false);
-          return model
-            ? {
-                ...current,
-                agentKind: model.agentKind ?? 'codex',
-                model: model.id,
-                reasoningEffort: current.reasoningEffort || model.defaultReasoningEffort || model.supportedReasoningEfforts[0] || '',
-                serviceTier: current.serviceTier || model.defaultServiceTier || '',
-              }
-            : current;
-        });
       })
       .catch((cause) => {
         if (active) {
@@ -885,13 +832,6 @@ function TaskEmployeeRunDialog(props: {
           employeeId: props.employee.id,
           supplementalInfo: supplementalInfo.trim() || null,
           ...(supplementalAttachments.length > 0 ? { supplementalAttachments: taskPushSupplementalRequestAttachments(supplementalAttachments) } : {}),
-          modelOverride: config.model || null,
-          reasoningEffort: config.reasoningEffort || null,
-          serviceTier: config.serviceTier || null,
-          workMode: config.workMode,
-          permissionMode: config.permissionMode,
-          promptOverride: config.prompt,
-          skillIds: config.skillIds,
           selectedDeliverableIds,
           ...(workspace ? { workspace } : {}),
         })
@@ -909,7 +849,7 @@ function TaskEmployeeRunDialog(props: {
         });
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [agentEntrypoint, config, props.client, props.employee.id, props.taskId, selectedDeliverableIds, supplementalAttachments, supplementalInfo, workspaceMode, workspaceTarget, zh]);
+  }, [agentEntrypoint, models, props.client, props.employee.id, props.taskId, selectedDeliverableIds, supplementalAttachments, supplementalInfo, workspaceMode, workspaceTarget, zh]);
 
   const existingEnvironments = capabilities?.existingEnvironments ?? [];
   const canContinueEnvironment = (environment: NonNullable<CodexTaskPushCapabilities['existingEnvironments']>[number]): boolean => environment.available;
@@ -924,7 +864,6 @@ function TaskEmployeeRunDialog(props: {
   /** 运行条件缺失时提供设置入口，不堆叠不能使用的配置控件。 */
   const hasRunnableModel = models.some((model) => model.available !== false);
   /** 选择器与摘要使用同一模型身份。 */
-  const selectedModel = models.find((model) => model.id === config.model || model.model === config.model);
 
   async function submit(): Promise<void> {
     if (!preview || preview.blockers.length > 0 || inputResources.processing) return;
@@ -968,6 +907,7 @@ function TaskEmployeeRunDialog(props: {
             </label>
             <TaskPushSupplementalAttachmentCards
               attachments={supplementalAttachments}
+              pendingResources={inputResources.pendingResources}
               language={props.language}
               disabled={props.busy || inputResources.processing}
               onRemove={(attachment) => {
@@ -1077,26 +1017,6 @@ function TaskEmployeeRunDialog(props: {
             </fieldset>
           ) : null}
 
-          {agentEntrypoint && hasRunnableModel ? (
-            <details className="task-work-config-details">
-              <summary>
-                <span>{zh ? '本次能力设置' : 'Settings for this work'}</span>
-                <small>
-                  {selectedModel?.displayName ?? config.model} · {config.skillIds.length} Skills
-                </small>
-              </summary>
-              <AgentExecutionConfigFields
-                value={config}
-                models={models}
-                skillClient={props.skillClient}
-                projectId={props.projectId}
-                language={props.language}
-                compact
-                onChange={(patch) => setConfig((current) => ({ ...current, ...patch }))}
-              />
-            </details>
-          ) : null}
-
           {props.acceptedDeliverables.length > 0 ? (
             <details className="task-work-context-details">
               <summary>{zh ? `参考已验收成果 · 已选 ${selectedDeliverableIds.length}` : `Accepted deliverable context (${selectedDeliverableIds.length} selected)`}</summary>
@@ -1128,29 +1048,28 @@ function TaskEmployeeRunDialog(props: {
           ) : null}
           {capabilityError || previewError || supplementalResourceError || props.operationError || submitError ? (
             <p className="digital-employee-feedback is-error" role="alert">
-              {capabilityError ?? previewError ?? supplementalResourceError ?? props.operationError ?? submitError}
+              <VisibleApplicationError error={capabilityError ?? previewError ?? supplementalResourceError ?? props.operationError ?? submitError} language={zh ? 'zh-CN' : 'en'} />
             </p>
           ) : null}
           {hasRunnableModel &&
             preview?.blockers.map((blocker) => (
               <p key={blocker.code} className="digital-employee-feedback is-error">
-                <WarningCircle size={17} aria-hidden="true" />
                 <VisibleApplicationError error={blocker} language={zh ? 'zh-CN' : 'en'} />
               </p>
             ))}
         </div>
         <footer>
           <small>{zh ? '指派后开始工作，进展和成果会回到当前任务。' : 'Work starts after assignment. Progress and deliverables return to this task.'}</small>
-          {capabilitiesLoaded && !hasRunnableModel && props.onOpenProjectSettings ? (
+          {capabilitiesLoaded && !hasRunnableModel ? (
             <Button
               variant="primary"
               size="regular"
               onClick={() => {
                 props.onDismiss();
-                props.onOpenProjectSettings?.();
+                window.dispatchEvent(new CustomEvent(modelSetupRequestedEvent, { detail: 'choose' }));
               }}
             >
-              {zh ? '打开项目设置' : 'Open project settings'}
+              {zh ? '配置模型' : 'Configure models'}
             </Button>
           ) : (
             <Button
@@ -1167,20 +1086,6 @@ function TaskEmployeeRunDialog(props: {
       </section>
     </ModalPortal>
   );
-}
-
-function initialRunConfig(employee: DigitalEmployeeRecord): AgentExecutionConfigValue {
-  const entrypoint = employee.entrypoint?.kind === 'agent' ? employee.entrypoint : null;
-  return {
-    agentKind: entrypoint?.agentKind ?? employee.agentKind,
-    model: entrypoint?.modelPolicy.defaultModel ?? employee.model ?? '',
-    reasoningEffort: employee.reasoningEffort ?? '',
-    serviceTier: employee.serviceTier ?? '',
-    workMode: employee.workMode,
-    permissionMode: entrypoint?.authorityPolicy.permissionMode ?? employee.permissionMode,
-    skillIds: [...(entrypoint?.skillPolicy.allowedSkillIds ?? employee.skillIds)],
-    prompt: entrypoint?.prompt ?? employee.prompt,
-  };
 }
 
 interface CommonLocalTaskBranch {
@@ -1539,10 +1444,6 @@ function DecisionDialog(props: {
   );
 }
 
-/** 用户按沟通、工作、成果和记录的目的切换内容。 */
-function tabLabel(tab: ManagementTab, language: DigitalEmployeeLanguage): string {
-  return (language === 'zh-CN' ? { collaboration: '沟通', work: '工作', deliverables: '成果', evidence: '运行记录' } : { collaboration: 'Conversation', work: 'Work', deliverables: 'Deliverables', evidence: 'Activity' })[tab];
-}
 function employeeName(run: TaskWorkItemRecord['runs'][number] | undefined): string {
   return typeof run?.employeeSnapshot.name === 'string' ? run.employeeSnapshot.name : '';
 }

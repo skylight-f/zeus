@@ -4,7 +4,7 @@ import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
 import type { ProjectGitAction, ProjectGitActionResponse, ProjectGitWorkbenchSnapshot, ProjectRecord } from '../apiClient.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
-import { useApplicationErrorDialog } from '../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { Button } from '../ui/Button.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
@@ -17,6 +17,8 @@ export interface NewConversationExecutionContextProps {
   projectId: string;
   projects: readonly Pick<ProjectRecord, 'id' | 'name' | 'localPath'>[];
   workspaceMode: 'direct' | 'worktree';
+  /** 新工作树分支必须使用的当前全局前缀。 */
+  taskBranchPrefix: string;
   worktree?: ConversationWorktreeOptions;
   onWorktreeChange: (options: ConversationWorktreeOptions) => void;
   onWorkspaceModeChange: (mode: 'direct' | 'worktree') => void;
@@ -38,7 +40,6 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
   const [workbench, setWorkbench] = useState<ProjectGitWorkbenchSnapshot | null>(null);
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [error, setError] = useState<unknown>(null);
-  useApplicationErrorDialog(error, { language: zh ? 'zh-CN' : 'en' });
   const [refreshing, setRefreshing] = useState(false);
   const [projectBusy, setProjectBusy] = useState(false);
 
@@ -50,17 +51,21 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
     [workbench, props.projectId],
   );
   const snapshot = rootRepository?.snapshot;
-  const sources = useMemo(
-    () => [
-      ...(snapshot?.localBranches ?? []).map((ref) => ({ ref, kind: 'local' as const })),
-      ...(snapshot?.remoteBranches ?? []).filter((ref) => ref.includes('/') && !ref.endsWith('/HEAD')).map((ref) => ({ ref, kind: 'remote' as const })),
-    ],
+  /** 首次提交前当前分支尚未进入 localBranches，仍需作为真实本地来源展示。 */
+  const localBranches = useMemo(
+    () => (!snapshot?.detached && !snapshot?.headSha && snapshot?.branch && !snapshot.localBranches.includes(snapshot.branch) ? [snapshot.branch, ...snapshot.localBranches] : (snapshot?.localBranches ?? [])),
     [snapshot],
+  );
+  const sources = useMemo(
+    () => [...localBranches.map((ref) => ({ ref, kind: 'local' as const })), ...(snapshot?.remoteBranches ?? []).filter((ref) => ref.includes('/') && !ref.endsWith('/HEAD')).map((ref) => ({ ref, kind: 'remote' as const }))],
+    [localBranches, snapshot?.remoteBranches],
   );
   const worktreeAvailable = loadState === 'ready' && sources.length > 0;
   const sourceAvailable = Boolean(props.worktree && sources.some((source) => source.kind === props.worktree?.sourceKind && source.ref === props.worktree.sourceRef));
   const branchName = props.worktree?.branchName.trim() ?? '';
-  const validWorktree = worktreeAvailable && sourceAvailable && branchName.startsWith('zeus/') && branchName.length > 'zeus/'.length;
+  /** 前缀已由设置边界规范化，这里只负责即时启用状态。 */
+  const branchNamespace = `${props.taskBranchPrefix}/`;
+  const validWorktree = worktreeAvailable && sourceAvailable && branchName.startsWith(branchNamespace) && branchName.length > branchNamespace.length;
   const branchLabel = snapshot?.detached ? (zh ? '游离 HEAD' : 'Detached HEAD') : snapshot?.branch || (loadState === 'loading' ? (zh ? '正在读取' : 'Loading') : zh ? '非 Git 目录' : 'Not a Git repository');
   const projectOptions = useMemo(
     () => [
@@ -82,7 +87,7 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
     if (!rootRepository) return [];
     const unavailableReason = zh ? '已在其他工作目录使用' : 'In use in another working folder';
     return [
-      ...rootRepository.snapshot.localBranches.map((branch) => {
+      ...localBranches.map((branch) => {
         const current = branch === rootRepository.snapshot.branch;
         const occupied = !current && checkedOutBranches.has(branch);
         return {
@@ -101,7 +106,7 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
         disabled: false,
       },
     ];
-  }, [checkedOutBranches, rootRepository, zh]);
+  }, [checkedOutBranches, localBranches, rootRepository, zh]);
 
   useEffect(() => {
     const version = ++loadVersionRef.current;
@@ -142,8 +147,8 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
   useEffect(() => {
     if (temporary || props.workspaceMode !== 'worktree' || props.worktree || !worktreeAvailable) return;
     const source = sources.find((entry) => entry.kind === 'local' && entry.ref === snapshot?.branch) ?? sources[0];
-    if (source) props.onWorktreeChange({ sourceKind: source.kind, sourceRef: source.ref, branchName: `zeus/conversation-${crypto.randomUUID().slice(0, 8)}` });
-  }, [temporary, props.workspaceMode, props.worktree, props.onWorktreeChange, worktreeAvailable, sources, snapshot?.branch]);
+    if (source) props.onWorktreeChange({ sourceKind: source.kind, sourceRef: source.ref, branchName: `${props.taskBranchPrefix}/conversation-${crypto.randomUUID().slice(0, 8)}` });
+  }, [temporary, props.workspaceMode, props.worktree, props.onWorktreeChange, props.taskBranchPrefix, worktreeAvailable, sources, snapshot?.branch]);
 
   useEffect(() => {
     props.onBusyChange?.(branchBusy || projectBusy || refreshing || (!temporary && props.workspaceMode === 'worktree' && !validWorktree));
@@ -196,6 +201,11 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
 
   return (
     <>
+      {error ? (
+        <p className="session-new-conversation-error" role="alert">
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+        </p>
+      ) : null}
       <div className="session-new-conversation-context" aria-label={zh ? '新对话的工作位置' : 'Work location for the new conversation'}>
         <span className="session-new-conversation-context-control">
           <ZeusSelect
@@ -303,7 +313,7 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
                     <input
                       aria-label={zh ? '工作树分支名' : 'Worktree branch name'}
                       value={props.worktree?.branchName ?? ''}
-                      placeholder="zeus/conversation-example"
+                      placeholder={`${props.taskBranchPrefix}/conversation-example`}
                       spellCheck={false}
                       disabled={props.disabled || projectBusy || !props.worktree}
                       onChange={(event) => {
@@ -311,7 +321,15 @@ export function NewConversationExecutionContext(props: NewConversationExecutionC
                       }}
                     />
                   </label>
-                  <small>{zh ? '从所选分支创建，分支名须以 zeus/ 开头。' : 'Create from the selected branch. The new name must start with zeus/.'}</small>
+                  <small>
+                    {!snapshot?.headSha && props.worktree?.sourceKind === 'local' && props.worktree.sourceRef === snapshot?.branch
+                      ? zh
+                        ? `空仓库会把当前项目文件带入工作树；分支名须以 ${branchNamespace} 开头。`
+                        : `The current project files will seed this empty repository worktree. The new name must start with ${branchNamespace}.`
+                      : zh
+                        ? `从所选分支创建，分支名须以 ${branchNamespace} 开头。`
+                        : `Create from the selected branch. The new name must start with ${branchNamespace}.`}
+                  </small>
                   {props.worktree && !sourceAvailable && loadState === 'ready' ? <span role="alert">{zh ? '来源分支已不可用，请重新选择。' : 'The source branch is no longer available. Choose another branch.'}</span> : null}
                   <Button variant="secondary" size="compact" busy={refreshing} disabled={props.disabled || projectBusy || !snapshot?.remotes.length || !props.onExecuteProjectGit} onClick={() => void refreshRemoteBranches()}>
                     {zh ? '刷新远程分支' : 'Refresh remote branches'}

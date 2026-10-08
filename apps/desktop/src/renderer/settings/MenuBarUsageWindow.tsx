@@ -1,6 +1,7 @@
 import { distributionAppName } from '../tooling/distribution.js';
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageOverviewSnapshot, UsageProviderSummary } from '@zeus/shared';
+import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageOverviewSnapshot, UsageProviderSummary, UsageOverviewRange, CodexLocalUsageTotals } from '@zeus/shared';
+import { isCodexSubscriptionUsage, hasPositiveCodexCredits, formatCodexCredits } from '@zeus/shared';
 import type { AppShellSettings, DashboardClient } from '../apiClient.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { menuBarRateLimitWindows, renderClassicTray } from './menuBarClassicTray.js';
@@ -13,6 +14,12 @@ type UsageClient = Pick<DashboardClient, 'loadUsageOverview' | 'subscribeEvents'
 // 使用主进程提供的运行名称，让开发、测试和正式应用与状态栏提示保持一致。
 const applicationName = new URLSearchParams(window.location.search).get('applicationName')?.trim() || distributionAppName;
 
+const overviewRangeOrder: UsageOverviewRange[] = ['today', '7d', '30d', 'all'];
+type ChartDimension = 'tokens' | 'cost';
+type ChartSource = 'local' | 'account';
+type DailySlot = { date: string; value: number | null; complete: boolean };
+const chartDimensionStorageKey = 'zeus.menu-bar-usage.chart-dimension';
+
 const snapshotStorageKey = 'zeus.menu-bar-usage.snapshot';
 const selectionStorageKey = 'zeus.menu-bar-usage.selection';
 /** 菜单栏独立保存供应商顺序，不改变供应商配置或后台统计顺序。 */
@@ -21,6 +28,14 @@ const providerOrderStorageKey = 'zeus.menu-bar-usage.provider-order';
 const copy = {
   'zh-CN': {
     all: '全部',
+    overviewRanges: { today: '今日', '7d': '近 7 日', '30d': '近 30 日', all: '全部' },
+    overview: '统计范围',
+    tokens: 'Token',
+    outputRate: '输出速率',
+    estimatedCost: '估算费用',
+    equivalentCost: 'API 等价费用',
+    equivalentCostHint: '按 API 单价换算的等价费用，不代表订阅实际扣款。',
+    remainingCredits: '剩余点数',
     allProviders: '全部供应源',
     reorderHint: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
     reorder: '排序',
@@ -80,6 +95,14 @@ const copy = {
   },
   'en-US': {
     all: 'All',
+    overviewRanges: { today: 'Today', '7d': '7 days', '30d': '30 days', all: 'All' },
+    overview: 'Statistics range',
+    tokens: 'Tokens',
+    outputRate: 'Output rate',
+    estimatedCost: 'Estimated cost',
+    equivalentCost: 'API equivalent cost',
+    equivalentCostHint: 'Converted at API rates; this is not an actual subscription charge.',
+    remainingCredits: 'Credits remaining',
     allProviders: 'All providers',
     reorderHint: 'Drag to reorder, or focus a handle and press ↑ ↓',
     reorder: 'Reorder',
@@ -481,7 +504,7 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
                 <small>{providerDetail}</small>
               </span>
               <span className="menu-bar-usage-provider-value">
-                <strong>{formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, props.language)}</strong>
+                <strong>{formatIncompleteTokens(provider.overviewRanges.today.local.totalTokens, provider.overviewRanges.today.complete, props.language)}</strong>
                 <small>{text.todayShort}</small>
               </span>
               <Chevron />
@@ -496,19 +519,29 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
 function ProviderDetail(props: { provider: UsageProviderSummary; language: Language }) {
   const { provider, language } = props;
   const text = copy[language];
-  const cacheAvailable = provider.cacheUsageAvailable ?? (provider.providerId === 'codex' || provider.sevenDayLocal.cachedInputTokens > 0 || provider.sevenDayLocal.cacheWriteInputTokens > 0);
-  const sevenDayLocalComplete = provider.sevenDayLocalComplete === true;
+  const [range, setRange] = useState<UsageOverviewRange>('7d');
+  const summary = provider.overviewRanges[range];
+  const local = summary.local;
+  const complete = summary.complete === true;
+  const equivalentCost = isCodexSubscriptionUsage(provider);
+  const costLabel = equivalentCost ? text.equivalentCost : text.estimatedCost;
   return (
     <article className="menu-bar-usage-detail">
       <ProviderSummaryCard provider={provider} language={language} />
-
+      <nav className="menu-bar-usage-range" aria-label={text.overview}>
+        {overviewRangeOrder.map((entry) => (
+          <button key={entry} type="button" aria-pressed={range === entry} onClick={() => setRange(entry)}>
+            {text.overviewRanges[entry]}
+          </button>
+        ))}
+      </nav>
       <dl className="menu-bar-usage-metrics">
-        <Metric label={text.sevenDaysShort} accessibleLabel={text.sevenDays} value={formatIncompleteTokens(provider.sevenDayLocal.totalTokens, provider.sevenDayLocalComplete, language)} />
-        <Metric label={text.cache} value={!sevenDayLocalComplete ? '—' : cacheAvailable ? formatPercent(provider.sevenDayLocal.cacheHitRate, language, '—') : text.cacheUnsupported} />
-        <Metric label={text.costShort} accessibleLabel={text.cost} value={sevenDayLocalComplete ? formatCost(provider, language, text.noPrice) : '—'} costBreakdown={provider.sevenDayCostBreakdown ?? []} language={language} />
+        <Metric label={text.tokens} value={formatIncompleteTokens(local.totalTokens, summary.complete, language)} />
+        <Metric label={text.cache} value={!complete ? '—' : provider.cacheUsageAvailable ? formatPercent(local.cacheHitRate, language, '—') : text.cacheUnsupported} />
+        <Metric label={costLabel} accessibleLabel={equivalentCost ? text.equivalentCostHint : costLabel} value={complete ? formatCost(local, language, text.noPrice) : '—'} costBreakdown={summary.costBreakdown} language={language} />
+        <Metric label={text.outputRate} value={local.outputTokensPerSecond == null ? '—' : `${formatTokens(local.outputTokensPerSecond, language)} / s`} />
       </dl>
-      {provider.sevenDayLocal.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
-
+      {local.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
       <DailyBars key={provider.providerId} provider={provider} language={language} />
     </article>
   );
@@ -519,7 +552,7 @@ function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: 
   const { provider, language } = props;
   const text = copy[language];
   const name = providerDisplayName(provider);
-  const todayValue = formatIncompleteTokens(provider.todayLocal.totalTokens, provider.todayLocalComplete, language);
+  const todayValue = formatIncompleteTokens(provider.overviewRanges.today.local.totalTokens, provider.overviewRanges.today.complete, language);
   const visibleWindows = menuBarRateLimitWindows(provider);
   /** 无官方额度时保留原有空态；多项额度按官方顺序逐一显示。 */
   const windows = visibleWindows.length ? visibleWindows : [undefined];
@@ -544,6 +577,11 @@ function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: 
                     <span className="menu-bar-usage-progress" role="progressbar" aria-label={quotaHeading} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
                       <i style={{ inlineSize: `${Math.max(0, Math.min(100, window.remainingPercent))}%` }} />
                     </span>
+                    {index === 0 && provider.providerId === 'codex' && hasPositiveCodexCredits(provider.officialCreditBalance) ? (
+                      <small title={provider.officialCreditBalance ?? undefined}>
+                        {text.remainingCredits} {formatCodexCredits(provider.officialCreditBalance, language)}
+                      </small>
+                    ) : null}
                     <time dateTime={window.resetsAt ? new Date(window.resetsAt * 1_000).toISOString() : undefined} title={window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : undefined}>
                       {window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : '—'}
                     </time>
@@ -573,10 +611,14 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
   const text = copy[props.language];
   /** Codex 可切换来源，首次展示本机账本；其他供应商始终使用本机账本。 */
   const [source, setSource] = useState<'local' | 'account'>('local');
+  const [localDimension, setLocalDimension] = useState<ChartDimension>(readStoredChartDimension);
   const codex = props.provider.providerId === 'codex';
   const accountUsage = codex && source === 'account';
+  const dimension: ChartDimension = accountUsage ? 'tokens' : localDimension;
+  const costDimension = dimension === 'cost';
+  const costLabel = isCodexSubscriptionUsage(props.provider) ? text.equivalentCost : text.estimatedCost;
   const buckets = accountUsage ? (props.provider.dailyAccount ?? null) : props.provider.dailyLocal;
-  const label = accountUsage ? text.accountRecentUsage : text.recentUsage;
+  const label = costDimension ? costLabel : accountUsage ? text.accountRecentUsage : text.recentUsage;
   const sourcePicker = codex ? (
     <label className="menu-bar-usage-chart-source-picker" title={accountUsage ? text.accountSourceHint : text.localSource}>
       <span className="menu-bar-usage-sr-only">{text.statisticsSource}</span>
@@ -600,10 +642,14 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
         <small>{text.insufficientHistory}</small>
       </div>
     );
-  const slots = buildDailySlots(props.provider, buckets, accountUsage);
-  const maximum = Math.max(...slots.flatMap((slot) => (slot.totalTokens && slot.totalTokens > 0 ? [slot.totalTokens] : [])), 1);
-  const todayValue = accountUsage ? formatOptionalTokens(props.provider.accountTodayTokens, props.language) : formatIncompleteTokens(props.provider.todayLocal.totalTokens, props.provider.todayLocalComplete, props.language);
-  const sevenDayValue = accountUsage ? formatOptionalTokens(props.provider.accountSevenDayTokens, props.language) : formatIncompleteTokens(props.provider.sevenDayLocal.totalTokens, props.provider.sevenDayLocalComplete, props.language);
+  const slots = buildDailySlots(props.provider, dimension, accountUsage ? 'account' : 'local');
+  const maximum = Math.max(...slots.flatMap((slot) => (slot.value && slot.value > 0 ? [slot.value] : [])), 1);
+  const todayValue = accountUsage
+    ? formatOptionalTokens(props.provider.accountTodayTokens, props.language)
+    : formatIncompleteTokens(props.provider.overviewRanges.today.local.totalTokens, props.provider.overviewRanges.today.complete, props.language);
+  const sevenDayValue = accountUsage
+    ? formatOptionalTokens(props.provider.accountSevenDayTokens, props.language)
+    : formatIncompleteTokens(props.provider.overviewRanges['7d'].local.totalTokens, props.provider.overviewRanges['7d'].complete, props.language);
   return (
     <figure className="menu-bar-usage-bars" aria-label={`${providerDisplayName(props.provider)} ${label}`}>
       <figcaption>
@@ -619,17 +665,38 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
           </div>
         </dl>
       </figcaption>
+      {!accountUsage ? (
+        <nav className="menu-bar-usage-range" aria-label={label}>
+          {(['tokens', 'cost'] as const).map((entry) => (
+            <button
+              key={entry}
+              type="button"
+              aria-pressed={dimension === entry}
+              onClick={() => {
+                setLocalDimension(entry);
+                try {
+                  localStorage.setItem(chartDimensionStorageKey, entry);
+                } catch {
+                  /* 偏好不可写时仅更新当前窗口。 */
+                }
+              }}
+            >
+              {entry === 'tokens' ? text.tokens : costLabel}
+            </button>
+          ))}
+        </nav>
+      ) : null}
       <div className="menu-bar-usage-bars-plot">
         {slots.map((slot) => {
-          const state = slot.totalTokens === null ? 'missing' : slot.totalTokens === 0 ? 'zero' : 'positive';
-          const value = slot.totalTokens === null ? text.missingDay : `${formatTokens(slot.totalTokens, props.language)} Token`;
+          const state = slot.value === null ? 'missing' : slot.value === 0 ? 'zero' : 'positive';
+          const value = slot.value === null ? text.missingDay : costDimension ? `${slot.complete ? '~' : '≥'}${formatCostAmount(slot.value, 'USD', props.language)}` : `${formatTokens(slot.value, props.language)} Token`;
           return (
             <span key={slot.date} data-state={state} aria-label={`${formatShortDate(slot.date, props.language)} ${value}`} title={`${slot.date} · ${value}`}>
-              <span className="menu-bar-usage-bar-slot">
-                {slot.totalTokens === null ? <em aria-hidden="true">—</em> : <i style={{ blockSize: slot.totalTokens === 0 ? '2px' : `${Math.max(10, (slot.totalTokens / maximum) * 100)}%` }} />}
-              </span>
+              <span className="menu-bar-usage-bar-slot">{slot.value === null ? <em aria-hidden="true">—</em> : <i style={{ blockSize: slot.value === 0 ? '2px' : `${Math.max(10, (slot.value / maximum) * 100)}%` }} />}</span>
               <small>{formatShortDate(slot.date, props.language)}</small>
-              <strong className="menu-bar-usage-bar-value">{formatOptionalTokens(slot.totalTokens, props.language)}</strong>
+              <strong className="menu-bar-usage-bar-value">
+                {slot.value === null ? '—' : costDimension ? `${slot.complete ? '~' : '≥'}${formatCostAmount(slot.value, 'USD', props.language)}` : formatOptionalTokens(slot.value, props.language)}
+              </strong>
             </span>
           );
         })}
@@ -716,9 +783,17 @@ function Metric(props: { label: string; accessibleLabel?: string; value: string;
             <tbody>
               {props.costBreakdown?.map((entry, index) => (
                 <tr key={`${entry.model}:${index}`}>
-                  <th scope="row">{entry.model}</th>
-                  <td>{formatModelRate(entry, props.language!)}</td>
-                  <td>{formatTokens(entry.usage.totalTokens, props.language!)} Token</td>
+                  <th scope="row">
+                    {entry.model}
+                    {entry.serviceTier || entry.longContext ? <small>{[entry.serviceTier, entry.longContext ? 'Long context' : null].filter(Boolean).join(' · ')}</small> : null}
+                  </th>
+                  <td>
+                    {formatModelRate(entry, props.language!)}
+                    {entry.pricePeriod ? <small>{formatPricePeriod(entry.pricePeriod, props.language!)}</small> : null}
+                  </td>
+                  <td>
+                    {formatTokens(entry.usage.totalTokens, props.language!)} Token<small>{formatModelEstimatedCost(entry, props.language!)}</small>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -780,20 +855,27 @@ function providerDisplayName(provider: UsageProviderSummary, compact = false): s
   return `${name.slice(0, 12)}…${name.slice(-8)}`;
 }
 
-function buildDailySlots(provider: UsageProviderSummary, buckets: ReadonlyArray<{ date: string; totalTokens: number }>, accountUsage: boolean): Array<{ date: string; totalTokens: number | null }> {
+function buildDailySlots(provider: UsageProviderSummary, dimension: ChartDimension, source: ChartSource): DailySlot[] {
+  /** 账户图使用官方历史；费用维度与普通供应商沿用本地日账本。 */
+  const accountUsage = provider.providerId === 'codex' && source === 'account';
+  const buckets = accountUsage ? (provider.dailyAccount ?? []) : provider.dailyLocal.map((day) => ({ date: day.date, totalTokens: dimension === 'cost' ? day.apiEquivalentUsd : day.totalTokens }));
+  /** 按日期查找数值，本地采集起点只用于普通供应商的空白日期。 */
   const bucketsByDate = new Map(buckets.map((bucket) => [bucket.date, bucket.totalTokens]));
-  const collectionStart = accountUsage ? null : timestampDateKey(provider.collectionStartedAt);
+  /** 费用有数值也可能只覆盖部分请求，每天独立保留缺价状态。 */
+  const pricingByDate = new Map(provider.dailyLocal.map((day) => [day.date, day.priceCoverage]));
+  const collectionStart = timestampDateKey(provider.collectionStartedAt);
+  /** 以本地自然日对应顶部今日指标，七天范围包含当天。 */
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   return Array.from({ length: 7 }, (_, index) => {
+    /** 每根柱对应独立自然日，最后一根固定为当天。 */
     const date = new Date(today);
     date.setDate(date.getDate() - 6 + index);
     const dateKey = localDateKey(date);
+    /** 官方缺失继续显示破折号；本地采集后的无记录日期才视作零，未定价日期按缺失处理。 */
     const recorded = bucketsByDate.get(dateKey);
-    return {
-      date: dateKey,
-      totalTokens: recorded === undefined ? (!accountUsage && collectionStart !== null && dateKey >= collectionStart ? 0 : null) : Math.max(0, recorded),
-    };
+    const value = recorded === null ? null : recorded === undefined ? (!accountUsage && collectionStart !== null && dateKey >= collectionStart ? 0 : null) : Math.max(0, recorded);
+    return { date: dateKey, value, complete: value !== null && (dimension !== 'cost' || recorded === undefined || pricingByDate.get(dateKey) === 1) };
   });
 }
 
@@ -851,9 +933,9 @@ function formatPercent(value: number | null, language: Language, unavailable = '
 }
 
 /** 原币种分别展示，不把人民币等费用折算成美元。 */
-function formatCost(provider: UsageProviderSummary, language: Language, unavailable: string): string {
-  if (!provider.sevenDayLocal.priceCoverage) return unavailable;
-  const costs = provider.sevenDayLocal.costs ?? (provider.sevenDayLocal.apiEquivalentUsd === null ? [] : [{ currency: 'USD', amount: provider.sevenDayLocal.apiEquivalentUsd }]);
+function formatCost(local: CodexLocalUsageTotals, language: Language, unavailable: string): string {
+  if (!local.priceCoverage) return unavailable;
+  const costs = local.costs ?? (local.apiEquivalentUsd === null ? [] : [{ currency: 'USD', amount: local.apiEquivalentUsd }]);
   if (!costs.length) return unavailable;
   const formatted = costs.map(({ currency, amount }) => {
     if (!Number.isFinite(amount)) return null;
@@ -884,7 +966,18 @@ function formatShortDate(value: string, language: Language): string {
 function readStoredSnapshot(): UsageOverviewSnapshot | null {
   try {
     const value = JSON.parse(localStorage.getItem(snapshotStorageKey) ?? 'null') as UsageOverviewSnapshot | null;
-    return value && Array.isArray(value.providers) && typeof value.updatedAt === 'string' ? value : null;
+    /** 缓存可能来自旧版结构；缺少当前渲染必需字段时等待实时读取，不能让菜单栏整页崩溃。 */
+    const compatible = value?.providers.every(
+      (provider) =>
+        Array.isArray(provider.dailyLocal) &&
+        overviewRangeOrder.every(
+          (range) =>
+            Boolean(provider.overviewRanges?.[range]?.local) &&
+            Array.isArray(provider.overviewRanges[range].costBreakdown) &&
+            provider.overviewRanges[range].costBreakdown.every((entry) => typeof entry.longContext === 'boolean' && (entry.serviceTier === null || typeof entry.serviceTier === 'string')),
+        ),
+    );
+    return value && Array.isArray(value.providers) && compatible && typeof value.updatedAt === 'string' ? value : null;
   } catch {
     return null;
   }
@@ -923,4 +1016,29 @@ function storeSelection(value: string): void {
   } catch {
     // 选择偏好不可写时，仅保留当前窗口内状态。
   }
+}
+
+function readStoredChartDimension(): ChartDimension {
+  try {
+    return localStorage.getItem(chartDimensionStorageKey) === 'cost' ? 'cost' : 'tokens';
+  } catch {
+    return 'tokens';
+  }
+}
+
+function formatPricePeriod(period: NonNullable<UsageModelCostBreakdown['pricePeriod']>, language: Language): string {
+  return `${period.from}～${period.to ?? (language === 'zh-CN' ? '至今' : 'now')}`;
+}
+
+function formatModelEstimatedCost(entry: UsageModelCostBreakdown, language: Language): string {
+  return entry.estimatedCosts?.length ? entry.estimatedCosts.map(({ currency, amount }) => `~${formatCostAmount(amount, currency, language)}`).join(' + ') : copy[language].noPrice;
+}
+
+function formatCostAmount(value: number, currency: string, language: Language): string {
+  /** 非零的小额费用不能四舍五入成零，使用最小展示单位表达。 */
+  const lessThanMinimum = value > 0 && value < 0.01;
+  const amount = new Intl.NumberFormat(language, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  if (currency === 'USD') return `${lessThanMinimum ? '<' : ''}$${lessThanMinimum ? '0.01' : amount}`;
+  if (currency === 'CNY') return `${lessThanMinimum ? '<' : ''}¥${lessThanMinimum ? '0.01' : amount}`;
+  return `${currency} ${lessThanMinimum ? '<0.01' : amount}`;
 }

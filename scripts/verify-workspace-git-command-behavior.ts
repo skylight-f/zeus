@@ -1,4 +1,4 @@
-import { mkdtemp, rm, mkdir, readFile, writeFile, chmod, symlink, lstat } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, readFile, writeFile, chmod, symlink, lstat, realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,7 @@ import {
   TaskIntegrationRepository,
   TaskIntegrationAttemptRepository,
   type ZeusDatabase,
+  type ZeusProjectRecord,
 } from '../packages/storage/src/index.js';
 import {
   startTaskBranchIntegration,
@@ -35,6 +36,7 @@ import {
 } from '../packages/git-core/src/index.js';
 import { missingTaskRepositories } from '../packages/local-server/src/taskRepositoryMembership.js';
 import { createGitIntegrationOperations, type GitIntegrationOperationDependencies } from '../packages/local-server/src/gitIntegrationOperations.js';
+import { readGitCommitContext, resolveTaskCommitRepository } from '../packages/local-server/src/gitCommitContext.js';
 import type { TaskWorkspaceConflictRecovery } from '../packages/shared/src/index.js';
 import {
   WorkspaceGitCommandApplication,
@@ -46,6 +48,7 @@ import {
   type WorkspaceGitScopeKind,
 } from '../packages/local-server/src/workspaceGitCommandApplication.js';
 import { registerWorkspaceGitCommandRoutes, workspaceGitCommandRoutePolicy } from '../packages/local-server/src/workspaceGitCommandRoutes.js';
+import { resolveConversationGitWorkspace } from '../packages/local-server/src/conversationGitWorkspace.js';
 
 const probeRoot = await mkdtemp(join(tmpdir(), 'zeus-workspace-git-command-probe-'));
 const observed: Record<string, unknown> = {};
@@ -337,9 +340,16 @@ async function verifyRepositoryAttachment(db: ZeusDatabase, application: Workspa
     projectSharedPaths: new ProjectSharedPathRepository(db),
     conversations: new ConversationRepository(db),
     conversationSubmissions: new ConversationSubmissionRepository(db),
+    /** 本现场只授权环境已有成员，新增仓库不扩大可写范围。 */
+    resolveTaskEnvironmentWritableRoots: (_project: unknown, members: Array<{ worktreePath: string | null }>) => members.flatMap((member) => (member.worktreePath ? [member.worktreePath] : [])),
+    appendAuditLog: () => undefined,
     recordTaskEvent: () => undefined,
   } as GitIntegrationOperationDependencies);
   assertProbe(missingTaskRepositories(registered, workspaces.listByEnvironment(environment.id)).length === 3, '带远端与无远端的新增仓库都必须被发现。');
+  /** 通过正式已有环境入口恢复分支，项目新增仓库不应迫使旧环境扩容。 */
+  const continued = await operations.resolveTaskPushEnvironment(project, task, { mode: 'existing', environmentId: environment.id }, 'continue-existing-members');
+  assertProbe(continued.workspaces.length === 1 && continued.workspaces[0]?.repositoryId === baseline.id, '旧环境应仅继续已有仓库，不强制补齐新增仓库。');
+  assertProbe(continued.writableRoots.length === 1 && (await realpath(continued.writableRoots[0]!)) === (await realpath(prepared.worktreePath)), '继续旧环境不得把新增仓库纳入可写范围。');
   assertProbe((await discoverGitRepositories(root)).length === 4, '仓库发现不能过滤无远端仓库。');
   for (const name of names.slice(1)) {
     const repository = registered.find((item) => item.name === name)!;
@@ -434,12 +444,138 @@ async function verifyRepositoryAttachment(db: ZeusDatabase, application: Workspa
     adoptUnregisteredDirectory: { nestedPaths: names },
     ignoredPaths: names,
   });
+  observed.conversationGitDirectories = await verifyConversationGitDirectories(db, project, environmentRoot, baseline.localPath);
   assertProbe(
     parent.worktreePath === environmentRoot && (await readFile(join(environmentRoot, 'root.txt'), 'utf8')) === 'parent task\n' && (await git(join(environmentRoot, 'local'), 'branch', '--show-current')) === branchName,
     '父仓补入不能覆盖已有子仓或任务文件。',
   );
 
-  return { repositories: names.length, preservedTaskContent: true, sourceUnchanged: true, replayedWithoutWrite: true, reclaimAndRestoreWithoutRemote: true };
+  /** 父仓工作区保留嵌套子仓，提交自身文件时不触发仅供目录回收使用的先子后父门禁。 */
+  const parentWorkspace = workspaces.create({
+    projectId: project.id,
+    taskId: task.id,
+    environmentId: environment.id,
+    repositoryName: 'parent',
+    repositoryRelativePath: '.',
+    repositoryPath: root,
+    ...parent,
+    remoteName: '',
+    remoteBranch: branchName,
+    state: 'ready',
+  });
+  /** 提交说明读取实际任务工作树，未勾选文件不得进入模型输入。 */
+  const commitRepository = await resolveTaskCommitRepository(project, task.id, parentWorkspace);
+  await writeFile(join(environmentRoot, 'unselected.txt'), '未勾选内容不得发送给模型\n');
+  /** 读取前后暂存区必须一致，生成说明不隐式暂存文件。 */
+  const stagedBeforeGeneration = await git(environmentRoot, 'diff', '--cached', '--name-only');
+  /** 本次只选择父仓改动，不读取项目来源目录或嵌套仓库。 */
+  const commitContext = await readGitCommitContext(commitRepository.localPath, ['root.txt']);
+  assertProbe(
+    commitRepository.localPath === (await realpath(environmentRoot)) &&
+      commitContext.files.length === 1 &&
+      commitContext.files[0] === 'root.txt' &&
+      commitContext.stagedDiff.includes('parent task') &&
+      !commitContext.stagedDiff.includes('未勾选内容'),
+    'AI 提交说明必须仅读取当前任务勾选文件。',
+  );
+  assertProbe((await git(environmentRoot, 'diff', '--cached', '--name-only')) === stagedBeforeGeneration, '生成提交说明不得改变暂存区。');
+  /** 错误归属、回收状态和物理分支不匹配都必须拒绝，不能回退读主仓。 */
+  for (const invalidWorkspace of [
+    undefined,
+    { ...parentWorkspace, projectId: 'other-project' },
+    { ...parentWorkspace, taskId: 'other-task' },
+    { ...parentWorkspace, state: 'reclaimed' as const },
+    { ...parentWorkspace, worktreePath: root },
+    { ...parentWorkspace, branchName: 'main' },
+  ]) {
+    /** 通过真实仓库现场核对拒绝结果，不模拟 Git 响应。 */
+    const rejected = await resolveTaskCommitRepository(project, task.id, invalidWorkspace).then(
+      () => false,
+      () => true,
+    );
+    assertProbe(rejected, 'AI 提交说明必须拒绝错误任务或失效工作树。');
+  }
+  /** 通过正式单仓交付入口提交父仓文件，不绕过命令准备与结果投影。 */
+  const parentCommitValue = { message: '父仓独立提交', selectedPaths: ['root.txt'] };
+  /** 命令身份只服务本次临时探针。 */
+  const parentCommit = await operations.prepareWorkspaceGitCommand({
+    commandType: workspaceGitCommandTypes.taskWorkspaceCommit,
+    operationIdentity: 'nested-parent-commit',
+    taskId: task.id,
+    workspaceId: parentWorkspace.id,
+    value: parentCommitValue,
+  });
+  /** 执行真实 Git 提交，并在成功后应用同一业务投影。 */
+  const parentCommitResult = await operations.executeWorkspaceGitCommand({
+    commandType: workspaceGitCommandTypes.taskWorkspaceCommit,
+    operationIdentity: 'nested-parent-commit',
+    prepared: parentCommit,
+    value: parentCommitValue,
+  });
+  parentCommitResult.commitAccepted();
+  assertProbe(parentCommitResult.response.statusCode === 200 && (await git(environmentRoot, 'show', 'HEAD:root.txt')) === 'parent task', '嵌套子仓存在时，父仓所选文件仍必须可以独立提交。');
+  assertProbe((await git(join(environmentRoot, 'local'), 'branch', '--show-current')) === branchName, '父仓提交不得回收或改写嵌套子仓 Worktree。');
+
+  return {
+    repositories: names.length,
+    preservedTaskContent: true,
+    sourceUnchanged: true,
+    replayedWithoutWrite: true,
+    reclaimAndRestoreWithoutRemote: true,
+    nestedParentCommittedIndependently: true,
+    continuedWithoutForcedAttachment: true,
+    commitGenerationUsesTaskSelection: true,
+  };
+}
+
+/** 沿用既有临时仓库，检查普通目录、工作树及持久目录的越界拒绝。 */
+async function verifyConversationGitDirectories(db: ZeusDatabase, project: ZeusProjectRecord, worktreePath: string, foreignPath: string) {
+  /** 所有会话和提交凭证仅写入探针数据库。 */
+  const conversations = new ConversationRepository(db),
+    submissions = new ConversationSubmissionRepository(db);
+  /** 创建最初提交的服务端目录，避免从客户端或命令目录猜测范围。 */
+  function createDirectoryConversation(title: string, cwd: string, mode?: 'direct' | 'worktree') {
+    /** 独立会话身份用于验证交付与审查共用的目录解析。 */
+    const conversation = conversations.create({ projectId: project.id, title });
+    submissions.createOrGet({
+      conversationId: conversation.id,
+      idempotencyKey: title,
+      requestHash: title,
+      clientMessageId: title,
+      kind: 'message',
+      requestedDelivery: 'send_now',
+      status: 'completed',
+      createdAt: new Date(clockMs).toISOString(),
+      input: { context: { projectLocalPath: cwd, ...(mode ? { executionWorkspaceMode: mode } : {}) } },
+    });
+    return conversation;
+  }
+  for (const mode of ['direct', undefined] as const) {
+    /** 缺省模式只在持久目录与项目真实目录相同时接受为普通模式。 */
+    const conversation = createDirectoryConversation(`普通目录-${mode ?? '缺省'}`, project.localPath, mode);
+    const resolved = await resolveConversationGitWorkspace(project, conversation.id, conversations, submissions);
+    assertProbe(resolved.localPath === (await realpath(project.localPath)) && resolved.workspaceMode === 'direct', '普通目录必须保留真实项目路径及模式，不能误判为工作树。');
+  }
+  /** 既有已登记工作树必须继续通过完整归属检查。 */
+  const worktreeConversation = createDirectoryConversation('独立工作树', worktreePath, 'worktree');
+  const worktree = await resolveConversationGitWorkspace(project, worktreeConversation.id, conversations, submissions);
+  assertProbe(worktree.localPath === (await realpath(worktreePath)) && worktree.workspaceMode === 'worktree', '有效工作树必须保留原目录和模式。');
+  for (const [title, cwd, mode] of [
+    ['普通目录越界', foreignPath, 'direct'],
+    ['工作树越界', foreignPath, 'worktree'],
+    ['工作树失效', join(probeRoot, 'missing-worktree'), 'worktree'],
+  ] as const) {
+    /** 无效目录不能回退为项目目录，也不能被当作另一个合法仓库。 */
+    const conversation = createDirectoryConversation(title, cwd, mode);
+    let rejected = false;
+    try {
+      await resolveConversationGitWorkspace(project, conversation.id, conversations, submissions);
+    } catch (error) {
+      rejected = (error as { code?: string }).code === 'ZEUS_CONVERSATION_WORKTREE_UNAVAILABLE';
+    }
+    assertProbe(rejected, `${title}必须拒绝且保留稳定错误身份。`);
+  }
+  return { direct: true, legacyDirect: true, worktree: true, foreignAndMissingRejected: true };
 }
 
 async function verifyWorkflowCandidate() {

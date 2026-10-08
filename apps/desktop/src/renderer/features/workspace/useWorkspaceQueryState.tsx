@@ -1,7 +1,8 @@
 import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
+import type { DigitalTeamEntrySelection } from '../digital-teams/DigitalTeamWorkspace.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GlobalAgentSettingsHandle } from '../../settings/GlobalAgentSettingsPane.js';
-import { projectTerminalOutput } from '@zeus/shared';
+import { projectTerminalOutput, temporaryWorkspaceId } from '@zeus/shared';
 import { cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig } from '@zeus/shared';
 import { type AutomaticUpdateIndicatorState, loadAutomaticUpdateIndicatorFromMain } from '../../appShellBridge.js';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation, conversationTreeRuntimeStateFromSession, type ProjectConversationGroup } from '../../session/ProjectConversationTree.js';
@@ -11,6 +12,7 @@ import type { CodexConversationCapabilities, CodexTaskPushCapabilities, NativeCo
 import { compareConversationStageUpdatedDesc } from '../../session/conversationOrdering.js';
 import { buildPersistedSessionViewCache, initialSessionHotCache, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
 import { type TaskModelPushForm, type TaskModelPushModalStatus } from '../../task/TaskModelPushModal.js';
+import { projectTaskModelPushConversationChoices } from '../../task/TaskModelPushPendingWorkspace.js';
 import { useConversationFeatureController } from '../conversations/useConversationFeatureController.js';
 import { useGitFeatureController } from '../git/useGitFeatureController.js';
 import { useProjectFeatureController } from '../projects/useProjectFeatureController.js';
@@ -34,7 +36,6 @@ import {
   type GitOperationConfirmation,
   type ConversationHistoryItem,
   type ProjectConfig,
-  type ProjectModelServiceTierPreference,
   type ProjectDatabaseSecretSnapshot,
   type ProjectRecord,
   type ReleaseStatusSnapshot,
@@ -109,8 +110,8 @@ import {
   resolveNativeConversationSelectionPresentation,
   resolveSelectedNativeConversationForProject,
   resolveTaskManagementStatusConfig,
-  resolveTaskStatusFilterForProject,
-  resolveTaskTableColumnsForProject,
+  resolveTaskStatusFilter,
+  resolveTaskTableColumns,
   type RuntimeConfirmationStatusState,
   type RuntimeLogCopyStatusState,
   type RuntimeLogExportStatusState,
@@ -187,6 +188,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setArchived: setArchivedConversations,
     setArchivedLoadState: setArchivedConversationLoadState,
     setRestoringConversationId: setRestoringArchivedConversationId,
+    loadArchived: loadArchivedConversations,
   } = useConversationFeatureController({
     client: props.nativeConversationClient?.conversations ?? null,
     initialTaskChoices: props.initialNativeConversationChoices,
@@ -215,12 +217,15 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [zeusWindowForeground, setZeusWindowForeground] = useState(false);
   const [focusedArchivedConversation, setFocusedArchivedConversation] = useState<NativeConversationChoice | null>(null);
   const [optimisticTerminalTaskStatuses, setOptimisticTerminalTaskStatuses] = useState<Record<string, TaskManagementStatus>>({});
+  /** 按任务保留最后一次状态选择的请求身份，列表卸载和连续保存都不丢失加载反馈。 */
+  const [pendingTaskStatuses, setPendingTaskStatuses] = useState<Record<string, { status: TaskManagementStatus }>>({});
   const [taskTerminalCleanupConfirmation, setTaskTerminalCleanupConfirmation] = useState<{
     statusLabel: string;
     resolve: (confirmed: boolean) => void;
   } | null>(null);
   const archivedConversations = conversationQuery.archived;
   const archivedConversationLoadState = conversationQuery.archivedLoadState;
+  const archivedConversationError = conversationQuery.errorCause ?? conversationQuery.error;
   const restoringArchivedConversationId = conversationQuery.restoringConversationId;
   const archivedConversationRefreshPromiseRef = useRef<Promise<void> | null>(null);
   const [newConversationFocusRequest, setNewConversationFocusRequest] = useState(0);
@@ -316,9 +321,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [projectCreateError, setProjectCreateError] = useState<string | undefined>();
   const [projectDirectoryChoosing, setProjectDirectoryChoosing] = useState(false);
   const projectCreateReturnFocusRef = useRef<HTMLElement | null>(null);
-  const [createProjectConfigForm] = useState(() => ({
-    defaultWorkMode: 'plan' as ProjectConfig['defaultWorkMode'],
-  }));
   const [taskSearchQuery, setTaskSearchQuery] = useState('');
   const [taskTagFilter, setTaskTagFilter] = useState('');
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
@@ -352,8 +354,12 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setSnapshot(props.snapshot);
     const restoredProjectId = resolveProjectWorkspaceTabs(props.snapshot.projects, props.snapshot.projects[0]?.id).activeProjectId;
     const restoredProject = props.snapshot.projects.find((project) => project.id === restoredProjectId);
-    const nextProject = syncRecordFromSnapshot(projectDetail ?? restoredProject, props.snapshot.projects);
-    const nextTask = syncRecordFromSnapshot(taskDetail, props.snapshot.tasks);
+    /** 无项目工作的技术归属可能不进入公开目录，保留已经明确加载的身份。 */
+    const nextProject =
+      projectDetail?.id === temporaryWorkspaceId ? (props.snapshot.projects.find((item) => item.id === projectDetail.id) ?? projectDetail) : syncRecordFromSnapshot(projectDetail ?? restoredProject, props.snapshot.projects);
+    /** 正在查看的临时工作成果不能被下一次目录水合替换为其他任务。 */
+    const nextTask =
+      taskDetail?.projectId === temporaryWorkspaceId && taskDetail.id === taskDetailPaneTaskId ? (props.snapshot.tasks.find((item) => item.id === taskDetail.id) ?? taskDetail) : syncRecordFromSnapshot(taskDetail, props.snapshot.tasks);
     setProjectDetail(nextProject);
     setTaskDetail(nextTask);
     setProjectEditForm({
@@ -395,6 +401,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       appLanguage: 'zh-CN',
       appearance: 'system',
       mainLayout: 'upstream',
+      taskBranchPrefix: 'zeus',
       webviewDebugEnabled: false,
       developerModeEnabled: false,
       multiWindowEnabled: true,
@@ -408,13 +415,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       defaultModel: null,
       defaultTaskTemplateId: null,
       taskTableColumns: normalizeTaskTableColumnPreferences(),
-      taskTableColumnsByProject: {},
       taskTableEnumSortOrders: defaultTaskTableEnumSortOrders,
       taskManagementStatusTemplate: cloneTaskManagementStatusConfig(defaultTaskManagementStatusConfig),
-      taskManagementStatusByProject: {},
-      taskStatusFilterByProject: {},
-      taskViewModeByProject: {},
-      taskPageViewByProject: {},
+      taskStatusFilter: 'unfinished',
+      taskViewMode: 'hierarchy',
+      taskPageView: 'list',
       taskExpandedIdsByProject: {},
       codeWorkspaceByProject: {},
       localLogDirectory: 'Zeus/logs',
@@ -428,12 +433,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   );
   const { snapshot: settingsQuery, update: setAppShellSettings } = useSettingsFeatureController({ client: props.nativeConversationClient?.settings ?? null, initialValue: initialAppShellSettings });
   const appShellSettings = settingsQuery.value;
-  useApplicationErrorDialog(projectWorkspaceConfigError, {
-    language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en',
-  });
-  useApplicationErrorDialog(archivedConversationLoadState === 'error' ? (conversationQuery.errorCause ?? conversationQuery.error) : null, {
-    language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en',
-  });
   const appShellSettingsRef = useRef(appShellSettings);
   const codeWorkspacePreferenceTimerRef = useRef<number | null>(null);
   appShellSettingsRef.current = appShellSettings;
@@ -443,23 +442,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     },
     [],
   );
-  const [taskStatusSettingsTargetId, setTaskStatusSettingsTargetId] = useState<string>(() => snapshot.projects[0]?.id ?? '__template__');
   const [taskManagementStatusReplacements, setTaskManagementStatusReplacements] = useState<Record<string, Record<string, string>>>({});
-  useEffect(() => {
-    setAppShellSettings((current) => {
-      const template = resolveTaskManagementStatusConfig(current);
-      const currentByProject = current.taskManagementStatusByProject ?? {};
-      const missingProjectIds = snapshot.projects.map((project) => project.id).filter((projectId) => !currentByProject[projectId]);
-      if (missingProjectIds.length === 0) return current;
-      return {
-        ...current,
-        taskManagementStatusByProject: {
-          ...currentByProject,
-          ...Object.fromEntries(missingProjectIds.map((projectId) => [projectId, cloneTaskManagementStatusConfig(template)])),
-        },
-      };
-    });
-  }, [snapshot.projects]);
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.zeusTheme = appShellSettings.appearance;
@@ -481,6 +464,12 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const gitDiffCopy = uiCopy.gitDiffWorkspace;
   const selectSearchPlaceholder = appShellSettings.appLanguage === 'zh-CN' ? '搜索选项' : 'Search options';
   const selectNoResults = appShellSettings.appLanguage === 'zh-CN' ? '没有匹配选项' : 'No matching options';
+  /** 任务入口上下文供团队页面和新建任务成功后的导航共用。 */
+  const [digitalTeamTask, setDigitalTeamTask] = useState<TaskRecord | undefined>();
+  /** 团队页面首次打开时选择的模板或运行。 */
+  const [digitalTeamEntrySelection, setDigitalTeamEntrySelection] = useState<DigitalTeamEntrySelection | undefined>();
+  /** 仅本次新建任务携带的团队，取消或完成后清空。 */
+  const [taskCreateTeamId, setTaskCreateTeamId] = useState<string | null>(null);
   const [taskCreateModalOpen, setTaskCreateModalOpen] = useState(false);
   const [taskDeleteDialogTaskId, setTaskDeleteDialogTaskId] = useState<string | null>(null);
   const [taskCreateForm, setTaskCreateForm] = useState<TaskCreateFormState>(() => buildTaskCreateInitialForm(appShellSettings.appLanguage));
@@ -491,7 +480,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   /** 同步阻止入口重复打开，失败时允许按原阶段和工作面身份重查。 */
   const taskModelPushEntryRef = useRef<{ taskId: string; stage?: TaskStageRecord; origin: TaskModelPushNavigationTarget; pending: boolean } | null>(null);
   const [taskModelPushCapabilities, setTaskModelPushCapabilities] = useState<CodexTaskPushCapabilities | null>(null);
-  const [taskModelPushServiceTierPreferences, setTaskModelPushServiceTierPreferences] = useState<ProjectModelServiceTierPreference[]>([]);
   const [taskModelPushRuntimeCapabilities, setTaskModelPushRuntimeCapabilities] = useState<CodexConversationCapabilities | null>(null);
   const [taskModelPushForm, setTaskModelPushForm] = useState<TaskModelPushForm>({
     model: '',
@@ -774,16 +762,19 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     // 切换项目或页面时收起旧抽屉，避免显示其他项目的会话。
     setSessionDrawerTarget(undefined);
   }, [activeNavTarget, activeProjectSection, activeProjectId]);
-  const taskStatusFilter = resolveTaskStatusFilterForProject(appShellSettings, activeProjectId);
-  const taskPageViewMode: TaskPageViewMode = activeProjectId ? (appShellSettings.taskPageViewByProject?.[activeProjectId] ?? 'list') : 'list';
-  const persistedTaskTableColumns = useMemo(() => resolveTaskTableColumnsForProject(appShellSettings, activeProjectId), [activeProjectId, appShellSettings.taskTableColumns, appShellSettings.taskTableColumnsByProject]);
-  const [taskTableLayoutDraft, setTaskTableLayoutDraft] = useState<{ projectId?: string; preferences: TaskTableColumnPreferences }>(() => ({
-    projectId: selectedProject?.id ?? props.snapshot?.projects[0]?.id,
-    preferences: resolveTaskTableColumnsForProject(appShellSettings, selectedProject?.id ?? props.snapshot?.projects[0]?.id),
-  }));
-  const activeTaskTableColumns = taskTableLayoutDraft.projectId === activeProjectId ? taskTableLayoutDraft.preferences : persistedTaskTableColumns;
-  const taskTableLayoutDirty = taskTableLayoutDraft.projectId === activeProjectId && !taskTableColumnPreferencesEqual(activeTaskTableColumns, persistedTaskTableColumns);
-  const [taskTableLayoutScopeDialogOpen, setTaskTableLayoutScopeDialogOpen] = useState(false);
+  const taskStatusFilter = resolveTaskStatusFilter(appShellSettings);
+  const taskPageViewMode: TaskPageViewMode = appShellSettings.taskPageView ?? 'list';
+  /** 所有项目共享一份已保存任务表格布局。 */
+  const persistedTaskTableColumns = useMemo(() => resolveTaskTableColumns(appShellSettings), [appShellSettings.taskTableColumns]);
+  /** 全局布局草稿不再在切换项目时被重置。 */
+  const [taskTableLayoutDraft, setTaskTableLayoutDraft] = useState<{ preferences: TaskTableColumnPreferences }>(() => ({ preferences: persistedTaskTableColumns }));
+  /** 保存回执只确认当时提交的草稿，后续编辑仍保留为未保存内容。 */
+  const taskTableLayoutDraftRef = useRef(taskTableLayoutDraft);
+  taskTableLayoutDraftRef.current = taskTableLayoutDraft;
+  /** 只在草稿尚未修改时接纳后来载入的已保存布局。 */
+  const previousTaskTableColumnsRef = useRef(persistedTaskTableColumns);
+  const activeTaskTableColumns = taskTableLayoutDraft.preferences;
+  const taskTableLayoutDirty = !taskTableColumnPreferencesEqual(activeTaskTableColumns, persistedTaskTableColumns);
   const [taskTableLayoutLeaveDialogOpen, setTaskTableLayoutLeaveDialogOpen] = useState(false);
   const [taskTableLayoutSaveBusy, setTaskTableLayoutSaveBusy] = useState(false);
   const [sourceWorkspaceLeaveDialogOpen, setSourceWorkspaceLeaveDialogOpen] = useState(false);
@@ -800,9 +791,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     void loadTaskBoard(activeProjectId);
   }, [activeProjectId, loadTaskBoard, taskBoardLoadState, taskBoardSnapshots, taskPageViewMode]);
   useEffect(() => {
-    if (taskTableLayoutDraft.projectId === activeProjectId) return;
-    setTaskTableLayoutDraft({ projectId: activeProjectId, preferences: persistedTaskTableColumns });
-  }, [activeProjectId, persistedTaskTableColumns, taskTableLayoutDraft.projectId]);
+    /** 上一次已保存的布局只用于判断当前草稿是否仍未改动。 */
+    const previous = previousTaskTableColumnsRef.current;
+    previousTaskTableColumnsRef.current = persistedTaskTableColumns;
+    setTaskTableLayoutDraft((current) => (taskTableColumnPreferencesEqual(current.preferences, previous) ? { preferences: persistedTaskTableColumns } : current));
+  }, [persistedTaskTableColumns]);
   useEffect(() => {
     const bridge = window.zeus;
     if (bridge?.setUnsavedChangeState) {
@@ -858,7 +851,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     (task: TaskRecord): TaskRecord => {
       const pending = taskModelPushPendingByTask[task.id];
       if (!pending || pending.status === 'failed') return task;
-      const statusConfig = resolveTaskManagementStatusConfig(appShellSettings, task.projectId);
+      const statusConfig = resolveTaskManagementStatusConfig(appShellSettings);
       return resolveTaskManagementStatus(task) === statusConfig.roles.defaultStatusId ? { ...task, managementStatus: statusConfig.roles.pushedStatusId } : task;
     },
     [appShellSettings, taskModelPushPendingByTask],
@@ -882,7 +875,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       new Set(
         snapshot.tasks
           .filter((task) => {
-            const config = resolveTaskManagementStatusConfig(appShellSettings, task.projectId);
+            const config = resolveTaskManagementStatusConfig(appShellSettings);
             const status = resolveTaskManagementStatus(task);
             return status === config.roles.completedStatusId || status === config.roles.cancelledStatusId;
           })
@@ -904,15 +897,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
           const pending = taskModelPushPendingByTask[task.id];
           /** 服务端返回的任务历史，包含可能先于推送回执到达的真实会话。 */
           const choices = nativeConversationChoicesByTask[task.id]?.choices ?? [];
-          if (!pending) return [task.id, choices];
-          /** 创建身份只能在同一项目和任务内关联，防止误合并同名会话及其他推送。 */
-          const isPendingChoice = (choice: NativeConversationChoice): boolean =>
-            choice.id === pending.choice.id || (Boolean(pending.operationIdentity) && choice.projectId === pending.task.projectId && choice.taskId === pending.task.id && choice.creationOperationIdentity === pending.operationIdentity);
-          /** 身份匹配不代表创建成功；只有原流程确认接受后才采用服务端展示状态。 */
-          const authoritativeChoice = pending.status === 'accepted' ? choices.find(isPendingChoice) : undefined;
-          /** 接管后继续保留稳定导航身份，创建中或失败时保持原工作面。 */
-          const projectedChoice = authoritativeChoice ? { ...authoritativeChoice, navigationId: pending.navigationId } : pending.choice;
-          return [task.id, [projectedChoice, ...choices.filter((choice) => !isPendingChoice(choice))]];
+          return [task.id, projectTaskModelPushConversationChoices(pending, choices)];
         }),
       ) as Record<string, NativeConversationChoice[]>,
     [nativeConversationChoicesByTask, snapshot.tasks, taskModelPushPendingByTask],
@@ -1012,7 +997,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const nativeConversationGroups = useMemo<ProjectConversationGroup[]>(
     () =>
       orderedProjects.map((project) => {
-        const statusConfig = resolveTaskManagementStatusConfig(appShellSettings, project.id);
+        const statusConfig = resolveTaskManagementStatusConfig(appShellSettings);
         return {
           projectId: project.id,
           projectName: project.name,
@@ -1035,7 +1020,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       }),
     [
       appShellSettings.appLanguage,
-      appShellSettings.taskManagementStatusByProject,
       appShellSettings.taskManagementStatusTemplate,
       conversationTreeHiddenTaskIds,
       nativeConversationChoicesByProject,
@@ -1213,7 +1197,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const nativeSessionTaskRecord = nativeSessionTaskRecordSource ? projectTaskModelPushManagementStatus(nativeSessionTaskRecordSource) : undefined;
   const optimisticNativeSessionTaskStatus = nativeSessionTaskRecord ? optimisticTerminalTaskStatuses[nativeSessionTaskRecord.id] : undefined;
   const effectiveNativeSessionTaskRecord = nativeSessionTaskRecord && optimisticNativeSessionTaskStatus ? { ...nativeSessionTaskRecord, managementStatus: optimisticNativeSessionTaskStatus } : nativeSessionTaskRecord;
-  const nativeSessionTaskStatusConfig = effectiveNativeSessionTaskRecord ? resolveTaskManagementStatusConfig(appShellSettings, effectiveNativeSessionTaskRecord.projectId) : null;
+  const nativeSessionTaskStatusConfig = effectiveNativeSessionTaskRecord ? resolveTaskManagementStatusConfig(appShellSettings) : null;
   /** 已归档会话、新建会话和任务结束中的操作沿用重新打开入口；未归档原会话可以继续。 */
   const nativeSessionTaskReadOnly = Boolean(
     (selectedNativeConversation?.archived !== false || optimisticNativeSessionTaskStatus) &&
@@ -1244,7 +1228,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     }
     return Object.fromEntries(entries);
   }, [nativeLegacyConversationDetails]);
-  const activeTaskManagementStatusConfig = resolveTaskManagementStatusConfig(appShellSettings, activeProjectId);
+  const activeTaskManagementStatusConfig = resolveTaskManagementStatusConfig(appShellSettings);
   const activeTaskManagementStatusLabels = buildConfiguredTaskManagementStatusLabels(activeTaskManagementStatusConfig, appShellSettings.appLanguage);
   const activeTaskManagementStatusIds = activeTaskManagementStatusConfig.statuses.map((status) => status.id);
   const taskStatusFilterValues: readonly TaskStatusFilter[] = ['', 'unfinished', ...activeTaskManagementStatusIds];
@@ -1290,6 +1274,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     appShellSettings,
     appShellSettingsRef,
     archivedConversationLoadState,
+    archivedConversationError,
     archivedConversationRefreshPromiseRef,
     archivedConversations,
     archivedProjects,
@@ -1305,7 +1290,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     conversationDraftOpen,
     conversationDrawer,
     conversationNotificationRef,
-    createProjectConfigForm,
     creatingGitConfirmationBusy,
     creatingProjectBusy,
     creatingTaskBusy,
@@ -1361,6 +1345,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     nativeSessionTaskReadOnly,
     newConversationFocusRequest,
     optimisticTerminalTaskStatuses,
+    pendingTaskStatuses,
     orderedProjects,
     patchExportStatus,
     patchProjectConfigForm,
@@ -1402,6 +1387,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setGlobalAgentSettingsDirty,
     projectTaskModelPushManagementStatus,
     projectWorkspaceConfigStatus,
+    projectWorkspaceConfigError,
     projectedRuntimeLogOutput,
     projectedTaskConversationChoices,
     reconcileNativeConversationProjectSnapshot,
@@ -1461,6 +1447,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setAppShellSettings,
     setArchivedConversationLoadState,
     setArchivedConversations,
+    loadArchivedConversations,
     setArchivedProjects,
     setCodexConfigImportError,
     setCodexConfigImportLoading,
@@ -1497,6 +1484,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setNativeLegacyMessageLoadState,
     setNewConversationFocusRequest,
     setOptimisticTerminalTaskStatuses,
+    setPendingTaskStatuses,
     setPatchExportStatus,
     setPendingProjectDeleteId,
     setProjectCodeWorkspaceMode,
@@ -1571,15 +1559,13 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setTaskModelPushForm,
     setTaskModelPushRefreshingRepositoryId,
     setTaskModelPushRuntimeCapabilities,
-    setTaskModelPushServiceTierPreferences,
     setTaskModelPushStatus,
     setTaskModelPushTaskId,
     setTaskSearchQuery,
-    setTaskStatusSettingsTargetId,
     setTaskTableLayoutDraft,
+    taskTableLayoutDraftRef,
     setTaskTableLayoutLeaveDialogOpen,
     setTaskTableLayoutSaveBusy,
-    setTaskTableLayoutScopeDialogOpen,
     setTaskTagFilter,
     setTaskTemplates,
     setTaskTerminalCleanupConfirmation,
@@ -1607,6 +1593,12 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     taskConversationReopenState,
     taskCreateError,
     taskCreateForm,
+    digitalTeamTask,
+    setDigitalTeamTask,
+    digitalTeamEntrySelection,
+    setDigitalTeamEntrySelection,
+    taskCreateTeamId,
+    setTaskCreateTeamId,
     taskCreateModalOpen,
     taskCreateReturnFocusRef,
     taskCreateTitleInputRef,
@@ -1638,7 +1630,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     taskModelPushPendingByTaskRef,
     taskModelPushRefreshingRepositoryId,
     taskModelPushRuntimeCapabilities,
-    taskModelPushServiceTierPreferences,
     taskModelPushStatus,
     taskModelPushTaskId,
     taskMutationQueuesRef,
@@ -1646,11 +1637,9 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     taskSearchQuery,
     taskStatusFilter,
     taskStatusFilterValues,
-    taskStatusSettingsTargetId,
     taskTableLayoutDirty,
     taskTableLayoutLeaveDialogOpen,
     taskTableLayoutSaveBusy,
-    taskTableLayoutScopeDialogOpen,
     taskTagFilter,
     taskTemplates,
     taskTerminalCleanupConfirmation,

@@ -22,6 +22,7 @@ interface DiffRow {
 interface CodeDiffViewProps {
   file: TaskGitFileDiff;
   unified?: boolean;
+  singleSide?: 'left' | 'right';
   alignReplacements?: boolean;
   resizable?: boolean;
   omitHunkHeaders?: boolean;
@@ -34,7 +35,7 @@ interface CodeDiffViewProps {
 
 /** 普通审阅采用原生 Diff；含评论的补丁保留权威行号映射，共用 Monaco 模型和高亮。 */
 export const CodeDiffView = memo(function CodeDiffView(props: CodeDiffViewProps) {
-  return props.renderLineNumber || props.renderLineComments ? <AnnotatedDiff {...props} /> : <NativeDiff {...props} />;
+  return props.singleSide || props.renderLineNumber || props.renderLineComments ? <AnnotatedDiff {...props} /> : <NativeDiff {...props} />;
 });
 
 function NativeDiff(props: CodeDiffViewProps) {
@@ -168,8 +169,8 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
     return result;
   }, [props.annotationLines, rows, props.file.oldPath, props.file.newPath]);
   useEffect(() => {
-    if (!left || (!props.unified && !right)) return;
-    const views = props.unified ? [left] : [left, right!];
+    if (props.singleSide === 'right' ? !right : !left || (!props.unified && !props.singleSide && !right)) return;
+    const views = props.singleSide === 'right' ? [right!] : props.unified || props.singleSide === 'left' ? [left!] : [left!, right!];
     let syncing = false,
       frame = 0,
       active = true;
@@ -181,7 +182,7 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
       widgets.splice(0).forEach(({ view, widget }) => view.removeGlyphMarginWidget(widget));
       const portals: LinePortal[] = [];
       views.forEach((view, index) => {
-        const side: 'left' | 'right' = index === 0 ? 'left' : 'right';
+        const side: 'left' | 'right' = props.singleSide === 'right' ? 'right' : index === 0 ? 'left' : 'right';
         for (const visible of view.getVisibleRanges())
           for (let number = visible.startLineNumber; number <= visible.endLineNumber; number++) {
             const row = rows[number - 1];
@@ -214,7 +215,18 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
       view.updateOptions({ glyphMargin: true, lineNumbers: 'off', lineDecorationsWidth: props.unified ? 100 : 54, wordWrap: 'off', padding: { top: 0, bottom: 32 } });
       const marks = view.createDecorationsCollection(
         rows.map((row, offset) => {
-          const kind = props.unified || row.kind === 'header' ? row.kind : row[index === 0 ? 'leftNumber' : 'rightNumber'] === null ? 'empty' : row.kind === 'replacement' ? (index === 0 ? 'deletion' : 'addition') : row.kind;
+          const kind =
+            props.unified || row.kind === 'header'
+              ? row.kind
+              : row[props.singleSide === 'right' ? 'rightNumber' : index === 0 ? 'leftNumber' : 'rightNumber'] === null
+                ? 'empty'
+                : row.kind === 'replacement'
+                  ? props.singleSide === 'right'
+                    ? 'addition'
+                    : index === 0
+                      ? 'deletion'
+                      : 'addition'
+                  : row.kind;
           return { range: new monaco.Range(offset + 1, 1, offset + 1, 1), options: { isWholeLine: true, className: 'code-diff-line is-' + kind } };
         }),
       );
@@ -229,7 +241,7 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
           .map((selection) => {
             const parts: string[] = [];
             for (let line = selection.startLineNumber; line <= selection.endLineNumber; line++) {
-              if (rows[line - 1]?.[index === 0 ? 'leftNumber' : 'rightNumber'] == null) continue;
+              if (rows[line - 1]?.[props.singleSide === 'right' ? 'rightNumber' : index === 0 ? 'leftNumber' : 'rightNumber'] == null) continue;
               const content = model.getLineContent(line);
               parts.push(content.slice(line === selection.startLineNumber ? selection.startColumn - 1 : 0, line === selection.endLineNumber ? selection.endColumn - 1 : undefined));
             }
@@ -262,17 +274,17 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
       widgets.forEach(({ view, widget }) => view.removeGlyphMarginWidget(widget));
       disposables.forEach((item) => item.dispose());
     };
-  }, [left, right, rows, props.unified]);
+  }, [left, right, rows, props.unified, props.singleSide]);
   useEffect(() => {
-    if (!left || (!props.unified && !right)) return;
+    if (props.singleSide === 'right' ? !right : !left || (!props.unified && !props.singleSide && !right)) return;
     const zones: Array<{ view: monaco.editor.IStandaloneCodeEditor; id: string; row: number; node: HTMLElement; height: number }> = [];
-    const views = props.unified ? [left] : [left, right!];
+    const views = props.singleSide === 'right' ? [right!] : props.unified || props.singleSide === 'left' ? [left!] : [left!, right!];
     const rowIds = [...new Set(comments.map((comment) => comment.row))];
     for (const row of rowIds)
       views.forEach((view, index) => {
         const node = document.createElement('div');
         node.className = 'code-diff-annotation';
-        comments.filter((item) => item.row === row && (props.unified || item.side === (index === 0 ? 'left' : 'right'))).forEach((item) => node.append(item.element));
+        comments.filter((item) => item.row === row && (props.unified || item.side === (props.singleSide === 'right' ? 'right' : index === 0 ? 'left' : 'right'))).forEach((item) => node.append(item.element));
         view.changeViewZones((accessor) => {
           zones.push({ view, row, node, height: 1, id: accessor.addZone({ afterLineNumber: row + 1, heightInPx: 1, domNode: node, suppressMouseDown: false }) });
           exposeEditorControl(view, node);
@@ -297,7 +309,7 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
       resize.disconnect();
       zones.forEach((zone) => zone.view.changeViewZones((accessor) => accessor.removeZone(zone.id)));
     };
-  }, [left, right, comments, props.unified]);
+  }, [left, right, comments, props.unified, props.singleSide]);
   useEffect(() => {
     const target = props.focusAnnotation;
     if (!target) return;
@@ -309,9 +321,9 @@ function AnnotatedDiff(props: CodeDiffViewProps) {
     return () => cancelAnimationFrame(frame);
   }, [props.focusAnnotation, comments, rows, left, right, props.unified]);
   return (
-    <div className={'code-diff-view' + (props.unified ? ' is-unified' : '')} aria-label={props.label}>
-      <CodeEditor path={props.file.oldPath + ':review-left'} language={detectSourceLanguage(props.file.oldPath || props.file.newPath)} content={content.left} readOnly onView={setLeft} />
-      {!props.unified ? <CodeEditor path={props.file.newPath + ':review-right'} language={detectSourceLanguage(props.file.newPath)} content={content.right} readOnly onView={setRight} /> : null}
+    <div className={'code-diff-view' + (props.unified || props.singleSide ? ' is-unified' : '')} aria-label={props.label}>
+      {props.singleSide !== 'right' ? <CodeEditor path={props.file.oldPath + ':review-left'} language={detectSourceLanguage(props.file.oldPath || props.file.newPath)} content={content.left} readOnly onView={setLeft} /> : null}
+      {!props.unified && props.singleSide !== 'left' ? <CodeEditor path={props.file.newPath + ':review-right'} language={detectSourceLanguage(props.file.newPath)} content={content.right} readOnly onView={setRight} /> : null}
       {linePortals.map((portal) => {
         const number = rows[portal.row]?.[portal.side === 'left' ? 'leftNumber' : 'rightNumber'];
         return createPortal(number == null ? null : (props.renderLineNumber?.(number, portal.side) ?? number), portal.element, portal.key);
@@ -329,7 +341,7 @@ function diffRows(file: TaskGitFileDiff, align: boolean, omitHunkHeaders: boolea
   const rows: DiffRow[] = [];
   for (const hunk of file.hunks) {
     if (!omitHunkHeaders) rows.push({ left: hunk.header, right: hunk.header, leftNumber: null, rightNumber: null, kind: 'header' });
-    for (let index = 0; index < hunk.lines.length; ) {
+    for (let index = 0; index < hunk.lines.length;) {
       const line = hunk.lines[index]!;
       if (align && (line.type === 'deletion' || line.type === 'addition')) {
         const deleted: typeof hunk.lines = [];
