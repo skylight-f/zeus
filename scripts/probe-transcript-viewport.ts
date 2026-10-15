@@ -1,5 +1,6 @@
 import { conversationProcessPresentation } from '../packages/shared/src/conversationProcessPresentation.js';
 import { activityOutcome, nativeActivityTitle, nativeActivityTool } from '../apps/desktop/src/renderer/session/activityPresentation.js';
+import { commandTerminationProjection, completedItemProjection } from '../packages/local-server/src/codexNativeConversationPolicy.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -24,7 +25,7 @@ import { mergeConversationProcessV2, mergeConversationTurnHistoryV2 } from '../a
 import { createInitialSessionState, createHydratedSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.js';
 import { createTranscriptProjection, reuseTranscriptRows, reuseTranscriptTurnRows, updateTranscriptProjection } from '../apps/desktop/src/renderer/session/transcriptProjection.js';
 import { reconcileTranscriptItems } from '../apps/desktop/src/renderer/session/transcriptReconciliation.js';
-import { buildPersistedSessionViewCache, initialSessionHotCache, primePersistedSessionViewCache } from '../apps/desktop/src/renderer/session/sessionHotCache.js';
+import { buildPersistedSessionViewCache, restoreSessionViewCache } from '../apps/desktop/src/renderer/session/sessionHotCache.js';
 import { mergeNavigationEntries, navigationRowKey } from '../apps/desktop/src/renderer/session/ConversationNavigation.js';
 import { createThreadScrollController } from '../apps/desktop/src/renderer/session/useThreadScrollController.js';
 import type { ConversationNavigationSnapshot } from '@zeus/shared';
@@ -54,7 +55,7 @@ registerHooks({
 /** tsx 探针不经过 Vite 的 JSX 自动运行时，显式提供组件模块需要的 React 命名空间。 */
 (globalThis as typeof globalThis & { React: typeof import('react') }).React = await import('react');
 /** 将历史过程分页串联到正式行编号和轮次分组，覆盖同轮多段思考。 */
-const { projectTranscriptRows, projectTranscriptTurnRows, projectTranscriptFailureRows, projectQueuedSubmissionItems } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
+const { projectTranscriptRows, projectTranscriptTurnRows, projectTranscriptFailureRows, projectQueuedSubmissionItems, transcriptRunStatus } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
 /** 工作面入口也引用组件样式，必须在样式加载钩子安装后导入。 */
 const { resolveConversationNavigationId, resolveSelectedNativeConversationForProject } = await import('../apps/desktop/src/renderer/features/workspace/workspaceSupport.js');
 
@@ -102,6 +103,29 @@ if (process.argv.includes('--source-aliases-only')) {
 if (process.argv.includes('--async-question-recovery')) {
   verifyAsyncQuestionRecovery();
   console.log('async-question-recovery=passed');
+  process.exit(0);
+}
+
+/** 切回缓存会话的普通读取不能误报断线，真实恢复及已确认运行态继续显示。 */
+function verifyTranscriptRunStatus(): void {
+  /** 缓存保留活动轮次，连接由当前订阅重新确认。 */
+  const state: NativeSessionState = { ...createInitialSessionState(), activeTurnId: 'status-turn', conversationState: 'active_prework' };
+  for (const transportState of ['disconnected', 'connecting', 'hydrating', 'failed', 'reconnecting', 'ready'] as const) {
+    assertProbe(
+      transcriptRunStatus({ ...state, transportState }) === (transportState === 'reconnecting' ? 'reconnecting' : transportState === 'ready' ? 'executing' : null),
+      `${transportState} 必须按真实连接状态显示，不能从缓存活动轮次推断重连。`,
+    );
+  }
+  assertProbe(transcriptRunStatus({ ...state, transportState: 'hydrating', providerReconnectAttempt: 2, providerReconnectAttempts: 5 }) === 'reconnecting', 'Provider 明确恢复连接时仍须显示。');
+  assertProbe(transcriptRunStatus({ ...state, transportState: 'ready', conversationState: 'waiting_user_input' }) === 'waiting_input', '正常连接时保留等待回答状态。');
+  assertProbe(transcriptRunStatus({ ...state, transportState: 'ready', conversationState: 'waiting_approval' }) === 'waiting_approval', '正常连接时保留等待审批状态。');
+  assertProbe(transcriptRunStatus({ ...state, transportState: 'connecting', conversationState: 'starting_turn' }) === 'starting', '已提交轮次保留启动处理状态。');
+  assertProbe(transcriptRunStatus({ ...state, transportState: 'reconnecting', terminalTurnIds: { 'status-turn': 'completed' } }) === null, '结束轮次不能显示活动重连提示。');
+}
+verifyTranscriptRunStatus();
+/** 单独检查连接提示，不受无关的历史存储场景影响。 */
+if (process.argv.includes('--run-status-only')) {
+  console.log('transcript-run-status=passed');
   process.exit(0);
 }
 
@@ -260,10 +284,10 @@ for (const [name, kind] of [
   assertProbe(nativeActivityTool({ toolName: name })?.kind === kind, '两个 Provider 的原生工具命名必须映射到同一展示类别。');
 }
 assertProbe(nativeActivityTool({ toolName: 'plugin_zeus_browser_open' }) === null, '插件名称包含原生工具字样也不能冒充原生操作。');
-/** 使用原生观察的应用名称，禁止从内部标识猜测产品。 */
+/** 使用当前原生观察结构中的应用名称，禁止从内部标识猜测产品。 */
 const desktopPresentation = conversationProcessPresentation('tool', {
   itemType: 'dynamicToolCall',
-  payload: { namespace: 'zeus_computer', tool: 'get_window_state', arguments: { pid: 42, window_id: 7 }, contentItems: [{ type: 'inputText', text: JSON.stringify({ app_name: 'Zeus Test' }) }], success: true },
+  payload: { namespace: 'zeus_computer', tool: 'get_window_state', arguments: { pid: 42, window_id: 7 }, contentItems: [{ type: 'inputText', text: JSON.stringify({ application: { name: 'Zeus Test' } }) }], success: true },
 });
 assertProbe(nativeActivityTitle({ status: 'completed', payload: desktopPresentation.payload }, true)?.includes('Zeus Test') === true, '历史投影必须保留工具身份和真实应用元信息。');
 assertProbe(!nativeActivityTitle({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'get_window_state', arguments: { pid: 42, window_id: 7 } } }, true)?.includes('window_id'), '缺少真实名称时不得在摘要暴露内部标识。');
@@ -274,11 +298,164 @@ assertProbe(
 );
 assertProbe(activityOutcome({ status: 'completed', payload: { success: false } }) === 'failed' && activityOutcome({ status: 'completed', payload: { status: 'cancelled' } }) === 'cancelled', '结束记录仍保留失败与取消的真实状态。');
 assertProbe(activityOutcome({ status: 'completed', payload: failedCommand.payload }) === 'failed', '非零退出码不能显示已完成。');
+/** 信号类终止只改变展示语义，不改写 Provider 的失败记录。 */
+for (const exitCode of [130, 143]) {
+  /** 实时和历史命令均包含明确活动类型，工具失败标志仍保留在原始结果。 */
+  const command = { type: 'commandExecution', status: 'failed', payload: { status: 'failed', exitCode, isError: true } };
+  assertProbe(activityOutcome(command) === 'terminated' && command.status === 'failed' && command.payload.exitCode === exitCode, '信号类终止不能显示运行失败或修改原始结果。');
+  assertProbe(activityOutcome({ ...command, status: 'completed' }) === 'terminated', '调用已返回不能覆盖命令的终止结果。');
+  assertProbe(activityOutcome({ ...command, type: 'mcpToolCall' }) === 'failed', '普通工具的同名退出码不能冒充命令终止。');
+  assertProbe(activityOutcome({ ...command, payload: { ...command.payload, status: 'cancelled' } }) === 'cancelled', '明确取消不能被非零退出码覆盖。');
+}
+/** 运行错误、强制退出和崩溃仍保留失败提示。 */
+for (const exitCode of [1, 127, 137, 139]) assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: { exitCode } }) === 'failed', '真实命令错误不能被归为正常终止。');
 assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', v2ContentTruncated: true } }) === 'unknown', 'CUA 结果截断时不能丢失动作状态并误报完成。');
+/** 两条投影入口共用中断元信息，原始状态、命令和退出码保持原样。 */
+const unfinishedCommandPayload = { status: 'inProgress', command: 'python3 -m http.server 0', aggregatedOutput: '' };
+const interruptedCommandPayload = commandTerminationProjection(unfinishedCommandPayload, 'commandExecution', 'interrupted');
+assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: interruptedCommandPayload }) === 'terminated', '没有退出码的中断命令不能显示运行失败');
+assertProbe(JSON.stringify(unfinishedCommandPayload) === JSON.stringify({ status: 'inProgress', command: 'python3 -m http.server 0', aggregatedOutput: '' }), '中断展示不能改变 Provider 原件');
+assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: commandTerminationProjection(interruptedCommandPayload, 'commandExecution', 'failed') }) === 'failed', '真实失败轮次必须撤销旧中断标记');
+assertProbe(
+  activityOutcome({ type: 'commandExecution', status: 'failed', payload: commandTerminationProjection({ ...unfinishedCommandPayload, exitCode: 7 }, 'commandExecution', 'interrupted') }) === 'failed',
+  '轮次中断不能掩盖已经取得的错误退出码',
+);
+assertProbe(
+  activityOutcome({ type: 'commandExecution', status: 'failed', payload: commandTerminationProjection({ ...unfinishedCommandPayload, error: { message: '执行错误' } }, 'commandExecution', 'interrupted') }) === 'failed',
+  '无退出码的明确执行错误不能归为终止',
+);
+assertProbe(
+  activityOutcome({
+    type: 'commandExecution',
+    status: 'completed',
+    payload: completedItemProjection({ payloadJson: JSON.stringify(interruptedCommandPayload), textContent: '' }, { status: 'completed', exitCode: 0 }, 'commandExecution').payload,
+  }) === 'completed',
+  '迟到的真实完成结果必须取代中断展示',
+);
+assertProbe(
+  activityOutcome({ type: 'commandExecution', status: 'failed', payload: conversationProcessPresentation('command', { provider: 'codex', payload: interruptedCommandPayload }).payload }) === 'terminated',
+  '过程展示必须保留共享中断元信息',
+);
+/** 只接受可以确认的独立搜索，组合命令、错误输出、缺失或不完整输出仍保留失败。 */
+for (const command of ['rg missing src', "rg -n '中文 关键词' src", 'rg -n "中文 关键词" src', "/bin/zsh -lc 'rg -n missing src'", ['rg', 'missing', 'src'], ['/bin/bash', '-lc', 'rg missing src']]) {
+  assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: { command, exitCode: 1, aggregatedOutput: '' } }) === 'no_matches', '独立 rg 的空输出退出 1 应显示未找到匹配');
+}
+for (const command of [
+  'false',
+  'rg missing src; false',
+  'rg missing src && false',
+  'rg missing src | cat',
+  'rg missing src > /dev/null',
+  'rg $(false) src',
+  'rg "$VALUE" src',
+  'rg missing src\nfalse',
+  "/bin/zsh -lc 'rg missing src; false'",
+  '/bin/zsh -lc "rg \'$(false)\' src"',
+  '/tmp/*/rg missing src',
+  "/bin/*/zsh -lc 'rg missing src'",
+]) {
+  assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: { command, exitCode: 1, aggregatedOutput: '' } }) === 'failed', '组合命令或展开不能借用搜索无匹配状态');
+}
+for (const extra of [{ stderr: 'rg: read error' }, { stdout: '存在输出' }, { v2ContentTruncated: true }, { aggregatedOutput: undefined }]) {
+  assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: { command: 'rg missing src', exitCode: 1, aggregatedOutput: '', ...extra } }) === 'failed', '输出异常、截断或缺失不能作为无匹配证据');
+}
+/** Pi 受管 bash 的进程输出与外层 JSON 元信息必须分开判断。 */
+const piNoMatches = conversationProcessPresentation('tool', {
+  provider: 'pi',
+  block: { name: 'bash', arguments: { command: 'rg missing src' } },
+  payload: { toolName: 'bash', result: { isError: true, details: { exitCode: 1 }, content: [{ type: 'text', text: JSON.stringify({ processId: 'managed-search', status: 'failed', exitCode: 1, hasMore: false, output: '' }) }] } },
+});
+assertProbe(activityOutcome({ type: piNoMatches.type, status: 'completed', payload: piNoMatches.payload }) === 'no_matches', 'Pi 的同一次无匹配搜索不能被通用工具错误标记覆盖');
+assertProbe(activityOutcome({ type: 'dynamicToolCall', status: 'failed', payload: { command: 'rg missing src', exitCode: 1, output: '' } }) === 'failed', '其他工具不得使用命令搜索语义');
+/** 使用当前 SDK 的原生验证字段，调用成功与验证通过分开判断。 */
+for (const [result, expected] of [
+  [{ status: 'unknown', stable: false }, 'unknown'],
+  [{ status: 'unsatisfied', stable: false }, 'failed'],
+  [{ status: 'satisfied', stable: true }, 'completed'],
+  [{ status: 'satisfied', stable: false }, 'unknown'],
+  [{}, 'unknown'],
+] as const) {
+  assertProbe(
+    activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'verify_state', success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] } }) === expected,
+    '桌面验证必须展示真实条件结果，不能只看调用成功',
+  );
+}
+assertProbe(activityOutcome({ status: 'in_progress', payload: { namespace: 'zeus_computer', tool: 'verify_state' } }) === 'running', '尚未返回的验证应保持进行中');
+assertProbe(
+  activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'verify_state', status: 'unknown', output: JSON.stringify({ status: 'satisfied', stable: true }) } }) === 'unknown',
+  '未确认的调用状态不能被单个条件结果覆盖',
+);
+/** 当前动作契约的 effect 与原生控制暂停同时保留，未知状态不得被当成成功。 */
+for (const [effect, expected] of [
+  ['confirmed', 'completed'],
+  ['partial', 'observe'],
+  ['unverifiable', 'observe'],
+  ['suspected_noop', 'observe'],
+  ['refused', 'failed'],
+  ['unrecognized', 'unknown'],
+] as const) {
+  assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', output: JSON.stringify({ action: { effect } }) } }) === expected, '桌面动作必须保留拒绝和未确认效果');
+}
+assertProbe(activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'get_window_state', output: JSON.stringify({ zeus_control: { paused: true } }) } }) === 'waiting', '用户控制暂停不能显示操作已完成');
+assertProbe(
+  activityOutcome({ status: 'completed', payload: { namespace: 'zeus_computer', tool: 'click', output: JSON.stringify({ effect: 'unverifiable', route: 'accessibility' }) } }) === 'observe',
+  'SDK 的直接动作结果也必须保留不可确认效果',
+);
 /** 工具展示可单独检查，不依赖后续长历史游标与数据库场景。 */
 if (process.argv.includes('--activity-presentation')) {
+  /** 命令、Provider 原件及展示元信息均在独立临时目录内验证。 */
+  const root = await mkdtemp(join(tmpdir(), 'zeus-activity-outcomes-'));
+  try {
+    writeFileSync(join(root, 'source.txt'), '已有内容\n');
+    /** 真实无匹配、CLI 参数错误和组合命令分别保留各自退出语义。 */
+    for (const [command, argv, expected] of [
+      ['rg missing source.txt', ['rg', 'missing', 'source.txt'], 'no_matches'],
+      ["rg '[' source.txt", ['rg', '[', 'source.txt'], 'failed'],
+      ['rg missing source.txt; false', ['/bin/sh', '-c', 'rg missing source.txt; false'], 'failed'],
+    ] as const) {
+      const run = spawnSync(argv[0], [...argv.slice(1)], { cwd: root, encoding: 'utf8' });
+      assertProbe(!run.error && typeof run.status === 'number', '真实命令必须取得实际退出码');
+      assertProbe(activityOutcome({ type: 'commandExecution', status: 'failed', payload: { command, exitCode: run.status, stdout: run.stdout, stderr: run.stderr } }) === expected, '真实 rg 结果和组合命令必须使用不同状态');
+    }
+    /** 使用产品仓储落盘中断原因，不能只依赖内存中的展示对象。 */
+    const databasePath = join(root, 'items.db');
+    const database = await createZeusDatabase(databasePath);
+    let storedId = '';
+    try {
+      const repository = new ConversationProviderItemRepository(database);
+      const item = repository.upsertCompleted({
+        conversationId: 'outcome-conversation',
+        turnId: 'outcome-turn',
+        providerThreadId: 'outcome-thread',
+        providerTurnId: 'outcome-native-turn',
+        providerItemId: 'unfinished-command',
+        itemType: 'commandExecution',
+        phase: 'prework',
+        payload: interruptedCommandPayload,
+        textContent: '',
+        status: 'failed',
+        completedAt: '2026-10-08T12:00:00.000Z',
+        updatedAt: '2026-10-08T12:00:00.000Z',
+      });
+      storedId = item.id;
+      await database.save();
+    } finally {
+      await database.close();
+    }
+    /** 重新打开真实 SQLite，确认原状态、原身份和中断展示均可恢复。 */
+    const reopened = await createZeusDatabase(databasePath);
+    try {
+      const item = new ConversationProviderItemRepository(reopened).getById(storedId);
+      assertProbe(item?.status === 'failed' && item.providerItemId === 'unfinished-command', '持久恢复不能改写原 Provider 状态或身份');
+      assertProbe(activityOutcome({ type: item.itemType, status: item.status, payload: JSON.parse(item.payloadJson) }) === 'terminated', '重新打开后没有退出码的中断命令必须保持已终止');
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
   await probeNavigation();
-  console.log('工具展示探针通过：原生身份、应用名称、失败、取消与 CUA 未确认结果。');
+  console.log('工具展示探针通过：原生身份、应用名称、中断原因、单次搜索无匹配与桌面验证结果。');
   process.exit(0);
 }
 assertProbe(
@@ -620,8 +797,10 @@ function verifyTranscriptSourceAliases(): void {
   /** 缓存读写边界拒绝重复身份，正常单条缓存仍可恢复。 */
   const persisted = buildPersistedSessionViewCache(new Map([[history.conversationId!, { state: history, estimatedBytes: 1, cachedAt: Date.now() }]]));
   assertProbe(persisted.entries.length === 1, '合法显示缓存必须继续可用');
-  primePersistedSessionViewCache({ ...persisted, entries: [{ ...persisted.entries[0]!, state: duplicated }] });
-  assertProbe(initialSessionHotCache().size === 0, '重复身份显示缓存不能进入首次渲染');
+  assertProbe(
+    restoreSessionViewCache({ ...persisted, entries: [{ ...persisted.entries[0]!, state: duplicated }] }, { projectId: history.projectId!, conversationId: history.conversationId! }) === undefined,
+    '重复身份显示缓存不能进入首次渲染',
+  );
 }
 verifyTranscriptSourceAliases();
 
@@ -1261,6 +1440,11 @@ async function probeNavigation() {
       ['optimistic-id', 'confirmed-id'].map((id) => ({ ...tail, id, rowKey: navigationRowKey(tail), loaded: true })),
     );
     assertProbe(merged.length === count && merged.filter((entry) => entry.loaded).length === 1, '实时确认必须按客户端身份去重，保留未加载占位');
+    /** 用户先进入历史页时保留回复补读，完整回复到达后撤销入口。 */
+    const partial = mergeNavigationEntries([tail], [{ ...tail, response: '', rowKey: navigationRowKey(tail), loaded: true }])[0]!;
+    assertProbe(partial.loaded && partial.needsTurnContent === true && partial.rowKey === navigationRowKey(tail), '用户气泡已显示不能让尚未加载的历史回复失去补读入口。');
+    assertProbe(merged.at(-1)?.needsTurnContent === false, '最终回复已进入正文后不能继续补读同一轮。');
+    assertProbe(mergeNavigationEntries([{ ...tail, response: '' }], [{ ...tail, response: '', rowKey: navigationRowKey(tail), loaded: true }])[0]?.needsTurnContent === false, '确实没有文字回复的轮次不能生成空的补读入口。');
     assertProbe(
       mergeNavigationEntries(
         [],

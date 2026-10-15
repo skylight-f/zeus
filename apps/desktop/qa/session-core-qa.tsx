@@ -1,3 +1,4 @@
+import { SystemMessagesQa } from './system-messages-qa.js';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ModelSelectQa } from './model-select-qa.js';
 import { asyncMessageQuestions, conversationQuestionNavigationExcerpt, buildTaskPushLayout, describeUserFacingError, formatAsyncQuestionAnswer, type ConversationNavigationEntry, type UserFacingErrorCause } from '@zeus/shared';
@@ -11,6 +12,7 @@ import { Button } from '../src/renderer/ui/Button.js';
 import { ConversationMarkdown } from '../src/renderer/session/ConversationMarkdown.js';
 import { ConversationInlineResource, ConversationResourceCards, defaultOpenTarget } from '../src/renderer/session/ConversationResources.js';
 import { ConversationComposer, type ComposerRuntimeSettings } from '../src/renderer/session/ConversationComposer.js';
+import type { ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { QueuedConversationMessages } from '../src/renderer/session/QueuedConversationMessages.js';
 import { SessionActivityGroup } from '../src/renderer/session/SessionActivity.js';
 import { SubagentWorkspace } from '../src/renderer/session/SubagentWorkspace.js';
@@ -76,6 +78,7 @@ const scenes: QaScene[] = [
   { query: 'model-select', title: '模型选择与置顶', summary: '共享选择框的分组、焦点、搜索和持久置顶。', answer: '', activities: [] },
   { query: 'paste-focus', title: '附件粘贴焦点', summary: '真实任务输入的异步附件与光标保持。', answer: '', activities: [] },
   { query: 'composer', title: '粘贴 Markdown', summary: '真实输入组件的 Markdown 排版、直接编辑和发送原文。', answer: '', activities: [] },
+  { query: 'system-messages', title: 'Zeus 系统消息', summary: '持久化、恢复和草稿归属。', answer: '', activities: [] },
   { query: 'error-order', title: '报错后的消息顺序', summary: '失败记录固定在发生位置。', answer: '', activities: [] },
   { query: 'error-layout', title: '会话错误提示预览', summary: '已确认的提示样式直接来自会话组件。', answer: '', activities: [] },
   { query: 'review', title: 'Markdown 变更审核', summary: '真实审核组件的预览、差异与读取状态。', answer: '', activities: [] },
@@ -187,6 +190,7 @@ export function SessionQaApp(props: { scene: QaScene }) {
   if (props.scene.query === 'queue-actions') return <QueueActionsQa />;
   if (props.scene.query === 'message-layout') return <MessageLayoutQa />;
   if (props.scene.query === 'model-select') return <ModelSelectQa />;
+  if (props.scene.query === 'system-messages') return <SystemMessagesQa />;
   if (props.scene.query === 'error-order') return <ErrorOrderQa />;
   if (props.scene.query === 'error-layout') return <ErrorLayoutQa />;
   if (props.scene.query === 'paste-focus') return <TaskPasteFocusQa />;
@@ -399,6 +403,10 @@ function QueueActionsQa() {
   const parameters = new URLSearchParams(window.location.search);
   /** 正常排队作为默认视觉对照，其他状态用于验证权限和恢复提示。 */
   const [scenario, setScenario] = useState(parameters.get('state') ?? 'queued');
+  /** 复现消息已保存、模型尚未接手时的真实空闲队首。 */
+  const preparing = scenario === 'preparing';
+  /** 恢复前后共用生产归约器，连接提示只随权威结束事件清除。 */
+  const connectionFeedback = scenario === 'reconnecting' || scenario === 'reconnected';
   /** 内容样本覆盖短消息、长文本、图文、纯附件和连续排队。 */
   const [sample, setSample] = useState(parameters.get('sample') ?? 'reference');
   /** 主题与窄栏只改变本页，不写入应用设置。 */
@@ -413,6 +421,8 @@ function QueueActionsQa() {
   const [outcomes, setOutcomes] = useState<Record<string, 'accepted' | 'deleted'>>({});
   /** 编辑结果继续绑定原提交身份，便于核对单行摘要即时更新。 */
   const [editedContent, setEditedContent] = useState<Record<string, string>>({});
+  /** 保存后的附件投影独立于原场景，重新编辑时读取同一份草稿。 */
+  const [editedAttachments, setEditedAttachments] = useState<Record<string, NativeConversationAttachment[]>>({});
   /** 人工重排结果按服务端完整身份列表模拟回写。 */
   const [queueOrder, setQueueOrder] = useState<string[]>([]);
   /** 输入框草稿只服务当前预览，不触碰正式会话。 */
@@ -421,6 +431,25 @@ function QueueActionsQa() {
   const surface = useRef<HTMLDivElement>(null);
   /** 显示操作回调与人工运行检查结果。 */
   const [result, setResult] = useState('等待检查');
+  useEffect(() => {
+    /** 浏览器场景只模拟宿主资源桥；Electron 保留真实选择、授权和预览能力。 */
+    if (window.zeus) return;
+    window.zeus = {
+      chooseConversationResources: async () => [{ name: '新增附件.txt', mime: 'text/plain', size: 12, kind: 'file', uploadRef: 'qa:queue-picked' }],
+      authorizeConversationFiles: async (files, source) => {
+        await nextQaTask();
+        return {
+          resources: files.map((file) => ({ name: file.name, mime: file.type || 'application/octet-stream', size: file.size, kind: file.type.startsWith('image/') ? 'image' : 'file', source, uploadRef: `qa:queue:${file.name}` })),
+          failedCount: 0,
+        };
+      },
+      materializeConversationResources: async (resources) =>
+        resources.map((resource) => ({ name: resource.name ?? 'Pasted text.txt', mime: 'text/plain', size: new Blob([resource.text ?? '']).size, kind: 'pasted_text', restorableText: resource.text, uploadRef: 'qa:queue:text' })),
+    } as NonNullable<Window['zeus']>;
+    return () => {
+      delete window.zeus;
+    };
+  }, []);
   /** 定稿对照文本与英文文本具有同一含义。 */
   const reference = language === 'zh-CN' ? '而且主智能体发送给子智能体的提示词为什么没显示?' : 'Why are the prompts sent from the main agent to subagents not displayed?';
   /** 长文本保留 Markdown 结构，并触发原有展开全文入口。 */
@@ -441,17 +470,25 @@ function QueueActionsQa() {
       id: `qa-submission-${index + 1}`,
       content: editedContent[`qa-submission-${index + 1}`] ?? text,
       position: index + 1,
-      status: scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted' ? 'resolved' : scenario === 'queued' || scenario === 'restoring' ? 'queued' : scenario === 'failed' ? 'failed' : 'paused',
-      pausedReason: ['queued', 'accepted', 'restoring'].includes(scenario) ? null : scenario,
+      status:
+        scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted'
+          ? 'resolved'
+          : scenario === 'queued' || scenario === 'restoring' || preparing || connectionFeedback
+            ? 'queued'
+            : scenario === 'failed'
+              ? 'failed'
+              : 'paused',
+      pausedReason: ['queued', 'accepted', 'restoring'].includes(scenario) || preparing || connectionFeedback ? null : scenario,
       providerTurnId: scenario === 'accepted' || outcomes[`qa-submission-${index + 1}`] === 'accepted' ? 'qa-turn' : null,
       createdAt: '2026-09-10T02:00:00Z',
       attachments:
-        sample === 'attachment' || sample === 'attachment-only'
+        editedAttachments[`qa-submission-${index + 1}`] ??
+        (sample === 'attachment' || sample === 'attachment-only'
           ? [
               { name: '排队消息说明.md', mime: 'text/markdown', size: 128, kind: 'file' as const, localPath: '/qa/排队消息说明.md' },
               { name: '界面参考图.png', mime: 'image/png', size: 2048, kind: 'image' as const, localPath: '/qa/界面参考图.png' },
             ]
-          : [],
+          : []),
       error:
         scenario === 'outcome_unknown'
           ? { code: 'ZEUS_CODEX_RPC_PROTOCOL_ERROR', message: 'Codex 响应无法读取，已发出的操作需要核对结果。', recoveryRequired: true }
@@ -495,18 +532,49 @@ function QueueActionsQa() {
       updatedAt: submission.createdAt,
     }));
   /** 活动轮次确保普通队列正在等待，恢复原因直接传给生产投影。 */
-  const state: NativeSessionState = {
+  const previewState: NativeSessionState = {
     ...createInitialSessionState(),
     draft: composerDraft,
     conversationId: 'qa-queue',
+    providerThreadId: 'qa-thread',
     transportState: 'ready',
-    activeTurnId: 'qa-turn',
+    providerReconnectAttempt: connectionFeedback ? 4 : 0,
+    providerReconnectAttempts: connectionFeedback ? 5 : 0,
+    providerReconnectTurnId: connectionFeedback ? 'qa-turn' : null,
+    activeTurnId: preparing ? null : 'qa-turn',
     startedTurnId: 'qa-turn',
-    conversationState: 'active_prework',
+    conversationState: preparing ? 'native_idle' : scenario === 'interrupted' ? 'paused' : 'active_prework',
     items: Object.fromEntries(acceptedItems.map((item) => [item.key, item])),
     itemOrder: acceptedItems.map((item) => item.key),
-    queue: { state: { type: 'active', turnId: 'qa-turn', phase: 'prework' }, submissions, waitReason: scenario === 'restoring' ? 'conversation_restoring' : null },
+    queue: {
+      state: preparing ? { type: 'idle' } : scenario === 'interrupted' ? { type: 'paused', reason: 'interrupted' } : { type: 'active', turnId: 'qa-turn', phase: 'prework' },
+      submissions,
+      waitReason: preparing ? 'dispatch_pending' : scenario === 'restoring' ? 'conversation_restoring' : null,
+    },
   };
+  /** 收到实际恢复事件后仍保留活动轮次，核对执行提示及时接手。 */
+  const state =
+    scenario === 'reconnected'
+      ? sessionReducer(previewState, {
+          type: 'event_received',
+          event: {
+            id: 'qa-recovery-complete',
+            type: 'conversation.transport.changed',
+            createdAt: '2026-10-12T04:00:00Z',
+            payload: {
+              conversationId: 'qa-queue',
+              threadId: 'qa-thread',
+              generationId: 'qa-generation',
+              sequence: 1,
+              providerThreadId: 'qa-thread',
+              providerTurnId: 'qa-turn',
+              recoveryState: 'idle',
+              reconnectAttempt: 0,
+              reconnectAttempts: 5,
+            },
+          },
+        })
+      : previewState;
   /** 切换场景时清除本页模拟结果，避免上一场景影响新的操作检查。 */
   function resetPreview(): void {
     setOutcomes({});
@@ -530,7 +598,7 @@ function QueueActionsQa() {
     /** 已接纳消息退出队列操作，其余按真实状态计算可见入口。 */
     const pendingCount = submissions.filter((submission) => submission.status !== 'resolved').length;
     /** 只有普通 queued 和安全 paused 项进入输入框卡片。 */
-    const expectedCards = ['queued', 'restoring', 'preflight_failed'].includes(scenario) ? pendingCount : 0;
+    const expectedCards = preparing ? Math.max(0, pendingCount - 1) : ['queued', 'restoring', 'interrupted', 'preflight_failed', 'reconnecting', 'reconnected'].includes(scenario) ? pendingCount : 0;
     /** 送达未知只检查；写前失败和待恢复消息提供先核对再发送的重试。 */
     const expectedCheck = scenario === 'outcome_unknown' ? pendingCount : 0;
     /** 无需错误详情也能重试已确认未发送的消息。 */
@@ -563,9 +631,9 @@ function QueueActionsQa() {
                 resetPreview();
               }}
             >
-              {['queued', 'restoring', 'outcome_unknown', 'recovery_required', 'recovered_unsent', 'accepted', 'failed', 'preflight_failed'].map((value, index) => (
+              {['queued', 'restoring', 'outcome_unknown', 'recovery_required', 'recovered_unsent', 'accepted', 'failed', 'preflight_failed', 'interrupted', 'preparing', 'reconnecting', 'reconnected'].map((value, index) => (
                 <option key={value} value={value}>
-                  {['正常排队', '正在恢复', '送达未知', '等待恢复', '已确认未发送', '已接纳', '发送失败', '发送前准备失败'][index]}
+                  {['正常排队', '正在恢复', '送达未知', '等待恢复', '已确认未发送', '已接纳', '发送失败', '发送前准备失败', '中断后暂停', '模型接手前准备', '连接中', '模型已恢复输出'][index]}
                 </option>
               ))}
             </select>
@@ -605,24 +673,24 @@ function QueueActionsQa() {
         {result}
       </p>
       <div ref={surface} className="ai-workspace" style={{ display: 'flex', flexDirection: 'column', height: 620, maxWidth: narrow ? 360 : 960, marginInline: 'auto' }}>
-        <ConversationTranscript
-          state={state}
-          language={language}
-          transcriptHydrated
-          onCancelQueuedSubmission={(id) => runAction(id, 'deleted')}
-          onRetryQueuedSubmission={(id) => runAction(id, 'accepted')}
-          onRecoverQueue={() => setResult('检查处理状态回调已触发')}
-        />
+        <ConversationTranscript state={state} language={language} transcriptHydrated onCancelQueuedSubmission={(id) => runAction(id, 'deleted')} onRetryQueuedSubmission={(id) => runAction(id, 'accepted')} />
         <div className="session-composer-stack">
           <QueuedConversationMessages
             state={state}
             language={language}
-            onEdit={(id, nextContent) => {
+            onEdit={async (id, nextContent, attachments) => {
+              if (failAction) throw new Error('保存失败，编辑内容已保留。');
               setEditedContent((current) => ({ ...current, [id]: nextContent }));
+              setEditedAttachments((current) => ({ ...current, [id]: attachments }));
               setResult(`编辑回调已触发：${id}`);
             }}
             onDelete={(id) => runAction(id, 'deleted')}
             onSendNow={(id) => runAction(id, 'accepted')}
+            onResumeQueue={() => {
+              if (failAction) throw new Error('继续发送失败，原队列已保留。');
+              setScenario('queued');
+              setResult('继续发送回调已触发，原消息恢复排队');
+            }}
             onReorder={(orderedIds) => {
               setQueueOrder(orderedIds);
               setResult(`重排回调已触发：${orderedIds.join(' → ')}`);
@@ -650,8 +718,10 @@ function MessageLayoutQa() {
   const parameters = new URLSearchParams(window.location.search);
   /** 链接场景直接呈现最终答复，复现历史资源只有名称和编号的恢复结果。 */
   const links = parameters.has('links');
+  /** 延迟过程页晚于首次展开动画抵达，复现加载完成后的二次增高。 */
+  const delayedProcess = parameters.has('delayed-process');
   /** 长过程覆盖九十三项操作和三十段思考，复现多屏内容的展开动效。 */
-  const longProcess = parameters.has('long-process');
+  const longProcess = parameters.has('long-process') || delayedProcess;
   /** 多阶段场景复现摘要、不同数量操作和外层折叠的延迟挂载。 */
   const processGroups = parameters.has('process-groups') || longProcess;
   /** 单条无详情的上下文整理也必须经过同一段操作折叠入口。 */
@@ -661,7 +731,7 @@ function MessageLayoutQa() {
   /** 沿用第一条操作，分别预览文件读取和目录浏览的真实图标映射。 */
   const activityAction = parameters.get('activity-action');
   /** 分页场景保留已读范围，缺页边界可见时沿用真实组件自动补齐。 */
-  const processPaging = parameters.has('process-paging');
+  const processPaging = parameters.has('process-paging') || delayedProcess;
   /** 同一条命令分别核对本地长输出和不可变结果分页。 */
   const outputPaging = parameters.has('output-paging');
   /** 复现旧活动首屏丢失命令预览、但历史详情句柄仍可读取的场景。 */
@@ -674,8 +744,14 @@ function MessageLayoutQa() {
   const longOutput = parameters.has('long-output');
   /** 连接场景沿用生产提示，对照执行文字及原位失败恢复。 */
   const connecting = parameters.has('connecting');
+  /** 预览官方连接事件对应的生产状态与失败后的原位续跑入口。 */
+  const providerConnecting = parameters.has('provider-connection');
+  /** 单轮恢复计数可逐项推进，固定总数与产品一致。 */
+  const [providerRetryAttempt, setProviderRetryAttempt] = useState(1);
+  /** 第五次失败后转为停止，点击生产重试入口再进入连接状态。 */
+  const [providerConnectionFailed, setProviderConnectionFailed] = useState(parameters.has('connection-failed'));
   /** 直接展示时间线的场景使用与应用相同的有限滚动视口。 */
-  const directTranscript = links || processPaging || outputPaging || longOutput || connecting || deferredCommand || activityFile;
+  const directTranscript = links || processPaging || outputPaging || longOutput || connecting || providerConnecting || deferredCommand || activityFile;
   /** 首段和末尾标记用于确认没有截断、重复或缺失正文。 */
   const fullOutput = useMemo(
     () => (outputPaging || longOutput ? `${Array.from({ length: 1200 }, (_, index) => `输出第 ${index + 1} 行：${'连续阅读命令输出。'.repeat(10)}`).join('\n')}\n命令输出末尾标记` : '阶段检查通过'),
@@ -693,6 +769,8 @@ function MessageLayoutQa() {
   const processReadCount = useRef(0);
   /** 读取回调只推进未读范围，不依赖额外分页按钮。 */
   const [processPageFinished, setProcessPageFinished] = useState(false);
+  /** 加载提示与真实内容分两次提交，覆盖异步尺寸变化。 */
+  const [processPageLoading, setProcessPageLoading] = useState(false);
   /** 失败预览保留原有过程，通过重新打开原有入口恢复未读页。 */
   const [processPageError, setProcessPageError] = useState<string | null>(null);
   /** 手动切换运行终态，检查每种耗时文案及过程折叠。 */
@@ -904,7 +982,7 @@ function MessageLayoutQa() {
       if (phaseControls.length !== expectedLabels.length || phaseControls.some((control, index) => control.textContent?.trim() !== expectedLabels[index])) throw new Error('逐段过程未显示真实数量入口');
       for (const control of phaseControls) if (control.getAttribute('aria-expanded') === 'true') control.click();
       await settle();
-      content.querySelectorAll('[data-viewport-reveal]').forEach((node) => node.getAnimations().forEach((animation) => animation.finish()));
+      content.querySelectorAll('[data-animate-height]').forEach((node) => node.getAnimations().forEach((animation) => animation.finish()));
       await waitForState(() => !content.querySelector('.session-activity-group'));
       if (content.querySelector('.session-activity-item-title, .session-activity-live, .session-activity-images, .session-activity-item-detail-body')) throw new Error('收起操作后仍挂载命令或图片');
       /** 操作开合不能改变既有会话行的位置与身份。 */
@@ -918,7 +996,7 @@ function MessageLayoutQa() {
         control.click();
         await settle();
         phase
-          .querySelector('[data-viewport-reveal]')
+          .querySelector('[data-animate-height]')
           ?.getAnimations()
           .forEach((animation) => animation.finish());
         await waitForState(() => !phase.querySelector('.session-activity-group'));
@@ -956,22 +1034,37 @@ function MessageLayoutQa() {
       outerControl.click();
       await settle();
       /** 手动检查同时核对真实高度动画：长内容不能在一帧内全部展开。 */
-      const disclosure = outerControl.closest('.session-turn-process')?.querySelector<HTMLElement>('[data-viewport-reveal]');
+      const disclosure = outerControl.closest('.session-turn-process')?.querySelector<HTMLElement>('[data-animate-height]');
       /** 后台页面不依赖逐帧回调，通过原生动画时间点验证中间展开状态。 */
       const animation = disclosure?.getAnimations()[0];
       if (disclosure && animation) {
         /** 先锁定终点，再检查中途确实只显露部分内容，最后恢复正常展开状态。 */
         const frames = animation.effect?.getKeyframes() ?? [];
-        /** 高度终点必须受可见范围约束，短内容沿用自身高度。 */
+        /** 高度终点必须等于完整自然内容，不能在结束帧跳到另一高度。 */
         const targetHeight = Number.parseFloat(String(frames.at(-1)?.blockSize));
         animation.pause();
         animation.currentTime = 70;
         /** 实际中间高度应介于零和目标高度之间。 */
         const middleHeight = disclosure.getBoundingClientRect().height;
         animation.finish();
-        if (!(targetHeight > 0 && targetHeight <= window.innerHeight && middleHeight > 0 && middleHeight < targetHeight)) throw new Error('处理过程没有逐步展开可见内容');
+        if (!(targetHeight > 0 && middleHeight > 0 && middleHeight < targetHeight && Math.abs(disclosure.getBoundingClientRect().height - targetHeight) < 1)) throw new Error('处理过程高度过渡不连续');
         await settle();
       }
+    }
+    if (delayedProcess && !processPageFinished) {
+      /** 请求完成后仍须由同一个外壳衔接高度，不能直接跳到完整正文。 */
+      const disclosure = outerControl.closest('.session-turn-process')?.querySelector<HTMLElement>('[data-animate-height]');
+      await waitForState(() => content.querySelectorAll('.session-activity-group').length === expectedCounts.length && Boolean(disclosure?.getAnimations().length));
+      /** 比较延迟到达后动画的终点和实际布局，排除一屏终点造成的尾帧跳变。 */
+      const animation = disclosure!.getAnimations()[0]!;
+      /** 原生动画关键帧记录实际接续高度。 */
+      const frames = animation.effect!.getKeyframes();
+      /** 请求结果包含三十段正文，终点应大于最初已读部分。 */
+      const targetHeight = Number.parseFloat(String(frames.at(-1)?.blockSize));
+      if (!(targetHeight > Number.parseFloat(String(frames[0]?.blockSize)))) throw new Error('异步内容未接续展开动画');
+      animation.finish();
+      if (Math.abs(disclosure!.getBoundingClientRect().height - targetHeight) >= 1) throw new Error('异步展开结束时高度跳变');
+      await settle();
     }
     /** 每段摘要只保留一个固定数量入口，不提前展示命令标题。 */
     const nestedControls = [...content.querySelectorAll<HTMLButtonElement>('.session-activity-group .session-turn-process-control > button')];
@@ -1002,7 +1095,7 @@ function MessageLayoutQa() {
     outerControl.click();
     await waitForState(() => outerControl.getAttribute('aria-expanded') === 'false');
     content
-      .querySelector('[data-viewport-reveal]')
+      .querySelector('[data-animate-height]')
       ?.getAnimations()
       .forEach((animation) => animation.finish());
     await waitForState(() => !content.querySelector('.session-activity-group'));
@@ -1077,7 +1170,7 @@ function MessageLayoutQa() {
             },
             { type: 'imageView', phase: 'prework', stageId: 'verify', text: '', payload: { path: 'artifacts/阶段截图.png' }, resources: [processImageResource], status: 'completed' },
             ...(extraOperation ? [{ type: 'webSearch', phase: 'prework', stageId: 'verify', text: '', payload: { query: 'Zeus 处理过程折叠' }, status: active ? 'in_progress' : 'completed' }] : []),
-            ...(longProcess
+            ...(longProcess && (!delayedProcess || processPageFinished)
               ? Array.from({ length: 30 }, (_, index) => [
                   {
                     type: 'agentMessage',
@@ -1175,6 +1268,19 @@ function MessageLayoutQa() {
     },
     terminalTurnIds: active ? {} : { 'qa-layout-turn': status },
   };
+  if (providerConnecting) {
+    /** 使用生产轮次错误结构，不从预览文案推断停止状态。 */
+    const turn = state.turnsByProviderId['qa-layout-turn']!;
+    turn.status = providerConnectionFailed ? 'failed' : 'running';
+    turn.error = providerConnectionFailed ? { category: 'network', code: 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', message: '连接重试五次均失败，会话已停止。请检查网络后重试。', providerStatus: 'failed', additionalDetails: [] } : null;
+    state.providerReconnectAttempt = providerConnectionFailed ? 0 : providerRetryAttempt;
+    state.providerReconnectAttempts = 5;
+    state.providerReconnectTurnId = providerConnectionFailed ? null : 'qa-layout-turn';
+    state.activeTurnId = providerConnectionFailed ? null : 'qa-layout-turn';
+    state.conversationState = providerConnectionFailed ? 'turn_failed' : 'active_prework';
+    state.terminalTurnIds = providerConnectionFailed ? { 'qa-layout-turn': 'failed' } : {};
+    state.snapshot = { id: state.conversationId, turns: [turn] } as NativeSessionState['snapshot'];
+  }
   /** 本场景只提供分页元数据；消息仍由上方生产时间线状态承载。 */
   if (processPaging)
     state.snapshot = {
@@ -1185,7 +1291,14 @@ function MessageLayoutQa() {
         history: { nextCursor: null, hasMore: false, loading: false, error: null, loadedThroughSequence: 0, oldestLoadedSequence: null },
         historyByTurn: {},
         processByTurn: {
-          'qa-layout-turn': { direction: parameters.has('process-forward') ? 'forward' : 'tail', loaded: true, loading: false, hasMore: !processPageFinished, nextCursor: processPageFinished ? null : 'qa-next', error: processPageError },
+          'qa-layout-turn': {
+            direction: parameters.has('process-forward') ? 'forward' : 'tail',
+            loaded: !delayedProcess || processPageFinished,
+            loading: processPageLoading,
+            hasMore: !processPageFinished,
+            nextCursor: processPageFinished ? null : 'qa-next',
+            error: processPageError,
+          },
         },
         resources: { nextCursor: null, hasMore: false, loading: false, loaded: true, error: null, items: [] },
         changeSetsByTurn: {},
@@ -1222,6 +1335,7 @@ function MessageLayoutQa() {
             子智能体
           </Button>
           <Button onClick={checkLayout}>检查耗时入口</Button>
+          {providerConnecting ? <Button onClick={() => (providerRetryAttempt < 5 ? setProviderRetryAttempt(providerRetryAttempt + 1) : setProviderConnectionFailed(true))}>下一次连接失败</Button> : null}
           {processGroups ? <Button onClick={() => void checkProcessContent().catch((error: unknown) => setLinkResult(String(error)))}>检查过程内容</Button> : null}
           {processGroups ? <Button onClick={() => setExtraOperation((value) => !value)}>{extraOperation ? '移除运行操作' : '新增运行操作'}</Button> : null}
           {replyTransition ? <Button onClick={() => setReplyText((text) => (text ? `${text}\n\n正文继续输出，过程入口保持原状态。` : '最终正文已经开始输出，轮次仍在运行。'))}>{replyText ? '继续输出正文' : '开始输出正文'}</Button> : null}
@@ -1236,6 +1350,14 @@ function MessageLayoutQa() {
             state={state}
             language={parameters.has('en') ? 'en-US' : 'zh-CN'}
             transcriptHydrated
+            onRetryFailedTurn={
+              providerConnecting
+                ? async () => {
+                    setProviderRetryAttempt(1);
+                    setProviderConnectionFailed(false);
+                  }
+                : undefined
+            }
             creationStatus={
               connectionState
                 ? {
@@ -1252,6 +1374,11 @@ function MessageLayoutQa() {
               processPaging
                 ? async () => {
                     processReadCount.current += 1;
+                    if (delayedProcess) {
+                      setProcessPageLoading(true);
+                      await new Promise<void>((resolve) => setTimeout(resolve, 600));
+                      setProcessPageLoading(false);
+                    }
                     if (parameters.has('process-error') && processReadCount.current === 1) {
                       setProcessPageError('过程分页示例失败');
                       throw new Error('过程分页示例失败');
@@ -1450,6 +1577,7 @@ function ResourceWorkspaceQa(props: { state: NativeSessionState; resources: Conv
   /** 将同一组正文资源交给生产时间线，附件也通过会话提供的预览入口。 */
   const state: NativeSessionState = {
     ...props.state,
+    ...(parameters.has('browser-comments') ? { browserSubmission: browserCommentQaSubmission() } : {}),
     attachments: [{ name: '附件图片.png', kind: 'image', mime: 'image/png', size: 68, uploadRef: 'qa-image' }],
     contextDraft: { ...props.state.contextDraft, codeComments: comments },
     itemOrder: [...props.state.itemOrder, ...(edges ? [plan.key] : [])],
@@ -1714,9 +1842,13 @@ function ErrorLayoutQa() {
   const [dark, setDark] = useState(false);
   /** 文件审核只展示预览反馈，不读取或操作工作区。 */
   const [review, setReview] = useState(false);
+  /** 记录真实反馈组件的点击结果，不连接账号或发送模型消息。 */
+  const [retryCount, setRetryCount] = useState(0);
+  /** 同一预览覆盖普通发送和任务首次推送两条生产入口。 */
+  const [taskPush, setTaskPush] = useState(true);
   /** 沿用用户截图中的错误码和原始说明，不假设消息已经发送或取消。 */
-  const error = { code: 'ZEUS_NATIVE_SUBMISSION_NOT_QUEUED', message: '这条消息已取消、替换或离开待发送状态，不会再次发送。' };
-  /** 合成消息复现未确认状态，预览不提供重发入口。 */
+  const error = { message: 'failed to load configuration: model_providers contains reserved built-in provider IDs: `openai`. Built-in providers cannot be overridden.' };
+  /** 合成消息复现明确未发送，使用生产反馈组件与重试按钮。 */
   const pending: NativeSessionItemBuffer = {
     key: 'preview-pending',
     conversationId: 'preview',
@@ -1725,11 +1857,12 @@ function ErrorLayoutQa() {
     itemId: 'preview-pending',
     type: 'userMessage',
     phase: 'user',
-    text: '',
-    status: 'paused',
+    text: '请修复 Codex 模型发送报错。',
+    status: 'failed',
     optimistic: true,
     resources: [],
-    payload: { deliveryError: error },
+    clientUserMessageId: 'preview-client-message',
+    payload: { deliveryError: error, ...(taskPush ? { taskPushLayout: buildTaskPushLayout({ taskTitle: 'Codex 发送失败', taskType: 'requirement', taskDescription: '请修复 Codex 模型发送报错。' }) } : {}) },
   };
   /** 回复文字用于对照截图中的正文边缘，不代表本次新增交付结果。 */
   const answer: NativeSessionItemBuffer = {
@@ -1792,13 +1925,23 @@ function ErrorLayoutQa() {
           <p>已确认样式 · 直接展示会话组件</p>
         </div>
         <nav aria-label="预览切换">
+          <Button aria-pressed={taskPush} onClick={() => setTaskPush(!taskPush)}>
+            {taskPush ? '检查普通消息' : '检查任务推送'}
+          </Button>
           <Button aria-pressed={dark} onClick={() => setDark(!dark)}>
             {dark ? '浅色' : '深色'}
           </Button>
         </nav>
       </header>
       <div className="session-transcript">
-        <MessageDeliveryOutcomeFeedback item={pending} language="zh-CN" />
+        <ConversationTranscript
+          state={{ ...createInitialSessionState(), conversationId: 'preview', transportState: 'ready', items: { [pending.key]: pending }, itemOrder: [pending.key] }}
+          language="zh-CN"
+          transcriptHydrated
+          creationStatus={taskPush ? { state: 'failed', message: '会话创建失败', errorCause: error, onRetry: () => setRetryCount((count) => count + 1) } : undefined}
+          onRetryPendingSend={() => setRetryCount((count) => count + 1)}
+        />
+        <p role="status">已请求重试 {retryCount} 次</p>
         <ThreadItemView item={answer} language="zh-CN" showAssistantActions />
         <TurnChangeCard changeSet={changeSet} language="zh-CN" onReview={() => setReview(true)} />
       </div>
@@ -1911,6 +2054,42 @@ async function chooseComposerQaAttachments(): Promise<NativeConversationAttachme
   return [{ name: '对齐检查.txt', kind: 'file', mime: 'text/plain', size: 12, uploadRef: `qa:${crypto.randomUUID()}` }];
 }
 
+/** 固定网页评论覆盖元素原文、长评论和截图不可用，不读取用户历史。 */
+function browserCommentQaSubmission(): ZeusBrowserPreparedSubmission {
+  return {
+    tabId: 'qa-browser',
+    commentIds: ['qa-comment'],
+    content: '网页评论',
+    attachments: [],
+    comments: [
+      {
+        id: 'qa-comment',
+        number: 1,
+        conversationId: 'qa-layout',
+        tabId: 'qa-browser',
+        body: '请说明三个场景如何经过这段流程：单一问题、多问题混合、同时命中高频意图和知识库。发送后仍须显示这条评论和批注原文。',
+        anchor: {
+          kind: 'element',
+          pageUrl: 'https://example.com/flow',
+          frameUrl: 'https://example.com/flow',
+          pageTitle: '意图识别流程',
+          frameDepth: 0,
+          immediateText: '文字意图识别：用户选择与规则优先，无法判断时再由 AI 分类。',
+          rect: { x: 0, y: 0, width: 320, height: 180 },
+          viewport: { width: 1280, height: 800, deviceScaleFactor: 1 },
+          scroll: { x: 0, y: 0 },
+          fixed: false,
+        },
+        designChanges: [],
+        screenshotPath: '/qa/comment-unavailable.png',
+        status: 'draft',
+        createdAt: '',
+        updatedAt: '',
+      },
+    ],
+  };
+}
+
 /** 使用真实会话输入组件验收工具栏及粘贴，只在本页记录发送结果，不调用模型。 */
 function ComposerMarkdownQa() {
   /** 地址参数覆盖窄分栏、深色和英文。 */
@@ -1919,6 +2098,7 @@ function ComposerMarkdownQa() {
   const [state, setState] = useState(() => {
     /** 长记录与输入框放在同一真实容器内，核对返回最新按钮的悬停与滚动。 */
     const initial = createInitialSessionState();
+    if (parameters.has('browser-comments')) initial.browserSubmission = browserCommentQaSubmission();
     /** 固定评论仅用于真实摘要悬浮详情的交互验收。 */
     const contextDraft = parameters.has('context-draft')
       ? {
@@ -1972,6 +2152,11 @@ function ComposerMarkdownQa() {
     },
     0,
   );
+  // 历史消息通过真实用户消息组件展示原文、评论和按需截图。
+  if (parameters.has('browser-comments')) {
+    message.text = '';
+    message.payload = { browserComments: browserCommentQaSubmission().comments };
+  }
   /** 仅普通浏览器 QA 注入附件返回值，不接触原生剪贴板或磁盘。 */
   useEffect(() => {
     if (window.zeus) return;
@@ -2139,6 +2324,7 @@ function ComposerMarkdownQa() {
           onAddAttachments={(attachments) => setState((current) => ({ ...current, attachments: [...current.attachments, ...attachments] }))}
           onRemoveAttachment={(attachment) => setState((current) => ({ ...current, attachments: current.attachments.filter((candidate) => candidate !== attachment) }))}
           onContextDraftChange={(contextDraft) => setState((current) => ({ ...current, contextDraft }))}
+          onRemoveBrowserSubmission={() => setState((current) => ({ ...current, browserSubmission: null }))}
           onDraftChange={(draft) => setState((current) => ({ ...current, draft }))}
           onSubmit={(_delivery, settings) => {
             // 当前验收页不加载技能目录，提交正文必须逐字符等于原始草稿。
@@ -2329,12 +2515,16 @@ function TaskPasteFocusQa() {
     optimizationCurrentState: '当前状态',
     optimizationExpectedOutcome: '预期结果',
     tags: '焦点',
+    ...(parameters.has('images')
+      ? { attachments: Array.from({ length: 6 }, (_, index) => ({ path: `qa:image-${index}`, name: `页面参考 ${index + 1}.svg`, kind: 'image' as const, field: 'description' as const, mimeType: 'image/svg+xml' })) }
+      : {}),
   }));
   /** 保留真实标题控件供弹窗初始焦点使用。 */
   const titleRef = useRef<HTMLInputElement | null>(null);
   /** 页面打开后运行一次现有组件的粘贴检查，结果显示在弹窗提示区。 */
-  const [result, setResult] = useState('正在检查附件粘贴焦点');
+  const [result, setResult] = useState(parameters.has('images') ? '' : '正在检查附件粘贴焦点');
   useEffect(() => {
+    if (parameters.has('images')) return;
     const timer = setTimeout(() => {
       const control = document.getElementById(`task-create-${parameters.get('field') ?? 'description'}-input`);
       if (!(control instanceof HTMLTextAreaElement) && !(control instanceof HTMLInputElement)) {
@@ -2380,6 +2570,19 @@ function TaskPasteFocusQa() {
         };
       }}
       onMaterializeResources={async () => []}
+      onLoadAttachmentPreview={
+        parameters.has('images')
+          ? async (path) => {
+              // 固定等待和失败样例用于检查占位；其他缩略图直接由真实组件解码。
+              if (path === 'qa:image-4' && parameters.has('loading')) return new Promise(() => {});
+              if (path === 'qa:image-5' && parameters.has('loading')) return null;
+              return {
+                mimeType: 'image/svg+xml',
+                previewUrl: `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="320" height="180" fill="#f2f1fb"/><rect x="20" y="20" width="280" height="64" rx="8" fill="white" stroke="#c5bfea"/><text x="36" y="58" font-size="18" fill="#4e4591">页面参考 ${path.slice(-1)}</text><path d="M160 84v26" stroke="#9185ca"/><rect x="70" y="110" width="180" height="44" rx="8" fill="white" stroke="#c5bfea"/></svg>`)}`,
+              };
+            }
+          : undefined
+      }
       onAddAttachments={(attachments) => setForm((current) => ({ ...current, attachments: [...current.attachments, ...attachments] }))}
       onRemoveAttachment={(path) => setForm((current) => ({ ...current, attachments: current.attachments.filter((attachment) => attachment.path !== path) }))}
       onParseThirdPartyLink={async () => ({ kind: 'unsupported' })}
@@ -2822,13 +3025,9 @@ function CopyErrorQa() {
               item={item}
               submissionId="copy-submission"
               language={zh ? 'zh-CN' : 'en-US'}
-              onRecoverQueue={check}
               onOpenAiSettings={(section) => setAction(section === 'runtime' ? '导航：设置 → AI 连接' : '导航：设置 → 模型供应商')}
               onReconnectCodex={() => setAction('请求连接 Codex；未重发消息')}
-              onRetryQueuedSubmission={() => {
-                setAction('请求发送已确认未发送的消息');
-                setPhase('waiting');
-              }}
+              onRetryQueuedSubmission={check}
               onCancelQueuedSubmission={() => {
                 setAction('请求取消此消息');
                 setPhase('complete');
@@ -3018,6 +3217,8 @@ function MarkdownReviewQa() {
 function NavigationQa() {
   /** 地址允许独立核对超过七条、长历史和窄窗口。 */
   const parameters = useMemo(() => new URLSearchParams(window.location.search), []);
+  /** 缓存会话保留正文，按地址分别检查普通订阅和真实重连提示。 */
+  const sessionTransport = parameters.get('session-transport');
   /** 模拟先取得历史目录、随后模型确认编号的任务推送恢复。 */
   const taskHistory = parameters.has('task-history');
   /** 同一目录混合普通发言、同步答题卡和异步答题卡。 */
@@ -3109,9 +3310,10 @@ function NavigationQa() {
   );
   /** 目录首次读取与正文独立。 */
   const loadNavigation = useCallback(async () => {
+    if (parameters.has('directory-delay')) await new Promise<void>((resolve) => window.setTimeout(resolve, 15_000));
     if (directoryFailure.current) throw new Error('验收注入：目录读取失败');
     return { conversationId, throughEventSeq: 1, entries };
-  }, [conversationId, entries]);
+  }, [conversationId, entries, parameters]);
   /** 延迟补齐目标轮次，让锚点补偿经历真实组件尺寸变化。 */
   const loadTurn = useCallback(async (turnId: string) => {
     await new Promise((resolve) => setTimeout(resolve, 120));
@@ -3209,8 +3411,11 @@ function NavigationQa() {
     return {
       ...createInitialSessionState(),
       conversationId,
-      transportState: 'ready',
-      conversationState: 'idle',
+      activeTurnId: sessionTransport ? entries[count - 1]!.turnId : null,
+      transportState: ['disconnected', 'connecting', 'hydrating', 'ready', 'reconnecting', 'failed'].includes(sessionTransport ?? '') ? (sessionTransport as NativeSessionState['transportState']) : 'ready',
+      providerReconnectAttempt: parameters.has('provider-retry') ? 2 : 0,
+      providerReconnectAttempts: parameters.has('provider-retry') ? 5 : 0,
+      conversationState: sessionTransport ? 'active_prework' : 'idle',
       transcriptRevision: 0,
       pendingRequests: entries.flatMap((entry, index) =>
         entry.requestId && loaded.has(index)
@@ -3238,12 +3443,21 @@ function NavigationQa() {
       turnsByProviderId: Object.fromEntries(
         entries.map((entry) => [
           entry.turnId,
-          { id: entry.turnId, providerTurnId: entry.turnId, submissionId: null, status: 'completed', startedAt: entry.occurredAt, completedAt: entry.occurredAt, createdAt: entry.occurredAt, updatedAt: entry.occurredAt },
+          {
+            id: entry.turnId,
+            providerTurnId: entry.turnId,
+            submissionId: null,
+            status: sessionTransport && entry === entries[count - 1] ? 'running' : 'completed',
+            startedAt: entry.occurredAt,
+            completedAt: sessionTransport && entry === entries[count - 1] ? null : entry.occurredAt,
+            createdAt: entry.occurredAt,
+            updatedAt: entry.occurredAt,
+          },
         ]),
       ),
-      terminalTurnIds: Object.fromEntries(entries.map((entry) => [entry.turnId, 'completed'])),
+      terminalTurnIds: Object.fromEntries(entries.filter((entry) => !sessionTransport || entry !== entries[count - 1]).map((entry) => [entry.turnId, 'completed'])),
     };
-  }, [loaded, entries, count, taskHistory, taskLayout, questionHistory, questionDelivery, questionPayload, questionResponse, oldQuestionResponse, conversationId]);
+  }, [loaded, entries, count, taskHistory, taskLayout, questionHistory, questionDelivery, questionPayload, questionResponse, oldQuestionResponse, conversationId, sessionTransport, parameters]);
 
   /** 持续生成经过正式归约器，使浏览器回归覆盖内容修订和增量投影。 */
   const projectedState = useRef<{ base: NativeSessionState; state: NativeSessionState } | null>(null);

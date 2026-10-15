@@ -110,11 +110,11 @@ export interface UsageModelRate {
   perRequest: number | null;
 }
 
-/** 账本已知价格目录的适用周期；结束日期为空表示当前最新目录。 */
+/** 同一计费条件下本地已记录的价格周期；日期不代表官方生效日。 */
 export interface UsageModelPricePeriod {
-  /** 价格目录开始日期，格式固定为 YYYY-MM-DD。 */
+  /** 该价格第一次出现的目录日期，格式固定为 YYYY-MM-DD。 */
   from: string;
-  /** 下一份目录生效前一天；当前最新目录为空。 */
+  /** 同条件下一次记录不同单价的前一天；尚未记录调价时为空。 */
   to: string | null;
 }
 
@@ -231,6 +231,13 @@ export interface UsageProviderAnalytics {
   projectId: string | null;
   model: string | null;
   official: CodexOfficialUsageSnapshot | null;
+  /** 当前供应商的筛选目录，不受时间、项目和模型裁剪，空范围不会擅自清除选择。 */
+  filters: {
+    /** 模型目录仅包含该当前供应商的历史记录。 */
+    models: Array<Pick<CodexLocalUsageGroup, 'id' | 'label'>>;
+    /** 项目目录保留历史项目名称的现有解析规则。 */
+    projects: Array<Pick<CodexLocalUsageGroup, 'id' | 'label'>>;
+  };
   local: {
     totals: CodexLocalUsageTotals;
     daily: CodexLocalUsageDay[];

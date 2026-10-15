@@ -7,6 +7,7 @@ import {
   conversationQuestionNavigationExcerpt,
   type ConversationNavigationEntry,
   type ConversationNavigationSnapshot,
+  type ConversationProcessGroup,
   type AssistantMessageMetadata,
   type AsyncQuestionAnswer,
   type AsyncQuestionResponse,
@@ -25,6 +26,11 @@ import type { ZeusDatabasePort } from './databasePort.js';
 import { type ArtifactRef, type ArtifactStore, artifactStoreGeneration } from './artifactStore.js';
 import { conversationSchemaGeneration, type ConversationSessionMetricsSnapshot, readConversationSessionMetrics } from './conversationExecutionStore.js';
 import { ConversationTranscriptRepository, providerFacet } from './conversationTranscriptStore.js';
+import { createHash } from 'node:crypto';
+import { ConversationSystemMessageRepository } from './conversationSystemMessageStore.js';
+import { isAbsolute } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { conversationImageAttachmentRef } from './conversationStore.js';
 
 export { conversationSnapshotV2StructureGeneration };
 
@@ -55,7 +61,7 @@ type ConversationPageKind = ConversationSnapshotV2PageKind;
 type ConversationProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'waiting' | 'warning';
 
 // 模型历史持久化的是结构化 JSON；普通会话正文只读取其中的可见文本，绝不能把内部 tool_call 包装层当作消息正文。
-// 用户消息的附件、任务布局和上下文是正文展示所需结构，保留原 JSON 交给 Renderer 还原；工具调用没有 text 字段，
+// 用户消息的附件、任务布局、回答评论和网页评论是正文展示所需结构，保留原 JSON 交给 Renderer 还原；工具调用没有 text 字段，
 // 继续保留原 JSON 预览供结构分类，Renderer 会按 toolPairId/type 将其从消息流排除。
 // 旧任务历史只保存纯文字时，按同会话的发送身份补回展示快照；不读取或暴露执行配置。
 // 首屏、历史分页和完整正文共用此投影，保证预览长度与内容句柄一致。
@@ -80,6 +86,7 @@ const modelHistoryVisibleContentSql = `COALESCE(
      json_type(content_json, '$.attachments') = 'array'
      OR json_type(content_json, '$.taskPushLayout') = 'object'
      OR json_type(content_json, '$.conversationContext') = 'object'
+     OR json_type(content_json, '$.browserComments') = 'array'
    )
     THEN content_json
   WHEN json_valid(content_json) AND json_type(content_json, '$.text') = 'text'
@@ -494,6 +501,8 @@ export interface ConversationProcessPageItem {
 }
 
 export interface ConversationResourcePageItem {
+  /** 资源所属消息的持久显示身份，不受 Provider 线程续接影响。 */
+  ownerEntryId: string | null;
   id: string;
   turnId: string;
   itemId: string;
@@ -501,10 +510,16 @@ export interface ConversationResourcePageItem {
   kind: string;
   presentation: string;
   displayName: string;
+  /** 文件匹配使用已登记的项目相对路径，不能把链接标题当成目标。 */
+  projectRelativePath: string | null;
+  /** 网站匹配使用已登记的 URL，打开仍须提交资源身份。 */
+  url: string | null;
   mimeType: string | null;
   previewKind: string | null;
   iconKind: string | null;
   attachmentRef: string | null;
+  /** 原正文引用用于准确挂接图片，不暴露受管归档位置。 */
+  sourceReference?: string | null;
   taskPushAttachmentKey: string | null;
   origin: string | null;
   delivery: 'assistant' | null;
@@ -729,6 +744,8 @@ const stableChangeSetStates = new Set(['applied', 'undone', 'conflicted', 'unava
  * 游标携带第一页读取时的高水位，后续追加的数据不会插入当前分页窗口。
  */
 export class ConversationSnapshotV2Repository {
+  /** 系统消息独立于模型历史，但共用产品会话的持久位置。 */
+  readonly systemMessages: ConversationSystemMessageRepository;
   /** 读取既有正文时只投影位置索引，不修改正文表。 */
   private readonly transcript: ConversationTranscriptRepository;
 
@@ -737,6 +754,38 @@ export class ConversationSnapshotV2Repository {
     private readonly artifactStore?: ArtifactStore,
   ) {
     this.transcript = new ConversationTranscriptRepository(db);
+    this.systemMessages = new ConversationSystemMessageRepository(db);
+  }
+
+  /** 只返回可见会话的正文命中身份；大历史保留元数据检索，不拖慢运行宿主。 */
+  searchContent(conversationIds: readonly string[], query: string): { conversationIds: string[]; skipped: boolean } {
+    /** 搜索范围由上游目录确定，用 JSON 参数避免大量会话超过 SQL 参数上限。 */
+    const scope = JSON.stringify(conversationIds);
+    /** 字面子串匹配，不把百分号、下划线和引号解释为查询语法。 */
+    const needle = query.trim().toLowerCase();
+    if (!needle || conversationIds.length === 0) return { conversationIds: [], skipped: false };
+    /** ponytail: 32MiB 内直接检索正文，更大历史回退元数据；需要扩大范围时接入全文索引。 */
+    const byteLimit = 32 * 1024 * 1024;
+    /** octet_length 读取持久字段大小，不把正文传到客户端。 */
+    const size = this.db.get<{ bytes: number }>(
+      `WITH scope AS (SELECT value AS id FROM json_each(?))
+       SELECT COALESCE((SELECT SUM(octet_length(content_json)) FROM conversation_model_history WHERE conversation_id IN (SELECT id FROM scope)), 0)
+            + COALESCE((SELECT SUM(octet_length(content)) FROM conversation_messages WHERE conversation_id IN (SELECT id FROM scope)), 0) AS bytes`,
+      [scope],
+    );
+    if ((size?.bytes ?? 0) > byteLimit) return { conversationIds: [], skipped: true };
+    /** 正文在服务端匹配，结果不携带完整历史、工具输出或执行配置。 */
+    const matches = this.db.select<{ conversation_id: string }>(
+      `WITH scope AS (SELECT value AS id FROM json_each(?))
+       SELECT DISTINCT conversation_id FROM conversation_model_history
+        WHERE conversation_id IN (SELECT id FROM scope) AND role NOT IN ('system', 'developer')
+          AND instr(lower(CASE WHEN json_valid(content_json) THEN COALESCE(json_extract(content_json, '$.text'), content_json) ELSE content_json END), ?) > 0
+       UNION
+       SELECT DISTINCT conversation_id FROM conversation_messages
+        WHERE conversation_id IN (SELECT id FROM scope) AND role IN ('user', 'assistant') AND instr(lower(content), ?) > 0`,
+      [scope, needle, needle],
+    );
+    return { conversationIds: matches.map((row) => row.conversation_id), skipped: false };
   }
 
   /** 只从当前运行分段的命令事实读取目录，不解析命令文本、模型回复或其他会话。 */
@@ -782,6 +831,8 @@ export class ConversationSnapshotV2Repository {
       assistant_phase: string | null;
       assistant_metadata_json: string | null;
       formal_plan: number;
+      /** 正式计划可能来自思考摘要，位置别名须保持原始分面。 */
+      reasoning_summary: number;
       question_answer_json: string | null;
     }>(
       `SELECT conversation_model_history.id, conversation_model_history.sequence,
@@ -793,6 +844,7 @@ export class ConversationSnapshotV2Repository {
         ${modelHistoryAssistantPhaseSql} AS assistant_phase,
         ${modelHistoryAssistantMetadataSql} AS assistant_metadata_json,
         ${modelHistoryFormalPlanSql} AS formal_plan,
+        ${modelHistoryReasoningSummarySql} AS reasoning_summary,
         ${modelHistoryQuestionAnswerSql} AS question_answer_json,
         substr(CASE WHEN json_valid(content_json) THEN COALESCE(
           NULLIF(json_extract(content_json, '$.displayText'), ''),
@@ -813,12 +865,15 @@ export class ConversationSnapshotV2Repository {
     );
     /** 同轮补充发言共用最终答复；正式计划只有在没有最终答复时使用。 */
     const answers = new Map<string, { text: string; final: boolean }>();
+    /** 内容存在性不依赖最终答复，失败轮次也必须拥有补读入口。 */
+    const contentTurnIds = new Set<string>();
     /** 每次用户发言独立占一条刻度，使用持久身份去重。 */
     const entries = new Map<string, ConversationNavigationEntry>();
     for (const row of rows) {
       /** 脱敏沿用现有历史预览规则。 */
       const text = redactSensitivePreview(row.preview).text;
       if (row.role === 'assistant') {
+        if (text.trim()) contentTurnIds.add(row.turn_id);
         /** 旧历史没有 phase 时与既有正文适配器保持相同的最终答复口径。 */
         const final = row.assistant_phase !== 'plan' && classifyAssistantMessage(parseJsonRecordOrNull(row.assistant_metadata_json) ?? {}, row.assistant_phase || 'final_answer') === 'final';
         if (text.trim() && (final || (row.formal_plan === 1 && !answers.get(row.turn_id)?.final))) answers.set(row.turn_id, { text: conversationNavigationExcerpt(text, 320), final });
@@ -850,7 +905,7 @@ export class ConversationSnapshotV2Repository {
         });
     }
     /** 普通发言保持模型历史顺序，答题卡保留自己的答案摘录。 */
-    const directory = [...entries.values()].map((entry) => ({ ...entry, response: entry.response || answers.get(entry.turnId)?.text || '' }));
+    const directory: ConversationNavigationEntry[] = [...entries.values()].map((entry) => ({ ...entry, hasContent: contentTurnIds.has(entry.turnId), response: entry.response || answers.get(entry.turnId)?.text || '' }));
     /** 同步询问独立存储，必须进入完整目录而不能只依赖已加载正文。 */
     const requests = this.db.select<{ id: string; turn_id: string; provider_turn_id: string | null; payload_json: string; response_json: string; contains_secret: number; occurred_at: string }>(
       `SELECT request.id, request.turn_id, turn.provider_turn_id, request.payload_json, request.response_json, request.contains_secret,
@@ -885,7 +940,68 @@ export class ConversationSnapshotV2Repository {
       });
     }
     directory.sort((left, right) => (left.placement?.order ?? Number.MAX_SAFE_INTEGER) - (right.placement?.order ?? Number.MAX_SAFE_INTEGER) || left.id.localeCompare(right.id));
-    return { conversationId, throughEventSeq, orderEpoch: this.transcript.orderEpoch(conversationId), entries: directory };
+    /** 沟通边界来自持久消息位置，思考与操作详情不进入目录正文。 */
+    const messageBoundaries = rows
+      .filter((row) => row.preview.trim())
+      .map((row) => ({
+        turnId: row.turn_id,
+        providerTurnId: row.provider_turn_id,
+        placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'model_history', sourceScope: row.segment_id, sourceId: row.id, facet: row.reasoning_summary === 1 ? 'reasoning_block' : 'body' }).placement,
+      }));
+    /** 已回答询问也切断过程；同一消息的多个来源只登记一个边界。 */
+    const boundaries = [
+      ...new Map(
+        [...messageBoundaries, ...directory.filter((entry) => entry.requestId && entry.placement).map((entry) => ({ turnId: entry.turnId, providerTurnId: entry.providerTurnId, placement: entry.placement! }))].map((row) => [
+          row.placement.entryId,
+          row,
+        ]),
+      ).values(),
+    ]
+      .filter((row) => row.placement.order !== null)
+      .sort((left, right) => left.placement.order! - right.placement.order!);
+    /** 每个区间仅包含身份、位置和总数，长工具输出不会进入首屏。 */
+    const ranges = boundaries.map((row, index) => ({
+      id: `turn-work-group:${row.placement.entryId}`,
+      turnId: row.turnId,
+      providerTurnId: row.providerTurnId,
+      afterEntryId: row.placement.entryId,
+      beforeEntryId: boundaries[index + 1]?.placement.entryId ?? null,
+      afterOrder: row.placement.order!,
+      beforeOrder: boundaries[index + 1]?.placement.order ?? null,
+    }));
+    /** 使用持久顺序索引聚合；临时思考摘要不生成入口，真实操作与持久思考正文仍可按需展开。 */
+    const counts = this.db.select<{ id: string; item_count: number }>(
+      `SELECT json_extract(boundary.value, '$.id') AS id,
+              COUNT(DISTINCT CASE WHEN alias.facet = 'tool_activity' THEN entry.id END) AS item_count
+         FROM json_each(?) AS boundary
+         JOIN conversation_transcript_entries AS entry
+           ON entry.conversation_id = ? AND entry.turn_id = json_extract(boundary.value, '$.turnId')
+          AND entry.display_order > json_extract(boundary.value, '$.afterOrder')
+          AND (json_extract(boundary.value, '$.beforeOrder') IS NULL OR entry.display_order < json_extract(boundary.value, '$.beforeOrder'))
+         JOIN conversation_transcript_aliases AS alias
+           ON alias.conversation_id = entry.conversation_id AND alias.entry_id = entry.id
+         LEFT JOIN conversation_process_items
+           ON alias.source_domain = 'process' AND conversation_process_items.conversation_id = alias.conversation_id
+          AND conversation_process_items.segment_id = alias.source_scope AND conversation_process_items.id = alias.source_id
+        WHERE entry.removed_revision IS NULL AND (
+          alias.facet = 'tool_activity' OR (alias.facet = 'reasoning_block' AND conversation_process_items.kind = 'reasoning' AND (
+            conversation_process_items.source_event_id GLOB 'pi:block:*' OR ${processProtocolFamilySql} = 'anthropic_messages'
+            OR CASE WHEN json_valid(conversation_process_items.detail_json) THEN json_extract(conversation_process_items.detail_json, '$.reasoningPresentation') END IN ('process_text', 'details_collapsed')
+          )))
+        GROUP BY json_extract(boundary.value, '$.id')`,
+      [JSON.stringify(ranges), conversationId],
+    );
+    /** 空白区间不产生虚假的操作入口。 */
+    const countById = new Map(counts.map((row) => [row.id, row.item_count]));
+    const processGroups: ConversationProcessGroup[] = ranges.flatMap((range) => (countById.has(range.id) ? [{ ...range, itemCount: countById.get(range.id)! }] : []));
+    return { conversationId, throughEventSeq, orderEpoch: this.transcript.orderEpoch(conversationId), entries: directory, processGroups };
+  }
+
+  /** 独立文本生成只读取最近三轮已关闭对话，不扩大首屏快照的两轮载入上限。 */
+  readRecentClosedTurns(conversationIdValue: string): ConversationSnapshotV2TurnSummary[] {
+    /** 所有正文及内容句柄仍绑定调用方指定的同一会话。 */
+    const conversationId = requiredIdentity(conversationIdValue, 'conversationId');
+    return this.latestTurnsByStatus(conversationId, ['completed', 'interrupted', 'failed'], 3).map((turn) => this.toTurnSummary(conversationId, turn));
   }
 
   readSnapshot(conversationIdValue: string, options: { closedTurnLimit?: number; byteLimit?: number; includeSessionMetrics?: boolean; executionContext?: ConversationSnapshotV2ExecutionContext } = {}): ConversationSnapshotV2 {
@@ -1132,11 +1248,30 @@ export class ConversationSnapshotV2Repository {
     );
   }
 
-  /** Telegram 从送达位置读取符合既有规则的结果，其他历史读取维持原有分页合同。 */
-  listModelHistoryPage(input: { conversationId: string; cursor?: string; entryLimit?: number; byteLimit?: number; afterSequence?: number; assistantOutputOnly?: boolean }): ConversationSnapshotV2Page<ConversationModelHistoryPageItem> {
-    const context = this.sequencePageContext(input, 'model_history', input.assistantOutputOnly ? 'assistant-output' : '');
+  /** 送达和建议复用冻结分页；建议在数据库层筛掉工具与思考，不能扩大到其他会话。 */
+  listModelHistoryPage(input: {
+    conversationId: string;
+    cursor?: string;
+    entryLimit?: number;
+    byteLimit?: number;
+    afterSequence?: number;
+    assistantOutputOnly?: boolean;
+    /** 建议可分别读取用户原话与助手正文，给用户要求保留独立预算。 */
+    dialogueRole?: 'user' | 'assistant';
+    /** 从尾部读取时仍返回正序结果，后续页保持相同过滤和高水位。 */
+    direction?: 'forward' | 'tail';
+  }): ConversationSnapshotV2Page<ConversationModelHistoryPageItem> {
+    /** 角色是内部枚举，SQL 仍使用参数绑定，不拼接外部文本。 */
+    const dialogueWhere = input.dialogueRole ? ` AND role = ? AND tool_pair_id IS NULL AND COALESCE(${modelHistoryReasoningSummarySql}, 0) = 0` : '';
+    /** 游标绑定过滤条件，不能把用户页游标用于助手正文。 */
+    const context = this.sequencePageContext(
+      input,
+      'model_history',
+      input.dialogueRole ? `dialogue:${input.dialogueRole}` : input.assistantOutputOnly ? 'assistant-output' : '',
+      input.dialogueRole ? { table: 'conversation_model_history', column: 'sequence', extraWhere: dialogueWhere, extraParams: [input.dialogueRole] } : null,
+    );
     if (!input.cursor && input.afterSequence !== undefined) {
-      if (!Number.isSafeInteger(input.afterSequence) || input.afterSequence < 0) throw new Error('消息送达位置必须是非负安全整数。');
+      if (!Number.isSafeInteger(input.afterSequence) || input.afterSequence < 0 || context.direction !== 'forward') throw new Error('消息送达位置必须是正向分页的非负安全整数。');
       context.afterSequence = input.afterSequence;
     }
     const rows = this.db.select<ModelHistoryProjectionRow>(
@@ -1165,11 +1300,11 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND sequence > ? AND sequence <= ?
+        WHERE conversation_id = ? AND sequence ${context.direction === 'tail' ? '<' : '>'} ? AND sequence <= ?${dialogueWhere}
           ${input.assistantOutputOnly ? `AND role = 'assistant' AND tool_pair_id IS NULL AND COALESCE(${modelHistoryReasoningSummarySql}, 0) = 0` : ''}
-        ORDER BY sequence
+        ORDER BY sequence ${context.direction === 'tail' ? 'DESC' : 'ASC'}
         LIMIT ?`,
-      [previewCharacterLimit, context.conversationId, context.afterSequence, context.throughSequence, context.entryLimit + 1],
+      [previewCharacterLimit, context.conversationId, context.afterSequence, context.throughSequence, ...(input.dialogueRole ? [input.dialogueRole] : []), context.entryLimit + 1],
     );
     return buildSequencePage(context, this.mapModelHistoryRows(context.conversationId, rows));
   }
@@ -1178,13 +1313,24 @@ export class ConversationSnapshotV2Repository {
    * 按权威 turn 身份补齐完成轮次的模型正文。过程表只保存命令、工具和摘要，
    * 不能替代运行期间已经展示过的阶段性 commentary；展开历史轮次时必须同时读取二者。
    */
-  listTurnModelHistoryPage(input: { conversationId: string; turnId: string; cursor?: string; direction?: 'forward' | 'tail'; entryLimit?: number; byteLimit?: number }): ConversationSnapshotV2Page<ConversationModelHistoryPageItem> {
+  listTurnModelHistoryPage(input: {
+    conversationId: string;
+    turnId: string;
+    cursor?: string;
+    direction?: 'forward' | 'tail';
+    entryLimit?: number;
+    byteLimit?: number;
+    /** 仅取已保存的用户与助手对话，避免工具结果或思考摘要占满建议材料。 */
+    dialogueOnly?: boolean;
+  }): ConversationSnapshotV2Page<ConversationModelHistoryPageItem> {
     const conversationId = requiredIdentity(input.conversationId, 'conversationId');
     const turnId = this.requireTurn(conversationId, input.turnId);
-    const context = this.sequencePageContext({ ...input, conversationId }, 'model_history', `turn:${turnId}`, {
+    /** 查询和游标高水位使用相同过滤条件，不扫描工具正文后再丢弃。 */
+    const dialogueWhere = input.dialogueOnly ? ` AND role IN ('user', 'assistant') AND tool_pair_id IS NULL AND COALESCE(${modelHistoryReasoningSummarySql}, 0) = 0` : '';
+    const context = this.sequencePageContext({ ...input, conversationId }, 'model_history', `turn:${turnId}${input.dialogueOnly ? ':dialogue' : ''}`, {
       table: 'conversation_model_history',
       column: 'sequence',
-      extraWhere: ' AND turn_id = ?',
+      extraWhere: ` AND turn_id = ?${dialogueWhere}`,
       extraParams: [turnId],
     });
     const rows = this.db.select<ModelHistoryProjectionRow>(
@@ -1213,7 +1359,7 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND turn_id = ?
+        WHERE conversation_id = ? AND turn_id = ?${dialogueWhere}
           AND sequence ${context.direction === 'tail' ? '<' : '>'} ? AND sequence <= ?
         ORDER BY sequence ${context.direction === 'tail' ? 'DESC' : 'ASC'}
         LIMIT ?`,
@@ -1272,6 +1418,10 @@ export class ConversationSnapshotV2Repository {
   listProcessPage(input: {
     conversationId: string;
     turnId: string;
+    /** 只读取指定沟通边界之间的过程；省略时读取整轮回看。 */
+    afterEntryId?: string;
+    /** 开放中的最后一组没有结束消息。 */
+    beforeEntryId?: string;
     kind?: ConversationProcessKind;
     cursor?: string;
     direction?: 'forward' | 'tail';
@@ -1282,12 +1432,29 @@ export class ConversationSnapshotV2Repository {
     const turnId = this.requireTurn(conversationId, input.turnId);
     const kind = input.kind === undefined ? null : processKind(input.kind);
     const pageKind = kind === 'command' ? 'commands' : 'process';
-    const scope = `${turnId}\0${kind ?? '*'}`;
+    /** 分组边界只接受同会话的持久消息，禁止使用客户端提供的位置值。 */
+    const after = input.afterEntryId === undefined ? null : this.transcript.envelopeForEntry(conversationId, requiredIdentity(input.afterEntryId, 'afterEntryId'))?.placement;
+    /** 结束边界可以来自同会话的下一轮，但必须严格晚于当前起点。 */
+    const before = input.beforeEntryId === undefined ? null : this.transcript.envelopeForEntry(conversationId, requiredIdentity(input.beforeEntryId, 'beforeEntryId'))?.placement;
+    if ((input.afterEntryId !== undefined && (!after || after.turnId !== turnId || after.order === null)) || (input.beforeEntryId !== undefined && (!after || !before || before.order === null || before.order <= after.order!)))
+      throw snapshotError('ZEUS_CONVERSATION_SNAPSHOT_V2_INVALID_ARGUMENT', '操作组边界无效，请重新读取会话目录。', 400);
+    /** 游标绑定起点，后续沟通可以收紧结束边界，但不能换到其他组。 */
+    const scope = `${turnId}\0${kind ?? '*'}${after ? `\0${after.entryId}` : ''}`;
+    /** 源别名连接到持久顺序，读取范围不依赖已挂载的界面元素。 */
+    const groupWhere = after
+      ? ` AND EXISTS (SELECT 1 FROM conversation_transcript_aliases AS alias JOIN conversation_transcript_entries AS entry
+      ON entry.conversation_id = alias.conversation_id AND entry.id = alias.entry_id
+      WHERE alias.conversation_id = conversation_process_items.conversation_id AND alias.source_domain = 'process'
+        AND alias.source_scope = conversation_process_items.segment_id AND alias.source_id = conversation_process_items.id
+        AND entry.removed_revision IS NULL AND entry.display_order > ?${before ? ' AND entry.display_order < ?' : ''})`
+      : '';
+    /** SQL 参数保持与授权后的边界一一对应。 */
+    const groupParams = after ? [after.order!, ...(before ? [before.order!] : [])] : [];
     const context = this.sequencePageContext({ ...input, conversationId }, pageKind, scope, {
       table: 'conversation_process_items',
       column: 'process_sequence',
-      extraWhere: kind ? ' AND turn_id = ? AND kind = ?' : ' AND turn_id = ?',
-      extraParams: kind ? [turnId, kind] : [turnId],
+      extraWhere: ` AND turn_id = ?${kind ? ' AND kind = ?' : ''}${groupWhere}`,
+      extraParams: [turnId, ...(kind ? [kind] : []), ...groupParams],
     });
     const rows = this.db.select<{
       id: string;
@@ -1336,11 +1503,11 @@ export class ConversationSnapshotV2Repository {
                        )))
                    ELSE NULL END AS presentation_json
          FROM conversation_process_items
-        WHERE conversation_id = ? AND turn_id = ?${kind ? ' AND kind = ?' : ''}
+        WHERE conversation_id = ? AND turn_id = ?${kind ? ' AND kind = ?' : ''}${groupWhere}
           AND process_sequence ${context.direction === 'tail' ? '<' : '>'} ? AND process_sequence <= ?
         ORDER BY process_sequence ${context.direction === 'tail' ? 'DESC' : 'ASC'}
         LIMIT ?`,
-      [previewCharacterLimit, context.conversationId, turnId, ...(kind ? [kind] : []), context.afterSequence, context.throughSequence, context.entryLimit + 1],
+      [previewCharacterLimit, context.conversationId, turnId, ...(kind ? [kind] : []), ...groupParams, context.afterSequence, context.throughSequence, context.entryLimit + 1],
     );
     const pairIds = rows.map((row) => conversationProcessProviderItemId(row.source_event_id));
     const toolResults = this.toolResultsByPair(context.conversationId, pairIds);
@@ -1413,6 +1580,8 @@ export class ConversationSnapshotV2Repository {
     if (!through) return emptyPage(conversationId, 'resources', throughEventSeq, this.transcript.orderEpoch(conversationId), limits);
     const after = cursor?.after ?? null;
     const rows = this.db.select<{
+      /** 原消息的规范显示身份。 */
+      owner_entry_id: string | null;
       id: string;
       turn_id: string;
       item_id: string;
@@ -1420,10 +1589,20 @@ export class ConversationSnapshotV2Repository {
       kind: string;
       presentation: string;
       display_name: string | null;
+      /** 正文匹配所需的授权路径；不下发本地绝对路径。 */
+      project_relative_path: string | null;
+      /** 已登记网站的目标，用于区分同名链接。 */
+      url: string | null;
       mime_type: string | null;
       preview_kind: string | null;
       icon_kind: string | null;
       attachment_ref: string | null;
+      /** 原始 Markdown 引用由资源登记时持久保存。 */
+      source_reference: string | null;
+      /** 仅用于恢复图片身份，不进入资源页响应。 */
+      target_json: string | null;
+      /** 旧归档的原始引用由对应 Provider 正文确认，不按文件名猜测。 */
+      provider_text: string | null;
       task_push_attachment_key: string | null;
       origin: string | null;
       delivery: string | null;
@@ -1431,14 +1610,32 @@ export class ConversationSnapshotV2Repository {
       updated_at: string;
     }>(
       `SELECT id, turn_id, item_id, source_index, kind, presentation,
+              (SELECT alias.entry_id
+                 FROM conversation_transcript_aliases AS alias
+                 JOIN conversation_provider_item_states AS source
+                   ON source.conversation_id = alias.conversation_id
+                  AND source.provider_thread_id = alias.source_scope
+                  AND source.provider_item_id = alias.source_id
+                WHERE source.id = conversation_resources.item_id
+                  AND source.conversation_id = conversation_resources.conversation_id
+                  AND alias.source_domain = 'provider_item'
+                ORDER BY CASE alias.facet WHEN 'body' THEN 0 ELSE 1 END
+                LIMIT 1) AS owner_entry_id,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.displayName') AS TEXT), 1, 512) ELSE NULL END AS display_name,
+              CASE WHEN kind = 'file' AND json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.projectRelativePath') AS TEXT), 1, 4096) ELSE NULL END AS project_relative_path,
+              CASE WHEN kind = 'website' AND json_valid(target_json) THEN substr(CAST(json_extract(target_json, '$.url') AS TEXT), 1, 8192) ELSE NULL END AS url,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.mimeType') AS TEXT), 1, 256) ELSE NULL END AS mime_type,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.previewKind') AS TEXT), 1, 64) ELSE NULL END AS preview_kind,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.iconKind') AS TEXT), 1, 64) ELSE NULL END AS icon_kind,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.attachmentRef') AS TEXT), 1, 512) ELSE NULL END AS attachment_ref,
+              CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.sourceReference') AS TEXT), 1, 8192) ELSE NULL END AS source_reference,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.taskPushAttachmentKey') AS TEXT), 1, 512) ELSE NULL END AS task_push_attachment_key,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.origin') AS TEXT), 1, 128) ELSE NULL END AS origin,
               CASE WHEN json_valid(display_json) THEN substr(CAST(json_extract(display_json, '$.delivery') AS TEXT), 1, 32) ELSE NULL END AS delivery,
+              CASE WHEN kind = 'attachment' THEN target_json ELSE NULL END AS target_json,
+              CASE WHEN json_valid(display_json) AND json_extract(display_json, '$.origin') = 'assistant_markdown_image'
+                THEN (SELECT text_projection FROM conversation_provider_item_states AS item WHERE item.id = conversation_resources.item_id AND item.conversation_id = conversation_resources.conversation_id)
+                ELSE NULL END AS provider_text,
               created_at, updated_at
          FROM conversation_resources
         WHERE conversation_id = ?
@@ -1449,6 +1646,7 @@ export class ConversationSnapshotV2Repository {
       [conversationId, ...(after ? [after.createdAt, after.sourceIndex, after.id] : []), through.createdAt, through.sourceIndex, through.id, limits.entryLimit + 1],
     );
     const items = rows.map((row) => ({
+      ownerEntryId: row.owner_entry_id,
       id: row.id,
       turnId: row.turn_id,
       itemId: row.item_id,
@@ -1456,10 +1654,13 @@ export class ConversationSnapshotV2Repository {
       kind: row.kind,
       presentation: row.presentation,
       displayName: row.display_name ?? 'Resource',
+      projectRelativePath: row.project_relative_path,
+      url: row.url,
       mimeType: row.mime_type,
       previewKind: row.preview_kind,
       iconKind: row.icon_kind,
-      attachmentRef: row.attachment_ref,
+      attachmentRef: restoredAssistantImageAttachmentRef(row),
+      sourceReference: row.source_reference,
       taskPushAttachmentKey: row.task_push_attachment_key,
       origin: row.origin,
       delivery: row.delivery === 'assistant' ? ('assistant' as const) : null,
@@ -2552,6 +2753,10 @@ function classifyTurnFailure(code: string | null, httpStatusCode: number | null,
   )
     return 'rate_limit';
   if (
+    code === 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED' ||
+    code === 'ZEUS_MODEL_RESPONSE_TIMEOUT' ||
+    code === 'ZEUS_MODEL_RESPONSE_RETRYING' ||
+    code === 'ZEUS_MODEL_RESPONSE_FAILED' ||
     code === 'httpConnectionFailed' ||
     code === 'responseStreamConnectionFailed' ||
     code === 'responseStreamDisconnected' ||
@@ -3097,6 +3302,44 @@ function boundedPresentationString(value: unknown, maximumLength: number): strin
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 新旧图片资源都恢复原图身份，原有资源编号、归档文件和访问授权保持不变。 */
+function restoredAssistantImageAttachmentRef(row: {
+  item_id: string;
+  kind: string;
+  preview_kind: string | null;
+  attachment_ref: string | null;
+  delivery: string | null;
+  origin: string | null;
+  target_json: string | null;
+  provider_text: string | null;
+}): string | null {
+  if (row.kind !== 'attachment' || row.preview_kind !== 'image' || /^assistant_image_[a-f0-9]{64}$/u.test(row.attachment_ref ?? '')) return row.attachment_ref;
+  if (row.delivery === 'assistant') {
+    /** 工具图片的目标已经由资源登记入口完成授权。 */
+    const path = parseJsonRecordOrNull(row.target_json)?.absolutePath;
+    return typeof path === 'string' && isAbsolute(path) ? conversationImageAttachmentRef(path) : row.attachment_ref;
+  }
+  if (row.origin !== 'assistant_markdown_image') return row.attachment_ref;
+  /** 旧归档名称包含条目与原始引用的摘要，必须精确核对后才能恢复身份。 */
+  for (const match of (row.provider_text ?? '').matchAll(/!?\[([^\]\n]+)\]\(([^)\n]+)\)/gu)) {
+    /** 归档时使用的引用保留原始写法，不能先解码再核对。 */
+    const href = match[2]!.trim().replace(/^<|>$/gu, '');
+    /** 同名或同标签图片不能绕过这项原始引用核对。 */
+    const archivedIdentity = createHash('sha256').update(`${row.item_id}\0${href}`).digest('hex');
+    if (!row.attachment_ref?.startsWith(`${archivedIdentity}.`)) continue;
+    try {
+      /** 核对成功后按归档入口的本地路径规则还原原图。 */
+      const reference = href.trim().replace(/^<|>$/gu, '');
+      /** 文件 URL 与编码路径仅用于身份计算，不授予新的读取权限。 */
+      const path = /^file:/iu.test(reference) ? fileURLToPath(reference) : decodeURIComponent(reference);
+      if (isAbsolute(path) && !path.includes('\0')) return conversationImageAttachmentRef(path);
+    } catch {
+      // 无法恢复的引用保留原记录，不能误隐藏图片。
+    }
+  }
+  return row.attachment_ref;
 }
 
 function parseJsonRecordOrNull(value: string | null): Record<string, unknown> | null {

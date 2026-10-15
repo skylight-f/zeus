@@ -8,6 +8,7 @@ import { commandEnvelopeSchemaGeneration, parseCommandEnvelope, type CommandEnve
 import { currentDatabasePerformanceTraceId } from '@zeus/storage';
 import type {
   CodexMcpServerStartupState,
+  CommandDeliveryRepository,
   ConversationCollaborationMode,
   ConversationItemPhase,
   ConversationItemType,
@@ -317,9 +318,24 @@ export function isSteeringSubmission(submission: Pick<ZeusConversationSubmission
   return Boolean(submission.targetProviderTurnId);
 }
 
-/** 目标轮次身份不是 steer 消息的送达回执；仅接受 Provider 精确用户消息或 turn/start 的耐久接纳事实。 */
-export function submissionDeliveryConfirmedForTurn(submission: ZeusConversationSubmissionRecord, turn: ZeusConversationTurnRecord, exactProviderMessage: boolean): boolean {
-  return exactProviderMessage || (submission.id === turn.clientSubmissionId && submission.submissionOutcome === 'accepted' && Boolean(submission.acceptedAt));
+/** 运行态与终态共用精确送达证据；内部续接没有用户气泡，须核对同一提交和轮次的接纳回执。 */
+export function submissionDeliveryConfirmedForTurn(submission: ZeusConversationSubmissionRecord, turn: ZeusConversationTurnRecord, exactProviderMessage: boolean, commandDeliveries: Pick<CommandDeliveryRepository, 'getByScope'>): boolean {
+  if (exactProviderMessage) return true;
+  if (submission.id !== turn.clientSubmissionId) return false;
+  if (submission.submissionOutcome === 'accepted' && submission.acceptedAt) return true;
+  return Boolean(
+    turn.providerTurnId &&
+    commandDeliveries
+      .getByScope('submission', submission.id)
+      ?.attempts.some(
+        (attempt) =>
+          attempt.destinationKind === 'provider_turn' &&
+          attempt.outcome === 'accepted' &&
+          attempt.receipt?.providerId === 'codex' &&
+          attempt.receipt.nativeSessionId === turn.providerThreadId &&
+          attempt.receipt.nativeTurnId === turn.providerTurnId,
+      ),
+  );
 }
 
 /** 失败标记可以留在线程上；只有轮次均已结束时，才允许用户发起下一轮。 */
@@ -449,6 +465,23 @@ export function liveProgressProjection(existing: { payloadJson: string } | undef
   };
 }
 
+/** 实时与历史都保留无退出码命令的明确中断原因；后续真实终态会撤销该展示标记。 */
+export function commandTerminationProjection(payload: Record<string, unknown>, itemType: ConversationItemType, turnStatus?: string): Record<string, unknown> {
+  if (itemType !== 'commandExecution') return payload;
+  /** 原始 Provider 状态与退出码不改写，原因只进入既有展示元信息。 */
+  const presentation = isRecord(payload.presentation) ? payload.presentation : {};
+  /** 已确认的失败或退出码优先于轮次中断，不能掩盖命令错误。 */
+  const unfinished = (payload.status === 'inProgress' || payload.status === undefined) && payload.exitCode == null && payload.success !== false && payload.isError !== true && payload.error == null;
+  if (turnStatus === undefined && unfinished) return payload;
+  if (!(turnStatus === 'interrupted' && unfinished) && presentation.terminationReason !== 'turn_interrupted') return payload;
+  /** 副本避免改变持久原件或其他调用者持有的同一对象。 */
+  const updated = { ...presentation };
+  if (turnStatus === 'interrupted' && unfinished) updated.terminationReason = 'turn_interrupted';
+  else delete updated.terminationReason;
+  return { ...payload, presentation: updated };
+}
+
+/** 完成消息合并已保存内容，并清除已被真实命令终态取代的中断标记。 */
 export function completedItemProjection(
   existing: { payloadJson: string; textContent: string } | undefined,
   completedPayload: Record<string, unknown>,
@@ -463,7 +496,7 @@ export function completedItemProjection(
     ...(existingPresentation || completedPresentation ? { presentation: { ...(existingPresentation ?? {}), ...(completedPresentation ?? {}) } } : {}),
   };
 
-  if (itemType !== 'reasoning') return { payload: sanitizeConversationItemPayload(payload), textContent: itemText(completedPayload) };
+  if (itemType !== 'reasoning') return { payload: sanitizeConversationItemPayload(commandTerminationProjection(payload, itemType)), textContent: itemText(completedPayload) };
 
   const completedSummary = readableReasoningSummary(completedPayload);
   const presentation = isRecord(payload.presentation) ? payload.presentation : {};

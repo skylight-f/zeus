@@ -482,14 +482,14 @@ function TaskGitMergeModalContent(props: TaskGitMergeModalContentProps) {
     setCommitGenerationFeedback(zh ? '正在生成…' : 'Generating…');
     setError(null);
     try {
-      /** 与源码提交入口共用最近选用的模型，不额外增加模型设置。 */
+      /** 与其他提交入口共用已保存的模型、推理和速率设置。 */
       const models = await loadGitCommitModelOptions(props.client, props.task.projectId, controller.signal);
       controller.signal.throwIfAborted();
       if (!models.modelRef) throw new Error(models.warning || (zh ? '暂无可用模型，请在设置中配置模型连接后重试。' : 'No models available. Configure a model connection in Settings, then retry.'));
       /** 请求包含明确任务身份；服务端根据记录定位每个 Worktree。 */
       const result = await props.client.generateGitCommitMessage(
         props.task.projectId,
-        { repositoryId: commitGenerationSelection[0]!.repositoryId, taskId: props.task.id, selection: commitGenerationSelection, language: zh ? 'zh-CN' : 'en', modelRef: models.modelRef },
+        { repositoryId: commitGenerationSelection[0]!.repositoryId, taskId: props.task.id, selection: commitGenerationSelection, language: zh ? 'zh-CN' : 'en', ...models.settings },
         (text) => {
           if (!controller.signal.aborted) setGeneratedMessage(text);
         },
@@ -1020,13 +1020,16 @@ function TaskGitMergeModalContent(props: TaskGitMergeModalContentProps) {
     });
   }
 
-  async function copyBranchName(branchName: string): Promise<void> {
+  /** 返回实际复制结果，供分支图标显示短暂确认。 */
+  async function copyBranchName(branchName: string): Promise<boolean> {
     try {
       if (window.zeus?.writeClipboardText) await window.zeus.writeClipboardText(branchName);
       else await navigator.clipboard.writeText(branchName);
       setFeedback({ tone: 'info', text: zh ? `已复制分支名：${branchName}` : `Copied branch name: ${branchName}` });
+      return true;
     } catch {
       setError(zh ? '复制分支名失败，请稍后重试。' : 'The branch name could not be copied. Try again.');
+      return false;
     }
   }
 
@@ -1115,7 +1118,8 @@ function TaskGitMergeModalContent(props: TaskGitMergeModalContentProps) {
                 <GitDeliveryActions
                   zh={zh}
                   busyAction={busyAction}
-                  clientAvailable={Boolean(props.client)}
+                  generationClient={props.client}
+                  projectId={props.task.projectId}
                   canGenerate={Boolean(commitGenerationSelection.length)}
                   onGenerate={() => {
                     if (busyAction === 'commit-message') commitGenerationController.current?.abort();
@@ -1137,7 +1141,7 @@ function TaskGitMergeModalContent(props: TaskGitMergeModalContentProps) {
                       {selectedWorkspace && selectedWorkspace.activeConversationCount > 0 ? (
                         <small
                           className="task-git-review-active-sessions"
-                          title={zh ? '合入只包含已提交内容；关联会话未归档时保留工作目录。' : 'Only committed changes are merged. The working folder is preserved while linked conversations remain unarchived.'}
+                          data-icon-tooltip={zh ? '合入只包含已提交内容；关联会话未归档时保留工作目录。' : 'Only committed changes are merged. The working folder is preserved while linked conversations remain unarchived.'}
                         >
                           {zh ? `${selectedWorkspace.activeConversationCount} 个会话运行中` : `${selectedWorkspace.activeConversationCount} active conversations`}
                         </small>

@@ -307,16 +307,17 @@ export class ConversationProviderItemRepository {
       .map((row) => row.provider_turn_id);
   }
 
-  /** 一次性补齐图片查看、最终答复图片及 Pi 文件链接，只读取含资源引用的已完成消息。 */
+  /** 一次性补齐图片查看、最终答复图片及两条执行链的正文链接，只读取含资源引用的已完成消息。 */
   listCompletedItemsForResourceBackfill(): ZeusConversationItemRecord[] {
     return this.db
       .select<ProviderItemRow>(
         `SELECT *
            FROM conversation_provider_item_states
           WHERE status = 'completed' AND (
-            item_type = 'imageView'
+            item_type IN ('imageView', 'imageGeneration')
+            OR instr(payload_projection_json, 'Generated images are saved') > 0
             OR (phase = 'final_answer' AND instr(text_projection, '![') > 0)
-            OR (agent_kind = 'pi' AND instr(text_projection, '](') > 0)
+            OR ((agent_kind = 'pi' OR item_type = 'agentMessage') AND (instr(text_projection, '](') > 0 OR instr(text_projection, '![') > 0))
           )
           ORDER BY conversation_id, updated_at, id`,
       )

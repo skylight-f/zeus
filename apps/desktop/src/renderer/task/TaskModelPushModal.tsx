@@ -14,6 +14,8 @@ import {
   type TaskPushSupplementalAttachment,
 } from '@zeus/shared';
 import type { TaskRecord } from '../apiClient.js';
+import { ConversationComposerAttachments } from '../session/ConversationComposerAttachments.js';
+import { pendingResourceDisplayName } from '../ui/pendingResourcePolicy.js';
 import type {
   CodexConversationCapabilities,
   CodexTaskPushCapabilities,
@@ -27,7 +29,6 @@ import type {
 import { useConversationInputResources } from '../session/useConversationInputResources.js';
 import { ConversationPendingAttachmentImages } from '../session/ConversationResources.js';
 import { normalizeServiceTierSelection, serviceTierOptions, serviceTierSelectionFromValue, serviceTierSelectionValue } from '../session/serviceTierSelection.js';
-import { readConversationRuntimePreferences, writeConversationRuntimePreferences } from '../session/conversationRuntimePreferences.js';
 import { hasAvailableConversationModel, resolveModelCapability } from '../session/modelSelection.js';
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
@@ -75,9 +76,8 @@ export function resolveTaskModelPushEntry(capabilities: CodexConversationCapabil
   return hasConfiguredProvider ? 'custom' : 'choose';
 }
 
-export type TaskModelPushPreferences = Pick<TaskModelPushForm, 'model' | 'effort' | 'serviceTier' | 'workMode' | 'permissionMode'> & {
-  workspaceMode?: 'direct' | 'worktree';
-};
+/** 项目内复用推送选项，不保存分支、历史会话、补充信息和并发确认。 */
+export type TaskModelPushPreferences = Pick<TaskModelPushForm, 'model' | 'effort' | 'serviceTier' | 'workMode' | 'permissionMode'> & Partial<Pick<TaskModelPushForm, 'workspaceMode' | 'contextCapacityTokens' | 'skillId'>>;
 
 type TaskPushRepositoryCapability = CodexTaskPushCapabilities['repositories'][number];
 type TaskPushSourceRef = TaskPushRepositoryCapability['sourceRefs'][number];
@@ -92,6 +92,7 @@ interface TaskPushCommonSource {
   refsByRepository: Record<string, string>;
 }
 
+/** 保留已有存储前缀，每个项目使用独立记录。 */
 const preferencesKeyPrefix = 'zeus.task-model-push-preferences:v1:';
 
 /** 统一兼容混合版本运行服务缺失的可选上下文集合；模型与仓库等创建必需能力仍保持严格校验。 */
@@ -434,7 +435,7 @@ function TaskPushContextPicker(props: {
                   <div>
                     <strong>{attachmentTitle}</strong>
                     {option.attachments.length > 0 ? (
-                      option.attachments.map((attachment) => (
+                      option.attachments.map((attachment, index) => (
                         <label key={attachment.key} className={!attachment.available ? 'is-unavailable' : undefined}>
                           <input
                             type="checkbox"
@@ -443,7 +444,7 @@ function TaskPushContextPicker(props: {
                             disabled={props.busy || !attachment.available}
                           />
                           <span>
-                            <strong>{attachment.name}</strong>
+                            <strong>{attachment.kind === 'image' ? `${props.zh ? '图片' : 'Image'} ${index + 1}` : pendingResourceDisplayName(attachment.name, props.zh ? 'zh-CN' : 'en-US')}</strong>
                             <small>
                               {attachment.available ? `${taskPushAttachmentFieldLabel(attachment.field, props.zh)} · ${attachment.kind}${attachment.size !== undefined ? ` · ${attachment.size} B` : ''}` : attachment.unavailableReason}
                             </small>
@@ -471,18 +472,19 @@ export function TaskPushLayoutPreview(props: { layout: TaskPushMessageLayout; la
   // 不按文件名匹配，也不将本机预览路径写回布局。
   const previewAttachmentsByKey = new Map(props.previewAttachments.map((attachment) => [attachment.taskPushAttachmentKey, attachment]));
 
-  /** 当前字段和补充附件共用同一图片匹配入口。 */
+  /** 当前字段和补充附件共用可点击预览，文本附件不再退回名称文案。 */
   function renderAttachment(key: string) {
     // 元数据决定是否为图片，来源只负责提供受控预览输入。
     const attachment = attachmentsByKey.get(key);
     const previewAttachment = previewAttachmentsByKey.get(key);
     if (!attachment) return null;
     if (attachment.kind === 'image' && previewAttachment) {
-      return <ConversationPendingAttachmentImages key={key} attachments={[{ ...previewAttachment, kind: 'image' }]} language={props.language} />;
+      return <ConversationPendingAttachmentImages key={key} attachments={[{ ...previewAttachment, kind: 'image' }]} language={props.language} compact />;
     }
+    if (previewAttachment) return <ConversationComposerAttachments key={key} attachments={[previewAttachment]} language={props.language} disabled={false} />;
     return (
       <span key={key} className="task-push-layout-attachment">
-        {attachment.kind === 'image' ? (props.language === 'zh-CN' ? '图片预览不可用' : 'Image preview unavailable') : props.language === 'zh-CN' ? '附件' : 'Attachment'} · {attachment.name}
+        {attachment.kind === 'image' ? (props.language === 'zh-CN' ? '图片预览不可用' : 'Image preview unavailable') : `${props.language === 'zh-CN' ? '附件' : 'Attachment'} · ${pendingResourceDisplayName(attachment.name, props.language)}`}
       </span>
     );
   }
@@ -526,12 +528,12 @@ export function TaskPushLayoutPreview(props: { layout: TaskPushMessageLayout; la
   );
 }
 
-/** 优先恢复上次推送选择；尚未推送配置过的项目才借用会话偏好。 */
+/** 只恢复当前项目的推送选择，其他项目和普通会话的偏好不参与。 */
 export function readTaskModelPushPreferences(storage: Pick<Storage, 'getItem'> | undefined, projectId: string): TaskModelPushPreferences | null {
   if (!storage) return null;
   try {
     /** 推送专属记录不受打开会话或修改会话参数影响。 */
-    const value = JSON.parse(storage.getItem(`${preferencesKeyPrefix}global`) ?? 'null') as Partial<TaskModelPushPreferences> | null;
+    const value = JSON.parse(storage.getItem(`${preferencesKeyPrefix}${encodeURIComponent(projectId)}`) ?? 'null') as Partial<TaskModelPushPreferences> | null;
     if (
       value?.model &&
       typeof value.model === 'string' &&
@@ -542,45 +544,31 @@ export function readTaskModelPushPreferences(storage: Pick<Storage, 'getItem'> |
       return {
         model: value.model,
         effort: value.effort,
-        serviceTier: { type: 'standard' },
+        serviceTier: value.serviceTier?.type === 'catalog' && value.serviceTier.id === 'priority' ? { type: 'catalog', id: 'priority' } : { type: 'standard' },
         workMode: value.workMode,
         permissionMode: value.permissionMode,
+        contextCapacityTokens: typeof value.contextCapacityTokens === 'number' && Number.isSafeInteger(value.contextCapacityTokens) && value.contextCapacityTokens > 0 ? value.contextCapacityTokens : null,
+        ...(typeof value.skillId === 'string' ? { skillId: value.skillId } : {}),
         ...(value.workspaceMode === 'direct' || value.workspaceMode === 'worktree' ? { workspaceMode: value.workspaceMode } : {}),
       };
     }
   } catch {
-    // 损坏的推送记录不阻断已有会话偏好的恢复。
-  }
-  /** 当前任务优先复用全局操作偏好，速度保持标准档位。 */
-  const current = readConversationRuntimePreferences(storage, projectId, 'task_development');
-  if (current?.model) {
-    return {
-      model: current.model,
-      effort: current.effort ?? '',
-      serviceTier: { type: 'standard' },
-      workMode: current.collaborationMode,
-      permissionMode: current.permissionMode,
-      ...(current.workspaceMode ? { workspaceMode: current.workspaceMode } : {}),
-    };
+    // 损坏的记录回到当前项目的初始选项，不借用其他项目的权限。
   }
   return null;
 }
 
+/** 用户修改选项时自动按项目保存，执行确认仍属于本次推送。 */
 export function writeTaskModelPushPreferences(storage: Pick<Storage, 'getItem' | 'setItem'> | undefined, projectId: string, form: TaskModelPushForm): void {
   if (!storage) return;
-  writeConversationRuntimePreferences(storage, projectId, 'task_development', {
-    model: form.model,
-    ...(form.effort ? { effort: form.effort } : {}),
-    serviceTier: form.serviceTier,
-    permissionMode: form.permissionMode,
-    collaborationMode: form.workMode,
-    ...(form.workspaceModeSelected ? { workspaceMode: form.workspaceMode } : {}),
-  });
   storage.setItem(
-    `${preferencesKeyPrefix}global`,
+    `${preferencesKeyPrefix}${encodeURIComponent(projectId)}`,
     JSON.stringify({
       model: form.model,
       effort: form.effort,
+      serviceTier: form.serviceTier,
+      contextCapacityTokens: form.contextCapacityTokens ?? null,
+      skillId: form.skillId,
       workMode: form.workMode,
       permissionMode: form.permissionMode,
       ...(form.workspaceModeSelected ? { workspaceMode: form.workspaceMode } : {}),
@@ -588,7 +576,14 @@ export function writeTaskModelPushPreferences(storage: Pick<Storage, 'getItem' |
   );
 }
 
-export function resolveTaskModelPushInitialForm(capabilities: CodexTaskPushCapabilities, remembered: TaskModelPushPreferences | null, skillId = ''): TaskModelPushForm {
+/** 模型目录可先初始化配置；仓库和上下文仍由完整任务查询补齐。 */
+export function resolveTaskModelPushInitialForm(
+  capabilities: Pick<CodexConversationCapabilities, 'models' | 'preferredModel'> & Partial<Pick<CodexTaskPushCapabilities, 'repositories' | 'existingEnvironments'>>,
+  remembered: TaskModelPushPreferences | null,
+  skillId = '',
+): TaskModelPushForm {
+  /** 未读取仓库时不猜测工作区方式，完整查询会继续执行原有协调。 */
+  const repositories = capabilities.repositories ?? [];
   const availableModels = capabilities.models.filter((model) => model.available !== false);
   const rememberedModel = resolveModelCapability(availableModels, remembered?.model);
   // 已记住或已配置的模型失效时等待用户明确选择。
@@ -599,22 +594,23 @@ export function resolveTaskModelPushInitialForm(capabilities: CodexTaskPushCapab
   const normalizedServiceTier = selectedModel ? normalizeServiceTierSelection(remembered?.serviceTier ?? { type: 'standard' }, selectedModel) : { selection: remembered?.serviceTier ?? { type: 'standard' as const }, downgraded: false };
   const firstAvailableEnvironment = capabilities.existingEnvironments?.find((environment) => environment.available);
   return {
+    contextCapacityTokens: remembered?.contextCapacityTokens ?? null,
     model: selectedModel?.id ?? requestedModel ?? '',
     effort,
     serviceTier: normalizedServiceTier.selection,
     serviceTierDowngraded: normalizedServiceTier.downgraded,
     workMode: remembered?.workMode ?? 'default',
-    // 用户已确认：项目没有成功记忆时，权限必须回退为只读。
+    // 当前项目没有选择记忆时，权限必须回退为只读。
     permissionMode: remembered?.permissionMode ?? 'read-only',
-    skillId,
-    workspaceMode: remembered?.workspaceMode ?? (capabilities.repositories.length > 0 ? 'worktree' : 'direct'),
+    skillId: remembered?.skillId ?? skillId,
+    workspaceMode: remembered?.workspaceMode ?? (repositories.length > 0 ? 'worktree' : 'direct'),
     workspaceModeSelected: Boolean(remembered?.workspaceMode),
-    workspaceModeResolved: capabilities.repositories.length > 0,
+    workspaceModeResolved: repositories.length > 0,
     taskBranchMode: 'create',
     environmentId: firstAvailableEnvironment?.id ?? '',
     directConcurrencyConfirmed: false,
     repositorySelections: Object.fromEntries(
-      capabilities.repositories.map((repository) => {
+      repositories.map((repository) => {
         const currentSourceRef = repository.sourceRefs.find((source) => source.current)?.ref ?? '';
         return [
           repository.id,
@@ -918,9 +914,9 @@ export function TaskModelPushModal(props: {
           >
             <div className="task-model-push-toolbar">
               <strong id="task-model-push-model-heading">{zh ? '模型选择' : 'Model selection'}</strong>
-              {/* 加载时保留接入按钮的布局，只禁用交互，避免工具栏高度变化。 */}
+              {/* 等待模型目录时保留按钮位置；已有目录不受仓库读取阻塞。 */}
               {props.onConnectModel && !modelSetupRequired ? (
-                <Button className="task-model-connect-link" variant="secondary" size="compact" onClick={props.onConnectModel} disabled={busy || props.status === 'loading'}>
+                <Button className="task-model-connect-link" variant="secondary" size="compact" onClick={props.onConnectModel} disabled={busy || (props.status === 'loading' && !runtimeCapabilities)}>
                   {zh ? '接入其他模型' : 'Connect another model'}
                 </Button>
               ) : null}
@@ -1282,7 +1278,7 @@ export function TaskModelPushModal(props: {
                     <ul className="task-model-push-existing-repositories">
                       {pendingEnvironmentRepositories.map((repository) => (
                         <li key={repository.repositoryId}>
-                          <span title={repository.relativePath}>{repository.repositoryName}</span>
+                          <span data-icon-tooltip={repository.relativePath}>{repository.repositoryName}</span>
                           <Button
                             variant="secondary"
                             size="compact"

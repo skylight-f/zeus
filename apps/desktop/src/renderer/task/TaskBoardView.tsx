@@ -1,3 +1,4 @@
+import { formatTaskDeadline, matchesTaskDeadline } from '@zeus/shared';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { Collapsible } from '../ui/Collapsible.js';
 import {
@@ -28,6 +29,7 @@ import { EyeSlashIcon as EyeSlash } from '@phosphor-icons/react/dist/csr/EyeSlas
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import {
   createDefaultTaskBoardViewSettings,
+  isTaskType,
   taskBoardCardProperties,
   taskBoardEmptyGroupId,
   taskBoardGroupProperties,
@@ -55,6 +57,9 @@ import { formatTaskType, type TaskBranchStatus } from './taskWorkspaceModel.js';
 import { taskBranchStatusTone, taskPriorityTone, taskRunStatusTone, taskTypeTone, type TaskSemanticTone } from './TaskRunStatusChip.js';
 
 export interface TaskBoardViewProps {
+  /** 当前时刻与项目的终态配置。 */
+  now?: number;
+  terminalStatuses?: readonly string[];
   projectId: string;
   language: 'zh-CN' | 'en-US';
   tasks: TaskRecord[];
@@ -137,6 +142,7 @@ const cardPropertyLabels: Record<TaskBoardCardProperty, [string, string]> = {
   source: ['任务来源', 'Source'],
   createdAt: ['创建时间', 'Created'],
   updatedAt: ['更新时间', 'Updated'],
+  deadline: ['截止时间', 'Deadline'],
 };
 
 const filterOperators: Array<{ value: TaskBoardFilterOperator; label: [string, string] }> = [
@@ -160,6 +166,7 @@ function transformStyle(transform: { x: number; y: number; scaleX?: number; scal
 }
 
 function taskBoardPropertyLabel(property: TaskBoardCardProperty, task: TaskRecord, context: TaskBoardProjectionContext): string {
+  if (property === 'deadline') return `${formatTaskDeadline(task.deadline)}${matchesTaskDeadline(task, 'overdue', context.now, context.terminalStatuses) ? (context.language === 'zh-CN' ? ' · 已逾期' : ' · Overdue') : ''}`;
   const values = taskBoardCardPropertyValues(task, property, context);
   if (property === 'taskType') return formatTaskType(task.taskType, context.language);
   if (property === 'managementStatus') return new Map(taskBoardGroupOptions(context, 'managementStatus').map((option) => [option.id, option.label])).get(values[0] ?? '') ?? values[0] ?? '—';
@@ -183,6 +190,7 @@ function taskBoardPropertyAccent(property: TaskBoardCardProperty, task: TaskReco
     const color = context.statusDefinitions.find((status) => status.id === (task.managementStatus ?? 'todo'))?.color;
     return { tone: 'neutral', color };
   }
+  if (property === 'deadline' && matchesTaskDeadline(task, 'overdue', context.now, context.terminalStatuses)) return { tone: 'neutral', color: '#c94545' };
   if (property === 'priority') return { tone: taskPriorityTone(task.priority ?? null) };
   if (property === 'taskType') return { tone: taskTypeTone(task.taskType) };
   if (property === 'runStatus') return { tone: taskRunStatusTone(context.runStatuses[task.id] ?? 'not_started') };
@@ -241,6 +249,7 @@ const TaskBoardCard = memo(function TaskBoardCard(props: {
           {props.card.task.title}
         </button>
         <button
+          data-icon-tooltip={props.context.language === 'zh-CN' ? '拖动任务' : 'Drag task'}
           ref={sortable.setActivatorNodeRef}
           type="button"
           className="task-board-drag-handle"
@@ -261,7 +270,7 @@ const TaskBoardCard = memo(function TaskBoardCard(props: {
               className={`task-board-card-property task-board-card-property-${property}${toned ? ` is-toned task-board-card-property-tone-${accent.tone}` : ''}`}
               style={accent.color ? ({ '--task-board-property-color': accent.color } as CSSProperties) : undefined}
               key={property}
-              title={translate(cardPropertyLabels[property], props.context.language)}
+              data-icon-tooltip={translate(cardPropertyLabels[property], props.context.language)}
             >
               <small>{translate(cardPropertyLabels[property], props.context.language)}</small>
               <span>{taskBoardPropertyLabel(property, props.card.task, props.context)}</span>
@@ -269,7 +278,7 @@ const TaskBoardCard = memo(function TaskBoardCard(props: {
           );
         })}
       </div>
-      <label className="task-board-move-menu">
+      <label className="task-board-move-menu" data-icon-tooltip={props.context.language === 'zh-CN' ? '移动到分组' : 'Move to group'}>
         <span className="sr-only">{props.context.language === 'zh-CN' ? '移动到分组' : 'Move to group'}</span>
         <ArrowRight aria-hidden="true" weight="bold" />
         <select
@@ -323,7 +332,12 @@ function TaskBoardLane(props: {
           </button>
           <span className="task-board-subgroup-actions">
             <span>{props.context.language === 'zh-CN' ? `${props.cards.length} 项` : `${props.cards.length} ${props.cards.length === 1 ? 'item' : 'items'}`}</span>
-            <button type="button" aria-label={`${props.context.language === 'zh-CN' ? '隐藏子分组' : 'Hide subgroup'} ${props.label}`} onClick={props.onHide}>
+            <button
+              data-icon-tooltip={props.context.language === 'zh-CN' ? '隐藏子分组' : 'Hide subgroup'}
+              type="button"
+              aria-label={`${props.context.language === 'zh-CN' ? '隐藏子分组' : 'Hide subgroup'} ${props.label}`}
+              onClick={props.onHide}
+            >
               <EyeSlash aria-hidden="true" />
             </button>
           </span>
@@ -409,6 +423,7 @@ function TaskBoardColumn(props: {
           {collapsed ? <CaretRight className="task-board-column-caret" aria-hidden="true" /> : <CaretDown className="task-board-column-caret" aria-hidden="true" />}
         </button>
         <button
+          data-icon-tooltip={props.settings.groupSort !== 'manual' ? (props.context.language === 'zh-CN' ? '使用手动排序后可拖动分组' : 'Use manual sorting to drag groups') : props.context.language === 'zh-CN' ? '拖动分组' : 'Drag group'}
           ref={sortable.setActivatorNodeRef}
           type="button"
           className="task-board-column-drag-handle"
@@ -419,7 +434,13 @@ function TaskBoardColumn(props: {
         >
           <DotsSixVertical aria-hidden="true" weight="bold" />
         </button>
-        <button type="button" className="task-board-column-hide" aria-label={`${props.context.language === 'zh-CN' ? '隐藏分组' : 'Hide group'} ${props.group.label}`} onClick={props.onHideGroup}>
+        <button
+          data-icon-tooltip={props.context.language === 'zh-CN' ? '隐藏分组' : 'Hide group'}
+          type="button"
+          className="task-board-column-hide"
+          aria-label={`${props.context.language === 'zh-CN' ? '隐藏分组' : 'Hide group'} ${props.group.label}`}
+          onClick={props.onHideGroup}
+        >
           <EyeSlash aria-hidden="true" />
         </button>
       </header>
@@ -795,6 +816,7 @@ function TaskBoardSettingsDialog(props: {
                     {translate(cardPropertyLabels[property], props.language)}
                   </label>
                   <button
+                    data-icon-tooltip={zh ? '向上移动字段' : 'Move property up'}
                     type="button"
                     aria-label={zh ? '向上移动字段' : 'Move property up'}
                     disabled={index === 0}
@@ -809,6 +831,7 @@ function TaskBoardSettingsDialog(props: {
                     <ArrowUp aria-hidden="true" />
                   </button>
                   <button
+                    data-icon-tooltip={zh ? '向下移动字段' : 'Move property down'}
                     type="button"
                     aria-label={zh ? '向下移动字段' : 'Move property down'}
                     disabled={index === draft.propertyOrder.length - 1}
@@ -1032,7 +1055,7 @@ function optimisticTaskForMove(task: TaskRecord, property: TaskBoardGroupPropert
   if (sourceId === targetId) return task;
   if (property === 'managementStatus') return { ...task, managementStatus: targetId };
   if (property === 'priority') return { ...task, priority: targetId };
-  if (property === 'taskType' && (targetId === 'requirement' || targetId === 'defect' || targetId === 'optimization')) return { ...task, taskType: targetId };
+  if (property === 'taskType' && isTaskType(targetId)) return { ...task, taskType: targetId };
   if (property === 'parentTask') return { ...task, parentTaskId: targetId === taskBoardEmptyGroupId ? null : targetId };
   if (property === 'tags') {
     const tags = (task.tags ?? []).filter((tag) => sourceId === taskBoardEmptyGroupId || tag !== sourceId);
@@ -1096,6 +1119,8 @@ export function TaskBoardView(props: TaskBoardViewProps) {
       settings
         ? {
             language: props.language,
+            now: props.now,
+            terminalStatuses: props.terminalStatuses,
             tasks: localTasks,
             settings,
             positions: snapshot?.positions ?? [],
@@ -1104,7 +1129,7 @@ export function TaskBoardView(props: TaskBoardViewProps) {
             branchStatuses: props.branchStatuses,
           }
         : null,
-    [localTasks, props.branchStatuses, props.language, props.runStatuses, props.statusDefinitions, settings, snapshot?.positions],
+    [props.now, props.terminalStatuses, localTasks, props.branchStatuses, props.language, props.runStatuses, props.statusDefinitions, settings, snapshot?.positions],
   );
   const groups = useMemo(() => (context ? buildTaskBoardGroups(context) : []), [context]);
   const groupOptions = useMemo(() => (context ? taskBoardGroupOptions(context, context.settings.groupBy) : []), [context]);

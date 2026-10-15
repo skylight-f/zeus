@@ -150,8 +150,11 @@ contextBridge.exposeInMainWorld('zeus', {
   exitExecutionHostMaintenance: () => ipcRenderer.invoke('zeus:execution-host-maintenance:exit'),
   restartAfterStartupFailure: () => ipcRenderer.invoke('zeus:startup-failure:restart'),
   exitAfterStartupFailure: () => ipcRenderer.invoke('zeus:startup-failure:exit'),
+  reportStartupSpan: (input: { stage: string; durationMs: number }) => ipcRenderer.send('zeus:renderer-startup-span', input),
+  reportHomeInteractive: () => ipcRenderer.send('zeus:renderer-home-interactive'),
+  getStartupSettings: () => ipcRenderer.invoke('zeus:startup-settings:get'),
   getLocalServerConfig: () => ipcRenderer.invoke('zeus:get-local-server-config'),
-  loadSessionViewCache: () => ipcRenderer.invoke('zeus:session-view-cache:load'),
+  loadSessionViewCache: (identity: { projectId: string; conversationId: string }) => ipcRenderer.invoke('zeus:session-view-cache:load', identity),
   persistSessionViewCache: (value: unknown) => ipcRenderer.send('zeus:session-view-cache:persist', value),
   runStorageRecoveryPreflightAndRestart: () => invokeMainCommand('zeus:storage-recovery:preflight-and-restart', 'desktop.storage_recovery.preflight_restart', 'execution_host', 'storage-recovery'),
   openTaskGitDeliveryWindow: (input: unknown) => ipcRenderer.invoke('zeus:task-git-delivery:open', input),
@@ -204,6 +207,13 @@ contextBridge.exposeInMainWorld('zeus', {
     ipcRenderer.on('zeus:task-git-delivery:open-conversation', handler);
     return () => ipcRenderer.removeListener('zeus:task-git-delivery:open-conversation', handler);
   },
+  /** 系统提醒只携带任务身份，Renderer 沿用现有导航和草稿保护。 */
+  onOpenTaskNotification: (listener: (input: unknown) => void) => {
+    /** 精确频道不向页面暴露通用 IPC 能力。 */
+    const handler = (_event: unknown, input: unknown) => listener(input);
+    ipcRenderer.on('zeus:task-notification:open', handler);
+    return () => ipcRenderer.removeListener('zeus:task-notification:open', handler);
+  },
   onOpenConversationNotification: (listener: (input: unknown) => void) => {
     const handler = (_event: unknown, input: unknown) => listener(input);
     ipcRenderer.on('zeus:conversation-notification:open', handler);
@@ -239,6 +249,10 @@ contextBridge.exposeInMainWorld('zeus', {
   requestProjectSourceLanguage: (input: unknown) => ipcRenderer.invoke('zeus:project-source:language', input),
   releaseProjectSourceLanguage: (projectId: string) => ipcRenderer.invoke('zeus:project-source:release-language', projectId),
   readProjectSourceFile: (input: unknown) => ipcRenderer.invoke('zeus:project-source:read-file', input),
+  /** 只向受信源码页提供草稿效果预览。 */
+  prepareProjectSourcePreview: (input: unknown) => ipcRenderer.invoke('zeus:project-source:prepare-preview', input),
+  /** 关闭页面或切换文件后撤销资源授权。 */
+  releaseProjectSourcePreview: (ids: string[]) => ipcRenderer.invoke('zeus:project-source:release-preview', ids),
   saveProjectSourceFile: (input: unknown) => invokeProjectSourceCommand('zeus:project-source:save-file', 'desktop.project_source.save_file', input),
   createProjectSourceEntry: (input: unknown) => invokeProjectSourceCommand('zeus:project-source:create-entry', 'desktop.project_source.create_entry', input),
   moveProjectSourceEntry: (input: unknown) => invokeProjectSourceCommand('zeus:project-source:move-entry', 'desktop.project_source.move_entry', input),
@@ -254,6 +268,8 @@ contextBridge.exposeInMainWorld('zeus', {
   },
   reportRendererFatalFailure: (message: string) => rendererBootstrapReporter.reportFailure(message),
   reportRendererRuntimeError: (message: string) => ipcRenderer.send('zeus:renderer-runtime-log', message),
+  /** 输入建议只上传有界诊断元数据，不通过日志 IPC 传递正文。 */
+  reportInputSuggestionDiagnostic: (entry: unknown) => ipcRenderer.send('zeus:input-suggestion-diagnostic', entry),
   reportRendererBootstrapReady: () => rendererBootstrapReporter.reportReady(),
   chooseProjectDirectory: () => ipcRenderer.invoke('zeus:choose-project-directory'),
   revealProjectInFinder: (projectPath: string) => ipcRenderer.invoke('zeus:reveal-project-in-finder', projectPath),
@@ -351,6 +367,8 @@ contextBridge.exposeInMainWorld('zeus', {
   showBrowserMenu: (input: unknown) => ipcRenderer.invoke('zeus:browser:show-menu', input),
   getBrowserSnapshot: (conversationId: string) => ipcRenderer.invoke('zeus:browser:get-snapshot', conversationId),
   openBrowserTab: (input: unknown) => ipcRenderer.invoke('zeus:browser:open-tab', input),
+  /** 首发受理后把当前窗口的浏览器草稿归入真实会话。 */
+  adoptBrowserDraft: (input: unknown) => ipcRenderer.invoke('zeus:browser:adopt-draft', input),
   activateBrowserTab: (input: unknown) => ipcRenderer.invoke('zeus:browser:activate-tab', input),
   closeBrowserTab: (input: unknown) => ipcRenderer.invoke('zeus:browser:close-tab', input),
   /** 明确关闭当前会话浏览器并释放全部标签。 */

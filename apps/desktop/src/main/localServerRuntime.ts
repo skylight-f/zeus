@@ -263,12 +263,12 @@ class ExecutionHostOwnershipError extends Error {
  * 写入可追踪的本机运行配置文件；该文件只记录路径与监听边界，
  * 严禁写入 Renderer API token、Telegram token 等敏感凭据。
  */
-async function writeDesktopLocalAppConfig(input: { configPath: string; userDataPath: string; projectRoot: string; dbPath: string }): Promise<void> {
+async function writeDesktopLocalAppConfig(input: { configPath: string; userDataPath: string; projectRoot: string; dbPath: string; /** 日志目录来自本次运行的数据布局，不按数据库文件名猜测。 */ localLogDirectory: string }): Promise<void> {
   const configFile: DesktopLocalAppConfigFile = {
     appName: 'Zeus',
     projectRoot: input.projectRoot,
     dbPath: input.dbPath,
-    localLogDirectory: `${input.dbPath}.logs`,
+    localLogDirectory: input.localLogDirectory,
     localServerHost: '127.0.0.1',
     updatedAt: new Date().toISOString(),
   };
@@ -595,6 +595,19 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
       await replaceMismatchedHost();
     };
 
+    // 冷启动发现旧版本时必须先完整替换旧 Core，再把业务配置交给 Renderer。
+    // 替换失败会进入唯一启动失败页，不能让新版界面继续使用旧版宿主。
+    if (connection.appVersion !== currentAppVersion) {
+      try {
+        await probeHostHandoff();
+      } catch (error) {
+        // 冷启动失败没有可返回的 runtime，必须撤销租约且不能留下恢复定时器。
+        closing = true;
+        await client.detach(leaseId).catch(() => undefined);
+        throw error;
+      }
+    }
+
     heartbeatTimer = setInterval(() => {
       if (heartbeatCyclePromise || closing) return;
       const cycle = maintainLease().finally(() => {
@@ -604,12 +617,6 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
       void cycle.catch(() => undefined);
     }, 1_000);
     heartbeatTimer.unref();
-
-    // 冷启动发现旧版本时必须先完整替换旧 Core，再把业务配置交给 Renderer。
-    // 替换失败会进入唯一启动失败页，不能让新版界面继续使用旧版宿主。
-    if (connection.appVersion !== currentAppVersion) {
-      await probeHostHandoff();
-    }
 
     handoffTimer = setInterval(() => {
       if (handoffProbePromise || handoffPromise || closing) return;
@@ -765,6 +772,7 @@ export async function startOwnedDesktopLocalServer(options: StartDesktopLocalSer
       userDataPath: options.userDataPath,
       projectRoot: options.projectRoot,
       dbPath,
+      localLogDirectory: dataLayout.localLogs,
     });
   }
   let currentServer: RunningZeusLocalServer;

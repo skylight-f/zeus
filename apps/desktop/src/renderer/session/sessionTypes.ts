@@ -1,3 +1,4 @@
+import type { ConversationSystemMessage, ConversationSystemMessagePage } from '@zeus/shared';
 import type { ConversationWorktreeOptions } from '@zeus/shared';
 import type { ConversationFeatureCatalog } from '@zeus/shared';
 import type { AssistantMessageMetadata, AsyncQuestionAnswer, AsyncQuestionResponse } from '@zeus/shared';
@@ -266,6 +267,10 @@ export interface NativeSubagentPromptFact {
 export type NativeSubmissionReceipt = Pick<NativeQueuedSubmission, 'id' | 'conversationId' | 'clientUserMessageId' | 'status' | 'pausedReason' | 'providerTurnId'>;
 
 export interface NativeQueuedSubmission {
+  /** 内部提交只显示系统状态，仍保留送达核对和错误反馈。 */
+  internalOperation?: boolean;
+  /** 明确关联被取消的原提交，实时与重新加载均可清理其临时气泡。 */
+  replacementOfSubmissionId?: string;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
   questionAnswer?: AsyncQuestionAnswer;
   id: string;
@@ -526,6 +531,8 @@ export interface NativeConversationExecutionContext {
 export type NativeConversationStage = 'created' | 'connecting' | 'queued' | 'running' | 'waiting_user' | 'waiting_approval' | 'completed' | 'failed' | 'paused' | 'ready' | 'archived';
 
 export interface NativeConversationSnapshot {
+  /** 同一读取进度下的有界系统消息。 */
+  systemMessages?: ConversationSystemMessagePage;
   /** 会话下次执行使用的容量，与本轮实际用量分开显示。 */
   contextCapacityTokens?: number | null;
   /** 原生窗口配置的最近发送或读回证据。 */
@@ -716,6 +723,8 @@ export type NativeConversationSnapshotV2Page<T> = SharedConversationSnapshotV2Pa
 
 /** 会话结构和最新消息由服务端在同一次同步读取中生成。 */
 export interface NativeConversationReadableSnapshot {
+  /** 同一读取进度下的有界系统消息。 */
+  systemMessages?: ConversationSystemMessagePage;
   /** 当前事件进度对应的有界会话结构。 */
   snapshot: NativeConversationSnapshotV2;
   /** 与结构具有相同事件进度的消息尾页。 */
@@ -790,6 +799,8 @@ export interface NativeConversationProcessV2Item {
 }
 
 export interface NativeConversationResourceV2Item {
+  /** 原消息的持久显示身份，旧缓存缺失时等待资源重新读取。 */
+  ownerEntryId?: string | null;
   id: string;
   turnId: string;
   itemId: string;
@@ -797,10 +808,16 @@ export interface NativeConversationResourceV2Item {
   kind: string;
   presentation: string;
   displayName: string;
+  /** 已登记文件的项目相对路径；旧缓存缺失时重新读取资源页。 */
+  projectRelativePath?: string | null;
+  /** 已登记网站的 URL；链接标题不作为目标替代值。 */
+  url?: string | null;
   mimeType: string | null;
   previewKind: string | null;
   iconKind: string | null;
   attachmentRef?: string | null;
+  /** 图片按原始引用匹配，不能用相同说明串接其他图片。 */
+  sourceReference?: string | null;
   taskPushAttachmentKey?: string | null;
   origin?: string | null;
   /** 旧 Snapshot V2 缓存可能没有该字段；缺失必须按普通过程资源处理。 */
@@ -1500,6 +1517,10 @@ export interface StartTaskModelPushRequest {
 
 export type StartNativeConversationRequest =
   | {
+      /** 首条消息的结构化网页批注，复用后续消息的处理链路。 */
+      browserComments?: ZeusBrowserComment[];
+      /** 首条消息的网页批注提示词。 */
+      browserCommentContent?: string;
       /** 本次创建选择的上下文窗口容量。 */
       contextCapacityTokens?: number | null;
       mode: 'create';
@@ -1546,6 +1567,10 @@ export type StartNativeConversationRequest =
     };
 
 export interface StartProjectConversationRequest {
+  /** 首条消息的结构化网页批注，复用后续消息的处理链路。 */
+  browserComments?: ZeusBrowserComment[];
+  /** 首条消息的网页批注提示词。 */
+  browserCommentContent?: string;
   /** 上下文窗口容量；空值使用默认。 */
   contextCapacityTokens?: number | null;
   source?: 'code_review';
@@ -1572,6 +1597,8 @@ export interface StartProjectConversationRequest {
 }
 
 export interface SendNativeMessageRequest {
+  /** 用户只指定原失败轮次，续接指令和权限由服务端生成。 */
+  retryOfTurnId?: string;
   /** 本次发送的容量，独立于当前正在执行的轮次。 */
   contextCapacityTokens?: number | null;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
@@ -1697,6 +1724,7 @@ export interface NativeExpertExecutionProjection {
 }
 
 export type NativeConversationEvent =
+  | NativeEvent<'conversation.system_message.updated', NativeEventIdentity & { message: ConversationSystemMessage }>
   | NativeEvent<
       'conversation.transport.changed',
       NativeEventIdentity & {
@@ -1714,6 +1742,7 @@ export type NativeConversationEvent =
   | NativeEvent<'conversation.thread.changed', NativeEventIdentity & { providerThreadId?: string; providerState?: string }>
   | NativeEvent<'conversation.turn.started', NativeTurnEventPayload>
   | NativeEvent<'conversation.turn.completed', NativeTurnEventPayload>
+  | NativeEvent<'conversation.turn.retrying', NativeTurnEventPayload>
   | NativeEvent<'conversation.turn.plan.updated', NativeTurnEventPayload & { plan: NativeTurnPlanSnapshot }>
   | NativeEvent<'conversation.turn.change_set.changed', NativeTurnEventPayload & { changeSetId: string; changeSet: TurnChangeSet }>
   | NativeEvent<'conversation.item.started', NativeItemEventPayload>
@@ -1794,10 +1823,12 @@ export type NativeConversationEvent =
   | NativeEvent<'conversation.native.error', NativeEventIdentity & { turnId?: string; error?: string | Record<string, unknown>; message?: string; recoveryRequired?: boolean; retryable?: boolean }>;
 
 export const nativeConversationEventTypes = new Set<NativeConversationEvent['type']>([
+  'conversation.system_message.updated',
   'conversation.transport.changed',
   'conversation.thread.changed',
   'conversation.turn.started',
   'conversation.turn.completed',
+  'conversation.turn.retrying',
   'conversation.turn.plan.updated',
   'conversation.turn.change_set.changed',
   'conversation.item.started',
@@ -1878,6 +1909,10 @@ export interface NativeSessionError {
 }
 
 export interface NativeSessionState {
+  /** 已接纳的系统消息不参与 Provider 轮次状态。 */
+  systemMessages?: Record<string, ConversationSystemMessage>;
+  /** 更早系统消息的独立持久位置游标。 */
+  systemMessagesCursor?: string | null;
   /** 位置索引仍在准备，保留当前正文而不当作模型失败。 */
   transcriptInitializing?: boolean;
   transportState: TransportState;
@@ -1894,6 +1929,8 @@ export interface NativeSessionState {
   providerThreadId: string | null;
   activeTurnId: string | null;
   startedTurnId: string | null;
+  /** 权威首屏或实时事件拥有的当前摘要，历史补读不能改写。 */
+  currentReasoningItem?: NativeSessionItemBuffer | null;
   snapshot: NativeConversationSnapshot | null;
   turnsByProviderId: Record<string, NativeTurnSnapshot>;
   changeSetsByProviderId: Record<string, TurnChangeSet>;

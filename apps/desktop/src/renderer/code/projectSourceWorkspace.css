@@ -1069,3 +1069,164 @@
     opacity: 0;
   }
 }
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.macos-ai-app .project-source-tree .project-source-module-header {
+  box-sizing: border-box;
+  width: 100%;
+  inline-size: 100%;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+  height: var(--source-module-header-height);
+  min-height: var(--source-module-header-height);
+  padding: 5px 12px;
+  font-size: 12px;
+  line-height: 20px;
+}
+.project-source-module-header > .project-source-branch-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.macos-ai-app .project-source-module-header > .project-code-actions {
+  max-inline-size: none;
+  padding: 0;
+}
+.project-source-tree-resizer.project-source-tree-resizer-overlay {
+  position: fixed;
+  z-index: 40;
+  -webkit-app-region: no-drag;
+}
+.project-source-editor-header {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+  background: var(--zeus-product-panel-muted);
+}
+
+@media (max-width: 900px) {
+  .project-source-tree-resizer-track {
+    display: none;
+  }
+}
+.project-source-branch-slot {
+  display: flex;
+  min-width: 0;
+}
+.macos-ai-app .project-source-branch-slot > .project-git-branch-trigger {
+  margin: 0;
+  min-inline-size: 0;
+  inline-size: 100%;
+  min-block-size: 28px;
+  padding: 3px 5px;
+}
+.project-source-file-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+.project-source-file-toolbar > .project-source-breadcrumbs {
+  flex: 1;
+  min-width: 0;
+}
+.project-source-view-modes {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding-inline: 8px;
+}
+.project-source-view-modes button,
+.project-source-preview-refresh {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 5px;
+  color: var(--zeus-control-muted-text);
+  background: transparent;
+  cursor: pointer;
+}
+.project-source-view-modes button:hover,
+.project-source-preview-refresh:hover {
+  color: var(--zeus-control-text);
+  background: var(--zeus-interaction-hover);
+}
+.project-source-view-modes button[aria-pressed='true'] {
+  color: var(--zeus-control-text);
+  background: color-mix(in srgb, var(--zeus-control-accent) 14%, transparent);
+}
+.project-source-view-modes button:focus-visible,
+.project-source-preview-refresh:focus-visible {
+  outline: 2px solid var(--zeus-control-accent);
+  outline-offset: -2px;
+}
+.project-source-document-views {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  grid-template-columns: minmax(0, 1fr);
+}
+.project-source-document-views[data-view-mode='split'] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.project-source-document-editor {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.project-source-document-editor[hidden] {
+  display: none;
+}
+.project-source-rendered-preview {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--zeus-product-panel);
+}
+.project-source-html-preview {
+  display: block;
+  border: 0;
+  width: 100%;
+  height: 100%;
+  background: #fff;
+}
+.project-source-preview-refresh {
+  position: absolute;
+  z-index: 1;
+  top: 5px;
+  right: 8px;
+  background: var(--zeus-product-panel);
+}
+.project-source-preview-message {
+  margin: 0;
+  padding: 20px 44px 20px 20px;
+  font-size: 12px;
+}
+.project-source-markdown-preview {
+  box-sizing: border-box;
+  height: 100%;
+  overflow: auto;
+  padding: 20px 36px 32px 24px;
+}
+.project-source-markdown-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+@media (max-width: 1100px) {
+  .project-source-document-views[data-view-mode='split'] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}

@@ -1,3 +1,4 @@
+import type { ConversationFileLocation } from '@zeus/shared';
 import { memo, useEffect, useRef, useState } from 'react';
 import { monaco, initializeSourceEditor, editorLanguage, ensureSourceModel, createTransientSourceModel } from './monacoRuntime.js';
 import { loadEditorGrammar } from './monacoGrammars.js';
@@ -18,6 +19,8 @@ export interface CodeEditorProps {
   label?: string;
   revealLine?: number | null;
   revealColumn?: number | null;
+  /** 文件引用的每次定位身份。 */
+  location?: ConversationFileLocation;
   options?: monaco.editor.IStandaloneEditorConstructionOptions;
   onChange?(content: string, change: CodeTextChange): void;
   onDocumentChange?(content: string, dirty: boolean): void;
@@ -137,11 +140,11 @@ export const CodeEditor = memo(function CodeEditor(props: CodeEditorProps) {
 
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || !props.revealLine) return;
-    const position = { lineNumber: props.revealLine, column: props.revealColumn ?? 1 };
+    if (!view || !(props.location?.line ?? props.revealLine)) return;
+    const position = { lineNumber: props.location?.line ?? props.revealLine!, column: props.revealColumn ?? 1 };
     view.setPosition(position);
     view.revealPositionInCenterIfOutsideViewport(position);
-  }, [props.revealLine, props.revealColumn, props.path, ready]);
+  }, [props.location, props.revealLine, props.revealColumn, props.path, ready]);
 
   return (
     <div className="project-source-code-editor zeus-monaco-editor" style={{ height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden', position: 'relative' }}>

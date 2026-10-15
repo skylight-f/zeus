@@ -11,6 +11,7 @@ import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/c
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { ComposerDropdown } from './ComposerDropdown.js';
+import { IconTooltip } from '../ui/IconTooltip.js';
 import type { NativePermissionMode } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 
@@ -19,6 +20,8 @@ export interface PermissionModeControlProps {
   value: NativePermissionMode;
   disabled?: boolean;
   supportsAutoReview?: boolean;
+  /** 设置页使用纯文字选项，会话工具栏继续使用紧凑图标和权限说明。 */
+  showLabel?: boolean;
   onChange: (permissionMode: NativePermissionMode) => void | Promise<void>;
 }
 
@@ -77,11 +80,12 @@ const labels = {
   },
 } as const;
 
+/** 会话与设置页共用权限入口，并保留完全访问的确认流程。 */
 export function PermissionModeControl(props: PermissionModeControlProps) {
   const copy = labels[props.language];
   const [confirmingFullAccess, setConfirmingFullAccess] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  /** 各权限使用独立图标，菜单与当前权限入口共享同一视觉标识。 */
+  /** 会话工具栏的菜单与当前权限入口共享同一视觉标识。 */
   const options = [
     { value: 'read-only', label: copy.readOnly, description: copy.readOnlyDescription, icon: <Eye size={20} weight="regular" /> },
     { value: 'auto', label: copy.auto, description: copy.autoDescription, icon: <ShieldCheck size={20} weight="regular" /> },
@@ -95,8 +99,8 @@ export function PermissionModeControl(props: PermissionModeControlProps) {
     { value: 'full-access', label: copy.fullAccess, description: copy.fullAccessDescription, icon: <ShieldWarning size={20} weight="fill" /> },
   ] as const;
   const selectedLabel = options.find((option) => option.value === props.value)?.label ?? copy.label;
-  /** 当前入口复用选项图标，计划模式不改写用户选择的权限。 */
-  const triggerIcon = options.find((option) => option.value === props.value)?.icon;
+  /** 设置页沿用任务推送的纯文字布局，工具栏保留选项图标。 */
+  const triggerIcon = props.showLabel ? undefined : options.find((option) => option.value === props.value)?.icon;
   /** 协作模式由独立入口表达，权限入口只说明真实权限。 */
   const effectiveLabel = `${copy.label}: ${selectedLabel}`;
 
@@ -111,27 +115,30 @@ export function PermissionModeControl(props: PermissionModeControlProps) {
 
   return (
     <span className="session-permission-control">
-      <ComposerDropdown
-        triggerRef={triggerRef}
-        label={copy.label}
-        title={props.disabled ? copy.locked : effectiveLabel}
-        triggerLabel={effectiveLabel}
-        triggerIcon={triggerIcon}
-        hideSelectedLabel
-        className="session-permission-dropdown"
-        popoverClassName="session-permission-popover"
-        value={props.value}
-        options={options}
-        disabled={props.disabled}
-        onChange={(next) => {
-          if (requiresPermissionModeConfirmation(props.value, next)) {
-            setConfirmingFullAccess(true);
-            return;
-          }
-          setConfirmingFullAccess(false);
-          void props.onChange(next);
-        }}
-      />
+      <IconTooltip label={props.disabled ? `${effectiveLabel}；${copy.locked}` : effectiveLabel}>
+        <ComposerDropdown
+          triggerRef={triggerRef}
+          label={copy.label}
+          // 可见提示由外层显示，避免同时弹出原生气泡。
+          title=""
+          triggerLabel={effectiveLabel}
+          triggerIcon={triggerIcon}
+          hideSelectedLabel={!props.showLabel}
+          className="session-permission-dropdown"
+          popoverClassName="session-permission-popover"
+          value={props.value}
+          options={props.showLabel ? options.map((option) => ({ ...option, icon: undefined, description: undefined })) : options}
+          disabled={props.disabled}
+          onChange={(next) => {
+            if (requiresPermissionModeConfirmation(props.value, next)) {
+              setConfirmingFullAccess(true);
+              return;
+            }
+            setConfirmingFullAccess(false);
+            void props.onChange(next);
+          }}
+        />
+      </IconTooltip>
       <MotionPresence>{confirmingFullAccess ? <FullAccessConfirmation language={props.language} onDismiss={() => closeConfirmation()} onConfirm={() => closeConfirmation('full-access')} /> : null}</MotionPresence>
     </span>
   );

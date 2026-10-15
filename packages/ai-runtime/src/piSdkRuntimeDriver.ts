@@ -1,4 +1,5 @@
 import { assertContextCapacitySupported, type PortableHistoryEntry } from '@zeus/shared';
+import { createModelConnectionDeadline, modelResponseRetryPolicy } from './modelResponseRetry.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -233,16 +234,6 @@ interface PiTerminalFailure {
 const piPreflightTimeoutMs = 5 * 60_000;
 const maximumPiDispatchContextBytes = 8 * 1024 * 1024;
 /**
- * 单轮模型请求的瞬时失败续跑次数。
- * 取值权衡：次数越多越能盖住网络抖动和供应商瞬时断连，但次数越多用户在真正断网时空等越久，
- * 且每次续跑都会再向供应商发一次请求（只影响计费，不会重放工具调用）。两次足以覆盖观测到的
- * 单点断连，又不至于让彻底不可用的连接长时间占用本轮。
- */
-const piModelRequestRetryLimit = 2;
-/** 续跑之间的退避基数：2 秒起倍增，给供应商和网络留出自愈时间。 */
-const piModelRequestRetryBaseDelayMs = 2_000;
-
-/**
  * 把会话档位交给 Pi。
  * 会话档位是用户词（厂商口径），Pi 只认七个中转词，所以这里用同一个模型的档位清单换算：
  * 认不出就回落到清单默认档，清单为空（未识别）时什么都不设，请求里也不会带任何档位字段。
@@ -385,11 +376,11 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     const settingsManager = SettingsManager.inMemory(
       {
         // 传输层（HTTP）重发继续禁止：Provider 写出后的超时或断连无法证明请求未被接纳，
-        // 需要新稳定身份的重发只能由 Zeus 的显式对账/重试命令发起。
+        // 避免与 Zeus 统一设置的会话恢复预算叠加。
         // 会话层保留有限自动续跑：Pi 只在收到可重试的瞬时错误时继续同一轮，并且会先从上下文里
-        // 摘掉失败的那条 assistant 消息再重新请求，不会重放已经执行过的工具调用，因此不会产生
-        // 重复副作用；次数耗尽后仍然按失败收尾，交给用户显式重新发送。
-        retry: { enabled: true, maxRetries: piModelRequestRetryLimit, baseDelayMs: piModelRequestRetryBaseDelayMs, provider: { maxRetries: 0 } },
+        // 摘掉失败的那条 assistant 消息再重新请求，保留已完成工具结果，不主动重放工具；
+        // 次数耗尽后仍然按失败收尾，交给用户手动重试。
+        retry: { enabled: true, maxRetries: modelResponseRetryPolicy.maxRetries, baseDelayMs: modelResponseRetryPolicy.baseDelayMs, provider: { maxRetries: 0 } },
         // 压缩阈值必须随目标窗口缩放：Pi 的压缩是单次摘要请求，历史贴近窗口时
         // 这个请求自身就会超过窗口并被 Provider 拒绝，之后每次发送都会重复失败。
         compaction: compactionSettingsForModel(model),
@@ -453,6 +444,9 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     const messageFailure = piMessageFailure(event);
     if (messageFailure) entry.pendingFailure = messageFailure;
     else if (event.type === 'message_end' && event.message.role === 'assistant') entry.pendingFailure = null;
+    if (event.type === 'auto_retry_end' && !event.success && event.attempt >= modelResponseRetryPolicy.maxRetries && event.finalError !== 'Retry cancelled' && entry.pendingFailure) {
+      entry.pendingFailure = { ...entry.pendingFailure, code: 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', message: `连接重试五次均失败，会话已停止。${entry.pendingFailure.message}` };
+    }
     const terminalFailure = event.type === 'agent_settled' ? entry.pendingFailure : null;
     if (event.type === 'agent_settled' || event.type === 'agent_end') {
       if (event.type === 'agent_settled') {
@@ -1264,14 +1258,46 @@ function withModelTransport(
   observePayload: (sessionId: string | undefined, model: Model<Api>, payload: unknown) => Promise<void>,
   projectContext: (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) => Promise<TranscriptContext>,
 ): ProviderStreams {
-  /** 异步准备阶段的取消也使用 Pi 的取消终态，避免被 lazyStream 包装成模型故障。 */
-  function projectStream(model: Model<Api>, setup: () => Promise<AsyncIterable<AssistantMessageEvent>>, signal?: AbortSignal) {
-    /** 内层复用官方准备失败处理，外层只校正取消语义并保留 result() 能力。 */
-    const source = lazyStream(model, setup);
+  /** 只对网络建链计时；确认旧流结束后才允许恢复，不限制连接建立后的生成。 */
+  function projectStream(model: Model<Api>, setup: (options: StreamOptions) => Promise<AsyncIterable<AssistantMessageEvent>>, options?: StreamOptions) {
+    /** 请求局部取消不影响用户整轮取消，避免超时被当成手动停止。 */
+    const deadline = new AbortController();
+    /** 在实际请求体准备完成后启动，收到响应头即结束，排除本地上下文准备时间。 */
+    let stopDeadline: () => void = () => undefined;
+    /** 用户停止使用原始信号，不能被建链超时改写为网络重试。 */
+    const signal = options?.signal;
+    /** 外部停止优先，不能因超时改写为自动重试。 */
+    const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+    /** 复用认证和写前接纳入口，只增加真实连接边界的计时。 */
+    const transportOptions = optionsFor(model, { ...options, signal: combined });
+    /** 保留调用方和 Core 的原有请求体回调。 */
+    const onPayload = transportOptions.onPayload;
+    /** 响应头先结束建链计时，再执行调用方的回调。 */
+    const onResponse = transportOptions.onResponse;
+    transportOptions.onPayload = async (payload, observedModel) => {
+      /** 持久接纳和请求体准备属于写前阶段，不能消耗网络建链时间。 */
+      const replacement = await onPayload?.(payload, observedModel);
+      stopDeadline();
+      stopDeadline = createModelConnectionDeadline(() => deadline.abort());
+      return replacement;
+    };
+    transportOptions.onResponse = async (response, observedModel) => {
+      stopDeadline();
+      await onResponse?.(response, observedModel);
+    };
     return lazyStream(model, async () => ({
       async *[Symbol.asyncIterator]() {
-        for await (const event of source) {
-          yield event.type === 'error' && signal?.aborted ? { ...event, reason: 'aborted' as const, error: { ...event.error, stopReason: 'aborted' as const } } : event;
+        try {
+          for await (const event of lazyStream(model, () => setup(transportOptions))) {
+            // 复用连接或非 HTTP 传输可能没有响应头回调，流开始同样明确结束建链。
+            if (event.type === 'start') stopDeadline();
+            if (event.type === 'error' && signal?.aborted) yield { ...event, reason: 'aborted' as const, error: { ...event.error, stopReason: 'aborted' as const } };
+            else if (event.type === 'error' && deadline.signal.aborted)
+              yield { ...event, reason: 'error' as const, error: { ...event.error, stopReason: 'error' as const, errorMessage: 'Model connection establishment timeout after 60000ms' } };
+            else yield event;
+          }
+        } finally {
+          stopDeadline();
         }
       },
     }));
@@ -1291,10 +1317,10 @@ function withModelTransport(
   };
   return {
     stream(model, context, options) {
-      return projectStream(model, async () => streams.stream(model, await projectContext(model, context, options), optionsFor(model, options)), options?.signal);
+      return projectStream(model, async (transportOptions) => streams.stream(model, await projectContext(model, context, transportOptions), transportOptions), options);
     },
     streamSimple(model, context, options) {
-      return projectStream(model, async () => streams.streamSimple(model, await projectContext(model, context, options), optionsFor(model, options)), options?.signal);
+      return projectStream(model, async (transportOptions) => streams.streamSimple(model, await projectContext(model, context, transportOptions), transportOptions), options);
     },
   };
 }

@@ -6,6 +6,10 @@ import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { createServer } from 'node:http';
+import { createPiSdkRuntimeDriver } from '../packages/ai-runtime/src/piSdkRuntimeDriver.js';
+import { createConfiguredModelDefinition, normalizeModelConnection } from '../packages/ai-runtime/src/modelConnectionCatalog.js';
+import { modelResponseRetryPolicy } from '../packages/ai-runtime/src/modelResponseRetry.js';
 import type { CodexAppServerEvent, CodexAppServerManager } from '../packages/ai-runtime/src/index.js';
 import type { TranscriptTurnWorkRow } from '../apps/desktop/src/renderer/session/ConversationTranscript.js';
 import type { NativeConversationSnapshot, NativeSessionItemBuffer, NativeQueueSnapshot, NativeSessionState } from '../apps/desktop/src/renderer/session/sessionTypes.js';
@@ -15,6 +19,7 @@ import { describeUserFacingError } from '../packages/shared/src/userFacingError.
 import { isProviderBlockingTurnFailure, projectConversationTurnFailure } from '../packages/storage/src/conversationSnapshotV2.js';
 import { createCodexProviderEventFlow } from '../packages/local-server/src/codexProviderEventFlow.js';
 import { projectCodexProviderEvent, type CodexProviderEventProjectionDependencies } from '../packages/local-server/src/codexProviderEventProjection.js';
+import { createCodexModelRequestTimingTracker } from '../packages/local-server/src/codexModelRequestTiming.js';
 import { isProviderResponseStreamDisconnected } from '../packages/local-server/src/codexNativeConversationPolicy.js';
 import { filterCompatibilitySnapshotItemAliases } from '../packages/local-server/src/codexProviderHistoryProjection.js';
 import { conversationWorkExecutionState } from '../packages/local-server/src/conversationWorkExecutionState.js';
@@ -97,10 +102,35 @@ function verifyProviderStreamFailurePresentation(): Record<string, unknown> {
   const workConversation = { stage: 'failed', providerState: 'paused' } as Parameters<typeof conversationWorkExecutionState>[0];
   const submission = (error: Record<string, unknown>) =>
     [{ status: 'failed', pausedReason: null, errorJson: JSON.stringify(error), updatedAt: '2026-09-28T00:00:00.000Z', createdAt: '2026-09-28T00:00:00.000Z', id: 'probe-submission' }] as Parameters<typeof conversationWorkExecutionState>[1];
-  const providerWorkState = conversationWorkExecutionState(workConversation, submission(rateLimitRecord));
-  const runtimeWorkState = conversationWorkExecutionState({ ...workConversation, providerState: 'failed' }, submission(sandboxRecord));
+  const providerWorkState = conversationWorkExecutionState(workConversation, submission(rateLimitRecord), []);
+  const runtimeWorkState = conversationWorkExecutionState({ ...workConversation, providerState: 'failed' }, submission(sandboxRecord), []);
   assertBehavior(providerWorkState.type === 'blocked', '服务类官方错误必须让任务工作保持阻塞。');
   assertBehavior(runtimeWorkState.type === 'failed', '沙箱或 Runtime 错误必须让任务工作正常失败。');
+  /** 重放已停止退出的耐久状态；会话 ready 和已取消提交不能把工作留在运行中。 */
+  const stoppedConversation = { stage: 'ready', providerState: 'ready' } as Parameters<typeof conversationWorkExecutionState>[0];
+  /** 轮次身份与时间保留关联关系，后续提交不能被该历史中断覆盖。 */
+  const stoppedTurn = { id: 'stopped-turn', providerTurnId: 'provider-stopped', status: 'interrupted', errorJson: null, createdAt: '2026-10-10T09:30:05.000Z' } as Parameters<typeof conversationWorkExecutionState>[2][number];
+  /** 已确认停止的原输入，避免将用户取消误报为执行失败。 */
+  const cancelledSubmission = {
+    id: 'stopped-submission',
+    status: 'cancelled',
+    providerTurnId: stoppedTurn.providerTurnId,
+    errorJson: JSON.stringify({ code: 'ZEUS_FORCED_QUIT_INTERRUPTED', providerOutcomeUnconfirmed: false }),
+    createdAt: '2026-10-10T09:30:04.000Z',
+    updatedAt: '2026-10-10T09:38:45.000Z',
+  } as Parameters<typeof conversationWorkExecutionState>[1][number];
+  assertBehavior(conversationWorkExecutionState(stoppedConversation, [cancelledSubmission], [stoppedTurn]).type === 'cancelled', '已确认停止必须让独立工作与旧员工执行收口，不能继续占用自动化队列。');
+  /** 停止请求尚未确认时必须继续监测，不提前取消也不进入不可自动恢复的终态。 */
+  const pendingStopTurn = { ...stoppedTurn, errorJson: JSON.stringify({ code: 'ZEUS_PROVIDER_STOP_PENDING', providerStopPending: true, providerOutcomeUnconfirmed: true }) };
+  assertBehavior(conversationWorkExecutionState(stoppedConversation, [cancelledSubmission], [pendingStopTurn]).type === 'waiting', 'Provider 停止待确认必须继续等待原轮次。');
+  assertBehavior(conversationWorkExecutionState(stoppedConversation, [{ ...cancelledSubmission, errorJson: JSON.stringify({ providerOutcomeUnconfirmed: true }) }], []).type === 'waiting', '缺少轮次的未知取消结果不能释放队列。');
+  /** 用户在原会话后续发起的新工作继续执行，取消排队消息不影响活动轮次。 */
+  const resumedSubmission = { ...cancelledSubmission, id: 'resumed-submission', status: 'queued', providerTurnId: null, errorJson: null, createdAt: '2026-10-11T00:00:00.000Z', updatedAt: '2026-10-11T00:00:00.000Z' } as Parameters<
+    typeof conversationWorkExecutionState
+  >[1][number];
+  assertBehavior(conversationWorkExecutionState({ ...stoppedConversation, stage: 'running' }, [cancelledSubmission, resumedSubmission], [stoppedTurn]).type === 'running', '旧中断不得取消后续新提交。');
+  assertBehavior(conversationWorkExecutionState({ ...stoppedConversation, stage: 'running' }, [cancelledSubmission], [{ ...stoppedTurn, status: 'running' }]).type === 'running', '取消排队输入不得结束仍活动的 Provider 轮次。');
+  assertBehavior(conversationWorkExecutionState(stoppedConversation, [{ ...cancelledSubmission, providerTurnId: null }], []).type === 'cancelled', '未派发输入明确取消后也必须收口工作。');
   return {
     legacyDisconnect: { category: failure.category, cause: failure.cause?.code ?? null, message: explanation.message },
     objectFailure: { category: objectFailure.category, cause: objectFailure.cause?.code ?? null, httpStatus: objectFailure.additionalDetails[0] ?? null },
@@ -436,7 +466,8 @@ registerHooks({
 });
 /** Node 探针不经过 Vite 自动 JSX 运行时，沿用现有转录探针的 React 注入。 */
 (globalThis as typeof globalThis & { React: typeof import('react') }).React = await import('react');
-const { projectQueuedSubmissionItems, projectTranscriptRows, projectTranscriptTurnRows } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
+/** 队列归属和进度提示共用生产转录投影，避免探针另建状态规则。 */
+const { projectQueuedSubmissionItems, projectTranscriptRows, projectTranscriptTurnRows, transcriptRunStatus, shouldShowTranscriptThinking } = await import('../apps/desktop/src/renderer/session/ConversationTranscript.js');
 
 async function verifyCompatibilityItemIdentity(): Promise<Record<string, unknown>> {
   const firstScopedId = scopedSnapshotProviderItemId('turn-1', 'item-1');
@@ -780,7 +811,41 @@ function verifyQueueMessageOwnership(): Record<string, unknown> {
   /** 插话必须有明确接纳证据；较新队列不能吞掉迟到的接纳事件。 */
   state = sessionReducer(state, { type: 'steering_submission_hydrated', submission: { ...queued.submissions[0]!, delivery: 'steer_now', status: 'steering', providerTurnId: 'turn' }, queue: { ...deleted, throughEventSeq: 11 } });
   assertBehavior(state.itemOrder.length === 1 && state.items[state.itemOrder[0]!]!.messageCreatedAt === createdAt && state.queue?.throughEventSeq === 12, '明确接纳的插话正文与队列水位必须分别收敛。');
-  return { deletedVisibleMessages: 0, sameTextIdentities: 2, attachmentPreserved: true, lateReceiptRejected: true, originalCreatedAt: createdAt, steeringAccepted: true };
+  /** 旧回复已完成时，新消息先进入空闲队首；水合不能让正在准备的提示消失。 */
+  const beforePreparation: NativeSessionState = { ...createInitialSessionState(), transportState: 'ready', activeTurnId: 'previous-turn', terminalTurnIds: { 'previous-turn': 'completed' } };
+  /** 真实队列水合仍保留 native_idle，由展示投影识别安全准备阶段。 */
+  const preparingQueue: NativeQueueSnapshot = { ...queued, throughEventSeq: 20, state: { type: 'idle' }, submissions: [queued.submissions[0]!] };
+  /** 同一队首覆盖普通派发、上下文准备和会话恢复。 */
+  for (const waitReason of [undefined, 'dispatch_pending', 'execution_context_preparing', 'conversation_restoring'] as const) {
+    /** 回放服务端空闲队首，而非手动设置 starting_turn 绕过问题。 */
+    const preparing = sessionReducer(beforePreparation, { type: 'queue_hydrated', queue: { ...preparingQueue, waitReason } });
+    assertBehavior(preparing.conversationState === 'native_idle' && transcriptRunStatus(preparing) === 'starting' && shouldShowTranscriptThinking(preparing), '新消息在模型接纳前必须持续显示准备发送。');
+  }
+  /** 人工暂停和失败不能被空闲队首伪装成正在执行。 */
+  for (const status of ['paused', 'failed'] as const) {
+    /** 权威提交状态仍由生产 reducer 接管。 */
+    const blocked = sessionReducer(beforePreparation, { type: 'queue_hydrated', queue: { ...preparingQueue, submissions: [{ ...preparingQueue.submissions[0]!, status, pausedReason: 'interrupted' }] } });
+    assertBehavior(transcriptRunStatus(blocked) === null && !shouldShowTranscriptThinking(blocked), '暂停或失败消息不得持续显示准备发送。');
+  }
+  /** 等待用户确认的队首保留原操作提示，不能伪装成后台正在推进。 */
+  for (const waitReason of ['user_confirmation', 'plan_confirmation', 'provider_stop_pending', 'recovery_required'] as const) {
+    /** 原权威等待原因优先于普通队首准备提示。 */
+    const waiting = sessionReducer(beforePreparation, { type: 'queue_hydrated', queue: { ...preparingQueue, waitReason } });
+    assertBehavior(transcriptRunStatus(waiting) === null && !shouldShowTranscriptThinking(waiting), '需要用户处理的队列不得显示准备发送。');
+  }
+  /** 较早的失败审计与服务端自动派发选择保持一致，不遮挡新的安全队首。 */
+  const historicalFailure = sessionReducer(beforePreparation, {
+    type: 'queue_hydrated',
+    queue: { ...preparingQueue, submissions: [{ ...preparingQueue.submissions[0]!, id: 'historical-failure', position: -1, status: 'failed' }, preparingQueue.submissions[0]!] },
+  });
+  assertBehavior(transcriptRunStatus(historicalFailure) === 'starting', '历史失败记录不得隐藏新队首的准备发送提示。');
+  /** 删除全部队首后立即撤销提示，不能遗留空转动画。 */
+  const cleared = sessionReducer(beforePreparation, { type: 'queue_hydrated', queue: { ...preparingQueue, submissions: [] } });
+  assertBehavior(transcriptRunStatus(cleared) === null && !shouldShowTranscriptThinking(cleared), '队列清空后不得保留准备状态。');
+  /** 模型正式接手后切回既有执行状态。 */
+  const executing: NativeSessionState = { ...beforePreparation, activeTurnId: 'new-turn', conversationState: 'active_prework', queue: preparingQueue };
+  assertBehavior(transcriptRunStatus(executing) === 'executing', '模型接手后必须恢复既有执行提示。');
+  return { deletedVisibleMessages: 0, sameTextIdentities: 2, attachmentPreserved: true, lateReceiptRejected: true, originalCreatedAt: createdAt, steeringAccepted: true, preparingFeedbackSurvivesIdleQueue: true };
 }
 
 function verifyRealtimeChangeSetProjection(): Record<string, unknown> {
@@ -1177,6 +1242,43 @@ async function verifySealedSegmentTerminalProjection(): Promise<Record<string, u
   return { status: sealedTurn.status, currentTurnId: runStates.get('conversation-sealed')?.turnId ?? null, effects };
 }
 
+/** 原生交互事件经过真实投影入口后，必须使当前请求失去纯文本测速资格。 */
+async function verifyInteractionOutputTiming(): Promise<string[]> {
+  /** 使用生产计时器检查当前请求隔离和完成后的状态清理。 */
+  const timing = createCodexModelRequestTimingTracker();
+  /** 已处理的交互重放只核对计时，不执行审批、问答或 Provider 调用。 */
+  const dependencies = {
+    options: {
+      execution: { segmentByNativeSession: () => undefined },
+      conversations: { getByProviderThreadId: () => ({ id: 'rate-conversation' }) },
+      turns: { listByConversation: () => [{ id: 'rate-turn', providerTurnId: 'turn-1' }] },
+      requests: { upsert: () => ({ id: 'rate-interaction', status: 'declined' }) },
+      manager: { getState: () => ({ type: 'ready', generationId: 'generation-probe' }), hasGeneration: () => true },
+      receipts: { record: () => undefined },
+    },
+    closed: false,
+    modelRequestTiming: timing,
+    hasProcessedProviderEvent: () => false,
+    maintainProviderReceiptGenerations: () => undefined,
+    rememberProcessedProviderEvent: () => undefined,
+    markScheduledPersistDirty: () => undefined,
+    flushScheduledPersist: async () => undefined,
+  } as unknown as CodexProviderEventProjectionDependencies;
+  /** 所有共用原生交互分支的事件都必须排除，不能只修用户回答这一种。 */
+  const methods = ['item/tool/requestUserInput', 'item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'mcpServer/elicitation/request'];
+  /** 每轮都重建文本计时，并保留一个并发轮次检查身份隔离。 */
+  for (const method of methods) {
+    timing.observe('rate-conversation', 'rate-turn', '2026-08-21T11:59:00.000Z', 'visible_text');
+    timing.observe('rate-conversation', 'other-turn', '2026-08-21T11:59:00.000Z', 'visible_text');
+    await projectCodexProviderEvent(dependencies, { ...providerEvent(1, method, { questions: [{ id: 'answer', question: '确认继续', isSecret: false, options: null }] }), requestId: method });
+    assertBehavior(timing.complete('rate-conversation', 'rate-turn').hasNonTextOutput, `${method} 未排除交互等待计时。`);
+    assertBehavior(!timing.complete('rate-conversation', 'other-turn').hasNonTextOutput, '交互事件污染了其他轮次的文本计时。');
+    timing.observe('rate-conversation', 'rate-turn', '2026-08-21T12:01:00.000Z', 'visible_text');
+    assertBehavior(!timing.complete('rate-conversation', 'rate-turn').hasNonTextOutput, '交互完成后仍污染后续纯文本请求。');
+  }
+  return methods;
+}
+
 /** 验证权威快照不再声明活动轮次时，深分页缓存不会复活旧分段的 running turn。 */
 function verifyAuthoritativeTurnCacheReconciliation(): Record<string, unknown> {
   /** 两份快照使用连续的历史范围，确保探针进入缓存复用分支。 */
@@ -1215,6 +1317,81 @@ function verifyAuthoritativeTurnCacheReconciliation(): Record<string, unknown> {
 const provider = await verifyCodexProviderEventFlow();
 /** 真实投影入口核对 sealed 分段终态与迟到活动的不同处理。 */
 const sealedSegmentTerminal = await verifySealedSegmentTerminalProjection();
+/** 交互等待不能进入当前请求的纯文本测速，也不能影响其他轮次和后续请求。 */
+/** 用真实 Pi SDK 和本地 HTTP 流确认响应头结束建链计时，不调用外部模型。 */
+async function verifyPiConnectionTimeoutBoundary() {
+  /** 只缩短本探针的建链时限，最终恢复正式一分钟配置。 */
+  const policy = modelResponseRetryPolicy as { connectionTimeoutMs: number };
+  /** 保存配置，避免后续既有场景继承加速时钟。 */
+  const originalTimeout = policy.connectionTimeoutMs;
+  /** 运行目录只属于本探针。 */
+  const root = await mkdtemp(join(tmpdir(), 'zeus-pi-connection-'));
+  /** 两个场景分别延迟正文和延迟响应头。 */
+  let connected = true;
+  /** 请求数用于核对失败没有在同一次流里重复写出。 */
+  let requests = 0;
+  /** 使用标准 Chat Completions 流，实际连接由已安装 SDK 建立。 */
+  const server = createServer((request, response) => {
+    requests += 1;
+    request.resume();
+    if (connected) {
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      response.flushHeaders();
+    }
+    /** 正文等待超过建链时限，已收到响应头的请求必须仍能完成。 */
+    const timer = setTimeout(() => {
+      if (response.destroyed) return;
+      if (!response.headersSent) response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      response.write(
+        `data: ${JSON.stringify({ id: 'local-probe', object: 'chat.completion.chunk', created: 1, model: 'connection-probe', choices: [{ index: 0, delta: { role: 'assistant', content: '{"decision":"accept","reason":"连接已建立，生成可继续"}' }, finish_reason: null }] })}\n\n`,
+      );
+      response.end(`data: ${JSON.stringify({ id: 'local-probe', object: 'chat.completion.chunk', created: 1, model: 'connection-probe', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+    }, 400);
+    response.on('close', () => clearTimeout(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  /** 监听地址由 Node 分配，不连接其他服务。 */
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Pi 连接探针没有取得本地端口。');
+  /** 模型和连接均使用生产规范化入口，不另造能力结构。 */
+  const connection = normalizeModelConnection(
+    { name: '本地连接探针', baseUrl: `http://127.0.0.1:${address.port}/v1`, models: [createConfiguredModelDefinition('connection-probe')] },
+    { id: 'connection-probe', apiKeyConfigured: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+  );
+  /** 独立审查复用生产流适配器；工具入口在本场景必须不可达。 */
+  const driver = createPiSdkRuntimeDriver({
+    adapterVersion: 'local-probe',
+    agentDirectory: join(root, 'agent'),
+    sessionDirectory: join(root, 'sessions'),
+    loadConnections: async () => [{ ...connection, apiKey: 'local-probe-key' }],
+    toolBroker: {
+      execute: async () => {
+        throw new Error('连接探针不得执行工具。');
+      },
+    },
+  });
+  try {
+    policy.connectionTimeoutMs = 150;
+    /** 正常已建链请求等待正文 400 毫秒，不能被 150 毫秒连接时限中止。 */
+    const normal = await driver.reviewPermission({ model: { sourceId: connection.id, modelId: 'connection-probe', displayName: null }, context: '只读本地连接验收。' });
+    assertBehavior(normal.decision === 'accept' && requests === 1, `已建立连接后错误限制了模型响应时间：${JSON.stringify(normal)}`);
+    connected = false;
+    /** 尚未收到响应头时仍必须取消本次建链，而不是无限等待。 */
+    const failed = await driver.reviewPermission({ model: { sourceId: connection.id, modelId: 'connection-probe', displayName: null }, context: '只读本地连接验收。' });
+    assertBehavior(failed.decision === 'manual' && requests === 2, '建链超过时限后未按真实失败收口。');
+    return { responseSurvivesConnectionDeadline: true, pendingConnectionStillTimesOut: true, externalRequests: 0 };
+  } finally {
+    policy.connectionTimeoutMs = originalTimeout;
+    await driver.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+/** 真实 Pi 传输只给建链计时，正常生成超出该时限也能完成。 */
+const piConnectionBoundary = await verifyPiConnectionTimeoutBoundary();
+const interactionOutputTiming = await verifyInteractionOutputTiming();
 /** Renderer 缓存核对旧非终态不会在权威空闲快照后复活。 */
 const authoritativeTurnCache = verifyAuthoritativeTurnCacheReconciliation();
 const sync = await verifyConversationSyncFlow();
@@ -1233,7 +1410,9 @@ console.log(
     {
       status: 'passed',
       provider,
+      piConnectionBoundary,
       sealedSegmentTerminal,
+      interactionOutputTiming,
       authoritativeTurnCache,
       sync,
       compatibilityItems,

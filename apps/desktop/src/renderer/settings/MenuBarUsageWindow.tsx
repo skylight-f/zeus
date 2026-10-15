@@ -252,7 +252,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
   }, [load, props.client]);
 
   useEffect(() => {
-    if (!snapshot || selection === 'all' || snapshot.providers.some((provider) => provider.providerId === selection)) return;
+    if (!snapshot || selection === 'all' || snapshot.providers.some((provider) => !provider.deleted && provider.providerId === selection)) return;
     setSelection('all');
     storeSelection('all');
   }, [selection, snapshot]);
@@ -278,7 +278,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
   /** 已保存供应商按偏好排列，新出现的供应商沿用后台顺序追加。 */
   const providerRanks = new Map(providerOrder.map((id, index) => [id, index]));
   /** 列表与标签始终使用同一份排序结果，不修改原始快照。 */
-  const providers = [...(snapshot?.providers ?? [])].sort((left, right) => (providerRanks.get(left.providerId) ?? providerOrder.length) - (providerRanks.get(right.providerId) ?? providerOrder.length));
+  const providers = (snapshot?.providers ?? []).filter((provider) => !provider.deleted).sort((left, right) => (providerRanks.get(left.providerId) ?? providerOrder.length) - (providerRanks.get(right.providerId) ?? providerOrder.length));
   /** 拖拽与键盘共用移动入口，忽略已失效的供应商或越界目标。 */
   const moveProvider = (providerId: string, targetId: string) => {
     /** 当前可见顺序也是保存后的顺序，失效供应商不重新插入。 */

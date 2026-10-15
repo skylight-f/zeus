@@ -1,5 +1,6 @@
 import type { NativeSessionItemBuffer, NativeSessionState } from './sessionTypes.js';
 import type { TranscriptRow, TranscriptTurnRow } from './ConversationTranscript.js';
+import { inlineResourceRequestSignature } from './conversationResourceProjection.js';
 
 /** 结构事件重新核对语义后，保留未变化条目与工具组的对象身份。 */
 export function reuseTranscriptRows(previous: readonly TranscriptRow[], incoming: TranscriptRow[]): TranscriptRow[] {
@@ -25,7 +26,9 @@ export function reuseTranscriptTurnRows(previous: readonly TranscriptTurnRow[], 
       const before = oldSegments.get(segment.key);
       return before && before.summary === segment.summary && sameReferences(before.rows, segment.rows) ? before : segment;
     });
-    return old.turnId === row.turnId && old.live === row.live && old.loadMore === row.loadMore && old.replyVisible === row.replyVisible && sameReferences(old.segments, segments) ? old : { ...row, segments };
+    return old.turnId === row.turnId && old.live === row.live && old.loadMore === row.loadMore && old.replyVisible === row.replyVisible && old.processGroup === row.processGroup && sameReferences(old.segments, segments)
+      ? old
+      : { ...row, segments };
   });
 }
 
@@ -50,6 +53,8 @@ export function isTranscriptContentUpdate(previous: NativeSessionItemBuffer, nex
     before?.openingInputId === after?.openingInputId &&
     before?.displayStageId === after?.displayStageId &&
     Boolean(previous.text.trim()) === Boolean(next.text.trim()) &&
+    // 完成正文补齐图片引用时需要重新核对交付归属，不能只替换文本后保留旧图片行。
+    (previous.status !== 'completed' || previous.text === next.text || inlineResourceRequestSignature([previous]) === inlineResourceRequestSignature([next])) &&
     previous.resources === next.resources &&
     Object.keys(previous.payload).length === Object.keys(next.payload).length &&
     Object.keys(previous.payload).every((key) => previous.payload[key] === next.payload[key])

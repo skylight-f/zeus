@@ -1,11 +1,17 @@
+import { readSessionViewCache, writeSessionViewCache } from '../apps/desktop/src/main/sessionViewCache.js';
+import { repairTaskAttachmentReferences } from '../packages/local-server/src/taskAttachmentLifecycle.js';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  ProjectRepository,
+  TaskRepository,
   ArtifactStore,
   ArtifactStoreError,
   ConversationExecutionRepository,
+  ConversationRepository,
+  ConversationSubmissionRepository,
   ConversationProviderItemRepository,
   ConversationResourceRepository,
   ConversationSnapshotV2Repository,
@@ -16,7 +22,7 @@ import {
 import { ManagedConversationToolResultStore, PortableConversationContextBuilder, planPortableContextCompaction } from '../packages/local-server/src/conversationPortableContext.js';
 import { searchPiWorkspace } from '../packages/local-server/src/piWorkspaceSearch.js';
 import { completedItemProjection, liveProgressProjection } from '../packages/local-server/src/codexNativeConversationPolicy.js';
-import { syncConversationResources, toConversationResourceOpenIntent } from '../packages/local-server/src/conversationResources.js';
+import { normalizeConversationResources, syncConversationResources, toConversationResource, toConversationResourceOpenIntent } from '../packages/local-server/src/conversationResources.js';
 import { readConversationResourcePreview } from '../packages/local-server/src/conversationResourcePreview.js';
 
 const probeRoot = await mkdtemp(join(tmpdir(), 'zeus-artifact-store-probe-'));
@@ -29,11 +35,80 @@ try {
   await verifyConversationToolResultReplay();
   await verifyContextBudgetAndSearch();
   await verifyConversationFileResources();
+  await verifyHomeSummaryAndDisplayCache();
 } finally {
   await rm(probeRoot, { recursive: true, force: true });
 }
 
 console.log(JSON.stringify({ status: 'passed', observed }, null, 2));
+
+/** 使用真实 SQLite 与文件，覆盖摘要分页、一次性附件核验与独立缓存权限。 */
+async function verifyHomeSummaryAndDisplayCache(): Promise<void> {
+  const root = join(probeRoot, 'home-summary');
+  await mkdir(root);
+  const databasePath = join(root, 'core.db');
+  const database = await createZeusDatabase(databasePath);
+  try {
+    const projects = new ProjectRepository(database);
+    const tasks = new TaskRepository(database);
+    projects.create({ id: 'summary-project', name: '分页探针', localPath: root });
+    for (let index = 0; index < 53; index += 1)
+      tasks.create({
+        id: `summary-${String(index).padStart(3, '0')}`,
+        projectId: 'summary-project',
+        title: `任务 ${index}`,
+        taskType: 'feature',
+        description: `Étage 隐藏正文 ${index}`,
+        createdFrom: 'manual',
+        sourceContext: index === 0 ? { attachments: [{ path: join(root, 'missing.png'), name: '历史附件', kind: 'image' }] } : {},
+      });
+    // 同时刻仍必须依靠身份稳定分页，不能漏项或重复。
+    database.execute('UPDATE tasks SET created_at = ?', ['2026-10-08T00:00:00.000Z']);
+    const first = tasks.listSummaryPage('summary-project');
+    const second = tasks.listSummaryPage('summary-project', { cursor: first.nextCursor! });
+    assertProbe(first.items.length === 50 && first.hasMore && second.items.length === 3 && !second.hasMore && new Set([...first.items, ...second.items].map((task) => task.id)).size === 53, '相同时间的任务必须完整稳定跨页');
+    assertProbe(!('description' in first.items[0]!) && !('sourceContextJson' in first.items[0]!), '摘要不能携带完整正文或来源上下文');
+    const searched = tasks.listSummaryPage('summary-project', { query: 'étage 隐藏正文 52' });
+    assertProbe(searched.items.length === 1 && searched.items[0]?.id === 'summary-052', '正文与 Unicode 搜索必须保持原有结果');
+    let rejected = false;
+    try {
+      tasks.listSummaryPage('different-project', { cursor: first.nextCursor! });
+    } catch {
+      rejected = true;
+    }
+    assertProbe(rejected, '分页游标不能跨项目使用');
+    // 移除游标行后仍从排序值继续，不依赖该行继续存在。
+    database.execute('UPDATE tasks SET deleted_at = ? WHERE id = ?', ['2026-10-08T01:00:00.000Z', first.items.at(-1)!.id]);
+    assertProbe(tasks.listSummaryPage('summary-project', { cursor: first.nextCursor! }).items.length === 3, '删除游标任务后仍应取得后续页');
+    const repaired = repairTaskAttachmentReferences(database, root, databasePath);
+    assertProbe(repaired.repairedFieldCount === 1, '首次核验必须修复历史字段');
+    const originalSelect = database.select.bind(database);
+    let scans = 0;
+    database.select = ((sql: string, ...args: unknown[]) => {
+      if (sql.includes('id, task_type, source_context_json')) scans += 1;
+      return originalSelect(sql, ...(args as [never]));
+    }) as typeof database.select;
+    repairTaskAttachmentReferences(database, root, databasePath);
+    assertProbe(scans === 0, '同一资料根成功核验后不能重复扫描历史任务');
+    await database.save();
+  } finally {
+    await database.close();
+  }
+  const cacheRoot = join(root, 'display-cache');
+  const identity = { projectId: 'project', conversationId: 'conversation' };
+  const now = new Date().toISOString();
+  const value = { schemaGeneration: 'zeus-session-display-cache', savedAt: now, entries: [{ ...identity, cachedAt: now, state: { display: '只读显示' } }] };
+  assertProbe(await writeSessionViewCache(cacheRoot, value), '独立缓存应原子写入');
+  assertProbe(Boolean(await readSessionViewCache(cacheRoot, identity)) && (await readSessionViewCache(cacheRoot, { ...identity, projectId: 'different' })) === null, '显示缓存必须绑定项目和会话');
+  const path = join(cacheRoot, (await readdir(cacheRoot))[0]!);
+  await chmod(cacheRoot, 0o755);
+  assertProbe((await readSessionViewCache(cacheRoot, identity)) === null, '显示缓存拒绝权限过宽目录');
+  await chmod(cacheRoot, 0o700);
+  await chmod(path, 0o644);
+  assertProbe((await readSessionViewCache(cacheRoot, identity)) === null, '显示缓存拒绝权限过宽文件');
+  assertProbe(!(await writeSessionViewCache(cacheRoot, { ...value, savedAt: '2020-01-01T00:00:00.000Z' })), '显示缓存拒绝过期信封');
+  observed.homeSummaryAndCache = { stablePagination: true, fullTextSearch: true, identityBoundCursor: true, deletedCursor: true, attachmentScanSkipped: true, asyncCache: true, permissions: true };
+}
 
 /** 真实文件与 SQLite 验证两条执行链共用资源、行号预览及重新打开后的持久身份。 */
 async function verifyConversationFileResources(): Promise<void> {
@@ -42,10 +117,24 @@ async function verifyConversationFileResources(): Promise<void> {
   await mkdir(root);
   await writeFile(join(root, '页面.html'), '<title>文件预览</title><p>预览内容</p>');
   await writeFile(join(root, 'source.ts'), '// 示例源码\nexport const value = 7;\n');
+  /** 任务目录共享主项目文档，同时保留一个未获授权的目录作为边界检查。 */
+  const registeredProjectRoot = join(probeRoot, 'registered-project');
+  await mkdir(join(registeredProjectRoot, 'docs'), { recursive: true });
+  await writeFile(join(registeredProjectRoot, 'docs', '共享.html'), '<title>共享文档</title><p>真实共享内容</p>');
+  await writeFile(join(registeredProjectRoot, 'docs', '说明.md'), '# 共享说明');
+  /** 图片与 HTML 共用共享目录，普通工作树副本仍保持隔离。 */
+  await writeFile(join(registeredProjectRoot, 'docs', '图片.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZXsAAAAASUVORK5CYII=', 'base64'));
+  await writeFile(join(registeredProjectRoot, 'private.md'), '主项目文件');
+  await writeFile(join(root, 'private.md'), '任务工作树副本');
+  await symlink(join(registeredProjectRoot, 'docs'), join(root, 'docs'), 'dir');
+  await mkdir(join(probeRoot, 'unauthorized'));
+  await writeFile(join(probeRoot, 'unauthorized', 'secret.md'), '未授权内容');
+  await symlink(join(probeRoot, 'unauthorized'), join(root, 'external'), 'dir');
   /** 两种 Provider 使用同一正文，同时覆盖行号、HTML、越界路径与危险协议。 */
-  const text = '[网页](页面.html) [代码](source.ts:2) [越界](../outside.ts) [危险](javascript:alert)';
+  const text =
+    '[网页](页面.html) [代码](source.ts:2) [官方提示词指南](https://platform.openai.com/docs/guides/prompt-engineering) [共享](docs/共享.html) [说明](docs/说明.md) [越界](../outside.ts) [外部](external/secret.md) [危险](javascript:alert)';
   /** 重复登记及重新打开前后用于核对的稳定资源身份。 */
-  let resourceIds: string[] = [];
+  const resourceIds: string[] = [];
   /** 独立账本不接触任何用户会话。 */
   const databasePath = join(root, 'resources.db');
   const database = await createZeusDatabase(databasePath);
@@ -55,6 +144,42 @@ async function verifyConversationFileResources(): Promise<void> {
     const resources = new ConversationResourceRepository(database);
     /** 固定时间避免探针把时钟变化误当作资源变化。 */
     const timestamp = '2026-09-23T06:00:00.000Z';
+    /** 本地接纳与 Provider 回显分开落库，复现整理对话期间的展示交接。 */
+    const conversations = new ConversationRepository(database);
+    /** 排队展示与真实消息共享同一客户端身份。 */
+    const submissions = new ConversationSubmissionRepository(database);
+    new ProjectRepository(database).create({ id: 'resource-project', name: '会话投影', localPath: root });
+    conversations.create({ id: 'resource-conversation', projectId: 'resource-project', title: '会话投影' });
+    /** 已接纳但模型尚未回显的原始输入。 */
+    const submission = submissions.createOrGet({
+      id: 'compacting-submission',
+      conversationId: 'resource-conversation',
+      idempotencyKey: 'compacting-submission',
+      requestHash: 'compacting-submission',
+      clientMessageId: 'compacting-message',
+      kind: 'message',
+      requestedDelivery: 'queue',
+      status: 'active',
+      input: { text: '你在等什么？' },
+      createdAt: timestamp,
+    });
+    /** 本地消息先于模型开始整理上下文，不能据此撤销展示。 */
+    const message = {
+      conversationId: submission.conversationId,
+      role: 'user' as const,
+      content: '你在等什么？',
+      source: 'zeus_local_submission',
+      metadata: { submissionId: submission.id },
+      createdAt: timestamp,
+      clientMessageId: submission.clientMessageId,
+    };
+    conversations.appendMessage(message);
+    assertProbe(
+      submissions.listQueueProjectionByConversation(submission.conversationId).some((entry) => entry.id === submission.id),
+      '整理对话期间，本地接纳记录不能让用户消息退出展示',
+    );
+    conversations.appendMessage({ ...message, providerThreadId: 'codex', providerTurnId: 'turn', providerItemId: 'compacting-user-echo' });
+    assertProbe(!submissions.listQueueProjectionByConversation(submission.conversationId).some((entry) => entry.id === submission.id), '模型回显接管后必须移除临时投影，避免重复气泡');
     for (const agentKind of ['codex', 'pi'] as const) {
       /** 相同输入仅改变执行链身份。 */
       const item = items.upsertCompleted({
@@ -73,9 +198,13 @@ async function verifyConversationFileResources(): Promise<void> {
         agentKind,
       });
       /** 公共登记同时形成 HTML 正文链接、网页卡片和源码链接。 */
-      const input = { projectId: 'resource-project', projectRoot: root, conversationId: item.conversationId, turnId: item.turnId, item, payload: {}, text, trustedAttachmentRoots: [], now: timestamp };
+      const input = { projectId: 'resource-project', projectRoot: root, registeredProjectRoot, conversationId: item.conversationId, turnId: item.turnId, item, payload: {}, text, trustedAttachmentRoots: [], now: timestamp };
       const projected = syncConversationResources(input, resources);
-      assertProbe(projected.length === 3, '两条执行链都应生成三个合法资源，不能接受越界路径或危险协议');
+      assertProbe(projected.length === 7, '两条执行链都应登记任务文件、普通网址与已授权共享文档，不能接受越界路径、外部符号链接或危险协议');
+      assertProbe(
+        projected.some((resource) => resource.kind === 'website' && resource.presentation === 'inline' && resource.url === 'https://platform.openai.com/docs/guides/prompt-engineering'),
+        '普通 Markdown 链接必须登记为受信正文资源',
+      );
       assertProbe(
         projected.some((resource) => resource.kind === 'file' && resource.iconKind === 'html' && resource.presentation === 'card' && resource.displayName === '文件预览'),
         'HTML 必须有以文档标题展示的网页卡片',
@@ -85,13 +214,40 @@ async function verifyConversationFileResources(): Promise<void> {
       assertProbe(source?.kind === 'file' && source.location?.line === 2, '代码文件链接必须保留行号');
       const preview = readConversationResourcePreview(source, toConversationResourceOpenIntent(resources.getById(source.id)!));
       assertProbe(preview.kind === 'source' && preview.content.includes('value = 7') && preview.location?.line === 2, '代码预览应读取真实文件并定位指定行');
+      /** 共享目录保存真实授权目标，预览和绝对路径引用必须指向同一份文件。 */
+      const shared = projected.find((resource) => resource.presentation === 'inline' && resource.displayName === '共享');
+      assertProbe(shared?.kind === 'file', '共享链接必须登记为正文文件资源');
+      const sharedIntent = toConversationResourceOpenIntent(resources.getById(shared.id)!);
+      assertProbe(sharedIntent.target.absolutePath === (await realpath(join(root, 'docs', '共享.html'))), '共享链接必须登记文件的真实路径');
+      const sharedPreview = readConversationResourcePreview(shared, sharedIntent);
+      assertProbe(sharedIntent.authority.allowedRoot === (await realpath(registeredProjectRoot)) && sharedPreview.kind === 'source' && sharedPreview.content.includes('真实共享内容'), '共享文档必须在已登记项目根内实际读取');
+      const absolute = normalizeConversationResources({ ...input, text: `[共享](${join(root, 'docs', '共享.html')})` });
+      assertProbe(absolute[0]?.canonicalTargetDigest === resources.getById(shared.id)?.canonicalTargetDigest, '绝对路径和相对路径必须登记同一授权目标');
+      assertProbe(normalizeConversationResources({ ...input, registeredProjectRoot: undefined, text: '[共享](docs/共享.html)' }).length === 0, '未登记主项目时不得授权共享目录');
+      /** 真实共享路径和任务入口必须登记同一目标，不能让标准文件链接退化为文字。 */
+      const canonicalShared = normalizeConversationResources({ ...input, text: `[共享](${join(registeredProjectRoot, 'docs', '共享.html')})` });
+      assertProbe(canonicalShared.length === 2 && canonicalShared[0]?.canonicalTargetDigest === resources.getById(shared.id)?.canonicalTargetDigest, '共享真实路径必须恢复 HTML 正文链接和网页卡片，并沿用同一授权身份');
+      /** 普通图片文件链接也使用相同的共享授权入口。 */
+      const canonicalImage = normalizeConversationResources({ ...input, text: `[图片](${join(registeredProjectRoot, 'docs', '图片.png')})` });
+      assertProbe(canonicalImage.length === 1 && toConversationResource({ ...canonicalImage[0]!, createdAt: timestamp, updatedAt: timestamp })?.kind === 'file', '共享图片真实路径必须登记为可打开的正文文件资源');
+      assertProbe(
+        normalizeConversationResources({ ...input, text: `[未共享](${join(registeredProjectRoot, 'private.md')}) [外部](${join(probeRoot, 'unauthorized', 'secret.md')}) [缺失](docs/missing.md)` }).length === 0,
+        '普通工作树副本、外部真实路径和缺失共享文件不得扩大任务授权',
+      );
+      /** 文件改动与结构化交付共用正文链接的同一授权边界。 */
+      for (const payload of [
+        { changes: [{ path: join(registeredProjectRoot, 'docs', '说明.md') }, { path: 'external/secret.md' }] },
+        { deliverables: [{ path: join(registeredProjectRoot, 'docs', '说明.md') }, { path: 'external/secret.md' }] },
+      ]) {
+        assertProbe(normalizeConversationResources({ ...input, text: '', payload }).length === 1, '文件改动和结构化交付必须接受已授权共享文档并拒绝外部符号链接');
+      }
       /** 后续状态事件省略资源字段时仍须返回原资源，不能让已显示的缩略图变成 404。 */
       const preserved = syncConversationResources({ ...input, text: '', payload: {} }, resources);
       assertProbe(JSON.stringify(preserved.map((resource) => resource.id)) === JSON.stringify(projected.map((resource) => resource.id)), '空资源投影不得删除同一条目的持久资源');
       assertProbe(JSON.stringify(syncConversationResources(input, resources).map((resource) => resource.id)) === JSON.stringify(projected.map((resource) => resource.id)), '重复登记不得改变资源身份或叠加卡片');
-      if (agentKind === 'pi') resourceIds = projected.map((resource) => resource.id);
+      resourceIds.push(...projected.map((resource) => resource.id));
     }
-    assertProbe(items.listCompletedItemsForResourceBackfill().length === 1, '普通文件历史回填只应选中 Pi 消息');
+    assertProbe(items.listCompletedItemsForResourceBackfill().length === 2, '普通文件历史回填必须同时选中 Codex 与 Pi 的已完成正文');
     await database.save();
   } finally {
     await database.close();
@@ -102,15 +258,23 @@ async function verifyConversationFileResources(): Promise<void> {
     const resources = new ConversationResourceRepository(reopened);
     assertProbe(
       resourceIds.every((id) => resources.getById(id)),
-      '重新打开后 Pi 文件资源必须仍然可解析',
+      '重新打开后两条执行链的文件资源必须仍然可解析',
     );
     /** 界面资源分页须返回同一批稳定身份，不能只在底层仓库中存在。 */
     const page = new ConversationSnapshotV2Repository(reopened).listResourcePage({ conversationId: 'resource-conversation' });
     assertProbe(
-      resourceIds.every((id) => page.items.some((resource) => resource.id === id)),
-      '重新打开后界面资源分页必须返回 Pi 的文件链接和卡片',
+      page.items.some((resource) => resource.displayName === '说明' && resource.projectRelativePath === 'docs/说明.md'),
+      '资源分页必须区分文件标题和授权路径',
     );
-    observed.conversationFileResources = { codexAndPi: true, htmlCard: true, sourceLinePreview: true, unauthorizedPathsRejected: true, stableAfterReopen: true };
+    assertProbe(
+      page.items.some((resource) => resource.displayName === '官方提示词指南' && resource.url === 'https://platform.openai.com/docs/guides/prompt-engineering'),
+      '资源分页必须保留网站目标，不能把链接标题当作 URL',
+    );
+    assertProbe(
+      resourceIds.every((id) => page.items.some((resource) => resource.id === id)),
+      '重新打开后界面资源分页必须返回两条执行链的文件链接和卡片',
+    );
+    observed.conversationFileResources = { codexAndPi: true, htmlCard: true, sourceLinePreview: true, authorizedSharedDirectory: true, relativeAndAbsoluteLinks: true, unauthorizedPathsRejected: true, stableAfterReopen: true };
   } finally {
     await reopened.close();
   }

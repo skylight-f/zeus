@@ -33,10 +33,14 @@ import type { ZeusBrowserComment, ZeusBrowserPreparedSubmission } from '@zeus/sh
 import { type ConversationContextDraft, emptyConversationContextDraft, type TaskPushMessageLayout } from '@zeus/shared';
 import { mergeConversationContentV2, reconcileConversationHistoryCache } from './conversationSnapshotV2Adapter.js';
 import { isTranscriptContentUpdate } from './transcriptProjection.js';
-import { mergeTranscriptItem, newestTranscriptPlacement, orderTranscriptCandidates, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
+import { mergeDurableItemResources, orderTranscriptCandidates, mergeTranscriptItem, newestTranscriptPlacement, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
+import { mergeSystemMessages } from './systemMessageProjection.js';
 import { isUnacceptedTranscriptMessage } from './conversationQueuePresentation.js';
+import { retainResourcesOwnedByItem } from './conversationResourceProjection.js';
 
 export type NativeSessionAction =
+  /** 系统消息命令回执或历史页不推进实时事件水位。 */
+  | { type: 'system_messages_loaded'; page: import('@zeus/shared').ConversationSystemMessagePage; history?: boolean }
   | { type: 'transport_changed'; transportState: TransportState; reconnectAttempt?: number; error?: NativeSessionError | null }
   /** 只更新准备状态，不触碰消息、排序、草稿或当前快照。 */
   | { type: 'transcript_initialization_changed'; initializing: boolean }
@@ -139,6 +143,7 @@ export function createInitialSessionState(): NativeSessionState {
     providerThreadId: null,
     activeTurnId: null,
     startedTurnId: null,
+    currentReasoningItem: null,
     snapshot: null,
     turnsByProviderId: {},
     changeSetsByProviderId: {},
@@ -184,6 +189,10 @@ export function createHydratedSessionState(snapshot: NativeConversationSnapshot)
 
 export function sessionReducer(state: NativeSessionState, action: NativeSessionAction): NativeSessionState {
   switch (action.type) {
+    case 'system_messages_loaded':
+      return state.conversationId === action.page.conversationId
+        ? { ...state, systemMessages: mergeSystemMessages(state.systemMessages, action.page.items), systemMessagesCursor: action.history ? action.page.nextCursor : state.systemMessagesCursor }
+        : state;
     case 'transcript_initialization_changed':
       return state.transcriptInitializing === action.initializing ? state : { ...state, transcriptInitializing: action.initializing };
     case 'transport_changed':
@@ -682,6 +691,14 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     order: entry.order,
     entryId: items[entry.key]?.transcript?.placement.entryId ?? entry.key,
   })).map((entry) => entry.key);
+  /** 轻量快照会合并旧资源，合并之后仍须按权威消息归属去掉历史错误关联。 */
+  const resourceMetadataById = new Map((snapshot.v2Paging?.resources.items ?? []).map((resource) => [resource.id, resource]));
+  for (const [key, item] of Object.entries(items)) {
+    if (!isUserMessageItem(item)) continue;
+    /** 只移除已被权威元数据明确归给其他消息的资源。 */
+    const ownedResources = retainResourcesOwnedByItem(item.resources, item.localItemId ?? item.itemId, item.transcript?.placement.entryId, resourceMetadataById);
+    if (ownedResources !== item.resources) items[key] = { ...item, resources: ownedResources };
+  }
   const stableItems = reuseEquivalentSessionItems(state.items, items);
   /** 只为仍在页面缓存中的条目保留额外摘要，避免轮次缓存无界增长。 */
   const retainedTurnIds = new Set(Object.values(stableItems).map((item) => item.turnId));
@@ -700,16 +717,29 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
   const hasVisibleActiveFeedback = activeTurnId
     ? Object.values(items).some((item) => item.turnId === activeTurnId && itemProvidesVisibleFeedback(item) && (!latestResolutionAt || (item.updatedAt ?? item.timelineAt ?? '') >= latestResolutionAt))
     : false;
+  /** 当前摘要只取权威活动投影，不从已缓存的历史过程选取。 */
+  const reasoningSnapshot =
+    activeTurnId && !snapshot.snapshotV2?.activeTurn?.completionOutput ? snapshot.items.toReversed().find((item) => item.turnId === activeTurnId && item.type === 'reasoning' && item.payload.v2ContentKind === 'active_item') : undefined;
+  /** 复用条目的显示身份，摘要正文仍由权威活动投影拥有。 */
+  const reasoningBuffer = reasoningSnapshot ? Object.values(stableItems).find((item) => item.localItemId === reasoningSnapshot.id) : undefined;
+  /** 旧快照不能覆盖比它更新的实时摘要。 */
+  const currentReasoningItem =
+    reasoningSnapshot && reasoningBuffer ? { ...reasoningBuffer, text: reasoningSnapshot.text, payload: reasoningSnapshot.payload, transcript: reasoningSnapshot.transcript, updatedAt: reasoningSnapshot.updatedAt } : null;
+  /** 同线程同轮次的快照刷新不能清掉仍在进行的连接提示；正式结束事件负责收口。 */
+  const retainProviderRetry = state.providerThreadId === snapshot.providerThreadId && snapshot.turns.some((turn) => turn.providerTurnId === state.providerReconnectTurnId && ['running', 'waiting', 'failed'].includes(turn.status));
   return {
     ...state,
+    systemMessages: mergeSystemMessages(state.conversationId === snapshot.id ? state.systemMessages : undefined, snapshot.systemMessages?.items ?? []),
+    systemMessagesCursor: state.conversationId === snapshot.id && state.systemMessagesCursor !== undefined ? state.systemMessagesCursor : (snapshot.systemMessages?.nextCursor ?? null),
     projectId: snapshot.projectId,
     conversationId: snapshot.id,
     providerThreadId: snapshot.providerThreadId,
-    providerReconnectAttempt: 0,
-    providerReconnectAttempts: 0,
-    providerReconnectTurnId: null,
+    providerReconnectAttempt: retainProviderRetry ? state.providerReconnectAttempt : 0,
+    providerReconnectAttempts: retainProviderRetry ? state.providerReconnectAttempts : 0,
+    providerReconnectTurnId: retainProviderRetry ? state.providerReconnectTurnId : null,
     activeTurnId,
     startedTurnId: activeTurnId,
+    currentReasoningItem: currentReasoningItem && state.currentReasoningItem?.turnId === activeTurnId ? mergeTranscriptItem(state.currentReasoningItem, currentReasoningItem) : currentReasoningItem,
     snapshot: { ...snapshot, turns: retainedTurns, changeSets: Object.values(changeSetsByProviderId) },
     turnsByProviderId,
     changeSetsByProviderId,
@@ -927,6 +957,7 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
     itemOrder: stableItemOrder,
     activeTurnId: state.activeTurnId,
     startedTurnId: state.startedTurnId,
+    currentReasoningItem: state.currentReasoningItem,
     queue: state.queue,
     pendingRequests: state.pendingRequests,
     planImplementationRequests: state.planImplementationRequests,
@@ -999,15 +1030,6 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-/** 同一持久消息的资源是渐进补齐数据；空快照不能撤销已经取得的图片与交付物。 */
-function mergeDurableItemResources(previous: NativeSessionItemBuffer['resources'] | undefined, incoming: NativeSessionItemBuffer['resources'] | undefined): NativeSessionItemBuffer['resources'] {
-  if (!previous?.length) return incoming ?? [];
-  if (!incoming?.length) return previous;
-  const resourcesById = new Map(previous.map((resource) => [resource.id, resource]));
-  for (const resource of incoming) resourcesById.set(resource.id, resource);
-  return [...resourcesById.values()];
-}
-
 function reduceNativeEvent(state: NativeSessionState, event: NativeConversationEvent, suppressRequestAuthority = false): NativeSessionState {
   if (state.seenEventIds[event.id]) return state;
   const payload = event.payload;
@@ -1029,6 +1051,8 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
   };
 
   switch (event.type) {
+    case 'conversation.system_message.updated':
+      return { ...base, systemMessages: mergeSystemMessages(base.systemMessages, [event.payload.message]) };
     case 'conversation.transport.changed':
       return applyProviderIdentityChange(base, payload, true);
     case 'conversation.thread.changed':
@@ -1113,6 +1137,7 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         ...turnBase,
         activeTurnId: turnId,
         startedTurnId: turnId,
+        currentReasoningItem: turnBase.activeTurnId === turnId ? turnBase.currentReasoningItem : null,
         queue,
         items,
         turnsByProviderId: { ...turnBase.turnsByProviderId, [turnId]: turn },
@@ -1121,6 +1146,7 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         conversationState: 'active_prework',
       };
     }
+    case 'conversation.turn.retrying':
     case 'conversation.turn.completed': {
       const turnId = stringValue(payload.turnId);
       if (!turnId) return base;
@@ -1175,10 +1201,13 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         turnsByProviderId: { ...base.turnsByProviderId, [canonicalTurnId]: turn },
         transcriptRevision: base.transcriptRevision + 1,
       };
+      // 自动恢复只封存上一次尝试，保留停止入口和正在连接状态。
+      if (event.type === 'conversation.turn.retrying') return { ...nextState, conversationState: 'active_prework' };
       if (!base.activeTurnId || !turnIdentities.has(base.activeTurnId)) return nextState;
       return {
         ...nextState,
         activeTurnId: null,
+        currentReasoningItem: null,
         conversationState: status === 'failed' && !warning ? 'turn_failed' : 'native_idle',
       };
     }
@@ -1526,7 +1555,8 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
           ? { ...previous?.payload, ...incomingPayload }
           : (incomingPayload ?? previous?.payload ?? matchedUserItem?.payload ?? {})
       : liveProgressPayload(previous?.payload ?? matchedUserItem?.payload, incomingPayload),
-    resources: completed ? (incomingResources ?? previous?.resources ?? matchedUserItem?.resources ?? []) : (previous?.resources ?? matchedUserItem?.resources ?? incomingResources ?? []),
+    // 图片可在流式正文之后登记；任何事件的空资源列表都不能撤销原资源。
+    resources: mergeDurableItemResources(previous?.resources ?? matchedUserItem?.resources, incomingResources ?? undefined),
     ...(resolvedClientId ? { clientUserMessageId: resolvedClientId, durableClientUserMessageId: resolvedClientId, optimistic: false } : {}),
     // 首次事件确定条目的时间线位置；delta/completed 只更新内容，不能让历史位置漂移。
     timelineAt: previous?.timelineAt ?? matchedUserItem?.timelineAt ?? event.createdAt,
@@ -1536,7 +1566,8 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
   };
   /** 实时、历史与分页共用正文权威判定。 */
   const next = previous ? mergeTranscriptItem(previous, projected) : projected;
-  if (next === previous) return state;
+  // 详情可能先载入同一条目；实时摘要仍需要取得独立的当前状态所有权。
+  if (next === previous && effectiveType !== 'reasoning') return state;
   const isNew = previous === undefined;
   const items = { ...state.items, [key]: next };
   if (matchedKey && matchedKey !== key) delete items[matchedKey];
@@ -1548,6 +1579,7 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
   return {
     ...state,
     activeTurnId: terminal ? state.activeTurnId : turnId,
+    currentReasoningItem: terminal ? state.currentReasoningItem : effectiveType === 'reasoning' ? next : next.phase === 'final_answer' ? null : state.currentReasoningItem?.turnId === turnId ? state.currentReasoningItem : null,
     items,
     itemOrder,
     transcriptRevision: state.transcriptRevision + 1,
@@ -1584,7 +1616,15 @@ function reduceTranscriptPlacements(state: NativeSessionState, batch: NativeConv
     const placement = entryId ? placements.get(entryId) : null;
     return [placement && request.transcript ? { ...request, transcript: { ...request.transcript, placement } } : request];
   });
-  return { ...state, items, pendingRequests, removedTranscriptEntryIds, itemOrder: sortSessionItemOrder(candidateOrder, items), transcriptRevision: state.transcriptRevision + 1 };
+  /** 系统消息与普通消息同批接管位置代次，避免混用新旧顺序。 */
+  const systemMessages = Object.fromEntries(
+    Object.entries(state.systemMessages ?? {}).flatMap(([id, message]) => {
+      const placement = placements.get(message.transcript.placement.entryId);
+      if (removed.has(message.transcript.placement.entryId)) return [];
+      return [[id, placement ? { ...message, transcript: { ...message.transcript, placement } } : message]];
+    }),
+  );
+  return { ...state, systemMessages, items, pendingRequests, removedTranscriptEntryIds, itemOrder: sortSessionItemOrder(candidateOrder, items), transcriptRevision: state.transcriptRevision + 1 };
 }
 
 /** 实时条目按正文时间线插入；已开轮用户消息用后续事件的显式开场身份临时固定位置。 */
@@ -1778,11 +1818,18 @@ function projectQueueSubmissionMessages(state: NativeSessionState, queue: Native
   const submissionIds = new Set(queue.submissions.map((submission) => submission.id));
   /** HTTP 回执到达前也能用客户端身份确认归属。 */
   const clientIds = new Set(queue.submissions.map((submission) => submission.clientUserMessageId));
+  /** 明确拒绝后由替代提交接管原气泡，不能把原引导留在已结束轮次中。 */
+  const replacedSubmissionIds = new Set(queue.submissions.map((submission) => submission.replacementOfSubmissionId).filter((id): id is string => Boolean(id)));
   /** 只移交未接纳的本地输入，持久正文及已进入轮次的插话保留。 */
   const removedKeys = new Set(
     state.itemOrder.filter((key) => {
       const item = state.items[key];
-      return item && isUserMessageItem(item) && isUnacceptedTranscriptMessage(item) && (submissionIds.has(stringValue(item.payload.submissionId) ?? '') || userMessageClientIds(item).some((id) => clientIds.has(id)));
+      return (
+        item &&
+        isUserMessageItem(item) &&
+        ((isUnacceptedTranscriptMessage(item) && (submissionIds.has(stringValue(item.payload.submissionId) ?? '') || userMessageClientIds(item).some((id) => clientIds.has(id)))) ||
+          (!item.providerItemId && replacedSubmissionIds.has(stringValue(item.payload.submissionId) ?? '')))
+      );
     }),
   );
   return {
@@ -1796,6 +1843,26 @@ function projectQueueSubmissionMessages(state: NativeSessionState, queue: Native
 }
 
 function projectSteeringSubmission(state: NativeSessionState, submission: NativeQueuedSubmission, authoritativeQueue?: NativeQueueSnapshot): NativeSessionState {
+  // 明确取消的原题回答不能被旧轮次结束事件误确认；实际 Provider 用户条目继续保留。
+  if (submission.status === 'cancelled') {
+    /** 只清理明确匹配原提交的临时消息，不按正文匹配其他答案。 */
+    const removedKeys = new Set(
+      Object.entries(state.items)
+        .filter(
+          ([, item]) =>
+            isUserMessageItem(item) && !item.providerItemId && (stringValue(item.payload.submissionId) === submission.id || (submission.clientUserMessageId && userMessageClientIds(item).includes(submission.clientUserMessageId))),
+        )
+        .map(([key]) => key),
+    );
+    /** 队列状态仍由同一权威事件接管，草稿与原问题记录不受影响。 */
+    const next = {
+      ...state,
+      items: Object.fromEntries(Object.entries(state.items).filter(([key]) => !removedKeys.has(key))),
+      itemOrder: state.itemOrder.filter((key) => !removedKeys.has(key)),
+      transcriptRevision: state.transcriptRevision + (removedKeys.size ? 1 : 0),
+    };
+    return authoritativeQueue ? projectQueueSubmissionMessages(next, authoritativeQueue) : next;
+  }
   // 队列水位只约束队列；迟到的明确接纳证据仍须交给正文。
   if (authoritativeQueue && state.queue && authoritativeQueue.throughEventSeq < state.queue.throughEventSeq) {
     if (submission.status === 'paused') return state;

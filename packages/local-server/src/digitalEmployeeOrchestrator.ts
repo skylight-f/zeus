@@ -14,6 +14,7 @@ import {
   CommandRunRepository,
   ConversationRepository,
   ConversationSubmissionRepository,
+  ConversationTurnRepository,
   type DigitalEmployeeAutomationRecord,
   DigitalEmployeeAutomationRepository,
   type DigitalEmployeeExecutionRecord,
@@ -60,7 +61,7 @@ interface DigitalEmployeeOrchestratorOptions {
     executionId: string | null;
     source: string;
     sourceRef: string;
-    context?: { permissionMode: 'read-only' | 'auto' | 'full-access' };
+    context?: { permissionMode: 'read-only' | 'auto' | 'auto-review' | 'full-access' };
   }): Promise<{ workflowRunId: string } | null>;
   /** 历史排队执行接入流程后读取完整流程终态。 */
   readProjectWorkflowRun?(runId: string): AutomationExecutionState | undefined;
@@ -82,6 +83,8 @@ interface DigitalEmployeeOrchestratorOptions {
   taskStageApplication: TaskStageApplication;
   conversations: ConversationRepository;
   conversationSubmissions: ConversationSubmissionRepository;
+  /** 读取 Provider 的确认终态，停止请求本身不能释放工作队列。 */
+  conversationTurns: ConversationTurnRepository;
   commandRuns: CommandRunRepository;
   conversationCapabilities: ConversationCapabilityQueryApplication;
   taskWorkManagement: TaskWorkManagementController;
@@ -102,7 +105,14 @@ export interface DigitalEmployeeOrchestrator {
   /** 统一自动化按规则筛选领取已有任务，不创建替代任务。 */
   selectEligibleAutomationTask(projectId: string, employeeId: string, taskId?: string, filter?: AutomationActionConfig['taskFilter']): ZeusTaskRecord | null;
   /** 普通自动化复用员工工作接纳，返回真实执行关联。 */
-  queueAutomatedAssignment(input: { projectId: string; taskId: string; employeeId: string; sourceRef: string; bypassWorkflow?: boolean; permissionMode?: 'read-only' | 'auto' | 'full-access' }): Promise<AutomationExecutionReference | null>;
+  queueAutomatedAssignment(input: {
+    projectId: string;
+    taskId: string;
+    employeeId: string;
+    sourceRef: string;
+    bypassWorkflow?: boolean;
+    permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
+  }): Promise<AutomationExecutionReference | null>;
   kick(): void;
   close(): Promise<void>;
 }
@@ -181,7 +191,7 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     /** 调研工作不进入项目研发流程。 */
     bypassWorkflow?: boolean;
     /** 自动化权限只能收紧员工和任务的既有授权。 */
-    permissionMode?: 'read-only' | 'auto' | 'full-access';
+    permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
   }): Promise<AutomationExecutionReference | null> {
     if (input.employee.entrypoint?.kind !== 'agent' || input.employee.entrypointMigrationState !== 'ready') {
       throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_AGENT_ENTRYPOINT_REQUIRED', '数字员工必须通过 Agent 会话执行；自动化不会运行旧版入口配置。', false);
@@ -446,7 +456,11 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
         return;
       }
     }
-    const executionState = conversationWorkExecutionState(conversation, options.conversationSubmissions.listByConversation(conversation.id));
+    const executionState = conversationWorkExecutionState(conversation, options.conversationSubmissions.listByConversation(conversation.id), options.conversationTurns.listByConversation(conversation.id));
+    if (executionState.type === 'cancelled') {
+      await failExecution(execution, orchestratorError(executionState.code, executionState.message, false), true);
+      return;
+    }
     if (executionState.type === 'blocked') throw orchestratorError(executionState.code, executionState.message, false, true);
     if (executionState.type === 'failed') throw orchestratorError(executionState.code, executionState.message, false);
     if (executionState.type === 'outcome_unknown') throw orchestratorError(executionState.code, executionState.message, true);
@@ -748,10 +762,10 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     await options.save();
   }
 
-  /** 将执行失败、结果未知和 Provider 阻塞分别落为准确的数字员工终态。 */
-  async function failExecution(execution: DigitalEmployeeExecutionRecord, error: unknown): Promise<void> {
+  /** 将已确认取消、执行失败、结果未知和 Provider 阻塞分别落为准确终态。 */
+  async function failExecution(execution: DigitalEmployeeExecutionRecord, error: unknown, cancelled = false): Promise<void> {
     const failure = normalizeOrchestratorError(error);
-    const status = failure.recoveryRequired || failure.blocked ? 'blocked' : 'failed';
+    const status = failure.recoveryRequired || failure.blocked ? 'blocked' : cancelled ? 'cancelled' : 'failed';
     const current = options.executions.getById(execution.id);
     if (!current || current.status === 'delivered' || current.status === 'cancelled') return;
     const retryUnsafe = retryWouldDuplicateUnknownWork(failure.code);
@@ -765,14 +779,14 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     const updated = options.executions.update(execution.id, { status, deliveryState, errorCode: failure.code, errorMessage: failure.message, completedAt: now().toISOString() });
     options.taskEvents.create({
       taskId: execution.taskId,
-      eventType: 'task.digital_employee.failed',
-      title: status === 'blocked' ? '数字员工执行已阻塞' : '数字员工执行失败',
+      eventType: status === 'cancelled' ? 'task.digital_employee.cancelled' : 'task.digital_employee.failed',
+      title: status === 'blocked' ? '数字员工执行已阻塞' : status === 'cancelled' ? '数字员工执行已取消' : '数字员工执行失败',
       payload: { executionId: execution.id, employeeId: execution.employeeId, code: failure.code, message: failure.message, recoveryRequired: failure.recoveryRequired, retryUnsafe },
     });
     options.appendAuditLog({
       actorType: 'worker',
       actorRef: execution.employeeId,
-      action: status === 'blocked' ? 'digital_employee.execution.blocked' : 'digital_employee.execution.failed',
+      action: status === 'blocked' ? 'digital_employee.execution.blocked' : status === 'cancelled' ? 'digital_employee.execution.cancelled' : 'digital_employee.execution.failed',
       resourceType: 'digital_employee_execution',
       resourceId: execution.id,
       payload: { projectId: execution.projectId, taskId: execution.taskId, code: failure.code, message: failure.message, recoveryRequired: failure.recoveryRequired, retryUnsafe },

@@ -1,5 +1,10 @@
 /** 所有文件入口共用预览类型与格式策略。 */
 export * from './filePreview.js';
+/** 任务截止时间与提醒共用的跨层契约。 */
+export * from './taskDeadline.js';
+/** 自动化通知中心的跨层查询与确认契约。 */
+export * from './automationNotifications.js';
+export * from './notifications.js';
 import type { UserFacingErrorCause } from './userFacingError.js';
 /** Zeus 任务状态：只描述真实任务生命周期，不承载任何示例或 mock 业务数据。 */
 export * from './taskPush.js';
@@ -15,12 +20,15 @@ export * from './terminalOutput.js';
 export * from './conversationDispatchWire.js';
 export * from './conversationSnapshotV2Wire.js';
 export * from './conversationTranscriptWire.js';
+export * from './conversationSystemMessage.js';
 export * from './im.js';
 export * from './skillIdentity.js';
 export * from './userFacingError.js';
 export * from './networkProxy.js';
 export * from './globalAgentSettings.js';
 export * from './contextCapacity.js';
+/** 独立输入建议的设置、目录和回执契约。 */
+export * from './inputSuggestion.js';
 
 /** 项目本地仓库发现状态；完成时间只代表当前目录最近一次完整扫描。 */
 export interface ProjectRepositoryDiscovery {
@@ -69,7 +77,7 @@ export function isTaskPriority(value: unknown): value is TaskPriority {
 }
 
 /** 任务类型只表达工作目标；不会改变任务状态、优先级或执行方式。 */
-export const taskTypeOrder = ['requirement', 'defect', 'optimization'] as const;
+export const taskTypeOrder = ['task', 'requirement', 'defect', 'optimization'] as const;
 
 export type TaskType = (typeof taskTypeOrder)[number];
 
@@ -78,7 +86,9 @@ export function isTaskType(value: unknown): value is TaskType {
   return typeof value === 'string' && taskTypeOrder.includes(value as TaskType);
 }
 
-const taskCommitPrefixByType: Record<TaskType, 'feat' | 'fix' | 'perf'> = {
+/** 通用任务使用中性的提交建议；具体分类沿用已有前缀。 */
+const taskCommitPrefixByType: Record<TaskType, 'chore' | 'feat' | 'fix' | 'perf'> = {
+  task: 'chore',
   requirement: 'feat',
   defect: 'fix',
   optimization: 'perf',
@@ -309,7 +319,7 @@ export const taskBoardGroupProperties = ['managementStatus', 'priority', 'taskTy
 export type TaskBoardGroupProperty = (typeof taskBoardGroupProperties)[number];
 export const taskBoardEmptyGroupId = '__zeus_none__';
 
-export const taskBoardCardProperties = ['code', 'managementStatus', 'priority', 'taskType', 'runStatus', 'branchStatus', 'tags', 'parentTask', 'source', 'createdAt', 'updatedAt'] as const;
+export const taskBoardCardProperties = ['code', 'managementStatus', 'priority', 'taskType', 'runStatus', 'branchStatus', 'tags', 'parentTask', 'source', 'createdAt', 'updatedAt', 'deadline'] as const;
 export type TaskBoardCardProperty = (typeof taskBoardCardProperties)[number];
 export type TaskBoardCardSize = 'small' | 'medium' | 'large';
 export type TaskBoardPreviewMode = 'none' | 'content' | 'first_image';
@@ -450,7 +460,7 @@ export function createDefaultTaskBoardViewSettings(): TaskBoardViewSettings {
     colorColumns: true,
     columnColors: {},
     cardSize: 'medium',
-    visibleProperties: ['code', 'priority', 'taskType', 'runStatus', 'tags'],
+    visibleProperties: ['code', 'priority', 'taskType', 'runStatus', 'tags', 'deadline'],
     propertyOrder: [...taskBoardCardProperties],
     preview: 'none',
     fitPreview: true,
@@ -567,6 +577,8 @@ export * from './browser.js';
 export * from './commands.js';
 export * from './conversationContext.js';
 export * from './conversationResources.js';
+export * from './conversationMarkdownReferences.js';
+export * from './conversationMarkdown.js';
 export * from './portableConversationContext.js';
 export * from './projectSourceWorkspace.js';
 export * from './projectSourceTextSearch.js';

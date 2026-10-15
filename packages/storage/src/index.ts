@@ -1,3 +1,6 @@
+import { migrateTaskReminders } from './taskReminderStore.js';
+/** 任务提醒与任务共用数据库和耐久事务。 */
+export { TaskReminderRepository } from './taskReminderStore.js';
 import { migrateEmployeeMemoryProposalSchema } from './employeeMemoryProposalStore.js';
 export * from './employeeMemoryProposalStore.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -55,6 +58,8 @@ export * from './defectWorkflowStore.js';
 export * from './workArtifactStore.js';
 export * from './automationEmployeeMigration.js';
 export * from './automationStore.js';
+/** 逐会话通知存储与确认。 */
+export * from './automationNotificationStore.js';
 export * from './digitalEmployeeCapabilityMigration.js';
 export * from './digitalEmployeeStageHandoffMigration.js';
 export * from './digitalEmployeeLegacyRetirementMigration.js';
@@ -66,6 +71,7 @@ export * from './conversationExecutionStore.js';
 export * from './conversationExpertStore.js';
 export * from './conversationRuntimeStore.js';
 export * from './conversationTranscriptStore.js';
+export * from './conversationSystemMessageStore.js';
 export * from './conversationLegacyCutover.js';
 export * from './conversationProviderItemStore.js';
 export * from './conversationSnapshotV2.js';
@@ -1004,6 +1010,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
       zeusDb.execute(`UPDATE conversation_legacy_write_fence SET current_writer_open = 1 WHERE singleton = 1`);
     }
     migrateCoreSchema(zeusDb);
+    migrateTaskReminders(zeusDb);
     migrateRetiredCodeGraph(zeusDb);
     migrateTaskBoardSchema(zeusDb);
     migrateRetiredUnitTestTemplate(zeusDb);

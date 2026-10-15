@@ -28,6 +28,7 @@ interface MemoryDraft {
   externalStateConfirmed: boolean;
 }
 
+/** 全局、项目和员工共用记忆治理，员工页使用简洁的列表标题。 */
 export function MemorySettingsPane(props: {
   client: MemoryApiClient;
   language: MemoryLanguage;
@@ -106,7 +107,11 @@ export function MemorySettingsPane(props: {
       <header className="memory-settings-header">
         <span>
           <h2>{props.scopeLabel ?? (zh ? '长期记忆' : 'Long-term memory')}</h2>
-          <p>{zh ? '保存可复用的知识、偏好和工作方法。每条经验保留来源与复核时间，可修正或停用；不会把整个会话当作记忆。' : 'Keep reusable knowledge, preferences, and workflows with sources, review dates, correction and deactivation.'}</p>
+          {scope.kind !== 'employee' ? (
+            <p>
+              {zh ? '保存可复用的知识、偏好和工作方法。每条经验保留来源与复核时间，可修正或停用；不会把整个会话当作记忆。' : 'Keep reusable knowledge, preferences, and workflows with sources, review dates, correction and deactivation.'}
+            </p>
+          ) : null}
         </span>
         <div className="settings-heading-actions">
           <SettingsSaveStatus status={busy ? 'saving' : formError ? 'failed' : saved ? 'saved' : 'idle'} language={props.language} />
@@ -152,6 +157,7 @@ export function MemorySettingsPane(props: {
                   </span>
                 </header>
                 <MemoryEditor
+                  employeeScope={scope.kind === 'employee'}
                   draft={draft}
                   mode={editor.mode}
                   lockedKey={editor.mode === 'supersede' ? editor.record.memoryKey : null}
@@ -198,7 +204,9 @@ export function MemorySettingsPane(props: {
       ) : null}
 
       {controller.snapshot.phase === 'loading' ? <p role="status">{zh ? '正在读取记忆…' : 'Loading memories…'}</p> : null}
-      {controller.snapshot.phase === 'ready' && controller.snapshot.items.length === 0 ? <p>{zh ? '当前范围还没有长期记忆。' : 'There are no long-term memories in this scope.'}</p> : null}
+      {controller.snapshot.phase === 'ready' && controller.snapshot.items.length === 0 ? (
+        <p>{scope.kind === 'employee' ? (zh ? '暂无记忆。' : 'No memories yet.') : zh ? '当前范围还没有长期记忆。' : 'There are no long-term memories in this scope.'}</p>
+      ) : null}
       <div className="memory-record-list">
         {controller.snapshot.items.map((record) => {
           const status = memoryDisplayStatus(record, controller.snapshot.items);
@@ -220,13 +228,21 @@ export function MemorySettingsPane(props: {
               </header>
               <p>{record.content}</p>
               <dl>
+                {record.scope.kind === 'employee' ? (
+                  <div>
+                    <dt>{zh ? '适用条件' : 'Applies to'}</dt>
+                    <dd>
+                      {record.projectLimitId ? `仅项目 ${record.projectLimitId}` : '该员工的通用记忆'} · {record.kind === 'domain_knowledge' ? '与任务目标相关时加入' : '已确认且在复核日期内'}
+                    </dd>
+                  </div>
+                ) : null}
                 <div>
                   <dt>{zh ? '范围' : 'Scope'}</dt>
                   <dd>{record.scope.kind === 'global' ? (zh ? '全局' : 'Global') : record.scope.id}</dd>
                 </div>
                 <div>
                   <dt>{zh ? '类型' : 'Kind'}</dt>
-                  <dd>{memoryValueLabel(record.kind, zh)}</dd>
+                  <dd>{memoryValueLabel(record.kind, zh, record.scope.kind === 'employee')}</dd>
                 </div>
                 <div>
                   <dt>{zh ? '来源' : 'Source'}</dt>
@@ -288,11 +304,26 @@ const memoryValueLabels: Record<string, [string, string]> = {
   explicit: ['明确确认', 'Explicitly confirmed'],
 };
 
-function memoryValueLabel(value: string, zh: boolean): string {
+/** 员工分类使用岗位文案，不改变项目与全局记忆术语。 */
+function memoryValueLabel(value: string, zh: boolean, employeeScope = false): string {
+  if (zh && employeeScope) {
+    const employeeLabels: Record<string, string> = { stable_workflow: '工作方法', domain_knowledge: '岗位知识与纠错经验', preference: '岗位相关偏好' };
+    if (employeeLabels[value]) return employeeLabels[value];
+  }
   return memoryValueLabels[value]?.[zh ? 0 : 1] ?? value;
 }
 
-function MemoryEditor(props: { draft: MemoryDraft; mode: 'create' | 'supersede'; lockedKey: string | null; language: MemoryLanguage; busy: boolean; onChange: (draft: MemoryDraft) => void; onCancel: () => void; onSubmit: () => void }) {
+function MemoryEditor(props: {
+  employeeScope?: boolean;
+  draft: MemoryDraft;
+  mode: 'create' | 'supersede';
+  lockedKey: string | null;
+  language: MemoryLanguage;
+  busy: boolean;
+  onChange: (draft: MemoryDraft) => void;
+  onCancel: () => void;
+  onSubmit: () => void;
+}) {
   const zh = props.language === 'zh-CN';
   const patch = (next: Partial<MemoryDraft>): void => props.onChange({ ...props.draft, ...next });
   return (
@@ -308,7 +339,10 @@ function MemoryEditor(props: { draft: MemoryDraft; mode: 'create' | 'supersede';
           ariaLabel={zh ? '记忆类型' : 'Memory kind'}
           value={props.draft.candidateKind}
           onChange={(candidateKind) => patch({ candidateKind: candidateKind as MemoryKind })}
-          options={['preference', 'safety_boundary', 'stable_workflow', 'domain_knowledge'].map((value) => ({ value, label: memoryValueLabel(value, zh) }))}
+          options={(props.employeeScope ? ['stable_workflow', 'domain_knowledge', 'preference'] : ['preference', 'safety_boundary', 'stable_workflow', 'domain_knowledge']).map((value) => ({
+            value,
+            label: memoryValueLabel(value, zh, props.employeeScope),
+          }))}
         />
       </label>
       <label className="memory-editor-content">
@@ -322,7 +356,7 @@ function MemoryEditor(props: { draft: MemoryDraft; mode: 'create' | 'supersede';
           ariaLabel={zh ? '记忆影响' : 'Memory effect'}
           value={props.draft.effect}
           onChange={(effect) => patch({ effect: effect as MemoryEffect, externalStateConfirmed: false })}
-          options={['advisory', 'external_state'].map((value) => ({ value, label: memoryValueLabel(value, zh) }))}
+          options={['advisory', 'external_state'].map((value) => ({ value, label: memoryValueLabel(value, zh, props.employeeScope) }))}
         />
       </label>
       <label>

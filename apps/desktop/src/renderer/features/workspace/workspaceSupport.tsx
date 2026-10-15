@@ -1,8 +1,9 @@
-import { temporaryWorkspaceId } from '@zeus/shared';
+import { normalizeTaskDeadline, type TaskDeadline } from '@zeus/shared';
+import { normalizeInputSuggestionSettings, temporaryWorkspaceId } from '@zeus/shared';
 import { usePresenceOpen } from '../../ui/MotionPresence.js';
 import { retainInputFocus } from '../../ui/retainInputFocus.js';
 import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
-import { type ClipboardEvent as ReactClipboardEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import {
   defaultTaskBranchPrefix,
@@ -47,7 +48,7 @@ import {
   type AiRuntimeSessionStatus,
   type AppShellSettings,
   type DashboardClient,
-  type DashboardSnapshot,
+  type WorkspaceSnapshot,
   type DeleteTaskRequest,
   type ExecutionHostTransition,
   type GitDiffSummary,
@@ -77,6 +78,7 @@ import {
   type ZeusRealtimeEvent,
 } from '../../apiClient.js';
 
+/** 全局数字员工与数字团队均从首页独立进入。 */
 /** 全局数字员工与数字团队均从首页独立进入。 */
 export type MainNavTarget = 'projects' | 'conversations' | 'automations' | 'skills' | 'digital-employees' | 'digital-teams' | 'settings';
 export type LegacyMainNavTarget = MainNavTarget | 'dashboard' | 'tasks' | 'runtime' | 'git-diff' | 'telegram' | 'settings-data';
@@ -153,6 +155,8 @@ export type ControlBusyProps = { 'aria-busy'?: true; 'data-loading'?: 'true' };
 export type TaskCreateAttachment = TaskAttachmentView;
 export type TaskCreateAttachmentCandidate = TaskAttachmentCandidate;
 export type TaskCreateFormState = {
+  /** 独立的截止配置，不从父任务继承。 */
+  deadline?: TaskDeadline | null;
   /** 草稿提交目标，与当前浏览的项目独立。 */
   projectId: string;
   /** 复制草稿显示专用标题；保存仍走普通创建命令。 */
@@ -176,6 +180,8 @@ export type TaskCreateTextField = Extract<
 >;
 export type TaskCreateAttachmentField = Exclude<TaskCreateTextField, 'title'>;
 export type TaskCreateDraft = {
+  /** 独立的截止配置，不从父任务继承。 */
+  deadline?: TaskDeadline | null;
   parentTaskId: string | null;
   title: string;
   taskType: TaskType;
@@ -206,6 +212,8 @@ export type TrackedTaskModelPushState = TaskModelPushPendingState & { origin: Ta
 export type NativeConversationAppClient = SessionControllerClient &
   Pick<
     DashboardClient,
+    | 'loadHomeAttention'
+    | 'loadHomeRuntime'
     | 'loadConversationGitHistory'
     | 'loadProjectGitComparisonDiff'
     | 'memory'
@@ -441,15 +449,15 @@ export function createNativeProjectConversationChoiceLoadCoordinator(): NativePr
 }
 
 export type TaskRuntimeControlHandlerResult =
-  | DashboardSnapshot
+  | WorkspaceSnapshot
   | {
-      snapshot: DashboardSnapshot;
+      snapshot: WorkspaceSnapshot;
       task?: TaskRecord;
       conversation?: ConversationHistoryItem;
       runtimeError?: { message: string };
     };
 export type NormalizedTaskRuntimeControlHandlerResult = {
-  snapshot: DashboardSnapshot;
+  snapshot: WorkspaceSnapshot;
   task?: TaskRecord;
   conversation?: ConversationHistoryItem;
   runtimeError?: { message: string };
@@ -569,6 +577,7 @@ export const nativeConversationListLifecycleEventTypes = new Set([
   'conversation.thread.changed',
   'conversation.turn.started',
   'conversation.turn.completed',
+  'conversation.turn.retrying',
   'conversation.queue.changed',
   'conversation.request.created',
   'conversation.request.resolved',
@@ -603,6 +612,7 @@ export type AppShellSettingsSavePayload = Pick<
   | 'multiWindowEnabled'
   | 'backgroundModeEnabled'
   | 'desktopNotificationsEnabled'
+  | 'inputSuggestions'
   | 'openAtLoginEnabled'
   | 'autoUpdateChannel'
   | 'defaultProjectId'
@@ -621,7 +631,8 @@ export type AppShellSettingsSavePayload = Pick<
 > & { taskManagementStatusReplacements?: Record<string, Record<string, string>> };
 
 export const PROJECT_SIDEBAR_DEFAULT_WIDTH = 248;
-export const PROJECT_SIDEBAR_MIN_WIDTH = 200;
+/** 右侧操作共用一列后，最窄侧栏减少一个 26px 按钮槽位。 */
+export const PROJECT_SIDEBAR_MIN_WIDTH = 174;
 export const PROJECT_SIDEBAR_MAX_WIDTH = 420;
 export const PROJECT_SIDEBAR_MIN_WORKSPACE_WIDTH = 520;
 export const PROJECT_SIDEBAR_SEPARATOR_WIDTH = 1;
@@ -937,6 +948,7 @@ export function normalizeRendererAppShellSettings(settings: AppShellSettings): A
   const taskManagementStatusTemplate = normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig);
   return {
     ...settings,
+    inputSuggestions: normalizeInputSuggestionSettings(settings.inputSuggestions),
     mainLayout: settings.mainLayout === 'current' ? 'current' : 'upstream',
     taskBranchPrefix: normalizeTaskBranchPrefix(settings.taskBranchPrefix) ?? defaultTaskBranchPrefix,
     collapsedProjectIds: Array.isArray(settings.collapsedProjectIds) ? [...new Set(settings.collapsedProjectIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim())).map((id) => id.trim()))].slice(0, 100) : [],
@@ -966,6 +978,7 @@ export function toAppShellSettingsSavePayload(settings: AppShellSettings, taskMa
     multiWindowEnabled: settings.multiWindowEnabled,
     backgroundModeEnabled: settings.backgroundModeEnabled,
     desktopNotificationsEnabled: settings.desktopNotificationsEnabled,
+    inputSuggestions: settings.inputSuggestions,
     openAtLoginEnabled: settings.openAtLoginEnabled,
     autoUpdateChannel: settings.autoUpdateChannel,
     defaultProjectId: settings.defaultProjectId,
@@ -1153,6 +1166,7 @@ export function buildDefaultTaskDraft(appLanguage: AppLanguage): { title: string
   };
 }
 
+/** 新建默认使用通用任务，具体分类由用户按需切换。 */
 export function buildTaskCreateInitialForm(_appLanguage: AppLanguage): TaskCreateFormState {
   void _appLanguage;
   return {
@@ -1160,7 +1174,7 @@ export function buildTaskCreateInitialForm(_appLanguage: AppLanguage): TaskCreat
     copiedFromTaskId: null,
     title: '',
     parentTaskId: null,
-    taskType: '',
+    taskType: 'task',
     description: '',
     defectCurrentState: '',
     defectExpectedOutcome: '',
@@ -1168,15 +1182,25 @@ export function buildTaskCreateInitialForm(_appLanguage: AppLanguage): TaskCreat
     optimizationCurrentState: '',
     optimizationExpectedOutcome: '',
     priority: 'p3',
+    deadline: null,
     tags: '',
     attachments: [],
   };
 }
 
+/** 通用任务可直接保存正文或附件，缺少显式标题时使用内容首行或附件名称。 */
 export function normalizeTaskCreateDraft(form: TaskCreateFormState, titleRequiredMessage: string, typeRequiredMessage: string): { draft: TaskCreateDraft } | { error: string } {
-  const title = form.title.trim();
+  /** 自动标题只用于通用任务，保留其他分类已有的标题要求。 */
+  const title = form.title.trim() || (form.taskType === 'task' ? (form.description.trim().split(/\r?\n/u)[0] || form.attachments[0]?.name || '').slice(0, 120) : '');
   if (!title) return { error: titleRequiredMessage };
   if (!form.taskType) return { error: typeRequiredMessage };
+  /** 创建时拒绝无效日期，错误留在现有表单中展示。 */
+  let deadline: TaskDeadline | null;
+  try {
+    deadline = normalizeTaskDeadline(form.deadline);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : '截止时间无效。' };
+  }
   const seenTags = new Set<string>();
   const tags = form.tags
     .split(',')
@@ -1198,6 +1222,7 @@ export function normalizeTaskCreateDraft(form: TaskCreateFormState, titleRequire
       optimizationCurrentState: form.optimizationCurrentState.trim(),
       optimizationExpectedOutcome: form.optimizationExpectedOutcome.trim(),
       priority: form.priority,
+      deadline,
       tags,
       // 任务持久化只保存 Zeus 托管后的本机路径与元信息；data URL 预览只留在本次 UI 状态，避免把大图写入任务 JSON。
       attachments: form.attachments.map(toPersistedTaskAttachment),
@@ -1314,7 +1339,7 @@ export function inferInitialMainNavTarget(props: {
   initialArchivedProjects?: ProjectRecord[];
   initialArchivedTasks?: TaskRecord[];
   initialTaskTemplates?: TaskTemplateRecord[];
-  snapshot?: DashboardSnapshot;
+  snapshot?: WorkspaceSnapshot;
 }): MainNavTarget {
   if (props.initialMainNavTarget) return normalizeMainNavTarget(`#${props.initialMainNavTarget}`);
   if (typeof window !== 'undefined' && window.location.hash) return readCurrentMainNavTarget();
@@ -1357,9 +1382,10 @@ export function inferInitialProjectSection(props: {
   initialProjectConfig?: ProjectConfig;
   initialProjectDatabaseSecret?: ProjectDatabaseSecretSnapshot;
   initialArchivedProjects?: ProjectRecord[];
-  snapshot?: DashboardSnapshot;
+  snapshot?: WorkspaceSnapshot;
 }): ProjectWorkspaceSection {
   if (props.snapshot?.projects[0]?.id === temporaryWorkspaceId) return 'sessions';
+  if (typeof window !== 'undefined' && window.location.hash === '#project-git') return 'git';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-commands' || window.location.hash.startsWith('#project-code'))) return 'code';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-tasks' || window.location.hash === '#tasks')) return 'tasks';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-sessions' || window.location.hash === '#conversations')) return 'sessions';
@@ -1387,7 +1413,7 @@ export function syncRecordFromSnapshot<T extends { id: string }>(current: T | un
   return current ? (records.find((record) => record.id === current.id) ?? records[0]) : records[0];
 }
 
-export function selectCreatedProjectTask(snapshot: DashboardSnapshot, previousTaskIds: Set<string>, projectId: string): TaskRecord | undefined {
+export function selectCreatedProjectTask(snapshot: WorkspaceSnapshot, previousTaskIds: Set<string>, projectId: string): TaskRecord | undefined {
   return snapshot.tasks.find((task) => task.projectId === projectId && !previousTaskIds.has(task.id)) ?? snapshot.tasks.find((task) => task.projectId === projectId);
 }
 
@@ -1509,18 +1535,17 @@ export function TaskCreateModal(props: {
   onOpenAttachment?: (path: string) => Promise<{ opened: boolean; error?: string }>;
   onRemoveAttachment: (path: string) => void;
   onClose: () => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  /** 两种提交共用表单校验与保存，推送意图由实际提交按钮决定。 */
+  onSubmit: (event: FormEvent<HTMLFormElement>, pushAfterCreate: boolean) => void;
 }) {
   /** 视觉退出期间立即注销旧附件和外部资料回执。 */
   const interactionOpen = usePresenceOpen() && props.open;
   const pasteShortcutFallbackTokenRef = useRef(0);
-  const [resourceProcessingCount, setResourceProcessingCount] = useState(0);
   /** 资源读取失败和部分成功保持在当前表单内可见。 */
   const [resourceError, setResourceError] = useState<string | null>(null);
   /** 与会话输入共用预览生命周期，创建和复制均按字段归属显示。 */
   const previews = usePendingResourcePreviews(
     props.form.attachments.map((attachment) => ({ id: attachment.path, name: attachment.name, kind: attachment.kind })),
-    props.copy.taskCountPrefix === 'Tasks' ? 'en-US' : 'zh-CN',
     interactionOpen ? 'task-create' : false,
   );
 
@@ -1540,7 +1565,6 @@ export function TaskCreateModal(props: {
   const thirdPartyRequestRef = useRef<symbol | null>(null);
   const taskTypeOptions = useMemo(() => [{ value: '' as const, label: props.copy.taskCreateTypePlaceholder, disabled: true }, ...props.copy.taskCreateTypeOptions], [props.copy.taskCreateTypeOptions, props.copy.taskCreateTypePlaceholder]);
   useEffect(() => {
-    setResourceProcessingCount(0);
     setResourceError(null);
     if (interactionOpen) {
       setSettingsOpen(false);
@@ -1568,34 +1592,46 @@ export function TaskCreateModal(props: {
   /** 当前资源错误优先显示，保留上层字段校验结果。 */
   const visibleError = resourceError ?? props.error;
   const describedBy = thirdPartyOpen ? 'task-create-third-party-help' : visibleError ? 'task-create-error' : undefined;
-  const resourcesBusy = resourceProcessingCount > 0;
+  const resourcesBusy = previews.processing;
   /** 附件处理只阻止提交和切换任务结构，不禁用正在输入的文字框。 */
   const textInputDisabled = props.busy || thirdPartyParsing;
   const interactionBusy = textInputDisabled || resourcesBusy;
 
+  /** 标题接收的附件放入当前正文；可恢复长文本回到正文末尾。 */
+  function taskCreateResourceTarget(target: NonNullable<ReturnType<typeof resolveTaskCreatePasteField>>): TaskAttachmentRestoreTarget {
+    if (target.field !== 'title') return captureTaskAttachmentRestoreTarget(target.field, target.control);
+    /** 标题不保存资源路径，正文是附件及长文本的稳定归属。 */
+    const field = activeTaskCreateContentField(props.form.taskType);
+    return { field, start: props.form[field].length, end: props.form[field].length };
+  }
+
+  /** 表单键盘粘贴与原生剪贴板兜底使用相同入口。 */
   function handleTaskCreateModalKeyDown(event: ReactKeyboardEvent<HTMLFormElement>): void {
     handleTaskCreatePasteShortcutFallback(event);
   }
 
+  /** 原生文件复制未派发粘贴事件时，继续导入到当前草稿。 */
   function handleTaskCreatePasteShortcutFallback(event: ReactKeyboardEvent<HTMLFormElement>): void {
     const pasteTarget = resolveTaskCreatePasteField(event.target);
     if (!pasteTarget || textInputDisabled || typeof window === 'undefined') return;
     if (event.key.toLowerCase() !== 'v' || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
     const fallbackToken = pasteShortcutFallbackTokenRef.current + 1;
     pasteShortcutFallbackTokenRef.current = fallbackToken;
-    const restoreTarget = captureTaskAttachmentRestoreTarget(pasteTarget.field, pasteTarget.control);
+    const restoreTarget = taskCreateResourceTarget(pasteTarget);
+    /** 标题中的混合文字保留原选区，附件的正文恢复位置单独记录。 */
+    const textSelection = { start: pasteTarget.control.selectionStart ?? pasteTarget.control.value.length, end: pasteTarget.control.selectionEnd ?? pasteTarget.control.value.length };
     // Finder / Paste.app 复制本地图片文件时，Electron 有时不会给 textarea 派发 DOM paste 事件；
     // 这里不阻止默认粘贴，只在短暂等待后发现 paste 事件没有到达时，让 Main 读取统一的文件、目录、图片或长文本资源。
     window.setTimeout(() => {
       if (pasteShortcutFallbackTokenRef.current !== fallbackToken) return;
-      void runTaskResourceOperation(pasteTarget.field, async (pending) => {
+      void runTaskResourceOperation(restoreTarget.field, async (pending) => {
         const result = await props.onReadClipboardResources();
         if (!pending.current() || pasteShortcutFallbackTokenRef.current !== fallbackToken) return;
         if (result.resources.length > 0) {
           props.onAddAttachments(withTaskAttachmentRestoreTarget(result.resources, restoreTarget));
         }
         // 兜底路径同样可能只剩正文：附件之外的文字必须回到当前字段。
-        if (result.text) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text, restoreTarget);
+        if (result.text) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text, textSelection);
         if (pasteShortcutFallbackTokenRef.current === fallbackToken) {
           pasteShortcutFallbackTokenRef.current += 1;
         }
@@ -1614,13 +1650,11 @@ export function TaskCreateModal(props: {
     /** 临时资源只用于界面，不进入任务草稿附件。 */
     const pending = previews.begin(files, text, field);
     setResourceError(null);
-    setResourceProcessingCount((current) => current + 1);
     try {
       await operation(pending);
     } catch {
       if (pending.current()) setResourceError(props.copy.taskCreatePasteAttachmentFailed);
     } finally {
-      if (pending.current()) setResourceProcessingCount((current) => Math.max(0, current - 1));
       pending.finish();
       restoreFocus();
     }
@@ -1684,6 +1718,7 @@ export function TaskCreateModal(props: {
     setThirdPartyHint({ tone: 'error', text: props.copy.taskCreateThirdPartyOpenFailed, openUrl: url });
   }
 
+  /** 标题与正文均接受资源，混合粘贴中的普通文字留在原控件。 */
   async function handleTaskCreateClipboardPaste(event: ReactClipboardEvent<HTMLFormElement>): Promise<void> {
     // 标题栏直接粘贴第三方详情链接时，自动转入链接读取。
     if (!interactionBusy && event.target instanceof HTMLInputElement && event.target.id === 'task-create-title-input') {
@@ -1700,7 +1735,9 @@ export function TaskCreateModal(props: {
     if (!pasteTarget || textInputDisabled) return;
     pasteShortcutFallbackTokenRef.current += 1;
     /** 固定长文本恢复位置，保存期间继续输入不会改变原归属。 */
-    const restoreTarget = captureTaskAttachmentRestoreTarget(pasteTarget.field, pasteTarget.control);
+    const restoreTarget = taskCreateResourceTarget(pasteTarget);
+    /** 异步导入期间仍使用原文字选区，不混用附件的正文归属。 */
+    const textSelection = { start: pasteTarget.control.selectionStart ?? pasteTarget.control.value.length, end: pasteTarget.control.selectionEnd ?? pasteTarget.control.value.length };
     /** 已有浏览器载荷直接导入，普通文字直接走控件的原生粘贴。 */
     const plainText = safelyReadClipboardData(event.clipboardData, 'text/plain');
     /** 两种剪贴板视图只读取其中一种，避免同一图片被重复导入。 */
@@ -1710,7 +1747,7 @@ export function TaskCreateModal(props: {
     if (pastedFiles.length === 0 && plainText.length < PENDING_RESOURCE_LONG_TEXT_THRESHOLD && !readNative) return;
     event.preventDefault();
     await runTaskResourceOperation(
-      pasteTarget.field,
+      restoreTarget.field,
       async (pending) => {
         if (pastedFiles.length > 0) {
           /** 直接使用已有 File，避免先做一次系统读取或图片编码。 */
@@ -1721,8 +1758,8 @@ export function TaskCreateModal(props: {
             result.resources.map((resource) => ({ id: resource.path, name: resource.name, kind: resource.kind })),
             result.failedCount,
           );
-          props.onAddAttachments(withTaskAttachmentField(result.resources, pasteTarget.field));
-          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, clipboardTextAfterResources(plainText, result.resources), restoreTarget);
+          props.onAddAttachments(withTaskAttachmentField(result.resources, restoreTarget.field));
+          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, clipboardTextAfterResources(plainText, result.resources), textSelection);
           if (result.failedCount > 0) setResourceError(props.copy.taskCountPrefix === 'Tasks' ? `${result.failedCount} attachment(s) could not be read.` : `另有 ${result.failedCount} 项附件无法读取。`);
           return;
         }
@@ -1731,7 +1768,7 @@ export function TaskCreateModal(props: {
           const result = await props.onReadClipboardResources();
           if (!pending.current()) return;
           if (result.resources.length > 0) props.onAddAttachments(withTaskAttachmentRestoreTarget(result.resources, restoreTarget));
-          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text || (result.resources.length === 0 ? plainText : ''), restoreTarget);
+          insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, result.text || (result.resources.length === 0 ? plainText : ''), textSelection);
           return;
         }
         try {
@@ -1739,14 +1776,45 @@ export function TaskCreateModal(props: {
           const resources = await props.onMaterializeResources([{ name: 'Pasted text.txt', type: 'text/plain', text: plainText, kind: 'pasted_text' }]);
           if (!pending.current()) return;
           if (resources.length === 0) throw new Error('长文本附件未能保存。');
+          // 保存后继续使用输入时的摘要，避免卡片内容闪回通用名称。
+          pending.complete(resources.map((resource) => ({ id: resource.path, name: resource.name, kind: resource.kind })));
           props.onAddAttachments(withTaskAttachmentRestoreTarget(resources, restoreTarget));
         } catch (error) {
-          if (pending.current()) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, plainText, restoreTarget);
+          if (pending.current()) insertTaskCreatePlainTextPaste(pasteTarget.field, pasteTarget.control, plainText, textSelection);
           throw error;
         }
       },
       pastedFiles,
       plainText,
+    );
+  }
+
+  /** 文件拖入标题或正文后走宿主授权与托管存储，不把路径当作文字。 */
+  async function handleTaskCreateDrop(event: ReactDragEvent<HTMLFormElement>): Promise<void> {
+    /** 原生拖入提供的文件先于控件默认行为处理。 */
+    const files = dataTransferFiles(event.dataTransfer);
+    if (files.length === 0) return;
+    event.preventDefault();
+    /** 只有可输入字段接收资源，忙碌时不改变草稿。 */
+    const target = resolveTaskCreatePasteField(event.target);
+    if (!target || textInputDisabled) return;
+    /** 固定本次附件归属，切换分类不会移动已经导入的资源。 */
+    const restoreTarget = taskCreateResourceTarget(target);
+    await runTaskResourceOperation(
+      restoreTarget.field,
+      async (pending) => {
+        /** 实际文件路径和读取权限由宿主统一校验。 */
+        const result = await props.onAuthorizeFiles(files, 'drop');
+        if (!pending.current()) return;
+        if (result.resources.length === 0) throw new Error('没有可读取的附件。');
+        pending.complete(
+          result.resources.map((resource) => ({ id: resource.path, name: resource.name, kind: resource.kind })),
+          result.failedCount,
+        );
+        props.onAddAttachments(withTaskAttachmentField(result.resources, restoreTarget.field));
+        if (result.failedCount > 0) setResourceError(props.copy.taskCountPrefix === 'Tasks' ? `${result.failedCount} attachment(s) could not be read.` : `另有 ${result.failedCount} 项附件无法读取。`);
+      },
+      files,
     );
   }
 
@@ -1774,7 +1842,7 @@ export function TaskCreateModal(props: {
   }
 
   /** 异步回填使用粘贴时的选区，保留处理期间继续输入的正文。 */
-  function insertTaskCreatePlainTextPaste(field: TaskCreateTextField, control: HTMLInputElement | HTMLTextAreaElement, text: string, selection?: TaskAttachmentRestoreTarget): void {
+  function insertTaskCreatePlainTextPaste(field: TaskCreateTextField, control: HTMLInputElement | HTMLTextAreaElement, text: string, selection?: Pick<TaskAttachmentRestoreTarget, 'start' | 'end'>): void {
     if (!text) return;
     const selectionStart = Math.min(selection?.start ?? control.selectionStart ?? control.value.length, control.value.length);
     const selectionEnd = Math.min(selection?.end ?? control.selectionEnd ?? selectionStart, control.value.length);
@@ -1800,6 +1868,10 @@ export function TaskCreateModal(props: {
       <form
         className="task-create-modal zeus-solid-form-surface"
         onPaste={handleTaskCreateClipboardPaste}
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes('Files')) event.preventDefault();
+        }}
+        onDrop={handleTaskCreateDrop}
         onSubmit={(event) => {
           if (thirdPartyOpen) {
             event.preventDefault();
@@ -1810,7 +1882,9 @@ export function TaskCreateModal(props: {
             event.preventDefault();
             return;
           }
-          props.onSubmit(event);
+          /** 回车只创建，只有明确点击推送按钮才携带推送意图。 */
+          const submitter = (event.nativeEvent as SubmitEvent).submitter;
+          props.onSubmit(event, submitter instanceof HTMLButtonElement && submitter.value === 'create-and-push');
         }}
         onKeyDown={handleTaskCreateModalKeyDown}
         data-modal-surface="dialog"
@@ -1950,9 +2024,9 @@ export function TaskCreateModal(props: {
                   />
                 </div>
               </div>
-              {props.form.taskType === 'requirement' ? (
+              {props.form.taskType === 'task' || props.form.taskType === 'requirement' ? (
                 <div className="task-create-field task-create-description-field">
-                  <span id="task-create-description-label">{props.copy.taskCreateDescriptionLabel}</span>
+                  <span id="task-create-description-label">{props.form.taskType === 'task' ? props.copy.taskCreateTaskDescriptionLabel : props.copy.taskCreateDescriptionLabel}</span>
                   <TaskCreateFieldAttachments
                     field="description"
                     attachments={props.form.attachments}
@@ -1968,7 +2042,7 @@ export function TaskCreateModal(props: {
                     id="task-create-description-input"
                     className="task-create-description-input"
                     value={props.form.description}
-                    placeholder={props.copy.taskCreateDescriptionPlaceholder}
+                    placeholder={props.form.taskType === 'task' ? props.copy.taskCreateTaskDescriptionPlaceholder : props.copy.taskCreateDescriptionPlaceholder}
                     aria-labelledby="task-create-description-label"
                     onChange={(event) => props.onFormChange('description', event.currentTarget.value)}
                     disabled={textInputDisabled}
@@ -2167,8 +2241,11 @@ export function TaskCreateModal(props: {
               <Button variant="secondary" size="regular" className="task-create-settings-toggle" aria-expanded={settingsOpen} aria-controls="task-create-options" onClick={() => setSettingsOpen((open) => !open)} disabled={interactionBusy}>
                 {props.copy.taskCreateMoreSettings}
               </Button>
-              <Button type="submit" variant="primary" size="regular" className="task-create-submit-button" busy={props.busy} disabled={interactionBusy}>
+              <Button type="submit" variant="secondary" size="regular" className="task-create-submit-button" busy={props.busy} disabled={interactionBusy}>
                 {props.busy ? props.copy.taskCreateSubmitting : props.copy.taskCreateSubmit}
+              </Button>
+              <Button type="submit" name="task-create-action" value="create-and-push" variant="primary" size="regular" className="task-create-push-button" disabled={interactionBusy}>
+                {props.copy.taskCreateSubmitAndPush}
               </Button>
             </>
           )}
@@ -2387,7 +2464,7 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
               className="task-enum-order-drag-handle"
               draggable
               aria-label={props.language === 'zh-CN' ? `拖动 ${item.label}` : `Drag ${item.label}`}
-              title={props.language === 'zh-CN' ? '拖动调整顺序' : 'Drag to reorder'}
+              data-icon-tooltip={props.language === 'zh-CN' ? '拖动调整顺序' : 'Drag to reorder'}
               onDragStart={(event) => {
                 setDraggedValue(item.value);
                 event.dataTransfer.effectAllowed = 'move';
@@ -2400,10 +2477,22 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
             <span className="task-enum-order-rank">{index + 1}</span>
             <span className="task-enum-order-label">{item.label}</span>
             <span className="task-enum-order-actions">
-              <button type="button" aria-label={props.language === 'zh-CN' ? `上移 ${item.label}` : `Move ${item.label} up`} disabled={index === 0} onClick={() => moveItem(item.value, index - 1)}>
+              <button
+                data-icon-tooltip={props.language === 'zh-CN' ? `上移 ${item.label}` : `Move ${item.label} up`}
+                type="button"
+                aria-label={props.language === 'zh-CN' ? `上移 ${item.label}` : `Move ${item.label} up`}
+                disabled={index === 0}
+                onClick={() => moveItem(item.value, index - 1)}
+              >
                 ↑
               </button>
-              <button type="button" aria-label={props.language === 'zh-CN' ? `下移 ${item.label}` : `Move ${item.label} down`} disabled={index === props.items.length - 1} onClick={() => moveItem(item.value, index + 1)}>
+              <button
+                data-icon-tooltip={props.language === 'zh-CN' ? `下移 ${item.label}` : `Move ${item.label} down`}
+                type="button"
+                aria-label={props.language === 'zh-CN' ? `下移 ${item.label}` : `Move ${item.label} down`}
+                disabled={index === props.items.length - 1}
+                onClick={() => moveItem(item.value, index + 1)}
+              >
                 ↓
               </button>
             </span>
@@ -2422,9 +2511,12 @@ export function safelyReadClipboardData(clipboardData: DataTransfer, type: strin
   }
 }
 
-export function resolveTaskCreatePasteField(target: EventTarget): { field: TaskCreateAttachmentField; control: HTMLInputElement | HTMLTextAreaElement } | undefined {
+/** 标题也接收资源，资源字段归属由当前任务类型确定。 */
+export function resolveTaskCreatePasteField(target: EventTarget): { field: TaskCreateTextField; control: HTMLInputElement | HTMLTextAreaElement } | undefined {
   if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return undefined;
-  const fieldByControlId = new Map<TaskCreateAttachmentField, string>([
+  /** 统一映射所有允许输入文字和资源的表单控件。 */
+  const fieldByControlId = new Map<TaskCreateTextField, string>([
+    ['title', 'task-create-title-input'],
     ['description', 'task-create-description-input'],
     ['defectCurrentState', 'task-create-defect-current-state-input'],
     ['defectExpectedOutcome', 'task-create-defect-expected-outcome-input'],
@@ -2477,7 +2569,7 @@ export function activeTaskCreateContentField(taskType: TaskType | ''): Extract<T
   return 'description';
 }
 
-/** Codex macOS 风格纯色设置 pane：用标题、留白和控件边界分组，不再用灰度条带或横线切割内容。 */
+/** 设置分组使用浅边框圆角卡片，组内行分隔和内边距统一由设置样式提供。 */
 export function NativeSettingsPane(props: { label: string; children: ReactNode; className?: string }) {
   return (
     <section className={`native-settings-pane ${props.className ?? ''}`} aria-label={props.label}>

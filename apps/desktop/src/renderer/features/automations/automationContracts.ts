@@ -1,15 +1,12 @@
 import type { AutomationDispatchTarget, AutomationActionConfig, AutomationExecutionReference, AutomationSourceEvent } from '@zeus/shared';
-/** 自动化引用导航复用既有会话、任务详情和流程页面。 */
-export type AutomationExecutionTarget = 'conversation' | 'task' | 'workflow';
-/** 宿主和工具页面使用同一真实执行引用契约。 */
-export type { AutomationExecutionReference } from '@zeus/shared';
 
 export type AutomationStatus = 'active' | 'paused' | 'deleted';
 export type AutomationTriggerKind = 'manual' | 'once' | 'interval' | 'daily' | 'weekly' | 'rrule' | 'event';
 export type AutomationConversationMode = 'independent' | 'original';
 export type AutomationBlockStrategy = 'serial' | 'discard' | 'cover';
 export type AutomationPermissionMode = 'read-only' | 'auto' | 'full-access';
-export type AutomationRunStatus = 'queued' | 'dispatching' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'outcome_unknown';
+/** 待验收不代表成功，也不会挡住下一次独立员工工作。 */
+export type AutomationRunStatus = 'queued' | 'dispatching' | 'running' | 'awaiting_review' | 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'outcome_unknown';
 
 export interface AutomationTriggerConfig {
   /** 事件发生前的真实项目状态条件。 */

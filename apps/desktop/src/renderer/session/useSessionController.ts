@@ -1,9 +1,12 @@
+import type { ConversationSystemMessage, ConversationSystemMessageInput, ConversationSystemMessagePage } from '@zeus/shared';
+import type { ConversationProcessGroup } from '@zeus/shared';
+import { restoreSessionViewCache } from './sessionHotCache.js';
 import { attachV2ResourcesToSnapshot } from './conversationResourceProjection.js';
 import { asyncMessageQuestions, formatAsyncQuestionAnswer, validateCanonicalRequestUserInputAnswers, type AsyncQuestionAnswer, type AsyncQuestionResponse } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
 import type { ConversationTranscriptEnvelope, ConversationTranscriptPlacementBatch, ConversationNavigationSnapshot } from '@zeus/shared';
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
-import { serializeBrowserComments, type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
+import { mergeBrowserSubmissions, serializeBrowserComments, type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { createInitialSessionState, durableUserMessageIdentity, sessionReducer, sessionTranscriptEntryId } from './sessionReducer.js';
 import {
   type CodexConversationCapabilities,
@@ -51,7 +54,8 @@ import {
 import { adaptConversationSnapshotV2, mergeConversationHistoryV2, mergeConversationProcessV2, mergeConversationTurnHistoryV2, resumeCachedConversationSnapshot, updateConversationV2Paging } from './conversationSnapshotV2Adapter.js';
 import { markConversationNavigationRenderReady } from '../performanceTraceContext.js';
 
-export const reconnectBackoffMs = [250, 500, 1_000, 2_000, 5_000] as const;
+/** 会话事件流按指数退避重试五次，单次等待小于一分钟。 */
+export const reconnectBackoffMs = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
 /** 常规只读核对次数；已接收消息阻挡待发队列时继续后台核对，不重放旧消息。 */
 export const pendingSendReconcileAttempts = 5 as const;
 /** 首次后台核对前的等待时间。 */
@@ -249,7 +253,13 @@ function realtimeBufferBudgetError(kind: RealtimeBufferKind): Error {
 }
 
 export interface SessionControllerClient {
+  /** 独立生成建议或润色候选；只读客户端可省略此能力。 */
+  generateInputSuggestion?(input: import('@zeus/shared').InputSuggestionRequest, signal: AbortSignal, diagnosticId?: string): Promise<import('@zeus/shared').InputSuggestionResult>;
   /** 独立读取全历史目录，不参与事件消费。 */
+  /** 持久系统消息的独立命令与读取端口。 */
+  saveConversationSystemMessage?(projectId: string, conversationId: string, input: ConversationSystemMessageInput): Promise<ConversationSystemMessage>;
+  /** 有界读取更早系统消息。 */
+  loadConversationSystemMessages?(projectId: string, conversationId: string, cursor?: string): Promise<ConversationSystemMessagePage>;
   loadConversationNavigation?(projectId: string, conversationId: string): Promise<ConversationNavigationSnapshot>;
   loadCodexConversationCapabilities?(projectId: string): Promise<CodexConversationCapabilities>;
 
@@ -279,9 +289,13 @@ export interface SessionControllerClient {
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind']; afterEntryId?: string; beforeEntryId?: string },
   ): Promise<NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>>;
-  loadNativeConversationResourcesV2?(projectId: string, conversationId: string, options?: { cursor?: string; limit?: number; byteLimit?: number }): Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
+  loadNativeConversationResourcesV2?(
+    projectId: string,
+    conversationId: string,
+    options?: { cursor?: string; limit?: number; byteLimit?: number; signal?: AbortSignal },
+  ): Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
   loadNativeConversationChangeSetV2?(projectId: string, conversationId: string, turnId: string): Promise<NativeConversationChangeSetV2Summary>;
   loadNativeConversationChangeFilesV2?(
     projectId: string,
@@ -323,7 +337,8 @@ export interface SessionControllerClient {
   sendNativeMessage(projectId: string, conversationId: string, input: SendNativeMessageRequest): Promise<NativeOperationAcceptance>;
 
   forgetNativeMessageCommand?(projectId: string, conversationId: string, idempotencyKey: string): void;
-  editNativeQueuedSubmission(projectId: string, conversationId: string, submissionId: string, content: string): Promise<NativeQueueSnapshot>;
+  /** 附件列表参与命令摘要，省略时保留服务端原附件。 */
+  editNativeQueuedSubmission(projectId: string, conversationId: string, submissionId: string, content: string, attachments?: NativeConversationAttachment[]): Promise<NativeQueueSnapshot>;
   retryNativeQueuedSubmission(projectId: string, conversationId: string, submissionId: string): Promise<NativeQueueSnapshot>;
   rerouteNativeQueuedSubmission(projectId: string, conversationId: string, submissionId: string, settings: NativeNextTurnSettings): Promise<NativeQueueSnapshot>;
   deleteNativeQueuedSubmission(projectId: string, conversationId: string, submissionId: string): Promise<NativeQueueSnapshot>;
@@ -393,8 +408,10 @@ export interface SessionController {
   /** 回答绑定原问题，独立于 Composer 普通消息草稿。 */
   answerAsyncQuestion(item: NativeSessionItemBuffer, answers: AsyncQuestionAnswer['answers'], asNewMessage?: boolean, answerAttachments?: Record<string, NativeConversationAttachment[]>): Promise<NativeOperationAcceptance | void>;
   retryPendingSend(clientUserMessageId: string, intent: 'check' | 'continue'): Promise<NativeOperationAcceptance | void>;
+  /** 已失败轮次显式续跑，保留草稿与原轮次的发送事实。 */
+  retryFailedTurn(providerTurnId: string): Promise<NativeOperationAcceptance | void>;
   cancelPendingSend(clientUserMessageId: string): Promise<void>;
-  editQueuedSubmission(submissionId: string, content: string): Promise<NativeQueueSnapshot>;
+  editQueuedSubmission(submissionId: string, content: string, attachments?: NativeConversationAttachment[]): Promise<NativeQueueSnapshot>;
   retryQueuedSubmission(submissionId: string): Promise<NativeQueueSnapshot>;
   rerouteQueuedSubmission(submissionId: string, settings: NativeNextTurnSettings): Promise<NativeQueueSnapshot>;
   deleteQueuedSubmission(submissionId: string): Promise<NativeQueueSnapshot>;
@@ -424,11 +441,15 @@ export interface SessionController {
   setNextTurnSettings(settings: NativeNextTurnSettings): Promise<NativeNextTurnSettings>;
   loadEarlierHistory(): Promise<void>;
   /** 全历史目录由工作面按进入、重连和稳定消息变化刷新。 */
+  /** 系统消息回执归入当前会话，不触发 Provider。 */
+  saveSystemMessage(input: ConversationSystemMessageInput): Promise<ConversationSystemMessage>;
+  /** 系统消息历史独立补页。 */
+  loadEarlierSystemMessages(): Promise<void>;
   loadNavigation(): Promise<ConversationNavigationSnapshot>;
   /** 导航只补齐指定轮次模型正文，处理过程继续由展开入口读取。 */
   loadNavigationTurn(turnId: string): Promise<void>;
   /** 仅首次读取采用指定方向；已有详情始终沿原游标补齐。 */
-  loadTurnProcess(turnId: string, startAtBeginning?: boolean): Promise<void>;
+  loadTurnProcess(turnId: string, startAtBeginning?: boolean, group?: ConversationProcessGroup): Promise<void>;
   loadConversationResources(): Promise<void>;
   loadTurnArtifacts(turnId: string): Promise<void>;
   loadV2Content(handle: string): Promise<void>;
@@ -528,7 +549,7 @@ class SocketDisconnectedDuringHydrationError extends Error {
 
 export function createSessionController(options: CreateSessionControllerOptions): SessionController {
   const storage = options.storage ?? browserStorage();
-  const storageKey = `zeus.native-session-draft:${options.projectId}:${options.conversationId}`;
+  const storageKey = conversationDraftStorageKey(options.projectId, options.conversationId);
   const persisted = readPersistedDraft(storage, storageKey);
   let pendingSend = persisted.pendingSend ?? null;
   let deferredSends: PendingSendEnvelope[] = (persisted.deferredSends ?? []).map((envelope) => ({
@@ -721,6 +742,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let nextTurnSettingsWrite: Promise<NativeNextTurnSettings> | null = null;
   let nextTurnSettingsRevision = 0;
   const listeners = new Set<() => void>();
+  /** 资源请求属于当前会话控制器，退出或重连时终止旧网络读取。 */
+  const resourceRequests = new Set<AbortController>();
   const createId = options.createId ?? defaultCreateId;
   const realtimeBufferWatermarks = new Map<RealtimeBufferKind, { entries: number; bytes: number; entryBucket: number; byteBucket: number }>();
 
@@ -797,12 +820,15 @@ export function createSessionController(options: CreateSessionControllerOptions)
 
   /** 收集动作中实际出现的持久身份，包含等待接管时新到的条目。 */
   function actionTranscripts(action: Parameters<typeof sessionReducer>[1]): ConversationTranscriptEnvelope[] {
-    if (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged') return [...action.snapshot.items, ...action.snapshot.requests].flatMap((item) => (item.transcript ? [item.transcript] : []));
+    if (action.type === 'system_messages_loaded') return action.page.items.map((message) => message.transcript);
+    if (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged')
+      return [...action.snapshot.items, ...action.snapshot.requests, ...(action.snapshot.systemMessages?.items ?? [])].flatMap((item) => (item.transcript ? [item.transcript] : []));
     if (action.type === 'pending_requests_hydrated') return [...action.requests, ...(action.items ?? [])].flatMap((item) => (item.transcript ? [item.transcript] : []));
     if (action.type === 'event_received') {
       const payload = action.event.payload;
       const candidates = [
         payload,
+        ...('message' in payload && payload.message && typeof payload.message === 'object' ? [payload.message] : []),
         ...('request' in payload && payload.request ? [payload.request] : []),
         ...('execution' in payload ? [payload.execution] : []),
         ...('executions' in payload && Array.isArray(payload.executions) ? payload.executions : []),
@@ -832,6 +858,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           const entryId = sessionTranscriptEntryId(item);
           return entryId ? [entryId] : [];
         }),
+        ...Object.values(state.systemMessages ?? {}).map((message) => message.transcript.placement.entryId),
         ...state.pendingRequests.flatMap((request) => (request.transcript ? [request.transcript.placement.entryId] : [])),
       ]);
       for (const action of placementActions) for (const envelope of actionTranscripts(action)) ids.add(envelope.placement.entryId);
@@ -1788,7 +1815,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const epoch = ++reconnectLoopEpoch;
     const loop = (async () => {
       let attempt = 0;
-      while (!disposed && epoch === reconnectLoopEpoch && stateNeedsRealtime()) {
+      while (!disposed && epoch === reconnectLoopEpoch && stateNeedsRealtime() && attempt < reconnectBackoffMs.length) {
         dispatch({ type: 'transport_changed', transportState: 'reconnecting', reconnectAttempt: attempt + 1 });
         const delayMs = reconnectDelayMs(attempt + 1);
         if (!(await waitForReconnectDelay(delayMs, epoch))) return;
@@ -1796,10 +1823,17 @@ export function createSessionController(options: CreateSessionControllerOptions)
           await hydrate(true, 'required');
           if (!disposed && epoch === reconnectLoopEpoch && state.transportState === 'ready') return;
         } catch {
-          // Keep retrying with capped exponential backoff until a connection succeeds,
-          // a manual reconnect replaces this loop, or the controller is disposed.
+          // 只继续剩余预算；手动重连或销毁会话会取消当前恢复链。
         }
         attempt += 1;
+      }
+      if (!disposed && epoch === reconnectLoopEpoch && attempt === reconnectBackoffMs.length) {
+        dispatch({
+          type: 'transport_changed',
+          transportState: 'failed',
+          reconnectAttempt: attempt,
+          error: { code: 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', message: '连接重试五次均失败。请检查网络后重试。', retryable: true, recoveryRequired: false },
+        });
       }
     })();
     reconnectLoopPromise = loop;
@@ -2388,6 +2422,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
         contextDraft: envelope.contextDraft,
         browserComments: envelope.browserSubmission?.comments ?? [],
         delivery: envelope.delivery,
+        preserveComposer: Boolean(envelope.composerConsumed),
         ...(envelope.questionAnswer ? { questionAnswer: envelope.questionAnswer, preserveComposer: true } : {}),
         previousConversationState: state.conversationState,
         startedAt: envelope.startedAt ?? new Date().toISOString(),
@@ -2511,7 +2546,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const request = (async () => {
       /** 目录和正文独立读取，不把目录进度写回实时同步水位。 */
       const result = await options.client.loadConversationNavigation!(options.projectId, options.conversationId);
-      if (disposed || generation !== connectionToken) throw new Error('会话连接已变化，请重新读取目录。');
+      if (disposed) throw new DOMException('目录读取已取消。', 'AbortError');
+      // 连接换代属于内部读取失效，直接读取当前目录，不要求用户处理。
+      if (generation !== connectionToken) return loadNavigation();
       for (const entry of result.entries) {
         /** 多次发言属于同一真实轮次，别名复用同一份轻量身份。 */
         const identity = { id: entry.turnId, providerTurnId: entry.providerTurnId, status: entry.status };
@@ -2865,29 +2902,25 @@ export function createSessionController(options: CreateSessionControllerOptions)
     }
   }
 
-  /** 同时补齐本轮正文和过程；首次选择方向后始终沿已有连续范围补页。 */
-  async function loadTurnProcessV2(turnIdentity: string, startAtBeginning = false): Promise<void> {
+  /** 展开只补齐操作详情，不借过程补读改变主消息列表和当前状态。 */
+  async function loadTurnProcessV2(turnIdentity: string, startAtBeginning = false, group?: ConversationProcessGroup): Promise<void> {
     const loadProcess = options.client.loadNativeConversationProcessV2;
-    const loadHistory = options.client.loadNativeConversationTurnModelHistoryV2;
     const generation = connectionToken;
     /** 完整目录为深历史提供准确身份，导航与展开不能按别名各自读取。 */
     const turn = await loadTurnReadIdentity(turnIdentity, generation);
     const current = state.snapshot;
-    if ((!loadProcess && !loadHistory) || !current?.snapshotV2 || !current.v2Paging) return;
+    if (!loadProcess || !current?.snapshotV2 || !current.v2Paging) return;
     // Snapshot V2 的固定首屏只携带最近闭合轮次；更早模型历史仍保留本地 turn id，
     // 服务端过程入口同时接受本地和 Provider 身份，因此旧轮次可以直接按历史身份读取。
     const localTurnId = turn.id;
-    const pagingKey = turnReadPagingKey(current, turn);
-    const currentProcessPage = turnReadPaging(current, turn, 'processByTurn');
-    const currentHistoryPage = turnReadPaging(current, turn, 'historyByTurn');
+    const pagingKey = group?.id ?? turnReadPagingKey(current, turn);
+    const currentProcessPage = group ? current.v2Paging.processByTurn[group.id] : turnReadPaging(current, turn, 'processByTurn');
     /** 失败和中断需要优先看到末尾错误上下文；只有正常完成态切换为从头阅读。 */
     const preferredDirection = startAtBeginning || turn?.status === 'completed' ? 'forward' : 'tail';
     /** 已存在的连续范围沿原方向续读；首次完成态直接从最早一页开始。 */
-    const direction = currentProcessPage?.direction ?? currentHistoryPage?.direction ?? preferredDirection;
+    const direction = currentProcessPage?.direction ?? preferredDirection;
     if (currentProcessPage?.loading) return;
-    const shouldLoadProcess = Boolean(loadProcess && !(currentProcessPage?.loaded && !currentProcessPage.hasMore));
-    const shouldLoadHistory = Boolean(loadHistory && !(currentHistoryPage?.loaded && !currentHistoryPage.hasMore));
-    if (!shouldLoadProcess && !shouldLoadHistory) return;
+    if (currentProcessPage?.loaded && !currentProcessPage.hasMore) return;
     /** 每次真正发起读取都换代，丢弃已失效的旧请求结果。 */
     const loadRevision = (turnDetailLoadRevisions.get(pagingKey) ?? 0) + 1;
     turnDetailLoadRevisions.set(pagingKey, loadRevision);
@@ -2896,70 +2929,82 @@ export function createSessionController(options: CreateSessionControllerOptions)
         ...paging,
         processByTurn: {
           ...paging.processByTurn,
-          ...(shouldLoadProcess
-            ? {
-                [pagingKey]: {
-                  direction,
-                  nextCursor: currentProcessPage?.nextCursor ?? null,
-                  hasMore: currentProcessPage?.hasMore ?? true,
-                  loading: true,
-                  loaded: currentProcessPage?.loaded ?? false,
-                  error: null,
-                },
-              }
-            : {}),
+          [pagingKey]: {
+            direction,
+            nextCursor: currentProcessPage?.nextCursor ?? null,
+            hasMore: currentProcessPage?.hasMore ?? true,
+            loading: true,
+            loaded: currentProcessPage?.loaded ?? false,
+            error: null,
+          },
         },
       })),
     );
-    const processResult = shouldLoadProcess
-      ? loadProcess!(options.projectId, options.conversationId, localTurnId, {
-          ...(currentProcessPage?.nextCursor ? { cursor: currentProcessPage.nextCursor } : {}),
-          // 首次读取与后续页使用同一小批量预算，避免长轮次一次挂载大量内容。
+    /** 完成轮次一次交付所选分组的完整预览，活动、失败及中断轮次继续逐页读取。 */
+    const completeBeforeDisplay = turn.status === 'completed' || startAtBeginning;
+    /** 有界预览先留在本次读取中，不逐页改写用户看到的操作数量。 */
+    const processPages: NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>[] = [];
+    /** 游标沿同一冻结范围推进，重复或缺失游标不能触发无限读取。 */
+    const seenCursors = new Set<string | null>();
+    /** 已读页面继续复用，只补齐尚未取得的范围。 */
+    let cursor = currentProcessPage?.nextCursor ?? null;
+    /** 失败保留原先的完整画面和已读游标，不展示本次尚未齐全的数量。 */
+    let processError: unknown = null;
+    try {
+      do {
+        if (seenCursors.has(cursor)) throw new Error('处理过程分页没有推进，请重新读取。');
+        seenCursors.add(cursor);
+        /** 每次请求仍只读取短预览，完整工具输出由展开单项时的独立入口负责。 */
+        const page = await loadProcess(options.projectId, options.conversationId, localTurnId, {
+          ...(group ? { afterEntryId: group.afterEntryId, ...(group.beforeEntryId ? { beforeEntryId: group.beforeEntryId } : {}) } : {}),
+          ...(cursor ? { cursor } : {}),
           direction,
           limit: 48,
           byteLimit: 96 * 1024,
-        }).then(
-          (page) => ({ page, error: null as unknown }),
-          (error: unknown) => ({ page: null, error }),
-        )
-      : Promise.resolve({ page: null, error: null as unknown });
-    const historyResult = shouldLoadHistory
-      ? loadTurnHistoryPageV2(turn, direction).then(
-          () => ({ error: null as unknown }),
-          (error: unknown) => ({ error }),
-        )
-      : Promise.resolve({ error: null as unknown });
-    const [settledProcess, settledHistory] = await Promise.all([processResult, historyResult]);
+        });
+        if (disposed || generation !== connectionToken || turnDetailLoadRevisions.get(pagingKey) !== loadRevision) return;
+        processPages.push(page);
+        if (!completeBeforeDisplay || !page.hasMore) break;
+        if (!page.nextCursor) throw new Error('处理过程分页缺少后续位置，请重新读取。');
+        cursor = page.nextCursor;
+      } while (completeBeforeDisplay);
+    } catch (error: unknown) {
+      processError = error;
+    }
+
     if (disposed || generation !== connectionToken || turnDetailLoadRevisions.get(pagingKey) !== loadRevision) return;
     const latest = state.snapshot;
     if (!latest?.snapshotV2 || !latest.v2Paging) return;
     let next = latest;
-    // 正文由共享入口实际接管后，再用更完整的过程投影补充同一 Provider item。
-    if (settledProcess.page) next = mergeConversationProcessV2(next, pagingKey, settledProcess.page);
-    if (settledProcess.error) {
+    /** 同一次读取只提交一个最终投影，期间到达的实时消息及资源保留在最新快照中。 */
+    try {
+      if (!processError) for (const page of processPages) next = mergeConversationProcessV2(next, pagingKey, page);
+    } catch (error: unknown) {
+      /** 页面身份无效时整批放弃，错误状态也必须结束读取提示。 */
+      next = latest;
+      processError = error;
+    }
+    if (processError) {
       next = updateConversationV2Paging(next, (paging) => ({
         ...paging,
-        processByTurn: settledProcess.error
-          ? {
-              ...paging.processByTurn,
-              [pagingKey]: {
-                direction,
-                nextCursor: currentProcessPage?.nextCursor ?? null,
-                hasMore: currentProcessPage?.hasMore ?? true,
-                loading: false,
-                loaded: currentProcessPage?.loaded ?? false,
-                error: errorMessage(settledProcess.error),
-              },
-            }
-          : paging.processByTurn,
+        processByTurn: {
+          ...paging.processByTurn,
+          [pagingKey]: {
+            direction,
+            nextCursor: currentProcessPage?.nextCursor ?? null,
+            hasMore: currentProcessPage?.hasMore ?? true,
+            loading: false,
+            loaded: currentProcessPage?.loaded ?? false,
+            error: errorMessage(processError),
+          },
+        },
       }));
     }
     await commitV2Snapshot(canonicalizeTurnReadPaging(next, turn), generation);
-    if (settledProcess.error) throw settledProcess.error;
-    if (settledHistory.error) throw settledHistory.error;
+    if (processError) throw processError;
   }
 
-  async function loadTurnArtifactsV2(turnIdentity: string): Promise<void> {
+  async function loadTurnArtifactsV2(turnIdentity: string, refreshResources = false): Promise<void> {
     const current = state.snapshot;
     if (!current?.snapshotV2 || !current.v2Paging) return;
     const generation = connectionToken;
@@ -2972,13 +3017,13 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const resources = current.v2Paging.resources;
     if (currentChange?.loading) return;
     const v2Turn = turn ? [...current.snapshotV2.recentClosedTurns, ...(current.snapshotV2.activeTurn ? [current.snapshotV2.activeTurn] : [])].find((candidate) => candidate.id === turn.id) : undefined;
-    const shouldLoadResources = Boolean(!resources.loading && options.client.loadNativeConversationResourcesV2 && (!resources.loaded || resources.hasMore));
+    const shouldLoadResources = Boolean(!resources.loading && options.client.loadNativeConversationResourcesV2 && (refreshResources || !resources.loaded || resources.hasMore));
     // 摘要只说明有变更，不能被当作已经加载全文；点击审阅时也允许按实时轮次重试。
     const knownChangeSet = state.changeSetsByProviderId[pagingKey];
     const shouldLoadChange = Boolean((v2Turn?.changeSetAvailable || knownChangeSet) && options.client.loadTurnChangeSet && (!knownChangeSet || knownChangeSet.contentProjection === 'summary'));
     if (!shouldLoadResources && !shouldLoadChange) {
       if (resources.loading) return;
-      const merged = await attachV2ResourcesToSnapshot(current, resources.items);
+      const merged = await attachV2ResourcesToSnapshot(current, resources.items, Object.values(state.items));
       if (!disposed && generation === connectionToken && merged !== current) dispatchV2Snapshot(merged);
       return;
     }
@@ -3009,18 +3054,23 @@ export function createSessionController(options: CreateSessionControllerOptions)
     if (shouldLoadResources) {
       loads.push(
         (async () => {
+          const request = new AbortController();
+          resourceRequests.add(request);
           try {
             let items = resources.items;
-            let cursor = resources.nextCursor;
-            let hasMore = !resources.loaded || resources.hasMore;
+            /** 资源页读完之后仍可能新增图片，明确补读必须从首页核对。 */
+            let cursor = refreshResources ? null : resources.nextCursor;
+            let hasMore = refreshResources || !resources.loaded || resources.hasMore;
             const seenCursors = new Set<string>();
             while (hasMore) {
               if (cursor && seenCursors.has(cursor)) throw new Error('会话资源分页游标没有推进。');
               if (cursor) seenCursors.add(cursor);
+              if (disposed || generation !== connectionToken) return;
               const page = await options.client.loadNativeConversationResourcesV2!(options.projectId, options.conversationId, {
                 ...(cursor ? { cursor } : {}),
                 limit: 32,
                 byteLimit: 64 * 1024,
+                signal: request.signal,
               });
               if (page.conversationId !== options.conversationId || page.schemaVersion !== 2 || page.structureGeneration !== current.snapshotV2!.structureGeneration || page.kind !== 'resources')
                 throw new Error('会话资源分页响应的身份或结构代次无效。');
@@ -3032,13 +3082,13 @@ export function createSessionController(options: CreateSessionControllerOptions)
             }
             let latest = state.snapshot;
             if (!latest?.snapshotV2 || !latest.v2Paging) return;
-            let merged = await attachV2ResourcesToSnapshot(latest, items);
+            let merged = await attachV2ResourcesToSnapshot(latest, items, Object.values(state.items));
             if (disposed || generation !== connectionToken) return;
-            // 资源挂接会计算 Provider item 身份；期间变更集可能已先写回，须基于最新快照重放一次。
+            // 等待资源挂接期间变更集可能已先写回，须基于最新快照重放一次。
             if (state.snapshot !== latest) {
               latest = state.snapshot;
               if (!latest?.snapshotV2 || !latest.v2Paging) return;
-              merged = await attachV2ResourcesToSnapshot(latest, items);
+              merged = await attachV2ResourcesToSnapshot(latest, items, Object.values(state.items));
               if (disposed || generation !== connectionToken) return;
             }
             dispatchV2Snapshot(
@@ -3048,6 +3098,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
               })),
             );
           } catch (error) {
+            if (disposed || generation !== connectionToken || request.signal.aborted) return;
             const latest = state.snapshot;
             if (latest?.v2Paging) {
               dispatchV2Snapshot(
@@ -3058,6 +3109,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
               );
             }
             throw error;
+          } finally {
+            resourceRequests.delete(request);
           }
         })(),
       );
@@ -3120,7 +3173,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
   async function loadConversationResourcesV2(): Promise<void> {
     // 资源页属于整个会话。传入不存在的轮次身份可复用同一套分页、并发保护和
     // 资源挂接逻辑，同时不会触发任何轮次 change set 读取。
-    await loadTurnArtifactsV2('__conversation_resources__');
+    await loadTurnArtifactsV2('__conversation_resources__', true);
   }
 
   const controller: SessionController = {
@@ -3128,6 +3181,19 @@ export function createSessionController(options: CreateSessionControllerOptions)
       if (state.transportState === 'ready') return Promise.resolve();
       if (!startPromise) {
         cancelReconnectLoop();
+        // 与真实读取并行；任何权威内容或本地消息先到达，都禁止缓存再占位。
+        if (!state.snapshot && state.itemOrder.length === 0 && typeof window !== 'undefined') {
+          void window.zeus
+            ?.loadSessionViewCache?.({ projectId: options.projectId, conversationId: options.conversationId })
+            .then((value) => {
+              if (disposed || state.snapshot || state.itemOrder.length > 0 || state.transportState === 'ready') return;
+              const cached = restoreSessionViewCache(value, options);
+              if (!cached?.snapshot) return;
+              state = { ...state, snapshot: cached.snapshot, items: cached.items, itemOrder: cached.itemOrder, transcriptRevision: state.transcriptRevision + 1 };
+              for (const listener of listeners) listener();
+            })
+            .catch(() => undefined);
+        }
         const attempt = hydrate(false);
         const tracked = attempt.finally(() => {
           if (startPromise === tracked) startPromise = null;
@@ -3137,6 +3203,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       return startPromise;
     },
     reconnect() {
+      for (const request of resourceRequests) request.abort();
       cancelReconnectLoop();
       dispatch({ type: 'transport_changed', transportState: 'reconnecting', reconnectAttempt: 1 });
       return hydrate(true, state.snapshot ? 'required' : 'auto');
@@ -3144,6 +3211,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     dispose() {
       if (disposed) return;
       disposed = true;
+      for (const request of resourceRequests) request.abort();
       finishPendingSendReconcileWait?.();
       for (const context of transcriptHydrations) context.controller.abort(new DOMException('会话已关闭。', 'AbortError'));
       placementActions.length = 0;
@@ -3236,11 +3304,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
     stageBrowserComments(prepared) {
       /** 已进入待发送或已发送消息的评论无需重复加入草稿。 */
       if (browserSubmissionUsesReservedComments(prepared)) return;
-      /** 同一评论重复确认只保留最新内容，跨网页评论继续累加。 */
-      const comments = dedupeById([...(state.browserSubmission?.comments ?? []), ...structuredClone(prepared.comments)]);
-      /** 截图按文件身份去重，不污染用户主动上传的附件。 */
-      const attachments = [...new Map([...(state.browserSubmission?.attachments ?? []), ...prepared.attachments].map((attachment) => [attachment.localPath, attachment])).values()];
-      dispatch({ type: 'browser_submission_changed', browserSubmission: { tabId: prepared.tabId, comments, commentIds: comments.map((comment) => comment.id), content: serializeBrowserComments(comments), attachments } });
+      dispatch({ type: 'browser_submission_changed', browserSubmission: mergeBrowserSubmissions(state.browserSubmission, structuredClone(prepared)) });
       persistDraft();
     },
     setContextDraft(contextDraft) {
@@ -3475,11 +3539,41 @@ export function createSessionController(options: CreateSessionControllerOptions)
       return sendOrDeferEnvelope(envelope);
     },
     retryPendingSend,
-    cancelPendingSend,
-    editQueuedSubmission(submissionId, content) {
+    /** 用户点击重试后，沿用已有耐久发送链路继续最新失败请求。 */
+    async retryFailedTurn(providerTurnId) {
+      /** 先取得权威终态；旧失败卡片不能在其他轮次运行时重新派发。 */
+      await applyAuthoritativeSnapshot(await loadConversationForHydration());
+      /** 只续跑最新的明确失败，不自动重放未知送达或已完成的请求。 */
+      const turn = state.snapshot?.turns.toSorted((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)).at(-1);
+      if (turn?.providerTurnId !== providerTurnId || turn.status !== 'failed' || turn.error?.category !== 'network') throw new Error('该轮次已改变，请检查当前会话后重试。');
+      if (activeOperation || deferredSends.length || state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)) || (pendingSend && pendingSend.deliveryState !== 'accepted'))
+        throw new Error('请先处理尚未确认的消息。');
+      /** 同一失败轮次的重复点击和重启复用发送身份。 */
+      const identity = `connection-retry:${providerTurnId}`;
+      // 恢复是系统动作，不创建本地用户气泡，也不消耗正在编辑的草稿。
       return runOperation(
-        `queue:edit:${submissionId}:${JSON.stringify(content)}`,
-        () => options.client.editNativeQueuedSubmission(options.projectId, options.conversationId, submissionId, content),
+        identity,
+        () =>
+          options.client.sendNativeMessage(options.projectId, options.conversationId, {
+            retryOfTurnId: providerTurnId,
+            content: '',
+            attachments: [],
+            delivery: 'queue',
+            collaborationMode: 'default',
+            idempotencyKey: identity,
+            clientUserMessageId: identity,
+          }),
+        async (acceptance) => {
+          if (acceptance.queue) await applyAuthoritativeQueue(acceptance.queue);
+          await applyAuthoritativeSnapshot(await loadConversationForHydration());
+        },
+      );
+    },
+    cancelPendingSend,
+    editQueuedSubmission(submissionId, content, attachments) {
+      return runOperation(
+        `queue:edit:${submissionId}:${JSON.stringify({ content, attachments })}`,
+        () => options.client.editNativeQueuedSubmission(options.projectId, options.conversationId, submissionId, content, attachments),
         (queue) => applyAuthoritativeQueue(queue, submissionId),
       );
     },
@@ -3635,6 +3729,22 @@ export function createSessionController(options: CreateSessionControllerOptions)
       });
     },
     loadEarlierHistory: loadEarlierHistoryV2,
+    async saveSystemMessage(input) {
+      if (!options.client.saveConversationSystemMessage) throw new Error('系统消息存储暂不可用。');
+      /** 回执和后续实时事件按相同消息身份合并。 */
+      const message = await options.client.saveConversationSystemMessage(options.projectId, options.conversationId, input);
+      if (message.conversationId !== options.conversationId) throw new Error('系统消息回执会话不一致。');
+      if (!disposed) dispatch({ type: 'system_messages_loaded', page: { conversationId: options.conversationId, items: [message], nextCursor: null } });
+      return message;
+    },
+    async loadEarlierSystemMessages() {
+      /** 以调用时已确认的游标读取，不用页号推算。 */
+      const cursor = state.systemMessagesCursor;
+      if (!cursor || !options.client.loadConversationSystemMessages) return;
+      /** 分页失败交回原读取入口，不递归创建系统消息。 */
+      const page = await options.client.loadConversationSystemMessages(options.projectId, options.conversationId, cursor);
+      if (!disposed && page.conversationId === options.conversationId && state.systemMessagesCursor === cursor) dispatch({ type: 'system_messages_loaded', page, history: true });
+    },
     loadNavigation,
     loadNavigationTurn,
     loadTurnProcess: loadTurnProcessV2,
@@ -3704,8 +3814,9 @@ export function useSessionControllerInstance(options: CreateSessionControllerOpt
   }, [controller, options.enabled]);
   useEffect(() => {
     if (options.enabled === false) return;
+    // 浏览器订阅属于可选宿主能力；桥接对象存在时也可能没有此接口。
     // 控制器持有最新草稿，连续确认无需等待 React 重绘，也不关闭浏览器。
-    return window.zeus?.onBrowserEvent((event) => {
+    return window.zeus?.onBrowserEvent?.((event) => {
       if ((event.type !== 'comments_saved' && event.type !== 'comments_removed') || event.conversationId !== options.conversationId) return;
       if (event.type === 'comments_saved') controller.stageBrowserComments(event.prepared);
       else controller.removeBrowserComments(event.commentIds);
@@ -3744,6 +3855,25 @@ function errorMessage(error: unknown): string {
   return error instanceof Error && error.message.trim() ? error.message : '按需读取失败。';
 }
 
+/** 输入框与后台建议共用草稿身份，不能另建一份草稿键规则。 */
+function conversationDraftStorageKey(projectId: string, conversationId: string): string {
+  return `zeus.native-session-draft:${projectId}:${conversationId}`;
+}
+
+/** 未打开的会话也按同一份草稿、附件和待发送记录判断是否允许自动建议。 */
+export function conversationDraftAllowsInputSuggestion(projectId: string, conversationId: string): boolean {
+  /** 无法读取草稿时不猜测为空，避免覆盖用户已有输入的意图。 */
+  const storage = browserStorage();
+  if (!storage) return false;
+  /** 后台自动生成不能把读取失败后的空草稿当作真实用户输入。 */
+  let readFailed = false;
+  /** 复用正式草稿读取与归一化逻辑，不复制存储格式。 */
+  const draft = readPersistedDraft(storage, conversationDraftStorageKey(projectId, conversationId), () => {
+    readFailed = true;
+  });
+  return !readFailed && !draft.draft.length && draft.attachments.length === 0 && !draft.browserSubmission && !hasConversationContext(draft.contextDraft ?? emptyConversationContextDraft) && !draft.pendingSend && !draft.deferredSends?.length;
+}
+
 function browserStorage(): SessionDraftStorage | undefined {
   try {
     return typeof window === 'undefined' ? undefined : window.localStorage;
@@ -3752,7 +3882,8 @@ function browserStorage(): SessionDraftStorage | undefined {
   }
 }
 
-function readPersistedDraft(storage: SessionDraftStorage | undefined, key: string): PersistedDraft {
+/** 输入框可显示安全空值，后台调用方同时接收读取失败，避免误启动模型。 */
+function readPersistedDraft(storage: SessionDraftStorage | undefined, key: string, onReadError?: () => void): PersistedDraft {
   const empty: PersistedDraft = { draft: '', attachments: [], contextDraft: structuredClone(emptyConversationContextDraft) };
   if (!storage) return empty;
   try {
@@ -3779,6 +3910,7 @@ function readPersistedDraft(storage: SessionDraftStorage | undefined, key: strin
       ...(pendingBrowserCommentMarks.length > 0 ? { pendingBrowserCommentMarks } : {}),
     };
   } catch {
+    onReadError?.();
     return empty;
   }
 }

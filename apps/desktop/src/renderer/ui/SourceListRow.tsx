@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, ComponentPropsWithRef, ReactNode } from 'react';
 
 export type SourceListRowButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> & {
   [attribute: `data-${string}`]: string | undefined;
@@ -14,6 +14,8 @@ interface SourceListRowCommonProps {
   actions?: ReactNode;
   expanded?: boolean;
   className?: string;
+  /** 整行共用右键与键盘入口，包含展开和操作图标区域。 */
+  rowProps?: ComponentPropsWithRef<'div'>;
   buttonProps: SourceListRowButtonProps;
 }
 
@@ -30,12 +32,14 @@ export type SourceListRowProps = SourceListRowCommonProps &
   );
 
 export function SourceListRow(props: SourceListRowProps) {
-  const { className: buttonClassName, ...buttonProps } = props.buttonProps;
+  /** 调用方保留 title 接口，实际按钮只保留一个应用提示入口。 */
+  const { className: buttonClassName, title, ...buttonProps } = props.buttonProps;
   const className = ['zeus-source-list-row', props.className].filter(Boolean).join(' ');
   const mainClassName = ['zeus-source-list-row-main', buttonClassName].filter(Boolean).join(' ');
 
   return (
     <div
+      {...props.rowProps}
       className={className}
       data-zeus-primitive="source-list-row"
       data-source-list-level={props.level}
@@ -45,7 +49,7 @@ export function SourceListRow(props: SourceListRowProps) {
       data-disclosure-placement={props.disclosure ? (props.disclosurePlacement ?? 'leading') : undefined}
     >
       {props.disclosure && props.disclosurePlacement !== 'trailing' ? <div className="zeus-source-list-row-disclosure">{props.disclosure}</div> : null}
-      <button {...buttonProps} className={mainClassName} aria-expanded={props.disclosure ? undefined : props.expanded}>
+      <button {...buttonProps} data-icon-tooltip={buttonProps['data-icon-tooltip'] || title} className={mainClassName} aria-expanded={props.disclosure ? undefined : props.expanded}>
         <span className="zeus-source-list-row-icon" aria-hidden="true">
           {props.icon}
         </span>

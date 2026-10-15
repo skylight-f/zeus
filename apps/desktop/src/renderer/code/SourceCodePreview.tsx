@@ -1,3 +1,4 @@
+import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { memo, useEffect, useMemo, useRef, type RefObject } from 'react';
 import { Compartment, EditorState } from '@codemirror/state';
 import { defaultKeymap } from '@codemirror/commands';
@@ -10,6 +11,20 @@ import { GitBlameToolbar, type SourceBlameLabels } from './GitBlameToolbar.js';
 import { loadSourceLanguage } from './sourceLanguageRegistry.js';
 import { useGitBlame } from './useGitBlame.js';
 import './blameGutter.css';
+
+const sourceSearchPhrases = {
+  Find: '查找',
+  Replace: '替换',
+  next: '下一处',
+  previous: '上一处',
+  all: '全部',
+  'match case': '区分大小写',
+  regexp: '正则表达式',
+  'by word': '全字匹配',
+  close: '关闭',
+  'current match': '当前匹配',
+  'on line': '所在行',
+};
 
 /** 评论继续由 React 管理，代码视图只负责把容器放在对应行之后。 */
 interface SourceLineWidget {
@@ -29,6 +44,8 @@ interface SourceCodePreviewProps {
   conversationId?: string;
   resourceId?: string;
   blameLabels?: SourceBlameLabels;
+  locale?: string;
+  searchRequest?: number;
   location?: ConversationFileLocation;
   widgets: SourceLineWidget[];
   /** 新打开的评论容器，完成代码区布局后再聚焦。 */
@@ -90,7 +107,9 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
           EditorState.readOnly.of(true),
           EditorView.editable.of(false),
           EditorView.contentAttributes.of({ tabindex: '0', 'aria-label': propsRef.current.label, 'aria-readonly': 'true' }),
-          keymap.of(defaultKeymap),
+          search({ top: true }),
+          EditorState.phrases.of(propsRef.current.locale === 'zh-CN' ? sourceSearchPhrases : {}),
+          keymap.of([...searchKeymap, ...defaultKeymap]),
           syntaxHighlighting(classHighlighter),
           languageSlot.of([]),
           widgetSlot.of([]),
@@ -112,6 +131,11 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
       view.destroy();
     };
   }, [props.content, props.path, props.label, commentsEnabled, blameSlot, languageSlot, widgetSlot]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view && props.searchRequest) openSearchPanel(view);
+  }, [props.searchRequest, props.content, props.path, props.label, commentsEnabled]);
 
   useEffect(() => {
     /** 先显示纯文本；加载高亮期间仍可滚动、选择和输入会话内容。 */
@@ -245,7 +269,7 @@ function selectedLineDecorations(view: EditorView, location?: ConversationFileLo
   const decorations = [];
   // 编辑器已经计算好可视范围，无须扫描全文。
   for (const range of view.visibleRanges) {
-    for (let position = range.from; position <= range.to; ) {
+    for (let position = range.from; position <= range.to;) {
       /** 根据文档偏移读取当前行。 */
       const line = view.state.doc.lineAt(position);
       /** 高亮原始请求范围内的可视行。 */

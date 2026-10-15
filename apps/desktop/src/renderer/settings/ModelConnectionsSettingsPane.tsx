@@ -645,6 +645,7 @@ export function ModelConnectionsSettingsPane(props: {
                   }}
                 />
                 <Button
+                  data-icon-tooltip={apiKeyVisible ? (zh ? '隐藏 API Key' : 'Hide API key') : zh ? '查看 API Key' : 'Show API key'}
                   size="compact"
                   aria-label={apiKeyVisible ? (zh ? '隐藏 API Key' : 'Hide API key') : zh ? '查看 API Key' : 'Show API key'}
                   aria-pressed={apiKeyVisible}
@@ -1237,13 +1238,15 @@ function ModelCapabilityFacts(props: { language: 'zh-CN' | 'en-US'; model: Model
       <div>
         <dt>{zh ? '推理档位' : 'Reasoning levels'}</dt>
         <dd>
-          {capability.reasoning.options.length === 0
-            ? zh
-              ? '未识别：跟随模型默认，不发送任何档位字段'
-              : 'Unidentified: follow the model default and send no thinking field'
-            : capability.reasoning.options.map((option) => option.label || option.id).join(' / ')}
-          {' · '}
-          {reasoningBasisLabel(capability.reasoning.basis, zh)}
+          <span className="model-reasoning-summary">
+            {capability.reasoning.options.length === 0
+              ? zh
+                ? '未识别：跟随模型默认，不发送任何档位字段'
+                : 'Unidentified: follow the model default and send no thinking field'
+              : capability.reasoning.options.map((option) => option.label || option.id).join(' / ')}
+            {' · '}
+            {reasoningBasisLabel(capability.reasoning.basis, zh)}
+          </span>
         </dd>
       </div>
       {props.reasoning?.connectionId ? <ModelReasoningSection language={props.language} model={props.model} context={props.reasoning} /> : null}
@@ -1353,13 +1356,13 @@ function ModelDefinitionEditor(props: {
         </span>
         <button type="button" className="model-definition-identity" onClick={props.onToggle} aria-expanded={props.expanded} aria-controls={detailsId}>
           <span>
-            <strong title={model.displayName || model.id}>{model.displayName || model.id}</strong>
+            <strong data-icon-tooltip={model.displayName || model.id}>{model.displayName || model.id}</strong>
             <small>{model.displayName && model.displayName !== model.id ? `${model.id} · ${modelRouteLabel(model, zh)}` : modelRouteLabel(model, zh)}</small>
           </span>
           <CaretDownIcon className="model-definition-chevron" aria-hidden="true" />
         </button>
         {props.readOnly ? null : (
-          <button className="model-definition-remove" type="button" onClick={props.onRemove} aria-label={zh ? `移除模型 ${model.id}` : `Remove model ${model.id}`} title={zh ? '移除模型' : 'Remove model'}>
+          <button className="model-definition-remove" type="button" onClick={props.onRemove} aria-label={zh ? `移除模型 ${model.id}` : `Remove model ${model.id}`} data-icon-tooltip={zh ? '移除模型' : 'Remove model'}>
             <X aria-hidden="true" weight="bold" />
           </button>
         )}

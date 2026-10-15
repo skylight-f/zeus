@@ -380,7 +380,7 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
             <Icon aria-hidden="true" />
             <span>{props.kind === 'command' ? copy.runCommand : fileRead ? copy.readFiles : copy.editFiles}</span>
           </span>
-          <span className="session-compact-approval-mode" title={`${copy.mode}: ${mode}`}>
+          <span className="session-compact-approval-mode" data-icon-tooltip={`${copy.mode}: ${mode}`}>
             {mode}
           </span>
         </header>
@@ -421,7 +421,16 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
                 </button>
               ) : null}
               {hasAllowOnce && menuDecisions.length > 1 ? (
-                <button ref={menuTriggerRef} type="button" className="session-request-grant-chevron" aria-label={copy.grantOptions} aria-expanded={menuOpen} aria-haspopup="menu" onClick={() => (menuOpen ? setMenuOpen(false) : openMenu())}>
+                <button
+                  data-icon-tooltip={copy.grantOptions}
+                  ref={menuTriggerRef}
+                  type="button"
+                  className="session-request-grant-chevron"
+                  aria-label={copy.grantOptions}
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  onClick={() => (menuOpen ? setMenuOpen(false) : openMenu())}
+                >
                   <CaretDown aria-hidden="true" size={13} weight="bold" />
                 </button>
               ) : null}
@@ -495,6 +504,8 @@ function CompactApprovalPanel(props: CompactApprovalPanelProps) {
   );
 }
 
+/** 标题旁的说明使用原生浮层，鼠标、键盘和点击均可查看，不触发授权。 */
+
 function FileApprovalTargetList(props: { paths: readonly string[]; moreLabel: (count: number) => string }) {
   const visiblePaths = props.paths.slice(0, 4);
   const remainingCount = props.paths.length - visiblePaths.length;
@@ -505,7 +516,7 @@ function FileApprovalTargetList(props: { paths: readonly string[]; moreLabel: (c
           const parts = approvalPathParts(path);
           return (
             <li key={path}>
-              <code title={path}>
+              <code data-icon-tooltip={path}>
                 <span className="session-file-approval-directory">{parts.directory}</span>
                 <span className="session-file-approval-name">{parts.name}</span>
               </code>
@@ -966,6 +977,7 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
             {currentQuestion.allowOther ? (
               <div className="session-question-other" data-selected={selectedValues.includes(otherAnswerControlValue(currentQuestion)) || undefined}>
                 <button
+                  data-icon-tooltip={zh ? '其他回答' : 'Other answer'}
                   ref={(element) => {
                     optionRefs.current[currentQuestion.options.length] = element;
                   }}
@@ -1011,6 +1023,16 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                     onDragLeave={inputResources.handleDragLeave}
                     onDrop={inputResources.handleDrop}
                   >
+                    {/* 附件先于正文，视觉顺序与键盘阅读顺序保持一致。 */}
+                    <ConversationComposerAttachments
+                      attachments={currentAttachments}
+                      pendingResources={inputResources.pendingResources}
+                      language={props.language}
+                      disabled={responding || inputResources.processing}
+                      className="session-question-answer-attachments"
+                      onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
+                      onRestorePastedText={inputResources.restorePastedText}
+                    />
                     <textarea
                       ref={(element) => {
                         otherAnswerRef.current = element;
@@ -1039,19 +1061,17 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                         handleAnswerInputKeyDown(event);
                       }}
                     />
-                    <ConversationComposerAttachments
-                      attachments={currentAttachments}
-                      pendingResources={inputResources.pendingResources}
-                      language={props.language}
-                      disabled={responding || inputResources.processing}
-                      className="session-question-answer-attachments"
-                      onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
-                      onRestorePastedText={inputResources.restorePastedText}
-                    />
                   </div>
                 )}
                 {answerAttachmentsEnabled && props.onChooseAttachments ? (
-                  <button type="button" className="session-question-attachment-button" aria-label={zh ? '添加附件' : 'Add attachment'} disabled={inputResources.processing} onClick={() => void chooseAnswerAttachments()}>
+                  <button
+                    data-icon-tooltip={zh ? '添加附件' : 'Add attachment'}
+                    type="button"
+                    className="session-question-attachment-button"
+                    aria-label={zh ? '添加附件' : 'Add attachment'}
+                    disabled={inputResources.processing}
+                    onClick={() => void chooseAnswerAttachments()}
+                  >
                     <Paperclip aria-hidden="true" />
                   </button>
                 ) : null}
@@ -1088,6 +1108,16 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                   onDragLeave={inputResources.handleDragLeave}
                   onDrop={inputResources.handleDrop}
                 >
+                  {/* 自由回答也将附件置于输入行上方。 */}
+                  <ConversationComposerAttachments
+                    attachments={currentAttachments}
+                    pendingResources={inputResources.pendingResources}
+                    language={props.language}
+                    disabled={responding || inputResources.processing}
+                    className="session-question-answer-attachments"
+                    onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
+                    onRestorePastedText={inputResources.restorePastedText}
+                  />
                   <textarea
                     ref={(element) => {
                       freeformRef.current = element;
@@ -1110,17 +1140,15 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                       handleAnswerInputKeyDown(event);
                     }}
                   />
-                  <ConversationComposerAttachments
-                    attachments={currentAttachments}
-                    pendingResources={inputResources.pendingResources}
-                    language={props.language}
-                    disabled={responding || inputResources.processing}
-                    className="session-question-answer-attachments"
-                    onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
-                    onRestorePastedText={inputResources.restorePastedText}
-                  />
                   {answerAttachmentsEnabled && props.onChooseAttachments ? (
-                    <button type="button" className="session-question-attachment-button" aria-label={zh ? '添加附件' : 'Add attachment'} disabled={inputResources.processing} onClick={() => void chooseAnswerAttachments()}>
+                    <button
+                      data-icon-tooltip={zh ? '添加附件' : 'Add attachment'}
+                      type="button"
+                      className="session-question-attachment-button"
+                      aria-label={zh ? '添加附件' : 'Add attachment'}
+                      disabled={inputResources.processing}
+                      onClick={() => void chooseAnswerAttachments()}
+                    >
                       <Paperclip aria-hidden="true" />
                     </button>
                   ) : null}

@@ -61,6 +61,8 @@ export interface StructuredComposerInputProps {
   autoFocus?: boolean;
   ariaLabel: string;
   placeholder: string;
+  /** 空输入框的灰字提示，与结构化标签和发送正文分开。 */
+  suggestion?: string | null;
   ariaKeyShortcuts?: string;
   loadCatalog?: (projectId?: string, forceReload?: boolean) => Promise<SkillCatalog>;
   loadEmployees?: (projectId: string) => Promise<DigitalEmployeeRecord[]>;
@@ -278,9 +280,10 @@ export function StructuredComposerInput(props: StructuredComposerInputProps) {
   }
 
   /** 正文与引用同步更新，输入法组词期间保持菜单关闭。 */
-  function updateValue(nextValue: string, caret: number): void {
+  function updateValue(nextValue: string, caret: number, restoredTokens?: StructuredToken[]): void {
     if (props.disabled) return;
-    const nextTokens = reconcileTokens(props.value, nextValue, tokens);
+    /** 润色及其原生撤销效果保留引用；普通输入继续沿用既有位置规则。 */
+    const nextTokens = restoredTokens ?? reconcileTokens(props.value, nextValue, tokens);
     setTokens(nextTokens);
     props.onSelectionChange(selectionFromTokens(nextValue, nextTokens));
     props.onValueChange(nextValue);
@@ -365,6 +368,7 @@ export function StructuredComposerInput(props: StructuredComposerInputProps) {
         ariaLabel={props.ariaLabel}
         ariaKeyShortcuts={props.ariaKeyShortcuts}
         placeholder={props.placeholder}
+        suggestion={props.suggestion}
         language={props.language}
         listboxId={trigger ? listboxId : undefined}
         activeDescendant={activeDescendant}

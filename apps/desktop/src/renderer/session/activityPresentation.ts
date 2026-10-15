@@ -1,10 +1,10 @@
 import type { NativeSessionItemBuffer } from './sessionTypes.js';
 
 /** 展示只读取真实调用与结果，不改变执行状态或历史身份。 */
-type ActivityItem = Pick<NativeSessionItemBuffer, 'payload' | 'status'>;
+type ActivityItem = Pick<NativeSessionItemBuffer, 'payload' | 'status'> & Partial<Pick<NativeSessionItemBuffer, 'type'>>;
 
 /** 已结束的工具也可能等待用户操作，不能统一写成成功。 */
-export type ActivityOutcome = 'running' | 'completed' | 'failed' | 'cancelled' | 'waiting' | 'observe' | 'unknown';
+export type ActivityOutcome = 'running' | 'completed' | 'failed' | 'cancelled' | 'terminated' | 'no_matches' | 'waiting' | 'observe' | 'unknown';
 
 /** 两种 Provider 使用同一原生工具注册表，仅名称分隔方式不同。 */
 export function nativeActivityTool(payload: Record<string, unknown>): { kind: 'browser' | 'computer'; method: string } | null {
@@ -45,18 +45,91 @@ function activityResult(payload: Record<string, unknown>): Record<string, unknow
   return result;
 }
 
-/** 失败、取消与未确认结果优先于调用完成；不从自然语言推断成功。 */
+/** 失败、取消、终止与未确认结果优先于调用完成；不从自然语言推断成功。 */
 export function activityOutcome(item: ActivityItem): ActivityOutcome {
   /** 字符串状态来自记录与原生返回，普通页面内容不能改变执行状态。 */
   const status = String(item.payload.status ?? item.status).toLowerCase();
   /** 仅原生工具的协议结果允许提供动作确认状态。 */
-  const result = nativeActivityTool(item.payload) ? activityResult(item.payload) : {};
-  if (item.status === 'failed' || status === 'failed' || item.payload.success === false || item.payload.isError === true || (typeof item.payload.exitCode === 'number' && item.payload.exitCode !== 0)) return 'failed';
+  const native = nativeActivityTool(item.payload);
+  /** 页面正文中的 status 字段不能冒充原生验证结果。 */
+  const result = native ? activityResult(item.payload) : {};
+  /** 明确的取消状态优先于取消时产生的非零退出码。 */
   if (['cancelled', 'canceled', 'interrupted'].includes(item.status) || ['cancelled', 'canceled', 'interrupted'].includes(status)) return 'cancelled';
+  /** 只解释命令的标准 SIGINT/SIGTERM 退出码，不推断正常清理或运行成功。 */
+  const commandType = item.type?.toLowerCase();
+  /** 只有命令可以使用进程退出语义，其他工具仍按真实调用结果展示。 */
+  const command = commandType === 'commandexecution' || commandType === 'command';
+  if (command && (item.payload.exitCode === 130 || item.payload.exitCode === 143)) return 'terminated';
+  if (
+    command &&
+    record(item.payload.presentation).terminationReason === 'turn_interrupted' &&
+    item.payload.exitCode == null &&
+    (item.payload.status === 'inProgress' || item.payload.status === undefined) &&
+    item.payload.success !== false &&
+    item.payload.isError !== true &&
+    item.payload.error == null
+  )
+    return 'terminated';
+  if (command && noMatchSearch(item.payload)) return 'no_matches';
+  if (item.status === 'failed' || status === 'failed' || item.payload.success === false || item.payload.isError === true || (typeof item.payload.exitCode === 'number' && item.payload.exitCode !== 0)) return 'failed';
   if (result.outcome === 'unknown' || record(result.action).outcome === 'unknown' || ['timed_out', 'observation_failed'].includes(String(record(result.confirmation).status)) || status === 'unknown') return 'unknown';
+  if (native?.kind === 'computer') {
+    /** 原生暂停表示用户正在操作，结束调用不能覆盖这一控制状态。 */
+    if (record(result.zeus_control).paused === true) return 'waiting';
+    /** SDK 验证必须明确满足并达到稳定条件，缺失或未知结果都不能宣布成功。 */
+    if (native.method === 'verify_state') {
+      if (item.status !== 'completed') return 'running';
+      if (result.status === 'unsatisfied') return 'failed';
+      return result.status === 'satisfied' && result.stable === true ? 'completed' : 'unknown';
+    }
+    /** 动作送达和动作生效分开判断；部分生效或不可确认时需要新的观察。 */
+    const effect = record(result.action).effect ?? result.effect;
+    if (effect === 'refused') return 'failed';
+    if (['partial', 'unverifiable', 'suspected_noop'].includes(String(effect))) return 'observe';
+    if (effect !== undefined && effect !== 'confirmed') return 'unknown';
+  }
   // CUA 结果被截断且未读到结构化状态时不能宣称操作完成。
-  if (item.status === 'completed' && nativeActivityTool(item.payload)?.kind === 'computer' && item.payload.v2ContentTruncated === true && Object.keys(result).length === 0) return 'unknown';
+  if (item.status === 'completed' && native?.kind === 'computer' && item.payload.v2ContentTruncated === true && Object.keys(result).length === 0) return 'unknown';
   return item.status === 'completed' ? 'completed' : 'running';
+}
+
+/** 只将已结束、完整输出为空的单次 rg 退出 1 解释为无匹配，保留原始退出码和失败记录。 */
+function noMatchSearch(payload: Record<string, unknown>): boolean {
+  if (payload.exitCode !== 1 || payload.error != null || payload.v2ContentTruncated === true || !singleRgCommand(payload.command)) return false;
+  /** Pi 受管 bash 返回完整结构化进程结果，不能把 JSON 元信息当成命令输出。 */
+  const managed = payload.toolName === 'bash' ? record(payload.output) : {};
+  if (typeof managed.processId === 'string' && typeof managed.output === 'string') return managed.exitCode === 1 && managed.hasMore === false && managed.output.trim() === '';
+  /** Codex 的终态空输出允许显式为 null；字段缺失仍不能当作已确认的空输出。 */
+  const output = [payload.aggregatedOutput, payload.output, payload.stdout, payload.stderr];
+  return (payload.aggregatedOutput === null || output.some((value) => typeof value === 'string')) && output.every((value) => value == null || (typeof value === 'string' && value.trim() === ''));
+}
+
+/** 确认命令只有一个 rg；组合命令、重定向和变量展开都不能套用搜索退出语义。 */
+function singleRgCommand(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    if (!value.every((argument) => typeof argument === 'string')) return false;
+    if (/(?:^|\/)rg$/u.test(value[0] ?? '')) return value.length > 1;
+    return value.length === 3 && /(?:^|\/)(?:sh|bash|zsh)$/u.test(value[0] ?? '') && /^-l?c$/u.test(value[1] ?? '') && singleRgCommand(value[2]);
+  }
+  if (typeof value !== 'string' || /[\r\n]/u.test(value)) return false;
+  /** ponytail: 只解码字面参数与引号拼接；展开、管道和重定向继续保留原状态。 */
+  const command = value.trim();
+  /** 同一参数可以由多段引号组成；粘连的 shell 操作符不能被跳过。 */
+  const wordPattern = /(?:[^\s'"\\;&|<>`$(){}*?[\]#!~]+|'[^']*'|"(?:[^"\\$`]|\\["\\])*")+/uy;
+  /** 解码后复用结构化参数的命令身份与 shell 层数判断。 */
+  const words: string[] = [];
+  /** 逐段完整消费原命令，不能从组合命令中只挑出 rg。 */
+  let offset = 0;
+  while (offset < command.length) {
+    wordPattern.lastIndex = offset;
+    /** 匹配失败或后接操作符时，保留真实失败状态。 */
+    const word = wordPattern.exec(command);
+    if (!word || (wordPattern.lastIndex < command.length && !/[ \t]/u.test(command[wordPattern.lastIndex]!))) return false;
+    words.push(word[0].replace(/'([^']*)'|"((?:[^"\\$`]|\\["\\])*)"/gu, (_match, single: string | undefined, double: string) => single ?? double.replace(/\\(["\\])/gu, '$1')));
+    offset = wordPattern.lastIndex;
+    while (offset < command.length && /[ \t]/u.test(command[offset]!)) offset += 1;
+  }
+  return singleRgCommand(words);
 }
 
 /** 动作名只描述工具实际能力，输入内容和内部选择器不进入摘要。 */
@@ -103,6 +176,8 @@ export function activityOutcomeLabel(outcome: ActivityOutcome, zh: boolean): str
     completed: ['已完成', 'Completed'],
     failed: ['失败', 'Failed'],
     cancelled: ['已取消', 'Cancelled'],
+    terminated: ['已终止', 'Terminated'],
+    no_matches: ['未找到匹配', 'No matches'],
     waiting: ['等待用户操作结束', 'Waiting for user'],
     observe: ['需重新观察', 'Observation required'],
     unknown: ['结果待确认', 'Result unconfirmed'],

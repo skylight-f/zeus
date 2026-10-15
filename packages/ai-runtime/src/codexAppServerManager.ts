@@ -1648,6 +1648,8 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
             dynamicTools: input.dynamicTools,
             // 原生线程及其子任务也不能隐式取得整个系统临时目录的写权限。
             config: {
+              // 内置供应商禁止覆盖；只关闭无限重连，其余沿用 Codex 原生连接参数。
+              'features.unbounded_connection_retries': false,
               ...contextCapacityConfig(input.contextCapacityTokens),
               ...(await readMcpThreadConfig(capabilities.generationId, input.cwd)),
               'sandbox_workspace_write.exclude_tmpdir_env_var': true,
@@ -1709,6 +1711,8 @@ export function createCodexAppServerManager(options: CreateCodexAppServerManager
             excludeTurns: true,
             cwd: input.cwd,
             config: {
+              // 恢复线程同样不重定义内置供应商，保留有限重连。
+              'features.unbounded_connection_retries': false,
               ...contextCapacityConfig(input.contextCapacityTokens),
               ...(await readMcpThreadConfig(capabilities.generationId, input.cwd)),
               // 恢复与新建遵守同一权限和子代理上限，不能恢复旧默认值。

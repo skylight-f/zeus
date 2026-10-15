@@ -4304,3 +4304,50 @@ body:has(.macos-ai-app.zeus-shell) {
     position: static;
   }
 }
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.macos-ai-app.zeus-shell [role='tab'][aria-selected='true']:where(:not(.zeus-workspace-tab)) {
+  color: var(--agentdesk-accent-strong);
+}
+.macos-ai-app.zeus-shell .git-separator-history-columns {
+  grid-row: 1;
+  grid-column: 2;
+}
+.macos-ai-app.zeus-shell .ai-workspace.classic-project-workspace {
+  --project-frame-gap: 12px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 4px !important;
+  padding: var(--project-frame-gap) !important;
+  min-inline-size: 0;
+  min-block-size: 0;
+  overflow: hidden;
+  background: var(--zeus-page-background) !important;
+}
+.macos-ai-app.zeus-shell.main-layout-upstream .ai-workspace.classic-project-workspace > .workspace-view {
+  border: 1px solid var(--zeus-card-border) !important;
+}
+.macos-ai-app.zeus-shell .ai-workspace.classic-project-workspace > .workspace-view {
+  box-sizing: border-box;
+  flex: 1 1 0 !important;
+  block-size: auto !important;
+  height: auto !important;
+  inline-size: 100%;
+  min-block-size: 0;
+  min-inline-size: 0;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden;
+  border: 0 !important;
+  border-radius: 12px !important;
+  background: var(--zeus-card-background) !important;
+  box-shadow: none !important;
+}
+.macos-ai-app.zeus-shell.main-layout-upstream .ai-workspace.classic-project-workspace > :is(.workspace-view-project-sessions, .workspace-view-project-tasks, .workspace-view-project-git, .workspace-view-project-code) {
+  background: var(--zeus-page-background) !important;
+  background-image: none !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}

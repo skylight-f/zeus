@@ -1,5 +1,8 @@
 import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
 
+import { systemMessageScope, recordSystemMessage, recoverSystemMessageOperation, bindDraftSystemMessages, useConversationSystemMessages } from './conversationSystemMessages.js';
+import { SystemMessageNotice } from './ConversationTranscript.js';
+import type { ConversationProcessGroup } from '@zeus/shared';
 import { ActivitySkillCatalogContext } from './SessionActivity.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
@@ -14,6 +17,7 @@ import { TerminalIcon as Terminal } from '@phosphor-icons/react/dist/csr/Termina
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import {
   isConversationSourcePreviewable,
+  mergeBrowserSubmissions,
   type FilePreviewRequest,
   type ConversationContextDraft,
   type ConversationFileLocation,
@@ -26,7 +30,7 @@ import type { DashboardClient, ProjectGitAction, ProjectGitActionResponse, Proje
 import { openConversationResourceInMain, openTurnChangeFileInMain } from '../appShellBridge.js';
 import { codexCapabilitiesChangedEvent } from '../features/codex/codexApiClient.js';
 import { ZeusSelect } from '../ZeusSelect.js';
-import { canSteerActiveTurn, type ComposerRuntimeSettings, ConversationComposer, type ConversationComposerProps, resolveComposerKeyIntent } from './ConversationComposer.js';
+import { canSteerActiveTurn, type ComposerRuntimeSettings, ConversationComposer, BrowserSubmissionAttachment, type ConversationComposerProps, resolveComposerKeyIntent } from './ConversationComposer.js';
 import { ConversationTranscript, type ConversationTranscriptProps, hasUnclaimedRecoveredRequestUserInput, type SessionCreationStatus } from './ConversationTranscript.js';
 import { QueuedConversationMessages, type QueuedConversationMessagesProps } from './QueuedConversationMessages.js';
 import { SessionPlanProgress } from './SessionActivity.js';
@@ -85,7 +89,10 @@ import { ConversationMarkdown } from './ConversationMarkdown.js';
 import { autosizeTextarea } from './textareaAutosize.js';
 import type { ComposerInputHandle } from './MarkdownComposerEditor.js';
 import { conversationAttachmentIdentity, ConversationComposerAttachments } from './ConversationComposerAttachments.js';
+import { useInputSuggestion } from './useInputSuggestion.js';
+import { InputSuggestionButton } from './InputSuggestionControl.js';
 import { ContextUsageIndicator } from './ContextUsageIndicator.js';
+import { IconTooltip } from '../ui/IconTooltip.js';
 import { ServiceTierToggle } from './ServiceTierToggle.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 import { SessionQuickActionsCard } from './SessionQuickActionsCard.js';
@@ -97,7 +104,7 @@ import { GoalPanel, GoalRail } from './GoalPanel.js';
 import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
 import { NewConversationExecutionContext } from './NewConversationExecutionContext.js';
 import { formatVisibleApplicationError, modelSetupRequestedEvent, reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-import type { ConversationModelSetupContext } from '../settings/ModelSetup.js';
+import type { ConversationModelSetupContext } from '../settings/useModelSetup.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import { isSessionTerminalShortcut, SessionTerminalPanel, type SessionTerminalClient } from './SessionTerminal.js';
 import { useSessionTerminalVisibility } from './useSessionTerminalVisibility.js';
@@ -118,7 +125,17 @@ export interface SessionWorkspaceTask {
 
 export type SessionStartMode = 'create' | 'resume' | 'reference_legacy';
 
+/** 首发确认后，将草稿标签和已提交批注交给真实会话。 */
+export interface NewConversationBrowserDraft {
+  /** 草稿浏览器的独立归属身份。 */
+  conversationId: string;
+  /** 待发送批注；仅浏览网页时为空。 */
+  submission: ZeusBrowserPreparedSubmission | null;
+}
+
 export interface SessionWorkspaceStartInput {
+  /** 新对话的浏览器上下文，首发失败时仍属于原草稿。 */
+  browserDraft?: NewConversationBrowserDraft;
   /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
   contextCapacityTokens?: number | null;
   mode: SessionStartMode;
@@ -146,6 +163,8 @@ export interface SessionWorkspaceStartInput {
 }
 
 export interface ProjectSessionWorkspaceStartInput {
+  /** 新对话的浏览器上下文，首发失败时仍属于原草稿。 */
+  browserDraft?: NewConversationBrowserDraft;
   /** 缺省继承项目，null 明确保留默认；草稿恢复保留选择。 */
   contextCapacityTokens?: number | null;
   source?: 'code_review';
@@ -194,8 +213,10 @@ export interface SessionWorkspaceActions {
   onChooseStartAttachments?: () => Promise<NativeConversationAttachment[]>;
   onAddAttachments?: (attachments: NativeConversationAttachment[]) => void;
   onRemoveAttachment?: (attachment: NativeConversationAttachment) => void;
-  onEditQueuedSubmission?: (submissionId: string, content: string) => void | Promise<void>;
+  onEditQueuedSubmission?: (submissionId: string, content: string, attachments: NativeConversationAttachment[]) => void | Promise<void>;
   onRetryQueuedSubmission?: (submissionId: string) => void | Promise<void>;
+  /** 网络失败停止后，只续跑用户明确选择的最新轮次。 */
+  onRetryFailedTurn?: (providerTurnId: string) => void | Promise<void>;
   onRetryPendingSend?: (clientUserMessageId: string, intent: 'check' | 'continue') => void | Promise<void>;
   onCancelPendingSend?: (clientUserMessageId: string) => void | Promise<void>;
   onRerouteQueuedSubmission?: (submissionId: string, settings: NativeNextTurnSettings) => void | Promise<void>;
@@ -205,7 +226,6 @@ export interface SessionWorkspaceActions {
   onAnswerAsyncQuestion?: (item: NativeSessionItemBuffer, answers: AsyncQuestionAnswer['answers'], asNewMessage: boolean, answerAttachments?: Record<string, NativeConversationAttachment[]>) => Promise<void>;
   onReorderQueue?: (orderedSubmissionIds: string[]) => void | Promise<void>;
   onResumeQueue?: () => void | Promise<void>;
-  onRecoverQueue?: () => void | Promise<void>;
   onRestoreArchivedConversation?: () => void | Promise<void>;
   onRespondToRequest?: (requestId: string, response: Record<string, unknown>) => void | Promise<void>;
   onEditUserItem?: (item: NativeSessionItemBuffer, content: string) => void | Promise<void>;
@@ -244,7 +264,7 @@ export interface SessionWorkspaceActions {
   onOperateTurnChangeSet?: (changeSet: TurnChangeSet, action: 'undo' | 'reapply') => Promise<TurnChangeSetOperationResult>;
   onLoadEarlierHistory?: () => void | Promise<void>;
   /** 深历史展开时保留从头或从尾读取的明确意图。 */
-  onLoadTurnProcess?: (turnId: string, startAtBeginning?: boolean) => void | Promise<void>;
+  onLoadTurnProcess?: (turnId: string, startAtBeginning?: boolean, group?: ConversationProcessGroup) => void | Promise<void>;
   onLoadConversationResources?: () => void | Promise<void>;
   onLoadTurnArtifacts?: (turnId: string) => void | Promise<void>;
   onLoadV2Content?: (handle: string) => Promise<void>;
@@ -330,6 +350,8 @@ export async function loadLegacyConversationDetail<T>(conversation: NativeConver
 }
 
 export interface ConnectedSessionWorkspaceProps {
+  /** 所有 Provider 共用专用建议设置，不继承会话模型。 */
+  inputSuggestionSettings?: import('@zeus/shared').InputSuggestionSettings;
   gitContext?: { client: DashboardClient; project: ProjectRecord };
   language: SessionUiLanguage;
   client: SessionControllerClient;
@@ -460,6 +482,24 @@ function useCodexCapabilitiesRevision(): number {
 /** 同步读取已有项目能力，只用于首帧展示；提交仍由服务端重新复验。 */
 export function readCachedCodexConversationCapabilities(client: SessionControllerClient, projectId: string): CodexConversationCapabilities | null {
   return conversationCapabilitiesEntry(client, projectId).value;
+}
+
+/** 任务完整查询同步更新共享模型目录，并阻止较早的预读回执覆盖新快照。 */
+export function cacheCodexConversationCapabilities(client: SessionControllerClient, capabilities: CodexConversationCapabilities): void {
+  /** 缓存仍按客户端和项目隔离，不保存任务仓库或上下文的独立副本。 */
+  const entry = conversationCapabilitiesEntry(client, capabilities.projectId);
+  entry.value = {
+    generationId: capabilities.generationId,
+    initializedAt: capabilities.initializedAt,
+    projectId: capabilities.projectId,
+    preferredModel: capabilities.preferredModel,
+    models: capabilities.models,
+    codexAccount: capabilities.codexAccount,
+    goals: capabilities.goals,
+    available: capabilities.available,
+    availabilityReason: capabilities.availabilityReason,
+  };
+  entry.promise = null;
 }
 
 export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps) {
@@ -741,6 +781,8 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
   return (
     <SessionWorkspace
       language={props.language}
+      inputSuggestionSettings={props.inputSuggestionSettings}
+      onGenerateInputSuggestion={props.client.generateInputSuggestion}
       state={displayedState}
       stateController={displayedState === state ? controller : undefined}
       conversation={displayedConversation}
@@ -803,14 +845,18 @@ export function createConnectedSessionActions(input: { controller: SessionContro
     const byIdentity = new Map(currentAttachments.map((attachment) => [conversationAttachmentIdentity(attachment), attachment]));
     attachments.forEach((attachment) => byIdentity.set(conversationAttachmentIdentity(attachment), attachment));
     input.controller.setAttachments([...byIdentity.values()]);
+    /** 文件实际加入后才恢复附件错误，取消选择不改变状态。 */
+    const state = input.controller.getState();
+    if (attachments.length) recoverSystemMessageOperation(systemMessageScope(state.projectId ?? '', state.conversationId), 'input_resource', Object.values(state.systemMessages ?? {}));
   };
   return {
     onReconnect: () => settle(input.controller.reconnect()),
+    onRetryFailedTurn: (providerTurnId) => input.controller.retryFailedTurn(providerTurnId).then(() => undefined),
     onDraftChange: input.controller.setDraft,
     onSubmit: (delivery, settings) => {
       const currentState = input.controller.getState();
       const effectiveDelivery = delivery === 'steer_now' && canSteerActiveTurn(currentState) ? 'steer_now' : 'queue';
-      // 发送失败交回输入区显示；前置校验错误不一定经过控制器的运行操作状态。
+      // 发送失败交回组件记录系统消息；前置校验错误不一定经过控制器的运行操作状态。
       return input.controller.send(effectiveDelivery, effectiveDelivery === 'steer_now' ? (currentState.activeTurnId ?? undefined) : undefined, effectiveDelivery === 'queue' ? settings : undefined).then(() => undefined);
     },
     onStageBrowserComments: (prepared) => input.controller.stageBrowserComments(prepared),
@@ -830,8 +876,8 @@ export function createConnectedSessionActions(input: { controller: SessionContro
       input.controller.setAttachments(input.controller.getState().attachments.filter((candidate) => candidate !== attachment));
     },
     // 编辑器只有在服务端确认后才退出；失败必须向组件传播以保留用户草稿。
-    onEditQueuedSubmission: async (submissionId, content) => {
-      await input.controller.editQueuedSubmission(submissionId, content);
+    onEditQueuedSubmission: async (submissionId, content, attachments) => {
+      await input.controller.editQueuedSubmission(submissionId, content, attachments);
     },
     // 重试失败必须回到原消息旁，不能吞掉拒绝原因或重复弹出全局错误。
     onRetryQueuedSubmission: async (submissionId) => {
@@ -861,10 +907,6 @@ export function createConnectedSessionActions(input: { controller: SessionContro
       await input.controller.reorderQueue(orderedSubmissionIds);
     },
     onResumeQueue: () => settle(input.controller.resumeQueue()),
-    // 检查失败回传消息旁的反馈，不由通用操作吞掉或重复弹窗。
-    onRecoverQueue: async () => {
-      await input.controller.recoverQueue('check');
-    },
     onRestoreArchivedConversation: () => settle(input.controller.restoreArchivedConversation()),
     onRespondToRequest: (requestId, response) => input.controller.respondToRequest(requestId, response).then(() => undefined),
     onRespondToPlanImplementationRequest: (requestId, response) => input.controller.respondToPlanImplementationRequest(requestId, response),
@@ -872,8 +914,8 @@ export function createConnectedSessionActions(input: { controller: SessionContro
     onNextTurnSettingsChange: (settings) => input.controller.setNextTurnSettings(settings).then(() => undefined),
     onPermissionModeChange: (permissionMode) => settle(input.controller.setPermissionMode(permissionMode)),
     onCollaborationModeChange: (collaborationMode) => settle(input.controller.setCollaborationMode(collaborationMode)),
-    onLoadEarlierHistory: () => settle(input.controller.loadEarlierHistory()),
-    onLoadTurnProcess: (turnId, startAtBeginning) => settle(input.controller.loadTurnProcess(turnId, startAtBeginning)),
+    onLoadEarlierHistory: () => settle(Promise.all([input.controller.loadEarlierHistory(), input.controller.loadEarlierSystemMessages()])),
+    onLoadTurnProcess: (turnId, startAtBeginning, group) => settle(input.controller.loadTurnProcess(turnId, startAtBeginning, group)),
     onLoadConversationResources: () => settle(input.controller.loadConversationResources()),
     onLoadTurnArtifacts: (turnId) => settle(input.controller.loadTurnArtifacts(turnId)),
     onLoadV2Content: (handle) => input.controller.loadV2Content(handle),
@@ -959,6 +1001,8 @@ export async function startNativeConversationWithDurableAcceptance<T>(options: {
   if (!isDurableNativeConversationAcceptance(request, acceptance, operationIdentity)) throw new Error('Native conversation start did not return a durable accepted operation.');
   options.envelopeManager.clearAccepted(options.input, request, acceptance, operationIdentity);
   const choice = nativeConversationChoiceFromAcceptance(acceptance, options.input.task);
+  // 只用本次耐久创建回执迁移草稿消息，不依据界面当前选中的会话猜测。
+  bindDraftSystemMessages(options.input.task.projectId, options.input.task.id, choice.id);
   // acceptance 导航属于 durable 边界，必须先于摘要刷新发生。
   await options.onAccepted(choice);
   try {
@@ -1073,6 +1117,7 @@ export async function startProjectConversationWithDurableAcceptance<T>(options: 
   if (!isDurableNativeConversationAcceptance(request, acceptance, operationIdentity)) throw new Error('Project conversation start did not return a durable accepted operation.');
   options.envelopeManager.clearAccepted(options.input, request, acceptance, operationIdentity);
   const choice = projectConversationChoiceFromAcceptance(acceptance, options.input.owner);
+  bindDraftSystemMessages(options.input.owner.projectId, null, choice.id);
   choice.workspaceMode ??= request.workspaceMode ?? 'direct';
   await options.onAccepted(choice);
   try {
@@ -1083,7 +1128,7 @@ export async function startProjectConversationWithDurableAcceptance<T>(options: 
 }
 
 function buildProjectConversationStartPayload(input: ProjectSessionWorkspaceStartInput): Omit<StartProjectConversationRequest, 'idempotencyKey' | 'clientUserMessageId'> {
-  if (!input.content.trim() && input.attachments.length === 0) throw new Error('Project conversation start content or attachments are required.');
+  if (!input.content.trim() && input.attachments.length === 0 && !input.browserDraft?.submission?.comments.length) throw new Error('Project conversation start content or attachments are required.');
   return {
     mode: 'create',
     ...(input.source ? { source: input.source, inheritConversationId: input.inheritConversationId } : {}),
@@ -1091,6 +1136,7 @@ function buildProjectConversationStartPayload(input: ProjectSessionWorkspaceStar
     ...(input.workspaceMode === 'worktree' && input.worktree ? { worktree: input.worktree } : {}),
     content: input.content,
     attachments: input.attachments,
+    ...(input.browserDraft?.submission ? { browserComments: input.browserDraft.submission.comments, browserCommentContent: input.browserDraft.submission.content } : {}),
     permissionMode: input.permissionMode ?? 'auto',
     collaborationMode: input.collaborationMode ?? 'default',
     ...(input.model ? { model: input.model } : {}),
@@ -1133,7 +1179,9 @@ function isProjectConversationStartRequest(value: unknown): value is StartProjec
     (value.source !== 'code_review' || (typeof value.inheritConversationId === 'string' && Boolean(value.inheritConversationId.trim()) && value.permissionMode === 'read-only' && value.collaborationMode === 'default')) &&
     typeof value.content === 'string' &&
     Array.isArray(value.attachments) &&
-    (Boolean(value.content.trim()) || value.attachments.length > 0) &&
+    (Boolean(value.content.trim()) || value.attachments.length > 0 || (Array.isArray(value.browserComments) && value.browserComments.length > 0)) &&
+    (value.browserComments === undefined || (Array.isArray(value.browserComments) && value.browserComments.length <= 200 && value.browserComments.every(isRecord))) &&
+    (value.browserCommentContent === undefined || typeof value.browserCommentContent === 'string') &&
     permissionModeField(value.permissionMode) !== undefined &&
     (value.collaborationMode === 'default' || value.collaborationMode === 'plan') &&
     serviceTierOverrideField(value.serviceTier) &&
@@ -1311,7 +1359,7 @@ export function createNativeConversationStartEnvelopeManager(options: {
 function buildStartNativeConversationPayload(input: SessionWorkspaceStartInput): StartNativeConversationPayload {
   const content = input.content.trim();
   if (input.mode === 'create') {
-    if (!content && !input.attachments?.length) throw new Error('Native conversation start content or attachments are required.');
+    if (!content && !input.attachments?.length && !input.browserDraft?.submission?.comments.length) throw new Error('Native conversation start content or attachments are required.');
     if (input.source === 'code_review' && (!input.inheritConversationId || !input.model)) {
       throw new Error('Code review requires an inherited conversation and an explicit model.');
     }
@@ -1321,6 +1369,7 @@ function buildStartNativeConversationPayload(input: SessionWorkspaceStartInput):
       ...(input.stageId ? { stageId: input.stageId } : {}),
       content,
       ...(input.attachments?.length ? { attachments: input.attachments } : {}),
+      ...(input.browserDraft?.submission ? { browserComments: input.browserDraft.submission.comments, browserCommentContent: input.browserDraft.submission.content } : {}),
       ...(input.inheritConversationId ? { inheritConversationId: input.inheritConversationId } : {}),
       permissionMode: input.permissionMode ?? 'auto',
       collaborationMode: input.collaborationMode ?? 'default',
@@ -1387,7 +1436,9 @@ function isStartNativeConversationRequest(value: unknown): value is StartNativeC
   if (typeof request.idempotencyKey !== 'string' || !request.idempotencyKey || typeof request.clientUserMessageId !== 'string' || !request.clientUserMessageId || typeof request.content !== 'string') return false;
   if (request.mode === 'create') {
     return (
-      (Boolean(request.content.trim()) || (Array.isArray(request.attachments) && request.attachments.length > 0)) &&
+      (Boolean(request.content.trim()) || (Array.isArray(request.attachments) && request.attachments.length > 0) || (Array.isArray(request.browserComments) && request.browserComments.length > 0)) &&
+      (request.browserComments === undefined || (Array.isArray(request.browserComments) && request.browserComments.length <= 200 && request.browserComments.every(isRecord))) &&
+      (request.browserCommentContent === undefined || typeof request.browserCommentContent === 'string') &&
       (request.source === undefined || request.source === 'code_review') &&
       (request.skillId === undefined || (typeof request.skillId === 'string' && /^[a-f0-9]{32}$/u.test(request.skillId))) &&
       (request.stageId === undefined || (typeof request.stageId === 'string' && Boolean(request.stageId))) &&
@@ -1453,6 +1504,10 @@ export function isDurableNativeConversationAcceptance(
 }
 
 export interface NewConversationDraft {
+  /** 浏览器身份、显示状态和批注随输入草稿一起恢复。 */
+  browserDraft?: NewConversationBrowserDraft;
+  /** 返回创建界面时恢复浏览器工作面。 */
+  browserOpen?: boolean;
   worktreeDrafts?: Record<string, ConversationWorktreeOptions>;
   workspaceMode?: 'direct' | 'worktree';
   content: string;
@@ -1470,6 +1525,10 @@ export interface NewConversationDraft {
 export type NewConversationDraftStore = Map<string, NewConversationDraft>;
 
 export interface SessionWorkspaceProps {
+  /** 仅主输入框消费这份独立建议设置。 */
+  inputSuggestionSettings?: import('@zeus/shared').InputSuggestionSettings;
+  /** 客户端由真实会话身份绑定轮次请求，不接收任意预测材料。 */
+  onGenerateInputSuggestion?: ConversationComposerProps['onGenerateInputSuggestion'];
   gitContext?: { client: DashboardClient; project: ProjectRecord };
   newConversationDrafts?: NewConversationDraftStore;
   language: SessionUiLanguage;
@@ -1544,7 +1603,7 @@ function useOptionalSessionStateSlice(controller: SessionController | undefined,
 function SessionTranscriptProjection(props: Omit<ConversationTranscriptProps, 'state'> & { state: NativeSessionState; controller?: SessionController }) {
   const { controller, state: fallbackState, ...transcriptProps } = props;
   const state = useOptionalSessionStateSlice(controller, fallbackState, createConversationTranscriptStateSelector);
-  return <ConversationTranscript {...transcriptProps} state={state} onLoadNavigation={controller?.loadNavigation} onLoadNavigationTurn={controller?.loadNavigationTurn} />;
+  return <ConversationTranscript {...transcriptProps} state={state} onLoadNavigation={controller?.loadNavigation} onLoadNavigationTurn={controller?.loadNavigationTurn} onSaveSystemMessage={controller?.saveSystemMessage} />;
 }
 
 function SessionComposerProjection(props: Omit<ConversationComposerProps, 'state'> & { state: NativeSessionState; controller?: SessionController }) {
@@ -1781,6 +1840,26 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const previousBlockingInteractionCountRef = useRef(0);
   const composerFocusRestorationPendingRef = useRef(false);
   const legacy = props.conversation && props.conversation.transportKind !== 'codex_native';
+  /** 旧会话复用已读取的正文，通知不会为确认已读而重新启动执行。 */
+  const legacyMessages = props.conversation ? (props.legacyMessages?.[props.conversation.legacySourceConversationId ?? props.conversation.id] ?? []) : [];
+  /** 旧会话的底部标记提供与原生正文相同的可见证据。 */
+  const legacyLatestContentRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    /** 回调与当前会话身份绑定，卸载时撤销旧会话的可见状态。 */
+    const report = props.onLatestContentVisibilityChange;
+    if (!legacy || !report) return;
+    report(false);
+    /** 没有成功加载正文时保留未读，加载失败不确认。 */
+    const marker = legacyLatestContentRef.current;
+    if (!marker || !legacyMessages.length || props.loadState === 'loading' || props.loadState === 'error' || typeof IntersectionObserver === 'undefined') return;
+    /** 实际滚动到已加载内容的末尾才允许确认。 */
+    const observer = new IntersectionObserver((entries) => report(entries[0]?.isIntersecting === true));
+    observer.observe(marker);
+    return () => {
+      observer.disconnect();
+      report(false);
+    };
+  }, [legacy, legacyMessages.length, props.loadState, props.conversation?.id, props.onLatestContentVisibilityChange]);
   // 终端只依赖稳定的项目与会话身份；会话快照重水合期间短暂为空不能关闭仍存活的 PTY 面板。
   const terminalAvailable = Boolean(props.terminalClient && props.conversation && props.projectPath && !legacy);
   const closeSessionTerminal = useCallback((): void => {
@@ -1955,7 +2034,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent): void => {
-      if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== 'b' || legacy) return;
+      if (event.defaultPrevented || !props.conversation || !(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== 'b' || legacy) return;
       event.preventDefault();
       contextReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setContextFullWidth(false);
@@ -1964,7 +2043,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     };
     window.addEventListener('keydown', handleShortcut);
     return () => window.removeEventListener('keydown', handleShortcut);
-  }, [legacy]);
+  }, [legacy, props.conversation]);
 
   useEffect(() => {
     if (!terminalAvailable) return;
@@ -2043,6 +2122,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     // 格式预览先退出阅读状态，避免编辑草稿时触发中断确认。
     if (event.target instanceof Element && event.target.closest('.structured-composer-preview')) return;
     if (event.target instanceof Element && event.target.closest('.session-composer-shell[data-goal-input="true"]')) return;
+    // 灰字的 Escape 由输入框消费，不能穿透为关闭工作面或中断操作。
+    if (event.target instanceof Element && event.target.closest('.session-composer-shell[data-input-suggestion="true"]')) return;
     const planRequest = pendingRequests.length === 0 ? pendingPlanImplementationRequests[0] : undefined;
     if (planRequest) {
       event.preventDefault();
@@ -2442,6 +2523,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     return (
       <SessionComposerProjection
         textareaRef={composerRef}
+        inputSuggestionSettings={props.inputSuggestionSettings}
+        onGenerateInputSuggestion={props.onGenerateInputSuggestion}
         state={props.state}
         controller={props.stateController}
         language={props.language}
@@ -2493,6 +2576,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
         onEdit={transcriptInteractionsEnabled ? actions.onEditQueuedSubmission : undefined}
         onDelete={transcriptInteractionsEnabled ? actions.onDeleteQueuedSubmission : undefined}
         onSendNow={transcriptInteractionsEnabled ? actions.onSendQueuedNow : undefined}
+        onResumeQueue={transcriptInteractionsEnabled ? actions.onResumeQueue : undefined}
         onReorder={transcriptInteractionsEnabled ? actions.onReorderQueue : undefined}
       />
     );
@@ -2579,7 +2663,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   <button
                     type="button"
                     className="session-thread-task-title"
-                    title={displayedHeader.title}
+                    data-icon-tooltip={displayedHeader.title}
                     aria-label={props.language === 'zh-CN' ? `打开任务详情：${displayedHeader.title}` : `Open task details: ${displayedHeader.title}`}
                     onClick={() => {
                       if (displayedHeader.taskId) actions.onOpenTaskDetail?.(displayedHeader.taskId);
@@ -2588,7 +2672,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     {displayedHeader.title}
                   </button>
                 ) : (
-                  <strong title={displayedHeader.title}>{displayedHeader.title}</strong>
+                  <strong data-icon-tooltip={displayedHeader.title}>{displayedHeader.title}</strong>
                 )}
                 {displayedHeader.taskId && displayedHeader.taskManagementStatus && displayedHeader.taskManagementStatusOptions?.length && actions.onTaskManagementStatusChange ? (
                   <ZeusSelect
@@ -2615,7 +2699,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     style={{ '--task-status-tone': displayedHeader.taskManagementStatus.color } as CSSProperties}
                     role="status"
                     aria-label={props.language === 'zh-CN' ? `任务状态：${displayedHeader.taskManagementStatus.label}` : `Task status: ${displayedHeader.taskManagementStatus.label}`}
-                    title={props.language === 'zh-CN' ? `任务状态：${displayedHeader.taskManagementStatus.label}` : `Task status: ${displayedHeader.taskManagementStatus.label}`}
+                    data-icon-tooltip={props.language === 'zh-CN' ? `任务状态：${displayedHeader.taskManagementStatus.label}` : `Task status: ${displayedHeader.taskManagementStatus.label}`}
                   >
                     <strong>{displayedHeader.taskManagementStatus.label}</strong>
                   </span>
@@ -2637,7 +2721,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   className={`session-browser-toggle ${browserOpen ? 'selected' : ''}`}
                   aria-pressed={browserOpen}
                   aria-label={props.language === 'zh-CN' ? '内置浏览器' : 'Built-in browser'}
-                  title={props.language === 'zh-CN' ? '内置浏览器（⌘⇧B）' : 'Built-in browser (⌘⇧B)'}
+                  data-icon-tooltip={props.language === 'zh-CN' ? '内置浏览器（⌘⇧B）' : 'Built-in browser (⌘⇧B)'}
                   onClick={(event) => {
                     contextReturnFocusRef.current = event.currentTarget;
                     if (browserOpen) {
@@ -2657,7 +2741,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   className={`session-browser-toggle session-terminal-toggle ${terminalOpen ? 'selected' : ''}`}
                   aria-pressed={terminalOpen}
                   aria-label={props.language === 'zh-CN' ? '会话终端' : 'Conversation terminal'}
-                  title={props.language === 'zh-CN' ? '会话终端（⌃`）' : 'Conversation terminal (Ctrl+`)'}
+                  data-icon-tooltip={props.language === 'zh-CN' ? '会话终端（⌃`）' : 'Conversation terminal (Ctrl+`)'}
                   onClick={(event) => {
                     if (terminalOpen) {
                       closeSessionTerminal();
@@ -2751,7 +2835,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           {/* 旧会话或未就绪会话仅在标题下保留项目名称。 */}
           {(legacy || !props.state) && displayedHeader.contextLabel ? (
             <div className="session-thread-subtitle-row">
-              <small className="session-thread-project-name" title={displayedHeader.contextLabel}>
+              <small className="session-thread-project-name" data-icon-tooltip={displayedHeader.contextLabel}>
                 {displayedHeader.contextLabel}
               </small>
             </div>
@@ -2792,14 +2876,15 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
               {props.language === 'zh-CN' ? '旧会话仍保持只读。' : 'The legacy conversation remains read-only.'}
             </p>
           ) : null}
-          {(props.legacyMessages?.[props.conversation.legacySourceConversationId ?? props.conversation.id] ?? []).length > 0 ? (
+          {legacyMessages.length > 0 ? (
             <section className="session-legacy-transcript" role="log" aria-live="off" aria-label={copy.legacyTranscript}>
-              {(props.legacyMessages?.[props.conversation.legacySourceConversationId ?? props.conversation.id] ?? []).map((message) => (
+              {legacyMessages.map((message) => (
                 <article key={message.id} className={`session-legacy-message session-legacy-message-${message.role}`}>
                   <strong>{message.role}</strong>
                   <ConversationMarkdown text={message.content} streamId={`legacy:${props.conversation!.id}:${message.id}`} phase="final" language={props.language} />
                 </article>
               ))}
+              <span ref={legacyLatestContentRef} className="session-latest-content-marker" aria-hidden="true" />
             </section>
           ) : null}
         </>
@@ -2842,7 +2927,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                         : undefined
                     }
                     onOpenAiSettings={actions.onOpenAiSettings}
-                    onRecoverQueue={transcriptInteractionsEnabled ? actions.onRecoverQueue : undefined}
+                    onReconnect={transcriptInteractionsEnabled ? actions.onReconnect : undefined}
+                    onRetryFailedTurn={transcriptInteractionsEnabled ? actions.onRetryFailedTurn : undefined}
                     onReconnectCodex={transcriptInteractionsEnabled ? actions.onReconnectCodex : undefined}
                     onInterrupt={!props.historyOnly && actions.onInterrupt ? actions.onInterrupt : undefined}
                     onRetryQueuedSubmission={transcriptInteractionsEnabled ? actions.onRetryQueuedSubmission : undefined}
@@ -3081,6 +3167,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       ) : (
         <NewConversationComposer
           key={owner?.kind === 'task' ? `task:${props.task?.id}` : 'project'}
+          inputSuggestionSettings={props.inputSuggestionSettings}
+          onGenerateInputSuggestion={props.onGenerateInputSuggestion}
           drafts={props.newConversationDrafts}
           language={props.language}
           taskBranchPrefix={props.taskBranchPrefix}
@@ -3231,6 +3319,10 @@ function isComposerWritableForFocus(state: NativeSessionState | null, readOnly: 
 }
 
 export function NewConversationComposer(props: {
+  /** 新建项目、临时和任务会话使用同一专用模型设置。 */
+  inputSuggestionSettings?: ConversationComposerProps['inputSuggestionSettings'];
+  /** 未创建会话也可主动润色草稿，不提前启动 Provider。 */
+  onGenerateInputSuggestion?: ConversationComposerProps['onGenerateInputSuggestion'];
   drafts?: NewConversationDraftStore;
   language: SessionUiLanguage;
   /** 新建项目会话工作树时使用的全局分支前缀。 */
@@ -3262,6 +3354,18 @@ export function NewConversationComposer(props: {
   const textareaRef = useRef<ComposerInputHandle | null>(null);
   const draftKey = props.owner?.kind === 'task' ? `task:${props.task?.id}` : 'project';
   const [restoredDraft] = useState(() => props.drafts?.get(draftKey));
+  /** 创建界面重挂载时保留浏览器归属，不提前创建模型会话。 */
+  const [browserDraft, setBrowserDraft] = useState<NewConversationBrowserDraft>(() => restoredDraft?.browserDraft ?? { conversationId: `browser-draft-${crypto.randomUUID()}`, submission: null });
+  /** 浏览器工作面随当前输入草稿恢复。 */
+  const [browserOpen, setBrowserOpen] = useState(() => restoredDraft?.browserOpen ?? false);
+  /** 浏览器全宽只属于当前阅读状态。 */
+  const [browserExpanded, setBrowserExpanded] = useState(false);
+  /** 顶栏承接既有浏览器标签栏。 */
+  const [browserToolbarHost, setBrowserToolbarHost] = useState<HTMLDivElement | null>(null);
+  /** 由实际容器宽度决定分栏，不使用屏幕宽度估算。 */
+  const [browserLayoutWidth, setBrowserLayoutWidth] = useState(0);
+  /** 新对话和任务内停靠输入共用此布局容器。 */
+  const browserLayoutRef = useRef<HTMLDivElement | null>(null);
   const [tokenDraft] = useState(() => restoredDraft?.tokenDraft ?? { current: [] });
   const runtimePreferencesInitializedRef = useRef(Boolean(restoredDraft));
   const structuredSelectionRef = useRef<StructuredComposerSelection>({
@@ -3298,7 +3402,23 @@ export function NewConversationComposer(props: {
     [worktreeProjectId],
   );
   const [executionContextBusy, setExecutionContextBusy] = useState(false);
-  const [localError, setLocalError] = useState<string | NativeConversationStartFailure | null>(null);
+  /** 创建前消息归属项目及任务草稿，重启后仍保留。 */
+  const systemScope = systemMessageScope(props.owner?.projectId ?? '', null, props.owner?.kind === 'task' ? props.owner.taskId : null);
+  const draftSystemMessages = useConversationSystemMessages(systemScope);
+  /** 空值只清理调用方的临时状态，不能删除已发生的系统消息。 */
+  const setLocalError = useCallback(
+    (error: string | NativeConversationStartFailure | null): void => {
+      if (error) recordSystemMessage(systemScope, typeof error === 'string' ? error : error.message, 'conversation_start', '会话操作失败。');
+    },
+    [systemScope],
+  );
+  /** 成功创建前的准备故障按其真实结果更新，历史仍保留。 */
+  const recoverDraftOperation = useCallback(
+    (operation: import('@zeus/shared').ConversationSystemMessageInput['operation']): void => {
+      recoverSystemMessageOperation(systemScope, operation);
+    },
+    [systemScope],
+  );
   /** 接入结果只属于原草稿，切换项目或卸载时取消。 */
   const modelSetupRequestRef = useRef<AbortController | null>(null);
   useEffect(() => () => modelSetupRequestRef.current?.abort(), [props.owner?.projectId]);
@@ -3306,6 +3426,8 @@ export function NewConversationComposer(props: {
   const [goalObjective, setGoalObjective] = useState(() => restoredDraft?.goalObjective ?? '');
   useLayoutEffect(() => {
     props.drafts?.set(draftKey, {
+      browserDraft,
+      browserOpen,
       workspaceMode,
       worktreeDrafts,
       content,
@@ -3319,7 +3441,74 @@ export function NewConversationComposer(props: {
       goalObjective,
       tokenDraft,
     });
-  }, [props.drafts, draftKey, workspaceMode, worktreeDrafts, content, attachments, permissionMode, collaborationMode, selectedModelId, selectedEffort, serviceTierSelection, goalInputOpen, goalObjective, tokenDraft]);
+  }, [
+    props.drafts,
+    draftKey,
+    browserDraft,
+    browserOpen,
+    workspaceMode,
+    worktreeDrafts,
+    content,
+    attachments,
+    permissionMode,
+    collaborationMode,
+    selectedModelId,
+    selectedEffort,
+    serviceTierSelection,
+    goalInputOpen,
+    goalObjective,
+    tokenDraft,
+  ]);
+
+  useLayoutEffect(() => {
+    /** 挂载和缩放均重新测量可用宽度。 */
+    const layout = browserLayoutRef.current;
+    if (!layout) return;
+    /** ResizeObserver 只写入容器的真实宽度。 */
+    const observer = new ResizeObserver(() => setBrowserLayoutWidth(layout.getBoundingClientRect().width));
+    observer.observe(layout);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return window.zeus?.onBrowserEvent?.((event) => {
+      if ((event.type !== 'comments_saved' && event.type !== 'comments_removed') || event.conversationId !== browserDraft.conversationId) return;
+      setBrowserDraft((current) => {
+        if (event.type === 'comments_saved') return { ...current, submission: mergeBrowserSubmissions(current.submission, event.prepared) };
+        if (!current.submission) return current;
+        /** 删除网页批注时同步移除草稿正文及对应截图。 */
+        const comments = current.submission.comments.filter((comment) => !event.commentIds.includes(comment.id));
+        return { ...current, submission: comments.length ? mergeBrowserSubmissions(null, { ...current.submission, comments }) : null };
+      });
+    });
+  }, [browserDraft.conversationId]);
+
+  /** 显式关闭释放标签；确认批注仅收起工作面，保留首发迁移所需的网页。 */
+  const closeBrowser = useCallback(async (): Promise<void> => {
+    try {
+      await window.zeus?.closeBrowserConversation?.(browserDraft.conversationId);
+      recoverDraftOperation('browser_close');
+      window.zeus?.notifySessionContextActivity?.({ active: false, kind: 'none' });
+      setBrowserOpen(false);
+      setBrowserExpanded(false);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    } catch (error) {
+      recordSystemMessage(systemScope, error, 'browser_close', '浏览器关闭失败。');
+    }
+  }, [browserDraft.conversationId, systemScope, recoverDraftOperation]);
+
+  useEffect(() => {
+    /** 新对话处理自己的浏览器快捷键，停靠输入仅在本容器获得焦点时接管。 */
+    const handleShortcut = (event: KeyboardEvent): void => {
+      if (event.defaultPrevented || event.repeat || !(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== 'b') return;
+      if (props.docked && !browserLayoutRef.current?.contains(document.activeElement)) return;
+      event.preventDefault();
+      if (browserOpen) void closeBrowser();
+      else setBrowserOpen(true);
+    };
+    window.addEventListener('keydown', handleShortcut);
+    return () => window.removeEventListener('keydown', handleShortcut);
+  }, [browserOpen, closeBrowser, props.docked]);
   const inputResources = useConversationInputResources({
     attachments: attachments,
     language: props.language === 'zh-CN' ? 'zh-CN' : 'en',
@@ -3328,17 +3517,19 @@ export function NewConversationComposer(props: {
     disabled: submitting || !props.owner || goalInputOpen,
     onTextChange: setContent,
     onAddAttachments: (selected) => {
-      setLocalError(null);
+      recoverDraftOperation('input_resource');
       setAttachments((current) => mergeConversationAttachments(current, selected));
     },
     onRemoveAttachment: (attachment) => {
       setAttachments((current) => current.filter((candidate) => candidate !== attachment));
     },
-    onError: setLocalError,
+    onError: (error) => recordSystemMessage(systemScope, error, 'input_resource', '输入附件处理失败。'),
   });
 
-  /** 新会话初始化和附件错误共用编辑器内的错误位。 */
-  const visibleLocalError = localError ?? (props.loadState === 'error' ? props.loadError : null);
+  /** 新会话初始化失败进入草稿消息流，输入框不承载错误。 */
+  useEffect(() => {
+    if (props.loadState === 'error' && props.loadError) setLocalError(props.loadError);
+  }, [props.loadState, props.loadError, setLocalError]);
 
   useEffect(() => {
     if (props.autoFocus) textareaRef.current?.focus();
@@ -3358,6 +3549,7 @@ export function NewConversationComposer(props: {
     }
     if (props.capabilities && capabilitiesRevision === 0) {
       setCapabilities(props.capabilities);
+      recoverDraftOperation('model_capabilities');
       setCapabilitiesLoading(false);
       return;
     }
@@ -3367,10 +3559,13 @@ export function NewConversationComposer(props: {
     void props
       .onLoadCapabilities?.(projectId)
       .then((snapshot) => {
-        if (active && snapshot) setCapabilities(snapshot);
+        if (active && snapshot) {
+          setCapabilities(snapshot);
+          recoverDraftOperation('model_capabilities');
+        }
       })
       .catch((error: unknown) => {
-        if (active) setLocalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
+        if (active) recordSystemMessage(systemScope, error, 'model_capabilities', '模型选项读取失败。');
       })
       .finally(() => {
         if (active) setCapabilitiesLoading(false);
@@ -3378,7 +3573,7 @@ export function NewConversationComposer(props: {
     return () => {
       active = false;
     };
-  }, [props.capabilities, props.onLoadCapabilities, props.owner?.projectId, capabilitiesRevision]);
+  }, [props.capabilities, props.onLoadCapabilities, props.owner?.projectId, capabilitiesRevision, systemScope, recoverDraftOperation]);
 
   const preferredModel = resolveModelCapability(capabilities?.models, selectedModelId) ?? resolveModelCapability(capabilities?.models, capabilities?.preferredModel);
   const modelPresentation = useMemo(() => presentModelOptions(capabilities?.models ?? [], preferredModel?.id ?? selectedModelId, props.language), [capabilities?.models, preferredModel?.id, props.language, selectedModelId]);
@@ -3441,9 +3636,19 @@ export function NewConversationComposer(props: {
     if (inputResources.processing) return;
     const structured = structuredSelectionRef.current;
     const submittedContent = overrides.content ?? structured.promptText;
-    const submittedDisplayText = overrides.content === undefined ? structured.displayText : overrides.content;
+    const submittedDisplayText =
+      (overrides.content === undefined ? structured.displayText : overrides.content) ||
+      (browserDraft.submission ? (props.language === 'zh-CN' ? `${browserDraft.submission.comments.length} 条网页批注` : `${browserDraft.submission.comments.length} browser comments`) : '');
     const submittedGoal = (overrides.goalObjective ?? (goalInputActive ? goalObjective : '')).trim();
-    if (!props.owner || submitting || executionContextBusy || capabilitiesLoading || (!selectedModel && !needsModelSetup) || (!needsModelSetup && !submittedContent.trim() && attachments.length === 0) || (goalInputActive && !submittedGoal))
+    if (
+      !props.owner ||
+      submitting ||
+      executionContextBusy ||
+      capabilitiesLoading ||
+      (!selectedModel && !needsModelSetup) ||
+      (!needsModelSetup && !submittedContent.trim() && attachments.length === 0 && !browserDraft.submission) ||
+      (goalInputActive && !submittedGoal)
+    )
       return;
     if (needsModelSetup) {
       setLocalError(null);
@@ -3463,6 +3668,7 @@ export function NewConversationComposer(props: {
           const model = reference ? resolveModelCapability(refreshed?.models, reference) : refreshed?.models.find((candidate) => candidate.sourceId === 'codex' && candidate.available !== false);
           if (!refreshed || !hasAvailableConversationModel(refreshed) || !model || model.available === false) throw new Error('ZEUS_MODEL_UNAVAILABLE');
           setCapabilities(refreshed);
+          recoverDraftOperation('model_capabilities');
           setSelectedModelId(model.id);
         },
       };
@@ -3477,9 +3683,12 @@ export function NewConversationComposer(props: {
       setLocalError(props.language === 'zh-CN' ? '请选择来源分支并填写工作树分支名。' : 'Choose a source branch and enter a worktree branch name.');
       return;
     }
+    suggestion.dismiss();
     setSubmitting(true);
     setLocalError(null);
     try {
+      /** 网页截图与用户附件共用既有去重和发送通道。 */
+      const submittedAttachments = mergeConversationAttachments(attachments, browserDraft.submission?.attachments ?? []);
       let accepted: void | boolean | NativeConversationStartPreparation | NativeConversationStartFailure;
       if (props.owner.kind === 'project') {
         if (!props.onStartProject) throw new Error('Project conversation start is unavailable.');
@@ -3488,7 +3697,8 @@ export function NewConversationComposer(props: {
           workspaceMode: props.owner.projectId === temporaryWorkspaceId ? 'direct' : workspaceMode,
           ...(props.owner.projectId !== temporaryWorkspaceId && workspaceMode === 'worktree' && worktree ? { worktree } : {}),
           content: submittedContent,
-          attachments,
+          attachments: submittedAttachments,
+          browserDraft,
           permissionMode,
           collaborationMode,
           serviceTierSelection,
@@ -3509,7 +3719,8 @@ export function NewConversationComposer(props: {
           task: props.task,
           ...(props.inheritConversationId ? { inheritConversationId: props.inheritConversationId } : {}),
           content: submittedContent,
-          attachments,
+          attachments: submittedAttachments,
+          browserDraft,
           permissionMode,
           collaborationMode,
           serviceTierSelection,
@@ -3538,10 +3749,21 @@ export function NewConversationComposer(props: {
     }
   }
 
+  /** 新草稿只在用户点击时生成，按项目和任务保存跨页面的请求结果。 */
+  const suggestion = useInputSuggestion({
+    scopeKey: `new:${props.owner?.kind === 'task' ? props.owner.taskId : (props.owner?.projectId ?? '')}`,
+    projectId: props.owner?.projectId,
+    draft: content,
+    eligible: Boolean(props.owner) && !submitting && !goalInputActive && !isComposing && !inputResources.processing,
+    settings: props.inputSuggestionSettings,
+    generate: props.onGenerateInputSuggestion,
+  });
+
   const composer = (
     <section
       className="session-composer-shell session-new-conversation-composer"
       aria-label={copy.newInput}
+      data-input-suggestion={suggestion.polishedText || suggestion.pending || suggestion.reason ? 'true' : undefined}
       aria-busy={submitting || executionContextBusy || capabilitiesLoading || inputResources.processing || undefined}
       data-goal-input={goalInputActive ? 'true' : 'false'}
       data-resource-dragging={inputResources.dragging ? 'true' : 'false'}
@@ -3558,11 +3780,7 @@ export function NewConversationComposer(props: {
         onRemove={(attachment) => setAttachments((current) => current.filter((candidate) => candidate !== attachment))}
         onRestorePastedText={goalInputActive ? undefined : inputResources.restorePastedText}
       />
-      {visibleLocalError ? (
-        <p className="session-new-conversation-error" role="alert">
-          {typeof visibleLocalError === 'string' ? visibleLocalError : visibleLocalError.message}
-        </p>
-      ) : null}
+      {browserDraft.submission ? <BrowserSubmissionAttachment submission={browserDraft.submission} language={props.language} disabled={submitting} onRemove={() => setBrowserDraft((current) => ({ ...current, submission: null }))} /> : null}
       <div className="session-composer-input-frame" data-goal-input={goalInputActive ? 'true' : 'false'}>
         {props.owner?.kind === 'project' && props.projects?.length ? (
           <NewConversationExecutionContext
@@ -3627,98 +3845,120 @@ export function NewConversationComposer(props: {
             }}
           />
         ) : (
-          <StructuredComposerInput
-            tokenDraft={tokenDraft}
-            value={content}
-            onValueChange={setContent}
-            onSelectionChange={(selection) => {
-              structuredSelectionRef.current = selection;
-            }}
-            textareaRef={textareaRef}
-            projectId={props.owner?.projectId}
-            language={props.language}
-            disabled={submitting || !props.owner}
-            autoFocus={props.autoFocus}
-            ariaLabel={copy.newInput}
-            ariaKeyShortcuts="Enter Shift+Enter Escape"
-            placeholder={copy.newPlaceholder}
-            loadCatalog={props.onLoadSkills}
-            loadEmployees={props.onLoadDigitalEmployees}
-            goalAvailable={goalAvailable}
-            onPlanMode={() => setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))}
-            onGoalMode={() => {
-              if (!goalAvailable) return;
-              setGoalInputOpen(true);
-              requestAnimationFrame(() => textareaRef.current?.focus());
-            }}
-            onOpenComputerSettings={props.onOpenComputerSettings}
-            onCompositionStart={() => setIsComposing(true)}
-            onCompositionEnd={() => setIsComposing(false)}
-            onPaste={inputResources.handlePaste}
-            onKeyDown={(event) => {
-              if (!goalInputActive) inputResources.handlePasteShortcut(event);
-              const intent = resolveComposerKeyIntent({
-                key: event.key,
-                shiftKey: event.shiftKey,
-                isComposing: isComposing || event.nativeEvent.isComposing,
-                keyCode: event.nativeEvent.keyCode,
-                repeat: event.repeat,
-              });
-              if (intent === 'escape' && goalInputActive) {
-                event.preventDefault();
-                event.stopPropagation();
-                setGoalInputOpen(false);
-                return;
-              }
-              if (intent !== 'submit') return;
-              event.preventDefault();
-              if (goalInputActive) {
-                if (goalObjectiveValid) void submit({ content: content.trim() ? content : goalObjective, goalObjective });
-                return;
-              }
-              if (/^\/goal(?:\s|$)/u.test(content.trim()) && goalAvailable) {
-                if (structuredSelectionRef.current.expertMentions.length > 0) {
-                  setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
-                  return;
-                }
-                const objective = content.trim().slice('/goal'.length).trim();
-                if (['pause', 'resume', 'clear'].includes(objective)) return;
-                setContent('');
-                if (!objective) {
-                  setGoalInputOpen(true);
-                  requestAnimationFrame(() => textareaRef.current?.focus());
-                  return;
-                }
-                setGoalObjective(objective);
+          <div className="session-composer-editor-with-suggestion" data-enabled={props.onGenerateInputSuggestion ? 'true' : undefined}>
+            {props.onGenerateInputSuggestion ? <InputSuggestionButton suggestion={suggestion} draft={content} inputRef={textareaRef} language={props.language} configured={Boolean(props.inputSuggestionSettings?.modelRef)} /> : null}
+            <StructuredComposerInput
+              tokenDraft={tokenDraft}
+              value={content}
+              onValueChange={(value) => {
+                suggestion.dismiss();
+                setContent(value);
+              }}
+              onSelectionChange={(selection) => {
+                structuredSelectionRef.current = selection;
+              }}
+              textareaRef={textareaRef}
+              projectId={props.owner?.projectId}
+              language={props.language}
+              disabled={submitting || !props.owner}
+              autoFocus={props.autoFocus}
+              ariaLabel={copy.newInput}
+              ariaKeyShortcuts="Enter Shift+Enter Escape"
+              placeholder={copy.newPlaceholder}
+              loadCatalog={props.onLoadSkills}
+              loadEmployees={props.onLoadDigitalEmployees}
+              goalAvailable={goalAvailable}
+              onPlanMode={() => setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))}
+              onGoalMode={() => {
+                if (!goalAvailable) return;
                 setGoalInputOpen(true);
-                void submit({ content: objective, goalObjective: objective });
-                return;
-              }
-              void submit();
-            }}
-          />
+                requestAnimationFrame(() => textareaRef.current?.focus());
+              }}
+              onOpenComputerSettings={props.onOpenComputerSettings}
+              onCompositionStart={() => {
+                suggestion.dismiss();
+                setIsComposing(true);
+              }}
+              onCompositionEnd={() => setIsComposing(false)}
+              onPaste={(event) => {
+                suggestion.dismiss();
+                inputResources.handlePaste(event);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape' && (suggestion.polishedText || suggestion.pending || suggestion.reason)) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  suggestion.dismiss();
+                  return;
+                }
+                if (!goalInputActive) inputResources.handlePasteShortcut(event);
+                const intent = resolveComposerKeyIntent({
+                  key: event.key,
+                  shiftKey: event.shiftKey,
+                  isComposing: isComposing || event.nativeEvent.isComposing,
+                  keyCode: event.nativeEvent.keyCode,
+                  repeat: event.repeat,
+                });
+                if (intent === 'escape' && goalInputActive) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setGoalInputOpen(false);
+                  return;
+                }
+                if (intent !== 'submit') return;
+                event.preventDefault();
+                if (goalInputActive) {
+                  if (goalObjectiveValid) void submit({ content: content.trim() ? content : goalObjective, goalObjective });
+                  return;
+                }
+                if (/^\/goal(?:\s|$)/u.test(content.trim()) && goalAvailable) {
+                  if (structuredSelectionRef.current.expertMentions.length > 0) {
+                    setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
+                    return;
+                  }
+                  const objective = content.trim().slice('/goal'.length).trim();
+                  if (['pause', 'resume', 'clear'].includes(objective)) return;
+                  setContent('');
+                  if (!objective) {
+                    setGoalInputOpen(true);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                    return;
+                  }
+                  setGoalObjective(objective);
+                  setGoalInputOpen(true);
+                  void submit({ content: objective, goalObjective: objective });
+                  return;
+                }
+                void submit();
+              }}
+            />
+          </div>
         )}
         <div className="session-composer-command-row">
           <span className="session-composer-leading-actions">
+            {/* 新建会话与共享输入框使用同一可见提示。 */}
             {props.onChooseAttachments ? (
-              <button
-                type="button"
-                className="session-attachment-button"
-                aria-label={copy.attach}
-                disabled={submitting || inputResources.processing || !props.owner}
-                onClick={async () => {
-                  try {
-                    const selected = await props.onChooseAttachments?.();
-                    if (selected?.length) {
-                      setAttachments((current) => mergeConversationAttachments(current, selected));
+              <IconTooltip label={copy.attach}>
+                <button
+                  type="button"
+                  className="session-attachment-button"
+                  aria-label={copy.attach}
+                  disabled={submitting || inputResources.processing || !props.owner}
+                  onClick={async () => {
+                    try {
+                      const selected = await props.onChooseAttachments?.();
+                      if (selected?.length) {
+                        recoverDraftOperation('input_resource');
+                        setAttachments((current) => mergeConversationAttachments(current, selected));
+                      }
+                    } catch (error) {
+                      recordSystemMessage(systemScope, error, 'input_resource', '输入附件处理失败。');
                     }
-                  } catch (error) {
-                    setLocalError(formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en'));
-                  }
-                }}
-              >
-                <Paperclip aria-hidden="true" weight="regular" />
-              </button>
+                  }}
+                >
+                  <Paperclip aria-hidden="true" weight="regular" />
+                </button>
+              </IconTooltip>
             ) : null}
             <PermissionModeControl
               language={props.language}
@@ -3729,25 +3969,26 @@ export function NewConversationComposer(props: {
             />
             <CollaborationModeControl language={props.language} value={collaborationMode} disabled={submitting || !props.owner} onChange={setCollaborationMode} />
             {goalAvailable ? (
-              <button
-                type="button"
-                className="session-goal-trigger"
-                aria-label={goalInputActive ? copy.exitGoal : copy.createGoal}
-                aria-pressed={goalInputActive}
-                data-active={goalInputActive ? 'true' : 'false'}
-                title={copy.createGoal}
-                disabled={submitting || !props.owner}
-                onClick={() => {
-                  if (!goalInputActive && structuredSelectionRef.current.expertMentions.length > 0) {
-                    setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
-                    return;
-                  }
-                  setGoalInputOpen((open) => !open);
-                  requestAnimationFrame(() => textareaRef.current?.focus());
-                }}
-              >
-                <Target aria-hidden="true" weight={goalInputActive ? 'fill' : 'regular'} />
-              </button>
+              <IconTooltip label={goalInputActive ? copy.exitGoal : copy.createGoal}>
+                <button
+                  type="button"
+                  className="session-goal-trigger"
+                  aria-label={goalInputActive ? copy.exitGoal : copy.createGoal}
+                  aria-pressed={goalInputActive}
+                  data-active={goalInputActive ? 'true' : 'false'}
+                  disabled={submitting || !props.owner}
+                  onClick={() => {
+                    if (!goalInputActive && structuredSelectionRef.current.expertMentions.length > 0) {
+                      setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
+                      return;
+                    }
+                    setGoalInputOpen((open) => !open);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
+                >
+                  <Target aria-hidden="true" weight={goalInputActive ? 'fill' : 'regular'} />
+                </button>
+              </IconTooltip>
             ) : null}
           </span>
           <span className="session-composer-trailing-actions">
@@ -3812,7 +4053,7 @@ export function NewConversationComposer(props: {
                   inputResources.processing ||
                   !props.owner ||
                   (!selectedModel && !needsModelSetup) ||
-                  (!needsModelSetup && (goalInputActive ? !goalObjectiveValid : !content.trim() && attachments.length === 0))
+                  (!needsModelSetup && (goalInputActive ? !goalObjectiveValid : !content.trim() && attachments.length === 0 && !browserDraft.submission))
                 }
                 aria-busy={submitting || undefined}
               >
@@ -3825,13 +4066,97 @@ export function NewConversationComposer(props: {
     </section>
   );
 
-  // 停靠态与普通输入框同为会话列的直接子项，避免恢复容器参与剩余空间分配后把输入框推到正文顶部。
-  if (props.docked) return composer;
-
+  /** 新对话复用已有会话的浏览器布局，网页和批注不依赖模型能力加载。 */
+  const browserWidth = resolveBrowserTargetWidth(browserLayoutWidth, 56, browserExpanded);
   return (
-    <section className="session-new-conversation">
-      <span className="session-new-conversation-spacer" aria-hidden="true" />
-      {composer}
+    <section
+      className="session-new-conversation-workspace"
+      onPointerDownCapture={(event) => {
+        /** 原生网页和输入框沿用已有会话的焦点归属通知。 */
+        const active = browserOpen && event.target instanceof Element && Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
+        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? 'browser' : 'none' });
+      }}
+      onFocusCapture={(event) => {
+        /** 焦点移入浏览器后，原生关闭标签快捷键只作用于当前网页。 */
+        const active = browserOpen && event.target instanceof Element && Boolean(event.target.closest('.session-context-sidecar, .session-context-toolbar-host'));
+        window.zeus?.notifySessionContextActivity?.({ active, kind: active ? 'browser' : 'none' });
+      }}
+    >
+      <header
+        className="session-thread-header"
+        data-context-toolbar={browserOpen || undefined}
+        data-context-full-width={browserExpanded || browserLayoutWidth <= 840 || undefined}
+        style={{ '--session-context-width': `${browserWidth}px` } as CSSProperties}
+      >
+        <div className="session-thread-title-copy">
+          <strong>{props.language === 'zh-CN' ? '新对话' : 'New conversation'}</strong>
+        </div>
+        <div className="session-context-header-tools">
+          <div ref={setBrowserToolbarHost} className="session-context-toolbar-host" />
+          <div className="session-thread-header-actions">
+            <button
+              type="button"
+              className={`session-browser-toggle ${browserOpen ? 'selected' : ''}`}
+              aria-label={props.language === 'zh-CN' ? '内置浏览器' : 'Built-in browser'}
+              aria-pressed={browserOpen}
+              aria-keyshortcuts="Meta+Shift+B Control+Shift+B"
+              data-icon-tooltip={props.language === 'zh-CN' ? '内置浏览器（⌘⇧B）' : 'Built-in browser (⌘⇧B)'}
+              onClick={() => (browserOpen ? void closeBrowser() : setBrowserOpen(true))}
+            >
+              <GlobeSimple aria-hidden="true" weight="regular" />
+            </button>
+          </div>
+        </div>
+      </header>
+      <div ref={browserLayoutRef} className="session-conversation-browser-layout" data-browser-open={browserOpen || undefined} data-browser-expanded={browserExpanded || undefined}>
+        <div className="session-conversation-pane">
+          {draftSystemMessages.length ? (
+            <section className="session-transcript" role="log" aria-label={props.language === 'zh-CN' ? 'Zeus 系统消息' : 'Zeus system messages'}>
+              {draftSystemMessages.map((message) => (
+                <SystemMessageNotice key={message.id} message={message} language={props.language} />
+              ))}
+            </section>
+          ) : null}
+          {props.docked ? (
+            composer
+          ) : (
+            <section className="session-new-conversation">
+              <span className="session-new-conversation-spacer" aria-hidden="true" />
+              {composer}
+            </section>
+          )}
+        </div>
+        <aside
+          className="session-browser-sidecar session-context-sidecar"
+          aria-label={props.language === 'zh-CN' ? '新对话浏览器' : 'New conversation browser'}
+          aria-hidden={!browserOpen}
+          data-context-open={browserOpen}
+          style={{ width: browserOpen ? browserWidth : 0, opacity: browserOpen ? 1 : 0 }}
+        >
+          <div className="session-browser-pane">
+            {browserOpen ? (
+              <BrowserWorkspace
+                toolbarHost={browserToolbarHost}
+                conversationId={browserDraft.conversationId}
+                language={props.language}
+                disabled={submitting}
+                expanded={browserExpanded}
+                canSplit={browserLayoutWidth > 840}
+                onClose={closeBrowser}
+                onToggleExpanded={() => setBrowserExpanded((current) => !current)}
+                onResetSize={() => setBrowserExpanded(false)}
+                onStageComments={(prepared) => {
+                  setBrowserDraft((current) => ({ ...current, submission: mergeBrowserSubmissions(current.submission, prepared) }));
+                  window.zeus?.notifySessionContextActivity?.({ active: false, kind: 'none' });
+                  setBrowserOpen(false);
+                  setBrowserExpanded(false);
+                  requestAnimationFrame(() => textareaRef.current?.focus());
+                }}
+              />
+            ) : null}
+          </div>
+        </aside>
+      </div>
     </section>
   );
 }

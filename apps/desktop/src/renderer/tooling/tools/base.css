@@ -849,3 +849,48 @@
 .macos-ai-app .automation-advanced-settings > .automation-form-section {
   margin-block-start: 16px;
 }
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.macos-ai-app .automation-editor-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 8fr) minmax(0, 5fr);
+  align-items: start;
+  gap: 24px;
+  min-inline-size: 0;
+}
+.macos-ai-app .automation-editor-settings {
+  display: grid;
+  position: relative;
+  align-content: start;
+  gap: 16px;
+  min-inline-size: 0;
+}
+.macos-ai-app .automation-editor-settings::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: -12px;
+  border-inline-start: 1px solid var(--zeus-product-line-soft);
+  pointer-events: none;
+}
+.macos-ai-app .automation-editor-settings .automation-form-grid > :only-child {
+  grid-column: 1 / -1;
+}
+.macos-ai-app .automation-form-section.automation-editor-content {
+  align-content: start;
+  padding-block-end: 0;
+  border-block-end: 0;
+}
+@media (width < 980px) {
+  .macos-ai-app .automation-editor-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .macos-ai-app .automation-editor-settings::before {
+    display: none;
+  }
+  .macos-ai-app .automation-form-section.automation-editor-content {
+    padding-block-end: 16px;
+    border-block-end: 1px solid var(--zeus-product-line-soft);
+  }
+}

@@ -11,6 +11,8 @@ export interface TranscriptNavigationEntry extends ConversationNavigationEntry {
   parentRowKey?: string;
   /** 真实用户消息是否已经进入正文投影。 */
   loaded: boolean;
+  /** 用户消息已显示，但持久目录中的回复还没有进入正文投影。 */
+  needsTurnContent?: boolean;
 }
 
 /** 从发送到历史恢复沿用客户端身份，缺失时才使用模型或持久身份。 */
@@ -24,7 +26,7 @@ export function navigationProviderIdentity(entry: Pick<ConversationNavigationEnt
 }
 
 /** 完整目录提供顺序，实时投影只补充相同发言的内容与新发言。 */
-export function mergeNavigationEntries(history: readonly ConversationNavigationEntry[], live: readonly TranscriptNavigationEntry[]): TranscriptNavigationEntry[] {
+export function mergeNavigationEntries(history: readonly ConversationNavigationEntry[], live: readonly TranscriptNavigationEntry[], contentLoaded?: (entry: ConversationNavigationEntry) => boolean): TranscriptNavigationEntry[] {
   /** 多种权威身份都可命中同一消息，禁止用相同正文猜测去重。 */
   const byIdentity = new Map<string, TranscriptNavigationEntry>();
   for (const entry of live) for (const identity of navigationIdentities(entry)) byIdentity.set(identity, entry);
@@ -41,6 +43,8 @@ export function mergeNavigationEntries(history: readonly ConversationNavigationE
       ...entry,
       rowKey: navigationRowKey(entry),
       loaded: Boolean(current),
+      // 用户气泡先到达不能结束整轮加载；已答题卡使用自身正文，不补读普通回复。
+      needsTurnContent: Boolean(current && !entry.requestId && (entry.hasContent ?? Boolean(entry.response)) && !(contentLoaded ? contentLoaded(entry) : current.response)),
       ...(current ? { prompt: current.prompt || entry.prompt, response: current.response || entry.response, status: current.status, parentRowKey: current.parentRowKey } : {}),
     };
   });
@@ -97,9 +101,37 @@ export function useConversationNavigation(input: { scopeKey: string | null; refr
           if (identities.has(identity)) throw new Error('历史目录包含重复消息。');
           identities.add(identity);
         }
+        /** 操作摘要用于生成读取范围；拒绝损坏、重复或乱序边界。 */
+        const groups = snapshot.processGroups;
+        if (
+          groups !== undefined &&
+          (!Array.isArray(groups) ||
+            groups.some(
+              (group, index) =>
+                !group ||
+                typeof group.id !== 'string' ||
+                !group.id ||
+                typeof group.turnId !== 'string' ||
+                !group.turnId ||
+                typeof group.afterEntryId !== 'string' ||
+                !group.afterEntryId ||
+                (group.providerTurnId !== null && typeof group.providerTurnId !== 'string') ||
+                (group.beforeEntryId !== null && (typeof group.beforeEntryId !== 'string' || !group.beforeEntryId)) ||
+                !Number.isSafeInteger(group.afterOrder) ||
+                !Number.isSafeInteger(group.itemCount) ||
+                group.itemCount < 0 ||
+                (group.beforeOrder !== null && (!Number.isSafeInteger(group.beforeOrder) || group.beforeOrder <= group.afterOrder)) ||
+                (group.beforeEntryId === null) !== (group.beforeOrder === null) ||
+                (index > 0 && group.afterOrder <= groups[index - 1]!.afterOrder),
+            ) ||
+            new Set(groups.map((group) => group.id)).size !== groups.length)
+        )
+          throw new Error('历史目录包含无效操作组。');
         setResult({ scope: input.scopeKey, snapshot, error: null, loading: false });
       })
       .catch((error: unknown) => {
+        // 页面退出取消的读取没有用户可处理的问题，不显示错误提示。
+        if (error instanceof Error && error.name === 'AbortError') return;
         if (!cancelled) setResult((previous) => ({ ...previous, error: error instanceof Error ? error.message : '历史目录读取失败。', loading: false }));
       });
     return () => {
@@ -131,7 +163,7 @@ export const ConversationNavigation = memo(function ConversationNavigation(props
   const railRef = useRef<HTMLElement | null>(null);
   /** 每条刻度的真实元素用于定位预览和焦点。 */
   const buttonsRef = useRef(new Map<string, HTMLButtonElement>());
-  /** 首次悬停等待，邻近刻度共享这一次等待。 */
+  /** 导航首次停留独立等待 250 毫秒，已打开的预览允许连续切换。 */
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 跨越刻度与卡片间隙时不立即关闭。 */
   const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -145,13 +177,12 @@ export const ConversationNavigation = memo(function ConversationNavigation(props
   const preview = props.entries.find((entry) => entry.rowKey === previewKey);
   /** 文案随会话语言切换。 */
   const zh = props.language === 'zh-CN';
-
   /** 重入只撤销关闭，不重置动画起点。 */
   const cancelClose = useCallback(() => {
     if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
     leaveTimerRef.current = null;
   }, []);
-  /** 键盘立即预览，鼠标首次停留后才显示。 */
+  /** 键盘和连续浏览立即预览；完全关闭后的首次悬停独立等待。 */
   const show = useCallback(
     (rowKey: string, immediate = false) => {
       cancelClose();
@@ -265,7 +296,10 @@ export const ConversationNavigation = memo(function ConversationNavigation(props
           aria-current={props.activeRowKey === entry.rowKey ? 'true' : undefined}
           aria-label={`${zh ? '跳到：' : 'Jump to: '}${entry.prompt}`}
           tabIndex={entry.rowKey === (props.activeRowKey ?? props.entries[0]?.rowKey) ? 0 : -1}
-          onPointerEnter={() => show(entry.rowKey)}
+          onPointerEnter={(event) => {
+            if (event.pointerType !== 'touch' && event.buttons === 0) show(entry.rowKey);
+          }}
+          onPointerLeave={() => hide()}
           onFocus={(event) => {
             if (event.currentTarget.matches(':focus-visible')) show(entry.rowKey, true);
           }}

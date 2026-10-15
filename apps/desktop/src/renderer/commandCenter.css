@@ -855,7 +855,6 @@
 
 /* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
 
-
 .command-run-details > summary::-webkit-details-marker,
 .command-parameter-help > summary::-webkit-details-marker {
   display: none;
@@ -1217,4 +1216,55 @@
   .command-run-details > summary > svg {
     transition: none;
   }
+}
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.project-command-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(1100px, calc(100vw - 32px));
+  height: min(800px, calc(100dvh - 64px));
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.project-command-dialog .command-center {
+  padding: 20px;
+  gap: 14px;
+}
+
+.project-command-dialog .command-center-header {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.command-center-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--zeus-control-muted-text);
+}
+
+.command-center-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+.command-center-close:hover:not(:disabled) {
+  background: var(--zeus-interaction-hover);
+  color: var(--zeus-control-text);
+}
+
+.command-center-close:focus-visible {
+  outline: 2px solid var(--zeus-control-accent);
+  outline-offset: -2px;
 }

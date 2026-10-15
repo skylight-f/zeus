@@ -1,5 +1,6 @@
 import { classifyAssistantMessage } from '@zeus/shared';
-import { type KeyboardEvent, type RefObject, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type HTMLAttributes, type KeyboardEvent, type RefObject, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useHoverIntent } from '../ui/useHoverIntent.js';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { BrowserCommentPreview } from './BrowserCommentPreview.js';
@@ -25,15 +26,18 @@ import { autosizeTextarea } from './textareaAutosize.js';
 import { CollaborationModeControl } from './CollaborationModeControl.js';
 import { ConversationComposerAttachments } from './ConversationComposerAttachments.js';
 import { ContextUsageIndicator } from './ContextUsageIndicator.js';
+import { IconTooltip } from '../ui/IconTooltip.js';
 import { ServiceTierToggle } from './ServiceTierToggle.js';
 import { resolveModelCapability } from './modelSelection.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
 import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
 
-import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { systemMessageScope, recordSystemMessage, recoverSystemMessage, useConversationSystemMessages } from './conversationSystemMessages.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import type { ComposerInputHandle } from './MarkdownComposerEditor.js';
+import { useInputSuggestion } from './useInputSuggestion.js';
+import { InputSuggestionButton } from './InputSuggestionControl.js';
 
 export type ComposerKeyIntent = 'submit' | 'newline' | 'escape' | 'ignore';
 export interface ComposerRuntimeSettings {
@@ -48,6 +52,10 @@ export interface ComposerRuntimeSettings {
 }
 
 export interface ConversationComposerProps {
+  /** 主输入框独享建议设置；答题和其他复用输入框保持原有行为。 */
+  inputSuggestionSettings?: import('@zeus/shared').InputSuggestionSettings;
+  /** 生成灰字或润色候选，不提交下一轮或改变执行队列。 */
+  onGenerateInputSuggestion?: (input: import('@zeus/shared').InputSuggestionRequest, signal: AbortSignal, diagnosticId?: string) => Promise<import('@zeus/shared').InputSuggestionResult>;
   state: NativeSessionState;
   language: SessionUiLanguage;
   textareaRef?: RefObject<ComposerInputHandle | null>;
@@ -86,6 +94,8 @@ const labels = {
     input: (provider: string) => `发送消息给 ${provider}`,
     placeholder: '继续对话，Enter 发送，Shift+Enter 换行',
     send: '发送',
+    /** 空输入时，发送按钮明确提交当前可见建议。 */
+    sendSuggestion: '发送输入建议',
     stop: '停止',
     attach: '添加附件',
     removeAttachment: '移除附件',
@@ -107,6 +117,8 @@ const labels = {
     input: (provider: string) => `Message ${provider}`,
     placeholder: 'Continue the conversation. Enter to send, Shift+Enter for a newline.',
     send: 'Send',
+    /** 与中文一致说明直接发送建议的操作。 */
+    sendSuggestion: 'Send input suggestion',
     stop: 'Stop',
     attach: 'Add attachment',
     removeAttachment: 'Remove attachment',
@@ -137,11 +149,28 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const composingRef = useRef(false);
   const structuredSelectionRef = useRef<StructuredComposerSelection>({ displayText: props.state.draft, promptText: props.state.draft, expertMentions: [], skillReferences: [], pluginReferences: [], computerUseRequested: false });
   const [isComposing, setIsComposing] = useState(false);
-  const [editorValue, setEditorValue] = useState(props.state.draft);
+  /** 输入 DOM 可复用，但草稿本地值必须跟随实际会话归属。 */
+  const editorScopeKey = JSON.stringify([props.state.projectId, props.state.conversationId]);
+  /** 输入法组合中的本地文本不回写到其他会话。 */
+  const [editorDraft, setEditorDraft] = useState({ key: editorScopeKey, text: props.state.draft });
+  /** 切换的首帧即使用新会话草稿，避免旧本地值取消已保存的生成。 */
+  const editorValue = editorDraft.key === editorScopeKey ? editorDraft.text : props.state.draft;
+  /** 所有本地输入更新都捕获当前会话身份。 */
+  const setEditorValue = useCallback((text: string) => setEditorDraft({ key: editorScopeKey, text }), [editorScopeKey]);
   const [goalInputOpen, setGoalInputOpen] = useState(false);
   const [goalDraft, setGoalDraft] = useState('');
   const [goalSubmitting, setGoalSubmitting] = useState(false);
-  const [inputResourceError, setInputResourceError] = useState<unknown>(null);
+  /** 输入区只记录系统消息，正文区域负责按持久位置展示。 */
+  const systemScope = systemMessageScope(props.state.projectId ?? props.projectId ?? '', props.state.conversationId);
+  const pendingSystemMessages = useConversationSystemMessages(systemScope);
+  /** 输入文件的失败与消息提交失败分别记录。 */
+  const setInputResourceError = (error: unknown): void => {
+    if (error) recordSystemMessage(systemScope, error, 'input_resource', '输入附件处理失败。');
+  };
+  /** 只有对应操作实际成功才补充恢复事实。 */
+  const recoverInputOperation = (operation: 'input_resource' | 'message_send'): void => {
+    for (const message of [...Object.values(props.state.systemMessages ?? {}), ...pendingSystemMessages]) if (message.operation === operation && !message.recoveredAt) recoverSystemMessage(systemScope, message);
+  };
   const [selectedModel, setSelectedModel] = useState(initialModel);
   /** 已持久化的下一轮容量；正在执行的请求保持原容量。 */
   const selectedCapacity = props.runtimeSettings?.contextCapacityTokens !== undefined ? props.runtimeSettings.contextCapacityTokens : (props.state.snapshot?.contextCapacityTokens ?? null);
@@ -156,7 +185,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const goalCount = [...goalDraft.trim()].length;
   const goalDraftValid = goalCount > 0 && goalCount <= 4_000;
   const goalOperationBusy = goalSubmitting || props.goalBusy === true;
-  const showSendCommand = props.inputBlocked !== true && (goalInputActive || !active || hasDraft);
   const modelPresentation = useMemo(() => presentModelOptions(props.capabilities?.models ?? [], selectedModel, props.language, { preserveMissingSelection: true }), [props.capabilities?.models, props.language, selectedModel]);
   const effectiveModel = modelPresentation.selectedId || selectedModel;
   const selectedCapability = resolveModelCapability(modelPresentation.models, effectiveModel);
@@ -177,7 +205,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
     disabled: !inputWritable || busy || goalInputActive,
     onTextChange: props.onDraftChange,
     onAddAttachments: (attachments) => {
-      setInputResourceError(null);
+      recoverInputOperation('input_resource');
       props.onAddAttachments?.(attachments);
     },
     onRemoveAttachment: (attachment) => props.onRemoveAttachment?.(attachment),
@@ -202,10 +230,27 @@ export function ConversationComposer(props: ConversationComposerProps) {
     if (textareaRef.current instanceof HTMLTextAreaElement) autosizeTextarea(textareaRef.current);
   }, [editorValue, goalDraft, goalInputActive, textareaRef]);
 
+  /** 自动预测要求空输入且无待处理交互；手动生成可以与主会话并行。 */
+  const suggestion = useInputSuggestion({
+    state: props.state,
+    draft: editorValue,
+    // 待处理问题由后台读取权威状态；这里仅报告即时输入限制，避免落后的会话投影漏掉完成事件。
+    automaticEligible: inputWritable && !hasDraft && editorValue.length === 0 && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
+    settings: props.inputSuggestionSettings,
+    generate: props.onGenerateInputSuggestion,
+    eligible: inputWritable && !busy && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
+  });
+  /** 只有空输入中的可见灰字可直接发送；已有正文优先，附件和评论仍随消息提交。 */
+  const sendableSuggestion = editorValue.length === 0 ? suggestion.text : null;
+  /** 按钮启用与真正发送共用当前可提交的内容，生成中和空结果不计入。 */
+  const hasSendableContent = hasDraft || Boolean(sendableSuggestion?.trim());
+  /** 主会话运行中也允许把已生成的建议加入原有发送队列。 */
+  const showSendCommand = props.inputBlocked !== true && (goalInputActive || !active || hasSendableContent);
+
   useEffect(() => {
     // 拼音尚未上屏时由编辑器本地值持有组合文本，避免会话快照或草稿持久化回写打断输入法。
     if (!composingRef.current) setEditorValue(props.state.draft);
-  }, [props.state.draft]);
+  }, [props.state.draft, setEditorValue]);
 
   useEffect(() => {
     if (!props.goal) return;
@@ -223,10 +268,17 @@ export function ConversationComposer(props: ConversationComposerProps) {
     return () => view.removeEventListener('resize', resize);
   }, [textareaRef]);
 
-  function submit(nextDelivery: 'queue' | 'steer_now'): void {
+  /** 发送按钮明确允许采纳灰字；输入框 Enter 沿用原有草稿发送行为。 */
+  function submit(nextDelivery: 'queue' | 'steer_now', acceptSuggestion = false): void {
     // 附件尚在导入时不能提交，避免正文先发出而附件随后落回草稿。
-    if (inputResources.processing) return;
+    if (!inputWritable || busy || goalOperationBusy || isComposing || composingRef.current || inputResources.processing) return;
     if (nextDelivery === 'queue' && !selectedCapability) return;
+    // 点击按钮后编辑器已失去焦点，使用核对空原文的事务；失败时不发送或清空候选。
+    if (acceptSuggestion && sendableSuggestion?.trim()) {
+      if (!textareaRef.current?.replaceDraft?.('', sendableSuggestion)) return;
+    } else if (!hasDraft) return;
+    suggestion.dismiss();
+    /** 采纳事务同步更新正文与引用后，再捕获发送内容，避免提交空正文。 */
     const structured = structuredSelectionRef.current;
     const settings =
       nextDelivery === 'queue' && effectiveModel
@@ -249,7 +301,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
     setInputResourceError(null);
     void Promise.resolve()
       .then(() => props.onSubmit(nextDelivery, settings))
-      .catch(setInputResourceError);
+      .then(() => recoverInputOperation('message_send'))
+      .catch((error: unknown) => recordSystemMessage(systemScope, error, 'message_send', '消息提交失败。'));
   }
 
   function enterGoalInput(initialObjective?: string): void {
@@ -310,6 +363,21 @@ export function ConversationComposer(props: ConversationComposerProps) {
 
   /** 普通输入与 Markdown 输入共用发送条件和附件快捷键。 */
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement | HTMLDivElement>): void {
+    // 输入法和候选菜单先处理按键；仅真正有焦点的空编辑器可以采纳灰字。
+    if (!isComposing && !composingRef.current && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
+      if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && suggestion.text && textareaRef.current?.insertSuggestion?.(suggestion.text)) {
+        event.preventDefault();
+        event.stopPropagation();
+        suggestion.dismiss();
+        return;
+      }
+      if (event.key === 'Escape' && (suggestion.text || suggestion.polishedText || suggestion.pending || suggestion.reason)) {
+        event.preventDefault();
+        event.stopPropagation();
+        suggestion.dismiss();
+        return;
+      }
+    }
     if (!goalInputActive) inputResources.handlePasteShortcut(event);
     const intent = resolveComposerKeyIntent({
       key: event.key,
@@ -358,6 +426,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
   return (
     <section
       className="session-composer-shell"
+      data-input-suggestion={suggestion.text || suggestion.polishedText || suggestion.pending || suggestion.reason ? 'true' : undefined}
       aria-label={inputLabel}
       aria-busy={busy || inputResources.processing || undefined}
       data-active={active ? 'true' : 'false'}
@@ -375,12 +444,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
       {!goalInputActive && (props.state.contextDraft.responseAnnotations.length || props.state.contextDraft.codeComments.length) ? (
         <ContextDraftAttachment draft={props.state.contextDraft} language={props.language} disabled={!inputWritable || busy} onRemove={() => props.onContextDraftChange?.({ responseAnnotations: [], codeComments: [] })} />
       ) : null}
-      {inputResourceError ? (
-        <p className="session-new-conversation-error" role="alert">
-          <VisibleApplicationError error={inputResourceError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
-        </p>
-      ) : null}
-      <div className="session-composer-input-frame" data-goal-input={goalInputActive ? 'true' : 'false'}>
+      <div className="session-composer-input-frame" data-goal-input={goalInputActive ? 'true' : 'false'} data-input-suggestion={!goalInputActive && props.onGenerateInputSuggestion ? 'true' : undefined}>
         {goalInputActive ? (
           <div className="session-goal-compose-context">
             <Target aria-hidden="true" weight="regular" />
@@ -419,77 +483,91 @@ export function ConversationComposer(props: ConversationComposerProps) {
             onKeyDown={handleKeyDown}
           />
         ) : (
-          <StructuredComposerInput
-            value={editorValue}
-            onValueChange={(nextValue) => {
-              setEditorValue(nextValue);
-              if (!composingRef.current) props.onDraftChange(nextValue);
-            }}
-            onSelectionChange={(selection) => {
-              structuredSelectionRef.current = selection;
-            }}
-            textareaRef={textareaRef}
-            projectId={props.projectId}
-            language={props.language}
-            disabled={!inputWritable || busy || goalOperationBusy}
-            ariaLabel={inputLabel}
-            ariaKeyShortcuts="Enter Shift+Enter Escape Meta+A Control+A"
-            placeholder={props.inputBlocked ? copy.recoveredInputBlocked : copy.placeholder}
-            loadCatalog={props.onLoadExtensions}
-            loadEmployees={props.onLoadEmployees}
-            goalAvailable={props.goalAvailable}
-            onPlanMode={() =>
-              props.onRuntimeSettingsChange?.({
-                model: effectiveModel,
-                effort: effectiveEffort,
-                ...serviceTierWireOverride(selectedServiceTier),
-                permissionMode: props.permissionMode,
-                collaborationMode: props.collaborationMode === 'plan' ? 'default' : 'plan',
-              })
-            }
-            onGoalMode={() => {
-              if (props.goal) props.onOpenGoal?.();
-              else enterGoalInput();
-            }}
-            onOpenComputerSettings={props.onOpenComputerSettings}
-            onCompositionStart={() => {
-              composingRef.current = true;
-              setIsComposing(true);
-            }}
-            onCompositionEnd={(nextValue) => {
-              composingRef.current = false;
-              setIsComposing(false);
-              setEditorValue(nextValue);
-              props.onDraftChange(nextValue);
-            }}
-            onBlur={(nextValue) => {
-              if (!composingRef.current) return;
-              composingRef.current = false;
-              setIsComposing(false);
-              setEditorValue(nextValue);
-              props.onDraftChange(nextValue);
-            }}
-            onPaste={inputResources.handlePaste}
-            onKeyDown={handleKeyDown}
-          />
+          <div className="session-composer-editor-with-suggestion" data-enabled={props.onGenerateInputSuggestion ? 'true' : undefined}>
+            {props.onGenerateInputSuggestion ? <InputSuggestionButton suggestion={suggestion} draft={editorValue} inputRef={textareaRef} language={props.language} configured={Boolean(props.inputSuggestionSettings?.modelRef)} /> : null}
+            <StructuredComposerInput
+              value={editorValue}
+              onValueChange={(nextValue) => {
+                suggestion.dismiss();
+                setEditorValue(nextValue);
+                if (!composingRef.current) props.onDraftChange(nextValue);
+              }}
+              onSelectionChange={(selection) => {
+                structuredSelectionRef.current = selection;
+              }}
+              textareaRef={textareaRef}
+              projectId={props.projectId}
+              language={props.language}
+              disabled={!inputWritable || busy || goalOperationBusy}
+              ariaLabel={inputLabel}
+              ariaKeyShortcuts="Enter Shift+Enter Escape Meta+A Control+A"
+              placeholder={props.inputBlocked ? copy.recoveredInputBlocked : copy.placeholder}
+              suggestion={suggestion.text}
+              loadCatalog={props.onLoadExtensions}
+              loadEmployees={props.onLoadEmployees}
+              goalAvailable={props.goalAvailable}
+              onPlanMode={() =>
+                props.onRuntimeSettingsChange?.({
+                  model: effectiveModel,
+                  effort: selectedEffort,
+                  ...serviceTierWireOverride(selectedServiceTier),
+                  permissionMode: props.permissionMode,
+                  collaborationMode: props.collaborationMode === 'plan' ? 'default' : 'plan',
+                })
+              }
+              onGoalMode={() => {
+                if (props.goal) props.onOpenGoal?.();
+                else enterGoalInput();
+              }}
+              onOpenComputerSettings={props.onOpenComputerSettings}
+              onCompositionStart={() => {
+                suggestion.dismiss();
+                composingRef.current = true;
+                setIsComposing(true);
+              }}
+              onCompositionEnd={(nextValue) => {
+                composingRef.current = false;
+                setIsComposing(false);
+                setEditorValue(nextValue);
+                props.onDraftChange(nextValue);
+              }}
+              onBlur={(nextValue) => {
+                if (!composingRef.current) return;
+                composingRef.current = false;
+                setIsComposing(false);
+                setEditorValue(nextValue);
+                props.onDraftChange(nextValue);
+              }}
+              onPaste={(event) => {
+                suggestion.dismiss();
+                inputResources.handlePaste(event);
+              }}
+              onKeyDown={handleKeyDown}
+            />
+          </div>
         )}
         <div className="session-composer-command-row">
           <span className="session-composer-leading-actions">
+            {/* 附件入口直接显示功能提示，禁用时仍可识别用途。 */}
             {props.onChooseAttachments ? (
-              <button
-                type="button"
-                className="session-attachment-button"
-                aria-label={copy.attach}
-                onClick={() => {
-                  setInputResourceError(null);
-                  void Promise.resolve(props.onChooseAttachments?.()).catch((error: unknown) => {
-                    setInputResourceError(error);
-                  });
-                }}
-                disabled={!inputWritable || busy || inputResources.processing}
-              >
-                <Paperclip aria-hidden="true" weight="regular" />
-              </button>
+              <IconTooltip label={copy.attach}>
+                <button
+                  type="button"
+                  className="session-attachment-button"
+                  aria-label={copy.attach}
+                  onClick={() => {
+                    setInputResourceError(null);
+                    void Promise.resolve()
+                      .then(() => props.onChooseAttachments?.())
+                      .catch((error: unknown) => {
+                        setInputResourceError(error);
+                      });
+                  }}
+                  disabled={!inputWritable || busy || inputResources.processing}
+                >
+                  <Paperclip aria-hidden="true" weight="regular" />
+                </button>
+              </IconTooltip>
             ) : null}
             <PermissionModeControl
               language={props.language}
@@ -522,26 +600,27 @@ export function ConversationComposer(props: ConversationComposerProps) {
               }
             />
             {props.goalAvailable ? (
-              <button
-                type="button"
-                className="session-goal-trigger"
-                aria-label={props.goal ? copy.goal : goalInputActive ? copy.exitGoal : copy.createGoal}
-                aria-haspopup={props.goal ? 'dialog' : undefined}
-                aria-pressed={!props.goal ? goalInputActive : undefined}
-                data-active={goalInputActive || props.goal ? 'true' : 'false'}
-                data-status={props.goal?.status}
-                title={props.goal ? copy.goal : copy.createGoal}
-                onClick={() => {
-                  if (props.goal) props.onOpenGoal?.();
-                  else if (goalInputActive) exitGoalInput();
-                  else if (structuredSelectionRef.current.expertMentions.length > 0) {
-                    setInputResourceError(new Error(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.'));
-                  } else enterGoalInput();
-                }}
-                disabled={props.readOnly === true || props.inputBlocked === true || goalOperationBusy || (props.goal ? !props.onOpenGoal : !props.onSetGoal)}
-              >
-                <Target aria-hidden="true" weight={goalInputActive || props.goal ? 'fill' : 'regular'} />
-              </button>
+              <IconTooltip label={props.goal ? copy.goal : goalInputActive ? copy.exitGoal : copy.createGoal}>
+                <button
+                  type="button"
+                  className="session-goal-trigger"
+                  aria-label={props.goal ? copy.goal : goalInputActive ? copy.exitGoal : copy.createGoal}
+                  aria-haspopup={props.goal ? 'dialog' : undefined}
+                  aria-pressed={!props.goal ? goalInputActive : undefined}
+                  data-active={goalInputActive || props.goal ? 'true' : 'false'}
+                  data-status={props.goal?.status}
+                  onClick={() => {
+                    if (props.goal) props.onOpenGoal?.();
+                    else if (goalInputActive) exitGoalInput();
+                    else if (structuredSelectionRef.current.expertMentions.length > 0) {
+                      setInputResourceError(new Error(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.'));
+                    } else enterGoalInput();
+                  }}
+                  disabled={props.readOnly === true || props.inputBlocked === true || goalOperationBusy || (props.goal ? !props.onOpenGoal : !props.onSetGoal)}
+                >
+                  <Target aria-hidden="true" weight={goalInputActive || props.goal ? 'fill' : 'regular'} />
+                </button>
+              </IconTooltip>
             ) : null}
           </span>
           <span className="session-composer-trailing-actions">
@@ -620,9 +699,9 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 <button
                   type="button"
                   className="session-send-button"
-                  aria-label={goalInputActive ? copy.createGoal : copy.send}
-                  onClick={() => (goalInputActive ? void setGoalObjective(goalDraft) : submit('queue'))}
-                  disabled={!inputWritable || !settingsWritable || busy || goalOperationBusy || inputResources.processing || (goalInputActive ? !goalDraftValid : !hasDraft)}
+                  aria-label={goalInputActive ? copy.createGoal : sendableSuggestion ? copy.sendSuggestion : copy.send}
+                  onClick={() => (goalInputActive ? void setGoalObjective(goalDraft) : submit('queue', true))}
+                  disabled={!inputWritable || !settingsWritable || busy || goalOperationBusy || inputResources.processing || (goalInputActive ? !goalDraftValid : !hasSendableContent)}
                   aria-busy={busy || goalOperationBusy || inputResources.processing || undefined}
                 >
                   {busy || goalOperationBusy || inputResources.processing ? <span className="session-command-spinner" aria-hidden="true" /> : <ArrowUp aria-hidden="true" weight="bold" />}
@@ -647,8 +726,68 @@ export function ConversationComposer(props: ConversationComposerProps) {
   );
 }
 
+/** 两类评论附件共用开关行为，等待只影响悬停，保留键盘和点击查看。 */
+function useContextDraftPreview() {
+  /** CSS 只负责展示，是否展开由真实交互状态决定。 */
+  const [open, setOpen] = useState(false);
+  /** 跨过气泡与详情之间的间隙时保留阅读入口。 */
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** 附件和其他详情采用同一连续停留时间。 */
+  const hoverIntent = useHoverIntent(() => setOpen(true));
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
+
+  /** 点击与键盘操作直接展示，并撤销所有旧计时。 */
+  function show(): void {
+    clearTimeout(closeTimer.current);
+    hoverIntent.cancel();
+    setOpen(true);
+  }
+
+  /** 移出后允许跨越小间隙，焦点仍在详情内时继续阅读。 */
+  function closeLater(element: HTMLElement): void {
+    hoverIntent.cancel();
+    clearTimeout(closeTimer.current);
+    closeTimer.current = setTimeout(() => {
+      if (!element.matches(':hover') && !element.contains(element.ownerDocument.activeElement)) setOpen(false);
+    }, 120);
+  }
+
+  /** 两种附件使用同一组事件，移除按钮不单独创建提示。 */
+  const surfaceProps: HTMLAttributes<HTMLElement> & { 'data-preview-open': boolean } = {
+    'data-preview-open': open,
+    onPointerEnter(event) {
+      clearTimeout(closeTimer.current);
+      if (!open && event.pointerType !== 'touch' && event.buttons === 0) hoverIntent.schedule(event.currentTarget);
+    },
+    onPointerLeave(event) {
+      closeLater(event.currentTarget);
+    },
+    onFocusCapture(event) {
+      hoverIntent.cancel();
+      if (event.target.matches(':focus-visible') && !event.currentTarget.contains(event.relatedTarget)) show();
+    },
+    onBlurCapture(event) {
+      if (!event.currentTarget.contains(event.relatedTarget)) closeLater(event.currentTarget);
+    },
+    onKeyDown(event) {
+      if (event.key !== 'Escape') return;
+      hoverIntent.cancel();
+      clearTimeout(closeTimer.current);
+      if (!open) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      // 从详情内部关闭时把焦点送回摘要，同一容器内的焦点恢复不会重新展开。
+      event.currentTarget.querySelector<HTMLButtonElement>('.session-context-draft-preview-trigger')?.focus({ preventScroll: true });
+    },
+  };
+  return { open, show, surfaceProps };
+}
+
 /** 待发送评论统一计数，悬停或聚焦时展示原文、来源与内容。 */
 function ContextDraftAttachment(props: { draft: ConversationContextDraft; language: SessionUiLanguage; disabled: boolean; onRemove?: () => void }) {
+  /** 评论摘要沿用共享的延迟与立即打开行为。 */
+  const preview = useContextDraftPreview();
   /** 回答和代码评论在摘要中合计，详情继续保留各自来源。 */
   const count = props.draft.responseAnnotations.length + props.draft.codeComments.length;
   const zh = props.language === 'zh-CN';
@@ -656,9 +795,9 @@ function ContextDraftAttachment(props: { draft: ConversationContextDraft; langua
   const previewId = useId();
   const label = zh ? `${count} 条评论` : `${count} ${count === 1 ? 'comment' : 'comments'}`;
   return (
-    <section className="session-composer-context-draft" aria-label={zh ? '待发送评论' : 'Pending comments'}>
+    <section {...preview.surfaceProps} className="session-composer-context-draft" aria-label={zh ? '待发送评论' : 'Pending comments'}>
       <span className="session-context-draft-chip">
-        <button type="button" className="session-context-draft-preview-trigger" aria-describedby={previewId}>
+        <button type="button" className="session-context-draft-preview-trigger" aria-describedby={preview.open ? previewId : undefined} onClick={preview.show}>
           <ChatCircle aria-hidden="true" weight="regular" />
           <strong>{label}</strong>
         </button>
@@ -666,7 +805,7 @@ function ContextDraftAttachment(props: { draft: ConversationContextDraft; langua
           <span aria-hidden="true">×</span>
         </button>
       </span>
-      <aside id={previewId} className="session-context-draft-preview" role="tooltip">
+      <aside id={previewId} className="session-context-draft-preview" role="tooltip" aria-hidden={!preview.open} inert={!preview.open}>
         <header>
           <strong>{zh ? '待发送详情' : 'Pending details'}</strong>
           <span>{label}</span>
@@ -694,18 +833,30 @@ function ContextDraftAttachment(props: { draft: ConversationContextDraft; langua
   );
 }
 
-/** 浏览器批注可展开查看全文与截图，移除操作独立于预览。 */
-function BrowserSubmissionAttachment(props: { submission: ZeusBrowserPreparedSubmission; language: SessionUiLanguage; disabled: boolean; onRemove?: () => void }) {
+/** 网页评论沿用回答评论的摘要气泡，悬停或聚焦后查看原文与评论。 */
+export function BrowserSubmissionAttachment(props: { submission: ZeusBrowserPreparedSubmission; language: SessionUiLanguage; disabled: boolean; onRemove?: () => void }) {
+  /** 网页评论与代码评论使用同一个展开规则。 */
+  const preview = useContextDraftPreview();
+  /** 详情与当前气泡一一关联，支持键盘聚焦。 */
+  const previewId = useId();
+  /** 统一当前语言的摘要文案。 */
+  const zh = props.language === 'zh-CN';
+  /** 输入框只展示数量，完整内容放入悬浮详情。 */
+  const label = zh ? `${props.submission.comments.length} 条网页评论` : `${props.submission.comments.length} browser comments`;
   return (
-    <section className="session-composer-context-draft session-composer-browser-submission" aria-label={props.language === 'zh-CN' ? '待发送网页评论' : 'Pending browser comments'}>
+    <section {...preview.surfaceProps} className="session-composer-context-draft" aria-label={zh ? '待发送网页评论' : 'Pending browser comments'}>
       <span className="session-context-draft-chip">
-        <ChatCircle aria-hidden="true" weight="regular" />
-        <strong>{props.language === 'zh-CN' ? `${props.submission.comments.length} 条网页评论` : `${props.submission.comments.length} browser comments`}</strong>
+        <button type="button" className="session-context-draft-preview-trigger" aria-describedby={preview.open ? previewId : undefined} onClick={preview.show}>
+          <ChatCircle aria-hidden="true" weight="regular" />
+          <strong>{label}</strong>
+        </button>
         <button type="button" aria-label={props.language === 'zh-CN' ? '移除网页评论' : 'Remove browser comments'} onClick={props.onRemove} disabled={props.disabled || !props.onRemove}>
           <span aria-hidden="true">×</span>
         </button>
       </span>
-      <BrowserCommentPreview comments={props.submission.comments} zh={props.language === 'zh-CN'} />
+      <aside id={previewId} className="session-context-draft-preview" aria-label={zh ? '网页评论详情' : 'Browser comment details'} aria-hidden={!preview.open} inert={!preview.open}>
+        <BrowserCommentPreview comments={props.submission.comments} zh={zh} />
+      </aside>
     </section>
   );
 }

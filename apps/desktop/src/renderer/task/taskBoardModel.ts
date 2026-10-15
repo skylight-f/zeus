@@ -1,4 +1,6 @@
+import { taskDeadlineTimes } from '@zeus/shared';
 import {
+  taskTypeOrder,
   taskBoardEmptyGroupId,
   taskBoardLayoutKey,
   type TaskBoardCalculation,
@@ -18,6 +20,9 @@ import { taskAgentRunStatusLabels } from './TaskRunStatusChip.js';
 import { formatTaskType, type TaskBranchStatus } from './taskWorkspaceModel.js';
 
 export interface TaskBoardProjectionContext {
+  /** 共享时钟和项目终态用于到期显示。 */
+  now?: number;
+  terminalStatuses?: readonly string[];
   language: 'zh-CN' | 'en-US';
   tasks: TaskRecord[];
   settings: TaskBoardViewSettings;
@@ -81,7 +86,7 @@ export function taskBoardGroupOptions(context: TaskBoardProjectionContext, prope
   const zh = context.language === 'zh-CN';
   if (property === 'managementStatus') return context.statusDefinitions.map((status) => ({ id: status.id, label: status.label?.trim() || defaultManagementStatusLabels[context.language][status.id] || status.id, color: status.color }));
   if (property === 'priority') return priorityOptions;
-  if (property === 'taskType') return (['requirement', 'defect', 'optimization'] as const).map((taskType) => ({ id: taskType, label: formatTaskType(taskType, context.language) }));
+  if (property === 'taskType') return taskTypeOrder.map((taskType) => ({ id: taskType, label: formatTaskType(taskType, context.language) }));
   if (property === 'tags')
     return [
       { id: taskBoardEmptyGroupId, label: zh ? '无标签' : 'No tags' },
@@ -133,6 +138,7 @@ export function taskBoardCardPropertyValues(task: TaskRecord, property: TaskBoar
   if (property === 'tags') return taskBoardGroupValues(task, 'tags', context);
   if (property === 'parentTask') return taskBoardGroupValues(task, 'parentTask', context);
   if (property === 'source') return taskBoardGroupValues(task, 'source', context);
+  if (property === 'deadline') return [task.deadline ? taskDeadlineTimes(task.deadline).dueAt : ''];
   if (property === 'createdAt') return [task.createdAt ?? ''];
   return [task.updatedAt ?? ''];
 }

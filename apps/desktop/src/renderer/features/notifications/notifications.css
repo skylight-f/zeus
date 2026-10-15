@@ -1,0 +1,238 @@
+/* 标题沿用原左缘与高度，仅将通知入口推到同一行的右端。 */
+.macos-ai-app.zeus-shell .project-sidebar-brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  margin-block-end: 4px;
+}
+.macos-ai-app.zeus-shell .project-sidebar-brand-row .project-sidebar-brand {
+  margin-block-end: 0;
+}
+/* 紧凑入口保留可点击面积，数字不挤压品牌文案。 */
+.macos-ai-app.zeus-shell .automation-notification-trigger {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 32px;
+  inline-size: 32px;
+  block-size: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--zeus-product-muted);
+  background: transparent;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.macos-ai-app.zeus-shell .automation-notification-trigger:hover,
+.macos-ai-app.zeus-shell .automation-notification-trigger[aria-expanded='true'] {
+  background: var(--zeus-hover-background, rgb(127 127 127 / 10%));
+  color: var(--zeus-product-text);
+}
+.automation-notification-trigger:focus-visible,
+.automation-notification-open:focus-visible,
+.automation-notification-read:focus-visible {
+  outline: 2px solid var(--zeus-brand-primary);
+  outline-offset: 2px;
+}
+/* 高对比角标不依赖颜色单独表达未读状态。 */
+.macos-ai-app.zeus-shell .automation-notification-badge {
+  position: absolute;
+  inset-block-start: -2px;
+  inset-inline-end: -3px;
+  box-sizing: border-box;
+  min-inline-size: 16px;
+  block-size: 16px;
+  padding-inline: 4px;
+  border-radius: 10px;
+  background: var(--zeus-brand-primary);
+  /* 深浅主题共用紫底白字，不跟随铃铛的灰色文字。 */
+  color: white;
+  font-size: 10px;
+  line-height: 16px;
+  font-weight: 650;
+  text-align: center;
+  pointer-events: none;
+  white-space: nowrap;
+}
+/* 原生顶层表面继承主题；视口约束防止窄窗溢出。 */
+.automation-notification-popover {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 0;
+  width: min(380px, calc(100vw - 16px));
+  max-height: min(520px, calc(100dvh - 16px));
+  box-sizing: border-box;
+  border: 1px solid var(--zeus-card-border);
+  border-radius: 10px;
+  background: var(--zeus-popover-bg);
+  color: var(--zeus-product-text);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 18%);
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-app-region: no-drag;
+}
+.automation-notification-popover:popover-open {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.automation-notification-popover::backdrop {
+  background: transparent;
+}
+/* 固定标题与分页，只有通知正文区域滚动。 */
+.automation-notification-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--zeus-product-line-soft);
+}
+/* 已读操作固定在标题右端，不随通知列表滚出视口。 */
+.automation-notification-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-inline-start: auto;
+}
+.automation-notification-header-actions > span,
+.automation-notification-time {
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+.automation-notification-list {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.automation-notification-list ul {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.automation-notification-item {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--zeus-product-line-soft);
+  overflow-wrap: anywhere;
+}
+.automation-notification-item:last-child {
+  border-bottom: 0;
+}
+/* 标题独立导航，描述和已读操作不嵌套进标题按钮。 */
+.automation-notification-open,
+.automation-notification-summary {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  text-align: start;
+  color: inherit;
+  font: inherit;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+.automation-notification-open {
+  cursor: pointer;
+}
+.automation-notification-open:hover > strong {
+  color: var(--zeus-brand-primary);
+}
+.automation-notification-open:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+/* 标题最多一行，完整名称保留在悬停说明和可访问名称中。 */
+.automation-notification-open > strong,
+.automation-notification-summary > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 时间是独立主体，靠右展示并保持完整，不再承载项目和状态字段。 */
+.automation-notification-time {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  white-space: nowrap;
+}
+.automation-notification-description {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+}
+/* 异常摘要最多两行，独立的完整说明按钮始终可见。 */
+.macos-ai-app .automation-notification-description .application-error-inline {
+  display: flex;
+  align-items: flex-start;
+}
+.macos-ai-app .automation-notification-description .application-error-inline-summary {
+  flex: 1 1 auto;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.automation-notification-item-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 单条已读不额外占一行；布局始终预留点击区域，显隐时不会挤动标题。 */
+.macos-ai-app.zeus-shell .automation-notification-read.zeus-button[data-button-size='compact'] {
+  flex: 0 0 24px;
+  inline-size: 24px;
+  min-inline-size: 24px;
+  block-size: 24px;
+  min-block-size: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--zeus-product-muted);
+  opacity: 0;
+}
+.macos-ai-app.zeus-shell .automation-notification-item:hover .automation-notification-read.zeus-button,
+.macos-ai-app.zeus-shell .automation-notification-item:focus-within .automation-notification-read.zeus-button,
+.macos-ai-app.zeus-shell .automation-notification-read.zeus-button[data-loading='true'] {
+  opacity: 1;
+}
+.macos-ai-app.zeus-shell .automation-notification-read.zeus-button:hover {
+  color: var(--zeus-product-text);
+  background: var(--zeus-hover-background, rgb(127 127 127 / 10%));
+}
+/* 触控或无悬停输入始终显示操作，不让用户寻找隐藏按钮。 */
+@media (hover: none) {
+  .macos-ai-app.zeus-shell .automation-notification-read.zeus-button[data-button-size='compact'] {
+    opacity: 1;
+  }
+}
+.automation-notification-empty {
+  padding: 24px 16px;
+  margin: 0;
+  color: var(--zeus-product-muted);
+  text-align: center;
+}
+.automation-notification-error {
+  padding: 10px 16px;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--zeus-product-line-soft);
+}
+.automation-notification-error p {
+  margin: 0 0 8px;
+}
+.automation-notification-footer {
+  display: flex;
+  justify-content: center;
+  padding: 10px 16px;
+  border-top: 1px solid var(--zeus-product-line-soft);
+}

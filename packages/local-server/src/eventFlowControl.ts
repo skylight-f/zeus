@@ -28,12 +28,15 @@ export interface ConversationEventFlowSnapshot {
 export const conversationEventTypeRegistry = {
   critical_fact: [
     'conversation.created',
+    'conversation.title.changed',
     'conversation.thread.changed',
     'conversation.thread.archived',
     'conversation.thread.unarchived',
     'conversation.transport.changed',
     'conversation.turn.started',
+    'conversation.system_message.updated',
     'conversation.turn.completed',
+    'conversation.turn.retrying',
     'conversation.request.created',
     'conversation.request.changed',
     'conversation.request.resolved',

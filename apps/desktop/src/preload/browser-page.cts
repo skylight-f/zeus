@@ -1,8 +1,5 @@
 import { ipcRenderer } from 'electron';
-
-/** 评论选项采用 Phosphor SlidersHorizontal 的 regular 原始路径，沙箱预加载无需引入 React。 */
-const commentOptionsIcon =
-  '<svg aria-hidden="true" viewBox="0 0 256 256" fill="currentColor" data-phosphor-icon="SlidersHorizontal"><path d="M40,88H73a32,32,0,0,0,62,0h81a8,8,0,0,0,0-16H135a32,32,0,0,0-62,0H40a8,8,0,0,0,0,16Zm64-24A16,16,0,1,1,88,80,16,16,0,0,1,104,64ZM216,168H199a32,32,0,0,0-62,0H40a8,8,0,0,0,0,16h97a32,32,0,0,0,62,0h17a8,8,0,0,0,0-16Zm-48,24a16,16,0,1,1,16-16A16,16,0,0,1,168,192Z"></path></svg>';
+import { installIconTooltips } from './iconTooltip.js';
 
 function invokeBrowserPageCommand(commandType: string, body: unknown): Promise<unknown> {
   const commandId = globalThis.crypto.randomUUID();
@@ -86,13 +83,6 @@ const state = {
   editorAnchor: null as PageAnchor | null,
   editorPoint: null as { x: number; y: number } | null,
   editorTarget: null as HTMLElement | null,
-  originalText: null as string | null,
-  editorTextNode: null as Text | null,
-  originalTextNodeValue: null as string | null,
-  originalInlineStyles: new Map<string, string>(),
-  originalInlinePriorities: new Map<string, string>(),
-  originalComputedStyles: new Map<string, string>(),
-  adjustedProperties: new Set<string>(),
   renderScheduled: false,
 };
 
@@ -111,6 +101,9 @@ function install(): void {
   rootHost.id = overlayRootId;
   rootHost.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
   shadow = rootHost.attachShadow({ mode: 'closed' });
+  /** 评论浮层使用共享提示机制，监听只作用于自己的 ShadowRoot。 */
+  const disposeIconTooltips = installIconTooltips(shadow);
+  window.addEventListener('pagehide', disposeIconTooltips, { once: true });
   const style = document.createElement('style');
   style.textContent = `
     :host { all: initial; color-scheme: light dark; }
@@ -138,14 +131,6 @@ function install(): void {
     .editor button[data-listening="true"] { background: rgb(118 56 245 / 12%); color: #7638f5; }
     .editor button:focus-visible,.editor input:focus-visible,.editor textarea:focus-visible { outline: 2px solid #7638f5; outline-offset: 2px; }
     .editor textarea:focus-visible { outline: 0; }
-    .adjust { margin: 2px 5px 5px; padding: 10px 4px 3px; border-top: 1px solid rgb(32 33 36 / 10%); display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .adjust[hidden] { display: none; }
-    .adjust label { display: grid; gap: 4px; color: #6f6f6f; font-size: 11px; }
-    .adjust label.wide { grid-column: 1 / -1; }
-    .adjust input { width: 100%; height: 30px; border: 1px solid rgb(32 33 36 / 15%); border-radius: 8px; padding: 0 8px; background: light-dark(#fff, #292a2d); color: inherit; }
-    .adjust input[type="color"] { padding: 3px; }
-    @media (max-width: 360px) { .editor,.editor[data-expanded="true"] { width: calc(100vw - 24px); } }
-    @media (prefers-reduced-motion: reduce) { .marker { transition: none; } }
   `;
   shadow.append(style);
   hoverOutline = document.createElement('div');
@@ -281,6 +266,7 @@ function systemBrowserUrlFromEvent(event: MouseEvent): string | null {
   }
 }
 
+/** 网页评论只采集评论文本，与会话评论使用相同的确认和取消操作。 */
 function openEditor(
   anchor: PageAnchor,
   target: HTMLElement | null,
@@ -291,57 +277,29 @@ function openEditor(
   existing?: BrowserComment,
 ): void {
   if (!editor) return;
-  restorePreview();
   state.editingCommentId = existing?.id;
   state.editorAnchor = anchor;
   state.editorPoint = point;
   state.editorTarget = target;
-  state.originalText = target?.textContent ?? null;
-  state.editorTextNode = target ? editableTextNode(target) : null;
-  state.originalTextNodeValue = state.editorTextNode?.data ?? null;
-  state.originalInlineStyles.clear();
-  state.originalInlinePriorities.clear();
-  state.originalComputedStyles.clear();
-  state.adjustedProperties.clear();
   editor.dataset.expanded = 'false';
   editor.innerHTML = `
     <div class="editor-row">
-      <button type="button" data-action="adjust" aria-label="评论选项" title="评论选项" aria-expanded="false">
-        ${commentOptionsIcon}
-      </button>
+      <button type="button" data-action="cancel" aria-label="取消评论" data-icon-tooltip="取消评论">×</button>
       <textarea rows="1" aria-label="评论内容" placeholder="添加评论…" maxlength="20000"></textarea>
-      <button type="button" data-action="voice" aria-label="Voice input" title="Voice input">
+      <button type="button" data-action="voice" aria-label="语音输入" data-icon-tooltip="语音输入">
         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6"></path>
         </svg>
       </button>
-      <button type="button" class="editor-save" data-action="save" aria-label="完成评论" title="完成评论并添加到输入框">
+      <button type="button" class="editor-save" data-action="save" aria-label="完成评论" data-icon-tooltip="完成评论并添加到输入框">
         <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="m6 12.5 4 4L18.5 8"></path>
         </svg>
       </button>
     </div>
-    <div class="adjust" hidden>
-      <button type="button" data-action="cancel" aria-label="取消评论" title="取消评论">×</button>
-      <label class="wide">文字<input data-adjust="text" type="text" value=""></label>
-      <label>字号<input data-adjust="font-size" type="text" placeholder="e.g. 16px"></label>
-      <label>内边距<input data-adjust="padding" type="text" placeholder="e.g. 12px"></label>
-      <label>文字颜色<input data-adjust="color" type="color" value="#1f2937"></label>
-      <label>背景颜色<input data-adjust="background-color" type="color" value="#ffffff"></label>
-    </div>
   `;
   const textarea = editor.querySelector<HTMLTextAreaElement>('textarea')!;
   textarea.value = existing?.body ?? '';
-  const textInput = editor.querySelector<HTMLInputElement>('[data-adjust="text"]')!;
-  textInput.value = (state.originalTextNodeValue ?? target?.textContent ?? '').trim().slice(0, 2_000);
-  editor.querySelector('[data-action="adjust"]')?.addEventListener('click', () => {
-    const controls = editor?.querySelector<HTMLElement>('.adjust');
-    if (!controls || !editor) return;
-    controls.hidden = !controls.hidden;
-    editor.dataset.expanded = String(!controls.hidden || textarea.scrollHeight > 36);
-    editor.querySelector('[data-action="adjust"]')?.setAttribute('aria-expanded', String(!controls.hidden));
-    positionEditor(anchor);
-  });
   editor.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeEditor());
   editor.querySelector('[data-action="save"]')?.addEventListener('click', () => void saveComment());
   const voiceButton = editor.querySelector<HTMLButtonElement>('[data-action="voice"]');
@@ -356,9 +314,6 @@ function openEditor(
       void saveComment();
     }
   });
-  for (const input of editor.querySelectorAll<HTMLInputElement>('[data-adjust]')) {
-    input.addEventListener('input', () => applyPreview(input));
-  }
   editor.hidden = false;
   if (target) drawTargetRect(hoverOutline, target);
   else drawRect(hoverOutline, anchor.rect);
@@ -398,7 +353,7 @@ function syncEditorActions(textarea: HTMLTextAreaElement): void {
   const saveButton = editor.querySelector<HTMLButtonElement>('[data-action="save"]');
   const voiceButton = editor.querySelector<HTMLButtonElement>('[data-action="voice"]');
   if (saveButton) saveButton.disabled = !hasBody;
-  editor.dataset.expanded = String(!editor.querySelector<HTMLElement>('.adjust')?.hidden || textarea.scrollHeight > 36);
+  editor.dataset.expanded = String(textarea.scrollHeight > 36);
   if (voiceButton) voiceButton.hidden = hasBody;
   if (state.editorAnchor) positionEditor(state.editorAnchor);
 }
@@ -408,7 +363,8 @@ function installVoiceInput(button: HTMLButtonElement, textarea: HTMLTextAreaElem
     (window as unknown as { webkitSpeechRecognition?: SpeechRecognitionConstructor; SpeechRecognition?: SpeechRecognitionConstructor }).SpeechRecognition ??
     (window as unknown as { webkitSpeechRecognition?: SpeechRecognitionConstructor }).webkitSpeechRecognition;
   if (!Recognition) {
-    button.title = 'Focus this field, then use system dictation';
+    button.dataset.iconTooltip = '聚焦输入框后使用系统听写';
+    button.setAttribute('aria-label', button.dataset.iconTooltip);
     button.addEventListener('click', () => textarea.focus());
     return;
   }
@@ -433,11 +389,16 @@ function installVoiceInput(button: HTMLButtonElement, textarea: HTMLTextAreaElem
     };
     const finish = (): void => {
       button.dataset.listening = 'false';
+      button.dataset.iconTooltip = '语音输入';
+      button.setAttribute('aria-label', '语音输入');
       speechRecognition = null;
     };
     recognition.onend = finish;
     recognition.onerror = finish;
     button.dataset.listening = 'true';
+    // 常见停止操作不新增气泡，辅助名称继续说明当前动作。
+    delete button.dataset.iconTooltip;
+    button.setAttribute('aria-label', '停止语音输入');
     recognition.start();
   });
 }
@@ -454,7 +415,6 @@ async function saveComment(): Promise<void> {
   }
   const buttons = [...editor.querySelectorAll<HTMLButtonElement>('button')];
   for (const button of buttons) button.disabled = true;
-  const designChanges = collectDesignChanges();
   editor.hidden = true;
   render();
   try {
@@ -462,9 +422,10 @@ async function saveComment(): Promise<void> {
       commentId: state.editingCommentId,
       body,
       anchor: state.editorAnchor,
-      designChanges: designChanges.length ? designChanges : (state.comments.find((comment) => comment.id === state.editingCommentId)?.designChanges ?? []),
+      // 保留旧评论的已存调整信息，新评论只记录用户内容。
+      designChanges: state.comments.find((comment) => comment.id === state.editingCommentId)?.designChanges ?? [],
     });
-    closeEditor(false);
+    closeEditor();
   } catch (error) {
     editor.hidden = false;
     render();
@@ -474,75 +435,12 @@ async function saveComment(): Promise<void> {
   }
 }
 
-function applyPreview(input: HTMLInputElement): void {
-  if (!editor || !state.editorTarget) return;
-  const target = state.editorTarget;
-  const property = input.dataset.adjust;
-  if (!property) return;
-  state.adjustedProperties.add(property);
-  if (property === 'text') {
-    if (state.editorTextNode && state.originalTextNodeValue !== null) {
-      state.editorTextNode.data = replaceTextNodeValue(state.originalTextNodeValue, input.value);
-    } else if (state.originalText !== null) {
-      target.textContent = input.value;
-    }
-  } else {
-    if (!state.originalInlineStyles.has(property)) {
-      state.originalInlineStyles.set(property, target.style.getPropertyValue(property));
-      state.originalInlinePriorities.set(property, target.style.getPropertyPriority(property));
-      state.originalComputedStyles.set(property, getComputedStyle(target).getPropertyValue(property).trim());
-    }
-    const value = input.value.trim();
-    if (value) target.style.setProperty(property, value, 'important');
-    else {
-      const original = state.originalInlineStyles.get(property);
-      if (original) target.style.setProperty(property, original, state.originalInlinePriorities.get(property) || '');
-      else target.style.removeProperty(property);
-    }
-  }
-  scheduleRender();
-}
-
-function collectDesignChanges(): DesignChange[] {
-  if (!editor || !state.editorTarget || !state.editorAnchor) return [];
-  const changes: DesignChange[] = [];
-  const textInput = editor.querySelector<HTMLInputElement>('[data-adjust="text"]');
-  const previousText = state.originalTextNodeValue?.trim() ?? state.originalText;
-  if (state.adjustedProperties.has('text') && textInput && previousText !== null && textInput.value !== previousText) {
-    changes.push({ kind: 'text', selector: state.editorAnchor.selector, previous: previousText, next: textInput.value });
-  }
-  for (const property of state.adjustedProperties) {
-    if (property === 'text') continue;
-    const input = editor.querySelector<HTMLInputElement>(`[data-adjust="${CSS.escape(property)}"]`);
-    if (!input) continue;
-    const next = input.value.trim();
-    if (!next) continue;
-    const previous = state.originalComputedStyles.get(property) ?? state.originalInlineStyles.get(property) ?? '';
-    if (previous.trim() !== next) changes.push({ kind: 'style', selector: state.editorAnchor.selector, property, previous: previous.trim(), next });
-  }
-  return changes;
-}
-
-function restorePreview(): void {
-  const target = state.editorTarget;
-  if (!target) return;
-  if (state.editorTextNode && state.originalTextNodeValue !== null) {
-    state.editorTextNode.data = state.originalTextNodeValue;
-  } else if (state.originalText !== null) {
-    target.textContent = state.originalText;
-  }
-  for (const [property, value] of state.originalInlineStyles) {
-    if (value) target.style.setProperty(property, value, state.originalInlinePriorities.get(property) || '');
-    else target.style.removeProperty(property);
-  }
-}
-
-function closeEditor(restore = true): void {
+/** 关闭评论仅清理浮层，不修改被评论的网页内容。 */
+function closeEditor(): void {
   if (speechRecognition) {
     speechRecognition.stop();
     speechRecognition = null;
   }
-  if (restore) restorePreview();
   if (editor) {
     editor.hidden = true;
     editor.innerHTML = '';
@@ -555,13 +453,6 @@ function closeEditor(restore = true): void {
   state.editorAnchor = null;
   state.editorPoint = null;
   state.editorTarget = null;
-  state.originalText = null;
-  state.editorTextNode = null;
-  state.originalTextNodeValue = null;
-  state.originalInlineStyles.clear();
-  state.originalInlinePriorities.clear();
-  state.originalComputedStyles.clear();
-  state.adjustedProperties.clear();
   window.getSelection()?.removeAllRanges();
 }
 
@@ -571,7 +462,7 @@ function elementAnchor(element: Element): PageAnchor {
   const role = element.getAttribute('role') || implicitRole(element);
   const explicitAccessibleName = element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || '';
   const inputValue = element instanceof HTMLInputElement ? element.value : '';
-  const semanticText = element instanceof HTMLElement ? editableTextNode(element)?.data : element.textContent;
+  const semanticText = element instanceof HTMLElement ? firstVisibleTextNode(element)?.data : element.textContent;
   const accessibleName = explicitAccessibleName || (role === 'button' || role === 'link' || role === 'heading' ? normalizedText(inputValue || semanticText || element.textContent, 1_000) : '');
   return baseAnchor('element', rect, {
     selector: selectorFor(element),
@@ -729,27 +620,7 @@ function frameDepth(): number {
 
 function hydrateComments(comments: BrowserComment[]): void {
   state.comments = comments.filter((comment) => comment.status === 'draft' && comment.anchor.frameUrl === location.href);
-  for (const comment of state.comments) applyPersistedDesignChanges(comment);
   renderMarkers();
-}
-
-function applyPersistedDesignChanges(comment: BrowserComment): void {
-  const selector = comment.anchor.selector;
-  if (!selector) return;
-  let target: HTMLElement | null = null;
-  try {
-    target = document.querySelector(selector);
-  } catch {
-    return;
-  }
-  if (!target) return;
-  for (const change of comment.designChanges) {
-    if (change.kind === 'text') {
-      const textNode = editableTextNode(target);
-      if (textNode) textNode.data = replaceTextNodeValue(textNode.data, change.next);
-      else target.textContent = change.next;
-    } else if (change.property) target.style.setProperty(change.property, change.next, 'important');
-  }
 }
 
 function renderMarkers(): void {
@@ -761,7 +632,8 @@ function renderMarkers(): void {
     marker.type = 'button';
     marker.textContent = String(comment.number);
     marker.dataset.commentId = comment.id;
-    marker.setAttribute('aria-label', `Browser comment ${comment.number}: ${comment.body}`);
+    marker.dataset.iconTooltip = `编辑第${comment.number}条网页评论`;
+    marker.setAttribute('aria-label', `${marker.dataset.iconTooltip}：${comment.body}`);
     marker.addEventListener('click', () => {
       // 已保存评论与会话消息一致：点击编号即可编辑，再确认更新草稿。
       openEditor(comment.anchor, null, resolveCommentMarker(comment), comment);
@@ -911,24 +783,23 @@ function normalizedText(value: string | null | undefined, maximum: number): stri
   return (value || '').replace(/\s+/gu, ' ').trim().slice(0, maximum);
 }
 
-function editableTextNode(element: HTMLElement): Text | null {
+/** 读取元素的可见语义文本用于保存锚点，不修改网页节点。 */
+function firstVisibleTextNode(element: HTMLElement): Text | null {
+  /** 遍历当前元素内的文本节点。 */
   const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  /** 当前待检查的文本。 */
   let node = walker.nextNode();
   while (node) {
     if (node instanceof Text && node.data.trim()) {
+      /** 隐藏、脚本和样式内容不作为批注原文。 */
       const parent = node.parentElement;
+      /** 样式只用于判断可见性。 */
       const style = parent ? getComputedStyle(parent) : null;
       if (parent && !parent.closest('script,style,noscript,[aria-hidden="true"]') && style?.display !== 'none' && style?.visibility !== 'hidden') return node;
     }
     node = walker.nextNode();
   }
   return null;
-}
-
-function replaceTextNodeValue(original: string, next: string): string {
-  const leading = original.match(/^\s*/u)?.[0] ?? '';
-  const trailing = original.match(/\s*$/u)?.[0] ?? '';
-  return `${leading}${next}${trailing}`;
 }
 
 function commonSelectionElement(selection: Selection): HTMLElement | null {

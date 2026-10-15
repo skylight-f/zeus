@@ -1,3 +1,6 @@
+import { registerTaskReminderService } from './taskReminderService.js';
+import { registerNotificationRoutes } from './notificationRoutes.js';
+import { repairTaskAttachmentReferences } from './taskAttachmentLifecycle.js';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
 import { resolveArchivedTaskManagementStatus, type ArchivedProjectTaskStatuses } from './taskManagementStatusMigration.js';
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
@@ -10,6 +13,7 @@ import type { TaskWorkToolPort } from './taskWorkDynamicTools.js';
 import { TaskWorkPlanningRepository, TaskWorkReviewRepository, TaskWorkDeploymentRepository } from '@zeus/storage';
 import { hasDatabaseUriPassword } from './projectCore.js';
 import { createAutomationConversationDispatch } from './automationConversationDispatch.js';
+import { createAutomationNotificationService } from './automationNotificationService.js';
 import { probeCodexConversation } from './codexConnectionDiagnostic.js';
 import {
   checkAiCliAdapter,
@@ -79,6 +83,7 @@ import {
   TaskWorkspaceRepository,
   TerminalEventRepository,
   type ZeusConversationRecord,
+  type ZeusConversationSubmissionRecord,
   type ZeusProjectRecord,
   type ZeusTaskIntegrationAttemptRecord,
   type ZeusTaskRecord,
@@ -172,6 +177,8 @@ import { registerProjectGitQueryRoutes } from './projectGitQueryRoutes.js';
 import { ProjectQueryApplication } from './projectQueryApplication.js';
 import { registerProjectQueryRoutes } from './projectQueryRoutes.js';
 import { createCommitCodexPool } from './gitCommitCodexGeneration.js';
+import { registerInputSuggestionRoutes } from './inputSuggestionRoutes.js';
+import { createInputSuggestionDiagnosticLog } from './inputSuggestionDiagnostics.js';
 import { readGitCommitContext, readCommitFingerprint, resolveCommitRepository, resolveTaskCommitRepository } from './gitCommitContext.js';
 import { PassThrough } from 'node:stream';
 import { generateGitCommitMessage } from './gitCommitMessageGeneration.js';
@@ -486,7 +493,7 @@ export type LocalServerPlatformRouteDependencies = Record<string, any> & {
   conversationDispatchCommands: ConversationDispatchCommandApplication;
   conversationAttachmentRoot?: string;
   /** 普通消息与计划修改共享同一个受信资源校验入口。 */
-  normalizeNativeConversationAttachments(value: unknown, projectLocalPath: string): NativeConversationAttachmentInput[];
+  normalizeNativeConversationAttachments(value: unknown, projectLocalPath: string, existingAttachments?: readonly NativeConversationAttachmentInput[]): NativeConversationAttachmentInput[];
   taskAttachmentRoot?: string;
   conversationProviderItems: ConversationProviderItemRepository;
   conversationRequests: ConversationServerRequestRepository;
@@ -910,33 +917,72 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   server.get('/api/projects/:projectId/git/commit-models', async (request: FastifyRequest<{ Params: { projectId: string } }>, reply) => {
     if (!projects.getById(request.params.projectId)) return reply.code(404).send({ error: 'ZEUS_PROJECT_NOT_FOUND', message: '项目不存在。' });
-    const items = (await modelConnections.listSelectableModels())
+    /** 只有提交模型入口预热提交池，建议目录读取不启动额外提交进程。 */
+    const result = await loadTextGenerationModels();
+    if (codexNativeEnabled && !readOnlyValidation && result.items.some((item) => item.id.startsWith('codex:'))) {
+      void commitCodexPool.warm({ commandPath: currentCodexRuntimeCommandPath(), codexHome: options.codexHome ?? dataLayout.codexHome, ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) }).catch(() => {
+        console.info(JSON.stringify({ event: 'git_commit_prewarm_failed' }));
+      });
+    }
+    return result;
+  });
+
+  /** 提交说明和输入建议共用现有模型目录及登录能力。 */
+  async function loadTextGenerationModels(selectedModelRef?: string) {
+    /** 设置入口和生成服务使用同一份模型能力，不能猜测可用档位。 */
+    const items: Array<Pick<CodexModelCapability, 'id' | 'model' | 'supportedReasoningEfforts' | 'defaultReasoningEffort' | 'serviceTiers'> & { label: string }> = (
+      selectedModelRef?.startsWith('codex:') ? [] : await modelConnections.listSelectableModels(selectedModelRef)
+    )
       .filter((model: SelectableConnectionModel) => model.available && model.enabled)
-      .map((model: SelectableConnectionModel) => ({ id: model.id, label: `${model.sourceName} · ${model.displayName}` }));
+      .filter((model: SelectableConnectionModel) => !selectedModelRef || model.id === selectedModelRef)
+      .map((model: SelectableConnectionModel) => ({
+        id: model.id,
+        model: model.model,
+        label: `${model.sourceName} · ${model.displayName}`,
+        supportedReasoningEfforts: model.supportedReasoningEfforts,
+        defaultReasoningEffort: model.defaultReasoningEffort ?? undefined,
+        serviceTiers: model.serviceTiers,
+      }));
+    /** API 生成不初始化无关的 Codex 进程或查询其账户。 */
+    if (selectedModelRef && !selectedModelRef.startsWith('codex:')) return { items, warning: '' };
+    /** 设置页面仍完整展示各供应商的可用模型和告警。 */
     let warning = '';
     try {
       if (!codexNativeEnabled) throw new Error('Codex 尚未启用。');
       const capabilities = await codexAppServerManager.ensureReady({ commandPath: currentCodexRuntimeCommandPath(), ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) });
       const account = await codexAppServerManager.readAccount();
       if (!account.signedIn && account.requiresOpenaiAuth) throw new Error('请先在 Zeus 中登录 Codex，再刷新模型列表。');
-      items.push(...capabilities.models.filter((model: CodexModelCapability) => model.raw.hidden !== true).map((model: CodexModelCapability) => ({ id: `codex:${model.model}`, label: `Codex · ${model.displayName || model.model}` })));
+      items.push(
+        ...capabilities.models
+          .filter((model: CodexModelCapability) => model.raw.hidden !== true)
+          .filter((model: CodexModelCapability) => !selectedModelRef || selectedModelRef === `codex:${model.model}`)
+          .map((model: CodexModelCapability) => ({
+            id: `codex:${model.model}`,
+            model: model.model,
+            label: `Codex · ${model.displayName || model.model}`,
+            supportedReasoningEfforts: model.supportedReasoningEfforts,
+            defaultReasoningEffort: model.defaultReasoningEffort,
+            serviceTiers: model.serviceTiers,
+          })),
+      );
     } catch (error) {
       warning = redactSensitiveText(error instanceof Error ? error.message : 'Codex 模型加载失败。').text;
     }
-    if (codexNativeEnabled && !readOnlyValidation && items.some((item: { id: string }) => item.id.startsWith('codex:'))) {
-      void commitCodexPool.warm({ commandPath: currentCodexRuntimeCommandPath(), codexHome: options.codexHome ?? dataLayout.codexHome, ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) }).catch(() => {
-        console.info(JSON.stringify({ event: 'git_commit_prewarm_failed' }));
-      });
-    }
     return { items, warning };
-  });
+  }
 
   const commitCodexPool = createCommitCodexPool();
   server.addHook('onClose', () => commitCodexPool.close());
   server.post(
     '/api/projects/:projectId/git/commit-message',
     { bodyLimit: 512_000 },
-    async (request: FastifyRequest<{ Params: { projectId: string }; Body: { repositoryId?: unknown; relativePath?: unknown; taskId?: unknown; language?: unknown; modelRef?: unknown; stream?: boolean; selection?: unknown } }>, reply) => {
+    async (
+      request: FastifyRequest<{
+        Params: { projectId: string };
+        Body: { repositoryId?: unknown; relativePath?: unknown; taskId?: unknown; language?: unknown; modelRef?: unknown; effort?: unknown; serviceTier?: unknown; stream?: boolean; selection?: unknown };
+      }>,
+      reply,
+    ) => {
       const project = projects.getById(request.params.projectId);
       if (!project) return reply.code(404).send({ error: 'ZEUS_PROJECT_NOT_FOUND', message: '项目不存在。' });
       const body = request.body;
@@ -946,7 +992,9 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         body.repositoryId.length > 200 ||
         (body.relativePath !== undefined && (typeof body.relativePath !== 'string' || body.relativePath.length > 4096)) ||
         (body.taskId !== undefined && (typeof body.taskId !== 'string' || !body.taskId.trim() || body.taskId.length > 200 || body.selection === undefined)) ||
-        (body.modelRef !== undefined && (typeof body.modelRef !== 'string' || !body.modelRef.trim() || body.modelRef.length > 2000))
+        (body.modelRef !== undefined && (typeof body.modelRef !== 'string' || !body.modelRef.trim() || body.modelRef.length > 2000)) ||
+        (body.effort !== undefined && (typeof body.effort !== 'string' || body.effort.length > 100)) ||
+        (body.serviceTier !== undefined && body.serviceTier !== null && body.serviceTier !== 'priority')
       ) {
         return reply.code(400).send({ error: 'ZEUS_GIT_COMMIT_MESSAGE_INPUT_INVALID', message: '已暂存改动内容无效或过大，请缩小提交范围。' });
       }
@@ -1031,6 +1079,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           language: body.language === 'en' ? ('en' as const) : ('zh-CN' as const),
           ...(selection ? { scope: 'selection' as const } : {}),
           ...(typeof body.modelRef === 'string' ? { modelRef: body.modelRef } : {}),
+          ...(typeof body.effort === 'string' ? { effort: body.effort } : {}),
+          ...(body.serviceTier === null || body.serviceTier === 'priority' ? { serviceTier: body.serviceTier === 'priority' ? ('priority' as const) : null } : {}),
         };
         const run = async () => {
           if (input.modelRef?.startsWith('codex:')) {
@@ -1108,7 +1158,15 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   });
   registerProjectQueryRoutes({ server, application: projectQueries });
 
-  const workManagementQueries = new WorkManagementQueryApplication({ projects, tasks, taskBoards, taskEvents, taskTemplates });
+  /** 查询和提醒共用项目配置中的完成、取消角色。 */
+  const deadlineTerminalStatuses = (projectId: string): string[] => {
+    /** 配置可能在运行中修改，每次读取当前角色。 */
+    const roles = resolveTaskManagementStatusConfigForProject(projectId).roles;
+    return [roles.completedStatusId, roles.cancelledStatusId];
+  };
+  const workManagementQueries = new WorkManagementQueryApplication({ projects, tasks, taskBoards, taskEvents, taskTemplates, terminalStatuses: deadlineTerminalStatuses });
+  /** 统一通知复用这一服务，避免重复创建任务提醒定时器。 */
+  const taskReminders = registerTaskReminderService({ server, db, terminalStatuses: deadlineTerminalStatuses, readOnly: readOnlyValidation, publish: publishRealtimeEvent, now });
   registerWorkManagementQueryRoutes({ server, application: workManagementQueries });
 
   const taskStageApplication = new TaskStageApplication({
@@ -1386,6 +1444,48 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   });
   registerConversationCapabilityQueryRoutes({ server, application: conversationCapabilityQueries });
 
+  /** 正式运行持久保存诊断；只读验收不向正式目录写入文件。 */
+  const inputSuggestionDiagnostics = readOnlyValidation ? undefined : createInputSuggestionDiagnosticLog({ directory: dataLayout.localLogs, source: 'core', appVersion: executionHostAppVersion, instanceId: executionHostInstanceId });
+  /** 建议拥有自己的取消范围，设置修改不会中断主会话。 */
+  const cancelInputSuggestions = registerInputSuggestionRoutes({
+    server,
+    repository: conversationSnapshotV2,
+    projectExists: (projectId) => Boolean(projects.getById(projectId)),
+    getConversation: (conversationId) => conversations.getRecordById(conversationId),
+    /** 只读取本会话队列，提交尚未建轮次时也不能使用上一轮回复。 */
+    hasPendingSubmission: (conversationId) => conversationSubmissions.listQueueProjectionByConversation(conversationId).some((submission: ZeusConversationSubmissionRecord) => ['queued', 'dispatching', 'active'].includes(submission.status)),
+    readSettings: () => (readOnlyValidation ? undefined : platformMutableState.appShellSettings.inputSuggestions),
+    modelConnections,
+    recordDiagnostic: inputSuggestionDiagnostics?.record,
+    flushDiagnostics: inputSuggestionDiagnostics?.flush,
+    loadModels: loadTextGenerationModels,
+    loadModel: async (selectedModelRef) => (await loadTextGenerationModels(selectedModelRef)).items.find((model) => model.id === selectedModelRef),
+    readSources: (projectId, conversationId) => {
+      /** 任务归属来自当前会话，禁止按任务名称寻找其他项目材料。 */
+      const conversation = conversationId ? conversations.getRecordById(conversationId) : undefined;
+      /** 新草稿没有任务身份，不猜测用户当前选中了哪项任务。 */
+      const task = conversation?.taskId ? tasks.getById(conversation.taskId) : undefined;
+      return {
+        task:
+          task?.projectId === projectId && task
+            ? {
+                id: task.id,
+                title: redactSensitiveText(task.title).text,
+                description: redactSensitiveText(
+                  [task.description, task.defectCurrentState, task.defectExpectedOutcome, task.defectReproductionSteps, task.optimizationCurrentState, task.optimizationExpectedOutcome].filter(Boolean).join('\n'),
+                ).text,
+                updatedAt: task.updatedAt,
+              }
+            : null,
+        memories: longTermMemories
+          .resolveForContext({ projectId, asOf: now().toISOString() })
+          .selected.filter((memory: import('@zeus/storage').LongTermMemoryRecord) => memory.confirmationLevel !== 'observed' && (memory.scope.kind === 'global' || memory.scope.kind === 'project'))
+          .map((memory: import('@zeus/storage').LongTermMemoryRecord) => ({ ...memory, content: redactSensitiveText(memory.content).text })),
+      };
+    },
+    codexOptions: () => ({ commandPath: currentCodexRuntimeCommandPath(), codexHome: options.codexHome ?? dataLayout.codexHome, ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) }),
+  });
+
   registerConversationSnapshotV2Api({
     server,
     repository: conversationSnapshotV2,
@@ -1625,6 +1725,16 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     now,
   });
 
+  // 首页附属状态独立读取，不把密钥或仓库扫描放入项目查询。
+  server.get('/api/dashboard/attention', async () => {
+    const projectIds = projects.list().map((project) => project.id);
+    return { conversationAttentionByProject: conversationChoiceQueries.attentionByProject(projectIds), conversationUnreadCountByProject: conversationChoiceQueries.unreadCountByProject(projectIds) };
+  });
+  server.get('/api/dashboard/runtime', async () => ({
+    aiCli: toPassiveRuntimeStatus(platformMutableState.runtimeSettings),
+    telegram: readOnlyValidation ? getTelegramConfigurationState(undefined, []) : getTelegramConfigurationState(await readTelegramToken(), platformMutableState.telegramSecuritySettings.allowedUserIds),
+  }));
+
   server.get('/api/dashboard', async (): Promise<DashboardSnapshot> => {
     const currentProjects = projects.list();
     const boundPort = getBoundPort();
@@ -1763,6 +1873,21 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   );
 
   registerConversationCommandRoutes({
+    /** 命令事务提交后才广播，失败回滚不能泄漏成功消息。 */
+    saveSystemMessage: (conversationId, input) => {
+      /** 原消息与位置登记共用当前命令事务。 */
+      const message = conversationSnapshotV2.systemMessages.save(conversationId, input);
+      /** 内容修订用于重复广播去重，恢复不改变位置修订。 */
+      const revision = `${message.transcript.sources[0]!.revision}:${message.transcript.placement.placementRevision}:${message.transcript.placement.orderEpoch}`;
+      conversationSyncProtocol.append({
+        conversationId,
+        type: 'conversation.system_message.updated',
+        eventId: `system-message:${conversationId}:${message.id}:${revision}`,
+        occurredAt: message.recoveredAt ?? message.occurredAt,
+        payload: { projectId: conversations.getRecordById(conversationId)!.projectId, message, entityRevision: revision },
+      });
+      return message;
+    },
     server,
     application: conversationCommands,
     projects,
@@ -1812,9 +1937,20 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           request: { changeSetId, expectedState, idempotencyKey: operationIdentity },
         }),
       message: executeConversationDispatchMessage,
-      queueUpdate: ({ params, content }) => {
-        requireNativeQueueConversation(params);
-        return conversationQueueCoreMutations.update({ conversationId: params.conversationId, submissionId: params.submissionId, content });
+      queueUpdate: ({ params, content, attachments }) => {
+        /** 附件授权只来自当前项目与当前提交，不复用其他会话的文件权限。 */
+        const conversation = requireNativeQueueConversation(params);
+        /** 只复用当前会话拥有的提交授权。 */
+        const submission = conversationSubmissions.getById(params.submissionId);
+        if (!submission || submission.conversationId !== conversation.id) throw nativeApiError('ZEUS_NATIVE_SUBMISSION_NOT_FOUND', 'Native submission was not found.', 404);
+        /** 新附件按原会话项目校验可信目录。 */
+        const project = projects.getById(conversation.projectId);
+        if (!project) throw nativeApiError('ZEUS_PROJECT_NOT_FOUND', 'Conversation project was not found.', 404);
+        /** 这里只读取服务端自己的持久化输入，忽略客户端声明的 authorizedPath。 */
+        const persisted = JSON.parse(submission.inputJson) as { attachments?: NativeConversationAttachmentInput[] };
+        /** 省略字段保留旧附件，明确传列表时复验每个资源。 */
+        const normalized = attachments === undefined ? undefined : normalizeNativeConversationAttachments(attachments, project.localPath, persisted.attachments ?? []);
+        return conversationQueueCoreMutations.update({ conversationId: params.conversationId, submissionId: params.submissionId, content, ...(normalized !== undefined ? { attachments: normalized } : {}) });
       },
       queueRetry: ({ params }) => {
         const conversation = requireNativeQueueConversation(params);
@@ -3109,14 +3245,15 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
                 resourceFailures += 1;
                 continue;
               }
-              const intent = toConversationResourceOpenIntent(record);
-              const absolutePath = typeof intent.target.absolutePath === 'string' ? resolve(intent.target.absolutePath) : '';
-              const allowedRoot = typeof intent.authority.allowedRoot === 'string' ? resolve(intent.authority.allowedRoot) : '';
-              if (!absolutePath || !allowedRoot || absolutePath === allowedRoot || !isPathInsideRoot(absolutePath, allowedRoot)) {
-                resourceFailures += 1;
-                continue;
-              }
               try {
+                /** 单个附件归档失败计入该条资源，不中断其他已完成输出。 */
+                const intent = toConversationResourceOpenIntent(record);
+                const absolutePath = typeof intent.target.absolutePath === 'string' ? resolve(intent.target.absolutePath) : '';
+                const allowedRoot = typeof intent.authority.allowedRoot === 'string' ? resolve(intent.authority.allowedRoot) : '';
+                if (!absolutePath || !allowedRoot || absolutePath === allowedRoot || !isPathInsideRoot(absolutePath, allowedRoot)) {
+                  resourceFailures += 1;
+                  continue;
+                }
                 const realRoot = realpathSync(allowedRoot);
                 const realFile = realpathSync(absolutePath);
                 const stats = statSync(realFile);
@@ -3425,6 +3562,20 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       );
   const automationTasks = new AutomationTaskRepository(db);
   const automationRuns = new AutomationRunRepository(db);
+  /** 自动化通知复用原执行仓库和事件连接，避免独立业务事实源。 */
+  const automationNotifications = createAutomationNotificationService({
+    db,
+    runs: automationRuns,
+    tasks: automationTasks,
+    conversations,
+    projects,
+    workRuns: taskWorkRuns,
+    legacyExecutions: digitalEmployeeExecutions,
+    readOnly: readOnlyValidation,
+    redact: (message) => redactSensitiveText(message).text,
+    publish: publishRealtimeEvent,
+  });
+  registerNotificationRoutes({ server, db, automations: automationNotifications, tasks: taskReminders, readOnly: readOnlyValidation });
   /** 自动化存储统一接收 ISO 时间，避免 Date 被 SQLite 静默绑定为 NULL。 */
   const automationNow = (): string => now().toISOString();
   /** 无项目自动化复用产品已有临时会话工作区，不创建普通项目。 */
@@ -3440,6 +3591,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     tasks: automationTasks,
     runs: automationRuns,
     db,
+    notifications: automationNotifications,
     ensureTemporaryWorkspace: ensureAutomationTemporaryWorkspace,
     kick: () => automationScheduler?.kick(),
     now: automationNow,
@@ -3589,6 +3741,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   /** 数字团队复用现有任务、会话、证据与 Git 能力，只新增冻结图和节点尝试账本。 */
   digitalTeamWorkflowCoordinator = new DigitalTeamWorkflowCoordinator({
+    employees: digitalEmployees,
     defects: new DefectWorkflowRepository(db),
     isCompletedTaskStatus: (projectId, statusId) => resolveTaskManagementStatusConfigForProject(projectId).roles.completedStatusId === statusId,
     validateTaskStatus: (projectId, statusId) => resolveTaskManagementStatusConfigForProject(projectId).statuses.some((status: import('@zeus/shared').TaskManagementStatusDefinition) => status.id === statusId),
@@ -3650,6 +3803,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   if (!readOnlyValidation) {
     automationScheduler = createAutomationScheduler({
+      synchronizeNotifications: () => automationNotifications.synchronize(),
       migrateLegacy: () => migrateEmployeeAutomationsToUnified(db),
       resolveLegacyTaskStatus: resolveArchivedTaskStatus,
       tasks: automationTasks,
@@ -3767,11 +3921,22 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           };
         }
         if (reference.kind === 'task_work') {
-          /** Task Work 成功以真实运行成果为准，等待输入仍保持运行。 */
+          /** 已产出成果与验收成功分开读取，等待输入仍占用执行队列。 */
           const run = taskWorkRuns.getById(reference.id);
           if (!run) return undefined;
           return {
-            status: run.status === 'succeeded' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'cancelled' ? 'cancelled' : run.status === 'outcome_unknown' ? 'outcome_unknown' : 'running',
+            status:
+              run.status === 'succeeded'
+                ? 'completed'
+                : run.status === 'runtime_completed'
+                  ? 'awaiting_review'
+                  : run.status === 'failed'
+                    ? 'failed'
+                    : run.status === 'cancelled'
+                      ? 'cancelled'
+                      : run.status === 'outcome_unknown'
+                        ? 'outcome_unknown'
+                        : 'running',
             errorCode: run.errorCode,
             errorMessage: run.errorMessage,
           };
@@ -3829,6 +3994,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       conversationSubmissions,
       commandRuns,
       conversationCapabilities: conversationCapabilityQueries,
+      conversationTurns,
       taskWorkManagement,
       executeTaskConversationIdempotent: (project, task, body, idempotencyKey) => executeTaskConversationIdempotent(project, task, body, idempotencyKey),
       readTaskWorkspaceSnapshot,
@@ -4293,6 +4459,12 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         },
       });
       platformMutableState.appShellSettings = mutation.result;
+      if (
+        previousSettings.inputSuggestions?.enabled !== mutation.result.inputSuggestions?.enabled ||
+        previousSettings.inputSuggestions?.modelRef !== mutation.result.inputSuggestions?.modelRef ||
+        previousSettings.inputSuggestions?.effort !== mutation.result.inputSuggestions?.effort
+      )
+        cancelInputSuggestions();
       return platformMutableState.appShellSettings;
     } catch (error) {
       const mapped = settingsCommandHttpError(error, redactSensitiveText);
@@ -4393,7 +4565,10 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           });
         },
       });
-      if (mutation.result.planned.appShell) platformMutableState.appShellSettings = mutation.result.planned.appShell;
+      if (mutation.result.planned.appShell) {
+        cancelInputSuggestions();
+        platformMutableState.appShellSettings = mutation.result.planned.appShell;
+      }
       if (mutation.result.planned.runtime) platformMutableState.runtimeSettings = mutation.result.planned.runtime;
       if (mutation.result.planned.telegramNotification) platformMutableState.telegramNotificationSettings = mutation.result.planned.telegramNotification;
       if (mutation.result.planned.telegramSecurity) platformMutableState.telegramSecuritySettings = mutation.result.planned.telegramSecurity;
@@ -4444,6 +4619,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         }),
         mutateAcceptedBusinessState: (result) => {
           const appliedCounts = importLocalBusinessData(db, parsed.input);
+          repairTaskAttachmentReferences(db, taskAttachmentRoot);
           if (JSON.stringify(appliedCounts) !== JSON.stringify(result.publicResult.importedCounts)) throw new Error('Business data import plan changed after validation.');
           appendAuditLog({
             actorType: 'local_api',

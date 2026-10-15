@@ -24,8 +24,9 @@ export function taskPriorityTone(priority: string | number | null): TaskSemantic
   return 'neutral';
 }
 
-/** 任务类型的语义色调：需求紫、缺陷红、优化绿。 */
+/** 任务类型的语义色调：通用任务中性、需求紫、缺陷红、优化绿。 */
 export function taskTypeTone(taskType: TaskType): TaskSemanticTone {
+  if (taskType === 'task') return 'neutral';
   if (taskType === 'requirement') return 'violet';
   if (taskType === 'defect') return 'red';
   return 'green';
@@ -79,13 +80,13 @@ export function TaskRunStatusChip(props: { status: TaskAgentRunStatus; label: st
   );
   if (props.onClick) {
     return (
-      <button type="button" className={className} title={props.label} aria-label={props.ariaLabel ?? props.label} onClick={props.onClick}>
+      <button type="button" className={className} data-icon-tooltip={props.label} aria-label={props.ariaLabel ?? props.label} onClick={props.onClick}>
         {content}
       </button>
     );
   }
   return (
-    <span className={className} title={props.label} aria-label={props.ariaLabel ?? props.label}>
+    <span className={className} data-icon-tooltip={props.label} aria-label={props.ariaLabel ?? props.label}>
       {content}
     </span>
   );

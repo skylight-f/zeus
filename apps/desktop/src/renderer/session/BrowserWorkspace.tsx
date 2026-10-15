@@ -124,7 +124,7 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
   const labels = copy[props.language];
   const viewportRef = useRef<HTMLDivElement | null>(null);
   /** 标签横向溢出时始终将当前标签带回可见区域。 */
-  const activeTabButtonRef = useRef<HTMLButtonElement | null>(null);
+  const activeTabElementRef = useRef<HTMLDivElement | null>(null);
   const focusCursorRef = useRef(0);
   const closedTabIdsRef = useRef(new Set<string>());
   const stageRef = useRef(props.onStageComments);
@@ -153,7 +153,7 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
   }, [findOpen, activeTab?.id]);
 
   useEffect(() => {
-    activeTabButtonRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    activeTabElementRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [activeTab?.id, props.toolbarHost]);
 
   useEffect(() => {
@@ -237,9 +237,23 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
     if (!bridge?.setBrowserLayout || !viewport || !tabId) return;
     // 只保留最新一帧的显示请求，弹窗出现时立即取消。
     let frame = 0;
+    // 复用公共浮层标记，同时识别门户和应用内部挂载的菜单。
+    const overlaySelector = '[data-motion-surface="popover"], [data-zeus-primitive="modal"], [data-zeus-primitive="drawer"]';
+    // 只订阅存活浮层的尺寸，移除后解除观察，避免长期保留菜单节点。
+    const popovers = new Set<HTMLElement>();
     // 只为前台或退场中的浮层让位；承载当前浏览器的会话抽屉、已被更上层隔离的背景浮层都不遮挡它。
-    const isSuspended = (): boolean =>
-      [...document.body.querySelectorAll(':scope > :is([data-zeus-primitive="modal"], [data-zeus-primitive="drawer"]):is(:not([inert]), [data-motion-state="closing"])')].some((surface) => !surface.contains(viewport));
+    const isSuspended = (): boolean => {
+      if ([...document.body.querySelectorAll(':scope > :is([data-zeus-primitive="modal"], [data-zeus-primitive="drawer"]):is(:not([inert]), [data-motion-state="closing"])')].some((surface) => !surface.contains(viewport))) return true;
+      // 菜单只在实际覆盖网页时让原生视图隐藏，左侧不重叠的下拉保持网页可见。
+      const viewportRect = viewport.getBoundingClientRect();
+      return [...popovers].some((surface) => {
+        // 退场动画仍需要让位；被其他弹窗隔离的背景菜单不参与遮挡判断。
+        if (surface.closest('[inert]') && surface.dataset.motionState !== 'closing') return false;
+        // 使用实际绘制表面，不能用无尺寸的选择器门户包装节点判断重叠。
+        const rect = surface.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.left < viewportRect.right && rect.right > viewportRect.left && rect.top < viewportRect.bottom && rect.bottom > viewportRect.top;
+      });
+    };
     // 每次提交都重新读取弹窗状态和尺寸，避免延迟回调把网页重新盖到弹窗上。
     const syncLayout = (): void => {
       if (closedTabIdsRef.current.has(tabId)) return;
@@ -262,15 +276,39 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
     // 占位区尺寸变化继续复用同一布局入口。
     const observer = new ResizeObserver(apply);
     observer.observe(viewport);
-    // 只观察弹窗与抽屉的门户增删；叠加层全部卸载后才恢复，不订阅正文或浮层内部内容变化。
-    const modalObserver = new MutationObserver(apply);
-    modalObserver.observe(document.body, { childList: true });
+    // 同步菜单的尺寸订阅，搜索结果变化后重新判断是否覆盖网页。
+    const observePopovers = (): void => {
+      for (const surface of popovers) {
+        if (surface.isConnected) continue;
+        observer.unobserve(surface);
+        popovers.delete(surface);
+      }
+      for (const surface of document.querySelectorAll<HTMLElement>('[data-motion-surface="popover"]')) {
+        if (popovers.has(surface)) continue;
+        popovers.add(surface);
+        observer.observe(surface);
+      }
+    };
+    // 下拉可挂在应用内部；只处理浮层增删和自身状态变化，不随正文更新提交原生布局。
+    const overlayObserver = new MutationObserver((records) => {
+      // 普通文本、图标和输入内容的变化不影响原生视图的覆盖关系。
+      const overlayChanged = records.some((record) =>
+        record.type === 'attributes'
+          ? record.target instanceof Element && record.target.matches(overlaySelector)
+          : [...record.addedNodes, ...record.removedNodes].some((node) => node instanceof Element && (node.matches(overlaySelector) || node.querySelector(overlaySelector))),
+      );
+      if (!overlayChanged) return;
+      observePopovers();
+      apply();
+    });
+    overlayObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'inert', 'data-motion-state'] });
+    observePopovers();
     window.addEventListener('resize', apply);
     apply();
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
-      modalObserver.disconnect();
+      overlayObserver.disconnect();
       window.removeEventListener('resize', apply);
       if (closedTabIdsRef.current.has(tabId)) return;
       const rect = viewport.getBoundingClientRect();
@@ -434,31 +472,37 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
   /** 标签由浏览器自身管理，移到顶栏后仍复用原有切换和关闭动作。 */
   const tabStrip = (
     <div className="browser-tab-strip">
-      <div className="browser-tabs" role="tablist" aria-label={labels.title}>
-        {snapshot.tabs.map((tab) => (
-          <div key={tab.id} className={`browser-tab-shell ${tab.id === snapshot.activeTabId ? 'selected' : ''}`}>
+      <div className="browser-tabs zeus-workspace-tabs" role="tablist" aria-label={labels.title}>
+        {snapshot.tabs.map((tab, index) => (
+          <div key={tab.id} ref={tab.id === snapshot.activeTabId ? activeTabElementRef : undefined} className="zeus-workspace-tab-shell" data-active={tab.id === snapshot.activeTabId || undefined}>
             <button
-              ref={tab.id === snapshot.activeTabId ? activeTabButtonRef : undefined}
               type="button"
               role="tab"
-              title={tab.url}
+              data-icon-tooltip={tab.url}
               aria-selected={tab.id === snapshot.activeTabId}
-              className="browser-tab"
+              tabIndex={tab.id === snapshot.activeTabId ? 0 : -1}
+              className="zeus-workspace-tab"
               onClick={() => void activateTab(tab.id)}
+              onKeyDown={(event) => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                event.preventDefault();
+                /** 与文件和终端标签保持相同的键盘切换方式。 */
+                const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? snapshot.tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + snapshot.tabs.length) % snapshot.tabs.length;
+                void activateTab(snapshot.tabs[nextIndex]!.id);
+                event.currentTarget.closest('[role="tablist"]')?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus();
+              }}
             >
               <GlobeSimple aria-hidden="true" weight="regular" />
               <span>{tab.url === 'about:blank' ? labels.newTab : tab.title || tab.url}</span>
               {tab.loading ? <span className="browser-tab-loading" aria-hidden="true" /> : null}
             </button>
-            <button type="button" className="browser-tab-close" aria-label={labels.closeTab} title={labels.closeTab} onClick={() => void closeTab(tab.id)}>
-              <span className="browser-tab-close-surface" aria-hidden="true">
-                <X weight="bold" />
-              </span>
+            <button type="button" className="zeus-workspace-tab-close" aria-label={`${labels.closeTab}: ${tab.title || tab.url}`} data-icon-tooltip={labels.closeTab} onClick={() => void closeTab(tab.id)}>
+              <X size={14} aria-hidden="true" weight="regular" />
             </button>
           </div>
         ))}
       </div>
-      <button type="button" className="browser-new-tab" aria-label={labels.newTab} title={labels.newTab} onClick={() => void addTab()}>
+      <button type="button" className="browser-new-tab" aria-label={labels.newTab} data-icon-tooltip={labels.newTab} onClick={() => void addTab()}>
         <Plus aria-hidden="true" weight="bold" />
       </button>
       <span className="browser-tab-strip-spacer" aria-hidden="true" />
@@ -467,12 +511,12 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
           type="button"
           disabled={props.canSplit === false}
           aria-label={props.expanded ? labels.collapse : labels.expand}
-          title={props.canSplit === false ? labels.splitUnavailable : props.expanded ? labels.collapse : labels.expand}
+          data-icon-tooltip={props.canSplit === false ? labels.splitUnavailable : props.expanded ? labels.collapse : labels.expand}
           onClick={props.onToggleExpanded}
         >
           {props.expanded ? <ArrowsInSimple aria-hidden="true" weight="regular" /> : <ArrowsOutSimple aria-hidden="true" weight="regular" />}
         </button>
-        <button type="button" aria-label={labels.close} title={labels.close} onClick={props.onClose}>
+        <button type="button" aria-label={labels.close} data-icon-tooltip={labels.close} onClick={props.onClose}>
           <X aria-hidden="true" weight="regular" />
         </button>
       </span>
@@ -491,24 +535,24 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
       {activeTab.annotationMode && draftComments.length > 0 ? (
         <div className="browser-toolbar browser-annotation-toolbar">
           <span className="browser-annotation-actions browser-annotation-actions-leading">
-            <button type="button" aria-label={labels.exit} title={labels.exit} onClick={() => void command({ action: 'set_annotation_mode', enabled: false })}>
+            <button type="button" aria-label={labels.exit} data-icon-tooltip={labels.exit} onClick={() => void command({ action: 'set_annotation_mode', enabled: false })}>
               <X aria-hidden="true" weight="bold" />
             </button>
-            <button type="button" aria-label={labels.clear} title={labels.clear} disabled={draftComments.length === 0} onClick={() => void clearComments()}>
+            <button type="button" aria-label={labels.clear} data-icon-tooltip={labels.clear} disabled={draftComments.length === 0} onClick={() => void clearComments()}>
               <Trash aria-hidden="true" weight="regular" />
             </button>
           </span>
-          <span className="browser-annotation-context" title={activeTab.url}>
+          <span className="browser-annotation-context" data-icon-tooltip={activeTab.url}>
             {labels.annotating(activeTab.url)}
           </span>
           <span className="browser-annotation-actions browser-annotation-actions-trailing">
-            <button type="button" aria-label={labels.focusNext} title={labels.focusNext} disabled={draftComments.length === 0} onClick={() => void focusNextComment()}>
+            <button type="button" aria-label={labels.focusNext} data-icon-tooltip={labels.focusNext} disabled={draftComments.length === 0} onClick={() => void focusNextComment()}>
               <CrosshairSimple aria-hidden="true" weight="regular" />
             </button>
             <button
               type="button"
               aria-label={commentsOpen ? labels.hideComments : labels.showComments}
-              title={commentsOpen ? labels.hideComments : labels.showComments}
+              data-icon-tooltip={commentsOpen ? labels.hideComments : labels.showComments}
               aria-pressed={commentsOpen}
               className={commentsOpen ? 'selected' : ''}
               onClick={() => setCommentsOpen((open) => !open)}
@@ -526,16 +570,16 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
       ) : (
         <div className="browser-toolbar browser-navigation-toolbar">
           <span className="browser-navigation-actions">
-            <button type="button" aria-label={labels.back} title={labels.back} disabled={!activeTab.canGoBack} onClick={() => void command({ action: 'back' })}>
+            <button type="button" aria-label={labels.back} data-icon-tooltip={labels.back} disabled={!activeTab.canGoBack} onClick={() => void command({ action: 'back' })}>
               <ArrowLeft aria-hidden="true" weight="regular" />
             </button>
-            <button type="button" aria-label={labels.forward} title={labels.forward} disabled={!activeTab.canGoForward} onClick={() => void command({ action: 'forward' })}>
+            <button type="button" aria-label={labels.forward} data-icon-tooltip={labels.forward} disabled={!activeTab.canGoForward} onClick={() => void command({ action: 'forward' })}>
               <ArrowRight aria-hidden="true" weight="regular" />
             </button>
             <button
               type="button"
               aria-label={activeTab.loading ? labels.stop : labels.reload}
-              title={activeTab.loading ? labels.stop : labels.reload}
+              data-icon-tooltip={activeTab.loading ? labels.stop : labels.reload}
               onClick={() => void command(activeTab.loading ? { action: 'stop' } : { action: 'reload' })}
             >
               {activeTab.loading ? <X aria-hidden="true" weight="regular" /> : <ArrowsClockwise aria-hidden="true" weight="regular" />}
@@ -562,7 +606,7 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
               className={`browser-annotate-button ${activeTab.annotationMode ? 'selected' : ''}`}
               aria-label={activeTab.annotationMode ? labels.annotatingMode : labels.annotate}
               aria-pressed={activeTab.annotationMode}
-              title={activeTab.annotationMode ? labels.annotatingMode : labels.annotate}
+              data-icon-tooltip={activeTab.annotationMode ? labels.annotatingMode : labels.annotate}
               onClick={() => void command({ action: 'set_annotation_mode', enabled: !activeTab.annotationMode })}
             >
               <span className="browser-annotate-icon" aria-hidden="true">
@@ -572,7 +616,7 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
               <span className="browser-annotate-label">{activeTab.annotationMode ? labels.annotatingMode : labels.annotate}</span>
               <kbd>⌘.</kbd>
             </button>
-            <button type="button" className="browser-more-trigger" aria-label={labels.more} title={labels.more} aria-haspopup="menu" aria-expanded={moreOpen} onClick={(event) => void openMoreMenu(event.currentTarget)}>
+            <button type="button" className="browser-more-trigger" aria-label={labels.more} data-icon-tooltip={labels.more} aria-haspopup="menu" aria-expanded={moreOpen} onClick={(event) => void openMoreMenu(event.currentTarget)}>
               <DotsThreeVertical aria-hidden="true" weight="bold" />
             </button>
           </span>
@@ -595,13 +639,13 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
           }}
         >
           <input ref={findInputRef} aria-label={labels.find} placeholder={labels.find} value={findText} maxLength={1000} onChange={(event) => setFindText(event.currentTarget.value)} />
-          <button type="button" aria-label={labels.findPrevious} title={labels.findPrevious} disabled={!findText.trim()} onClick={() => void command({ action: 'find', text: findText, forward: false })}>
+          <button type="button" aria-label={labels.findPrevious} data-icon-tooltip={labels.findPrevious} disabled={!findText.trim()} onClick={() => void command({ action: 'find', text: findText, forward: false })}>
             <ArrowUp aria-hidden="true" />
           </button>
-          <button type="submit" aria-label={labels.findNext} title={labels.findNext} disabled={!findText.trim()}>
+          <button type="submit" aria-label={labels.findNext} data-icon-tooltip={labels.findNext} disabled={!findText.trim()}>
             <ArrowDown aria-hidden="true" />
           </button>
-          <button type="button" aria-label={labels.closeFind} title={labels.closeFind} onClick={() => void closeFind()}>
+          <button type="button" aria-label={labels.closeFind} data-icon-tooltip={labels.closeFind} onClick={() => void closeFind()}>
             <X aria-hidden="true" />
           </button>
         </form>
@@ -639,7 +683,7 @@ export function BrowserWorkspace(props: BrowserWorkspaceProps) {
                       <strong>{comment.body}</strong>
                       <small>{comment.anchor.accessibleName || comment.anchor.immediateText || comment.anchor.kind}</small>
                     </button>
-                    <button type="button" className="browser-comment-delete" aria-label={labels.delete} title={labels.delete} onClick={() => void command({ action: 'delete_comment', commentId: comment.id })}>
+                    <button type="button" className="browser-comment-delete" aria-label={labels.delete} data-icon-tooltip={labels.delete} onClick={() => void command({ action: 'delete_comment', commentId: comment.id })}>
                       <Trash aria-hidden="true" weight="regular" />
                     </button>
                   </li>

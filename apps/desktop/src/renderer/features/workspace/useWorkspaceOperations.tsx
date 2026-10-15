@@ -4,10 +4,8 @@ import { cloneTaskManagementStatusConfig, type TaskManagementStatusConfig } from
 import { notifyMainAppShellSettingsChanged, recordManualUpdateCheckInMain } from '../../appShellBridge.js';
 import { ConnectedSessionWorkspace, SessionWorkspace, NewConversationComposer, type NewConversationDraftStore } from '../../session/SessionWorkspace.js';
 import type { SessionTerminalClient } from '../../session/SessionTerminal.js';
-import { selectHasConfirmedUserMessage } from '../../session/sessionSelectors.js';
 import { TaskDetailPaneContent } from '../../task/TaskDetailPaneContent.js';
 import { TaskDigitalTeamProgress } from '../digital-teams/TaskDigitalTeamProgress.js';
-import { writeTaskModelPushPreferences } from '../../task/TaskModelPushModal.js';
 import { taskModelPushHasRealChoice } from '../../task/TaskModelPushPendingWorkspace.js';
 import { normalizeTaskTableColumnPreferences, normalizeTaskTableEnumSortOrders, resolveTaskManagementStatus } from '../../task/taskWorkspaceModel.js';
 import { createSessionOperationId } from '../../sessionOperationIdentity.js';
@@ -30,7 +28,6 @@ import { normalizeProjectConfig, normalizeRuntimeSettings, parseNumericList, res
 import { buildGitHunkReviewKey, buildGitOperationExecutionInput, formatGitOperationLabel, formatRuntimeLogLine, toSafeAppShellImport } from './workspaceFormatters.js';
 import {
   adjustProjectSidebarWidthForKeyboard,
-  browserNativeConversationStartStorage,
   buildRuntimeSessionTaskDraft,
   clampProjectSidebarWidth,
   createSessionWorkspaceTask,
@@ -105,7 +102,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     pendingTaskTableLayoutLeaveRef,
     pendingWorkspaceLeaveKindRef,
     persistedTaskTableColumns,
-    projectCodeWorkspaceMode,
     projectPanel,
     projectSidebarCommittedWidthRef,
     projectSidebarDragCleanupRef,
@@ -153,6 +149,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setLatestConversationContentVisible,
     setPatchExportStatus,
     setProjectCodeWorkspaceMode,
+    setVisitedCodeWorkspaceModes,
     setProjectConfig,
     setProjectConfigForm,
     setProjectDetail,
@@ -201,7 +198,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setTelegramSecuritySettings,
     setTelegramTestStatus,
     setTelegramTokenInput,
-    setVisitedCodeWorkspaceModes,
+    setProjectCommandsProjectId,
     settingsWorkspaceCopy,
     snapshot,
     taskModelPushEntry,
@@ -1481,7 +1478,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     requestWorkspaceLeave(navigate);
   }
 
-  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = projectCodeWorkspaceMode, onNavigated?: () => void): void {
+  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = 'source', onNavigated?: () => void): void {
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
@@ -1492,39 +1489,43 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         setProjectCodeWorkspaceMode(codeMode);
         setVisitedCodeWorkspaceModes((current) => new Set(current).add(codeMode));
       }
+      setProjectCommandsProjectId(null);
       // 项目设置直接进入数字员工，不再自动打开旧项目配置抽屉。
       setProjectPanel(undefined);
-      if (typeof window !== 'undefined') window.history.replaceState(null, '', section === 'code' ? (codeMode === 'commands' ? '#project-commands' : `#project-code-${codeMode}`) : `#project-${section}`);
+      if (typeof window !== 'undefined') window.history.replaceState(null, '', section === 'code' ? `#project-code-${codeMode}` : `#project-${section}`);
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       onNavigated?.();
     };
-    if (project.id === activeProjectId && section === activeProjectSection && (section !== 'code' || codeMode === projectCodeWorkspaceMode)) {
+    if (project.id === activeProjectId && activeNavTarget === (section === 'sessions' ? 'conversations' : 'projects') && section === activeProjectSection) {
       navigate();
       return;
     }
     requestWorkspaceLeave(navigate);
   }
 
+  /** 命令始终绑定请求项目；在当前源码或 Git 中打开时不触发离开检查。 */
   function openProjectCommands(projectId: string): void {
+    /** 项目必须仍存在，避免旧会话误用当前项目执行命令。 */
     const project = snapshot.projects.find((candidate) => candidate.id === projectId);
     if (!project) {
       recordLocalError('project-commands-open', new Error('The conversation project is no longer available.'));
       return;
     }
+    /** 从其他页面进入源码后打开命令，同项目 Git 视图保持原位。 */
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
       setConversationDraftOpen(false);
       setActiveNavTarget('projects');
       setActiveProjectSection('code');
-      setProjectCodeWorkspaceMode('commands');
-      setVisitedCodeWorkspaceModes((current) => new Set(current).add('commands'));
+      setProjectCodeWorkspaceMode('source');
+      setProjectCommandsProjectId(project.id);
       setProjectPanel(undefined);
-      if (typeof window !== 'undefined') window.history.replaceState(null, '', '#project-commands');
+      if (typeof window !== 'undefined') window.history.replaceState(null, '', '#project-code-source');
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
     };
-    if (project.id === activeProjectId && activeProjectSection === 'code' && projectCodeWorkspaceMode === 'commands') {
-      navigate();
+    if (project.id === activeProjectId && activeNavTarget === 'projects' && activeProjectSection === 'code') {
+      setProjectCommandsProjectId(project.id);
       return;
     }
     requestWorkspaceLeave(navigate);
@@ -1575,7 +1576,17 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     return uiCopy.sidebar.selectRepository;
   }
 
-  function handleWindowDragPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+  /** 顶部空白区继续手动拖窗；真实控件、正文和门户弹层不进入拖拽流程。 */
+  function handleWindowDragPointerDown(event: ReactPointerEvent<HTMLElement>): void {
+    if (
+      !(event.target instanceof Element) ||
+      !event.currentTarget.contains(event.target) ||
+      event.target.closest('button, a, input, select, textarea, label, summary, [tabindex], [role="button"], [role="combobox"], [role="menuitem"], [contenteditable="true"]')
+    )
+      return;
+    /** 沿用布局定义的拖拽高度，避免导航变化后再次覆盖工作区按钮。 */
+    const dragBounds = event.currentTarget.querySelector('.window-drag-strip')?.getBoundingClientRect();
+    if (!dragBounds || event.clientY < dragBounds.top || event.clientY >= dragBounds.bottom) return;
     const bridge = window.zeus;
     if (event.button !== 0 || !bridge?.beginWindowDrag || !bridge.moveWindowDrag || !bridge.endWindowDrag) return;
     event.preventDefault();
@@ -1725,12 +1736,12 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     target.addEventListener('lostpointercapture', cancelProjectSidebarResize);
   }
 
-  /** 完整页与内嵌页共用当前会话的团队进展，任务历史由原选择入口保留。 */
+  /** 任务详情由左栏显示团队状态，独立会话页保留原进展入口。 */
   function renderNativeConversationWorkspace(onOpenTaskDetail: (taskId: string) => void, embeddedInTask = false): ReactNode {
     /** 原会话阅读与输入保持同一控制器，不因后台团队状态重读重新创建。 */
     const workspace = renderNativeConversationWorkspaceContent(onOpenTaskDetail, embeddedInTask);
     /** 完整页和任务内嵌页共用准确会话关联，不能由外层任务另取一份旧运行。 */
-    if (!nativeSessionTask || !selectedNativeConversation || !props.commandClient) return workspace;
+    if (embeddedInTask || !nativeSessionTask || !selectedNativeConversation || !props.commandClient) return workspace;
     return (
       <div className="task-conversation-with-team-progress">
         <TaskDigitalTeamProgress
@@ -1786,6 +1797,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           language={appShellSettings.appLanguage}
           client={props.nativeConversationClient}
           controllerEnabled={false}
+          inputSuggestionSettings={appShellSettings.inputSuggestions}
           localState={pending.session}
           conversation={pending.choice}
           task={nativeSessionTask}
@@ -1848,6 +1860,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           language={appShellSettings.appLanguage}
           client={props.nativeConversationClient}
           controllerEnabled={!selectedTaskModelPushOperation || (selectedTaskModelPushOperation.status === 'accepted' && taskModelPushHasRealChoice(selectedTaskModelPushOperation))}
+          inputSuggestionSettings={appShellSettings.inputSuggestions}
           localState={selectedTaskModelPushOperation?.session}
           localActions={selectedTaskModelPushOperation ? taskModelPushWorkspaceActions(selectedTaskModelPushOperation, onOpenTaskDetail) : undefined}
           conversation={selectedNativeConversation}
@@ -1883,9 +1896,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onChooseAttachments={props.onChooseConversationResources ? chooseNativeConversationAttachments : undefined}
           onStateChange={(conversationId, state) => {
             recordNativeConversationRuntimeState(conversationId, state);
-            if (selectedTaskModelPushOperation?.status === 'accepted' && selectedTaskModelPushOperation.choice?.id === conversationId && selectHasConfirmedUserMessage(state, selectedTaskModelPushOperation.request.clientUserMessageId)) {
-              writeTaskModelPushPreferences(browserNativeConversationStartStorage(), selectedTaskModelPushOperation.task.projectId, selectedTaskModelPushOperation.form);
-            }
           }}
           onStartConversation={startNativeConversation}
           onStartProjectConversation={startProjectConversation}
@@ -1913,6 +1923,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     }
     return (
       <SessionWorkspace
+        inputSuggestionSettings={appShellSettings.inputSuggestions}
+        onGenerateInputSuggestion={props.nativeConversationClient?.generateInputSuggestion}
         newConversationDrafts={newConversationDrafts}
         key={selectedNativeConversation ? `${selectedNativeConversation.projectId}:${selectedNativeConversation.navigationId ?? selectedNativeConversation.id}` : `new-conversation-${newConversationFocusRequest}`}
         language={appShellSettings.appLanguage}
@@ -2003,6 +2015,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           setActiveNavTarget('digital-teams');
         }}
         digitalTeamClient={props.commandClient ?? null}
+        onSubscribeRealtimeEvents={props.onSubscribeRealtimeEvents}
         digitalEmployeeClient={props.commandClient ?? null}
         conversations={taskDetailPaneConversations}
         conversationsLoading={taskDetailPaneConversationState?.status === 'loading' && !taskDetailPaneConversationState.choicesKnown}
@@ -2026,6 +2039,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           props.nativeConversationClient ? (
             <NewConversationComposer
               key={`task-discussion-${taskDetailPaneTask.id}`}
+              inputSuggestionSettings={appShellSettings.inputSuggestions}
+              onGenerateInputSuggestion={props.nativeConversationClient.generateInputSuggestion}
               docked
               drafts={newConversationDrafts}
               language={appShellSettings.appLanguage}
@@ -2153,6 +2168,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     loadTaskTemplates,
     moveTaskBoardTask,
     openProjectSection,
+    openProjectCommands,
     projectDrawerVisualProps,
     projectSidebarMaximumWidth,
     projectSidebarShellStyle,

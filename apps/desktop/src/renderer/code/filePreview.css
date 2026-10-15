@@ -227,3 +227,34 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.file-review-stats {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.file-review-stats > .is-addition {
+  color: var(--zeus-code-addition-text);
+}
+.file-review-stats > .is-deletion {
+  color: var(--zeus-control-danger-text);
+}
+.file-preview-setting {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--zeus-control-muted-text);
+}
+.file-preview-setting select {
+  max-width: 130px;
+  min-width: 0;
+  font: inherit;
+  color: var(--zeus-control-text);
+  background: var(--zeus-control-bg);
+  border: 1px solid var(--zeus-control-border);
+  border-radius: 4px;
+  padding: 3px 4px;
+}

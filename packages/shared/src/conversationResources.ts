@@ -64,6 +64,8 @@ export interface ConversationWebsiteResource extends ConversationResourceBase {
 
 export interface ConversationAttachmentResource extends ConversationResourceBase {
   kind: 'attachment';
+  /** 原消息已公开的引用，用于区分同说明图片；不包含受管归档路径。 */
+  sourceReference?: string;
   attachmentRef: string;
   mimeType?: string;
   previewKind: 'image' | 'document' | 'none';
@@ -85,6 +87,9 @@ export type ConversationOpenTarget =
   | 'editor:vscode-insiders'
   | 'editor:cursor'
   | 'editor:windsurf'
+  | 'editor:intellij-idea'
+  | 'editor:rider'
+  | 'editor:webstorm'
   | 'terminal:terminal'
   | 'terminal:ghostty';
 

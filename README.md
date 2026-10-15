@@ -10,6 +10,7 @@ Zeus 是一款 AI 研发工作台，将项目与任务管理、Coding Agent 会�
 - 新建项目会话时可选择“项目目录”或“新建工作树”；项目目录沿用当前分支，工作树可选择本地或远程来源分支并设置新分支名，未提交修改保留在项目目录。会话列表以目录和分支图标区分工作位置，悬停可查看路径。
 - 不选项目也可启动临时会话，默认工作目录为当前 Zeus 数据目录下的 `workspaces/temporary`；文件和会话历史保留在本机。
 - 在“设置 → 通用”切换经典布局或紧凑布局，选择自动保存；未选择过布局时沿用经典布局，已有选择和会话状态保持不变。
+- 在“设置 → 通用 → 输入建议”选择专用模型和推理深度，默认使用最低档位。模型列表自动更新，加载失败可重试。可启用回复后的自动灰字建议，在输入框内按 Tab 采纳；也可点击输入区右上角星光按钮：空白时主动生成建议，有文字时润色草稿。润色先在输入框上方预览，点击“采用”才替换原文，并支持撤销。关闭自动建议后仍可手动使用；每次生成增加专用模型用量，最多等待 20 秒，不自动重试。
 - 在创建任务中粘贴 GitHub Issue、Jira 工作项或禅道详情链接，读取标题和正文后确认创建；受限内容通过 Zeus 登录，GitHub 与 Jira 附件保留为来源链接。
 - 任务列表可读取当前禅道账号负责的任务和缺陷，确认后导入 Zeus。
 - 浏览和编辑项目源码，搜索文件与代码内容；源码侧栏支持内容搜索、大小写与全字匹配，以及单处、单文件和全部替换。搜索包含未保存草稿，替换已打开文件后可撤销并手动保存。编辑器支持多光标、查找替换、折叠、差异审阅和冲突选入。TypeScript/JavaScript 支持项目补全、定义跳转、引用查找、重命名、诊断和格式化；其他已支持语言提供语法高亮。
@@ -103,7 +104,8 @@ requirement，用于减少升级后因代码身份变化而重复询问“文稿
 - 开发配置读取根目录 `.env`、`.env.development`，系统环境变量优先；`ZEUS_DEV_MODE=test pnpm dev` 读取 `.env`、`.env.test`。数据默认隔离到 `.tmp/electron-development-data` 或 `.tmp/electron-test-data`，可通过 `ZEUS_USER_DATA_DIR` 指定兼容的开发数据目录。不要指向正式数据目录。修改环境文件后重启开发命令；只有 `VITE_` 前缀变量可供前端读取，勿放入密钥。
 - 首次使用的开发数据目录必须不存在或为空，由启动过程创建身份标记。指定非主外接屏使用 `ZEUS_TEST_DISPLAY_ID=<显示器 ID> pnpm dev`，无需预写 `main-window-state.json`；显示器不可用时停止创建窗口。已有文件但缺少身份标记时，保留原目录并将 `ZEUS_USER_DATA_DIR` 指向新的空目录，已有数据另行确认迁移；反复重启不会补建标记，离线认领工具目前只支持正式版和测试版。
 - `pnpm build`、`pnpm verify:publish` 和所有打包、签名、发布入口保持原有行为，不启动开发服务、不读取上述开发入口配置。
-- 开发运行健康检查使用 `node scripts/verify-packaged-app-health.mjs <本项目 Electron.app 绝对路径> --development --runtime-root <本次开发数据目录> --runtime-pid <界面进程号>`，核对当前工作树入口、隔离身份、宿主端口及推进的真实心跳。开发检查不代表测试包结构或签名通过；省略 `--development` 时仍严格要求完整测试包。
+- 开发运行健康检查使用 `node scripts/verify-packaged-app-health.mjs --development --runtime-root <本次开发数据目录> --runtime-pid <界面进程号>`，从本项目依赖自动取得 Electron 路径，核对当前工作树入口、隔离身份、宿主端口及推进的真实心跳。开发检查不代表测试包结构或签名通过；省略 `--development` 时仍严格要求完整测试包。
+- 原生 Computer Use 运行检查使用 `node scripts/verify-computer-use-runtime.mjs --pid <本任务界面进程号> --port <本机 Inspector 端口> --data-root <本任务 .tmp 数据目录> --display-id <非工作显示器 ID>`。按需加 `--file-picker`，在同一入口串行完成新弹窗观察、选文件、取消和返回主窗口；状态无效时停止，保持后台焦点且不重放动作。
 - `pnpm verify:publish`：本地与 CI 共用的检查入口，执行冲突、格式、Lint、架构边界、类型和构建检查，不发布。
 - `pnpm package:mac`：默认只生成独立身份 `Zeus Test.app`，输出到 `dist/test/mac-arm64/`（Intel 为 `dist/test/mac/`）；运行验收使用独立用户数据目录。
 - `pnpm package:mac:release`：生成正式 DMG；仅在明确需要安装包或发布时执行。

@@ -1,3 +1,5 @@
+import { matchesTaskDeadline, isTaskDeadlineFilter, type TaskDeadlineFilter } from '@zeus/shared';
+import './task-deadline.css';
 import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { GearSixIcon as GearSix } from '@phosphor-icons/react/dist/csr/GearSix';
 import { type TaskBoardFilterGroup, type TaskManagementStatusDefinition } from '@zeus/shared';
@@ -143,6 +145,10 @@ export type TaskWorkspaceBulkActionStatus = { kind: 'idle' | 'running' | 'done' 
 export type TaskWorkspaceListState = 'ready' | 'loading' | 'error';
 
 export interface TaskWorkspaceProps {
+  /** 时间筛选、共享时钟及条件修改入口。 */
+  deadlineFilter?: TaskDeadlineFilter;
+  deadlineNow?: number;
+  onDeadlineFilterChange?: (value: TaskDeadlineFilter) => void;
   projectName?: string;
   tasks: TaskRecord[];
   boardTasks?: TaskRecord[];
@@ -177,6 +183,11 @@ export interface TaskWorkspaceProps {
   modelPushEntry?: { taskId: string; status: 'checking' | 'error'; error?: string | null };
   taskActionBusy?: boolean;
   listState?: TaskWorkspaceListState;
+  /** 两种主布局共用列表分页，滚动到接近底部时读取下一页。 */
+  hasMoreTasks?: boolean;
+  loadingMoreTasks?: boolean;
+  taskPageError?: string | null;
+  onLoadMoreTasks?: () => void;
   activeProjectId?: string;
   pageViewMode: TaskPageViewMode;
   taskBoardSnapshot?: TaskBoardViewSnapshot | null;
@@ -228,7 +239,7 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
   const model = useMemo(
     () =>
       createTaskWorkspaceViewModel({
-        tasks: props.tasks,
+        tasks: props.tasks.filter((task) => matchesTaskDeadline(task, props.deadlineFilter ?? 'all', props.deadlineNow, [props.completedStatusId, props.cancelledStatusId])),
         query: props.searchQuery,
         status: props.statusFilter,
         tag: props.tagFilter,
@@ -250,6 +261,8 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
       }),
     [
       props.tasks,
+      props.deadlineFilter,
+      props.deadlineNow,
       props.searchQuery,
       props.statusFilter,
       props.tagFilter,
@@ -287,6 +300,7 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
       createdAt: props.copy.createdAtColumnTitle,
       updatedAt: props.copy.updatedAtColumnTitle,
       priority: props.copy.priorityColumnTitle,
+      deadline: props.copy.taskCountPrefix === 'Tasks' ? 'Deadline' : '截止时间',
       project: props.copy.projectColumnTitle,
       template: props.copy.templateColumnTitle,
       description: props.copy.descriptionColumnTitle,
@@ -354,7 +368,14 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
   }, [bulkStatusOptions, bulkTargetStatus]);
 
   return (
-    <section className="task-management-codex-layout task-table-only-layout task-table-layout" aria-label={props.copy.workbenchAria}>
+    <section
+      onScrollCapture={(event) => {
+        const target = event.target as HTMLElement;
+        if (props.hasMoreTasks && !props.loadingMoreTasks && !props.taskPageError && target.scrollHeight - target.scrollTop - target.clientHeight < 160) props.onLoadMoreTasks?.();
+      }}
+      className="task-management-codex-layout task-table-only-layout task-table-layout"
+      aria-label={props.copy.workbenchAria}
+    >
       <section className="task-management-navigation task-table-workbench" aria-label={props.copy.filterAria}>
         <section className="task-filter-workbench task-filter-toolbar task-table-toolbar task-table-primary-toolbar" aria-label={props.copy.filterAria}>
           <label className="task-filter-control-row task-filter-search task-toolbar-search" aria-label={props.copy.searchAria}>
@@ -370,6 +391,24 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
               </button>
             ))}
           </div>
+          {/* 截止筛选复用统一选择器的菜单、选中标记和键盘交互。 */}
+          <ZeusSelect
+            size="compact"
+            searchable={false}
+            className="task-deadline-quick-filter"
+            ariaLabel={isEnglishCopy ? 'Filter by deadline' : '按截止时间筛选'}
+            value={props.deadlineFilter ?? 'all'}
+            onChange={(value) => {
+              if (isTaskDeadlineFilter(value)) props.onDeadlineFilterChange?.(value);
+            }}
+            options={[
+              { value: 'all', label: isEnglishCopy ? 'All deadlines' : '全部截止时间' },
+              { value: 'overdue', label: isEnglishCopy ? 'Overdue' : '已逾期' },
+              { value: 'today', label: isEnglishCopy ? 'Due today' : '今天截止' },
+              { value: 'next_seven_days', label: isEnglishCopy ? 'Next 7 days' : '未来 7 天' },
+              { value: 'unset', label: isEnglishCopy ? 'No deadline' : '未设截止' },
+            ]}
+          />
           <div className="task-table-view-actions" aria-label={isEnglishCopy ? 'Task view actions' : '任务视图动作'}>
             <div className="task-table-page-view-segments" role="group" aria-label={isEnglishCopy ? 'Task view' : '任务视图'}>
               <button className="task-table-view-pill" type="button" aria-pressed={props.pageViewMode === 'list'} onClick={() => props.onPageViewModeChange('list')}>
@@ -402,7 +441,7 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
                   aria-haspopup="dialog"
                   aria-expanded={boardSettingsSection !== null}
                   aria-label={isEnglishCopy ? 'Board settings' : '看板设置'}
-                  title={isEnglishCopy ? 'Board settings' : '看板设置'}
+                  data-icon-tooltip={isEnglishCopy ? 'Board settings' : '看板设置'}
                   onClick={() => setBoardSettingsSection('layout')}
                 >
                   <GearSix aria-hidden="true" />
@@ -420,7 +459,7 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
                     aria-haspopup="dialog"
                     popoverTarget={fieldSettingsId}
                     aria-label={props.copy.fieldSettingsAria}
-                    title={props.copy.fieldSettingsAria}
+                    data-icon-tooltip={props.copy.fieldSettingsAria}
                   >
                     <span className="task-table-field-settings-label">{columnViewActionLabel}</span>
                   </button>
@@ -528,6 +567,8 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
               loading={Boolean(props.taskBoardLoading)}
               error={props.taskBoardError ?? null}
               statusDefinitions={props.statusDefinitions}
+              terminalStatuses={[props.completedStatusId, props.cancelledStatusId]}
+              now={props.deadlineNow}
               runStatuses={boardRunStatuses}
               branchStatuses={boardBranchStatuses}
               settingsOpen={boardSettingsSection !== null}
@@ -535,12 +576,13 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
               onSettingsOpenChange={(open) => setBoardSettingsSection((current) => (open ? (current ?? 'layout') : null))}
               onSettingsSectionChange={setBoardSettingsSection}
               projectTaskCount={props.tasks.length}
-              externalFiltersActive={Boolean(props.searchQuery.trim() || props.statusFilter || props.tagFilter)}
+              externalFiltersActive={Boolean(props.searchQuery.trim() || props.statusFilter || props.tagFilter || (props.deadlineFilter && props.deadlineFilter !== 'all'))}
               onCreateTask={props.onCreateTask}
               onClearExternalFilters={() => {
                 props.onSearchChange('');
                 props.onStatusFilterChange('');
                 props.onTagFilterChange('');
+                props.onDeadlineFilterChange?.('all');
               }}
               onReload={() => props.onReloadTaskBoard?.()}
               onUpdateSettings={(settings) => {
@@ -678,6 +720,21 @@ export function TaskWorkspace(props: TaskWorkspaceProps) {
                 </section>
               ) : null}
             </TaskDataTable>
+            {props.hasMoreTasks ? (
+              <div role="status" className="task-table-pagination">
+                {props.loadingMoreTasks ? (
+                  '正在读取更多任务…'
+                ) : props.taskPageError ? (
+                  <button type="button" onClick={props.onLoadMoreTasks}>
+                    读取失败，重试
+                  </button>
+                ) : (
+                  <button type="button" onClick={props.onLoadMoreTasks}>
+                    继续加载任务
+                  </button>
+                )}
+              </div>
+            ) : null}
           </>
         )}
       </section>

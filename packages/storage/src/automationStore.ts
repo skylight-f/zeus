@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { temporaryWorkspaceId, type AutomationActionConfig, type AutomationDispatchTarget, type AutomationExecutionReference, type AutomationSourceEvent } from '@zeus/shared';
 import { randomId } from './randomId.js';
+import { migrateAutomationNotifications } from './automationNotificationStore.js';
 import type { ZeusDatabasePort } from './databasePort.js';
 
 export const automationSchemaMigrationId = '20260829_0374_automation_tasks_v1';
@@ -11,7 +12,8 @@ export const automationStatuses = ['active', 'paused', 'deleted'] as const;
 export const automationTriggerKinds = ['manual', 'once', 'interval', 'daily', 'weekly', 'rrule', 'event'] as const;
 export const automationConversationModes = ['independent', 'original'] as const;
 export const automationBlockStrategies = ['serial', 'discard', 'cover'] as const;
-export const automationRunStatuses = ['queued', 'dispatching', 'running', 'succeeded', 'failed', 'blocked', 'cancelled', 'outcome_unknown'] as const;
+/** 待验收保留真实成果引用，独立员工工作不再占用执行队列。 */
+export const automationRunStatuses = ['queued', 'dispatching', 'running', 'awaiting_review', 'succeeded', 'failed', 'blocked', 'cancelled', 'outcome_unknown'] as const;
 export const automationPermissionModes = ['read-only', 'auto', 'full-access'] as const;
 
 export type AutomationStatus = (typeof automationStatuses)[number];
@@ -556,6 +558,7 @@ export function migrateAutomationSchema(db: ZeusDatabasePort): void {
   migrateAutomationDispatchProgress(db);
   migrateAutomationTaskCreationGrants(db);
   migrateAutomationConversationRules(db);
+  migrateAutomationNotifications(db);
 }
 
 /** 旧普通会话只保留历史，规则需显式改选员工动作才可再次启用。 */
@@ -999,7 +1002,7 @@ export class AutomationRunRepository {
         this.setTerminal(previous.id, 'outcome_unknown', 'ZEUS_AUTOMATION_DISPATCH_OUTCOME_UNKNOWN', '覆盖时无法证明旧 Provider 或外部命令已停止。');
       }
       /** 队列容量同样按自动化整体计算。 */
-      const queued = this.db.select<{ id: string }>(`SELECT id FROM automation_runs WHERE automation_id = ? AND status = 'queued' ORDER BY accepted_at, id`, [task.id]);
+      const queued = this.db.select<{ id: string }>(`SELECT id FROM automation_runs WHERE automation_id = ? AND status = 'queued' ORDER BY queue_position, accepted_at, id`, [task.id]);
       if (task.blockStrategy === 'serial' && active.length > 0 && queued.length >= task.queueCapacity) {
         this.setTerminal(queued[0]!.id, 'cancelled', 'ZEUS_AUTOMATION_QUEUE_EVICTED', '队列已满，已淘汰最早等待运行。');
       }
@@ -1079,9 +1082,9 @@ export class AutomationRunRepository {
       .map(mapRun);
   }
 
-  /** 恢复只读取未结束运行，不受历史列表页数限制。 */
+  /** 待验收继续对账真实成果，不受历史列表页数限制。 */
   listInFlight(): AutomationRunRecord[] {
-    return this.db.select<DbAutomationRunRow>(`SELECT ${runSelect} FROM automation_runs WHERE status IN ('dispatching', 'running') ORDER BY accepted_at, id`).map(mapRun);
+    return this.db.select<DbAutomationRunRow>(`SELECT ${runSelect} FROM automation_runs WHERE status IN ('dispatching', 'running', 'awaiting_review') ORDER BY accepted_at, id`).map(mapRun);
   }
 
   findAcceptedSubmission(run: AutomationRunRecord): { conversationId: string; submissionId: string } | undefined {
@@ -1114,9 +1117,9 @@ export class AutomationRunRepository {
       /** 候选可能在等待前一次派发时被取消或移出队列。 */
       const current = this.getById(id);
       if (!current || current.status !== 'queued') return undefined;
-      /** 以领取时的任务状态为准，不沿用候选查询时的启用状态。 */
+      /** 领取时重新核对启用和串行占位，防止旧候选越过刚接纳的工作。 */
       const task = this.db.get<{ status: AutomationStatus }>('SELECT status FROM automation_tasks WHERE id = ?', [current.automationId]);
-      if (task?.status !== 'active') return undefined;
+      if (task?.status !== 'active' || this.listActive(current.automationId).length > 0) return undefined;
       /** 仅实际领取的运行记录开始时间和尝试次数。 */
       const timestamp = nowIso();
       /** 本次领取使用下一次尝试身份。 */
@@ -1296,6 +1299,22 @@ export class AutomationRunRepository {
     return this.getById(id)!;
   }
 
+  /** 独立员工工作已产出成果时释放执行队列，验收仍由原任务处理。 */
+  markAwaitingReview(id: string): AutomationRunRecord {
+    return this.db.transaction(() => {
+      /** 冻结动作决定是否可以释放，后续编辑不改变原运行的验收边界。 */
+      const run = this.getById(id);
+      if (!run) throw new Error('ZEUS_AUTOMATION_RUN_NOT_FOUND: 自动化运行不存在。');
+      if (run.status !== 'running' || new AutomationTaskRepository(this.db).getRevision(run.automationRevisionId)?.snapshot.action.kind !== 'employee_work') return run;
+      /** 待验收不是成功或终态，完成时间仍为空。 */
+      const timestamp = nowIso();
+      this.db.execute("UPDATE automation_runs SET status = 'awaiting_review', unread = 1, updated_at = ? WHERE id = ?", [timestamp, id]);
+      this.db.execute("UPDATE automation_run_attempts SET status = 'awaiting_review' WHERE run_id = ? AND attempt = ?", [id, run.attempt]);
+      this.promoteNext(id);
+      return this.getById(id)!;
+    });
+  }
+
   setTerminal(id: string, status: Extract<AutomationRunStatus, 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'outcome_unknown'>, errorCode: string | null = null, errorMessage: string | null = null): AutomationRunRecord {
     const timestamp = nowIso();
     this.db.transaction(() => {
@@ -1343,13 +1362,6 @@ export class AutomationRunRepository {
     return updated;
   }
 
-  acknowledge(id: string): AutomationRunRecord {
-    this.db.execute(`UPDATE automation_runs SET unread = 0 WHERE id = ?`, [id]);
-    const updated = this.getById(id);
-    if (!updated) throw new Error('ZEUS_AUTOMATION_RUN_NOT_FOUND: 自动化运行不存在。');
-    return updated;
-  }
-
   private insertTerminal(input: EnqueueAutomationRunInput, task: AutomationTaskRecord, status: Extract<AutomationRunStatus, 'blocked' | 'cancelled'>, errorCode: string, errorMessage: string, timestamp: string): AutomationRunRecord {
     /** 终态运行也保留完整项目范围，便于界面解释失败对象。 */
     const projectIds = stringArray(input.projectIds, '运行项目');
@@ -1375,12 +1387,16 @@ export class AutomationRunRepository {
     return this.getById(id)!;
   }
 
+  /** 执行占位释放后只提升一个队首，成果验收和终态结算共用此边界。 */
   private promoteNext(completedId: string): void {
+    /** 原运行决定队列归属，不读取当前规则的新项目范围。 */
     const completed = this.getById(completedId);
-    if (!completed) return;
-    /** 当前运行结束后只提升同一自动化的下一次触发。 */
-    const next = this.db.get<{ id: string }>(`SELECT id FROM automation_runs WHERE automation_id = ? AND status = 'queued' ORDER BY accepted_at, id LIMIT 1`, [completed.automationId]);
-    if (!next) return;
+    if (!completed || this.listActive(completed.automationId).length > 0) return;
+    /** 按队列位置保持同毫秒触发的顺序；旧成果验收不能再次提升已就绪队首。 */
+    const next = this.db.get<{ id: string; position: number }>(`SELECT id, queue_position AS position FROM automation_runs WHERE automation_id = ? AND status = 'queued' ORDER BY queue_position, accepted_at, id LIMIT 1`, [
+      completed.automationId,
+    ]);
+    if (!next || next.position === 0) return;
     this.db.execute(`UPDATE automation_runs SET queue_position = 0 WHERE id = ?`, [next.id]);
     this.db.execute(`UPDATE automation_runs SET queue_position = queue_position - 1 WHERE automation_id = ? AND status = 'queued' AND queue_position > 0 AND id <> ?`, [completed.automationId, next.id]);
   }

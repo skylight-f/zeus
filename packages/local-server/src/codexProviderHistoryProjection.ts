@@ -16,6 +16,7 @@ import type { CreateCodexNativeConversationCoordinatorOptions, NativeConversatio
 import {
   classifySnapshotTurn,
   completedItemProjection,
+  commandTerminationProjection,
   coordinatorError,
   findSnapshotTurn,
   isRecord,
@@ -30,6 +31,7 @@ import {
   requireString,
   snapshotConfirmsIdleProviderThread,
   snapshotConfirmsSafeResumeBoundary,
+  submissionDeliveryConfirmedForTurn,
 } from './codexNativeConversationPolicy.js';
 import { appendProviderSyncAudit, type ProviderSyncAuditOutcome } from './providerSyncAudit.js';
 import { sanitizeConversationItemPayload } from './conversationResources.js';
@@ -96,6 +98,8 @@ export function filterCompatibilitySnapshotItemAliases(items: readonly ZeusConve
 }
 
 export interface CodexProviderHistoryProjectionDependencies {
+  /** 自动续接仍在执行时，历史读取不能提前结算原请求。 */
+  isProviderConnectionRetryPending(conversationId: string, providerTurnId: string): boolean;
   options: CreateCodexNativeConversationCoordinatorOptions;
   failedTurnResults: Map<string, Error & { code: string }>;
   processProjector: TurnProcessProjector;
@@ -375,7 +379,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       if (!existingTurn || classification === 'active' || existingTurn.status !== classification || repairTurnIds.has(providerTurn.id)) {
         providerTurn.items = await readCodexTurnItems(options.manager, { threadId: providerThreadId, turnId: providerTurn.id, ...input });
       }
-      const projected = await projectProviderSnapshotTurn(conversation, providerThreadId, providerTurn, existingTurn, requestedRevision);
+      const projected = await projectProviderSnapshotTurn(conversation, providerThreadId, providerTurn, existingTurn, requestedRevision, providerTurn.id === turnsDescending[0]?.id);
       localTurns.set(providerTurn.id, projected);
     }
     await reconcileRecoveredRequestUserInput(options.conversations.getById(conversation.id) ?? conversation, providerThreadId, eligibleDescending, localTurns);
@@ -433,16 +437,21 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     });
   }
 
+  /** 补齐每个轮次的历史；只有 Provider 最新轮次可以暂停当前待发队列。 */
   async function projectProviderSnapshotTurn(
     conversation: ZeusConversationWithMessagesRecord,
     providerThreadId: string,
     providerTurn: CodexTurnSnapshot,
     existingTurnInput: ZeusConversationTurnRecord | undefined,
     requestedRevision: number,
+    isLatestProviderTurn: boolean,
   ): Promise<ZeusConversationTurnRecord> {
     // 读取正文期间可能收到实时结束事件，必须采用此刻已落库的轮次状态。
     const existingTurn = existingTurnInput ? (options.turns.getById(existingTurnInput.id) ?? existingTurnInput) : undefined;
-    let classification = classifySnapshotTurn(providerTurn);
+    /** 原生中断由 Zeus 的网络恢复发起时，保留产品失败原因与原始证据。 */
+    const storedFailure = parseJsonRecord(existingTurn?.errorJson ?? '{}');
+    const preserveResponseFailure = existingTurn?.status === 'failed' && /^ZEUS_(?:MODEL_RESPONSE_|SESSION_CONNECTION_)/u.test(String(storedFailure.code));
+    let classification = preserveResponseFailure ? ('failed' as const) : classifySnapshotTurn(providerTurn);
     if (classification === 'unknown') throw coordinatorError('ZEUS_NATIVE_PROVIDER_TURN_INVALID', `Provider turn has an unknown status: ${providerTurn.id}`);
     const submissions = options.submissions.listByConversation(conversation.id);
     if (classification === 'active' && existingTurn && shouldPreserveProviderStopTerminalTurn({ turn: existingTurn, submissions })) {
@@ -492,7 +501,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     const stateChanged = !existingTurn || existingTurn.status !== status;
     const turnProjectionChanged = !existingTurn || existingTurn.status !== status || existingTurn.clientSubmissionId !== clientSubmissionId || existingTurn.startedAt !== startedAt || existingTurn.completedAt !== completedAt;
     /** 历史恢复与实时事件复用同一份官方失败记录和阻塞判断。 */
-    const failureRecord = classification === 'failed' ? providerTurnFailureRecord({ turn: providerTurn }, providerTurnFailure({ turn: providerTurn }, providerTurn.id)) : undefined;
+    const failureRecord = preserveResponseFailure ? storedFailure : classification === 'failed' ? providerTurnFailureRecord({ turn: providerTurn }, providerTurnFailure({ turn: providerTurn }, providerTurn.id)) : undefined;
     /** 只有官方服务不可用类错误暂停会话，本地执行错误仍保持失败。 */
     const providerBlocked = failureRecord ? isProviderBlockingTurnFailure(failureRecord) : false;
     let turn = turnProjectionChanged
@@ -526,6 +535,8 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       });
     }
 
+    if (dependencies.isProviderConnectionRetryPending(conversation.id, providerTurn.id)) return turn;
+
     if (classification === 'active') {
       if (matchedSubmission && (matchedSubmission.status === 'dispatching' || matchedSubmission.status === 'queued')) {
         options.submissions.updateStatus(matchedSubmission.id, 'active', { providerTurnId: providerTurn.id, dispatchedAt: startedAt });
@@ -550,12 +561,12 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     } else {
       const terminalReconciliation = reconcileTerminalTurnSubmissions(conversation, turn, completedAt ?? timestamp, failureRecord);
       // 重新读取旧终态只补齐历史，不再次暂停用户在故障处理后新发的消息。
-      if (classification === 'failed' && !wasTerminal) {
+      if (classification === 'failed' && !wasTerminal && isLatestProviderTurn) {
         for (const queued of submissions.filter((entry) => entry.status === 'queued')) {
           options.submissions.updateStatus(queued.id, 'paused', { pausedReason: 'recovery_required', ...(failureRecord ? { error: failureRecord } : {}) });
         }
       }
-      const interruptedQueue = classification === 'interrupted' && !wasTerminal ? interruptedQueueSubmissions(submissions) : [];
+      const interruptedQueue = classification === 'interrupted' && !wasTerminal && isLatestProviderTurn ? interruptedQueueSubmissions(submissions) : [];
       for (const queued of interruptedQueue.filter((entry: ZeusConversationSubmissionRecord) => entry.status === 'queued')) {
         options.submissions.updateStatus(queued.id, 'paused', { pausedReason: 'interrupted' });
       }
@@ -636,6 +647,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     const completedProjection = userMessageProjection
       ? { ...completedItemProjection(existing, presentedItemPayload, itemType), textContent: userMessageProjection.content }
       : completedItemProjection(existing, presentedItemPayload, itemType);
+    completedProjection.payload = commandTerminationProjection(completedProjection.payload, itemType, turnClassification);
     /** 中断轮次中的未完成命令没有成功证据；正常回合结束也不能结束后台进程。 */
     const unfinishedCommand = itemType === 'commandExecution' && itemPayload.status === 'inProgress';
     const itemFailed = itemPayload.status === 'failed' || (unfinishedCommand && (turnClassification === 'interrupted' || turnClassification === 'failed'));
@@ -790,7 +802,8 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     return {
       ...metadata,
       turns: options.turns.listByConversation(conversationId).flatMap((turn) => {
-        if (!turn.providerTurnId) return [];
+        // 会话历史可以跨运行段，当前线程的运行快照只包含其所属轮次。
+        if (!turn.providerTurnId || turn.providerThreadId !== metadata.id) return [];
         const submission = turn.clientSubmissionId ? submissionsById.get(turn.clientSubmissionId) : undefined;
         return [
           {
@@ -815,7 +828,16 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
     }
     // 线程状态通知也会核对历史；空闲历史没有正在准备的消息是正常现象，不能暂停它。
     // 前面的旧轮次投影可能已把会话设为空闲，这里按仍有效的发送占用恢复准备状态。
-    const submissions = options.submissions.listByConversation(conversation.id);
+    /** 已接受运行段固定提交所属线程，旧线程的活动提交不能污染当前线程。 */
+    const segmentThreadIds = new Map(options.execution.listSegments(conversation.id).map((segment) => [segment.id, segment.nativeSessionId]));
+    /** 未绑定线程的准备中提交仍保留原来的安全核对。 */
+    const submissions = options.submissions.listByConversation(conversation.id).filter((submission) => !submission.segmentId || !segmentThreadIds.get(submission.segmentId) || segmentThreadIds.get(submission.segmentId) === snapshot.id);
+    /** 历史轮次保留在正文中，运行门禁只消费当前线程。 */
+    const currentTurns = options.turns.listByConversation(conversation.id).filter((turn) => turn.providerThreadId === snapshot.id);
+    /** 快照轮次按历史顺序排列；旧中断只能结算自己的提交，不能暂停后续轮次的队列。 */
+    const latestProviderTurn = snapshot.turns?.at(-1);
+    /** Provider 轮次来自外部快照，读取身份前保留类型校验。 */
+    const latestProviderTurnId = isRecord(latestProviderTurn) && typeof latestProviderTurn.id === 'string' ? latestProviderTurn.id : null;
     /** 必须匹配实际发送占用，不能保护重启残留或另一条消息。 */
     const preparing = submissions.find((submission) => dependencies.isPreparingDispatch(conversation.id, submission.id));
     if (preparing && snapshotConfirmsIdleProviderThread(snapshot)) {
@@ -841,7 +863,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       }
     }
     if (inFlight.length === 0) {
-      const protectedProviderStopTurn = options.turns.listByConversation(conversation.id).find((turn) => shouldPreserveProviderStopTerminalTurn({ turn, submissions }) && snapshot.status?.type === 'active');
+      const protectedProviderStopTurn = currentTurns.find((turn) => shouldPreserveProviderStopTerminalTurn({ turn, submissions }) && snapshot.status?.type === 'active');
       if (protectedProviderStopTurn) {
         options.conversations.bindProvider(conversation.id, {
           providerId: 'codex',
@@ -854,7 +876,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       }
       const activeProviderTurn = (Array.isArray(snapshot.turns) ? snapshot.turns.filter(isRecord) : []).find((candidate) => classifySnapshotTurn(candidate) === 'active');
       const activeProviderTurnId = activeProviderTurn && typeof activeProviderTurn.id === 'string' ? activeProviderTurn.id : null;
-      const projectedRemoteTurn = activeProviderTurnId ? options.turns.listByConversation(conversation.id).find((turn) => turn.providerTurnId === activeProviderTurnId && !turn.clientSubmissionId) : undefined;
+      const projectedRemoteTurn = activeProviderTurnId ? currentTurns.find((turn) => turn.providerTurnId === activeProviderTurnId && !turn.clientSubmissionId) : undefined;
       if (activeProviderTurnId && projectedRemoteTurn) {
         options.turns.upsert({ ...projectedRemoteTurn, status: 'running', completedAt: null, updatedAt: now() });
         options.conversations.bindProvider(conversation.id, {
@@ -892,7 +914,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       }
       // 单轮失败不终止 thread；只有 Provider 快照能对上本地终态轮次时才恢复下一轮派发。
       if (conversation.providerState === 'paused' || conversation.providerState === 'failed') {
-        if (!snapshotConfirmsSafeResumeBoundary(snapshot, options.turns.listByConversation(conversation.id))) {
+        if (!snapshotConfirmsSafeResumeBoundary(snapshot, currentTurns)) {
           markConversationRecoveryRequired(conversation.id, coordinatorError('ZEUS_NATIVE_PROVIDER_STATE_UNCONFIRMED', 'Provider thread state cannot confirm that the previous turn is terminal.'));
           return;
         }
@@ -926,7 +948,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
         continue;
       }
       const timestamp = now();
-      const existingTurn = options.turns.listByConversation(conversation.id).find((turn) => turn.providerTurnId === providerTurnId || turn.clientSubmissionId === submission.id);
+      const existingTurn = currentTurns.find((turn) => turn.providerTurnId === providerTurnId || turn.clientSubmissionId === submission.id);
       if (classification === 'active' && isInteractionAuthorityMissingTurn(existingTurn)) {
         options.conversations.bindProvider(conversation.id, {
           providerId: 'codex',
@@ -950,7 +972,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       if (classification === 'active') {
         const pending = options.requests.listByConversation(conversation.id).find((request) => request.turnId === turn.id && request.status === 'pending' && request.transportGenerationId === generationId);
         if (pending) options.turns.upsert({ ...turn, status: 'waiting', updatedAt: timestamp });
-        if (exactDeliveryConfirmed || initialTurnAcceptanceConfirmed) {
+        if (submissionDeliveryConfirmedForTurn(submission, turn, exactDeliveryConfirmed, options.commandDeliveries)) {
           options.submissions.updateStatus(submission.id, 'active', { providerTurnId });
         } else {
           markSubmissionRecoveryRequired(submission, coordinatorError('ZEUS_NATIVE_SUBMISSION_DELIVERY_UNCONFIRMED', 'The active provider turn does not contain exact evidence that this user message was received.'));
@@ -971,7 +993,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
         runStates.set(conversation.id, result.recoveryRequired.length > 0 ? { type: 'paused', reason: 'recovery_required' } : { type: 'idle' });
       } else if (classification === 'interrupted') {
         const result = reconcileTerminalTurnSubmissions(conversation, turn, timestamp);
-        const interruptedQueue = interruptedQueueSubmissions(submissions);
+        const interruptedQueue = providerTurnId === latestProviderTurnId ? interruptedQueueSubmissions(submissions) : [];
         for (const queued of interruptedQueue.filter((entry: ZeusConversationSubmissionRecord) => entry.status === 'queued')) options.submissions.updateStatus(queued.id, 'paused', { pausedReason: 'interrupted' });
         const hasInterruptedQueue = interruptedQueue.length > 0;
         const requiresRecovery = result.recoveryRequired.length > 0;
@@ -990,7 +1012,7 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
         const providerBlocked = isProviderBlockingTurnFailure(failureRecord);
         const failedTurn = options.turns.upsert({ ...turn, status: 'failed', error: failureRecord, completedAt: timestamp, updatedAt: timestamp });
         reconcileTerminalTurnSubmissions(conversation, failedTurn, timestamp, failureRecord);
-        for (const queued of submissions.filter((entry) => entry.status === 'queued')) {
+        for (const queued of submissions.filter((entry) => entry.status === 'queued' && providerTurnId === latestProviderTurnId)) {
           options.submissions.updateStatus(queued.id, 'paused', { pausedReason: 'recovery_required', error: failureRecord });
         }
         options.conversations.bindProvider(conversation.id, { providerId: 'codex', providerThreadId: turn.providerThreadId, providerModel: conversation.providerModel, providerState: providerBlocked ? 'paused' : 'failed' });

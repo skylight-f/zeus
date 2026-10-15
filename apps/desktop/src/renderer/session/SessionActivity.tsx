@@ -11,6 +11,7 @@ import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist
 import { WrenchIcon as Wrench } from '@phosphor-icons/react/dist/csr/Wrench';
 import { BrowserIcon as Browser } from '@phosphor-icons/react/dist/csr/Browser';
 import { ImageIcon as Image } from '@phosphor-icons/react/dist/csr/Image';
+import { ImagesIcon as Images } from '@phosphor-icons/react/dist/csr/Images';
 import { ListChecksIcon as ListChecks } from '@phosphor-icons/react/dist/csr/ListChecks';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
 import { PlugsIcon as Plugs } from '@phosphor-icons/react/dist/csr/Plugs';
@@ -167,9 +168,19 @@ function SessionActivityGroupContent(props: SessionActivityGroupProps) {
           </ol>
         ) : null}
         {imageResources.length > 0 ? (
-          <div className="session-activity-images">
+          <details className="session-activity-images" open>
+            <summary>
+              {/* 图片数量沿用普通操作行的图标列、标题和箭头，保持混合记录对齐。 */}
+              <span className="session-activity-item-icon" aria-hidden="true">
+                <Images />
+              </span>
+              <span className="session-activity-item-copy session-activity-item-summary">
+                <span className="session-activity-item-title">{props.language === 'zh-CN' ? `已查看 ${imageResources.length} 张图像` : `Viewed ${imageResources.length} ${imageResources.length === 1 ? 'image' : 'images'}`}</span>
+                <CaretDown aria-hidden="true" className="session-activity-item-caret session-activity-images-caret" weight="bold" />
+              </span>
+            </summary>
             <ConversationResourceCards resources={imageResources} language={props.language} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
-          </div>
+          </details>
         ) : null}
       </div>
     </AnimatedSize>
@@ -251,7 +262,7 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
           <span>{target.prefix}</span>{' '}
         </>
       ) : null}
-      <button type="button" className="session-activity-resource-link" title={target.title} onClick={() => void props.onOpenResource?.(target.resource, defaultOpenTarget(target.resource))}>
+      <button type="button" className="session-activity-resource-link" data-icon-tooltip={target.title} onClick={() => void props.onOpenResource?.(target.resource, defaultOpenTarget(target.resource))}>
         {skillActivity ? title : target.label}
       </button>
     </span>
@@ -282,9 +293,13 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
             {open ? (
               <div className="session-activity-item-detail-body">
                 {/* 旧缓存可能只有详情句柄，读取完成前保留明确的进度反馈。 */}
-                {!detail.command && !detail.cwd && !detail.output && !toolResult && props.item.payload.v2ContentTruncated === true ? <small role="status">{props.language === 'zh-CN' ? '正在读取命令…' : 'Loading command…'}</small> : null}
+                {!detail.command && !detail.cwd && !detail.output && detail.exitCode === null && !toolResult && props.item.payload.v2ContentTruncated === true ? (
+                  <small role="status">{props.language === 'zh-CN' ? '正在读取命令…' : 'Loading command…'}</small>
+                ) : null}
                 {detail.command ? <code>{detail.command}</code> : null}
                 {detail.cwd ? <small>{detail.cwd}</small> : null}
+                {/* 终止只描述进程结束，原始非零退出码仍供用户核对。 */}
+                {detail.exitCode !== null ? <small>{props.language === 'zh-CN' ? `退出码：${detail.exitCode}` : `Exit code: ${detail.exitCode}`}</small> : null}
                 {detail.output || toolResult ? <ActivityItemOutput key={toolResult?.handle ?? props.item.key} output={detail.output} toolResult={toolResult} language={props.language} onLoadToolResult={props.onLoadToolResult} /> : null}
                 {contentLoadError ? (
                   <div className="session-message-delivery-error" role="alert">
@@ -484,6 +499,8 @@ function activityOutputPreview(output: string, visibleCharacters: number): { tex
 
 export function SessionPlanProgress(props: { plan: NativeTurnPlanSnapshot; language: SessionUiLanguage }) {
   const [open, setOpen] = useState(false);
+  /** 计划详情仅在持续悬停后展开，点击与键盘仍直接打开。 */
+  const hoverIntent = useHoverIntent(() => show());
   /** 鼠标离开后仍在面板内输入时保留展开。 */
   const dockRef = useRef<HTMLElement>(null);
   const popoverId = useId();
@@ -502,11 +519,13 @@ export function SessionPlanProgress(props: { plan: NativeTurnPlanSnapshot; langu
   }
 
   function show(): void {
+    hoverIntent.cancel();
     cancelClose();
     setOpen(true);
   }
 
   function scheduleClose(): void {
+    hoverIntent.cancel();
     cancelClose();
     closeTimerRef.current = setTimeout(() => {
       if (!dockRef.current?.contains(document.activeElement)) setOpen(false);
@@ -541,10 +560,13 @@ export function SessionPlanProgress(props: { plan: NativeTurnPlanSnapshot; langu
     <section
       ref={dockRef}
       className="session-plan-dock"
-      onPointerEnter={show}
+      onPointerEnter={(event) => {
+        cancelClose();
+        if (!open && event.pointerType !== 'touch' && event.buttons === 0) hoverIntent.schedule(event.currentTarget);
+      }}
       onPointerLeave={scheduleClose}
       onFocusCapture={(event) => {
-        if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) show();
+        if (event.target instanceof HTMLElement && event.target.matches(':focus-visible') && (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget))) show();
       }}
       onBlurCapture={handleBlur}
       onKeyDown={handleKeyDown}
@@ -605,8 +627,8 @@ export function SessionTurnDuration(props: { turn: NativeTurnSnapshot; requests:
   if (duration === null) return props.fallback ?? null;
   /** 紧凑时长与参考布局一致。 */
   const value = formatDuration(duration);
-  /** 失败和中断仍明确区分于正常完成。 */
-  const terminalStatus = props.turn.status === 'interrupted' || props.turn.status === 'failed' ? props.turn.status : 'completed';
+  /** 已有失败详情由统一错误反馈承载，耗时不再重复报错；缺少详情和用户中断仍保留状态。 */
+  const terminalStatus = props.turn.status === 'interrupted' || (props.turn.status === 'failed' && !props.turn.error) ? props.turn.status : 'completed';
   /** 状态文案随界面语言变化。 */
   const label =
     props.language === 'zh-CN'
@@ -636,8 +658,12 @@ export function SessionTurnProcessDisclosure(props: {
   language: SessionUiLanguage;
   children: ReactNode;
   onOpen?: () => void | Promise<void>;
+  /** 目录晚于用户展开抵达时，按同一持久分组补读一次。 */
+  loadKey?: string;
   loading?: boolean;
   error?: string | null;
+  /** 完成轮次的预览尚未齐全时只显示读取状态，不逐页展示递增数量。 */
+  contentPending?: boolean;
   /** 入口可表达整轮处理过程或补载的轮次详情。 */
   labelKind?: 'process' | 'details';
   /** 整轮入口使用真实轮次用时，缺失时间时显示原文案。 */
@@ -664,7 +690,7 @@ export function SessionTurnProcessDisclosure(props: {
   useEffect(() => {
     if (!open || !onOpenRef.current) return;
     void Promise.resolve(onOpenRef.current()).catch(() => undefined);
-  }, [open]);
+  }, [open, props.loadKey]);
   /** 数量由当前真实条目生成，作为阶段入口的固定摘要。 */
   const countLabel = props.itemCount ? (props.language === 'zh-CN' ? `${props.itemCount} 项操作` : `${props.itemCount} ${props.itemCount === 1 ? 'operation' : 'operations'}`) : null;
   /** 轮次过程和补载详情共用同一个入口组件。 */
@@ -694,7 +720,7 @@ export function SessionTurnProcessDisclosure(props: {
         <button
           type="button"
           aria-label={accessibleLabel}
-          title={accessibleLabel}
+          data-icon-tooltip={accessibleLabel}
           aria-expanded={open}
           aria-controls={bodyId}
           onClick={(event) => {
@@ -707,14 +733,14 @@ export function SessionTurnProcessDisclosure(props: {
           <CaretDown className="session-turn-process-caret" aria-hidden="true" weight="bold" />
         </button>
       </div>
-      <Collapsible id={bodyId} open={open} revealWithinViewport>
+      <Collapsible id={bodyId} open={open} animateHeight>
         <div className="session-turn-process-body">
-          {props.loading ? (
+          {props.loading || (props.contentPending && !props.error) ? (
             <p className="session-v2-page-status" role="status" aria-live="polite">
               {props.language === 'zh-CN' ? '正在读取处理过程…' : 'Loading process…'}
             </p>
           ) : null}
-          {props.children}
+          {props.contentPending ? null : props.children}
           {props.error ? (
             <p className="session-v2-page-error" role="alert">
               <VisibleApplicationError error={props.error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
@@ -900,6 +926,8 @@ function activityItemDetail(item: NativeSessionItemBuffer): {
   command: string | null;
   cwd: string | null;
   output: string | null;
+  /** 非零退出码保留在详情，避免把终止误解为运行成功。 */
+  exitCode: number | null;
 } | null {
   /** 原始工具身份保留在展开详情，摘要不暴露内部命名。 */
   const nativeTool = nativeActivityTool(item.payload);
@@ -914,9 +942,11 @@ function activityItemDetail(item: NativeSessionItemBuffer): {
         .join('\n')
     : null;
   const output = primitive(item.payload.aggregatedOutput ?? item.payload.output ?? item.payload.stdout ?? item.payload.stderr) ?? activityToolResult(item)?.projection ?? nativeOutput ?? presentationLiveText(item);
+  /** 正常完成不增加冗余字段，异常退出保留准确整数。 */
+  const exitCode = Number.isInteger(item.payload.exitCode) && item.payload.exitCode !== 0 ? (item.payload.exitCode as number) : null;
   /** 历史长记录可能在命令字段前截断，缺少预览不代表没有可读取的详情。 */
   const deferredDetail = item.payload.v2ContentTruncated === true && typeof item.payload.v2ContentHandle === 'string' && Boolean(item.payload.v2ContentHandle);
-  return command || cwd || output || deferredDetail || activityToolResult(item) ? { command, cwd, output } : null;
+  return command || cwd || output || exitCode !== null || deferredDetail || activityToolResult(item) ? { command, cwd, output, exitCode } : null;
 }
 
 function commandActionTitle(item: NativeSessionItemBuffer, language: SessionUiLanguage): string | null {
@@ -1034,3 +1064,4 @@ function primitive(value: unknown): string | null {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+import { useHoverIntent } from '../ui/useHoverIntent.js';

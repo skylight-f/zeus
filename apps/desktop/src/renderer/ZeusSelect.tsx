@@ -42,6 +42,8 @@ export interface ZeusSelectProps<T extends string> {
   triggerIcon?: ReactNode;
   triggerClassName?: string;
   triggerTitle?: string;
+  /** 显式功能提示优先于 triggerTitle，两种入口均使用统一延迟气泡。 */
+  triggerTooltip?: string;
   triggerRef?: RefObject<HTMLButtonElement | null>;
   hideSelectedLabel?: boolean;
   className?: string;
@@ -557,7 +559,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
                       tabIndex={open && (props.pinning || option.value === activeValue) ? 0 : -1}
                       disabled={option.disabled}
                       data-value={option.value}
-                      title={optionLabel}
+                      data-icon-tooltip={optionLabel}
                       onFocus={() => setActiveValue(option.value)}
                       onClick={() => selectOption(option.value)}
                       onKeyDown={(event) => handleOptionKeyDown(event, option)}
@@ -581,7 +583,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
                         type="button"
                         className="zeus-select-pin"
                         aria-label={`${pinned ? props.pinning.unpinLabel : props.pinning.pinLabel} ${optionLabel}`}
-                        title={pinned ? props.pinning.unpinLabel : props.pinning.pinLabel}
+                        data-icon-tooltip={`${pinned ? props.pinning.unpinLabel : props.pinning.pinLabel} ${optionLabel}`}
                         aria-pressed={pinned}
                         onClick={(event) => togglePin(option, event.currentTarget)}
                       >
@@ -627,7 +629,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
         aria-expanded={open}
         aria-controls={props.pinning ? `${rootId}-dialog` : listboxId}
         aria-activedescendant={open && !props.pinning ? activeOptionId : undefined}
-        title={props.triggerTitle}
+        data-icon-tooltip={props.triggerTooltip || props.triggerTitle}
         disabled={props.disabled}
         onClick={() => (open ? closeListbox(false) : openListbox(props.value))}
         onKeyDown={handleTriggerKeyDown}

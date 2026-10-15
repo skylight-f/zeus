@@ -58,6 +58,8 @@ export interface CreateCodexNativeConversationCoordinatorOptions {
   usage: CodexUsageService;
   execution: ConversationExecutionRepository;
   commandDeliveries: CommandDeliveryRepository;
+  /** 核对跨分段发送的候选线程；与组合根的启动恢复共用持久接纳流程。 */
+  reconcileOutcomeUnknownSwitches?: (conversationId: string) => Promise<void>;
   toolResults: ManagedConversationToolResultStore;
   eventFlow: ConversationEventFlowControl;
   broadcast: (type: string, payload: Record<string, unknown>) => void;
@@ -158,6 +160,10 @@ export interface NativeSubmissionError {
 export type NativeSubmissionRecoveryKind = 'interaction_response';
 
 export interface NativeQueuedSubmission {
+  /** 内部提交保留队列与恢复能力，展示为系统操作而非用户发言。 */
+  internalOperation?: boolean;
+  /** 明确关联被取消的原提交，实时与重新加载均可清理其临时气泡。 */
+  replacementOfSubmissionId?: string;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
   questionAnswer?: AsyncQuestionAnswer;
   id: string;
@@ -263,7 +269,7 @@ export interface NativeConversationAttachmentInput {
   size: number;
   localPath?: string;
   uploadRef?: string;
-  /** Local Server 验签后写入的精确路径授权；API 调用方不能自行声明。 */
+  /** Local Server 验签或校验可信目录后确认的真实路径授权；API 调用方不能自行声明。 */
   authorizedPath?: string;
   /** 任务首发服务端快照中的附件位置身份；普通会话附件不填写。 */
   taskPushAttachmentKey?: string;
@@ -283,6 +289,10 @@ export interface NativeQuestionAnswerAttachmentInput {
 }
 
 export interface StartTaskConversationInput {
+  /** 首发与后续消息共用结构化网页批注。 */
+  browserComments?: Record<string, unknown>[];
+  /** 首发与后续消息共用网页批注提示词。 */
+  browserCommentContent?: string;
   /** 会话创建时冻结的上下文容量，空值保留默认。 */
   contextCapacityTokens?: number | null;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
@@ -343,6 +353,10 @@ export interface StartTaskConversationInput {
 }
 
 export interface StartProjectConversationInput {
+  /** 首发与后续消息共用结构化网页批注。 */
+  browserComments?: Record<string, unknown>[];
+  /** 首发与后续消息共用网页批注提示词。 */
+  browserCommentContent?: string;
   /** 会话创建时冻结的上下文容量，空值保留默认。 */
   contextCapacityTokens?: number | null;
   executionWorkspaceMode?: 'direct' | 'worktree';
@@ -385,6 +399,10 @@ export interface SetNativeGoalInput {
 }
 
 export interface SubmitNativeMessageInput {
+  /** 由恢复入口绑定原提交，模型、权限和容量继续使用其冻结上下文。 */
+  resumeSubmissionId?: string;
+  /** 仅由服务端恢复入口设置，客户端不能自行隐藏普通消息。 */
+  internalOperation?: boolean;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
   questionAnswer?: AsyncQuestionAnswer;
   conversationId: string;
@@ -458,6 +476,8 @@ export interface EditQueuedSubmissionInput {
   conversationId: string;
   submissionId: string;
   content: string;
+  /** 正文与附件一起替换；省略字段保留原附件。 */
+  attachments?: NativeConversationAttachmentInput[];
 }
 
 export interface DeleteQueuedSubmissionInput {

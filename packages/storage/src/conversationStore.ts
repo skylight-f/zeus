@@ -1,11 +1,17 @@
 import { assertContextCapacity } from '@zeus/shared';
 import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
 import type { SQLInputValue } from 'node:sqlite';
 import { randomId } from './randomId.js';
 import { type CodexUsageEstimate, type ConversationResourceKind, type ConversationResourcePresentation, type TokenUsageBreakdown } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
 import type { ConversationAgentKind } from './conversationItemTypes.js';
 import { ConversationTranscriptRepository, hashConversationTranscriptContent } from './conversationTranscriptStore.js';
+
+/** 助手图片复用原始绝对路径的稳定附件身份，归档副本与工具输出共用该身份。 */
+export function conversationImageAttachmentRef(absolutePath: string): string {
+  return `assistant_image_${createHash('sha256').update(resolve(absolutePath)).digest('hex')}`;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -1320,6 +1326,11 @@ export class ConversationRepository {
     return this.getById(conversationId)!;
   }
 
+  /** 目录只判断消息是否存在，避免为可见性检查加载整段会话正文。 */
+  hasMessages(conversationId: string): boolean {
+    return Boolean(this.db.get<{ present: number }>('SELECT 1 AS present FROM conversation_messages WHERE conversation_id = ? LIMIT 1', [conversationId]));
+  }
+
   listMessages(conversationId: string): ZeusConversationMessageRecord[] {
     return this.db
       .select<DbConversationMessageRow>(
@@ -1869,6 +1880,24 @@ export class ConversationGoalRepository {
 export class ConversationTurnRepository {
   constructor(private readonly db: ZeusDatabasePort) {}
 
+  /** 启动时按已接受提交的冻结运行段校正线程归属，保留轮次状态与诊断记录。 */
+  restoreAcceptedThreadBindings(): void {
+    this.db.execute(
+      `UPDATE conversation_turns AS turn
+          SET provider_thread_id = segment.native_session_id
+         FROM conversation_submissions AS submission
+         JOIN conversation_runtime_segments AS segment ON segment.id = submission.segment_id
+        WHERE turn.client_submission_id = submission.id
+          AND turn.conversation_id = submission.conversation_id
+          AND turn.conversation_id = segment.conversation_id
+          AND turn.provider_turn_id = submission.provider_turn_id
+          AND submission.accepted_at IS NOT NULL
+          AND segment.runtime_kind = 'codex'
+          AND segment.native_session_id IS NOT NULL
+          AND turn.provider_thread_id <> segment.native_session_id`,
+    );
+  }
+
   upsert(
     input: Omit<ZeusConversationTurnRecord, 'id' | 'errorJson' | 'planJson' | 'agentKind' | 'nativeRunId'> & {
       id?: string;
@@ -2357,7 +2386,7 @@ export class ConversationSubmissionRepository {
       .map(mapConversationSubmissionRow);
   }
 
-  /** 展示交接包含尚在发送中的提交和未接纳的失败项，调度队首仍使用独立的可调度队列。 */
+  /** 展示交接保留 Provider 回显前的提交；本地接纳记录不能提前撤销气泡，调度仍使用独立队列。 */
   listQueueProjectionByConversation(conversationId: string): ZeusConversationSubmissionRecord[] {
     return this.db
       .select<DbConversationSubmissionRow>(
@@ -2365,7 +2394,7 @@ export class ConversationSubmissionRepository {
        AND (status IN ('queued', 'paused', 'dispatching') OR (status = 'failed' AND provider_turn_id IS NULL)
          OR (status = 'active' AND NOT EXISTS (SELECT 1 FROM conversation_messages AS message
            WHERE message.conversation_id = conversation_submissions.conversation_id AND message.role = 'user'
-             AND message.client_message_id = conversation_submissions.client_message_id)))
+             AND message.client_message_id = conversation_submissions.client_message_id AND message.provider_item_id IS NOT NULL)))
        AND COALESCE(json_extract(input_json, '$.expertRound'), 0) <> 1
        ORDER BY queue_position, created_at, id`,
         [conversationId],

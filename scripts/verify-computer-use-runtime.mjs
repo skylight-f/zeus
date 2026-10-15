@@ -11,11 +11,15 @@ const { values } = parseArgs({
     'data-root': { type: 'string' },
     'display-id': { type: 'string' },
     'show-cursor': { type: 'boolean' },
+    /** 在同一真实窗口验证原生选文件、取消和返回主窗口。 */
+    'file-picker': { type: 'boolean' },
     'user-priority': { type: 'boolean' },
     'packaged-app': { type: 'string' },
     performance: { type: 'boolean' },
     'system-stop': { type: 'boolean' },
     'single-display': { type: 'boolean' },
+    /** 等待真实五分钟回收，并核对恢复和取消边界。 */
+    'session-expiry': { type: 'boolean' },
   },
 });
 /** 所有路径及进程身份必须来自本工作树。 */
@@ -27,11 +31,15 @@ const expected = {
   hostBundleId: values['packaged-app'] ? 'dev.hypha.zeus.test' : 'com.github.Electron',
   displayId: Number(values['display-id']),
   showCursor: values['show-cursor'] === true,
+  /** 文件选择使用实际 preload、Main IPC 和后台原生控件。 */
+  filePicker: values['file-picker'] === true,
   userPriority: values['user-priority'] === true,
   performance: values.performance === true,
   systemStop: values['system-stop'] === true,
   /** 仅在用户明确变更副屏验收约束后，由本次编排显式传入。 */
   singleDisplay: values['single-display'] === true,
+  /** 专项检查不修改驱动的真实空闲期限。 */
+  sessionExpiry: values['session-expiry'] === true,
 };
 if (!Number.isSafeInteger(expected.pid) || expected.pid <= 0 || !Number.isSafeInteger(expected.port) || expected.port <= 0 || !Number.isSafeInteger(expected.displayId) || !expected.dataRoot.startsWith(`${resolve('.tmp')}/`))
   throw new Error('必须指定本任务 --pid、--port、--display-id 和 .tmp 下的 --data-root。');
@@ -92,6 +100,179 @@ async function verifyInElectron(expected) {
   const remainingChecks = [];
   /** 实际延迟、传图字节和原生进程资源单独记录，不能用静态检查替代。 */
   const performanceResults = {};
+
+  /** 文件选择的所有依赖步骤在同一入口串行检查，禁止读取空状态或重放动作。 */
+  async function verifyFilePicker(target) {
+    /** 专项使用独立轮次，不恢复前面已经停止的控制者。 */
+    const pickerCall = (tool, args) => call(tool, args, 'file-picker-owner');
+    /** 只在工具成功后解析数据，错误原文保留在失败原因中。 */
+    const checkedResult = (result, description) => {
+      assert(result.success, `${description}失败：${textOf(result)}`);
+      return JSON.parse(textOf(result));
+    };
+    /** 每次动作之前确认有效树和精确窗口，不把空树当成可操作状态。 */
+    const observe = async (nativeTarget, description) => {
+      /** 取得本次真实快照，禁止复用上一次窗口状态。 */
+      const result = await pickerCall('get_window_state', { ...nativeTarget, max_elements: 1400, max_depth: 24, max_image_dimension: 512, timeout_ms: 2500 });
+      /** 原生错误必须先终止流程，再读取元素。 */
+      const state = checkedResult(result, description);
+      await fs.writeFile(`${expected.dataRoot}/../computer-file-picker-last-state.json`, JSON.stringify({ description, nativeTarget, state }));
+      /** 原生实际图像保留为证据，不拿页面 DOM 代替系统控件或截图。 */
+      const screenshot = result.contentItems.find((item) => item.type === 'inputImage');
+      if (screenshot) await fs.writeFile(`${expected.dataRoot}/../computer-file-picker-last.png`, Buffer.from(screenshot.imageUrl.split(',')[1], 'base64'));
+      assert(
+        Array.isArray(state?.elements) &&
+          state.background_input?.exact_window?.status === 'matched' &&
+          state.background_input.exact_window.pid === nativeTarget.pid &&
+          state.background_input.exact_window.window_id === nativeTarget.window_id,
+        `${description}未匹配有效窗口，尚未派发输入`,
+      );
+      return state;
+    };
+    /** 只能使用本次观察取得的语义身份，操作前再次核对后台条件。 */
+    const click = async (nativeTarget, element, description) => {
+      assert(element && typeof element.element_token === 'string' && element.enabled !== false, `${description}缺少有效控件或控件禁用，尚未派发输入`);
+      assert(!window.isFocused(), '应用已被用户切到前台，停止专项输入');
+      if (!expected.singleDisplay) assert(electron.screen.getDisplayNearestPoint(electron.screen.getCursorScreenPoint()).id !== expected.displayId, '用户正在验收屏工作，停止专项输入');
+      return checkedResult(await pickerCall('click', { ...nativeTarget, element_token: element.element_token }), description);
+    };
+    /** 界面和绘制策略必须在专项结束后恢复。 */
+    const originalUrl = window.webContents.getURL();
+    /** 保留当前真实窗口的后台绘制设置。 */
+    const originalThrottling = window.webContents.getBackgroundThrottling();
+    /** 原生接口仅设置本任务默认目录，不模拟选择结果。 */
+    const originalShowOpenDialog = electron.dialog.showOpenDialog;
+    /** 本次新建目录只包含本任务文件，不改动已有诊断记录。 */
+    const fixtureRoot = `${expected.dataRoot}/computer-file-picker-${Date.now()}`;
+    /** 选择结果必须严格对应此文件。 */
+    const fileName = 'computer-use-fixture.txt';
+    /** 实际磁盘内容和返回大小互相核对。 */
+    const fileContent = 'Computer Use 原生文件选择检查\n';
+    /** 主窗口和两次弹窗的真实身份作为专项证据返回。 */
+    const panelIds = [];
+    await fs.mkdir(fixtureRoot);
+    try {
+      await fs.writeFile(`${fixtureRoot}/${fileName}`, fileContent);
+      await fs.writeFile(
+        `${fixtureRoot}/picker.html`,
+        '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>原生文件选择检查</title><main style="padding:50px;font:20px sans-serif"><h1>原生文件选择检查</h1><button id="native-picker" style="font-size:24px">选择验收文件</button></main></html>',
+      );
+      // 只为本任务窗口改变初始目录，其他调用原样转交。
+      electron.dialog.showOpenDialog = function (parent, options) {
+        return parent === window && options?.properties?.includes('openFile') ? originalShowOpenDialog.call(this, parent, { ...options, defaultPath: fixtureRoot }) : originalShowOpenDialog.apply(this, arguments);
+      };
+      window.webContents.setBackgroundThrottling(false);
+      await window.loadFile(`${fixtureRoot}/picker.html`);
+      // 导航可以创建新的渲染进程，绘制策略在新页面就绪后再次明确设置。
+      window.webContents.setBackgroundThrottling(false);
+      // 最后返回 undefined，不把事件处理函数跨进程传回，实际选择仍走正常 IPC。
+      await window.webContents.executeJavaScript("document.getElementById('native-picker').addEventListener('click',()=>{globalThis.__zeusPickerResult=window.zeus.chooseConversationResources();});void 0;");
+      /** 实际页面帧必须推进，DOM 已加载不能替代后台绘制就绪。 */
+      const painted = await window.webContents.executeJavaScript('new Promise(resolve=>{const deadline=setTimeout(()=>resolve(false),5000);requestAnimationFrame(()=>requestAnimationFrame(()=>{clearTimeout(deadline);resolve(true)}));})');
+      assert(painted === true, '文件选择页面没有推进实际绘制帧，尚未派发输入');
+      await observe(target, '文件选择页面初次观察');
+      /** 原生窗口存在性可以稳定核对，网页按钮则使用随后取得的实际 AX 控件。 */
+      const ready = await pickerCall('verify_state', { ...target, expect: [{ window: { exists: true } }], timeout_ms: 5000 });
+      /** verify_state 调用完成和实际条件满足分别核对，不能只看工具成功标志。 */
+      const readyState = checkedResult(ready, '文件选择页面的窗口就绪检查');
+      if (readyState.status !== 'satisfied' || readyState.stable !== true) {
+        await observe(target, '页面就绪失败后的原生状态');
+        await fs.writeFile(
+          `${expected.dataRoot}/../computer-file-picker-page-state.json`,
+          JSON.stringify(await window.webContents.executeJavaScript('({url:location.href,title:document.title,text:document.body.innerText,button:!!document.getElementById("native-picker")})')),
+        );
+      }
+      assert(readyState.status === 'satisfied' && readyState.stable === true, `文件选择页面的原生窗口没有实际就绪：${JSON.stringify(readyState)}`);
+      /** 新弹窗身份来自打开前后的系统窗口清单，不使用旧窗口代替。 */
+      const openPanel = async () => {
+        /** 打开之前的实际系统窗口集合。 */
+        const before = checkedResult(await pickerCall('list_windows', { pid: expected.pid, on_screen_only: true }), '打开前窗口发现');
+        assert(Array.isArray(before?.windows), '打开前窗口清单无效');
+        /** 实际主窗口按钮来自当前快照。 */
+        const state = await observe(target, '主窗口观察');
+        await click(
+          target,
+          state.elements.find((element) => element.role === 'AXButton' && element.label === '选择验收文件'),
+          '打开文件选择框',
+        );
+        /** 投递后只观察，不因出现新窗口而重复点击。 */
+        const after = checkedResult(await pickerCall('list_windows', { pid: expected.pid, on_screen_only: true }), '弹窗发现');
+        assert(Array.isArray(after?.windows), '打开后窗口清单无效');
+        /** 新窗口身份必须唯一，否则无法安全派发输入。 */
+        const newWindows = after.windows.filter((candidate) => !before.windows.some((previous) => previous.window_id === candidate.window_id));
+        assert(newWindows.length === 1, `实际新弹窗数量为 ${newWindows.length}，停止输入`);
+        /** 同一实际应用中新发现的系统窗口身份。 */
+        const panelTarget = { pid: expected.pid, window_id: newWindows[0].window_id };
+        panelIds.push(panelTarget.window_id);
+        return { panelTarget, state: await observe(panelTarget, '文件选择框观察') };
+      };
+      /** 结果读取有界等待实际 IPC，不因迟到结果重复点击原生按钮。 */
+      const readSelection = async () => {
+        /** 期限计时器在实际结果返回后立即释放。 */
+        let timer;
+        try {
+          return await Promise.race([
+            window.webContents.executeJavaScript('globalThis.__zeusPickerResult'),
+            new Promise((_resolve, reject) => {
+              timer = setTimeout(() => reject(new Error('文件选择结果未在期限内返回；禁止重放动作')), 5000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      /** 关闭之后重新观察主窗口和系统清单，不能只凭动作派发判断完成。 */
+      const confirmClosed = async (panelTarget) => {
+        /** 系统清单确认实际弹窗已经消失。 */
+        const windows = checkedResult(await pickerCall('list_windows', { pid: expected.pid, on_screen_only: true }), '关闭后窗口发现');
+        assert(Array.isArray(windows?.windows) && !windows.windows.some((candidate) => candidate.window_id === panelTarget.window_id), '文件选择框没有实际关闭');
+        /** 同轮次主窗口必须重新可用，不能只验证弹窗消失。 */
+        const state = await observe(target, '关闭后主窗口观察');
+        assert(state.zeus_control?.paused === false && state.zeus_control?.sharing_active === true && !window.isFocused(), '关闭弹窗后主窗口暂停、共享失效或焦点被改变');
+      };
+      /** 默认语义点击选中真实文件行，再使用新观察的打开按钮。 */
+      const opened = await openPanel();
+      /** 默认语义选择必须得到原生选中值回读。 */
+      const selection = await click(
+        opened.panelTarget,
+        opened.state.elements.find((element) => element.label === fileName && element.role === 'AXTextField'),
+        '选择实际文件',
+      );
+      assert(selection.effect === 'confirmed', '真实文件行没有确认选中');
+      /** 打开按钮使用选中文件后的新快照。 */
+      const selectedState = await observe(opened.panelTarget, '选中文件后的观察');
+      await click(
+        opened.panelTarget,
+        selectedState.elements.find((element) => element.role === 'AXButton' && element.label === '打开'),
+        '确认打开',
+      );
+      /** 返回值只包含实际 IPC 的可序列化资源数据。 */
+      const selected = await readSelection();
+      assert(Array.isArray(selected) && selected.length === 1 && selected[0].name === fileName && selected[0].kind === 'file' && selected[0].size === Buffer.byteLength(fileContent), '实际选择结果不是本任务文件');
+      await confirmClosed(opened.panelTarget);
+      /** 同轮次再次打开并取消，确认空结果和主窗口继续控制。 */
+      const cancelled = await openPanel();
+      await click(
+        cancelled.panelTarget,
+        cancelled.state.elements.find((element) => element.role === 'AXButton' && element.label === '取消'),
+        '取消文件选择',
+      );
+      /** 取消必须由正常 IPC 返回真实空数组。 */
+      const cancelledResult = await readSelection();
+      assert(Array.isArray(cancelledResult) && cancelledResult.length === 0, '取消没有返回实际空结果');
+      await confirmClosed(cancelled.panelTarget);
+      return { fileName, size: selected[0].size, panelIds, selectedFile: true, cancelled: true, parentContinued: true, focused: window.isFocused() };
+    } finally {
+      electron.dialog.showOpenDialog = originalShowOpenDialog;
+      try {
+        await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId: 'file-picker-owner' });
+        await window.loadURL(originalUrl);
+      } finally {
+        window.webContents.setBackgroundThrottling(originalThrottling);
+        await fs.rm(fixtureRoot, { recursive: true, force: true });
+      }
+    }
+  }
   try {
     /** 模块异步加载期间全局停止，不能在停止之后初始化无所属轮次的 SDK。 */
     const discoveryStartup = host.ensureDriver().then(
@@ -132,9 +313,21 @@ async function verifyInElectron(expected) {
     assert(nativeWindow, '未找到本任务原生主窗口');
     /** 精确窗口身份始终来自真实发现。 */
     const target = { pid: expected.pid, window_id: Number(nativeWindow.window_id ?? nativeWindow.windowId) };
+    if (expected.filePicker) {
+      // 实际业务流程先于进程失联等故障注入，结束共享后再恢复正常页面。
+      performanceResults.filePicker = await verifyFilePicker(target);
+      assert(host.windowOwners.size === 0, '文件选择专项结束后窗口占用残留');
+      checks.push('native_file_picker_open_cancel_and_parent_continue_without_focus');
+    }
     /** 首次真实截图与辅助功能读取。 */
     const observed = await call('get_window_state', { ...target, max_elements: 80, max_image_dimension: 256 });
     assert(observed.success, textOf(observed));
+    /** 实际宿主只返回一份结构化控件树，继续保留原生快照和完整性字段。 */
+    const observation = JSON.parse(textOf(observed));
+    assert(Array.isArray(observation.elements) && observation.snapshot_id && typeof observation.elements_complete === 'boolean', '控件树投影丢失原生身份或完整性');
+    assert(!('tree_markdown' in observation) && !('_note' in observation), '控件树仍重复发送');
+    if (observation.elements_complete === false) assert(observation.zeus_next_step?.includes('max_elements'), '部分控件树缺少正确预算提示');
+    checks.push('compact_observation_preserves_native_identity_and_completeness');
     assert(JSON.parse(textOf(observed)).zeus_control?.monitoring === true, '原生用户输入监听尚未就绪');
     assert(JSON.parse(textOf(observed)).zeus_control?.events_ready === true && JSON.parse(textOf(observed)).zeus_control?.sharing_active === true, '真实窗口共享或已认证事件通道尚未就绪');
     workerPids.push(host.workerPid);
@@ -144,18 +337,23 @@ async function verifyInElectron(expected) {
     assert(Number.isSafeInteger(observedAt) && Math.abs(Date.now() - observedAt) < 10_000 && host.getPreview('computer-runtime-probe')?.capturedAt === new Date(observedAt).toISOString(), '预览没有使用真实系统帧采集时间');
     checks.push('native_frame_capture_timestamp_used_in_preview');
     /** 在真实会话创建请求已派发、回复未返回时停止，确认原生会话也被释放。 */
-    const sessionOwner = host.ensureOwner({ conversationId: 'computer-runtime-probe', threadId: 'native', turnId: 'session-start-owner', tool: 'get_window_state' });
-    const sessionStartup = host.ensureOwnerSession(host.driver, sessionOwner, sessionOwner.input).then(
-      () => true,
-      () => false,
-    );
-    /** 微任务只等待真实派发，不替换 Driver 或原生返回值。 */
-    for (let attempt = 0; !sessionOwner.sessionDriver && attempt < 20; attempt += 1) await Promise.resolve();
-    assert(sessionOwner.sessionDriver && !sessionOwner.sessionStarted, '没有捕获会话创建回复前的真实派发');
-    await host.stopOwner(sessionOwner);
-    assert(!(await sessionStartup) && !sessionOwner.sessionStarted, '迟到会话创建复活已停止控制');
-    const sessions = await host.driver.callTool('list_sessions', JSON.stringify({ limit: 100 }));
-    assert(!sessions.isError && !JSON.parse(sessions.structuredJson).sessions.some((session) => session.session === sessionOwner.id), '创建期间停止后原生会话残留');
+    const sessionDriver = host.driver;
+    /** 重复覆盖 SDK 排队和取消交错，不能靠单次幸运时序通过。 */
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const sessionOwner = host.ensureOwner({ conversationId: 'computer-runtime-probe', threadId: 'native', turnId: `session-start-owner-${attempt}`, tool: 'get_window_state' });
+      const sessionStartup = host.ensureOwnerSession(host.driver, sessionOwner, sessionOwner.input).then(
+        () => true,
+        () => false,
+      );
+      /** 微任务只等待真实派发，不替换 Driver 或原生返回值。 */
+      for (let attempt = 0; !sessionOwner.sessionDriver && attempt < 20; attempt += 1) await Promise.resolve();
+      assert(sessionOwner.sessionDriver && !sessionOwner.sessionStarted, '没有捕获会话创建回复前的真实派发');
+      await host.stopOwner(sessionOwner);
+      assert(!(await sessionStartup) && !sessionOwner.sessionStarted, '迟到会话创建复活已停止控制');
+      assert(host.driver === sessionDriver, '停止会话创建误回收共享驱动');
+      const sessions = await host.driver.callTool('list_sessions', JSON.stringify({ limit: 100 }));
+      assert(!sessions.isError && !JSON.parse(sessions.structuredJson).sessions.some((session) => session.session === sessionOwner.id), '创建期间停止后原生会话残留');
+    }
     checks.push('stop_during_dispatched_session_start_releases_native_session');
     /** 未改变的图片读取只返回元数据。 */
     const preview = host.getPreview('computer-runtime-probe');
@@ -181,6 +379,126 @@ async function verifyInElectron(expected) {
     assert(semantic.success, textOf(semantic));
     assert(host.getPreview('computer-runtime-probe')?.capturedAt === preview.capturedAt, 'AX-only 伪造新截图时间');
     checks.push('preview_incremental_image_and_capture_timestamp');
+    if (expected.sessionExpiry) {
+      /** 固定当前真实驱动，恢复不能影响其他命名会话或更换 worker。 */
+      const driver = host.driver;
+      /** 初次观察的控制者在原生过期后仍保留宿主缓存，复现实际故障。 */
+      const owner = [...host.owners.values()].find((candidate) => candidate.input.turnId === 'runtime-owner');
+      /** 真实调用只记录方法名和结果，不替换原生响应或记录窗口内容。 */
+      const nativeCalls = [];
+      /** 保留原始方法，探针包装仅用于计数。 */
+      const callTool = driver.callTool.bind(driver);
+      driver.callTool = async (...args) => {
+        /** 响应完全来自本任务原生 worker。 */
+        const result = await callTool(...args);
+        if (args[0] === 'get_window_state' || args[0] === 'press_key') nativeCalls.push({ tool: args[0], isError: result.isError });
+        return result;
+      };
+      /** 查询实际命名会话，不触碰待过期会话的活动时间。 */
+      const sessionsNow = async () => {
+        /** 官方发现接口返回原生当前活动会话。 */
+        const result = await driver.callTool('list_sessions', JSON.stringify({ limit: 100 }));
+        assert(!result.isError, result.structuredJson ?? result.rawJson);
+        return JSON.parse(result.structuredJson).sessions;
+      };
+      /** 等待真实回收，不调整系统时钟、TTL 或替换原生状态。 */
+      const idleStarted = Date.now();
+      await fs.writeFile(`${expected.dataRoot}/../computer-session-expiry-progress.json`, JSON.stringify({ phase: 'waiting_for_native_idle_expiry', pid: process.pid, workerPid: host.workerPid }));
+      while ((await sessionsNow()).some((session) => session.session === owner.id)) {
+        assert(Date.now() - idleStarted < 360_000, '真实空闲期限后会话仍未回收');
+        await new Promise((resolveIdle) => setTimeout(resolveIdle, 1000));
+      }
+      performanceResults.sessionIdleElapsedMs = Date.now() - idleStarted;
+      assert(owner.sessionStarted && owner.windows.size > 0, '未复现原生已回收而宿主仍持有旧观察');
+      /** 另一轮次在恢复前建立真实会话，核对恢复没有全局清空驱动。 */
+      const independent = host.ensureOwner({ conversationId: 'computer-runtime-probe', threadId: 'native', turnId: 'expiry-independent', tool: 'get_window_state' });
+      await host.ensureOwnerSession(driver, independent, independent.input);
+      nativeCalls.length = 0;
+      /** 失效后的首次真实观察应内部恢复，只向调用者返回新观察。 */
+      const recovered = await call('get_window_state', { ...target, include_screenshot: false, max_elements: 40 });
+      assert(recovered.success, textOf(recovered));
+      assert(nativeCalls.length === 2 && nativeCalls[0].isError && !nativeCalls[1].isError, '首次观察没有且仅有一次原生拒绝后的恢复');
+      assert(host.driver === driver && independent.sessionStarted && (await sessionsNow()).some((session) => session.session === independent.id), '恢复影响了其他轮次');
+      assert(owner.windows.has(`${target.pid}:${target.window_id}`) && !owner.preview.needsObservation, '新观察没有恢复准确窗口所有权');
+      checks.push('real_idle_expiry_recovers_observation_once_and_preserves_other_session');
+      /** 显式结束真实会话，随后输入必须被拒绝，不能恢复并重放。 */
+      await driver.endSession({ session: owner.id });
+      nativeCalls.length = 0;
+      const refusedInput = await call('press_key', { ...target, key: 'F24' });
+      assert(!refusedInput.success && textOf(refusedInput).includes('ZEUS_COMPUTER_OBSERVATION_REQUIRED') && nativeCalls.length === 1, '会话结束后的输入被自动重放');
+      assert(!owner.sessionStarted && owner.windows.size === 0 && ![...host.windowOwners.values()].includes(owner.id), '失效会话仍持有旧观察或窗口占用');
+      const staleInput = await call('press_key', { ...target, key: 'F24' });
+      assert(!staleInput.success && textOf(staleInput).includes('ZEUS_COMPUTER_OBSERVATION_REQUIRED') && nativeCalls.length === 1, '旧观察仍可派发输入');
+      checks.push('ended_session_input_is_not_replayed_and_old_observation_is_revoked');
+      await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId: 'runtime-owner' });
+      /** 实际建会话已完成后再交错暂停或结束，验证迟到回复不会复活控制。 */
+      for (const reason of ['ZEUS_COMPUTER_USER_CONTROL', 'ZEUS_COMPUTER_SHARING_STOPPED', 'turn_end']) {
+        /** 每种竞争使用新的真实产品轮次。 */
+        const turnId = `expiry-${reason}`;
+        const observed = await call('get_window_state', { ...target, include_screenshot: false, max_elements: 20 }, turnId);
+        assert(observed.success, textOf(observed));
+        /** 只操作当前探针轮次的原生会话。 */
+        const active = [...host.owners.values()].find((candidate) => candidate.input.turnId === turnId);
+        await driver.endSession({ session: active.id });
+        /** 包装真实开始调用，仅在原生回复与宿主接收之间插入控制事件。 */
+        const startSession = driver.startSession.bind(driver);
+        driver.startSession = async (...args) => {
+          /** 保留实际成功或失败结果，不伪造原生回复。 */
+          const result = await startSession(...args);
+          if (reason === 'turn_end') await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId });
+          else host.pauseApplication(target.pid, reason);
+          return result;
+        };
+        nativeCalls.length = 0;
+        try {
+          /** 本次观察已收到原生会话失效，但恢复期间被用户侧控制终止。 */
+          const interrupted = await call('get_window_state', { ...target, include_screenshot: false }, turnId);
+          assert(!interrupted.success && !active.sessionStarted && active.windows.size === 0 && nativeCalls.length === 1, `${reason} 后恢复继续派发观察`);
+          assert(host.driver === driver && independent.sessionStarted, `${reason} 影响其他轮次`);
+        } finally {
+          driver.startSession = startSession;
+          await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId });
+        }
+        checks.push(`recovery_native_start_reply_respects_${reason}`);
+      }
+      /** 期限检查同样使用真实结束与建会话，只延迟交付真实开始回复。 */
+      const deadlineTurn = 'expiry-deadline';
+      assert((await call('get_window_state', { ...target, include_screenshot: false }, deadlineTurn)).success, '期限检查初始观察失败');
+      const deadlineOwner = [...host.owners.values()].find((candidate) => candidate.input.turnId === deadlineTurn);
+      await driver.endSession({ session: deadlineOwner.id });
+      /** 同一请求的截止时间不能在恢复后重新计算。 */
+      const deadlineUnixMs = Date.now() + 2000;
+      const startSession = driver.startSession.bind(driver);
+      driver.startSession = async (...args) => {
+        /** 等待原生真实响应，再把交付延迟至原期限之后。 */
+        const result = await startSession(...args);
+        await new Promise((resolveDeadline) => setTimeout(resolveDeadline, Math.max(0, deadlineUnixMs - Date.now()) + 50));
+        return result;
+      };
+      nativeCalls.length = 0;
+      try {
+        /** 通过正常动态工具入口传入原始截止时间。 */
+        const expired = await host.invoke({
+          namespace: 'zeus_computer',
+          tool: 'get_window_state',
+          arguments: { ...target, include_screenshot: false },
+          conversationId: 'computer-runtime-probe',
+          threadId: 'native',
+          turnId: deadlineTurn,
+          deadlineUnixMs,
+        });
+        assert(!expired.success && textOf(expired).includes('ZEUS_COMPUTER_DEADLINE_EXCEEDED') && nativeCalls.length === 1, '恢复延长原期限或在超时后派发观察');
+      } finally {
+        driver.startSession = startSession;
+        await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId: deadlineTurn });
+      }
+      checks.push('session_recovery_keeps_original_deadline');
+      await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId: 'expiry-independent' });
+      await host.endComputerUse({ conversationId: 'computer-runtime-probe', turnId: 'competing-owner' });
+      assert(host.windowOwners.size === 0 && (await sessionsNow()).length === 0, '专项检查结束后原生会话或窗口占用残留');
+      checks.push('expiry_probe_releases_all_native_sessions');
+      return { pid: process.pid, displayId: expected.displayId, workerPids, checks, remainingChecks, performanceResults };
+    }
     if (expected.performance) {
       /** 多次真实调用取分位数，不把一次缓存命中当成整条链路性能。 */
       const summarize = (samples) => {
@@ -366,7 +684,7 @@ await new Promise((resolveOpen, reject) => {
 /** 单次调试请求有界等待，迟到响应不重新触发动作。 */
 const result = await new Promise((resolveResult, reject) => {
   /** 超时只结束探针，宿主本身仍按调用期限回收。 */
-  const timer = setTimeout(() => reject(new Error('Computer Use 真实运行检查超时')), expected.userPriority || expected.systemStop ? 240000 : expected.performance ? 120000 : 60000);
+  const timer = setTimeout(() => reject(new Error('Computer Use 真实运行检查超时')), expected.sessionExpiry ? 420000 : expected.userPriority || expected.systemStop ? 240000 : expected.performance ? 120000 : 60000);
   socket.addEventListener('message', (event) => {
     /** 只处理本探针的唯一响应。 */
     const message = JSON.parse(event.data);

@@ -1,9 +1,13 @@
+import { useBackgroundInputSuggestions } from '../../session/useBackgroundInputSuggestions.js';
 import type { ProjectRecord } from '../../apiClient.js';
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { temporaryWorkspaceId, describeUserFacingError, isTaskPriority, type ProjectCodeWorkspacePreference, renderTaskPushLayoutText, type ThirdPartyTaskExtract } from '@zeus/shared';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation } from '../../session/ProjectConversationTree.js';
 import {
   loadLegacyConversationDetail,
+  cacheCodexConversationCapabilities,
+  preloadCodexConversationCapabilities,
+  readCachedCodexConversationCapabilities,
   nativeConversationChoiceFromAcceptance,
   type NativeConversationStartFailure,
   type NativeConversationStartPreparation,
@@ -62,7 +66,7 @@ import { reportStorageReadOnlyFault } from '../../storageRecoveryError.js';
 import { readSkillWorkflowDefault, workflowSkillSelectionRequest } from '../skills/skillWorkflowPreferences.js';
 import { createSessionOperationId } from '../../sessionOperationIdentity.js';
 import {
-  type DashboardSnapshot,
+  type WorkspaceSnapshot,
   type ConversationHistoryItem,
   type ProjectGitAction,
   type ProjectGitActionResponse,
@@ -102,7 +106,6 @@ import {
   normalizeProjectLocalPath,
   normalizeRendererAppShellSettings,
   normalizeTaskCreateDraft,
-  type ProjectCodeWorkspaceMode,
   resolveConversationNavigationId,
   resolveSelectedNativeConversationForProject,
   resolveNativeConversationSelectionPresentation,
@@ -134,6 +137,10 @@ function resolveTaskModelPushCapability(capabilities: CodexTaskPushCapabilities,
 }
 
 export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
+  /** 创建后等真实任务详情完成渲染，再复用推送入口，避免旧快照与导航身份竞争。 */
+  const taskCreatePushTaskIdRef = useRef<string | null>(null);
+  /** 同一草稿保存期间只接纳一次提交意图。 */
+  const taskCreateSubmittingRef = useRef(false);
   /** 后台发现与当前推送弹窗的仓库更新共用独立生命周期。 */
   const refreshTaskModelPushRepositories = useProjectRepositoryDiscovery(state);
   const {
@@ -212,7 +219,6 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     setOptimisticTerminalTaskStatuses,
     setPendingTaskStatuses,
     setPendingProjectDeleteId,
-    setProjectCodeWorkspaceMode,
     setProjectConfig,
     setProjectConfigForm,
     setProjectCreateDialogOpen,
@@ -255,7 +261,6 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     setTaskSearchQuery,
     setTaskTagFilter,
     setTaskTerminalCleanupConfirmation,
-    setVisitedCodeWorkspaceModes,
     settingsWorkspaceCopy,
     snapshot,
     taskCreateForm,
@@ -435,6 +440,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     [attentionAcknowledgementCoordinator, props.nativeConversationClient],
   );
 
+  /** 后台建议复用工作台全局事件，无需等待对应会话显示。 */
+  const observeInputSuggestion = useBackgroundInputSuggestions({ client: props.nativeConversationClient, settings: appShellSettings.inputSuggestions });
+
   useEffect(() => {
     const subscribeRealtimeEvents = props.onSubscribeRealtimeEvents;
     if (!subscribeRealtimeEvents) return;
@@ -559,6 +567,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     };
     const unsubscribe = subscribeRealtimeEvents(
       (event) => {
+        observeInputSuggestion(event);
         if (event.type === 'codex.models.changed') {
           // 当前连接发布新目录后，所有模型选择器共用一次能力变更通知。
           if (event.payload.succeeded === true) window.dispatchEvent(new Event(codexCapabilitiesChangedEvent));
@@ -728,6 +737,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     props.nativeConversationClient,
     props.onLoadTask,
     props.onSubscribeRealtimeEvents,
+    observeInputSuggestion,
     reconcileNativeConversationProjectSnapshot,
     reconcileNativeConversationProjectionStates,
     resumeNativeConversationAttentionAcknowledgements,
@@ -787,7 +797,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     counts[managementStatus] = (counts[managementStatus] ?? 0) + 1;
     return counts;
   }, {});
-  const changedFiles = gitDiff?.files ?? snapshot.git.changedFiles;
+  const changedFiles = gitDiff?.files ?? snapshot.git?.changedFiles ?? [];
 
   useEffect(() => {
     const visibleTaskIdSet = new Set(visibleTasks.map((task) => task.id));
@@ -860,7 +870,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     taskLocalVersionTransitionsRef.current.set(taskId, transitions);
   }
 
-  function applyTaskMutationSnapshot(nextSnapshot: DashboardSnapshot, taskId: string): TaskRecord {
+  function applyTaskMutationSnapshot(nextSnapshot: WorkspaceSnapshot, taskId: string): TaskRecord {
     const updatedTask = nextSnapshot.tasks.find((task) => task.id === taskId);
     if (!updatedTask) throw new Error(`Updated task ${taskId} was not present in the dashboard snapshot.`);
     mergeTaskRecord(updatedTask);
@@ -895,7 +905,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         if (input.projectId && updatedTask.projectId === input.projectId) {
           // 移动成功后打开目标项目，并一次刷新解除关系的其他任务。
           setSnapshot(nextSnapshot);
-          setProjectDetail(nextSnapshot.projects.find((project) => project.id === updatedTask.projectId));
+          setProjectDetail(nextSnapshot.projects.find((project) => project.id === updatedTask.projectId) ?? snapshot.projects.find((project) => project.id === updatedTask.projectId));
           activeProjectIdRef.current = updatedTask.projectId;
         }
         recordTaskMutationVersion(taskId, expectedUpdatedAt, updatedTask.updatedAt);
@@ -944,6 +954,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     });
   }
 
+  /** 详情读取同步共享任务记录，防止后续会话选择用摘要覆盖完整正文。 */
   async function loadTaskDetail(taskId: string): Promise<void> {
     setConversationDraftOpen(false);
     if (!props.onLoadTask) {
@@ -952,7 +963,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     }
     setActionState('updating-task');
     try {
+      /** 完整记录先回填共享集合，再建立当前详情选中态。 */
       const task = await props.onLoadTask(taskId);
+      mergeTaskRecord(task);
       setTaskDetail(task);
       setActionState('idle');
     } catch (error) {
@@ -1143,19 +1156,13 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     try {
       const nextSnapshot = await props.onDeleteProject(projectId);
       setSnapshot(nextSnapshot);
-      setProjectDetail(nextSnapshot.projects[0]);
+      setProjectDetail(snapshot.projects.find((project) => project.id !== projectId));
       setPendingProjectDeleteId(undefined);
       setActionState('idle');
     } catch (error) {
       recordLocalError('renderer-action', error);
       setActionState('failed');
     }
-  }
-
-  async function selectProjectCodeWorkspaceMode(mode: ProjectCodeWorkspaceMode): Promise<void> {
-    setProjectCodeWorkspaceMode(mode);
-    setVisitedCodeWorkspaceModes((current) => new Set(current).add(mode));
-    if (typeof window !== 'undefined') window.history.replaceState(null, '', mode === 'commands' ? '#project-commands' : `#project-code-${mode}`);
   }
 
   function resetProjectCreateDialog(): void {
@@ -1276,7 +1283,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   }
 
   /** 新建与复制共用提交身份，目标项目参与去重以免重试落入错误项目。 */
-  async function createProjectTaskFromDraft(draft: TaskCreateDraft, projectId = activeProjectId): Promise<boolean> {
+  async function createProjectTaskFromDraft(draft: TaskCreateDraft, projectId = activeProjectId, pushAfterCreate = false): Promise<boolean> {
     if (!props.onCreateTaskDraft || !projectId) return false;
     const previousTaskIds = new Set(snapshot.tasks.map((task) => task.id));
     setActionState('creating-task');
@@ -1289,7 +1296,11 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const createdTask = selectCreatedProjectTask(nextSnapshot, previousTaskIds, projectId);
       setSnapshot(nextSnapshot);
       if (createdTask) {
-        setProjectDetail(nextSnapshot.projects.find((project) => project.id === projectId));
+        if (pushAfterCreate) {
+          taskCreatePushTaskIdRef.current = createdTask.id;
+          setActiveNavTarget('projects');
+        }
+        setProjectDetail(nextSnapshot.projects.find((project) => project.id === projectId) ?? snapshot.projects.find((project) => project.id === projectId));
         activeProjectIdRef.current = projectId;
         // 弹窗提交成功后才落真实任务；只清搜索和标签并打开详情，不覆盖用户按项目记住的状态筛选。
         setConversationDraftOpen(false);
@@ -1298,7 +1309,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         setTaskDetail(createdTask);
         setActiveProjectSection('tasks');
         setTaskDetailPaneTaskId(createdTask.id);
-        if (taskCreateTeamId) {
+        if (taskCreateTeamId && !pushAfterCreate) {
           setDigitalTeamTask(createdTask);
           setDigitalTeamEntrySelection({ kind: 'template', templateId: taskCreateTeamId });
           setActiveNavTarget('digital-teams');
@@ -1339,7 +1350,13 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   }
 
   /** 复制仅预填可编辑内容，目标选择和保存沿用新建任务流程。 */
-  function openTaskCopyModal(task: TaskRecord): void {
+  async function openTaskCopyModal(task: TaskRecord): Promise<void> {
+    try {
+      if (props.onLoadTask) task = await props.onLoadTask(task.id);
+    } catch (error) {
+      recordLocalError('task-copy-load', error);
+      return;
+    }
     openTaskCreateModal();
     setActiveProjectSection('tasks');
     setTaskCreateForm({
@@ -1474,8 +1491,11 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     }));
   }
 
-  async function submitTaskCreateModal(event: FormEvent<HTMLFormElement>): Promise<void> {
+  /** 两种创建意图共用校验、幂等保存与失败草稿，保存后才允许进入推送。 */
+  async function submitTaskCreateModal(event: FormEvent<HTMLFormElement>, pushAfterCreate = false): Promise<void> {
     event.preventDefault();
+    if (taskCreateSubmittingRef.current) return;
+    /** 提交前完成标题与类型校验，失败时保留当前草稿和焦点。 */
     const normalized = normalizeTaskCreateDraft(taskCreateForm, taskWorkspaceCopy.taskCreateTitleRequired, taskWorkspaceCopy.taskCreateTypeRequired);
     if ('error' in normalized) {
       setTaskCreateError(normalized.error);
@@ -1486,9 +1506,24 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       }
       return;
     }
-    const created = await createProjectTaskFromDraft(normalized.draft, taskCreateForm.projectId);
-    if (created) closeTaskCreateModal();
+    taskCreateSubmittingRef.current = true;
+    try {
+      /** 创建成功与推送检查成功是独立事实，推送失败不重复创建。 */
+      const created = await createProjectTaskFromDraft(normalized.draft, taskCreateForm.projectId, pushAfterCreate);
+      if (created) closeTaskCreateModal();
+    } finally {
+      taskCreateSubmittingRef.current = false;
+    }
   }
+
+  /** 页面已持有新任务和稳定导航身份时，消费一次快捷推送意图。 */
+  useEffect(() => {
+    /** 推送只能指向本次保存产生的真实任务。 */
+    const taskId = taskCreatePushTaskIdRef.current;
+    if (!taskId || taskDetailPaneTaskId !== taskId || !snapshot.tasks.some((task) => task.id === taskId)) return;
+    taskCreatePushTaskIdRef.current = null;
+    void openTaskModelPush(taskId);
+  }, [snapshot, taskDetailPaneTaskId, openTaskModelPush]);
 
   async function refreshNativeConversationChoices(taskId: string): Promise<NativeConversationChoicesSnapshot | null> {
     const client = props.nativeConversationClient;
@@ -1608,6 +1643,14 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     void refreshArchivedConversations();
   }
 
+  /** 保存会话标题后刷新所属目录，避免菜单弹窗成功但列表标题未更新。 */
+  async function renameConversation(conversation: NativeConversationChoice, title: string): Promise<void> {
+    const client = props.nativeConversationClient;
+    if (!client) return;
+    await client.conversations.renameConversation(conversation.projectId, conversation.id, title);
+    await (conversation.taskId ? refreshNativeConversationChoices(conversation.taskId) : refreshNativeProjectConversationChoices(conversation.projectId));
+  }
+
   async function restoreTaskConversation(conversation: NativeConversationChoice): Promise<void> {
     const client = props.nativeConversationClient;
     if (!client || restoringArchivedConversationId) return;
@@ -1636,16 +1679,27 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     [requestWorkspaceLeaveRef],
   );
 
+  /** 慢目录读取不能覆盖用户后来选择的另一条会话。 */
+  const nativeConversationSelectionRevision = useRef(0);
+
   /** 所有入口先沿用当前投影的导航身份，真实会话身份仍用于读取消息。 */
   async function applyNativeConversationSelection(conversation: NativeConversationChoice, navigation: 'page' | 'preserve', presentation?: 'history' | 'interactive'): Promise<void> {
-    const targetProject = snapshot.projects.find((candidate) => candidate.id === conversation.projectId);
-    if (targetProject) {
-      activeProjectIdRef.current = targetProject.id;
-      setProjectDetail(targetProject);
-    }
-    const task = conversation.taskId ? snapshot.tasks.find((candidate) => candidate.id === conversation.taskId) : undefined;
-    if (task) setTaskDetail(task);
-    else setTaskDetail(undefined);
+    /** 此次导航在开始读取前冻结其先后顺序。 */
+    const selectionRevision = ++nativeConversationSelectionRevision.current;
+    /** 自动化会话可能早于项目和任务目录到达，先并行补读其真实归属。 */
+    const [targetProject, task] = await Promise.all([
+      snapshot.projects.find((candidate) => candidate.id === conversation.projectId) ?? props.onLoadProject?.(conversation.projectId) ?? props.commandClient?.loadProject(conversation.projectId),
+      conversation.taskId ? (snapshot.tasks.find((candidate) => candidate.id === conversation.taskId) ?? props.onLoadTask?.(conversation.taskId) ?? props.commandClient?.loadTask(conversation.taskId)) : undefined,
+    ]);
+    if (selectionRevision !== nativeConversationSelectionRevision.current) return;
+    if (!targetProject || targetProject.id !== conversation.projectId) throw new Error('原会话所属项目无法读取。');
+    if (conversation.taskId && (!task || task.id !== conversation.taskId || task.projectId !== targetProject.id)) throw new Error('原会话所属任务无法读取。');
+    /** 查看无项目会话也只读取已存在的托管工作区，不创建替代项目。 */
+    setSnapshot((current) => (current.projects.some((project) => project.id === targetProject.id) ? current : { ...current, projects: [...current.projects, targetProject] }));
+    activeProjectIdRef.current = targetProject.id;
+    setProjectDetail(targetProject);
+    if (task) mergeTaskRecord(task);
+    setTaskDetail(task);
     /** 自动化等入口可先于列表拿到会话；选择前补齐列表事实，页面才能解析实际会话。 */
     const listedConversation = resolveSelectedNativeConversationForProject(state.nativeConversationChoices, conversation.id, conversation.projectId);
     // 创建期入口只属于本地工作面，不能写入正式目录或被当作已接纳会话保留。
@@ -1883,6 +1937,16 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     return props.onChooseConversationResources?.() ?? [];
   }
 
+  /** 浏览器迁移失败不撤销已受理的首发，记录错误后继续进入真实会话。 */
+  async function adoptConversationBrowser(input: SessionWorkspaceStartInput | ProjectSessionWorkspaceStartInput, choice: NativeConversationChoice): Promise<void> {
+    if (!input.browserDraft || !window.zeus?.adoptBrowserDraft) return;
+    try {
+      await window.zeus.adoptBrowserDraft({ sourceConversationId: input.browserDraft.conversationId, conversationId: choice.id, commentIds: input.browserDraft.submission?.commentIds ?? [] });
+    } catch (error) {
+      recordLocalError('conversation-browser-adopt', error);
+    }
+  }
+
   async function startNativeConversation(input: SessionWorkspaceStartInput): Promise<boolean | NativeConversationStartPreparation | NativeConversationStartFailure> {
     const client = props.nativeConversationClient;
     if (!client) {
@@ -1912,7 +1976,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         input,
         envelopeManager: nativeConversationStartEnvelopeManager,
         dispatch: (taskId, request) => client.startNativeConversation(taskId, request),
-        onAccepted: (choice) => {
+        onAccepted: async (choice) => {
+          await adoptConversationBrowser(input, choice);
           // durable acceptance 到达后必须立即离开创建表单；历史摘要刷新只是 best-effort，
           // 不能把已接受操作重新暴露成使用新 ID 的第二次创建。
           nativeConversationChoiceLoadCoordinator.preserveAccepted(choice);
@@ -1981,7 +2046,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         input,
         envelopeManager: projectConversationStartEnvelopeManager,
         dispatch: (acceptedProjectId, request) => client.startProjectConversation(acceptedProjectId, request),
-        onAccepted: (choice) => {
+        onAccepted: async (choice) => {
+          await adoptConversationBrowser(input, choice);
           nativeProjectConversationChoiceLoadCoordinator.preserveAccepted(choice);
           setNativeConversationChoicesByProject((current) => {
             const prior = current[projectId];
@@ -2173,7 +2239,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const expectedUpdatedAt = resolveTaskMutationVersion(taskId, options.expectedUpdatedAt ?? currentTask.updatedAt ?? '');
       setActionState('updating-task');
       try {
-        let nextSnapshot: DashboardSnapshot;
+        let nextSnapshot: WorkspaceSnapshot;
         try {
           nextSnapshot = await updateManagementStatus(taskId, status, expectedUpdatedAt, undefined, options.reopenConversationId);
         } catch (error) {
@@ -2259,29 +2325,22 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     const request = ++taskModelPushCapabilityRequestRef.current;
     setTaskModelPushEntry('checking');
     const remembered = readTaskModelPushPreferences(browserNativeConversationStartStorage(), task.projectId);
+    /** 复用项目已预读的模型目录，首帧不等待账号、附件和 Git 检查。 */
+    const runtimeCapabilities = client ? readCachedCodexConversationCapabilities(client, task.projectId) : null;
+    /** 初始化沿用同一套偏好与能力规则，不建立第二份默认模型逻辑。 */
+    const initialForm = resolveTaskModelPushInitialForm(runtimeCapabilities ?? { models: [], preferredModel: null }, remembered, readSkillWorkflowDefault('task_push'));
     setTaskModelPushTaskId(task.id);
     setTaskModelPushCapabilities(null);
-    setTaskModelPushRuntimeCapabilities(null);
+    setTaskModelPushRuntimeCapabilities(runtimeCapabilities);
     setTaskModelPushForm({
+      ...initialForm,
       ...(stage ? { stageId: stage.id } : {}),
-      model: stage?.modelRef ?? remembered?.model ?? '',
-      effort: stage?.effort ?? remembered?.effort ?? '',
-      serviceTier: stage?.serviceTier ? { type: 'catalog', id: stage.serviceTier } : (remembered?.serviceTier ?? { type: 'standard' }),
-      serviceTierDowngraded: false,
+      model: stage?.modelRef ?? initialForm.model,
+      effort: stage?.effort ?? initialForm.effort,
+      serviceTier: stage?.serviceTier ? { type: 'catalog', id: stage.serviceTier } : initialForm.serviceTier,
+      serviceTierDowngraded: stage?.serviceTier ? false : initialForm.serviceTierDowngraded,
       workMode: stage?.workMode ?? remembered?.workMode ?? 'default',
       permissionMode: stage?.permissionMode ?? remembered?.permissionMode ?? 'read-only',
-      skillId: readSkillWorkflowDefault('task_push'),
-      workspaceMode: remembered?.workspaceMode ?? 'direct',
-      workspaceModeSelected: Boolean(remembered?.workspaceMode),
-      taskBranchMode: 'create',
-      environmentId: '',
-      directConcurrencyConfirmed: false,
-      repositorySelections: {},
-      currentConversationIds: [],
-      parentContextSelections: {},
-      relatedContextSelections: {},
-      supplementalInfo: '',
-      supplementalAttachments: [],
     });
     setTaskModelPushStatus('loading');
     setTaskModelPushRefreshingRepositoryId(null);
@@ -2316,9 +2375,27 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     /** 能力读取不再加载项目偏好，不会准备工作区或创建会话。 */
     const client = props.nativeConversationClient;
     if (!client) throw new Error('ZEUS_MODEL_UNAVAILABLE');
+    /** 首次预读尚未完成时，模型与完整任务资料并行到达；后者始终拥有最终快照。 */
+    let taskCapabilitiesResolved = false;
+    void preloadCodexConversationCapabilities(client, task.projectId)
+      .then((runtimeCapabilities) => {
+        if (!runtimeCapabilities || taskCapabilitiesResolved || !isTaskModelPushRequestCurrent(request, origin)) return;
+        setTaskModelPushRuntimeCapabilities(runtimeCapabilities);
+        setTaskModelPushForm((current) => {
+          if (current.stageId) return current;
+          /** 只补齐模型配置，不覆盖用户正在填写的补充内容、附件或仓库选择。 */
+          const normalized = resolveTaskModelPushInitialForm(runtimeCapabilities, current, current.skillId);
+          return { ...current, model: normalized.model, effort: normalized.effort, serviceTier: normalized.serviceTier, serviceTierDowngraded: normalized.serviceTierDowngraded };
+        });
+      })
+      .catch((error: unknown) => {
+        if (!taskCapabilitiesResolved && isTaskModelPushRequestCurrent(request, origin)) recordBackgroundSynchronizationError('task-push-model-preload', error);
+      });
     const rawCapabilities = await client.loadCodexTaskPushCapabilities(task.projectId, task.id);
+    taskCapabilitiesResolved = true;
     if (!isTaskModelPushRequestCurrent(request, origin)) return;
     const capabilities = normalizeTaskModelPushCapabilities(rawCapabilities);
+    cacheCodexConversationCapabilities(client, capabilities);
     setTaskModelPushRuntimeCapabilities(capabilities);
     /** 首次加载只根据同一份完整快照选择下一工作面，不再发起独立模型预检。 */
     const destination = resolveTaskModelPushEntry(capabilities, capabilities.hasConfiguredProvider);
@@ -2504,6 +2581,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
             : `The selected model does not accept reasoning effort ${normalizedForm.effort || '(empty)'}. Select it again before pushing.`,
         );
       }
+      // 本次明确确认的选项立即按项目保存，后续异步回执不能覆盖更新的选择。
+      writeTaskModelPushPreferences(browserNativeConversationStartStorage(), task.projectId, normalizedForm);
       const fingerprint = JSON.stringify({
         taskId: task.id,
         projectId: task.projectId,
@@ -2657,24 +2736,12 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         const submissionError = submission && typeof submission.error === 'object' && submission.error !== null ? (submission.error as Record<string, unknown>) : {};
         const recoverableDirectDirectoryFailure =
           submission?.status === 'paused' && submission.pausedReason === 'recovery_required' && submissionError.code === 'ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE' && submissionError.recoveryRequired === true;
-        if (!recoverableDirectDirectoryFailure) {
-          const reason = typeof submissionError.message === 'string' && submissionError.message.trim() ? submissionError.message : null;
-          throw Object.assign(
-            new Error(
-              reason ??
-                (appShellSettings.appLanguage === 'zh-CN'
-                  ? '对话还未连接到 AI 服务。为避免重复创建，Zeus 已暂停再次尝试。'
-                  : 'The conversation has not connected to the AI service. Zeus has paused further attempts to avoid creating duplicates.'),
-            ),
-            { code: typeof submissionError.code === 'string' ? submissionError.code : 'ZEUS_TASK_MODEL_PUSH_PROVIDER_NOT_ESTABLISHED' },
-          );
+        if (recoverableDirectDirectoryFailure) {
+          // 原提交在 Provider RPC 前失败；恢复同一会话和提交，避免另建会话或重复首条消息。
+          await client.recoverNativeQueue(pending.task.projectId, acceptance.conversation.id, 'continue');
+          choice = await client.loadNativeConversationChoice(pending.task.projectId, acceptance.conversation.id);
         }
-        // 原提交在 Provider RPC 前失败；恢复同一会话和提交，避免另建会话或重复首条消息。
-        await client.recoverNativeQueue(pending.task.projectId, acceptance.conversation.id, 'continue');
-        choice = await client.loadNativeConversationChoice(pending.task.projectId, acceptance.conversation.id);
-        if (!choice.providerThreadId) {
-          throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '工作目录已可用，但对话仍未连接到 AI 服务。' : 'The working folder is available, but the conversation has not connected to the AI service.');
-        }
+        // 已落库的失败交给会话控制器核对与重试，不能重新调用只会返回原接纳结果的创建接口。
       }
       taskModelPushEnvelopeRef.current.delete(pending.task.id);
       taskModelPushDispatchingTaskIdsRef.current.delete(pending.task.id);
@@ -2704,11 +2771,6 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const attached = attachedStates[pending.task.id];
       if (!attached || !taskModelPushHasRealChoice(attached)) throw new Error('Real task-push conversation was not attached atomically.');
       setTaskModelPushAnnouncement(appShellSettings.appLanguage === 'zh-CN' ? `${pending.task.title}：会话已创建。` : `${pending.task.title}: Conversation created.`);
-      const submissionStatus = typeof acceptance.submission?.status === 'string' ? acceptance.submission.status : null;
-      if (submissionStatus === 'active') {
-        // 只有 thread/start 与首个 turn/start 都成功后，才更新同项目任务开发类型的选择记忆。
-        writeTaskModelPushPreferences(browserNativeConversationStartStorage(), pending.task.projectId, pending.form);
-      }
       // 真实会话只接管内部读写身份，绝不根据完成时的页面状态再次导航或滚动。
       await flushTaskModelPushDeferredMessages(attached);
       void refreshNativeConversationChoices(pending.task.id).catch((error: unknown) => recordLocalError('task-model-push-history-refresh', error));
@@ -3021,8 +3083,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     });
   }
 
-  function editTaskModelPushPendingMessage(taskId: string, messageId: string, content: string): void {
-    mutateTaskModelPushPending(taskId, (pending) => updateTaskModelPushDeferredMessages(pending, (messages) => messages.map((message) => (message.id === messageId ? { ...message, content } : message))));
+  /** 待建会话消息的正文与附件一起替换，取消编辑不触碰原草稿。 */
+  function editTaskModelPushPendingMessage(taskId: string, messageId: string, content: string, attachments: NativeConversationAttachment[]): void {
+    mutateTaskModelPushPending(taskId, (pending) => updateTaskModelPushDeferredMessages(pending, (messages) => messages.map((message) => (message.id === messageId ? { ...message, content, attachments } : message))));
   }
 
   function deleteTaskModelPushPendingMessage(taskId: string, messageId: string): void {
@@ -3073,7 +3136,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         if (!current) return;
         updateAttachments(current.session.attachments.filter((candidate) => !(candidate.name === attachment.name && candidate.localPath === attachment.localPath && candidate.uploadRef === attachment.uploadRef)));
       },
-      onEditQueuedSubmission: (messageId, content) => editTaskModelPushPendingMessage(pending.task.id, messageId, content),
+      onEditQueuedSubmission: (messageId, content, attachments) => editTaskModelPushPendingMessage(pending.task.id, messageId, content, attachments),
       onDeleteQueuedSubmission: (messageId) => deleteTaskModelPushPendingMessage(pending.task.id, messageId),
       onSendQueuedNow: (messageId) => steerTaskModelPushPendingMessage(pending.task.id, messageId),
       onReorderQueue: (orderedIds) => reorderTaskModelPushPendingMessages(pending.task.id, orderedIds),
@@ -3087,6 +3150,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     addTaskCreateAttachments,
     applyThirdPartyTaskExtract,
     archiveConversation,
+    renameConversation,
     authorizeTaskCreateFiles,
     changedFiles,
     chooseNativeConversationAttachments,
@@ -3143,7 +3207,6 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     saveProjectWorkspaceConfig,
     selectNativeConversation,
     selectNewConversationProject,
-    selectProjectCodeWorkspaceMode,
     startNativeConversation,
     startProjectConversation,
     submitTaskCreateModal,

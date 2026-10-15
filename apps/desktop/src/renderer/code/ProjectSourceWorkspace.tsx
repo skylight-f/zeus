@@ -1,3 +1,4 @@
+import { projectSourcePreviewKind } from '@zeus/shared';
 import { FilePreview } from './FilePreview.js';
 import type { FilePreviewRequest } from '@zeus/shared';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
@@ -25,6 +26,7 @@ import { SourceGitChanges, fileDiff, type SourceGitClient } from './SourceGitCha
 import type { GitDiffSummary } from '../features/git/gitContracts.js';
 import { SideBySideDiff } from '../git/ProjectGitDiffViewer.js';
 
+const ProjectSourceRenderedPreview = lazy(() => import('./ProjectSourceRenderedPreview.js').then((module) => ({ default: module.ProjectSourceRenderedPreview })));
 const ProjectSourceEditor = lazy(() => import('./ProjectSourceEditor.js').then((module) => ({ default: module.ProjectSourceEditor })));
 const CodeEditor = lazy(() => import('./CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
 // 文件系统事件在这个时间窗内按目录和文件去重，避免批量写入触发重复读取与渲染。
@@ -114,7 +116,11 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   directoriesRef.current = directories;
   tabsRef.current = tabs;
   activePathRef.current = activePath;
+  /** 每个文件的效果模式与未保存草稿分别保存。 */
+  const [viewModes, setViewModes] = useState<Record<string, 'source' | 'preview' | 'split'>>({});
   const activeTab = tabs.find((tab) => tab.document.relativePath === activePath) ?? null;
+  const previewKind = activeTab?.document.editable ? projectSourcePreviewKind(activeTab.document.relativePath) : null;
+  const viewMode = previewKind && activePath ? (viewModes[activePath] ?? 'source') : 'source';
   const dirty = tabs.some((tab) => tab.dirty);
   dirtyRef.current = dirty;
   const searchBuffers = useMemo(() => tabs.filter((tab) => tab.document.editable).map((tab) => ({ relativePath: tab.document.relativePath, content: tab.draft, revision: tab.document.revision })), [tabs]);
@@ -181,6 +187,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   const openFile = useCallback(
     async (relativePath: string, line?: number, column?: number) => {
       setChangePreview(null);
+      if (line !== undefined) setViewModes((current) => ({ ...current, [relativePath]: 'source' }));
       fileOpenRequestedRef.current = true;
       const existing = tabsRef.current.find((tab) => tab.document.relativePath === relativePath);
       if (existing) {
@@ -922,6 +929,15 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                 {breadcrumbs.map((part, index) => (
                   <span key={`${part}-${index}`}>{part}</span>
                 ))}
+                {previewKind ? (
+                  <span role="group" aria-label={zh ? '文件展示方式' : 'File view mode'}>
+                    {(['source', 'preview', 'split'] as const).map((mode) => (
+                      <button key={mode} type="button" aria-pressed={viewMode === mode} onClick={() => setViewModes((current) => ({ ...current, [activeTab.document.relativePath]: mode }))}>
+                        {mode === 'source' ? (zh ? '源码' : 'Source') : mode === 'preview' ? (zh ? '预览' : 'Preview') : zh ? '分栏' : 'Split'}
+                      </button>
+                    ))}
+                  </span>
+                ) : null}
               </nav>
               {!activeTab.document.editable ? (
                 <FilePreview
@@ -931,27 +947,46 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                   zh={zh}
                 />
               ) : (
-                <Suspense fallback={<div className="project-source-code-editor-loading">{zh ? '正在加载代码编辑器…' : 'Loading code editor…'}</div>}>
-                  <ProjectSourceEditor
-                    projectId={props.project.id}
-                    revision={activeTab.document.revision.sha256}
-                    dirty={activeTab.dirty}
-                    zh={zh}
-                    onCompareConflict={compareConflict}
-                    path={activeTab.document.relativePath}
-                    language={activeTab.document.language}
-                    content={activeTab.draft}
-                    savedContent={activeTab.document.content}
-                    readOnly={false}
-                    revealLine={activeTab.revealLine}
-                    revealColumn={activeTab.revealColumn}
-                    onCursorChange={(cursorLine, cursorColumn) =>
-                      setTabs((current) => current.map((tab) => (tab.document.relativePath === activeTab.document.relativePath ? { ...tab, cursorLine, cursorColumn, revealLine: null, revealColumn: null } : tab)))
-                    }
-                    onSave={() => void saveTab(activeTab.document.relativePath)}
-                    onSaveAll={() => void saveAll()}
-                  />
-                </Suspense>
+                <div className="project-source-document-views" data-view-mode={viewMode}>
+                  <div className="project-source-document-editor" hidden={viewMode === 'preview'}>
+                    <Suspense fallback={<div className="project-source-code-editor-loading">{zh ? '正在加载代码编辑器…' : 'Loading code editor…'}</div>}>
+                      <ProjectSourceEditor
+                        projectId={props.project.id}
+                        revision={activeTab.document.revision.sha256}
+                        dirty={activeTab.dirty}
+                        zh={zh}
+                        onCompareConflict={compareConflict}
+                        path={activeTab.document.relativePath}
+                        language={activeTab.document.language}
+                        content={activeTab.draft}
+                        savedContent={activeTab.document.content}
+                        readOnly={false}
+                        revealLine={activeTab.revealLine}
+                        revealColumn={activeTab.revealColumn}
+                        onCursorChange={(cursorLine, cursorColumn) =>
+                          setTabs((current) => current.map((tab) => (tab.document.relativePath === activeTab.document.relativePath ? { ...tab, cursorLine, cursorColumn, revealLine: null, revealColumn: null } : tab)))
+                        }
+                        onSave={() => void saveTab(activeTab.document.relativePath)}
+                        onSaveAll={() => void saveAll()}
+                      />
+                    </Suspense>
+                  </div>
+                  {previewKind && viewMode !== 'source' ? (
+                    <Suspense fallback={<p role="status">{zh ? '正在打开预览…' : 'Opening preview…'}</p>}>
+                      <ProjectSourceRenderedPreview
+                        projectId={props.project.id}
+                        path={activeTab.document.relativePath}
+                        kind={previewKind}
+                        draft={activeTab.draft}
+                        language={props.language}
+                        openFile={async (path) => {
+                          setViewModes((current) => ({ ...current, [path]: 'preview' }));
+                          await openFile(path);
+                        }}
+                      />
+                    </Suspense>
+                  ) : null}
+                </div>
               )}
             </>
           ) : (

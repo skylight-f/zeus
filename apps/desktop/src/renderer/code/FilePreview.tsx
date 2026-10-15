@@ -1,23 +1,55 @@
 import { createContext, lazy, Suspense, useEffect, useMemo, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
-import { XIcon } from '@phosphor-icons/react/dist/csr/X';
-import { detectSourceLanguage, userFacingErrorCause, type FilePreviewItem, type FilePreviewRequest, type FileReview, type ConversationFileLocation, type UserFacingErrorCause } from '@zeus/shared';
+import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
+import { ArrowCounterClockwiseIcon as ArrowCounterClockwise } from '@phosphor-icons/react/dist/csr/ArrowCounterClockwise';
+import { ArrowSquareOutIcon as ArrowSquareOut } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
+import { ArrowsInSimpleIcon as ArrowsInSimple } from '@phosphor-icons/react/dist/csr/ArrowsInSimple';
+import { ArrowsOutSimpleIcon as ArrowsOutSimple } from '@phosphor-icons/react/dist/csr/ArrowsOutSimple';
+import { DownloadSimpleIcon as DownloadSimple } from '@phosphor-icons/react/dist/csr/DownloadSimple';
+import { EyeIcon as Eye } from '@phosphor-icons/react/dist/csr/Eye';
+import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
+import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
+import { GitDiffIcon as GitDiff } from '@phosphor-icons/react/dist/csr/GitDiff';
+import { MinusIcon as Minus } from '@phosphor-icons/react/dist/csr/Minus';
+import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
+import {
+  sourceLanguageOptions,
+  filePreviewTextEncodings,
+  type FilePreviewTextEncoding,
+  detectSourceLanguage,
+  userFacingErrorCause,
+  type FilePreviewItem,
+  type FilePreviewRequest,
+  type FileReview,
+  type ConversationFileLocation,
+  type UserFacingErrorCause,
+} from '@zeus/shared';
 import { ModalPortal } from '../ui/ModalPortal.js';
+import { Button } from '../ui/Button.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-import './filePreview.css';
+import { FileTypeIcon } from './FileTypeIcon.js';
 import { CodeReviewTextContext } from './codeReviewContext.js';
+import './filePreview.css';
 
 /** 会话统一选择预览容器：图片可用弹窗，其他文件进入右侧审阅。 */
 export const FilePreviewOpenContext = createContext<((request: FilePreviewRequest, image?: boolean) => void) | null>(null);
 
 /** 文本编辑器仅在真正查看文本时加载。 */
 const CodeEditor = lazy(() => import('./CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
-/** Git 差异按需加载 Monaco 审阅视图。 */
+/** Git 差异继续使用既有的虚拟化增删行视图。 */
 const CodeDiffView = lazy(() => import('./CodeDiffView.js').then((module) => ({ default: module.CodeDiffView })));
 /** Markdown 沿用受限渲染器，不加载任意活动 HTML。 */
 const Markdown = lazy(() => import('../session/ConversationMarkdown.js').then((module) => ({ default: module.ConversationMarkdown })));
 
-/** 新入口复用本地文字按钮，保持原工具栏样式。 */
-export function PreviewIconButton({ label, children, ...buttonProps }: { label: string; children: ReactNode } & Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'aria-label' | 'className' | 'title' | 'type'>) {
+/** 图标按钮只接受一个功能名称，同时用于悬浮提示和无障碍名称。 */
+export function PreviewIconButton({
+  label,
+  children,
+  tooltip = true,
+  ...buttonProps
+}: { label: string; children: ReactNode; /** 保留调用接口；普通图标与常见操作现在共用延迟提示。 */ tooltip?: boolean } & Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'aria-label' | 'className' | 'title' | 'type'>) {
+  // 不把提示样式参数透传给原生按钮，所有已有提示使用统一气泡。
+  void tooltip;
   void children;
   return (
     <button {...buttonProps} type="button" aria-label={label} title={label}>
@@ -26,29 +58,50 @@ export function PreviewIconButton({ label, children, ...buttonProps }: { label: 
   );
 }
 
-/** 两类文件审阅共用切换入口；带行号先定位源码，普通打开优先查看差异。 */
-export function FileReviewContent(props: { review?: FileReview; zh: boolean; children: ReactNode }) {
-  /** 用户选择只影响本次打开的文件。 */
-  const [showDiff, setShowDiff] = useState(Boolean(props.review?.diff && !props.review.location?.line));
+/** 打开引用先阅读文件；有 Git 改动时通过标准按钮进入比较，读取失败仍保留说明。 */
+export function FileReviewContent(props: {
+  review?: FileReview;
+  zh: boolean;
+  /** 工具栏搜索时先显示完整源码，再由源码编辑器打开查找。 */
+  sourceRequest?: number;
+  /** 审阅操作并入调用方的文件工具栏，不再生成独立一行。 */
+  toolbar: (actions: ReactNode) => ReactNode;
+  children: ReactNode;
+}) {
+  /** 文件内容是默认入口，只有用户主动查看改动才显示差异。 */
+  const [showDiff, setShowDiff] = useState(false);
   useEffect(() => {
     // 再次点击同一引用也回到源码，不能停留在上次切换的差异页。
     if (props.review?.location?.line) setShowDiff(false);
   }, [props.review?.location]);
+  useEffect(() => {
+    // 搜索当前文件必须挂载源码，不能继续停在差异编辑器。
+    if (props.sourceRequest) setShowDiff(false);
+  }, [props.sourceRequest]);
   return (
     <>
-      {props.review?.diff ? (
-        <nav className="file-preview-toolbar" aria-label={props.zh ? 'Git 差异与源码' : 'Git diff and source'}>
-          <button type="button" aria-pressed={showDiff} onClick={() => setShowDiff(true)}>
-            {props.zh ? 'Git 差异' : 'Git diff'}
-          </button>
-          <button type="button" aria-pressed={!showDiff} onClick={() => setShowDiff(false)}>
-            {props.zh ? '源码' : 'Source'}
-          </button>
-          <span>{props.zh ? 'HEAD → 当前文件（含暂存与未暂存）' : 'HEAD → Current file (staged and unstaged)'}</span>
-        </nav>
-      ) : props.review?.diff === null ? (
-        <p role="status">{props.zh ? '与 HEAD 相同，无 Git 差异。' : 'No Git diff from HEAD.'}</p>
-      ) : null}
+      {props.toolbar(
+        props.review?.diff ? (
+          <>
+            <Button
+              size="compact"
+              title={showDiff ? (props.zh ? '返回文件内容' : 'Back to file content') : props.zh ? '与上次提交比较（含暂存与未暂存改动）' : 'Compare with the last commit (staged and unstaged changes)'}
+              onClick={() => setShowDiff(!showDiff)}
+            >
+              {showDiff ? <FileCode aria-hidden="true" /> : <GitDiff aria-hidden="true" />}
+              {showDiff ? (props.zh ? '返回文件' : 'Back to file') : props.zh ? '查看改动' : 'View changes'}
+            </Button>
+            <span className="file-review-stats">
+              <span className="is-addition" aria-label={`${props.zh ? '新增行数' : 'Added lines'}: ${props.review.diff.addedLines}`}>
+                +{props.review.diff.addedLines}
+              </span>
+              <span className="is-deletion" aria-label={`${props.zh ? '删除行数' : 'Deleted lines'}: ${props.review.diff.deletedLines}`}>
+                −{props.review.diff.deletedLines}
+              </span>
+            </span>
+          </>
+        ) : null,
+      )}
       {props.review?.error ? (
         <p role="status">
           {props.zh ? 'Git 差异读取失败：' : 'Could not read Git diff: '}
@@ -76,7 +129,9 @@ export function FilePreview(props: {
   zh: boolean;
   /** 文本继续复用原差异与评论界面。 */
   children?: ReactNode | ((toolbar: ReactNode) => ReactNode);
+  /** 调用方已有的关闭等操作并入预览工具栏。 */
   actions?: ReactNode;
+  /** Git 比较已知的变更状态同时用于媒体文件名称。 */
   fileStatus?: string;
   /** 外部已知的修订用于显式刷新当前文件。 */
   revision?: string | number;
@@ -96,8 +151,8 @@ function FilePreviewBody(props: {
   identity: string;
   zh: boolean;
   children?: ReactNode | ((toolbar: ReactNode) => ReactNode);
-  actions?: ReactNode;
-  fileStatus?: string;
+  /** 嵌入预览的附加操作。 */ actions?: ReactNode;
+  /** 文件的实际 Git 变更状态。 */ fileStatus?: string;
   /** 弹窗提供关闭动作，单张图片据此使用纯预览布局。 */ onClose?: () => void;
 }) {
   /** 资源读取完成前不复用旧文件的内容。 */
@@ -106,6 +161,8 @@ function FilePreviewBody(props: {
   const [error, setError] = useState<UserFacingErrorCause | string>('');
   /** 用户主动刷新次数。 */
   const [attempt, setAttempt] = useState(0);
+  /** 编码选择仅重载只读预览，不影响源码保存。 */
+  const [textEncoding, setTextEncoding] = useState<FilePreviewTextEncoding | ''>(() => (JSON.parse(props.identity) as FilePreviewRequest).textEncoding ?? '');
   /** 当前选择的版本侧。 */
   const [selected, setSelected] = useState(1);
   /** 当前差异或内容展示方式。 */
@@ -124,7 +181,7 @@ function FilePreviewBody(props: {
       return;
     }
     void bridge
-      .loadFilePreview(JSON.parse(props.identity) as FilePreviewRequest)
+      .loadFilePreview({ ...(JSON.parse(props.identity) as FilePreviewRequest), textEncoding: textEncoding || undefined })
       .then((result) => {
         ids = result.map((item) => item.id).filter(Boolean);
         if (active) setItems(result);
@@ -137,12 +194,12 @@ function FilePreviewBody(props: {
       active = false;
       if (ids.length) void bridge.releaseFilePreview(ids).catch(() => undefined);
     };
-  }, [props.identity, props.zh, attempt]);
+  }, [props.identity, props.zh, attempt, textEncoding]);
   /** 文字默认差异；有媒体时优先展示实际内容。 */
   const textOnly = items?.some((item) => item.kind === 'text') && items.every((item) => item.kind === 'text' || item.kind === 'unavailable');
   /** 按文件类型和用户选择确定当前视图。 */
   const showDiff = Boolean(props.children) && (mode === 'diff' || (mode === 'auto' && textOnly));
-  // 无法读取的版本不能推断为空；仅在两端文本都可用时提供完整内容。
+  /** Monaco 差异读取两端全文，不能仅用上下文片段填充模型。 */
   const reviewText = useMemo(() => (items?.length === 2 && items.every((item) => item.kind === 'text') ? { original: items[0]!.content ?? '', modified: items[1]!.content ?? '' } : null), [items]);
   /** 图片两端使用并排展示。 */
   const images = items && items.length === 2 && items.some((item) => item.kind === 'image') && items.every((item) => item.kind === 'image' || item.kind === 'unavailable');
@@ -161,49 +218,58 @@ function FilePreviewBody(props: {
       setError(userFacingErrorCause(cause));
     }
   }
+  /** 单文件的刷新、版本切换与系统操作放在同一行；比较视图保留公共操作栏。 */
+  const toolbar = (
+    <>
+      {props.children ? (
+        <>
+          <PreviewIconButton label={props.zh ? '差异' : 'Diff'} aria-pressed={showDiff} onClick={() => setMode('diff')}>
+            <GitDiff size={16} aria-hidden="true" />
+          </PreviewIconButton>
+          <PreviewIconButton label={props.zh ? '内容预览' : 'Preview'} aria-pressed={!showDiff} onClick={() => setMode('preview')}>
+            <Eye size={16} aria-hidden="true" />
+          </PreviewIconButton>
+        </>
+      ) : null}
+      {!showDiff && !images && items && items.length > 1
+        ? items.map((item, index) => (
+            <PreviewIconButton key={index} label={item.label} aria-pressed={current === item} onClick={() => setSelected(index)}>
+              {index === 0 ? <ArrowCounterClockwise size={16} aria-hidden="true" /> : <ArrowClockwise size={16} aria-hidden="true" />}
+            </PreviewIconButton>
+          ))
+        : null}
+      {attachment.kind === 'attachment' && items?.every((item) => item.kind === 'unavailable') ? (
+        <PreviewIconButton label={props.zh ? '打开附件' : 'Open attachment'} onClick={() => void openAttachment()}>
+          <ArrowSquareOut size={16} aria-hidden="true" />
+        </PreviewIconButton>
+      ) : null}
+      <PreviewIconButton label={error ? (props.zh ? '重试' : 'Retry') : props.zh ? '刷新' : 'Refresh'} onClick={() => setAttempt((value) => value + 1)}>
+        <ArrowClockwise size={16} aria-hidden="true" />
+      </PreviewIconButton>
+      {props.actions}
+    </>
+  );
   return (
     <section className={`file-preview${simpleImage ? ' file-preview-simple-image' : ''}`} aria-label={props.zh ? '文件预览' : 'File preview'}>
       {props.onClose ? (
         <header className="file-preview-dialog-header">
           <strong>{simpleImage ? (props.zh ? '图片预览' : 'Image preview') : props.zh ? '文件预览' : 'File preview'}</strong>
-          {simpleImage ? <span title={current?.name}>{current?.name}</span> : null}
-          <button type="button" className="file-preview-close" aria-label={props.zh ? '关闭' : 'Close'} title={props.zh ? '关闭' : 'Close'} onClick={props.onClose}>
-            <XIcon size={18} aria-hidden="true" />
+          <button type="button" className="file-preview-close" aria-label={props.zh ? '关闭' : 'Close'} data-icon-tooltip={props.zh ? '关闭' : 'Close'} onClick={props.onClose}>
+            <X size={18} aria-hidden="true" />
           </button>
         </header>
       ) : null}
-      {!simpleImage || error ? (
+      {(!simpleImage || error) && !(showDiff && typeof props.children === 'function') && (showDiff || images || !current || error) ? (
         <nav className="file-preview-toolbar" aria-label={props.zh ? '预览操作' : 'Preview actions'}>
-          {props.children ? (
-            <>
-              <button type="button" aria-pressed={showDiff} onClick={() => setMode('diff')}>
-                {props.zh ? '差异' : 'Diff'}
-              </button>
-              <button type="button" aria-pressed={!showDiff} onClick={() => setMode('preview')}>
-                {props.zh ? '内容预览' : 'Preview'}
-              </button>
-            </>
-          ) : null}
-          {!showDiff && !images && items && items.length > 1
-            ? items.map((item, index) => (
-                <button key={index} type="button" aria-pressed={current === item} onClick={() => setSelected(index)}>
-                  {item.label}
-                </button>
-              ))
-            : null}
-          {attachment.kind === 'attachment' && items?.every((item) => item.kind === 'unavailable') ? (
-            <button type="button" onClick={() => void openAttachment()}>
-              {props.zh ? '打开附件' : 'Open attachment'}
-            </button>
-          ) : null}
-          <button type="button" onClick={() => setAttempt((value) => value + 1)}>
-            {error ? (props.zh ? '重试' : 'Retry') : props.zh ? '刷新' : 'Refresh'}
-          </button>
-          {props.actions}
+          {toolbar}
         </nav>
       ) : null}
       {showDiff ? (
-        <CodeReviewTextContext.Provider value={reviewText}>{typeof props.children === 'function' ? props.children(null) : props.children}</CodeReviewTextContext.Provider>
+        typeof props.children === 'function' ? (
+          <CodeReviewTextContext.Provider value={reviewText}>{props.children(toolbar)}</CodeReviewTextContext.Provider>
+        ) : (
+          <CodeReviewTextContext.Provider value={reviewText}>{props.children}</CodeReviewTextContext.Provider>
+        )
       ) : error ? (
         <p role="alert">{simpleImage && typeof error === 'string' ? error : <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />}</p>
       ) : !items ? (
@@ -213,7 +279,19 @@ function FilePreviewBody(props: {
       ) : (
         <div className={images ? 'file-preview-pair' : 'file-preview-single'}>
           {(images ? items : current ? [current] : []).map((item, index) => (
-            <FilePreviewContent key={`${item.id}:${index}:${item.label}`} item={props.location ? { ...item, review: { ...item.review, location: props.location } } : item} zh={props.zh} />
+            <FilePreviewContent
+              key={`${item.id}:${index}:${item.label}`}
+              item={props.location ? { ...item, review: { ...item.review, location: props.location } } : item}
+              zh={props.zh}
+              fileStatus={props.fileStatus}
+              encoding={textEncoding}
+              onEncodingChange={(encoding) => {
+                // 用户选择编码时保留内容预览，避免文本解码成功后跳回默认差异页。
+                setMode('preview');
+                setTextEncoding(encoding);
+              }}
+              toolbar={images ? undefined : toolbar}
+            />
           ))}
         </div>
       )}
@@ -234,25 +312,25 @@ export function PreviewImage(props: { url: string; name: string; zh: boolean; on
       <div className="file-preview-toolbar" role="group" aria-label={props.zh ? '图片缩放' : 'Image zoom'}>
         <span>{dimensions}</span>
         {props.compact ? (
-          <button type="button" title={zoom ? (props.zh ? '适应窗口' : 'Fit') : props.zh ? '原始尺寸' : 'Actual size'} onClick={() => setZoom(zoom ? 0 : 1)}>
-            {zoom ? `${zoom * 100}%` : props.zh ? '适应窗口' : 'Fit'}
-          </button>
+          <PreviewIconButton label={zoom ? (props.zh ? '适应窗口' : 'Fit') : props.zh ? '原始尺寸' : 'Actual size'} onClick={() => setZoom(zoom ? 0 : 1)}>
+            {zoom ? <ArrowsInSimple size={18} aria-hidden="true" /> : <ArrowsOutSimple size={18} aria-hidden="true" />}
+          </PreviewIconButton>
         ) : (
           <>
-            <button type="button" aria-pressed={zoom === 0} onClick={() => setZoom(0)}>
-              {props.zh ? '适应窗口' : 'Fit'}
-            </button>
-            <button type="button" aria-pressed={zoom === 1} onClick={() => setZoom(1)}>
-              {props.zh ? '原始尺寸' : 'Actual size'}
-            </button>
+            <PreviewIconButton label={props.zh ? '适应窗口' : 'Fit'} aria-pressed={zoom === 0} onClick={() => setZoom(0)}>
+              <ArrowsInSimple size={18} aria-hidden="true" />
+            </PreviewIconButton>
+            <PreviewIconButton label={props.zh ? '原始尺寸' : 'Actual size'} aria-pressed={zoom === 1} onClick={() => setZoom(1)}>
+              <ArrowsOutSimple size={18} aria-hidden="true" />
+            </PreviewIconButton>
           </>
         )}
-        <button type="button" aria-label={props.zh ? '缩小' : 'Zoom out'} onClick={() => setZoom((value) => Math.max(0.25, (value || 1) / 2))}>
-          −
-        </button>
-        <button type="button" aria-label={props.zh ? '放大' : 'Zoom in'} onClick={() => setZoom((value) => Math.min(16, (value || 1) * 2))}>
-          +
-        </button>
+        <PreviewIconButton tooltip={false} label={props.zh ? '缩小' : 'Zoom out'} onClick={() => setZoom((value) => Math.max(0.25, (value || 1) / 2))}>
+          <Minus size={18} aria-hidden="true" />
+        </PreviewIconButton>
+        <PreviewIconButton tooltip={false} label={props.zh ? '放大' : 'Zoom in'} onClick={() => setZoom((value) => Math.min(16, (value || 1) * 2))}>
+          <Plus size={18} aria-hidden="true" />
+        </PreviewIconButton>
         {zoom && !props.compact ? <span>{zoom * 100}%</span> : null}
       </div>
       <div className="file-preview-checker">
@@ -277,10 +355,19 @@ export function PreviewImage(props: { url: string; name: string; zh: boolean; on
 }
 
 /** 已授权内容和系统操作共用明确的失败状态，绝不自动打开外部应用。 */
-function FilePreviewContent(props: { item: FilePreviewItem; zh: boolean }) {
+function FilePreviewContent(props: {
+  item: FilePreviewItem;
+  zh: boolean;
+  /** 比较视图提供的真实 Git 状态。 */ fileStatus?: string;
+  /** 当前用户选择的解码方式。 */ encoding: FilePreviewTextEncoding | '';
+  /** 编码切换重读已授权文件。 */ onEncodingChange(encoding: FilePreviewTextEncoding | ''): void;
+  /** 单文件操作与文件元信息共用一行。 */ toolbar?: ReactNode;
+}) {
   /** 当前已授权的文件描述。 */
   const item = props.item;
-  /** 用户选择的源码展示状态。 */
+  /** 通用文本入口与会话源码使用同一行定位高亮，保留范围终点。 */
+  /** 自动识别可切换为已支持语法或纯文本，不改变文件正文。 */
+  const [language, setLanguage] = useState(() => detectSourceLanguage(item.name, item.content) ?? 'text'); /** 用户选择的源码展示状态。 */
   const [source, setSource] = useState(Boolean(item.review?.location?.line));
   /** 本次操作的可见错误。 */
   const [error, setError] = useState<UserFacingErrorCause | string>('');
@@ -297,40 +384,92 @@ function FilePreviewContent(props: { item: FilePreviewItem; zh: boolean }) {
   }
   return (
     <article className="file-preview-content">
-      <header>
-        <strong title={item.name}>{item.name}</strong>
-        <small>
-          {item.label} · {item.mime} · {item.byteLength.toLocaleString()} B
-        </small>
-      </header>
-      {item.id ? (
-        <div className="file-preview-toolbar">
-          {(markdown || item.mime === 'image/svg+xml') && item.content !== undefined ? (
-            <button type="button" aria-pressed={source} onClick={() => setSource(!source)}>
-              {source ? (props.zh ? '查看效果' : 'Rendered') : props.zh ? '查看源码' : 'Source'}
-            </button>
-          ) : null}
-          <button type="button" onClick={() => void action('quick-look')}>
-            {props.zh ? '系统预览' : 'Quick Look'}
-          </button>
-          <button type="button" onClick={() => void action('open')}>
-            {props.zh ? '打开文件' : 'Open'}
-          </button>
-          <button type="button" onClick={() => void action('reveal')}>
-            {props.zh ? '定位文件' : 'Reveal'}
-          </button>
-          <button type="button" onClick={() => void action('export')}>
-            {props.zh ? '导出此版本' : 'Export version'}
-          </button>
-        </div>
-      ) : null}
-      {error ? (
-        <p role="alert">
-          <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />
-        </p>
-      ) : null}
-      {item.reason ? <p role="status">{item.reason}</p> : item.id && item.byteLength === 0 ? <p role="status">{props.zh ? '此版本是空文件。' : 'This version is an empty file.'}</p> : null}
-      <FileReviewContent review={item.kind === 'text' ? item.review : undefined} zh={props.zh}>
+      <FileReviewContent
+        review={item.kind === 'text' ? item.review : undefined}
+        zh={props.zh}
+        toolbar={(reviewActions) => (
+          <>
+            <header>
+              <FileTypeIcon name={item.name} size={20} />
+              <div className="file-preview-identity">
+                <strong data-icon-tooltip={item.kind === 'image' ? undefined : item.name} data-file-status={props.fileStatus ?? item.review?.diff?.changeType}>
+                  {item.kind === 'image' ? (props.zh ? '图片预览' : 'Image preview') : item.name}
+                </strong>
+                <small>
+                  {item.label} · {item.mime} · {item.byteLength.toLocaleString()} B{item.encoding ? ` · ${item.encoding.toUpperCase()}` : ''}
+                </small>
+              </div>
+              {item.id && (item.kind === 'text' || item.mime === 'application/octet-stream' || item.mime === 'image/svg+xml') ? (
+                <label className="file-preview-setting">
+                  <span>{props.zh ? '编码' : 'Encoding'}</span>
+                  <select aria-label={props.zh ? '预览编码' : 'Preview encoding'} value={props.encoding} onChange={(event) => props.onEncodingChange(event.currentTarget.value as FilePreviewTextEncoding | '')}>
+                    <option value="">{props.zh ? '自动识别' : 'Automatic'}</option>
+                    {filePreviewTextEncodings.map((encoding) => (
+                      <option key={encoding} value={encoding}>
+                        {encoding.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {item.content !== undefined && (item.kind === 'text' || source) ? (
+                <label className="file-preview-setting">
+                  <span>{props.zh ? '语言' : 'Language'}</span>
+                  <select
+                    aria-label={props.zh ? '预览高亮语言' : 'Preview syntax language'}
+                    value={language}
+                    onChange={(event) => {
+                      // 阅读模式下选择高亮语言时打开源码，使语言选择立即可见。
+                      setLanguage(event.currentTarget.value);
+                      if (markdown) setSource(true);
+                    }}
+                  >
+                    <option value="text">{props.zh ? '纯文本' : 'Plain text'}</option>
+                    {sourceLanguageOptions.map((language) => (
+                      <option key={language} value={language}>
+                        {language}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {item.id || props.toolbar || reviewActions ? (
+                <nav className="file-preview-toolbar" aria-label={props.zh ? '文件操作' : 'File actions'}>
+                  {reviewActions}
+                  {props.toolbar}
+                  {item.id ? (
+                    <>
+                      {(markdown || item.mime === 'image/svg+xml') && item.content !== undefined ? (
+                        <PreviewIconButton label={source ? (props.zh ? '查看效果' : 'Rendered') : props.zh ? '查看源码' : 'Source'} aria-pressed={source} onClick={() => setSource(!source)}>
+                          {source ? <Eye size={18} aria-hidden="true" /> : <FileCode size={18} aria-hidden="true" />}
+                        </PreviewIconButton>
+                      ) : null}
+                      <PreviewIconButton label={props.zh ? '系统预览' : 'Quick Look'} onClick={() => void action('quick-look')}>
+                        <Eye size={18} aria-hidden="true" />
+                      </PreviewIconButton>
+                      <PreviewIconButton label={props.zh ? '打开文件' : 'Open'} onClick={() => void action('open')}>
+                        <ArrowSquareOut size={18} aria-hidden="true" />
+                      </PreviewIconButton>
+                      <PreviewIconButton label={props.zh ? '定位文件' : 'Reveal'} onClick={() => void action('reveal')}>
+                        <FolderOpen size={18} aria-hidden="true" />
+                      </PreviewIconButton>
+                      <PreviewIconButton label={props.zh ? '导出此版本' : 'Export version'} onClick={() => void action('export')}>
+                        <DownloadSimple size={18} aria-hidden="true" />
+                      </PreviewIconButton>
+                    </>
+                  ) : null}
+                </nav>
+              ) : null}
+            </header>
+            {error ? (
+              <p role="alert">
+                <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />
+              </p>
+            ) : null}
+            {item.reason ? <p role="status">{item.reason}</p> : item.id && item.byteLength === 0 ? <p role="status">{props.zh ? '此版本是空文件。' : 'This version is an empty file.'}</p> : null}
+          </>
+        )}
+      >
         {(item.kind === 'text' || source) && item.content !== undefined ? (
           <Suspense fallback={<p role="status">{props.zh ? '正在打开文本…' : 'Opening text…'}</p>}>
             {markdown && !source ? (
@@ -339,7 +478,7 @@ function FilePreviewContent(props: { item: FilePreviewItem; zh: boolean }) {
               </div>
             ) : (
               <div className="file-preview-text">
-                <CodeEditor path={item.name} label={item.name} language={detectSourceLanguage(item.name)} content={item.content} revealLine={item.review?.location?.line} readOnly />
+                <CodeEditor path={item.name} label={item.name} language={language} content={item.content} location={item.review?.location} readOnly />
               </div>
             )}
           </Suspense>

@@ -1,5 +1,7 @@
+import { buildPersistedSessionViewCache } from '../apps/desktop/src/renderer/session/sessionHotCache.ts';
+import { inlineResourceRequestSignature } from '../apps/desktop/src/renderer/session/conversationResourceProjection.ts';
 import { ZeusApiError } from '../apps/desktop/src/renderer/transport/localApiTransport.ts';
-import { createSessionController, type SessionControllerClient, sessionRealtimeBufferBudget } from '../apps/desktop/src/renderer/session/useSessionController.ts';
+import { createSessionController, type SessionControllerClient, sessionRealtimeBufferBudget, reconnectBackoffMs } from '../apps/desktop/src/renderer/session/useSessionController.ts';
 import { adaptConversationSnapshotV2, mergeConversationProcessV2, resumeCachedConversationSnapshot } from '../apps/desktop/src/renderer/session/conversationSnapshotV2Adapter.ts';
 import { createHydratedSessionState, createInitialSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.ts';
 import type {
@@ -172,6 +174,8 @@ function createHarness(
   const sockets: VerifierSocket[] = [];
   const requestedAfterSequences: number[] = [];
   const connectedAfterSequences: number[] = [];
+  /** 记录实际控制器选用的退避，不引入另一套计时规则。 */
+  const reconnectDelays: number[] = [];
   const client = {
     /** 差异读取用于验证终态摘要补齐和用户重试。 */
     loadTurnChangeSet: changeSetLoader,
@@ -250,7 +254,9 @@ function createHarness(
         storedDraft = null;
       },
     },
-    reconnectDelay: async () => undefined,
+    reconnectDelay: async (delayMs) => {
+      reconnectDelays.push(delayMs);
+    },
   });
   return {
     controller,
@@ -261,6 +267,7 @@ function createHarness(
     },
     sockets,
     connectedAfterSequences,
+    reconnectDelays,
     requestedAfterSequences,
     snapshotReads: () => snapshotReads,
     sendCalls: () => sendCalls,
@@ -316,6 +323,12 @@ async function verifyStableHydrationPages() {
   const harness = createHarness(undefined, 0, false, [], null, undefined, undefined, createHydratedSessionState(partial));
   /** 真实控制器的请求参数决定是否保留方向与游标。 */
   const requests: Array<{ cursor?: string; direction?: string }> = [];
+  /** 展开不能借操作读取重新取得正文历史。 */
+  let historyReads = 0;
+  harness.client.loadNativeConversationTurnModelHistoryV2 = async () => {
+    historyReads += 1;
+    return historyV2;
+  };
   harness.client.loadNativeConversationProcessV2 = async (_project, _conversation, _turn, options) => {
     requests.push(options ?? {});
     if (requests.length === 1) throw new Error('隔离探针模拟首次补页失败');
@@ -331,6 +344,7 @@ async function verifyStableHydrationPages() {
     await harness.controller.loadTurnProcess('turn', true);
     await harness.controller.loadTurnProcess('turn', true);
     assert(requests.length === 2 && requests.every((request) => request.direction === 'tail' && request.cursor === 'earlier-process'), '完成态展开与重试必须延续末页游标，完成后再次读取不得发请求。');
+    assert(historyReads === 0, '展开操作不能读取正文历史。');
   } finally {
     harness.controller.dispose();
   }
@@ -362,9 +376,12 @@ async function verifyQueuedRetryReconciliation() {
     assert(harness.connectedAfterSequences.length === 1, '空闲会话重试后必须恢复实时连接，接收正文和后续进展。');
     assert(!Object.values(harness.controller.getState().items).some((item) => item.payload.submissionId === submission.id), '替换成功后不得遗留旧失败气泡。');
     recovered = { ...queue, submissions: [{ ...submission, status: 'paused', pausedReason: 'outcome_unknown' }] };
-    /** 核对仍未知时返回原权威队列，不得调用重试接口或移除暂停状态。 */
-    const unknown = await harness.controller.retryQueuedSubmission(submission.id);
-    assert(unknown.submissions[0]?.pausedReason === 'outcome_unknown' && retries === 1, '未知结果必须保留原暂停队列，不得再次发送。');
+    /** 仍未知时保留核对状态，不重复抛错，也不得调用重试接口。 */
+    const unknown = await harness.controller.retryQueuedSubmission(submission.id).then(
+      () => null,
+      (error: Error) => error,
+    );
+    assert(unknown === null && retries === 1 && checks === 2 && harness.controller.getState().queue?.submissions.find((entry) => entry.id === submission.id)?.pausedReason === 'outcome_unknown', '未知结果不得再次发送。');
     recovered = { ...queue, submissions: [{ ...submission, providerTurnId: 'accepted-turn' }] };
     /** 已送达分支仍须独立补齐权威正文。 */
     const readsBeforeAccepted = harness.snapshotReads();
@@ -692,9 +709,20 @@ function verifyRestoredSubmissionOrder() {
         steered.itemOrder.map((key) => steered.items[key]!),
         steered.queue,
       )
+        .filter((item) => item.type === 'agentMessage')
         .map((item) => item.text)
-        .join('|') === '回复 1|回复 3|回复 5|第一次引导',
-      '尚无持久位置的引导不得按时间猜测插入权威正文。',
+        .join('|') === '回复 1|回复 3|回复 5',
+      '缺少持久位置的接纳通知不得重排已确认正文',
+    );
+    const positioned = sessionReducer(steered, { type: 'snapshot_hydrated', snapshot: { ...base, items: [...replies, acceptedInputs[1]!], submissions: [], queue } });
+    assert(
+      orderTranscriptItemsWithQueue(
+        positioned.itemOrder.map((key) => positioned.items[key]!),
+        positioned.queue,
+      )
+        .map((item) => item.text)
+        .join('|') === '回复 1|第一次引导|回复 3|回复 5',
+      '取得持久位置后，引导必须插回对应回复之前',
     );
     for (const action of [
       { type: 'queue_hydrated' as const, queue: lateQueue },
@@ -708,7 +736,13 @@ function verifyRestoredSubmissionOrder() {
         live.itemOrder.map((key) => live.items[key]!),
         live.queue,
       );
-      assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5', '持久输入补回后首发与引导必须按权威位置归位，待发消息留在输入框队列。');
+      assert(
+        ordered
+          .filter((item) => item.type === 'agentMessage')
+          .map((item) => item.text)
+          .join('|') === '回复 1|回复 3|回复 5',
+        '队列水位不能在持久正文补齐前改变已确认回复顺序。',
+      );
       /** 内容增量更新不能用更新时间把回复挪到后续输入之后。 */
       const updated = ordered.map((item) => (item.text === '回复 1' ? { ...item, updatedAt: at(30) } : item));
       assert(
@@ -730,7 +764,10 @@ function verifyRestoredSubmissionOrder() {
       state.itemOrder.map((key) => state.items[key]!),
       state.queue,
     );
-    assert(ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5', '切回会话后，任务首发和多次引导必须留在对应回复之前。');
+    assert(
+      ordered.map((item) => item.text).join('|') === '任务推送提示词|回复 1|第一次引导|回复 3|第二次引导|回复 5' && composerQueuedSubmissions(state).some((submission) => submission.content === '待发消息'),
+      '切回会话后持久正文顺序保持不变，未发送内容仍在队列区域。',
+    );
     for (const status of ['completed', 'resolved']) {
       /** 终态已确认但原生身份仍未补齐的分页合并结果也不能进入队尾。 */
       const terminal = ordered.map((item) => (item.clientUserMessageId === submissions[0]!.clientUserMessageId ? { ...item, status } : item));
@@ -1157,6 +1194,124 @@ async function verifyIdleTransitionReleasesSubscription() {
   assert(harness.connectedAfterSequences.length === 1, 'Intentional idle release must not schedule a reconnect loop.');
   harness.controller.dispose();
   return { socketClosed: 1, connections: harness.connectedAfterSequences.length, transportState: 'ready' };
+}
+
+/** 验证事件流五次失败停止，恢复按钮可重新连接，已有草稿不会丢失。 */
+async function verifyConnectionRetryBudget() {
+  /** 初次连接正常，之后让实际控制器遇到连续读取失败。 */
+  const harness = createHarness();
+  await harness.controller.start();
+  harness.controller.setDraft('断网期间保留的草稿');
+  /** 恢复原读取入口后可直接验证手动重连。 */
+  const read = harness.client.loadNativeConversationReadableSnapshot;
+  /** 明确计数自动读取，避免把停止状态当作只隐藏提示。 */
+  let failedReads = 0;
+  harness.client.loadNativeConversationReadableSnapshot = async () => {
+    failedReads += 1;
+    throw new Error('network connection unavailable');
+  };
+  harness.sockets[0]!.close();
+  await waitUntil(() => harness.controller.getState().error?.code === 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', '五次连接失败停止');
+  assert(failedReads === 5, '会话连接失败只能自动重试五次。');
+  assert(JSON.stringify(harness.reconnectDelays) === JSON.stringify(reconnectBackoffMs) && harness.reconnectDelays.every((delay) => delay <= 60_000), '连接间隔必须指数退避，且单次不超过一分钟。');
+  assert(harness.controller.getState().draft === '断网期间保留的草稿', '连接失败不能清空用户草稿。');
+  harness.client.loadNativeConversationReadableSnapshot = read;
+  await harness.controller.reconnect();
+  assert(harness.controller.getState().transportState === 'ready' && harness.controller.getState().reconnectAttempt === 0, '手动重试成功必须清除连接计数。');
+  harness.controller.dispose();
+  return { failedReads, delays: harness.reconnectDelays, manualReconnect: 'ready', draftRetained: true };
+}
+
+/** 当前进度只由活动快照和实时事件更新，历史补页没有更新权限。 */
+function verifyReasoningProgressOwnership() {
+  /** 隔离首屏沿用真实快照转换，不连接 Provider。 */
+  const snapshot = adaptConversationSnapshotV2({ snapshot: snapshotV2, history: historyV2, queue, requests: [], planImplementationRequests: [], choice, goal });
+  /** 真实归约器接纳活动轮次与第一条实时摘要。 */
+  let state = sessionReducer(createHydratedSessionState(snapshot), { type: 'event_received', event: conversationEvent(1, 'conversation.turn.started', { turnId: 'progress-turn' }) });
+  state = sessionReducer(state, {
+    type: 'event_received',
+    event: conversationEvent(2, 'conversation.item.delta', { turnId: 'progress-turn', itemId: 'progress', itemType: 'reasoning', textContent: '当前实时进度', transcript: transcript('progress', 1) }),
+  });
+  /** 保存实时摘要的对象身份，后续补页只能影响历史集合。 */
+  const current = state.currentReasoningItem;
+  assert(current?.text === '当前实时进度', '实时事件必须更新当前摘要。');
+  /** 补入位置更靠后的旧摘要，覆盖之前从列表末尾取摘要的缺口。 */
+  const historical = {
+    id: 'historical-reasoning',
+    turnId: 'progress-turn',
+    providerItemId: 'historical-reasoning',
+    type: 'reasoning',
+    status: 'completed',
+    phase: 'prework',
+    text: '历史补读的摘要',
+    payload: { v2ContentKind: 'process_detail' },
+    resources: [],
+    startedAt: occurredAt,
+    updatedAt: occurredAt,
+    transcript: transcript('historical-reasoning', 3),
+  };
+  state = sessionReducer(state, { type: 'snapshot_v2_page_merged', snapshot: { ...state.snapshot!, items: [...state.snapshot!.items, historical] } });
+  assert(state.currentReasoningItem === current, '历史补页不能替换当前实时摘要。');
+  /** 冷开读取权威活动投影，不从历史过程恢复进度。 */
+  const cold = createHydratedSessionState({
+    ...snapshot,
+    turns: Object.values(state.turnsByProviderId),
+    items: [{ ...historical, id: 'progress', providerItemId: 'progress', text: '权威活动进度', payload: { v2ContentKind: 'active_item' } }],
+  });
+  assert(cold.currentReasoningItem?.text === '权威活动进度', '冷开必须恢复权威活动摘要。');
+  return { realtime: true, historicalPageRetainedCurrent: true, coldSnapshot: true };
+}
+
+/** 重试只传目标轮次，不写入用户消息或清空草稿。 */
+async function verifyFailedTurnRetry() {
+  /** 初始服务端状态是已停止的网络失败。 */
+  const harness = createHarness(undefined, 0, false);
+  harness.client.loadNativeConversationReadableSnapshot = async () => ({
+    snapshot: {
+      ...snapshotV2,
+      recentClosedTurns: [
+        {
+          id: 'failed-turn',
+          providerTurnId: 'failed-turn',
+          submissionId: null,
+          status: 'failed',
+          hasError: true,
+          error: { category: 'network', code: 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', message: '连接重试五次均失败。', providerStatus: 'failed', additionalDetails: [] },
+          hasPlan: false,
+          plan: null,
+          startedAt: occurredAt,
+          completedAt: occurredAt,
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+          agentKind: 'codex',
+          openingUserMessage: null,
+          completionOutput: null,
+          process: { available: false, latestSequence: 0 },
+          resourcesAvailable: false,
+          changeSetAvailable: false,
+        },
+      ],
+      limits: { ...snapshotV2.limits, returnedTurnCount: 1 },
+    },
+    history: historyV2,
+  });
+  await harness.controller.start();
+  harness.controller.setDraft('点击重试时保留的新草稿');
+  /** 同轮次重新读取权威快照时，正在连接的计数必须保持。 */
+  const retrying = { ...harness.controller.getState(), providerReconnectAttempt: 3, providerReconnectAttempts: 5, providerReconnectTurnId: 'failed-turn' };
+  /** 使用生产归约器验证快照替换，不依赖展示组件的局部变量。 */
+  const refreshed = sessionReducer(retrying, { type: 'snapshot_hydrated', snapshot: retrying.snapshot! });
+  assert(refreshed.providerReconnectAttempt === 3 && refreshed.providerReconnectAttempts === 5, '同轮次快照刷新不能清掉连接计数。');
+  await harness.controller.retryFailedTurn('failed-turn');
+  await waitUntil(() => harness.sendCalls() === 1, '网络失败显式续跑');
+  /** 读取实际进入既有发送入口的消息，不把点击回调视作发送完成。 */
+  const sent = harness.sentMessages[0]!;
+  assert(sent.clientUserMessageId === 'connection-retry:failed-turn' && sent.idempotencyKey === 'connection-retry:failed-turn', '同一失败轮次续跑必须复用稳定的发送身份。');
+  assert(sent.retryOfTurnId === 'failed-turn' && sent.content === '', '客户端只传失败轮次，续接指令必须由服务端生成。');
+  assert(!Object.values(harness.controller.getState().items).some((item) => item.optimistic && item.type === 'userMessage'), '系统续接不能创建乐观用户气泡。');
+  assert(harness.controller.getState().draft === '点击重试时保留的新草稿', '点击重试不能清空新草稿。');
+  harness.controller.dispose();
+  return { sentMessages: 1, stableIdentity: true, draftRetained: true, snapshotRetryRetained: true };
 }
 
 /** 验证 Provider 断流核对期间保留实时订阅，并向会话状态投影五次计数。 */
@@ -2399,6 +2554,175 @@ function verifyTaskPushChoiceHandoff() {
   return { arrivalOrders: 3, canonicalConversationId: canonical.id, retainedHistory: sibling.id };
 }
 
+/** 图片资源页读完后仍可补齐迟到图片，重开会话继续使用同一显示身份。 */
+async function verifyImageResourceRecovery() {
+  /** 首屏没有图片元数据，正文已经带有受控图片引用。 */
+  const fresh = adaptConversationSnapshotV2({ snapshot: snapshotV2, history: historyV2, queue, requests: [], planImplementationRequests: [], choice, goal });
+  /** 已确认消息的身份、顺序和分组由原显示凭证固定。 */
+  const item = {
+    id: 'image-message',
+    providerItemId: null,
+    turnId: 'turn',
+    type: 'agentMessage',
+    status: 'completed',
+    text: '![设计稿](design.png)',
+    phase: 'final_answer',
+    payload: {},
+    resources: [],
+    startedAt: occurredAt,
+    updatedAt: occurredAt,
+    transcript: transcript('image-message', 1),
+  };
+  /** 消息已持久化，但资源页首次确实为空。 */
+  const cached = { ...fresh, items: [item] };
+  /** 资源登记之后出现的正式元数据。 */
+  const resource = {
+    id: 'late-image',
+    turnId: 'turn',
+    itemId: item.id,
+    sourceIndex: 0,
+    kind: 'file',
+    presentation: 'inline',
+    displayName: 'design.png',
+    mimeType: 'image/png',
+    previewKind: 'image',
+    iconKind: 'image',
+    createdAt: occurredAt,
+    updatedAt: occurredAt,
+    accessPolicy: 'authorized_open_intent_or_preview' as const,
+    transcript: item.transcript,
+  };
+  /** 当前与重开的控制器各自拥有原会话状态。 */
+  const harness = createHarness(undefined, 0, false, [], null, undefined, undefined, createHydratedSessionState(cached));
+  /** 服务端资源是否已登记，与正文终态相互独立。 */
+  let available = false;
+  /** 模拟一次读取失败，随后仍允许原位重试。 */
+  let fail = false;
+  /** 所有读取记录首页游标，避免读完资源后只复用旧缓存。 */
+  const reads: Array<string | undefined> = [];
+  harness.client.loadNativeConversationResourcesV2 = async (_project, _conversation, options) => {
+    reads.push(options?.cursor);
+    if (fail) {
+      fail = false;
+      throw new Error('受控资源读取失败');
+    }
+    return { ...historyV2, kind: 'resources', items: available ? [resource] : [] };
+  };
+  /** 初始显示结构需要逐字段保持。 */
+  const initialOrder = harness.controller.getState().itemOrder.join(',');
+  try {
+    await harness.controller.loadConversationResources();
+    assert(harness.controller.getState().snapshot?.v2Paging?.resources.loaded && reads.length === 1, '首次空资源页必须如实完成读取。');
+    available = true;
+    await harness.controller.loadConversationResources();
+    /** 资源迟到之后仍附着原消息，不能新增重复消息。 */
+    const restored = harness.controller.getState();
+    assert(Number(reads.length) === 2 && restored.snapshot?.items[0]?.resources?.[0]?.id === resource.id, '读完旧资源页后必须能重新取得迟到图片。');
+    assert(restored.itemOrder.join(',') === initialOrder && JSON.stringify(restored.snapshot?.items[0]?.transcript.placement) === JSON.stringify(item.transcript.placement), '资源补齐不能改变消息顺序或分组。');
+    fail = true;
+    await harness.controller.loadConversationResources().catch(() => undefined);
+    assert(Boolean(harness.controller.getState().snapshot?.v2Paging?.resources.error) && harness.controller.getState().snapshot?.items[0]?.resources?.[0]?.id === resource.id, '读取失败保留原消息与已登记图片。');
+    await harness.controller.loadConversationResources();
+    assert(!harness.controller.getState().snapshot?.v2Paging?.resources.error && Number(reads.length) === 4 && reads.every((cursor) => cursor === undefined), '重试必须从首页读取并清除真实错误。');
+    /** 重开时只恢复持久正文，再通过同一资源接口完成图片恢复。 */
+    const reopened = createHarness(undefined, 0, false, [], null, undefined, undefined, createHydratedSessionState(cached));
+    reopened.client.loadNativeConversationResourcesV2 = harness.client.loadNativeConversationResourcesV2;
+    try {
+      await reopened.controller.loadConversationResources();
+      assert(reopened.controller.getState().snapshot?.items[0]?.resources?.[0]?.id === resource.id && reopened.controller.getState().itemOrder.join(',') === initialOrder, '冷恢复必须补齐同一消息中的图片。');
+    } finally {
+      reopened.controller.dispose();
+    }
+  } finally {
+    harness.controller.dispose();
+  }
+  return { lateResource: true, emptyPageRefetched: true, retry: true, coldRecovery: true, stablePlacement: true, resourceReads: reads.length };
+}
+
+/** 定向使用既有真实控制器探针，不引入额外框架。 */
+if (process.argv.includes('--image-resource-recovery-only')) {
+  console.log(JSON.stringify({ imageResourceRecovery: await verifyImageResourceRecovery() }));
+  process.exit(0);
+}
+
+/** 缓存与权威读取竞争时，真实控制器只允许缓存填充尚未取得的显示内容。 */
+async function verifyAsyncSessionCache(): Promise<void> {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const first = createHarness(undefined, 0, false);
+  let resolveCache!: (value: unknown) => void;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      zeus: {
+        loadSessionViewCache: () =>
+          new Promise((resolve) => {
+            resolveCache = resolve;
+          }),
+      },
+    },
+  });
+  try {
+    await first.controller.start();
+    const authoritative = first.controller.getState();
+    const cached = { ...authoritative, snapshot: { ...authoritative.snapshot!, title: '旧显示缓存' } };
+    const envelope = buildPersistedSessionViewCache(new Map([[conversationId, { state: cached, cachedAt: Date.now(), estimatedBytes: 0 }]]));
+    assert(envelope.entries.length === 1, '探针缓存必须通过正式清洗');
+    resolveCache(envelope);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert(first.controller.getState() === authoritative, '晚到缓存不能覆盖已取得的权威快照、顺序或滚动所用修订');
+    first.controller.dispose();
+    const second = createHarness(undefined, 0, false);
+    const read = second.client.loadNativeConversationReadableSnapshot!.bind(second.client);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    second.client.loadNativeConversationReadableSnapshot = async (...args) => {
+      await gate;
+      return read(...args);
+    };
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { zeus: { loadSessionViewCache: async () => envelope } } });
+    second.controller.setDraft('尚未发送的新草稿');
+    const pending = second.controller.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert(second.controller.getState().snapshot?.title === '旧显示缓存' && second.controller.getState().draft === '尚未发送的新草稿', '先到缓存只能补显示，不能覆盖输入');
+    release();
+    await pending;
+    assert(second.controller.getState().snapshot?.title !== '旧显示缓存' && second.controller.getState().draft === '尚未发送的新草稿', '权威快照必须接管显示并保留草稿');
+    second.controller.dispose();
+  } finally {
+    first.controller.dispose();
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+}
+
+/** 旧链接不能登记时，新回复仍补载；没有新完整链接时不循环请求。 */
+function verifyInlineResourceRequests(): void {
+  /** 模拟始终无法登记的历史链接。 */
+  const history = { key: 'history', turnId: 'old-turn', providerItemId: 'old-item', text: '[旧链接](missing-file.md)' };
+  /** 后续回复仍需登记新的链接。 */
+  const reply = { key: 'reply', turnId: 'new-turn', providerItemId: 'new-item', text: '[文档](https://example.com/docs)' };
+  /** 历史失败项单独存在时的请求身份。 */
+  const previous = inlineResourceRequestSignature([history]);
+  /** 新回复加入后的请求身份必须变化。 */
+  const current = inlineResourceRequestSignature([history, reply]);
+  assert(current !== previous, '旧消息资源缺失不能遮住后续回复的新链接');
+  assert(current === inlineResourceRequestSignature([history, { ...reply, text: `${reply.text} 后续普通文字` }]), '正文逐字增长不能重复请求相同资源');
+  assert(current !== inlineResourceRequestSignature([history, { ...reply, text: `${reply.text} [下一页](https://example.com/next)` }]), '同一条回复新增完整链接后必须允许补载');
+  assert(current !== inlineResourceRequestSignature([history, { ...reply, providerItemId: 'confirmed-item' }]), '正文取得权威身份后必须允许资源重新挂接');
+  assert(inlineResourceRequestSignature([{ ...reply, status: 'inProgress' }]) !== inlineResourceRequestSignature([{ ...reply, status: 'completed' }]), '正文完成后必须允许补读迟到图片资源');
+}
+
+verifyInlineResourceRequests();
+
+/** 本轮启动与缓存专项仍复用现有脚本，不引入新框架或文件。 */
+if (process.argv.includes('--startup-cache-only')) {
+  await verifyAsyncSessionCache();
+  console.log(JSON.stringify({ asyncSessionCache: 'passed', queuedRetry: await verifyQueuedRetryReconciliation(), processStructure: await verifyStableHydrationPages(), placementTakeover: await verifyPlacementEpochTakeover() }));
+  process.exit(0);
+}
+
 /** 创建身份专项复用现有探针，不引入新的验证体系。 */
 if (process.argv.includes('--task-push-choice-handoff-only')) {
   console.log(JSON.stringify({ taskPushChoiceHandoff: verifyTaskPushChoiceHandoff() }));
@@ -2442,7 +2766,21 @@ if (process.argv.includes('--session-defects-only')) {
 
 /** 回复流恢复专项仅运行本次状态与订阅检查，避开无关历史队列场景。 */
 if (process.argv.includes('--provider-stream-recovery-only')) {
-  console.log(JSON.stringify({ providerStreamRecoveryStatus: await verifyProviderStreamRecoveryStatus() }));
+  console.log(JSON.stringify({ providerStreamRecoveryStatus: await verifyProviderStreamRecoveryStatus(), connectionRetryBudget: await verifyConnectionRetryBudget(), failedTurnRetry: await verifyFailedTurnRetry() }));
+  process.exit(0);
+}
+
+/** 当前任务的恢复与展开核验独立执行，未完成的异步读取必须报错而非静默退出。 */
+if (process.argv.includes('--recovery-presentation-only')) {
+  /** 有界截止时间同时保持事件循环，避免未完成的 Promise 被误判为成功。 */
+  const deadline = setTimeout(() => {
+    throw new Error('恢复展示探针在二十秒内未完成。');
+  }, 20_000);
+  try {
+    console.log(JSON.stringify({ stableHydrationPages: await verifyStableHydrationPages(), failedTurnRetry: await verifyFailedTurnRetry(), reasoningProgressOwnership: verifyReasoningProgressOwnership() }));
+  } finally {
+    clearTimeout(deadline);
+  }
   process.exit(0);
 }
 
@@ -2481,6 +2819,9 @@ const result =
           activeSnapshotWatermarkSubscription: await verifyActiveSnapshotWatermarkSubscription(),
           idleTransitionReleasesSubscription: await verifyIdleTransitionReleasesSubscription(),
           providerStreamRecoveryStatus: await verifyProviderStreamRecoveryStatus(),
+          connectionRetryBudget: await verifyConnectionRetryBudget(),
+          failedTurnRetry: await verifyFailedTurnRetry(),
+          reasoningProgressOwnership: verifyReasoningProgressOwnership(),
           renderDeltaOverflow: await verifyRenderDeltaOverflow(),
           syncGapByteOverflow: await verifyGapByteOverflow(),
           contiguousGapReplay: await verifyContiguousGapReplay(),

@@ -115,9 +115,33 @@ export function CodexUsageSettingsPane(props: { client: UsageClient | null; lang
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
   const loadRevision = useRef(0);
-  const [filterOptions, setFilterOptions] = useState<{ projects: CodexLocalUsageGroup[]; models: CodexLocalUsageGroup[] }>({ projects: [], models: [] });
+  /** 后端是当前供应商目录的权威来源。 */
+  const providers = snapshot?.providers ?? [];
+  /** 失效选择立即回到全部，不显示已移除连接的占位面板。 */
+  const selectedProvider = providers.find((entry) => entry.provider.providerId === selectedProviderId);
+  /** 单个供应商只提供自己的项目和模型选项。 */
+  const filterProviders = selectedProvider ? [selectedProvider] : providers;
+  /** 去重只作用于当前快照，不累积历史选项。 */
+  const projects = usageFilterOptions(filterProviders, 'projects');
+  /** 模型目录独立于已选项目，允许用户退出组合筛选。 */
+  const models = usageFilterOptions(filterProviders, 'models');
 
+  const filterOptions = { projects, models };
+
+  /** 下钻沿用可用筛选，不让同一行进入详情后改变统计范围。 */
+  const selectProvider = (providerId: string) => {
+    setSelectedProviderId(providerId);
+    /** 下钻保留仍适用的条件；切换到不含该选项的供应商时才清除。 */
+    const next = providers.find((entry) => entry.provider.providerId === providerId);
+    if (next) {
+      setProjectId((current) => (next.filters.projects.some((group) => group.id === current) ? current : ''));
+      setModel((current) => (next.filters.models.some((group) => group.id === current) ? current : ''));
+    }
+  };
+
+  /** 同次响应提供稳定选项；失效条件清除后重新读取，不把旧结果标成新范围。 */
   const load = useCallback(async () => {
+    /** 本轮请求身份用于处理刷新和快速筛选的竞争。 */
     const revision = ++loadRevision.current;
     if (!props.client) {
       setLoading(false);
@@ -126,26 +150,33 @@ export function CodexUsageSettingsPane(props: { client: UsageClient | null; lang
     }
     setLoading(true);
     try {
+      /** 详情查询不需要再请求一次未筛选快照。 */
       const next = await props.client.loadUsageAnalytics({ range, projectId: projectId || undefined, model: model || undefined });
       if (revision !== loadRevision.current) return;
+      /** 校验选择时也使用本轮供应商目录，避免删除连接后残留筛选。 */
+      const selected = next.providers.find((entry) => entry.provider.providerId === selectedProviderId);
+      /** 全部视图允许选择任一当前供应商有记录的模型和项目。 */
+      const scope = selected ? [selected] : next.providers;
+      /** 已删除供应商的条件一并清除，即使另一供应商使用同名模型。 */
+      const selectionRemoved = selectedProviderId !== 'all' && !selected;
+      /** 没有记录的失效项目不继续限制页面。 */
+      const nextProject = !selectionRemoved && scope.some((entry) => entry.filters.projects.some((group) => group.id === projectId)) ? projectId : '';
+      /** 没有记录的失效模型不继续限制页面。 */
+      const nextModel = !selectionRemoved && scope.some((entry) => entry.filters.models.some((group) => group.id === model)) ? model : '';
+      if (selectionRemoved) setSelectedProviderId('all');
+      if (nextProject !== projectId || nextModel !== model) {
+        setProjectId(nextProject);
+        setModel(nextModel);
+        return;
+      }
       setSnapshot(next);
-      setFilterOptions((current) => ({
-        projects: mergeGroups(
-          current.projects,
-          next.providers.flatMap((provider) => provider.local.byProject),
-        ),
-        models: mergeGroups(
-          current.models,
-          next.providers.flatMap((provider) => provider.local.byModel),
-        ),
-      }));
       setError(null);
     } catch (cause) {
       if (revision === loadRevision.current) setError(cause);
     } finally {
       if (revision === loadRevision.current) setLoading(false);
     }
-  }, [copy.unavailable, model, projectId, props.client, range]);
+  }, [copy.unavailable, model, projectId, props.client, range, selectedProviderId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), props.refreshRevision > 0 ? 180 : 0);
@@ -180,7 +211,7 @@ export function CodexUsageSettingsPane(props: { client: UsageClient | null; lang
       {snapshot ? (
         <>
           <UsageSection title={copy.provider} description={copy.providerHelp} badge={`${snapshot.providers.length}`}>
-            <ProviderTabs providers={snapshot.providers} selectedProviderId={selectedProviderId} onChange={setSelectedProviderId} language={props.language} />
+            <ProviderTabs providers={snapshot.providers} selectedProviderId={selectedProviderId} onChange={selectProvider} language={props.language} />
           </UsageSection>
           <div className="codex-usage-filters" aria-label={copy.local}>
             <label>
@@ -835,8 +866,8 @@ function UsageBreakdownTable(props: { title: string; rows: CodexLocalUsageGroup[
   );
 }
 
-function mergeGroups(current: CodexLocalUsageGroup[], incoming: CodexLocalUsageGroup[]): CodexLocalUsageGroup[] {
-  return [...new Map([...current, ...incoming].map((group) => [group.id, group])).values()].sort((left, right) => left.label.localeCompare(right.label));
+function usageFilterOptions(providers: UsageProviderAnalytics[], field: 'models' | 'projects'): Array<Pick<CodexLocalUsageGroup, 'id' | 'label'>> {
+  return [...new Map(providers.flatMap((entry) => entry.filters[field]).map((group) => [group.id, group])).values()].sort((left, right) => left.label.localeCompare(right.label));
 }
 
 function formatTokens(value: number | null, language: Language): string {

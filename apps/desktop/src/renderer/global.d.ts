@@ -93,8 +93,12 @@ declare global {
       exitExecutionHostMaintenance: () => Promise<void>;
       restartAfterStartupFailure: () => Promise<void>;
       exitAfterStartupFailure: () => Promise<void>;
+      /** 启动耗时与主页可交互状态上报。 */
+      reportStartupSpan: (input: { stage: string; durationMs: number }) => void;
+      reportHomeInteractive: () => void;
+      getStartupSettings: () => Promise<import('./features/settings/settingsContracts.js').AppShellSettings | null>;
       getLocalServerConfig: () => Promise<DashboardClientOptions>;
-      loadSessionViewCache: () => Promise<unknown | null>;
+      loadSessionViewCache: (identity: { projectId: string; conversationId: string }) => Promise<unknown | null>;
       persistSessionViewCache: (value: import('./session/sessionHotCache.js').PersistedSessionViewCache) => void;
       runStorageRecoveryPreflightAndRestart: () => Promise<{
         faultId: string;
@@ -155,6 +159,8 @@ declare global {
       onProjectGitDiffAppearance: (listener: (appearance: 'light' | 'dark' | 'system') => void) => () => void;
       onTaskGitDeliveryChanged: (listener: (taskId: string) => void) => () => void;
       onOpenTaskGitDeliveryConversation: (listener: (input: { taskId: string; conversationId: string }) => void) => () => void;
+      /** 系统单条提醒打开任务，汇总提醒打开通知分类。 */
+      onOpenTaskNotification?: (listener: (input: { projectId?: string; taskId?: string; reminderId?: string }) => void) => () => void;
       onOpenConversationNotification: (listener: (input: { projectId: string; conversationId: string }) => void) => () => void;
       getRequestingWindowForeground: () => Promise<{ foreground: boolean }>;
       onRequestingWindowForegroundChanged: (listener: (foreground: boolean) => void) => () => void;
@@ -180,6 +186,10 @@ declare global {
       requestProjectSourceLanguage: (input: SourceLanguageRequest) => Promise<SourceLanguageResult>;
       releaseProjectSourceLanguage: (projectId: string) => Promise<void>;
       readProjectSourceFile: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDocument>;
+      /** 项目内的草稿效果预览与相对资源读取。 */
+      prepareProjectSourcePreview: (input: import('@zeus/shared').ProjectSourcePreviewRequest) => Promise<import('@zeus/shared').ProjectSourcePreviewGrant>;
+      /** 资源授权绑定当前窗口，不保留已关闭页面。 */
+      releaseProjectSourcePreview: (ids: string[]) => Promise<void>;
       saveProjectSourceFile: (input: SaveProjectSourceFileInput) => Promise<ProjectSourceDocument>;
       createProjectSourceEntry: (input: CreateProjectSourceEntryInput) => Promise<ProjectSourceEntry>;
       moveProjectSourceEntry: (input: MoveProjectSourceEntryInput) => Promise<ProjectSourceEntry>;
@@ -191,6 +201,8 @@ declare global {
       onProjectSourceEvent: (listener: (event: ProjectSourceEvent) => void) => () => void;
       reportRendererFatalFailure: (message: string) => void;
       reportRendererRuntimeError: (message: string) => void;
+      /** 本机输入建议阶段日志，不包含草稿或回复正文。 */
+      reportInputSuggestionDiagnostic: (entry: import('@zeus/shared').InputSuggestionUiDiagnostic) => void;
       reportRendererBootstrapReady: () => void;
       chooseProjectDirectory: () => Promise<string | null>;
       revealProjectInFinder: (projectPath: string) => Promise<{ revealed: true; path: string }>;
@@ -345,6 +357,8 @@ declare global {
       >;
       getBrowserSnapshot: (conversationId: string) => Promise<ZeusBrowserConversationSnapshot>;
       openBrowserTab: (input: { conversationId: string; url?: string }) => Promise<ZeusBrowserConversationSnapshot>;
+      /** 首发受理后迁移草稿网页，仅将本次提交的批注标记为已发送。 */
+      adoptBrowserDraft: (input: { sourceConversationId: string; conversationId: string; commentIds: string[] }) => Promise<ZeusBrowserConversationSnapshot>;
       activateBrowserTab: (input: { conversationId: string; tabId: string }) => Promise<ZeusBrowserConversationSnapshot>;
       closeBrowserTab: (input: { conversationId: string; tabId: string }) => Promise<ZeusBrowserConversationSnapshot>;
       /** 关闭当前会话全部标签，返回清理后的权威状态。 */

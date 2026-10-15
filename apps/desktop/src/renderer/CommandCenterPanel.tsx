@@ -1,3 +1,4 @@
+import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import { MotionPresence } from './ui/MotionPresence.js';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
@@ -41,6 +42,8 @@ import './commandCenter.css';
 import { ProjectTerminalPanel } from './features/runtime/ProjectTerminalPanel.js';
 
 export interface CommandCenterPanelProps {
+  /** 项目弹窗的关闭入口；关闭显示层不终止后台运行。 */
+  onClose?: () => void;
   mode: 'global' | 'project';
   project?: ProjectRecord;
   client: DashboardClient;
@@ -248,7 +251,7 @@ function CommandRunFileActions(props: { artifacts: CommandArtifact[]; client: Da
                     role="menuitem"
                     disabled={Boolean(downloadingId)}
                     aria-busy={downloadingId === artifact.id || undefined}
-                    title={artifact.relativePath}
+                    data-icon-tooltip={artifact.relativePath}
                     onClick={() => void downloadArtifact(artifact)}
                   >
                     {downloadingId === artifact.id ? <CircleNotch className="command-run-copy-spinner" aria-hidden="true" /> : <DownloadSimple aria-hidden="true" />}
@@ -357,7 +360,7 @@ function CommandRunLog(props: { runId: string; content: string; ariaLabel: strin
             aria-busy={copyState === 'copying' || undefined}
             data-copy-state={copyState}
             aria-label={copyLabel}
-            title={copyLabel}
+            data-icon-tooltip={copyLabel}
             onClick={() => void copyCompleteLog()}
           >
             {copyState === 'copying' ? (
@@ -826,7 +829,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       <section className="command-center" aria-labelledby="command-center-title">
         <header className="command-center-header">
           <span>
-            <h2 id="command-center-title">{heading}</h2>
+            <h2 id="command-center-title">{props.onClose && props.project ? `${props.project.name} · ${heading}` : heading}</h2>
             {props.mode === 'global' ? <p>{zh ? '在项目中运行' : 'Run from a project'}</p> : null}
           </span>
           <div className="command-center-header-actions">
@@ -835,6 +838,11 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
               <Plus aria-hidden="true" />
               {zh ? '新建命令' : 'New command'}
             </Button>
+            {props.onClose ? (
+              <button type="button" className="command-center-close" disabled={busy} onClick={props.onClose} aria-label={zh ? '关闭命令' : 'Close commands'} data-icon-tooltip={zh ? '关闭命令' : 'Close commands'}>
+                <X aria-hidden="true" />
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -876,7 +884,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
                           onClick={() => void openRunHistory(command)}
                           disabled={!props.project || busy}
                           aria-label={`${zh ? '查看执行历史' : 'View run history'} ${command.title}`}
-                          title={zh ? '执行历史' : 'Run history'}
+                          data-icon-tooltip={zh ? '查看执行历史' : 'View run history'}
                         >
                           <ClockCounterClockwise aria-hidden="true" />
                         </button>
@@ -889,10 +897,18 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
                     <span className="command-definition-management">
                       {editable ? (
                         <>
-                          <button type="button" className="command-definition-icon-action" onClick={() => openEdit(command)} disabled={busy} aria-label={`${zh ? '编辑' : 'Edit'} ${command.title}`}>
+                          <button
+                            data-icon-tooltip={`${zh ? '编辑命令' : 'Edit command'} ${command.title}`}
+                            type="button"
+                            className="command-definition-icon-action"
+                            onClick={() => openEdit(command)}
+                            disabled={busy}
+                            aria-label={`${zh ? '编辑' : 'Edit'} ${command.title}`}
+                          >
                             <PencilSimple aria-hidden="true" />
                           </button>
                           <button
+                            data-icon-tooltip={`${pendingDeleteId === command.id ? (zh ? '确认删除命令' : 'Confirm command deletion') : zh ? '删除命令' : 'Delete command'} ${command.title}`}
                             type="button"
                             className="command-definition-icon-action"
                             data-confirm={pendingDeleteId === command.id ? 'true' : undefined}
@@ -1075,7 +1091,7 @@ function CommandRunHistoryModal(props: {
                   <header>
                     <span>
                       <strong>{formatRunTime(props.runDetail.run.createdAt)}</strong>
-                      <small title={props.runDetail.run.cwd}>{props.runDetail.run.cwd}</small>
+                      <small data-icon-tooltip={props.runDetail.run.cwd}>{props.runDetail.run.cwd}</small>
                     </span>
                     <div className="command-run-detail-actions">
                       {selectedStatus ? <span className={`command-run-status ${selectedStatus.className}`}>{selectedStatus.label}</span> : null}
@@ -1396,10 +1412,10 @@ function CommandRunModal(props: {
         <div className="command-modal-body command-run-body" inert={props.busy} aria-busy={props.busy || undefined}>
           <div className="command-run-context">
             <FolderSimple aria-hidden="true" />
-            <span title={props.project.localPath} aria-label={`${zh ? '项目目录' : 'Project directory'} ${props.project.localPath}`}>
+            <span data-icon-tooltip={props.project.localPath} aria-label={`${zh ? '项目目录' : 'Project directory'} ${props.project.localPath}`}>
               {props.project.localPath}
             </span>
-            <small title={zh ? '超时上限' : 'Timeout limit'}>{timeoutLabel}</small>
+            <small data-icon-tooltip={zh ? '超时上限' : 'Timeout limit'}>{timeoutLabel}</small>
           </div>
           <div className="command-run-parameters">
             {requiredParameters.map((parameter, index) => (

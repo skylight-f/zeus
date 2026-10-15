@@ -1,4 +1,5 @@
 import { useMotionPresence } from '../ui/useMotionPresence.js';
+import { useHoverIntent } from '../ui/useHoverIntent.js';
 import { type CSSProperties, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { NativeUnifiedUsageSnapshot } from './sessionTypes.js';
@@ -7,6 +8,7 @@ import { formatTokenCount } from './tokenUsageFormat.js';
 
 type ContextUsageSeverity = 'unavailable' | 'normal' | 'warning' | 'danger';
 
+/** 显示真实上下文占用，容量与使用量共用名称和值的列表格式。 */
 export function ContextUsageIndicator(props: {
   /** 下一轮选择的容量，独立于真实使用量。 */ contextCapacityTokens?: number | null;
   contextCapacityEvidence?: import('@zeus/shared').ContextCapacityEvidence | null;
@@ -16,6 +18,8 @@ export function ContextUsageIndicator(props: {
   const tooltipId = `session-context-usage-${useId().replaceAll(':', '')}`;
   const indicatorRef = useRef<HTMLSpanElement | null>(null);
   const [tooltipOpen, setTooltipOpen] = useState(false);
+  /** 悬停等待与普通按钮一致，主动查看仍即时显示。 */
+  const hoverIntent = useHoverIntent(() => setTooltipOpen(true));
   /** 鼠标移开后平滑退出，并且不把最后位置重置到页面左上角。 */
   const { ref: tooltipRef, present: tooltipPresent } = useMotionPresence<HTMLSpanElement>(tooltipOpen);
   const [tooltipPosition, setTooltipPosition] = useState<{ left: number; top: number } | null>(null);
@@ -34,6 +38,10 @@ export function ContextUsageIndicator(props: {
   const progress = ratio === null ? 0 : Math.min(100, Math.max(0, ratio * 100));
   const severity = contextUsageSeverity(ratio);
   const copy = contextUsageCopy(props.language, used, capacity, ratio, severity, estimate?.estimatedHeadroomTokens ?? null, compaction?.status ?? null);
+  /** 所选容量复用使用量的紧凑数字格式，精确值保留在说明中。 */
+  const selectedCapacity = props.contextCapacityTokens == null ? null : formatTokenCount(props.contextCapacityTokens, props.language);
+  /** 引擎回报的容量使用相同数字格式与单位。 */
+  const engineCapacity = capacity === null ? null : formatTokenCount(capacity, props.language);
 
   useLayoutEffect(() => {
     if (!tooltipOpen) {
@@ -60,7 +68,7 @@ export function ContextUsageIndicator(props: {
       window.removeEventListener('resize', position);
       window.removeEventListener('scroll', position, true);
     };
-  }, [capacity, compaction?.status, estimate?.estimatedHeadroomTokens, props.language, tooltipOpen, used]);
+  }, [capacity, compaction?.status, estimate?.estimatedHeadroomTokens, props.contextCapacityTokens, props.language, tooltipOpen, used]);
 
   const tooltip = (
     <span
@@ -74,52 +82,52 @@ export function ContextUsageIndicator(props: {
       style={contextUsageTooltipPositionStyle(tooltipPosition)}
     >
       <strong aria-hidden="true">{copy.title}</strong>
-      <small>
-        {props.language === 'zh-CN' ? '所选容量：' : 'Selected capacity: '}
-        {props.contextCapacityTokens == null ? (props.language === 'zh-CN' ? '默认' : 'Default') : `${props.contextCapacityTokens / 1000}K Token`}
-      </small>
+      {/* 容量与占用明细共用普通字重的标题列和右对齐的值列。 */}
+      <dl>
+        <div>
+          <dt>{props.language === 'zh-CN' ? '所选容量' : 'Selected capacity'}</dt>
+          <dd data-icon-tooltip={selectedCapacity ? `${selectedCapacity.exact} Token` : undefined}>{selectedCapacity ? `${selectedCapacity.compact} Token` : props.language === 'zh-CN' ? '默认' : 'Default'}</dd>
+        </div>
+        {available && engineCapacity ? (
+          <div>
+            <dt>{props.language === 'zh-CN' ? '引擎回报的可用空间' : 'Engine usable window'}</dt>
+            <dd data-icon-tooltip={`${engineCapacity.exact} Token`}>{engineCapacity.compact} Token</dd>
+          </div>
+        ) : null}
+        {available ? (
+          <>
+            <div>
+              <dt>{copy.percentageLabel}</dt>
+              <dd>{copy.percentage}</dd>
+            </div>
+            <div>
+              <dt>{copy.usedLabel}</dt>
+              <dd data-icon-tooltip={copy.usedTitle}>{copy.used}</dd>
+            </div>
+            <div>
+              <dt>{copy.remainingLabel}</dt>
+              <dd data-icon-tooltip={copy.remainingTitle}>{copy.remaining}</dd>
+            </div>
+          </>
+        ) : null}
+        {copy.estimatedHeadroom ? (
+          <div>
+            <dt>{copy.estimatedHeadroomLabel}</dt>
+            <dd data-icon-tooltip={copy.estimatedHeadroomTitle}>{copy.estimatedHeadroom}</dd>
+          </div>
+        ) : null}
+        {copy.compaction ? (
+          <div>
+            <dt>{copy.compactionLabel}</dt>
+            <dd>{copy.compaction}</dd>
+          </div>
+        ) : null}
+      </dl>
       {pending ? <small>{props.language === 'zh-CN' ? '下一轮应用，等待引擎回报；Codex 切换容量可能需约一分钟。' : 'Applies next turn; awaiting engine usage. Codex may take about a minute.'}</small> : null}
-      {available ? (
-        <small>
-          {props.language === 'zh-CN' ? '引擎回报的可用空间：' : 'Engine usable window: '}
-          {formatTokenCount(capacity!, props.language).compact}
-          {props.contextCapacityTokens != null && capacity !== props.contextCapacityTokens ? (props.language === 'zh-CN' ? '（已扣除引擎保留空间）' : ' (after engine reservation)') : ''}
-        </small>
+      {available && props.contextCapacityTokens != null && capacity !== props.contextCapacityTokens ? (
+        <small>{props.language === 'zh-CN' ? '引擎回报的可用空间已扣除引擎保留空间。' : 'The engine usable window excludes reserved space.'}</small>
       ) : null}
-      {available || copy.estimatedHeadroom || copy.compaction ? (
-        <dl>
-          {available ? (
-            <>
-              <div>
-                <dt>{copy.percentageLabel}</dt>
-                <dd>{copy.percentage}</dd>
-              </div>
-              <div>
-                <dt>{copy.usedLabel}</dt>
-                <dd title={copy.usedTitle}>{copy.used}</dd>
-              </div>
-              <div>
-                <dt>{copy.remainingLabel}</dt>
-                <dd title={copy.remainingTitle}>{copy.remaining}</dd>
-              </div>
-            </>
-          ) : null}
-          {copy.estimatedHeadroom ? (
-            <div>
-              <dt>{copy.estimatedHeadroomLabel}</dt>
-              <dd title={copy.estimatedHeadroomTitle}>{copy.estimatedHeadroom}</dd>
-            </div>
-          ) : null}
-          {copy.compaction ? (
-            <div>
-              <dt>{copy.compactionLabel}</dt>
-              <dd>{copy.compaction}</dd>
-            </div>
-          ) : null}
-        </dl>
-      ) : (
-        <span>{copy.empty}</span>
-      )}
+      {!available && !copy.estimatedHeadroom && !copy.compaction ? <span>{copy.empty}</span> : null}
       {copy.risk ? <small>{copy.risk}</small> : null}
     </span>
   );
@@ -134,14 +142,28 @@ export function ContextUsageIndicator(props: {
       role="img"
       aria-label={copy.accessibleLabel}
       aria-describedby={tooltipOpen ? tooltipId : undefined}
-      onPointerEnter={() => setTooltipOpen(true)}
+      onPointerEnter={(event) => {
+        if (event.pointerType !== 'touch' && event.buttons === 0) hoverIntent.schedule(event.currentTarget);
+      }}
       onPointerLeave={(event) => {
+        hoverIntent.cancel();
         if (document.activeElement !== event.currentTarget) setTooltipOpen(false);
       }}
-      onFocus={() => setTooltipOpen(true)}
-      onBlur={() => setTooltipOpen(false)}
+      onFocus={(event) => {
+        hoverIntent.cancel();
+        if (event.currentTarget.matches(':focus-visible')) setTooltipOpen(true);
+      }}
+      onClick={() => {
+        hoverIntent.cancel();
+        setTooltipOpen(true);
+      }}
+      onBlur={() => {
+        hoverIntent.cancel();
+        setTooltipOpen(false);
+      }}
       onKeyDown={(event) => {
         if (event.key === 'Escape') {
+          hoverIntent.cancel();
           event.preventDefault();
           event.stopPropagation();
           setTooltipOpen(false);

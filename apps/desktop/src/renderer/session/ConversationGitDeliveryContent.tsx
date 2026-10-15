@@ -290,7 +290,7 @@ export function ConversationGitDeliveryContent(props: { client: DashboardClient;
       /** 无任务目录不传 taskId，使用服务端验证过的仓库身份。 */
       const result = await props.client.generateGitCommitMessage(
         props.project.id,
-        { repositoryId: commitSelection[0]!.repositoryId, selection: commitSelection, language: zh ? 'zh-CN' : 'en', modelRef: models.modelRef },
+        { repositoryId: commitSelection[0]!.repositoryId, selection: commitSelection, language: zh ? 'zh-CN' : 'en', ...models.settings },
         (text) => {
           if (!controller.signal.aborted) setGenerated(text);
         },
@@ -399,8 +399,10 @@ export function ConversationGitDeliveryContent(props: { client: DashboardClient;
                   onCopyBranch={async (branch) => {
                     try {
                       await navigator.clipboard.writeText(branch);
+                      return true;
                     } catch (reason) {
                       setError(formatVisibleApplicationError(reason, zh ? 'zh-CN' : 'en'));
+                      return false;
                     }
                   }}
                 />
@@ -409,7 +411,8 @@ export function ConversationGitDeliveryContent(props: { client: DashboardClient;
                 <GitDeliveryActions
                   zh={zh}
                   busyAction={busyAction}
-                  clientAvailable
+                  generationClient={props.client}
+                  projectId={props.project.id}
                   canGenerate={Boolean(commitCount)}
                   onGenerate={() => void generateMessage()}
                   message={generated ?? message}

@@ -1,4 +1,4 @@
-import { useId, useMemo, useRef, type ReactNode, type ComponentProps } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type ComponentProps } from 'react';
 import type { TaskGitFileStatus, TaskWorkspaceIndexSnapshot, TaskWorkspaceSnapshot, TaskGitDiffSummary } from '../session/sessionTypes.js';
 import { Button } from '../ui/Button.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
@@ -6,9 +6,13 @@ import { ZeusSelect } from '../ZeusSelect.js';
 import { SideBySideDiff } from './ProjectGitDiffViewer.js';
 import { GitPaneSeparator } from './GitPaneSeparator.js';
 import { CopySimpleIcon } from '@phosphor-icons/react/dist/csr/CopySimple';
-import { CaretDownIcon } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { CheckIcon } from '@phosphor-icons/react/dist/csr/Check';
+import { WarningCircleIcon } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import { FolderIcon } from '@phosphor-icons/react/dist/csr/Folder';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
+import { groupDirectoryFiles } from '../code/groupDirectoryFiles.js';
+import { GitCommitGenerationSettingsButton } from './GitCommitGenerationSettings.js';
+import type { GitCommitModelsClient } from './gitCommitModels.js';
 
 /** 两种交付入口共用文件范围。 */
 export type DiffScope = 'committed' | 'working';
@@ -107,8 +111,18 @@ export function DeliveryRepositoryFileTree(props: {
   onToggleFiles: (workspaceId: string, paths: string[], selected: boolean) => void;
   /** 双击仅打开差异，不改变勾选范围。 */
   onOpenFile: (workspaceId: string, path: string) => void;
-  onCopyBranch: (branchName: string) => void | Promise<void>;
+  /** 只有剪贴板写入成功才返回 true，避免把错误回报成已复制。 */
+  onCopyBranch: (branchName: string) => boolean | Promise<boolean>;
 }) {
+  /** 复制反馈只属于成功写入的分支。 */
+  const [copiedBranch, setCopiedBranch] = useState<string | null>(null);
+  // 短暂确认后恢复原操作名称，组件退出时释放定时器。
+  useEffect(() => {
+    if (!copiedBranch) return;
+    /** 确认持续时间与其他复制入口一致。 */
+    const timer = window.setTimeout(() => setCopiedBranch(null), 1600);
+    return () => window.clearTimeout(timer);
+  }, [copiedBranch]);
   /** 同一任务分支下的仓库保持现有排序与交付范围。 */
   const branchGroups = groupDeliveryRepositoriesByBranch(props.groups);
   return (
@@ -119,7 +133,7 @@ export function DeliveryRepositoryFileTree(props: {
             type="button"
             className={props.diffScope === 'working' ? 'is-active' : ''}
             aria-pressed={props.diffScope === 'working'}
-            title={props.zh ? '本机未提交' : 'Local uncommitted'}
+            data-icon-tooltip={props.zh ? '本机未提交' : 'Local uncommitted'}
             onClick={() => props.onScopeChange('working')}
             disabled={props.disabled}
           >
@@ -129,7 +143,7 @@ export function DeliveryRepositoryFileTree(props: {
             type="button"
             className={props.diffScope === 'committed' ? 'is-active' : ''}
             aria-pressed={props.diffScope === 'committed'}
-            title={props.zh ? '已提交成果' : 'Committed result'}
+            data-icon-tooltip={props.zh ? '已提交成果' : 'Committed result'}
             onClick={() => props.onScopeChange('committed')}
             disabled={props.disabled}
           >
@@ -168,12 +182,15 @@ export function DeliveryRepositoryFileTree(props: {
                   {currentConversation ? <small className="task-git-current-conversation-badge">{props.zh ? '当前会话' : 'Current session'}</small> : null}
                   <button
                     type="button"
-                    aria-label={props.zh ? '复制分支名' : 'Copy branch name'}
-                    title={props.zh ? '复制分支名' : 'Copy branch name'}
-                    onClick={() => void props.onCopyBranch(branchGroup.branchName)}
+                    aria-label={copiedBranch === branchGroup.branchName ? (props.zh ? '已复制分支名' : 'Branch name copied') : props.zh ? '复制分支名' : 'Copy branch name'}
+                    data-icon-tooltip={copiedBranch === branchGroup.branchName ? (props.zh ? '已复制分支名' : 'Branch name copied') : props.zh ? '复制分支名' : 'Copy branch name'}
+                    onClick={async () => {
+                      // 回执由实际执行复制的调用方提供，不根据点击推测成功。
+                      setCopiedBranch((await props.onCopyBranch(branchGroup.branchName)) ? branchGroup.branchName : null);
+                    }}
                     disabled={props.disabled}
                   >
-                    <CopySimpleIcon size={14} aria-hidden="true" />
+                    {copiedBranch === branchGroup.branchName ? <CheckIcon size={14} aria-hidden="true" /> : <CopySimpleIcon size={14} aria-hidden="true" />}
                   </button>
                 </span>
               </header>
@@ -251,37 +268,7 @@ function DeliveryDirectoryFiles(props: {
   onOpen: (path: string) => void;
 }) {
   /** 文件按下一级路径分组，目录排序在普通文件之前。 */
-  const entries = useMemo(() => {
-    /** 每个目录记录其后代，选择时无需重新扫描其他仓库。 */
-    const groups = new Map<string, DeliveryFile[]>();
-    for (const file of props.files) {
-      /** 尾部斜杠区分目录与叶子。 */
-      const remainder = file.path.slice(props.prefix.length);
-      /** 找到当前目录下一级边界。 */
-      const slash = remainder.indexOf('/');
-      /** 叶子保留文件名，目录保留末尾分隔符。 */
-      const name = slash < 0 ? remainder : remainder.slice(0, slash + 1);
-      /** 同目录后代共用一份集合。 */
-      const files = groups.get(name) ?? [];
-      files.push(file);
-      groups.set(name, files);
-    }
-    return [...groups]
-      .map(([name, files]) => {
-        // 连续单子目录合成一行；遇到文件或目录分叉即停止，保持批量勾选范围。
-        while (name.endsWith('/')) {
-          /** 第一条路径提供下一级边界，所有后代必须共享该目录。 */
-          const slash = files[0]!.path.indexOf('/', props.prefix.length + name.length);
-          if (slash < 0) break;
-          /** 合并名称仍保留末尾斜杠，递归与复选框继续使用完整路径。 */
-          const next = files[0]!.path.slice(props.prefix.length, slash + 1);
-          if (!files.every((file) => file.path.startsWith(props.prefix + next))) break;
-          name = next;
-        }
-        return [name, files] as const;
-      })
-      .sort(([left], [right]) => Number(right.endsWith('/')) - Number(left.endsWith('/')) || left.localeCompare(right));
-  }, [props.files, props.prefix]);
+  const entries = useMemo(() => groupDirectoryFiles(props.files, props.prefix), [props.files, props.prefix]);
   return (
     <ol>
       {entries.map(([name, files]) => {
@@ -315,7 +302,7 @@ function DeliveryDirectoryFiles(props: {
           <li key={path}>
             {directory ? (
               <details open className="task-git-delivery-directory">
-                <summary title={path}>
+                <summary data-icon-tooltip={path}>
                   {checkbox}
                   <DeliveryEntryIcon />
                   <span>{name.slice(0, -1)}</span>
@@ -326,7 +313,7 @@ function DeliveryDirectoryFiles(props: {
             ) : (
               <div className={`task-git-delivery-file-row${props.selectedFile === path ? ' is-active' : ''}`}>
                 {checkbox}
-                <button type="button" title={path} aria-pressed={props.selectedFile === path} onClick={() => props.onSelect(path)} onDoubleClick={() => props.onOpen(path)} disabled={props.disabled}>
+                <button type="button" data-icon-tooltip={path} aria-pressed={props.selectedFile === path} onClick={() => props.onSelect(path)} onDoubleClick={() => props.onOpen(path)} disabled={props.disabled}>
                   <DeliveryEntryIcon path={path} />
                   <span>{name}</span>
                   <small>
@@ -361,6 +348,27 @@ export function DeliveryFeedbackNotice(props: {
   const resultAnchor = `--delivery-results-${resultId.replace(/:/g, '')}`;
   /** 查询原生浮层状态，让 Escape 优先关闭明细而不是交付窗口。 */
   const resultPopover = useRef<HTMLDivElement>(null);
+  /** 鼠标和键盘均可查看同一份明细。 */
+  const resultTrigger = useRef<HTMLButtonElement>(null);
+  /** 短暂跨过入口与浮层间隙时，不立即关闭正在查看的内容。 */
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** 鼠标等待后展示逐仓结果，点击与键盘继续使用即时原生浮层。 */
+  const hoverIntent = useHoverIntent(() => showResults());
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
+  /** 原生浮层负责定位、外部点击和 Escape，悬停只控制显示。 */
+  function showResults(): void {
+    hoverIntent.cancel();
+    clearTimeout(closeTimer.current);
+    if (!resultPopover.current?.matches(':popover-open')) resultPopover.current?.showPopover();
+  }
+  /** 鼠标与焦点离开入口和明细后才关闭，便于阅读或复制长内容。 */
+  function closeResultsLater(): void {
+    hoverIntent.cancel();
+    clearTimeout(closeTimer.current);
+    closeTimer.current = setTimeout(() => {
+      if (!resultTrigger.current?.matches(':hover, :focus') && !resultPopover.current?.matches(':hover, :focus-within')) resultPopover.current?.hidePopover();
+    }, 120);
+  }
   return (
     <div
       className={`task-git-delivery-notice is-${props.feedback.tone}`}
@@ -378,11 +386,42 @@ export function DeliveryFeedbackNotice(props: {
     >
       {(props.compactResults || props.feedback.action) && (props.feedback.results?.length || props.feedback.summary) && !props.feedback.onAction ? (
         <>
-          <button type="button" className="task-git-delivery-result-trigger" popoverTarget={resultId} title={props.feedback.text} style={{ anchorName: resultAnchor }}>
+          <button
+            ref={resultTrigger}
+            type="button"
+            className="task-git-delivery-result-trigger"
+            popoverTarget={resultId}
+            popoverTargetAction="show"
+            aria-describedby={resultId}
+            style={{ anchorName: resultAnchor }}
+            onPointerEnter={(event) => {
+              clearTimeout(closeTimer.current);
+              if (event.pointerType !== 'touch' && event.buttons === 0) hoverIntent.schedule(event.currentTarget);
+            }}
+            onPointerLeave={closeResultsLater}
+            onClick={hoverIntent.cancel}
+            onFocus={(event) => {
+              hoverIntent.cancel();
+              if (event.currentTarget.matches(':focus-visible')) showResults();
+            }}
+            onBlur={closeResultsLater}
+          >
             <span>{props.feedback.summary ?? props.feedback.text}</span>
-            <CaretDownIcon aria-hidden="true" />
+            <WarningCircleIcon size={16} aria-hidden="true" />
           </button>
-          <div ref={resultPopover} id={resultId} popover="auto" className="task-git-delivery-result-popover" style={{ positionAnchor: resultAnchor }} aria-label={props.zh ? '逐仓交付结果' : 'Per-repository delivery results'}>
+          <div
+            ref={resultPopover}
+            id={resultId}
+            popover="auto"
+            role="tooltip"
+            className="task-git-delivery-result-popover"
+            style={{ positionAnchor: resultAnchor }}
+            aria-label={props.zh ? '逐仓交付结果' : 'Per-repository delivery results'}
+            onPointerEnter={showResults}
+            onPointerLeave={closeResultsLater}
+            onFocus={showResults}
+            onBlur={closeResultsLater}
+          >
             {props.feedback.results?.length ? <BatchDeliveryResults results={props.feedback.results} zh={props.zh} /> : <div className={`task-git-delivery-feedback is-${props.feedback.tone}`}>{props.feedback.text}</div>}
           </div>
         </>
@@ -464,7 +503,7 @@ export function GitDeliveryWorkspace(props: {
         <GitPaneSeparator name="delivery-height" label={props.zh ? '调整文件区与差异区高度' : 'Resize files and diff'} axis="y" initial={42} min={25} max={65} />
         <main className="task-git-review-main task-git-delivery-diff-main">
           <header className="task-git-review-pane-title">
-            <strong title={props.selectedFile}>{props.diffTitle}</strong>
+            <strong data-icon-tooltip={props.selectedFile}>{props.diffTitle}</strong>
           </header>
           {!props.selectedFile ? (
             <div className="task-git-delivery-empty">
@@ -492,7 +531,10 @@ export function GitDeliveryWorkspace(props: {
 export function GitDeliveryActions(props: {
   zh: boolean;
   busyAction: BusyAction;
-  clientAvailable: boolean;
+  /** 设置与生成读取同一项目的真实模型目录。 */
+  generationClient: GitCommitModelsClient | null;
+  /** 当前项目身份用于读取独立设置或继承全局默认。 */
+  projectId: string;
   canGenerate: boolean;
   onGenerate: () => void;
   message: string;
@@ -525,16 +567,19 @@ export function GitDeliveryActions(props: {
       <section className="task-git-delivery-action-step">
         <div className="task-git-delivery-step-heading">
           <strong>{props.zh ? '1. 提交文件' : '1. Commit files'}</strong>
-          <Button
-            variant="secondary"
-            size="compact"
-            aria-label={props.busyAction === 'commit-message' ? (props.zh ? '停止生成提交说明' : 'Stop generating commit message') : props.zh ? 'AI 生成提交说明' : 'Generate commit message with AI'}
-            title={props.zh ? '根据勾选文件生成提交说明' : 'Generate a commit message from selected files'}
-            disabled={props.busyAction !== 'commit-message' && (busy || !props.clientAvailable || !props.canGenerate)}
-            onClick={props.onGenerate}
-          >
-            {props.busyAction === 'commit-message' ? (props.zh ? '停止生成' : 'Stop generating') : props.zh ? 'AI 生成' : 'AI Generate'}
-          </Button>
+          <span className="task-git-generation-controls">
+            <Button
+              variant="secondary"
+              size="compact"
+              aria-label={props.busyAction === 'commit-message' ? (props.zh ? '停止生成提交说明' : 'Stop generating commit message') : props.zh ? 'AI 生成提交说明' : 'Generate commit message with AI'}
+              title={props.zh ? '根据勾选文件生成提交说明' : 'Generate a commit message from selected files'}
+              disabled={props.busyAction !== 'commit-message' && (busy || !props.generationClient || !props.canGenerate)}
+              onClick={props.onGenerate}
+            >
+              {props.busyAction === 'commit-message' ? (props.zh ? '停止生成' : 'Stop generating') : props.zh ? 'AI 生成' : 'AI Generate'}
+            </Button>
+            <GitCommitGenerationSettingsButton client={props.generationClient} projectId={props.projectId} zh={props.zh} disabled={busy} />
+          </span>
         </div>
         {props.beforeCommit}
         {props.commitCount > 0 ? (
@@ -590,3 +635,4 @@ export function GitDeliveryActions(props: {
     </aside>
   );
 }
+import { useHoverIntent } from '../ui/useHoverIntent.js';

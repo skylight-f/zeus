@@ -464,7 +464,7 @@ export class WorkManagementTaskOperations<TCleanup, TConversation extends Reopen
     const targetManagementStatus = input.projectId && input.projectId !== existing.projectId ? this.options.resolveManagementStatusConfig(this.requireProject(input.projectId).id).roles.defaultStatusId : undefined;
     if (input.title !== undefined && typeof input.title !== 'string') throw routeError(400, 'ZEUS_INVALID_TASK_TITLE', 'Task title must be a string.');
     if (typeof input.title === 'string' && !input.title.trim()) throw routeError(400, 'ZEUS_TASK_TITLE_REQUIRED', 'Task title is required.');
-    if (input.taskType !== undefined && !isTaskType(input.taskType)) throw routeError(400, 'ZEUS_INVALID_TASK_TYPE', 'Task type must be requirement, defect or optimization.');
+    if (input.taskType !== undefined && !isTaskType(input.taskType)) throw routeError(400, 'ZEUS_INVALID_TASK_TYPE', '任务类型必须是任务、需求、缺陷或优化。');
     if (input.description !== undefined && typeof input.description !== 'string') throw routeError(400, 'ZEUS_INVALID_TASK_DESCRIPTION', 'Task description must be a string.');
     if ([input.defectCurrentState, input.defectExpectedOutcome, input.defectReproductionSteps, input.optimizationCurrentState, input.optimizationExpectedOutcome].some((value) => value !== undefined && typeof value !== 'string')) {
       throw routeError(400, 'ZEUS_INVALID_TASK_CONTENT', 'Task type content fields must be strings when provided.');
@@ -499,6 +499,7 @@ export class WorkManagementTaskOperations<TCleanup, TConversation extends Reopen
       optimizationCurrentState: input.optimizationCurrentState,
       optimizationExpectedOutcome: input.optimizationExpectedOutcome,
       priority: input.priority,
+      deadline: input.deadline,
       tags: input.tags,
       attachments,
       sourceContext,
@@ -582,6 +583,12 @@ export class WorkManagementTaskOperations<TCleanup, TConversation extends Reopen
     });
     this.auditTask(context, 'task.relationships.updated', updated, { parentTaskId: updated.parentTaskId, relatedTaskIds: updated.relatedTaskIds });
     this.publishTaskUpdated(updated, ['relationships']);
+    /** 双向关系的增删会改动另一端，按受影响身份通知所有已打开窗口。 */
+    for (const relatedId of new Set([...existing.relatedTaskIds, ...updated.relatedTaskIds])) {
+      if (existing.relatedTaskIds.includes(relatedId) === updated.relatedTaskIds.includes(relatedId)) continue;
+      const related = this.options.tasks.getById(relatedId);
+      if (related) this.publishTaskUpdated(related, ['relationships']);
+    }
     return updated;
   }
 

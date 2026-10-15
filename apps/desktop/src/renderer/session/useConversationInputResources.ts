@@ -26,6 +26,8 @@ export interface ConversationInputResourceHandlers {
   pendingResources: PendingResourceCardItem[];
   processing: boolean;
   dragging: boolean;
+  /** 文件选择与粘贴、拖放共用异步生命周期，关闭编辑器后忽略迟到回执。 */
+  chooseAttachments(): void;
   handlePaste(event: ClipboardEvent<HTMLTextAreaElement | HTMLDivElement>): void;
   handlePasteShortcut(event: KeyboardEvent<HTMLTextAreaElement | HTMLDivElement>): void;
   handleDragEnter(event: DragEvent<HTMLElement>): void;
@@ -37,11 +39,7 @@ export interface ConversationInputResourceHandlers {
 
 export function useConversationInputResources(options: UseConversationInputResourcesOptions): ConversationInputResourceHandlers {
   /** 会话与任务输入共用即时预览，不改变真实附件授权契约。 */
-  const previews = usePendingResourcePreviews(
-    options.attachments.map((attachment) => ({ id: attachment.localPath ?? attachment.uploadRef, name: attachment.name, kind: attachment.kind ?? 'file' })),
-    options.language === 'zh-CN' ? 'zh-CN' : 'en-US',
-  );
-  const [processingCount, setProcessingCount] = useState(0);
+  const previews = usePendingResourcePreviews(options.attachments.map((attachment) => ({ id: attachment.localPath ?? attachment.uploadRef, name: attachment.name, kind: attachment.kind ?? 'file' })));
   const [dragDepth, setDragDepth] = useState(0);
   const pasteGeneration = useRef(0);
   const mounted = useRef(true);
@@ -64,14 +62,12 @@ export function useConversationInputResources(options: UseConversationInputResou
       const restoreFocus = retainInputFocus(latest.current.textareaRef.current);
       /** 普通文件、图片和长文本立即显示对应卡片。 */
       const pending = previews.begin(files, text);
-      setProcessingCount((current) => current + 1);
       try {
         await operation(pending);
       } catch (error) {
         if (pending.current()) latest.current.onError(formatVisibleApplicationError(error, latest.current.language));
       } finally {
         pending.finish();
-        if (mounted.current) setProcessingCount((current) => Math.max(0, current - 1));
         restoreFocus();
       }
     },
@@ -100,6 +96,19 @@ export function useConversationInputResources(options: UseConversationInputResou
     [runResourceOperation],
   );
 
+  /** 选择文件只写入当前草稿，不触碰主输入框或已排队消息。 */
+  const chooseAttachments = useCallback(() => {
+    void runResourceOperation(async (pending) => {
+      /** 选择器返回宿主已经授权的资源，保存消息时服务端仍会复验。 */
+      const bridge = window.zeus?.chooseConversationResources;
+      if (!bridge) throw new Error('当前应用版本未提供会话附件选择能力。');
+      /** 取消选择返回空列表，不视为导入失败。 */
+      const attachments = await bridge();
+      if (!pending.current() || attachments.length === 0) return;
+      latest.current.onAddAttachments(attachments);
+    });
+  }, [runResourceOperation]);
+
   const materializeLongText = useCallback(
     (text: string, selection: TextSelection) => {
       void runResourceOperation(
@@ -113,6 +122,8 @@ export function useConversationInputResources(options: UseConversationInputResou
             const attachments = await bridge([{ name: 'Pasted text.txt', type: 'text/plain', text, source: 'paste', kind: 'pasted_text' }]);
             if (!pending.current()) return;
             if (attachments.length === 0) throw new Error('长文本附件未能保存。');
+            // 保存结果使用受信引用，卡片只显示已有元信息。
+            pending.complete(attachments.map((attachment) => ({ id: attachment.localPath ?? attachment.uploadRef, name: attachment.name, kind: attachment.kind ?? 'pasted_text' })));
             latest.current.onAddAttachments(attachments);
           } catch (error) {
             if (mounted.current) insertText(latest.current, text, selection);
@@ -204,8 +215,9 @@ export function useConversationInputResources(options: UseConversationInputResou
 
   return {
     pendingResources: previews.pendingResources,
-    processing: processingCount > 0,
+    processing: previews.processing,
     dragging: dragDepth > 0,
+    chooseAttachments,
     handlePaste,
     handlePasteShortcut,
     handleDragEnter,

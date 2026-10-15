@@ -29,10 +29,13 @@ import { createPortal } from 'react-dom';
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 
 import type { ConversationFileIconKind, ConversationFileLocation, ConversationOpenTarget, ConversationResource, ConversationResourceOpenTarget, ConversationResourcePreview } from '@zeus/shared';
+import { userFacingErrorCause } from '@zeus/shared';
 import { listConversationResourceOpenTargetsInMain } from '../appShellBridge.js';
 import type { NativeConversationAttachment } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { ResourceLoading } from '../ui/ResourceLoading.js';
+import { pendingResourceDisplayName } from '../ui/pendingResourcePolicy.js';
 
 export interface ConversationResourceInteraction {
   onOpenResource?: (resource: ConversationResource, target: ConversationOpenTarget, location?: ConversationFileLocation) => void | Promise<void>;
@@ -43,24 +46,33 @@ export function isPendingImageAttachment(attachment: Pick<NativeConversationAtta
   return attachment.kind === 'image' || ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.mime.toLowerCase());
 }
 
-export function ConversationPendingAttachmentImages(props: { attachments: NativeConversationAttachment[]; language: SessionUiLanguage; onVisibleContentChange?: () => void }) {
+/** 待入库图片沿用本地预览；任务提示词也只显示缩略图。 */
+export function ConversationPendingAttachmentImages(props: {
+  attachments: NativeConversationAttachment[];
+  language: SessionUiLanguage;
+  onVisibleContentChange?: () => void;
+  /** 任务字段在资源登记前后保持相同的附件布局。 */ compact?: boolean;
+}) {
   const images = props.attachments.filter(isPendingImageAttachment);
   if (images.length === 0) return null;
   return (
-    <section className="session-resource-card-list session-pending-attachment-images" aria-label={props.language === 'zh-CN' ? '待处理图片' : 'Pending images'}>
+    <section className="session-resource-card-list session-pending-attachment-images" data-layout="images" data-compact={props.compact || undefined} aria-label={props.language === 'zh-CN' ? '待处理图片' : 'Pending images'}>
       {images.map((attachment) => (
-        <ConversationPendingAttachmentImage key={pendingAttachmentIdentity(attachment)} attachment={attachment} language={props.language} onVisibleContentChange={props.onVisibleContentChange} />
+        <ConversationPendingAttachmentImage key={pendingAttachmentIdentity(attachment)} attachment={attachment} language={props.language} compact={props.compact} onVisibleContentChange={props.onVisibleContentChange} />
       ))}
     </section>
   );
 }
 
-function ConversationPendingAttachmentImage(props: { attachment: NativeConversationAttachment; language: SessionUiLanguage; onVisibleContentChange?: () => void }) {
+/** 本地缩略图只读取已授权附件，点击沿用统一文件预览。 */
+function ConversationPendingAttachmentImage(props: { attachment: NativeConversationAttachment; language: SessionUiLanguage; onVisibleContentChange?: () => void; /** 紧凑缩略图保留文件名与打开入口。 */ compact?: boolean }) {
   /** 图片由会话统一打开弹窗，独立页面沿用自身预览。 */
   const openFilePreview = useContext(FilePreviewOpenContext);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [loading, setLoading] = useState(true);
+  /** 读取返回后等待浏览器解码，加载结束才切换为真实图片。 */
+  const [decodedPreviewUrl, setDecodedPreviewUrl] = useState<string | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const identity = pendingAttachmentIdentity(props.attachment);
 
@@ -101,7 +113,7 @@ function ConversationPendingAttachmentImage(props: { attachment: NativeConversat
 
   useLayoutEffect(() => {
     props.onVisibleContentChange?.();
-  }, [failed, previewUrl, props.onVisibleContentChange]);
+  }, [failed, previewUrl, decodedPreviewUrl, props.onVisibleContentChange]);
 
   return (
     <>
@@ -109,21 +121,29 @@ function ConversationPendingAttachmentImage(props: { attachment: NativeConversat
         type="button"
         className="session-resource-image session-pending-attachment-image"
         aria-label={`${props.language === 'zh-CN' ? '在 Zeus 中预览' : 'Preview in Zeus'}：${props.attachment.name}`}
-        aria-busy={loading || undefined}
-        title={props.attachment.name}
+        aria-busy={(!failed && (loading || decodedPreviewUrl !== previewUrl)) || undefined}
+        data-icon-tooltip={failed ? (props.language === 'zh-CN' ? '缩略图不可用，点击查看文件与可用操作' : 'Thumbnail unavailable. Open file preview and actions.') : props.language === 'zh-CN' ? '预览图片' : 'Preview image'}
         onClick={() => (openFilePreview ? openFilePreview({ kind: 'attachment', localPath: props.attachment.localPath, uploadRef: props.attachment.uploadRef }, true) : setPreviewOpen(true))}
       >
         {failed ? (
           <span className="session-resource-image-placeholder" role="status">
-            {props.language === 'zh-CN' ? '缩略图不可用，点击查看文件与可用操作' : 'Thumbnail unavailable. Open file preview and actions.'}
+            <FileImage aria-hidden="true" weight="regular" />
+            <span>{props.compact ? (props.language === 'zh-CN' ? '打开' : 'Open') : props.language === 'zh-CN' ? '缩略图不可用，点击查看文件与可用操作' : 'Thumbnail unavailable. Open file preview and actions.'}</span>
           </span>
         ) : previewUrl ? (
-          <img decoding="async" src={previewUrl} alt={props.attachment.name} onError={() => setFailed(true)} />
+          <>
+            <img
+              decoding="async"
+              src={previewUrl}
+              alt={props.attachment.name}
+              style={decodedPreviewUrl === previewUrl ? undefined : { visibility: 'hidden' }}
+              onLoad={() => setDecodedPreviewUrl(previewUrl)}
+              onError={() => setFailed(true)}
+            />
+            {decodedPreviewUrl !== previewUrl ? <ResourceLoading label={props.language === 'zh-CN' ? '正在加载图片' : 'Loading image'} /> : null}
+          </>
         ) : (
-          <span className="session-resource-image-placeholder" role="status">
-            <FileImage aria-hidden="true" weight="regular" />
-            <span>{props.language === 'zh-CN' ? '正在显示图片' : 'Showing image'}</span>
-          </span>
+          <ResourceLoading label={props.language === 'zh-CN' ? '正在加载图片' : 'Loading image'} />
         )}
       </button>
       <MotionPresence>
@@ -157,6 +177,7 @@ async function loadPendingAttachmentPreview(
   return loadTaskPreview(attachment.localPath);
 }
 
+/** 消息文件引用显示真实文件名，点击仍使用登记资源和本次行号。 */
 export function ConversationInlineResource(
   props: ConversationResourceInteraction & {
     resource: ConversationResource;
@@ -164,14 +185,20 @@ export function ConversationInlineResource(
     language: SessionUiLanguage;
   },
 ) {
+  /** 打开完成前阻止重复请求，不把处理中状态当作打开成功。 */
   const [busy, setBusy] = useState(false);
+  /** 本次打开失败沿用消息中的可见错误说明。 */
   const [error, setError] = useState<unknown>(null);
+  /** 文件位置与展示文字分开，按当前界面语言显示。 */
   const rawLocation = props.resource.kind === 'file' ? locationLabel(props.resource, props.language) : null;
-  /** 已有英文行号由结构化位置统一本地化，避免正文重复追加。 */
-  const label = rawLocation ? props.label.replace(/\s*\(\s*lines?\s+\d+(?:\s*[–-]\s*\d+)?\s*\)\s*$/iu, '') : props.label;
+  /** 文件引用显示真实文件名，说明性链接文字不覆盖文件身份。 */
+  const label = props.resource.kind === 'file' ? props.resource.projectRelativePath.split('/').at(-1) || props.resource.displayName : props.label;
+  /** 位置只追加一次，保留未带行号的普通文件引用。 */
   const location = rawLocation && !label.endsWith(rawLocation) ? rawLocation : null;
+  /** 完整路径或网址作为提示，原文件名不承担访问授权。 */
   const title = props.resource.kind === 'file' ? props.resource.projectRelativePath : props.resource.kind === 'website' ? props.resource.url : props.resource.displayName;
 
+  /** 打开沿用资源身份和当前点击的位置，不按显示名称读取文件。 */
   async function open(): Promise<void> {
     if (!props.onOpenResource || busy) return;
     setBusy(true);
@@ -187,10 +214,24 @@ export function ConversationInlineResource(
 
   return (
     <span className="session-inline-resource-shell" data-resource-kind={props.resource.kind}>
-      <button type="button" className="session-inline-resource" title={title} aria-label={`${label}${location ? ` ${location}` : ''}`} aria-busy={busy || undefined} data-error={Boolean(error) || undefined} onClick={() => void open()}>
+      <button
+        type="button"
+        className="session-inline-resource"
+        data-icon-tooltip={title}
+        aria-label={`${label}${location ? ` ${location}` : ''}`}
+        aria-busy={busy || undefined}
+        data-error={Boolean(error) || undefined}
+        onClick={() => void open()}
+      >
         <ResourceIcon resource={props.resource} />
+        {props.resource.kind === 'file' ? '\u00a0' : null}
         <span>{label}</span>
-        {location ? <span className="session-inline-resource-location">{location}</span> : null}
+        {location ? (
+          <>
+            {' '}
+            <span className="session-inline-resource-location">{location}</span>
+          </>
+        ) : null}
       </button>
       {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : null}
     </span>
@@ -218,6 +259,7 @@ export function ConversationGeneratedImage(
   return <ConversationImagePreview {...props} className="session-generated-image" placeholderClassName="session-generated-image-placeholder" />;
 }
 
+/** 图片正文和附件共用受控读取；已知的大小限制改走文件打开入口。 */
 function ConversationImagePreview(
   props: ConversationResourceInteraction & {
     resource: ConversationResource;
@@ -225,6 +267,8 @@ function ConversationImagePreview(
     language: SessionUiLanguage;
     className: string;
     placeholderClassName: string;
+    /** 附件缩略图使用简短提示，完整原因保留在悬停说明中。 */
+    compact?: boolean;
     onVisibleContentChange?: () => void;
   },
 ) {
@@ -232,7 +276,11 @@ function ConversationImagePreview(
   const [visible, setVisible] = useState(false);
   const [preview, setPreview] = useState<Extract<ConversationResourcePreview, { kind: 'image' }> | null>(null);
   const [loading, setLoading] = useState(false);
+  /** 资源读取已按可见区域延迟；回执后立即解码，避免再次懒加载而停在占位。 */
+  const [decodedPreviewUrl, setDecodedPreviewUrl] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
+  /** 重试只重新读取相同受控资源，不打开另一个窗口或改变消息位置。 */
+  const [retry, setRetry] = useState(0);
   const resourceRef = useRef(props.resource);
   const languageRef = useRef(props.language);
   const loadPreviewRef = useRef(props.onLoadResourcePreview);
@@ -244,7 +292,7 @@ function ConversationImagePreview(
 
   useLayoutEffect(() => {
     visibleContentChangeRef.current?.();
-  }, [error, preview]);
+  }, [error, preview, decodedPreviewUrl]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -276,6 +324,7 @@ function ConversationImagePreview(
     if (!visible || !loadPreview) return;
     let active = true;
     setLoading(true);
+    setError(null);
     void loadPreview(resourceRef.current)
       .then((result) => {
         if (!active) return;
@@ -294,7 +343,7 @@ function ConversationImagePreview(
     return () => {
       active = false;
     };
-  }, [props.resource.id, Boolean(props.onLoadResourcePreview), visible]);
+  }, [props.resource.id, Boolean(props.onLoadResourcePreview), visible, retry]);
 
   /** 图片缩略图也沿用会话资源入口，不自行创建弹窗。 */
   async function open(): Promise<void> {
@@ -309,7 +358,25 @@ function ConversationImagePreview(
     setError(cause);
   }
 
+  /** 超出大小限制无法靠重试恢复，仍允许打开文件和选择可用应用。 */
+  const previewTooLarge = userFacingErrorCause(error).code === 'ZEUS_CONVERSATION_RESOURCE_TOO_LARGE';
   const unavailable = !loadPreviewRef.current;
+  /** 小缩略图只显示可执行的简短状态，完整原因使用同一悬停说明。 */
+  const compactStatus = previewTooLarge
+    ? props.language === 'zh-CN'
+      ? '大图'
+      : 'Large'
+    : error
+      ? props.language === 'zh-CN'
+        ? '重试'
+        : 'Retry'
+      : unavailable
+        ? props.language === 'zh-CN'
+          ? '打开'
+          : 'Open'
+        : props.language === 'zh-CN'
+          ? '加载中'
+          : 'Loading';
   const status = error
     ? formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en')
     : unavailable
@@ -327,32 +394,53 @@ function ConversationImagePreview(
       ref={rootRef}
       type="button"
       className={props.className}
-      aria-label={`${props.language === 'zh-CN' ? '在 Zeus 中预览' : 'Preview in Zeus'}：${props.label}`}
-      aria-busy={loading || undefined}
+      aria-label={`${error && !previewTooLarge ? (props.language === 'zh-CN' ? '重新加载图片' : 'Retry image') : props.language === 'zh-CN' ? '在 Zeus 中预览' : 'Preview in Zeus'}：${props.label}`}
+      aria-busy={(!error && !unavailable && (loading || !preview || decodedPreviewUrl !== preview.dataUrl)) || undefined}
       data-error={Boolean(error) || undefined}
-      title={props.resource.displayName}
+      data-icon-tooltip={error ? status : props.language === 'zh-CN' ? '预览图片' : 'Preview image'}
       onClick={() => {
         setVisible(true);
+        if (error && !previewTooLarge) {
+          setPreview(null);
+          setRetry((value) => value + 1);
+          return;
+        }
         void open();
       }}
     >
-      {preview ? (
-        <img decoding="async" src={preview.dataUrl} alt={props.label} loading="lazy" onError={() => reportPreviewFailure(languageRef.current === 'zh-CN' ? '图片预览加载失败。' : 'The image preview failed to load.')} />
-      ) : (
+      {preview && !error ? (
+        <>
+          <img
+            decoding="async"
+            src={preview.dataUrl}
+            alt={props.label}
+            style={decodedPreviewUrl === preview.dataUrl ? undefined : { visibility: 'hidden' }}
+            onLoad={() => setDecodedPreviewUrl(preview.dataUrl)}
+            onError={() => reportPreviewFailure(languageRef.current === 'zh-CN' ? '图片预览加载失败。' : 'The image preview failed to load.')}
+          />
+          {decodedPreviewUrl !== preview.dataUrl ? <ResourceLoading label={status} /> : null}
+        </>
+      ) : error || unavailable ? (
         <span className={props.placeholderClassName} role="status">
-          {!error ? <FileImage aria-hidden="true" weight="regular" /> : null}
-          <span>{status}</span>
+          <FileImage aria-hidden="true" weight="regular" />
+          <span>{props.compact ? compactStatus : status}</span>
+          {error && !props.compact ? <span>{previewTooLarge ? (props.language === 'zh-CN' ? '点击打开' : 'Click to open') : props.language === 'zh-CN' ? '点击重试' : 'Click to retry'}</span> : null}
         </span>
+      ) : (
+        <ResourceLoading label={status} />
       )}
       {preview ? <span className="session-sr-only">{status}</span> : null}
     </button>
   );
 }
 
+/** 图片只显示缩略图；附件直接预览，项目文件保留打开方式。 */
 export function ConversationResourceCards(
   props: ConversationResourceInteraction & {
     resources: ConversationResource[];
     language: SessionUiLanguage;
+    /** 任务字段的附件列表避免大幅挤占正文空间。 */
+    compact?: boolean;
   },
 ) {
   const resources = props.resources.filter((resource) => resource.presentation === 'card');
@@ -360,12 +448,12 @@ export function ConversationResourceCards(
   const imageCount = resources.filter(isImageResource).length;
   const layout = imageCount === resources.length ? 'images' : imageCount === 0 ? 'files' : 'mixed';
   return (
-    <section className="session-resource-card-list" data-layout={layout} aria-label={props.language === 'zh-CN' ? '会话资源' : 'Conversation resources'}>
+    <section className="session-resource-card-list" data-layout={layout} data-compact={props.compact || undefined} aria-label={props.language === 'zh-CN' ? '会话资源' : 'Conversation resources'}>
       {resources.map((resource) =>
         isImageResource(resource) ? (
-          <ConversationResourceImage key={resource.id} resource={resource} language={props.language} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
+          <ConversationResourceImage key={resource.id} resource={resource} language={props.language} compact={props.compact} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
         ) : (
-          <ConversationResourceCard key={resource.id} resource={resource} language={props.language} onOpenResource={props.onOpenResource} />
+          <ConversationResourceCard key={resource.id} resource={resource} language={props.language} compact={props.compact} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
         ),
       )}
     </section>
@@ -376,6 +464,8 @@ function ConversationResourceImage(
   props: ConversationResourceInteraction & {
     resource: ConversationResource;
     language: SessionUiLanguage;
+    /** 小缩略图的失败提示保留完整悬停说明，只显示短文案。 */
+    compact?: boolean;
   },
 ) {
   return (
@@ -383,6 +473,7 @@ function ConversationResourceImage(
       resource={props.resource}
       label={props.resource.displayName}
       language={props.language}
+      compact={props.compact}
       onOpenResource={props.onOpenResource}
       onLoadResourcePreview={props.onLoadResourcePreview}
       className="session-resource-image"
@@ -391,16 +482,20 @@ function ConversationResourceImage(
   );
 }
 
+/** 文件名保留完整悬停说明，自动转换的文本显示易读名称。 */
 function ConversationResourceCard(
   props: ConversationResourceInteraction & {
     resource: ConversationResource;
     language: SessionUiLanguage;
+    /** 紧凑附件行使用小缩略图和收窄的操作按钮。 */
+    compact?: boolean;
   },
 ) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const subtitle = resourceSubtitle(props.resource, props.language);
 
+  /** 读取错误就地显示，打开目标仍由受控资源决定。 */
   async function open(target = defaultOpenTarget(props.resource)): Promise<void> {
     if (!props.onOpenResource || busy) return;
     setBusy(true);
@@ -415,24 +510,35 @@ function ConversationResourceCard(
   }
 
   return (
-    <article className="session-resource-card" data-resource-kind={props.resource.kind} data-error={Boolean(error) || undefined}>
-      <button type="button" className="session-resource-card-main" aria-busy={busy || undefined} onClick={() => void open()}>
+    <article className="session-resource-card" data-resource-kind={props.resource.kind} data-compact={props.compact || undefined} data-error={Boolean(error) || undefined}>
+      <button type="button" className="session-resource-card-main" data-icon-tooltip={props.resource.displayName} aria-busy={busy || undefined} onClick={() => void open()}>
         <span className="session-resource-card-icon">
           <ResourceIcon resource={props.resource} />
         </span>
         <span className="session-resource-card-copy">
-          <strong>{props.resource.displayName}</strong>
+          <strong>{pendingResourceDisplayName(props.resource.displayName, props.language)}</strong>
           <small>{subtitle}</small>
         </span>
       </button>
-      <OpenWithMenu resource={props.resource} language={props.language} disabled={busy} onOpen={(target) => open(target)} />
+      {/* 附件卡只保留默认预览入口，外部应用操作由文件预览承载。 */}
+      {props.resource.kind !== 'attachment' ? <OpenWithMenu resource={props.resource} language={props.language} disabled={busy} onOpen={(target) => open(target)} /> : null}
       {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : null}
     </article>
   );
 }
 
 /** 资源卡和文件工具栏复用同一套可用应用检测及键盘菜单。 */
-export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean; resource: ConversationResource; language: SessionUiLanguage; disabled: boolean; onOpen: (target: ConversationOpenTarget) => void | Promise<void> }) {
+export function OpenWithMenu(props: {
+  label?: string;
+  applicationsOnly?: boolean;
+  /** 文件工具栏优先向下展开，空间不足时仍避开窗口边界。 */ preferBelow?: boolean;
+  /** 已检测的真实应用供工具栏与菜单共用，避免重复检测。 */ targets?: ConversationResourceOpenTarget[];
+  /** 文件操作与应用列表分隔，仍处于同一个键盘菜单。 */ footer?: ReactNode;
+  resource: ConversationResource;
+  language: SessionUiLanguage;
+  disabled: boolean;
+  onOpen: (target: ConversationOpenTarget) => void | Promise<void>;
+}) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
@@ -469,7 +575,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
       const left = Math.max(margin, Math.min(triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - margin));
       const above = triggerRect.top - menuRect.height - gap;
       const below = triggerRect.bottom + gap;
-      const top = above >= margin ? above : Math.max(margin, Math.min(below, window.innerHeight - menuRect.height - margin));
+      const top = props.preferBelow && below + menuRect.height <= window.innerHeight - margin ? below : above >= margin ? above : Math.max(margin, Math.min(below, window.innerHeight - menuRect.height - margin));
       setMenuPosition({ left, top });
     };
     position();
@@ -479,13 +585,14 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
       window.removeEventListener('resize', position);
       window.removeEventListener('scroll', position, true);
     };
-  }, [error, loading, open, targets.length]);
+  }, [error, loading, open, targets.length, props.preferBelow]);
 
   useEffect(() => {
     if (!open || loading || targets.length === 0) return;
     requestAnimationFrame(() => menuButtons(menuRef.current)[0]?.focus());
   }, [loading, open, targets]);
 
+  /** 优先复用工具栏的检测结果，其他入口仍按需请求宿主。 */
   async function toggle(): Promise<void> {
     if (props.disabled) return;
     const next = !open;
@@ -494,13 +601,28 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
     setLoading(true);
     setError(null);
     try {
-      const result = await listConversationResourceOpenTargetsInMain({
-        zeus: window.zeus,
-        projectId: props.resource.projectId,
-        conversationId: props.resource.conversationId,
-        resourceId: props.resource.id,
-      });
-      setTargets(props.applicationsOnly ? result.targets.filter((target) => target.available && (target.id === 'system_default' || target.id.startsWith('editor:') || target.id.startsWith('terminal:'))) : result.targets);
+      const result = props.targets
+        ? { targets: props.targets }
+        : await listConversationResourceOpenTargetsInMain({
+            zeus: window.zeus,
+            projectId: props.resource.projectId,
+            conversationId: props.resource.conversationId,
+            resourceId: props.resource.id,
+          });
+      /** 文件菜单先显示首选编辑器、默认应用和终端，其余编辑器随后展示。 */
+      const applications = result.targets.filter((target) => target.available && (target.id === 'system_default' || target.id.startsWith('editor:') || target.id.startsWith('terminal:')));
+      /** 与工具栏使用同一检测顺序，首个可用编辑器优先。 */
+      const primary = applications.find((target) => target.id.startsWith('editor:'));
+      setTargets(
+        props.applicationsOnly
+          ? [
+              ...(primary ? [primary] : []),
+              ...applications.filter((target) => target.id === 'system_default'),
+              ...applications.filter((target) => target.id.startsWith('terminal:')),
+              ...applications.filter((target) => target.id.startsWith('editor:') && target !== primary),
+            ]
+          : result.targets,
+      );
     } catch (loadError) {
       setError(loadError);
     } finally {
@@ -542,6 +664,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
         className="session-open-with-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
+        data-icon-tooltip={props.label ?? (props.language === 'zh-CN' ? '打开方式' : 'Open with')}
         aria-label={props.language === 'zh-CN' ? `选择 ${props.resource.displayName} 的打开方式` : `Open ${props.resource.displayName} with`}
         disabled={props.disabled}
         onClick={() => void toggle()}
@@ -559,7 +682,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
         ? createPortal(
             <div className={openWithPortalClassName()}>
               <div
-                className="session-open-with-menu"
+                className={`session-open-with-menu${props.applicationsOnly ? ' session-open-with-app-menu' : ''}`}
                 data-motion-surface="popover"
                 data-motion-state={open ? 'open' : 'closing'}
                 inert={!open}
@@ -569,6 +692,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                 onKeyDown={handleMenuKeyDown}
                 style={menuPositionStyle(menuPosition)}
               >
+                {/* 底部操作先关闭菜单并恢复焦点，随后由各自受控入口执行。 */}
                 {loading ? <span className="session-open-with-status">{props.language === 'zh-CN' ? '正在检测应用…' : 'Detecting apps…'}</span> : null}
                 {error ? (
                   <span className="session-open-with-status" role="alert">
@@ -582,7 +706,7 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                         role="menuitem"
                         key={target.id}
                         disabled={!target.available}
-                        title={!target.available ? target.reason : undefined}
+                        data-icon-tooltip={!target.available ? target.reason : undefined}
                         onClick={() => {
                           closeAndRestoreFocus();
                           void props.onOpen(target.id);
@@ -591,6 +715,8 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                         <span className="session-open-with-target-label">
                           {target.iconDataUrl ? (
                             <img src={target.iconDataUrl} alt="" width={20} height={20} />
+                          ) : target.id === 'system_default' && props.applicationsOnly ? (
+                            <FolderOpen className="session-open-with-default-icon" aria-hidden="true" weight="duotone" />
                           ) : target.id.startsWith('terminal:') ? (
                             <TerminalWindow aria-hidden="true" />
                           ) : target.id === 'copy_path' || target.id === 'copy_link' ? (
@@ -604,12 +730,17 @@ export function OpenWithMenu(props: { label?: string; applicationsOnly?: boolean
                           ) : (
                             <AppWindow aria-hidden="true" />
                           )}
-                          {localizedTargetLabel(target, props.language)}
+                          {props.applicationsOnly && target.id === 'system_default' ? 'Default app' : props.applicationsOnly && target.id === 'editor:vscode' ? 'VS Code' : localizedTargetLabel(target, props.language)}
                         </span>
                         {target.exactLocation && target.available ? <small>{props.language === 'zh-CN' ? '精确到行' : 'Exact line'}</small> : null}
                       </button>
                     ))
                   : null}
+                {props.footer ? (
+                  <div className="session-open-with-footer" onClick={closeAndRestoreFocus}>
+                    {props.footer}
+                  </div>
+                ) : null}
               </div>
             </div>,
             document.body,

@@ -47,15 +47,15 @@ const taskTableModules = [ClientSideRowModelModule, ColumnApiModule, ColumnAutoS
 const taskTableRowClassRules: RowClassRules<TaskRowViewModel> = { 'task-data-table-selected': ({ data }) => Boolean(data?.selected) };
 /** 表格颜色跟随 Zeus 主题，固定行高确保虚拟滚动无需逐行测量。 */
 const taskTableTheme = themeQuartz.withParams({
-  backgroundColor: 'var(--zeus-card-background)',
-  dataBackgroundColor: 'var(--zeus-card-background)',
-  oddRowBackgroundColor: 'var(--zeus-card-background)',
+  backgroundColor: 'var(--zeus-product-canvas)',
+  dataBackgroundColor: 'var(--zeus-product-canvas)',
+  oddRowBackgroundColor: 'var(--zeus-product-canvas)',
   foregroundColor: 'var(--zeus-product-text)',
   headerBackgroundColor: 'var(--zeus-card-background)',
   headerTextColor: 'var(--zeus-product-muted)',
   borderColor: 'var(--zeus-card-border)',
   accentColor: 'var(--zeus-accent)',
-  rowHoverColor: 'color-mix(in srgb, var(--zeus-product-text) 3%, var(--zeus-card-background))',
+  rowHoverColor: 'color-mix(in srgb, var(--zeus-product-text) 3%, var(--zeus-product-canvas))',
   fontFamily: 'inherit',
   fontSize: 12,
   headerFontSize: 11,
@@ -285,13 +285,13 @@ function TaskCell(props: CustomCellRendererProps<TaskRowViewModel>) {
   }
   if (columnKey === 'taskType')
     return (
-      <span title={cell.primary} className={`task-status-chip task-type-chip task-status-tone-${taskTypeTone(task.taskType)}`}>
+      <span data-icon-tooltip={cell.primary} className={`task-status-chip task-type-chip task-status-tone-${taskTypeTone(task.taskType)}`}>
         <strong>{cell.primary}</strong>
       </span>
     );
   if (columnKey === 'branchStatus')
     return (
-      <span title={cell.primary} className={`task-status-chip task-branch-status-chip task-status-tone-${taskBranchStatusTone(cell.sortValue as TaskBranchStatus)}`}>
+      <span data-icon-tooltip={cell.primary} className={`task-status-chip task-branch-status-chip task-status-tone-${taskBranchStatusTone(cell.sortValue as TaskBranchStatus)}`}>
         <strong>{cell.primary}</strong>
       </span>
     );
@@ -312,7 +312,7 @@ function TaskCell(props: CustomCellRendererProps<TaskRowViewModel>) {
       />
     );
   return (
-    <span className="task-data-table-text" title={[cell.primary, cell.secondary].filter(Boolean).join('\n')}>
+    <span className="task-data-table-text" data-icon-tooltip={[cell.primary, cell.secondary].filter(Boolean).join('\n')}>
       {cell.primary}
       {cell.secondary ? <small> · {cell.secondary}</small> : null}
     </span>
@@ -335,7 +335,7 @@ function TaskActionCell({ task }: { task: TaskRecord }) {
           size="compact"
           className="task-table-row-action task-table-row-action-push"
           aria-label={label(pushLabel)}
-          title={terminal ? label(workspace.copy.taskActionTerminalHelp) : label(pushLabel)}
+          data-icon-tooltip={terminal ? label(workspace.copy.taskActionTerminalHelp) : label(pushLabel)}
           busy={entry?.status === 'checking'}
           disabled={Boolean(workspace.taskActionBusy) || terminal}
           onClick={() => workspace.onPushTaskToNewConversation?.(task.id)}
@@ -349,7 +349,7 @@ function TaskActionCell({ task }: { task: TaskRecord }) {
           size="compact"
           className="task-table-row-action"
           aria-label={label(workspace.copy.taskActionCodeDelivery)}
-          title={label(workspace.copy.taskActionCodeDelivery)}
+          data-icon-tooltip={label(workspace.copy.taskActionCodeDelivery)}
           disabled={Boolean(workspace.taskActionBusy)}
           onClick={() => workspace.onOpenTaskCodeDelivery?.(task.id)}
         >
@@ -362,7 +362,7 @@ function TaskActionCell({ task }: { task: TaskRecord }) {
           size="compact"
           className="task-table-row-action"
           aria-label={label(workspace.copy.taskActionDelete)}
-          title={label(workspace.copy.taskActionDelete)}
+          data-icon-tooltip={label(workspace.copy.taskActionDelete)}
           disabled={Boolean(workspace.taskActionBusy)}
           onClick={() => workspace.onDeleteTask?.(task.id)}
         >

@@ -1,3 +1,6 @@
+import { TerminalIcon as WorkspaceCommandsIcon } from '@phosphor-icons/react/dist/csr/Terminal';
+import { GitBranchIcon as WorkspaceGitIcon } from '@phosphor-icons/react/dist/csr/GitBranch';
+import { DotsThreeVerticalIcon as DotsThreeVertical } from '@phosphor-icons/react/dist/csr/DotsThreeVertical';
 import { distributionAppName } from '../../tooling/distribution.js';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { temporaryWorkspaceId, normalizeSidebarConversationFilters, sidebarConversationRunStatusGroup, sidebarConversationRunStatusGroups, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
@@ -10,7 +13,6 @@ import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/Fol
 import { FolderPlusIcon as FolderPlus } from '@phosphor-icons/react/dist/csr/FolderPlus';
 import { FunnelIcon as Funnel } from '@phosphor-icons/react/dist/csr/Funnel';
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
-import { DotsThreeVerticalIcon as DotsThreeVertical } from '@phosphor-icons/react/dist/csr/DotsThreeVertical';
 import { GearSixIcon as GearSix } from '@phosphor-icons/react/dist/csr/GearSix';
 import { UserCircleIcon } from '@phosphor-icons/react/dist/csr/UserCircle';
 import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
@@ -22,9 +24,7 @@ import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/C
 import { DownloadSimpleIcon as DownloadSimple } from '@phosphor-icons/react/dist/csr/DownloadSimple';
 import { SpinnerGapIcon as SpinnerGap } from '@phosphor-icons/react/dist/csr/SpinnerGap';
 import { ListChecksIcon as WorkspaceTasksIcon } from '@phosphor-icons/react/dist/csr/ListChecks';
-import { GitBranchIcon as WorkspaceGitIcon } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { CodeSimpleIcon as WorkspaceSourceIcon } from '@phosphor-icons/react/dist/csr/CodeSimple';
-import { TerminalIcon as WorkspaceCommandsIcon } from '@phosphor-icons/react/dist/csr/Terminal';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
 import { ChatCircleDotsIcon as ChatCircleDots } from '@phosphor-icons/react/dist/csr/ChatCircleDots';
 import { type AutomaticUpdateIndicatorState } from '../../appShellBridge.js';
@@ -48,7 +48,8 @@ import { reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { formatVisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { SourceListRow } from '../../ui/SourceListRow.js';
 import { useNewItemMotionIds } from '../../ui/useNewItemMotion.js';
-import { type AiRuntimeAdapterDescriptor, type AiRuntimeAdapterStatus, type AiRuntimeTerminalEvent, type ProjectConfig, type ProjectRecord, type RuntimeSettings, type TaskRecord } from '../../apiClient.js';
+import { type AiRuntimeAdapterDescriptor, type AiRuntimeAdapterStatus, type AiRuntimeTerminalEvent, type DashboardClient, type ProjectConfig, type ProjectRecord, type RuntimeSettings, type TaskRecord } from '../../apiClient.js';
+import type { TaskSummary } from '../tasks/taskContracts.js';
 import { GENERIC_SHELL_CRITICAL_CONFIRMATION_PHRASE, type GenericShellCommandRisk } from './workspaceFormatters.js';
 import {
   controlBusyProps,
@@ -186,7 +187,7 @@ export function ProjectCreateDialog(props: {
               </span>
               <span className="project-create-folder-picker-copy">
                 <strong>{props.form.localPath ? defaultProjectNameFromLocalPath(props.form.localPath) : props.copy.createChooseFolder}</strong>
-                {props.form.localPath ? <small title={props.form.localPath}>{props.form.localPath}</small> : null}
+                {props.form.localPath ? <small data-icon-tooltip={props.form.localPath}>{props.form.localPath}</small> : null}
               </span>
               <span className="project-create-folder-change">{props.form.localPath ? props.copy.createChangeFolder : props.copy.createSelectFolder}</span>
             </button>
@@ -309,106 +310,6 @@ export function ProjectRenameDialog(props: {
     </ModalPortal>
   );
   return surface;
-}
-
-/** 上游主界面布局的项目工具栏；布局切换只改变外壳，不影响项目和会话状态。 */
-export function ProjectWorkspaceModeToolbar(props: {
-  project: ProjectRecord;
-  projects: ProjectRecord[];
-  onSelectProject: (project: ProjectRecord) => void;
-  section: ProjectWorkspaceSection;
-  codeMode: ProjectCodeWorkspaceMode;
-  language: AppLanguage;
-  onOpen: (section: ProjectWorkspaceSection, codeMode?: ProjectCodeWorkspaceMode) => void;
-  /** 当前项目有已选中的会话时才提供抽屉入口。 */
-  currentConversationAvailable: boolean;
-  /** 展开状态同步给辅助技术。 */
-  currentConversationOpen: boolean;
-  /** 只打开当前会话，不切换项目工作区。 */
-  onOpenCurrentConversation: () => void;
-}) {
-  /** 导航文案跟随当前应用语言。 */
-  const zh = props.language === 'zh-CN';
-  /** 当前会话入口的固定名称不再随 Option 键切换。 */
-  const conversationLabel = zh ? '当前会话' : 'Current conversation';
-  /** 未选中会话时解释入口不可用的原因。 */
-  const conversationTitle = props.currentConversationAvailable ? conversationLabel : zh ? '先从侧栏选择一段会话' : 'Select a conversation in the sidebar first';
-  /** 各工作区的可见名称。 */
-  const labels: Record<ProjectWorkspaceEntryId, string> = {
-    tasks: zh ? '任务' : 'Tasks',
-    git: 'Git',
-    source: zh ? '源码' : 'Source',
-    commands: zh ? '命令' : 'Commands',
-  };
-  /** 同一套线性图标保持一致的视觉重量。 */
-  const icons: Record<ProjectWorkspaceEntryId, ReactNode> = {
-    tasks: <WorkspaceTasksIcon size={18} weight="regular" aria-hidden="true" />,
-    git: <WorkspaceGitIcon size={18} weight="regular" aria-hidden="true" />,
-    source: <WorkspaceSourceIcon size={18} weight="regular" aria-hidden="true" />,
-    commands: <WorkspaceCommandsIcon size={18} weight="regular" aria-hidden="true" />,
-  };
-  return (
-    <header className="project-workspace-mode-toolbar" aria-label={props.project.name}>
-      <div className="project-workspace-identity" title={props.project.localPath}>
-        <ZeusSelect
-          ariaLabel={zh ? '当前项目，切换项目' : 'Current project, switch project'}
-          value={props.project.id}
-          options={props.projects.map((project) => ({ value: project.id, label: project.name }))}
-          onChange={(id) => {
-            const project = props.projects.find((item) => item.id === id);
-            if (project && project.id !== props.project.id) props.onSelectProject(project);
-          }}
-          triggerIcon={<FolderOpen size={18} aria-hidden="true" />}
-          triggerClassName="project-workspace-identity-trigger"
-          triggerTitle={props.project.name}
-          searchable
-          searchPlaceholder={zh ? '搜索项目' : 'Search projects'}
-          emptyLabel={zh ? '没有匹配项目' : 'No matching projects'}
-          popoverMinWidth={260}
-          size="compact"
-        />
-      </div>
-      <span className="project-workspace-separator" aria-hidden="true" />
-      <nav aria-label={zh ? '项目工作区' : 'Project workspace'}>
-        {PROJECT_WORKSPACE_ENTRIES.map((item) => {
-          /** 当前工作区与源码子模式共同决定选中态。 */
-          const active = props.section === item.section && (item.section !== 'code' || props.codeMode === item.codeMode);
-          /** 当前入口文案。 */
-          const label = labels[item.id];
-          /** 读屏和提示保留快捷键说明。 */
-          const shortcutLabel = zh ? `${label}（⌘${item.shortcutKey}）` : `${label} (⌘${item.shortcutKey})`;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              className={active ? 'is-active' : ''}
-              aria-label={shortcutLabel}
-              aria-current={active ? 'page' : undefined}
-              aria-keyshortcuts={`Meta+${item.shortcutKey}`}
-              title={shortcutLabel}
-              onClick={() => props.onOpen(item.section, item.codeMode)}
-            >
-              <span aria-hidden="true">{icons[item.id]}</span>
-              <span className="project-workspace-mode-label">{label}</span>
-            </button>
-          );
-        })}
-      </nav>
-      <button
-        type="button"
-        className="project-workspace-current-conversation"
-        aria-label={conversationLabel}
-        aria-haspopup="dialog"
-        aria-expanded={props.currentConversationOpen}
-        title={conversationTitle}
-        disabled={!props.currentConversationAvailable}
-        onClick={props.onOpenCurrentConversation}
-      >
-        <ChatCircleDots size={18} weight="regular" aria-hidden="true" />
-        <span>{conversationLabel}</span>
-      </button>
-    </header>
-  );
 }
 
 type GlobalSearchSourceResult = ProjectSourceContentMatch & { project: ProjectRecord };
@@ -667,8 +568,9 @@ function GlobalSearchGroup(props: { title: string; icon: ReactNode; children: Re
   );
 }
 
-/** 项目切换器固定在左上角，五个项目工作区入口独立为最左侧活动栏。 */
+/** 项目切换器固定在左上角，活动栏保留会话、任务与源码入口。 */
 export function ProjectWorkspaceNavigation(props: {
+  notificationCenter?: ReactNode;
   attentionAction?: ReactNode;
   project: ProjectRecord;
   projects: ProjectRecord[];
@@ -1001,6 +903,7 @@ export function ProjectWorkspaceNavigation(props: {
           onOpenConversation={props.onOpenConversation}
           onOpenSourceMatch={props.onOpenSourceMatch}
         />
+        {props.notificationCenter}
         {props.attentionAction}
       </header>
       <nav className="project-workspace-mode-rail" aria-label={zh ? '项目工作区' : 'Project workspace'}>
@@ -1127,6 +1030,8 @@ export function ProjectWorkspaceNavigation(props: {
 
 /** 项目导航将状态筛选与搜索叠加，会话始终平铺。 */
 export function SidebarNav(props: {
+  /** 通知状态驻留工作台，标题行仅承载全局入口。 */
+  notificationCenter?: ReactNode;
   mainLayout?: 'current' | 'upstream';
   activeNavTarget: WorkspaceViewId;
   activeProjectId?: string;
@@ -1140,6 +1045,12 @@ export function SidebarNav(props: {
   /** 用户操作与旧偏好接收共用本机设置保存入口。 */
   onConversationFiltersChange: (filters: SidebarConversationFilters) => void;
   conversationGroups: ProjectConversationGroup[];
+  /** 任务全文匹配只装载摘要页，正文保留在服务端。 */
+  loadTaskSearchPage?: DashboardClient['tasks']['loadTaskSummaries'];
+  /** 会话正文返回命中身份和性能回退状态。 */
+  searchConversationContent?: DashboardClient['conversations']['searchConversationContent'];
+  /** 无会话的任务搜索结果复用现有详情入口。 */
+  onOpenTaskDetail: (taskId: string, projectId: string) => void;
   selectedConversationId?: string | null;
   conversationStates: Record<string, ConversationTreeRuntimeState>;
   automaticUpdateIndicator: AutomaticUpdateIndicatorState | null;
@@ -1150,9 +1061,11 @@ export function SidebarNav(props: {
   onCreateConversation: () => void;
   onSelectConversation: (conversation: NativeConversationChoice) => void;
   onArchiveConversation: (conversation: NativeConversationChoice) => Promise<void>;
+  /** 只在真实会话客户端就绪时提供重命名能力。 */
+  onRenameConversation?: (conversation: NativeConversationChoice, title: string) => Promise<void>;
   onNavigate: (target: WorkspaceViewId) => void;
   onOpenAutomaticUpdate: () => void;
-  onOpenProjectSection: (project: ProjectRecord, section: ProjectWorkspaceSection) => void;
+  onOpenProjectSection: (project: ProjectRecord, section: ProjectWorkspaceSection, codeMode?: ProjectCodeWorkspaceMode) => void;
   onTogglePinnedProject: (projectId: string) => void;
   onToggleProjectCollapsed: (projectId: string) => void;
   onRevealProjectInFinder: (projectPath: string) => Promise<void>;
@@ -1168,6 +1081,10 @@ export function SidebarNav(props: {
   const [closingProjectMenuIds, setClosingProjectMenuIds] = useState<Set<string>>(() => new Set());
   const [projectMenuPositions, setProjectMenuPositions] = useState<Map<string, { left: number; top: number }>>(() => new Map());
   const [projectSearchQuery, setProjectSearchQuery] = useState('');
+  /** 结果绑定查询文字，较早的异步响应不能覆盖当前搜索。 */
+  const [contentSearch, setContentSearch] = useState<{ query: string; tasks: TaskSummary[]; conversationIds: string[]; failed: boolean }>({ query: '', tasks: [], conversationIds: [], failed: false });
+  /** 只重试当前搜索，不重载整个工作区。 */
+  const [contentSearchRevision, setContentSearchRevision] = useState(0);
   /** 已保存的数据库设置优先；旧缓存只作为首次接收来源。 */
   const [legacyConversationFilters] = useState(readLegacySidebarConversationFilters);
   /** 搜索文字仍保持临时输入，漏斗由工作台持久设置直接控制。 */
@@ -1211,15 +1128,15 @@ export function SidebarNav(props: {
     setVisibleConversationCountByProject({});
   }, [props.activeProjectId]);
   useEffect(() => {
-    openProjectMenuIdsRef.current = openProjectMenuIds;
-  }, [openProjectMenuIds]);
-  useEffect(() => {
     return () => {
       projectMenuCloseTimerRefs.current.forEach((timer) => clearTimeout(timer));
       projectMenuCloseTimerRefs.current.clear();
       clearTimeout(sidebarScrollIdleTimerRef.current);
     };
   }, []);
+  useEffect(() => {
+    openProjectMenuIdsRef.current = openProjectMenuIds;
+  }, [openProjectMenuIds]);
   const toggleProjectCollapsed = (projectId: string, expanded: boolean) => {
     if (expanded) {
       setVisibleConversationCountByProject((current) => {
@@ -1380,6 +1297,60 @@ export function SidebarNav(props: {
   /** 会话侧栏严格跟随顶部选中的当前项目，其他项目通过顶部入口切换。 */
   const scopedProjects = scopeToCurrentProject ? props.projects.filter((project) => project.id === props.activeProjectId) : props.projects;
   const scopedConversationGroups = scopeToCurrentProject ? props.conversationGroups.filter((group) => group.projectId === props.activeProjectId) : props.conversationGroups;
+  /** 查询和范围都是稳定文字，目录状态变化不会重复发起同一全文读取。 */
+  const normalizedProjectSearch = projectSearchQuery.trim().toLowerCase();
+  const projectSearchScope = JSON.stringify(scopedProjects.map((project) => project.id));
+  useEffect(() => {
+    /** 输入改变后取消旧请求，避免异步结果和旧错误覆盖新查询。 */
+    const controller = new AbortController();
+    let active = true;
+    if (!normalizedProjectSearch) {
+      setContentSearch({ query: '', tasks: [], conversationIds: [], failed: false });
+      return;
+    }
+    /** 复用本地查询接口，输入停顿后才读取正文命中。 */
+    const timer = window.setTimeout(() => {
+      /** 各项目只返回任务摘要与会话身份，不向 Renderer 复制完整正文。 */
+      const projectIds: string[] = JSON.parse(projectSearchScope);
+      void Promise.allSettled(
+        projectIds.map(async (projectId) => {
+          /** 每个项目沿用已有摘要游标，保证搜索覆盖未加载的任务。 */
+          const tasks: TaskSummary[] = [];
+          let cursor: string | undefined;
+          if (props.loadTaskSearchPage) {
+            do {
+              const page = await props.loadTaskSearchPage({ projectId, query: normalizedProjectSearch, cursor, signal: controller.signal });
+              tasks.push(...page.items);
+              cursor = page.hasMore && page.nextCursor ? page.nextCursor : undefined;
+            } while (cursor);
+          }
+          /** 大历史由服务端预算决定是否回退，任务全文仍继续匹配。 */
+          try {
+            const content = await props.searchConversationContent?.(projectId, normalizedProjectSearch, { signal: controller.signal });
+            return { tasks, conversationIds: content?.conversationIds ?? [], failed: false };
+          } catch {
+            // 会话正文读取失败时仍保留本项目已找到的任务，并允许用户重试。
+            return { tasks, conversationIds: [], failed: true };
+          }
+        }),
+      ).then((settled) => {
+        if (!active) return;
+        /** 保留已成功项目的结果，同时明确提示失败，允许重试。 */
+        const results = settled.flatMap((item) => (item.status === 'fulfilled' ? [item.value] : []));
+        setContentSearch({
+          query: normalizedProjectSearch,
+          tasks: results.flatMap((item) => item.tasks),
+          conversationIds: results.flatMap((item) => item.conversationIds),
+          failed: results.some((item) => item.failed) || settled.some((item) => item.status === 'rejected'),
+        });
+      });
+    }, 250);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [normalizedProjectSearch, projectSearchScope, props.loadTaskSearchPage, props.searchConversationContent, contentSearchRevision]);
   const contextTitle =
     props.activeNavTarget === 'automations'
       ? zh
@@ -1413,7 +1384,7 @@ export function SidebarNav(props: {
                     ? '会话'
                     : 'Conversations';
   const openProjectRenameDialog = (project: ProjectRecord) => {
-    closeProjectMoreMenuWithMotion(project.id);
+    closeOpenProjectMoreMenusWithMotion();
     setProjectRenameTarget(project);
     setProjectRenameDraft(project.name);
     setProjectRenameError(undefined);
@@ -1478,6 +1449,27 @@ export function SidebarNav(props: {
   }
   /** 状态筛选或同任务去重生效时，漏斗和空项目选项都反映当前筛选。 */
   const hasConversationFilter = hasStatusFilter || latestConversationOnly;
+  /** 未完成的新查询只使用当前文字的本地命中，不沿用旧的全文结果。 */
+  const currentContentSearch = contentSearch.query === normalizedProjectSearch ? contentSearch : undefined;
+  const contentSearchPending = Boolean(normalizedProjectSearch && (props.loadTaskSearchPage || props.searchConversationContent) && !currentContentSearch);
+  /** 完整任务内容命中可对应多条会话，身份集合避免重复扫描正文。 */
+  const matchedTaskIds = new Set(currentContentSearch?.tasks.map((task) => task.id));
+  const matchedConversationIds = new Set(currentContentSearch?.conversationIds);
+  /** 项目名称命中仍展开整个项目，清空后恢复用户原来的折叠状态。 */
+  function matchesProjectSearch(project: ProjectRecord): boolean {
+    return !normalizedProjectSearch || [project.name, project.localPath].some((value) => value.toLowerCase().includes(normalizedProjectSearch));
+  }
+  /** 标题、摘要、所属任务和持久正文共用同一匹配判断。 */
+  function matchesConversationSearch(conversation: NativeConversationChoice, task?: ProjectConversationGroup['tasks'][number]): boolean {
+    return (
+      !normalizedProjectSearch ||
+      matchedConversationIds.has(conversation.id) ||
+      Boolean(task && matchedTaskIds.has(task.taskId)) ||
+      [conversationDisplayTitle(conversation.title, task?.taskTitle, props.appLanguage), conversation.summary, task?.taskTitle, task?.taskCode].some((value) => value?.toLowerCase().includes(normalizedProjectSearch))
+    );
+  }
+  /** 没有会话的任务仍可搜索和打开；运行态筛选不被任务结果绕过。 */
+  const searchTasks = (currentContentSearch?.tasks ?? []).filter((task) => activeRunStatusFilters.length === 0 && (!hasTaskStatusFilter || activeStatusFilters.includes(`status:${task.managementStatus}`)));
   /** 已选状态只出现在漏斗悬停提示中，不额外占用侧栏空间。 */
   const statusFilterLabel = hasStatusFilter
     ? statusFilterOptions
@@ -1486,34 +1478,29 @@ export function SidebarNav(props: {
         .join(props.appLanguage === 'zh-CN' ? '、' : ', ')
     : copy.allConversations;
   /** 上游已按阶段时间倒序；先取每个任务首条，再筛选运行状态、搜索和分页，避免旧会话重新出现。 */
-  const filteredConversationGroups = scopedConversationGroups.map((group) => ({
-    ...group,
-    conversations: !hasTaskStatusFilter || activeStatusFilters.includes('project') ? group.conversations?.filter(matchesConversationRunStatus) : [],
-    tasks: (!hasTaskStatusFilter ? group.tasks : group.tasks.filter((task) => activeStatusFilters.includes(`status:${task.managementStatus}`))).map((task) => ({
-      ...task,
-      conversations: (latestConversationOnly ? task.conversations.slice(0, 1) : task.conversations).filter(matchesConversationRunStatus),
-    })),
-  }));
+  const filteredConversationGroups = scopedConversationGroups.map((group) => {
+    /** 项目级命中和会话级命中都叠加已有状态、去重过滤。 */
+    const projectMatch = scopedProjects.some((project) => project.id === group.projectId && matchesProjectSearch(project));
+    return {
+      ...group,
+      conversations:
+        !hasTaskStatusFilter || activeStatusFilters.includes('project') ? group.conversations?.filter((conversation) => matchesConversationRunStatus(conversation) && (projectMatch || matchesConversationSearch(conversation))) : [],
+      tasks: (!hasTaskStatusFilter ? group.tasks : group.tasks.filter((task) => activeStatusFilters.includes(`status:${task.managementStatus}`))).map((task) => ({
+        ...task,
+        conversations: (latestConversationOnly ? task.conversations.slice(0, 1) : task.conversations).filter((conversation) => matchesConversationRunStatus(conversation) && (projectMatch || matchesConversationSearch(conversation, task))),
+      })),
+    };
+  });
   /** 空项目是否隐藏由独立显示选项决定；全部模式仍保留空项目。 */
   const visibleProjects = scopedProjects.filter((project) => {
     /** 搜索与列表渲染共用已筛选的数据，不能由被筛掉的会话撑起空项目。 */
     const group = filteredConversationGroups.find((candidate) => candidate.projectId === project.id);
     /** 项目直属会话与符合状态的任务会话。 */
     const conversations = [...(group?.conversations ?? []), ...(group?.tasks.flatMap((task) => task.conversations) ?? [])];
-    if (showConversationNavigation && hasConversationFilter && hideEmptyFilteredProjects && conversations.length === 0) return false;
-    /** 沿用项目名称、目录和会话显示标题的大小写不敏感搜索。 */
-    const query = projectSearchQuery.trim().toLocaleLowerCase();
-    return (
-      !query ||
-      project.name.toLocaleLowerCase().includes(query) ||
-      project.localPath.toLocaleLowerCase().includes(query) ||
-      (showConversationNavigation &&
-        conversations.some((conversation) =>
-          conversationDisplayTitle(conversation.title, group?.tasks.find((task) => task.taskId === conversation.taskId)?.taskTitle, props.appLanguage)
-            .toLocaleLowerCase()
-            .includes(query),
-        ))
-    );
+    /** 全文命中的无会话任务同样撑起项目结果，不能被空项目选项吞掉。 */
+    const hasTaskMatches = searchTasks.some((task) => task.projectId === project.id);
+    if (showConversationNavigation && hasConversationFilter && hideEmptyFilteredProjects && conversations.length === 0 && !hasTaskMatches) return false;
+    return matchesProjectSearch(project) || hasTaskMatches || (showConversationNavigation && conversations.length > 0);
   });
   const enteringProjectIds = useNewItemMotionIds(scopedProjects.map((project) => project.id));
   // 上游沿用 main 的 44px 交通灯安全区；当前布局保留紧凑侧栏。
@@ -1529,9 +1516,12 @@ export function SidebarNav(props: {
       <div className="project-window-control-reserved-space" aria-hidden="true" />
       {props.mainLayout === 'upstream' ? (
         <nav className="project-quick-actions codex-source-list-quick-actions" aria-label={copy.quickActionsLabel}>
-          <strong className="project-sidebar-brand" title={distributionAppName === 'Zeus' ? undefined : '基于 Zeus'}>
-            {distributionAppName}
-          </strong>
+          <div className="project-sidebar-brand-row">
+            <strong className="project-sidebar-brand" title={distributionAppName === 'Zeus' ? undefined : '基于 Zeus'}>
+              {distributionAppName}
+            </strong>
+            {props.notificationCenter}
+          </div>
           <button type="button" className="project-quick-action" onClick={props.onCreateConversation} disabled={!props.activeProjectId}>
             <span className="project-quick-action-icon" aria-hidden="true">
               <svg viewBox="0 0 20 20" focusable="false">
@@ -1611,7 +1601,15 @@ export function SidebarNav(props: {
                 <circle cx="8.8" cy="8.8" r="5.4" />
                 <path d="m13 13 3.4 3.4" />
               </svg>
-              <input type="search" aria-label={copy.search} placeholder={copy.search} value={projectSearchQuery} onChange={(event) => setProjectSearchQuery(event.currentTarget.value)} />
+              <input
+                type="search"
+                maxLength={256}
+                aria-label={copy.search}
+                placeholder={copy.search}
+                aria-busy={contentSearchPending || undefined}
+                value={projectSearchQuery}
+                onChange={(event) => setProjectSearchQuery(event.currentTarget.value)}
+              />
             </label>
             <span className="project-sidebar-heading-actions">
               {showConversationNavigation && props.mainLayout !== 'upstream' ? (
@@ -1631,6 +1629,7 @@ export function SidebarNav(props: {
                   }}
                   triggerIcon={<Funnel aria-hidden="true" weight={hasConversationFilter ? 'fill' : 'regular'} />}
                   triggerClassName={`project-conversation-filter-button${hasConversationFilter ? ' is-filtered' : ''}`}
+                  triggerTooltip={props.appLanguage === 'zh-CN' ? '筛选会话' : 'Filter conversations'}
                   triggerTitle={`${copy.filterConversationsByTaskStatus}: ${statusFilterLabel}${latestConversationOnly ? ` · ${copy.latestConversationOnly}` : ''}`}
                   searchable={false}
                   hideSelectedLabel
@@ -1654,7 +1653,7 @@ export function SidebarNav(props: {
                   }
                   footer={
                     <>
-                      <label className="project-conversation-filter-display" title={copy.hideEmptyFilteredProjects}>
+                      <label className="project-conversation-filter-display" data-icon-tooltip={copy.hideEmptyFilteredProjects}>
                         <span>{copy.hideEmptyFilteredProjectsLabel}</span>
                         <span className="settings-switch-state">
                           <input
@@ -1691,12 +1690,28 @@ export function SidebarNav(props: {
                 />
               ) : null}
               {!props.activeProjectId && props.mainLayout !== 'upstream' ? (
-                <button type="button" className="project-add-button" aria-label={copy.addProject} title={copy.addProject} onClick={props.onCreateProject} disabled={!props.canCreateProject} {...controlBusyProps(props.createProjectBusy)}>
+                <button
+                  type="button"
+                  className="project-add-button"
+                  aria-label={copy.addProject}
+                  data-icon-tooltip={copy.addProject}
+                  onClick={props.onCreateProject}
+                  disabled={!props.canCreateProject}
+                  {...controlBusyProps(props.createProjectBusy)}
+                >
                   <Plus aria-hidden="true" weight="regular" />
                 </button>
               ) : null}
             </span>
           </div>
+          {contentSearch.failed ? (
+            <p role="status">
+              {zh ? '搜索失败，请重试。' : 'Search failed.'}
+              <button type="button" onClick={() => setContentSearchRevision((value) => value + 1)}>
+                {zh ? '重试' : 'Retry'}
+              </button>
+            </p>
+          ) : null}
           <div className="project-sidebar-list-content" onScroll={props.mainLayout === 'current' ? handleSidebarScroll : undefined}>
             {visibleProjects.length === 0 ? (
               <section className="project-inline-recovery-row project-search-empty-row" aria-label={hasConversationFilter ? copy.noConversationMatches : copy.noProjectMatches}>
@@ -1779,6 +1794,7 @@ export function SidebarNav(props: {
                       </button>
                       {props.pendingProjectDeleteId === project.id ? (
                         <button
+                          data-icon-tooltip={`${expanded ? copy.collapseProjectPrefix : copy.expandProjectPrefix}${copy.labelSeparator}${project.name}`}
                           type="button"
                           role="menuitem"
                           className="danger-action project-menu-confirm-remove-action"
@@ -2018,7 +2034,7 @@ export function AutomaticUpdateIndicatorButton(props: { state: AutomaticUpdateIn
   const actionHint = zh ? '点击打开更新窗口' : 'Open the update window';
   return (
     <section className="automatic-update-indicator" data-phase={props.state.phase} aria-live="polite" aria-atomic="true">
-      <button type="button" title={`${props.state.detail} ${actionHint}`} aria-label={zh ? `${label}。${props.state.detail} ${actionHint}` : `${label}. ${props.state.detail} ${actionHint}`} onClick={props.onOpen}>
+      <button type="button" data-icon-tooltip={`${props.state.detail} ${actionHint}`} aria-label={zh ? `${label}。${props.state.detail} ${actionHint}` : `${label}. ${props.state.detail} ${actionHint}`} onClick={props.onOpen}>
         <span className="automatic-update-indicator-icon" aria-hidden="true">
           {icon}
         </span>
@@ -2251,4 +2267,103 @@ export function resolveRuntimeNormalizedLogPath(events: AiRuntimeTerminalEvent[]
 export function normalizeRuntimeSettingNumber(value: string, fallback: number, max = 20): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= max ? parsed : fallback;
+}
+
+export function ProjectWorkspaceModeToolbar(props: {
+  project: ProjectRecord;
+  projects: ProjectRecord[];
+  onSelectProject: (project: ProjectRecord) => void;
+  section: ProjectWorkspaceSection;
+  codeMode: ProjectCodeWorkspaceMode;
+  language: AppLanguage;
+  onOpen: (section: ProjectWorkspaceSection, codeMode?: ProjectCodeWorkspaceMode) => void;
+  /** 当前项目有已选中的会话时才提供抽屉入口。 */
+  currentConversationAvailable: boolean;
+  /** 展开状态同步给辅助技术。 */
+  currentConversationOpen: boolean;
+  /** 只打开当前会话，不切换项目工作区。 */
+  onOpenCurrentConversation: () => void;
+}) {
+  /** 导航文案跟随当前应用语言。 */
+  const zh = props.language === 'zh-CN';
+  /** 当前会话入口的固定名称不再随 Option 键切换。 */
+  const conversationLabel = zh ? '当前会话' : 'Current conversation';
+  /** 未选中会话时解释入口不可用的原因。 */
+  const conversationTitle = props.currentConversationAvailable ? conversationLabel : zh ? '先从侧栏选择一段会话' : 'Select a conversation in the sidebar first';
+  /** 各工作区的可见名称。 */
+  const labels: Record<ProjectWorkspaceEntryId, string> = {
+    tasks: zh ? '任务' : 'Tasks',
+    git: 'Git',
+    source: zh ? '源码' : 'Source',
+    commands: zh ? '命令' : 'Commands',
+  };
+  /** 同一套线性图标保持一致的视觉重量。 */
+  const icons: Record<ProjectWorkspaceEntryId, ReactNode> = {
+    tasks: <WorkspaceTasksIcon size={18} weight="regular" aria-hidden="true" />,
+    git: <WorkspaceGitIcon size={18} weight="regular" aria-hidden="true" />,
+    source: <WorkspaceSourceIcon size={18} weight="regular" aria-hidden="true" />,
+    commands: <WorkspaceCommandsIcon size={18} weight="regular" aria-hidden="true" />,
+  };
+  return (
+    <header className="project-workspace-mode-toolbar" aria-label={props.project.name}>
+      <div className="project-workspace-identity" title={props.project.localPath}>
+        <ZeusSelect
+          ariaLabel={zh ? '当前项目，切换项目' : 'Current project, switch project'}
+          value={props.project.id}
+          options={props.projects.map((project) => ({ value: project.id, label: project.name }))}
+          onChange={(id) => {
+            const project = props.projects.find((item) => item.id === id);
+            if (project && project.id !== props.project.id) props.onSelectProject(project);
+          }}
+          triggerIcon={<FolderOpen size={18} aria-hidden="true" />}
+          triggerClassName="project-workspace-identity-trigger"
+          triggerTitle={props.project.name}
+          searchable
+          searchPlaceholder={zh ? '搜索项目' : 'Search projects'}
+          emptyLabel={zh ? '没有匹配项目' : 'No matching projects'}
+          popoverMinWidth={260}
+          size="compact"
+        />
+      </div>
+      <span className="project-workspace-separator" aria-hidden="true" />
+      <nav aria-label={zh ? '项目工作区' : 'Project workspace'}>
+        {PROJECT_WORKSPACE_ENTRIES.map((item) => {
+          /** 当前工作区与源码子模式共同决定选中态。 */
+          const active = props.section === item.section && (item.section !== 'code' || props.codeMode === item.codeMode);
+          /** 当前入口文案。 */
+          const label = labels[item.id];
+          /** 读屏和提示保留快捷键说明。 */
+          const shortcutLabel = zh ? `${label}（⌘${item.shortcutKey}）` : `${label} (⌘${item.shortcutKey})`;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              className={active ? 'is-active' : ''}
+              aria-label={shortcutLabel}
+              aria-current={active ? 'page' : undefined}
+              aria-keyshortcuts={`Meta+${item.shortcutKey}`}
+              title={shortcutLabel}
+              onClick={() => props.onOpen(item.section, item.codeMode)}
+            >
+              <span aria-hidden="true">{icons[item.id]}</span>
+              <span className="project-workspace-mode-label">{label}</span>
+            </button>
+          );
+        })}
+      </nav>
+      <button
+        type="button"
+        className="project-workspace-current-conversation"
+        aria-label={conversationLabel}
+        aria-haspopup="dialog"
+        aria-expanded={props.currentConversationOpen}
+        title={conversationTitle}
+        disabled={!props.currentConversationAvailable}
+        onClick={props.onOpenCurrentConversation}
+      >
+        <ChatCircleDots size={18} weight="regular" aria-hidden="true" />
+        <span>{conversationLabel}</span>
+      </button>
+    </header>
+  );
 }

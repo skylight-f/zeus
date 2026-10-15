@@ -929,7 +929,6 @@
   gap: 16px;
 }
 @media (max-width: 840px) {
-
   .digital-team-template-browser {
     align-items: stretch;
     flex-direction: column;
@@ -965,4 +964,67 @@
   .digital-team-settings-content {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.digital-team-repair-settings > label > span {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.digital-team-repair-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 160px);
+  flex: 1 1 100%;
+  order: 2;
+  gap: 12px;
+}
+.digital-team-repair-settings > label {
+  display: grid;
+  gap: 4px;
+}
+.digital-team-flow-surface .react-flow__handle.target {
+  background: var(--zeus-product-panel);
+  border-color: var(--zeus-product-accent);
+}
+.digital-team-node-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.digital-team-node-navigation button[aria-pressed='true'] {
+  color: var(--zeus-product-accent);
+  background: var(--zeus-product-accent-soft);
+}
+.digital-team-node-field-grid,
+.digital-team-inspector .employee-execution-settings .digital-employee-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 10px;
+}
+.digital-team-inspector .employee-execution-field:where(:first-child, :last-child) {
+  grid-column: 1 / -1;
+}
+.digital-team-inspector .employee-execution-label {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.digital-team-execution-settings,
+.digital-team-status-settings {
+  display: grid;
+  gap: 12px;
+}
+.digital-team-execution-settings h3 {
+  margin: 0;
+  font-size: 12px;
+}
+@media (max-width: 840px) {
+  .digital-team-repair-settings {
+    flex: 0 0 auto;
+    order: 0;
+  }
+}
+.digital-team-node .react-flow__handle.connecting {
+  opacity: 1;
 }

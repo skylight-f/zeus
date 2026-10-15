@@ -100,3 +100,18 @@
   font: inherit;
   user-select: text;
 }
+
+/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+.session-source-blame-text {
+  min-inline-size: 0;
+  overflow: hidden;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 11px;
+  line-height: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -3,12 +3,12 @@ import { Profiler, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RendererErrorBoundary } from './ErrorBoundary.js';
 import { distributionAppName } from './tooling/distribution.js';
-import { createDashboardClient, type DashboardClient, type ExecutionHostTransition, type ProjectGitActionResponse, type ReadOnlyValidationIdentity, ZeusApiError } from './apiClient.js';
+import { createDashboardClient, type DashboardClient, type WorkspaceSnapshot, type ExecutionHostTransition, type ProjectGitActionResponse, type ReadOnlyValidationIdentity, ZeusApiError } from './apiClient.js';
 import { openSourceInMain, revealProjectInFinderInMain } from './appShellBridge.js';
 import { initializeNativeCloseLayerRouting } from './ui/nativeCloseLayer.js';
 import { ApplicationErrorDialogHost, reportApplicationError } from './ui/ApplicationErrorDialog.js';
 import { RendererPerformanceCollector } from './rendererPerformanceObservability.js';
-import { primePersistedSessionViewCache } from './session/sessionHotCache.js';
+import { installIconTooltips } from '../preload/iconTooltip.js';
 // 启动失败可能早于工作台模块加载，恢复页样式必须随入口就绪。
 import './styles.css';
 
@@ -31,6 +31,9 @@ function unwrapProjectGitActionIpcResult(result: Awaited<ReturnType<NonNullable<
 }
 
 initializeNativeCloseLayerRouting();
+/** 所有独立窗口共享提示机制；页面退出时移除监听。 */
+const disposeIconTooltips = installIconTooltips(document);
+window.addEventListener('pagehide', disposeIconTooltips, { once: true });
 const rendererPerformance = new RendererPerformanceCollector();
 const rendererHydrationStartedAt = performance.now();
 rendererPerformance.install();
@@ -47,17 +50,22 @@ async function renderWithClient(
   readOnlyValidation?: ReadOnlyValidationIdentity,
   bootstrap?: {
     appModule: Promise<typeof import('./App.js')>;
-    sessionViewCache: Promise<unknown | null>;
   },
 ): Promise<void> {
-  const [appModule, snapshot, appShellSettings, sessionViewCache] = await Promise.all([
+  const [appModule, snapshot, appShellSettings] = await Promise.all([
     bootstrap?.appModule ?? import('./App.js'),
-    client.loadDashboard(),
-    client.settings.loadAppShellSettings(),
-    bootstrap?.sessionViewCache ?? Promise.resolve(null),
+    (() => {
+      const startedAt = performance.now();
+      return client.loadHome().then((home) => {
+        window.zeus?.reportStartupSpan?.({ stage: 'home_query', durationMs: performance.now() - startedAt });
+        return home;
+      });
+    })(),
+    window.zeus?.getStartupSettings?.().then((settings) => settings ?? client.settings.loadAppShellSettings()) ?? client.settings.loadAppShellSettings(),
   ]);
   const { App, buildProjectDirectoryResolution, buildTemplateTaskDraft } = appModule;
-  primePersistedSessionViewCache(sessionViewCache);
+  /** 命令回执提供精确变更，工作台自己维护已经加载的项目和分页。 */
+  const changed = (change: Partial<Pick<WorkspaceSnapshot, 'projects' | 'tasks' | 'removedProjectIds' | 'removedTaskIds'>>): WorkspaceSnapshot => ({ ...snapshot, kind: 'change', projects: [], tasks: [], ...change });
   const root = document.getElementById('root');
   if (!root) throw new Error('Zeus renderer root element is missing');
   const reactRoot = createRoot(root);
@@ -112,12 +120,11 @@ async function renderWithClient(
               return resolved.path;
             }}
             onCreateCurrentProject={async (request) => {
-              await client.projects.createProject(request);
-              return client.loadDashboard();
+              return changed({ projects: [await client.projects.createProject(request)] });
             }}
             onArchiveProject={async (projectId) => {
               await client.projects.archiveProject(projectId);
-              return client.loadDashboard();
+              return changed({ removedProjectIds: [projectId] });
             }}
             onLoadProjects={(query) => client.projects.loadProjects({ query })}
             onLoadProject={(projectId) => client.projects.loadProject(projectId)}
@@ -127,18 +134,16 @@ async function renderWithClient(
             onSaveProjectDatabasePassword={(projectId, password) => client.projects.saveProjectDatabasePassword(projectId, password)}
             onClearProjectDatabasePassword={(projectId) => client.projects.clearProjectDatabasePassword(projectId)}
             onUpdateProject={async (projectId, input) => {
-              await client.projects.updateProject(projectId, input);
-              return client.loadDashboard();
+              return changed({ projects: [await client.projects.updateProject(projectId, input)] });
             }}
             onRevealProjectInFinder={(projectPath) => revealProjectInFinderInMain({ zeus: window.zeus, projectPath })}
             onDeleteProject={async (projectId) => {
               await client.projects.deleteProject(projectId);
-              return client.loadDashboard();
+              return changed({ removedProjectIds: [projectId] });
             }}
             onCreateProjectArchiveConfirmation={(projectId) => client.projects.createProjectArchiveConfirmation(projectId)}
             onRestoreProject={async (projectId) => {
-              await client.projects.restoreProject(projectId);
-              return client.loadDashboard();
+              return changed({ projects: [await client.projects.restoreProject(projectId)] });
             }}
             onLoadArchivedProjects={() => client.projects.loadArchivedProjects()}
             onLoadArchivedTasks={(projectId) => client.tasks.loadArchivedTasks(projectId)}
@@ -150,7 +155,7 @@ async function renderWithClient(
             onOpenTaskAttachment={(path) => window.zeus?.openTaskAttachment?.(path) ?? Promise.resolve({ opened: false, error: 'open_attachment_unavailable' })}
             onCreateTaskFromTemplate={async (templateId, projectId, idempotencyKey) => {
               const templateTaskDraft = buildTemplateTaskDraft(appShellSettings.appLanguage);
-              await client.createTaskFromTemplate(templateId, {
+              const task = await client.createTaskFromTemplate(templateId, {
                 idempotencyKey,
                 projectId,
                 title: templateTaskDraft.title,
@@ -159,12 +164,12 @@ async function renderWithClient(
                   ...templateTaskDraft.variables,
                 },
               });
-              return client.loadDashboard();
+              return changed({ tasks: [task] });
             }}
             onChooseConversationResources={() => window.zeus?.chooseConversationResources?.() ?? Promise.resolve([])}
             onChooseTaskAttachments={() => window.zeus?.chooseTaskAttachments?.() ?? Promise.resolve([])}
             onCreateTaskDraft={async (projectId, draft, idempotencyKey) => {
-              await client.tasks.createTask({
+              const task = await client.tasks.createTask({
                 idempotencyKey,
                 projectId,
                 parentTaskId: draft.parentTaskId,
@@ -178,12 +183,13 @@ async function renderWithClient(
                 optimizationExpectedOutcome: draft.optimizationExpectedOutcome,
                 tags: draft.tags,
                 priority: draft.priority,
+                deadline: draft.deadline,
                 sourceContext: {
                   path: snapshot.projects.find((project) => project.id === projectId)?.localPath ?? snapshot.projects[0]?.localPath ?? '',
                   attachments: draft.attachments,
                 },
               });
-              return client.loadDashboard();
+              return changed({ tasks: [task] });
             }}
             onLoadTasks={async (projectId, query, managementStatus, tag, sortBy) =>
               client.tasks.loadTasks({
@@ -197,50 +203,44 @@ async function renderWithClient(
             }
             onLoadTask={(taskId) => client.tasks.loadTask(taskId)}
             onUpdateTask={async (taskId, input) => {
-              await client.tasks.updateTask(taskId, input);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.updateTask(taskId, input)] });
             }}
             onUpdateTaskRelationships={async (taskId, input) => {
-              await client.tasks.updateTaskRelationships(taskId, input);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.updateTaskRelationships(taskId, input)] });
             }}
             onUpdateTaskTags={async (taskId, tags, expectedUpdatedAt) => {
-              await client.tasks.updateTaskTags(taskId, tags, expectedUpdatedAt);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.updateTaskTags(taskId, tags, expectedUpdatedAt)] });
             }}
             onDeleteTask={async (taskId, input) => {
-              await client.tasks.deleteTask(taskId, input);
-              return client.loadDashboard();
+              const result = await client.tasks.deleteTask(taskId, input);
+              return changed({ removedTaskIds: result.deletedTaskIds, tasks: await Promise.all(result.movedChildTaskIds.map((id) => client.tasks.loadTask(id))) });
             }}
             onRunTask={async (taskId) => {
               const result = await client.tasks.runTask(taskId);
               return {
-                snapshot: await client.loadDashboard(),
+                snapshot: changed({ tasks: [result.task] }),
                 task: result.task,
                 conversation: result.conversation,
                 runtimeError: result.runtimeError,
               };
             }}
             onPauseTask={async (taskId) => {
-              await client.tasks.pauseTask(taskId);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.pauseTask(taskId)] });
             }}
             onContinueTask={async (taskId) => {
               const result = await client.tasks.continueTask(taskId);
               return {
-                snapshot: await client.loadDashboard(),
+                snapshot: changed({ tasks: [result.task] }),
                 task: result.task,
                 conversation: result.conversation,
                 runtimeError: result.runtimeError,
               };
             }}
             onCancelTask={async (taskId) => {
-              await client.tasks.cancelTask(taskId);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.cancelTask(taskId)] });
             }}
             onRetryTask={async (taskId) => {
-              await client.tasks.retryTask(taskId);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.retryTask(taskId)] });
             }}
             onLoadLegacyConversation={(projectId, conversationId) => client.loadLegacyConversation(projectId, conversationId)}
             onSendConversationMessage={(projectId, conversationId, content) => client.sendConversationMessage(projectId, conversationId, content)}
@@ -288,8 +288,8 @@ async function renderWithClient(
             onRestoreRuntimeSession={(sessionId) => client.restoreRuntimeSession(sessionId)}
             onDeleteRuntimeSession={(sessionId) => client.deleteRuntimeSession(sessionId)}
             onCreateTaskFromRuntimeSession={async (sessionId, input, idempotencyKey) => {
-              await client.createTaskFromRuntimeSession(sessionId, { ...input, idempotencyKey });
-              return client.loadDashboard();
+              const task = await client.createTaskFromRuntimeSession(sessionId, { ...input, idempotencyKey });
+              return changed({ tasks: [task] });
             }}
             onLoadSecuritySecrets={() => client.loadSecuritySecrets()}
             onLoadSecurityAuditLogs={() => client.loadSecurityAuditLogs()}
@@ -310,20 +310,17 @@ async function renderWithClient(
             onSaveTelegramSecuritySettings={(input) => client.saveTelegramSecuritySettings(input)}
             onLoadTaskEvents={(taskId) => client.tasks.loadTaskEvents(taskId)}
             onUpdateTaskStatus={async (taskId, status) => {
-              await client.tasks.updateTaskStatus(taskId, status);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.updateTaskStatus(taskId, status)] });
             }}
             onUpdateTaskManagementStatus={async (taskId, status, expectedUpdatedAt, confirmWorktreeCleanup, reopenConversationId) => {
-              await client.tasks.updateTaskManagementStatus(taskId, status, expectedUpdatedAt, confirmWorktreeCleanup, reopenConversationId);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.updateTaskManagementStatus(taskId, status, expectedUpdatedAt, confirmWorktreeCleanup, reopenConversationId)] });
             }}
             onArchiveTask={async (taskId) => {
               await client.tasks.archiveTask(taskId);
-              return client.loadDashboard();
+              return changed({ removedTaskIds: [taskId] });
             }}
             onRestoreTask={async (taskId) => {
-              await client.tasks.restoreTask(taskId);
-              return client.loadDashboard();
+              return changed({ tasks: [await client.tasks.restoreTask(taskId)] });
             }}
             onCreateGitConfirmation={(operation, message) =>
               client.git.createGitConfirmation({
@@ -492,12 +489,15 @@ async function hydrateRenderer(): Promise<void> {
   const surface = parameters.get('surface');
   /** 明细窗口不依赖本地服务或数据库迁移，避免无关启动状态阻塞短时悬浮展示。 */
   await waitForConversationStoreMigration();
-  // App 模块和纯本地显示缓存不依赖执行宿主，先与宿主就绪检查并行。
+  // App 模块与宿主就绪检查并行；会话缓存只在选择会话后读取。
+  const appModuleStartedAt = performance.now();
   const mainWindowBootstrap = surface
     ? undefined
     : {
-        appModule: import('./App.js'),
-        sessionViewCache: window.zeus.loadSessionViewCache?.().catch(() => null) ?? Promise.resolve(null),
+        appModule: import('./App.js').then((module) => {
+          window.zeus?.reportStartupSpan?.({ stage: 'app_module', durationMs: performance.now() - appModuleStartedAt });
+          return module;
+        }),
       };
   const executionHostMaintenance = await window.zeus.getExecutionHostMaintenanceStatus?.();
   if (executionHostMaintenance) {
@@ -508,7 +508,10 @@ async function hydrateRenderer(): Promise<void> {
   const config = await window.zeus.getLocalServerConfig();
   const client = createDashboardClient({
     ...config,
-    onPerformanceSpan: rendererPerformance.onApiSpan,
+    onPerformanceSpan: (span) => {
+      rendererPerformance.onApiSpan(span);
+      if (span.operation === 'GET /api/task-summaries') window.zeus?.reportStartupSpan?.({ stage: 'task_page', durationMs: span.durationMs });
+    },
     refreshLocalServerConfig: window.zeus.getLocalServerConfig,
     ...(window.zeus.loadProjectGitWorkbench
       ? {
@@ -649,8 +652,8 @@ function renderConversationStoreMigration(status: NonNullable<Awaited<ReturnType
     padding: '32px',
     boxSizing: 'border-box',
     // 迁移早于应用设置加载，颜色继承首屏的系统或明确主题。
-    background: 'light-dark(#f7f8fa, #17191d)',
-    color: 'light-dark(#202124, #ebedf0)',
+    background: 'light-dark(#f7f8fa, var(--zeus-dark-canvas))',
+    color: 'light-dark(#202124, var(--zeus-dark-text))',
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   });
   const panel = document.createElement('section');
@@ -666,7 +669,7 @@ function renderConversationStoreMigration(status: NonNullable<Awaited<ReturnType
   Object.assign(title.style, { margin: '0 0 12px', fontSize: '22px', lineHeight: '1.3' });
   const detail = document.createElement('p');
   detail.textContent = zh ? '正在准备和检查你的对话记录。完成后会自动打开 Zeus，请保持应用开启。' : 'Preparing and checking your conversation history. Zeus will open automatically when ready. Keep the app open.';
-  Object.assign(detail.style, { margin: '0', color: 'light-dark(#5f6368, #a7acb4)', lineHeight: '1.65', whiteSpace: 'pre-wrap' });
+  Object.assign(detail.style, { margin: '0', color: 'light-dark(#5f6368, var(--zeus-dark-muted))', lineHeight: '1.65', whiteSpace: 'pre-wrap' });
   panel.append(title);
   panel.append(detail);
   shell.append(panel);

@@ -5,7 +5,7 @@ import type { DigitalEmployeeApiClient } from './digitalEmployeeApiClient.js';
 import type { EmployeeMemoryProposal } from './digitalEmployeeContracts.js';
 
 /** 候选经验在此审查，读取列表不会让它自动生效。 */
-export function EmployeeMemoryProposals(props: { client: DigitalEmployeeApiClient; projectId: string; employeeId: string; onAccepted(): void }) {
+export function EmployeeMemoryProposals(props: { client: DigitalEmployeeApiClient; projectId?: string; employeeId: string; onAccepted(): void }) {
   /** 当前员工的权威建议与读取状态。 */
   const [items, setItems] = useState<EmployeeMemoryProposal[] | null>(null);
   /** 失败保留原列表与重试入口。 */
@@ -16,8 +16,7 @@ export function EmployeeMemoryProposals(props: { client: DigitalEmployeeApiClien
     /** 防止切换员工后迟到响应串入当前范围。 */
     let active = true;
     setError(null);
-    void props.client
-      .loadEmployeeMemoryProposals(props.projectId, props.employeeId)
+    void (props.projectId ? props.client.loadEmployeeMemoryProposals(props.projectId, props.employeeId) : props.client.loadGlobalEmployeeMemoryProposals(props.employeeId))
       .then((next) => {
         if (active) setItems(next);
       })
@@ -31,12 +30,11 @@ export function EmployeeMemoryProposals(props: { client: DigitalEmployeeApiClien
   return (
     <section className="employee-memory-proposals">
       <header>
-        <h4>员工提出的经验建议</h4>
+        <h4>待确认建议</h4>
         <Button size="compact" variant="secondary" onClick={() => setRevision((value) => value + 1)}>
           刷新建议
         </Button>
       </header>
-      <p>接纳前不会用于新任务。可以先修正内容，再决定是否成为个人经验。</p>
       {error ? (
         <p role="alert">
           <VisibleApplicationError error={error} />

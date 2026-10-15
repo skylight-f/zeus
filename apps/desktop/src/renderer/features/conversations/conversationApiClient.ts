@@ -1,3 +1,4 @@
+import type { ConversationSystemMessage, ConversationSystemMessageInput, ConversationSystemMessagePage } from '@zeus/shared';
 import type { SendConversationMessageResult } from './conversationContracts.js';
 import type { ConversationNavigationSnapshot } from '@zeus/shared';
 import type { ConversationHistoryItem } from '../conversations/conversationContracts.js';
@@ -49,6 +50,12 @@ import { buildConversationDispatchCommandRequest, conversationDispatchClientComm
 import { buildConversationStartCommandRequest, conversationStartClientCommandTypes } from './conversationStartCommandClient.js';
 
 export interface ConversationApiClient {
+  /** 分页读取 Zeus 系统消息，不请求模型历史。 */
+  loadConversationSystemMessages(projectId: string, conversationId: string, cursor?: string): Promise<ConversationSystemMessagePage>;
+  /** 通过公开命令保存系统消息及其恢复事实。 */
+  saveConversationSystemMessage(projectId: string, conversationId: string, input: ConversationSystemMessageInput): Promise<ConversationSystemMessage>;
+  /** 自动建议只提交轮次身份；主动润色才传草稿，模型和历史由服务端读取。 */
+  generateInputSuggestion: (input: import('@zeus/shared').InputSuggestionRequest, signal: AbortSignal, diagnosticId?: string) => Promise<import('@zeus/shared').InputSuggestionResult>;
   /** 读取全部用户发言目录，不拉取正文。 */
   loadConversationNavigation: (projectId: string, conversationId: string) => Promise<ConversationNavigationSnapshot>;
   /** 读取旧会话正文，保留已有历史查看行为。 */
@@ -58,6 +65,8 @@ export interface ConversationApiClient {
   loadArchivedConversations: () => Promise<ArchivedConversationChoicesSnapshot>;
   loadProjectConversationChoices: (projectId: string) => Promise<NativeProjectConversationChoicesSnapshot>;
   loadProjectConversationChoiceGroups: (projectId: string) => Promise<NativeProjectConversationChoiceGroupsSnapshot>;
+  /** 搜索持久正文，只返回会话身份；较大历史明确告知回退。 */
+  searchConversationContent: (projectId: string, query: string, options?: { signal?: AbortSignal }) => Promise<{ conversationIds: string[]; skipped: boolean }>;
   startProjectConversation: (projectId: string, input: StartProjectConversationRequest) => Promise<NativeConversationStartDispatchResult>;
   loadTaskConversationChoices: (taskId: string) => Promise<NativeConversationChoicesSnapshot>;
   loadCodexConversationCapabilities: (projectId: string) => Promise<CodexConversationCapabilities>;
@@ -84,9 +93,13 @@ export interface ConversationApiClient {
     projectId: string,
     conversationId: string,
     turnId: string,
-    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind'] },
+    options?: { cursor?: string; direction?: 'forward' | 'tail'; limit?: number; byteLimit?: number; kind?: NativeConversationProcessV2Item['kind']; afterEntryId?: string; beforeEntryId?: string },
   ) => Promise<NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>>;
-  loadNativeConversationResourcesV2: (projectId: string, conversationId: string, options?: { cursor?: string; limit?: number; byteLimit?: number }) => Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
+  loadNativeConversationResourcesV2: (
+    projectId: string,
+    conversationId: string,
+    options?: { cursor?: string; limit?: number; byteLimit?: number; signal?: AbortSignal },
+  ) => Promise<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>;
   loadNativeConversationChangeSetV2: (projectId: string, conversationId: string, turnId: string) => Promise<NativeConversationChangeSetV2Summary>;
   loadNativeConversationChangeFilesV2: (
     projectId: string,
@@ -130,7 +143,7 @@ export interface ConversationApiClient {
   updateNativeNextTurnSettings: (projectId: string, conversationId: string, settings: NativeNextTurnSettings) => Promise<NativeNextTurnSettings>;
   sendNativeMessage: (projectId: string, conversationId: string, input: SendNativeMessageRequest) => Promise<NativeOperationAcceptance>;
   forgetNativeMessageCommand: (projectId: string, conversationId: string, idempotencyKey: string) => void;
-  editNativeQueuedSubmission: (projectId: string, conversationId: string, submissionId: string, content: string) => Promise<NativeQueueSnapshot>;
+  editNativeQueuedSubmission: (projectId: string, conversationId: string, submissionId: string, content: string, attachments?: NativeConversationAttachment[]) => Promise<NativeQueueSnapshot>;
   retryNativeQueuedSubmission: (projectId: string, conversationId: string, submissionId: string) => Promise<NativeQueueSnapshot>;
   rerouteNativeQueuedSubmission: (projectId: string, conversationId: string, submissionId: string, settings: NativeNextTurnSettings) => Promise<NativeQueueSnapshot>;
   deleteNativeQueuedSubmission: (projectId: string, conversationId: string, submissionId: string) => Promise<NativeQueueSnapshot>;
@@ -158,12 +171,14 @@ export interface ConversationApiClient {
 
 export function createConversationApiClient(transport: LocalApiTransport): ConversationApiClient {
   return {
+    generateInputSuggestion: (input, signal, diagnosticId) => transport.request('/api/input-suggestions/generate', { ...jsonRequest('POST', input), signal, traceId: diagnosticId }),
     loadLegacyConversation: (projectId, conversationId) => transport.request<ConversationHistoryItem>(`/api/projects/${projectId}/conversations/${conversationId}`),
     sendConversationMessage: (projectId, conversationId, content) =>
       transport.request<SendConversationMessageResult>(`/api/projects/${projectId}/conversations/${conversationId}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
     loadArchivedConversations: () => transport.request<ArchivedConversationChoicesSnapshot>('/api/conversations/archived'),
     loadProjectConversationChoices: (projectId) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/conversation-choices`),
     loadProjectConversationChoiceGroups: (projectId) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/conversation-choice-groups`),
+    searchConversationContent: (projectId, query, options) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/conversation-content-search?${new URLSearchParams({ query })}`, { signal: options?.signal }),
     startProjectConversation: async (projectId, input) => {
       const { idempotencyKey, ...body } = input;
       const commandBody = await buildConversationStartCommandRequest({
@@ -202,6 +217,13 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
         headers: { 'x-zeus-snapshot-caller': 'renderer-session-v2' },
         signal: options?.signal,
       }),
+    loadConversationSystemMessages: (projectId, conversationId, cursor) =>
+      transport.request<ConversationSystemMessagePage>(`${conversationPath(projectId, conversationId)}/system-messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+    saveConversationSystemMessage: async (projectId, conversationId, input) =>
+      transport.request<ConversationSystemMessage>(
+        `${conversationPath(projectId, conversationId)}/system-messages`,
+        jsonRequest('POST', await buildConversationCommandRequest({ commandType: conversationClientCommandTypes.systemMessageSave, conversationId, value: input })),
+      ),
     loadConversationNavigation: (projectId, conversationId) => transport.request<ConversationNavigationSnapshot>(`${conversationPath(projectId, conversationId)}/navigation`),
     loadNativeConversationSessionMetrics: (projectId, conversationId) => transport.request<NativeSessionMetricsSnapshot>(`${conversationPath(projectId, conversationId)}/session-metrics`),
     loadNativeConversationTranscriptPlacements: (projectId, conversationId, entryIds, expectedOrderEpoch) =>
@@ -216,7 +238,7 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
     loadNativeConversationProcessV2: (projectId, conversationId, turnId, options) =>
       transport.request<NativeConversationSnapshotV2Page<NativeConversationProcessV2Item>>(`${conversationPath(projectId, conversationId)}/turns/${encodeURIComponent(turnId)}/process${pageQuery(options)}`),
     loadNativeConversationResourcesV2: (projectId, conversationId, options) =>
-      transport.request<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>(`${conversationPath(projectId, conversationId)}/resources/page${pageQuery(options)}`),
+      transport.request<NativeConversationSnapshotV2Page<NativeConversationResourceV2Item>>(`${conversationPath(projectId, conversationId)}/resources/page${pageQuery(options)}`, { signal: options?.signal }),
     loadNativeConversationChangeSetV2: (projectId, conversationId, turnId) => transport.request<NativeConversationChangeSetV2Summary>(`${conversationPath(projectId, conversationId)}/turns/${encodeURIComponent(turnId)}/change-set/summary`),
     loadNativeConversationChangeFilesV2: (projectId, conversationId, turnId, changeSetId, options) =>
       transport.request<NativeConversationSnapshotV2Page<NativeConversationChangeFileV2Item>>(
@@ -310,12 +332,14 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
     },
     connectEvents: (onEvent, options) => transport.connectEvents(onEvent, options),
     sendNativeMessage: async (projectId, conversationId, input) => {
+      /** 续接只发送目标和稳定身份，模型指令由服务端生成。 */
+      const value = input.retryOfTurnId ? { retryOfTurnId: input.retryOfTurnId, idempotencyKey: input.idempotencyKey, clientUserMessageId: input.clientUserMessageId } : input;
       const body = await buildConversationDispatchCommandRequest({
         commandType: conversationDispatchClientCommandTypes.messageSubmit,
         scopeKind: 'product_conversation',
         scopeId: conversationId,
         reconnectIdentity: input.idempotencyKey,
-        value: input,
+        value,
       });
       return transport.request<NativeOperationAcceptance>(`${conversationPath(projectId, conversationId)}/messages`, jsonRequest('POST', body));
     },
@@ -326,8 +350,13 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
         scopeId: conversationId,
         reconnectIdentity: idempotencyKey,
       }),
-    editNativeQueuedSubmission: async (projectId, conversationId, submissionId, content) => {
-      const body = await buildConversationDispatchCommandRequest({ commandType: conversationDispatchClientCommandTypes.queueUpdate, scopeKind: 'submission', scopeId: submissionId, value: { content } });
+    editNativeQueuedSubmission: async (projectId, conversationId, submissionId, content, attachments) => {
+      const body = await buildConversationDispatchCommandRequest({
+        commandType: conversationDispatchClientCommandTypes.queueUpdate,
+        scopeKind: 'submission',
+        scopeId: submissionId,
+        value: { content, ...(attachments !== undefined ? { attachments } : {}) },
+      });
       return transport.request<NativeQueueSnapshot>(queueSubmissionPath(projectId, conversationId, submissionId), jsonRequest('PATCH', body));
     },
     retryNativeQueuedSubmission: async (projectId, conversationId, submissionId) => {
@@ -390,7 +419,7 @@ function queueSubmissionPath(projectId: string, conversationId: string, submissi
   return `${conversationPath(projectId, conversationId)}/queue/${encodeURIComponent(submissionId)}`;
 }
 
-function pageQuery(options?: { cursor?: string; limit?: number; byteLimit?: number; direction?: 'forward' | 'tail'; kind?: string }): string {
+function pageQuery(options?: { cursor?: string; limit?: number; byteLimit?: number; direction?: 'forward' | 'tail'; kind?: string; afterEntryId?: string; beforeEntryId?: string }): string {
   if (!options) return '';
   const query = new URLSearchParams();
   if (options.cursor) query.set('cursor', options.cursor);
@@ -398,6 +427,8 @@ function pageQuery(options?: { cursor?: string; limit?: number; byteLimit?: numb
   if (options.byteLimit !== undefined) query.set('byteLimit', String(options.byteLimit));
   if (options.direction) query.set('direction', options.direction);
   if (options.kind) query.set('kind', options.kind);
+  if (options.afterEntryId) query.set('afterEntryId', options.afterEntryId);
+  if (options.beforeEntryId) query.set('beforeEntryId', options.beforeEntryId);
   return query.size > 0 ? `?${query.toString()}` : '';
 }
 

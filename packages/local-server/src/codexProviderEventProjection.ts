@@ -30,6 +30,7 @@ import type { NativeUserMessageProjection } from './codexNativeUserMessageProjec
 import type { CodexRolloutRequestUserInputRecovery } from './codexRolloutRequestUserInput.js';
 import {
   completedItemProjection,
+  commandTerminationProjection,
   coordinatorError,
   hasAuditableFileApprovalTarget,
   hasSecretQuestion,
@@ -163,6 +164,17 @@ export interface CodexProviderEventProjectionDependencies {
 
   /** 回复流断开后只读核对 Provider 权威状态，不自动重放原轮次。 */
   recoverProviderStreamFailure(conversationId: string, providerThreadId: string, providerTurnId: string): void;
+  /** Zeus 接管连接失败，先确认原轮次停止再安排恢复。 */
+  reportProviderConnectionRetry(conversationId: string, providerThreadId: string, providerTurnId: string, error: Record<string, unknown>): Promise<void>;
+  /** Provider 真实结束后收口提示，并读取连接耗尽的产品失败原因。 */
+  finishProviderConnectionRetry(
+    conversationId: string,
+    providerThreadId: string,
+    providerTurnId: string,
+    terminal?: boolean,
+    error?: Record<string, unknown>,
+    status?: string,
+  ): { attempt: number; failure: Record<string, unknown> | null; retrying: boolean } | undefined;
 
   rejectTurnResultWaiters(key: string, error: Error): void;
 
@@ -210,6 +222,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     recoverExternalRequestUserInputAnswer,
     recoverExternallyResolvedRequestUserInputAnswers,
     recoverProviderStreamFailure,
+    reportProviderConnectionRetry,
+    finishProviderConnectionRetry,
     rejectTurnResultWaiters,
     resolveTurnResult,
     rememberProcessedProviderEvent,
@@ -360,7 +374,16 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     }
   }
 
-  if (event.method === 'thread/goal/updated' && conversation && threadId) {
+  if (conversation && threadId && event.method.endsWith('/delta') && typeof params.delta === 'string' && params.delta.trim()) {
+    /** 去重和线程校验后的真实输出才结束提示；迟到输出不能取消已发出的停止。 */
+    const providerTurnId = providerTurnIdFrom(params);
+    if (providerTurnId) finishProviderConnectionRetry(conversation.id, threadId, providerTurnId, false);
+  }
+  if (event.method === 'error' && params.willRetry === true && conversation && threadId) {
+    /** 错误必须绑定官方 thread 与 turn，不能从当前页面猜测运行身份。 */
+    const providerTurnId = providerTurnIdFrom(params);
+    if (providerTurnId && isRecord(params.error)) await reportProviderConnectionRetry(conversation.id, threadId, providerTurnId, params.error);
+  } else if (event.method === 'thread/goal/updated' && conversation && threadId) {
     const goal = await options.manager.readThreadGoal({ threadId });
     if (goal) projectGoal(conversation.id, goal, typeof params.turnId === 'string' ? params.turnId : null, event.receivedAt);
   } else if (event.method === 'thread/goal/cleared' && conversation && threadId) {
@@ -586,18 +609,41 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     if (!turn) return;
     await recoverExternallyResolvedRequestUserInputAnswers(conversation, providerTurnId);
     if (turn.status === 'completed' || turn.status === 'interrupted' || turn.status === 'failed') return;
-    const terminalStatus = providerTurnTerminalStatus(params);
+    /** 原生中断确认后，连接预算耗尽在产品层记为失败；原生终态仍保留在错误证据中。 */
+    const nativeStatus = providerTurnTerminalStatus(params);
+    /** 原生失败只是一次尝试的结果；预算未耗尽时继续保留产品请求。 */
+    const connectionRetry = finishProviderConnectionRetry(
+      conversation.id,
+      threadId,
+      providerTurnId,
+      true,
+      nativeStatus === 'failed' ? providerTurnFailureRecord(params, providerTurnFailure(params, providerTurnId)) : undefined,
+      nativeStatus,
+    );
+    const retrying = connectionRetry?.retrying === true;
+    /** 自然完成优先于迟到的停止请求，不把已经成功的结果改写为失败。 */
+    const terminalStatus = connectionRetry?.failure && providerTurnTerminalStatus(params) === 'interrupted' ? 'failed' : providerTurnTerminalStatus(params);
     const interrupted = terminalStatus === 'interrupted';
     const failed = terminalStatus === 'failed';
     const timestamp = event.receivedAt;
     modelRequestTiming.clear(conversation.id, turn.id);
     sessionMetricsChanged = true;
-    const failure = failed ? providerTurnFailure(params, providerTurnId) : null;
+    const failure = failed
+      ? connectionRetry?.failure
+        ? Object.assign(coordinatorError(String(connectionRetry.failure.code), String(connectionRetry.failure.message)), { providerTurnId })
+        : providerTurnFailure(params, providerTurnId)
+      : null;
     /** 同一份官方失败记录同时驱动落库、展示和会话阻塞判断。 */
-    const failureRecord = failure ? providerTurnFailureRecord(params, failure) : undefined;
+    const failureRecord = failure
+      ? {
+          ...providerTurnFailureRecord(params, failure),
+          ...(connectionRetry?.failure ?? {}),
+          ...(retrying ? { code: 'ZEUS_MODEL_RESPONSE_RETRYING' } : {}),
+        }
+      : undefined;
     /** 外部服务类错误暂停会话；本地 Runtime 与工具错误仍保持真实失败。 */
     const providerBlocked = failureRecord ? isProviderBlockingTurnFailure(failureRecord) : false;
-    if (failure && isProviderResponseStreamDisconnected(failure)) {
+    if (!connectionRetry && failure && isProviderResponseStreamDisconnected(failure)) {
       providerStreamRecovery = { conversationId: conversation.id, providerThreadId: threadId, providerTurnId };
     }
     const turnItems = options.providerItems.listByConversation(conversation.id).filter((item) => item.turnId === turn.id);
@@ -617,7 +663,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
                 candidate.textContent.trim().startsWith(streamedText),
             )
           : undefined;
-      const streamedPayload = parseJsonRecord(streamedItem.payloadJson);
+      const streamedPayload = commandTerminationProjection(parseJsonRecord(streamedItem.payloadJson), streamedItem.itemType, terminalStatus);
       const streamedPresentation = isRecord(streamedPayload.presentation) ? streamedPayload.presentation : {};
       const reconciledItem = options.providerItems.upsertCompleted({
         conversationId: conversation.id,
@@ -691,6 +737,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     if (!internalContextCompaction && !failed && !interrupted) createdPlanImplementationRequest = ensurePlanImplementationRequest(conversation.id, turn, activeSubmission, timestamp);
     if (internalContextCompaction) {
       runStates.set(conversation.id, { type: 'idle' });
+    } else if (retrying) {
+      runStates.set(conversation.id, { type: 'active', turnId: providerTurnId, phase: 'prework' });
     } else if (failed) {
       for (const queued of submissions.filter((entry) => entry.status === 'queued')) options.submissions.updateStatus(queued.id, 'paused', { pausedReason: 'recovery_required' });
       runStates.set(conversation.id, { type: 'paused', reason: 'recovery_required' });
@@ -709,11 +757,11 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       providerId: 'codex',
       providerThreadId: threadId,
       providerModel: conversation.providerModel,
-      providerState: internalContextCompaction ? 'ready' : failed ? (providerBlocked ? 'paused' : 'failed') : recoveryRequiredSubmissions.length > 0 || (interrupted && hasInterruptedQueue) ? 'paused' : 'ready',
+      providerState: retrying ? 'waiting' : internalContextCompaction ? 'ready' : failed ? (providerBlocked ? 'paused' : 'failed') : recoveryRequiredSubmissions.length > 0 || (interrupted && hasInterruptedQueue) ? 'paused' : 'ready',
     });
     const ephemeral = contexts.get(conversation.id)?.ephemeral === true;
     const conversationGoal = options.goals.get(conversation.id);
-    if (!internalContextCompaction && !ephemeral && !conversationGoal) {
+    if (!retrying && !internalContextCompaction && !ephemeral && !conversationGoal) {
       options.conversations.markAttentionUnread(conversation.id, {
         kind: failed ? 'failed' : interrupted ? 'interrupted' : 'completed',
         turnId: providerTurnId,
@@ -721,8 +769,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       });
     }
     const resultKey = `${conversation.id}:${providerTurnId}`;
-    if (internalContextCompaction) {
-      // 压缩轮次没有用户提交和回答等待者；只保留过程、usage 与终态，不制造普通回答结果。
+    if (internalContextCompaction || retrying) {
+      // 自动续接由最终尝试结算原请求；压缩轮次没有用户提交和回答等待者；只保留过程、usage 与终态，不制造普通回答结果。
     } else if (failure) {
       failedTurnResults.set(resultKey, failure);
       rejectTurnResultWaiters(resultKey, failure);
@@ -738,7 +786,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       };
       resolveTurnResult(result);
     }
-    if (!internalContextCompaction && ephemeral) {
+    if (!retrying && !internalContextCompaction && ephemeral) {
       options.conversations.bindProvider(conversation.id, {
         providerId: 'codex',
         providerThreadId: threadId,
@@ -749,7 +797,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       contexts.delete(conversation.id);
     }
     broadcast = {
-      type: 'conversation.turn.completed',
+      type: retrying ? 'conversation.turn.retrying' : 'conversation.turn.completed',
       payload: {
         conversationId: conversation.id,
         projectId: conversation.projectId,
@@ -759,7 +807,10 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
         completedAt: timestamp,
         ...(failureRecord ? { error: projectConversationTurnFailure(failureRecord) } : {}),
         hasUnreadAttention: options.conversations.getById(conversation.id)?.attentionUnread === true,
-        notificationEligible: !internalContextCompaction && !conversationGoal,
+        notificationEligible: !retrying && !internalContextCompaction && !conversationGoal,
+        /** 正常实时完成才允许预测下一句，独立于桌面通知和目标模式。 */
+        inputSuggestionEligible: !retrying && !internalContextCompaction,
+        ...(retrying ? { internalOperation: 'connection_retry', retrying: true } : {}),
         ...(internalContextCompaction ? { internalOperation: 'context_compaction' } : {}),
       },
     };
@@ -1504,6 +1555,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     if (requestKind) {
       const providerTurnId = providerTurnIdFrom(params);
       const turn = providerTurnId ? options.turns.listByConversation(conversation.id).find((candidate) => candidate.providerTurnId === providerTurnId) : undefined;
+      // 用量通知可能在用户回答、审批或 MCP 交互结束后才到达，整段请求不能作为纯文本测速样本。
+      if (turn) modelRequestTiming.observe(conversation.id, turn.id, event.receivedAt, 'non_text');
       const request = options.requests.upsert({
         conversationId: conversation.id,
         turnId: turn?.id,
