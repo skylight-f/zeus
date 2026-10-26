@@ -13,9 +13,7 @@ import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 /** 与会话和交付共用按可视区域渲染的差异视图。 */
 const CodeDiffView = lazy(() => import('../code/CodeDiffView.js').then((module) => ({ default: module.CodeDiffView })));
 
-import '../styles.css';
-import '../ui/primitives.css';
-import '../agentdesk-theme.css';
+import '../workspace.css';
 
 interface SideBySideDiffProps {
   partitionHunks?: boolean;

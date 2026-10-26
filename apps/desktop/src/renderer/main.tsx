@@ -11,7 +11,7 @@ import { RendererPerformanceCollector } from './rendererPerformanceObservability
 import { installIconTooltips } from '../preload/iconTooltip.js';
 import { installMarkdownListInput } from '../preload/markdownListInput.js';
 // 启动失败可能早于工作台模块加载，恢复页样式必须随入口就绪。
-import './styles.css';
+import './workspace.css';
 
 /** 启动阶段尚未加载设置时采用中文；设置就绪后沿用用户选择。 */
 let startupLanguage: 'zh-CN' | 'en-US' = 'zh-CN';

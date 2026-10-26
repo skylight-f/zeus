@@ -241,7 +241,8 @@
 }
 @media (min-width: 760px) {
   .macos-ai-app.zeus-shell.project-navigation-rail-shell .project-workspace-project-switcher:has(.attention-toggle) {
-    grid-template-columns: minmax(0, 1fr) minmax(180px, clamp(180px, 24vw, 320px)) 32px;
+    /* 本地顶栏同时保留通知与待处理入口，分别占一列，避免待处理按钮挤到设置侧栏上方。 */
+    grid-template-columns: minmax(0, 1fr) minmax(180px, clamp(180px, 24vw, 320px)) 32px 32px;
     column-gap: 10px;
     padding-inline-end: 10px;
   }

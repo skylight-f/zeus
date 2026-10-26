@@ -3,6 +3,7 @@ import { GitBranchIcon as WorkspaceGitIcon } from '@phosphor-icons/react/dist/cs
 import { DotsThreeVerticalIcon as DotsThreeVertical } from '@phosphor-icons/react/dist/csr/DotsThreeVertical';
 import { distributionAppName } from '../../tooling/distribution.js';
 import { MotionPresence } from '../../ui/MotionPresence.js';
+import { MenuSurface } from '../../ui/MenuSurface.js';
 import { temporaryWorkspaceId, normalizeSidebarConversationFilters, sidebarConversationRunStatusGroup, sidebarConversationRunStatusGroups, type ProjectSourceContentMatch, type SidebarConversationFilters } from '@zeus/shared';
 import { Collapsible } from '../../ui/Collapsible.js';
 import { handleSourceListKeyboardNavigation } from './workspaceSupport.js';
@@ -568,32 +569,187 @@ function GlobalSearchGroup(props: { title: string; icon: ReactNode; children: Re
   );
 }
 
+/** 两种布局共用项目操作，移除仍由工作台执行二次确认。 */
+interface ProjectActionsProps {
+  pinnedProjectIds: string[];
+  onTogglePinnedProject: (projectId: string) => void;
+  onRevealProjectInFinder: (projectPath: string) => Promise<void>;
+  onRenameProject: (projectId: string, displayName: string) => Promise<void>;
+  onPrepareProjectDelete: (projectId: string) => void;
+  onConfirmProjectDelete: (projectId: string) => void;
+  pendingProjectDeleteId?: string;
+}
+
+/** 经典布局的更多菜单与紧凑布局的右键菜单使用同一组动作。 */
+function ProjectMenuActions(props: { actions: ProjectActionsProps; project: ProjectRecord; language: AppLanguage; onClose: () => void; onRename: (project: ProjectRecord) => void }) {
+  const { actions, project } = props;
+  const copy = getLanguageCopy(props.language).sidebar;
+  const pinned = actions.pinnedProjectIds.includes(project.id);
+  return (
+    <>
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          actions.onTogglePinnedProject(project.id);
+          props.onClose();
+        }}
+      >
+        <span className="project-more-menu-icon" aria-hidden="true">
+          {pinned ? <PushPinSlash weight="regular" /> : <PushPin weight="regular" />}
+        </span>
+        <span>{pinned ? copy.unpinProject : copy.pinProject}</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          props.onClose();
+          void actions.onRevealProjectInFinder(project.localPath).catch(() => undefined);
+        }}
+      >
+        <span className="project-more-menu-icon" aria-hidden="true">
+          <FolderOpen weight="regular" />
+        </span>
+        <span>{copy.revealProjectInFinder}</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          props.onClose();
+          props.onRename(project);
+        }}
+      >
+        <span className="project-more-menu-icon" aria-hidden="true">
+          <PencilSimple weight="regular" />
+        </span>
+        <span>{copy.renameProject}</span>
+      </button>
+      <button type="button" role="menuitem" className="project-menu-remove-action" onClick={() => actions.onPrepareProjectDelete(project.id)}>
+        <span className="project-more-menu-icon" aria-hidden="true">
+          <X weight="regular" />
+        </span>
+        <span>{copy.deleteProject}</span>
+      </button>
+      {actions.pendingProjectDeleteId === project.id ? (
+        <button
+          type="button"
+          role="menuitem"
+          className="danger-action project-menu-confirm-remove-action"
+          onClick={() => {
+            actions.onConfirmProjectDelete(project.id);
+            props.onClose();
+          }}
+        >
+          <span className="project-more-menu-icon" aria-hidden="true">
+            <X weight="bold" />
+          </span>
+          <span>{copy.confirmDeleteProject}</span>
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+/** 重命名共用校验、错误反馈和关闭后焦点恢复。 */
+function useProjectRename(props: ProjectActionsProps, language: AppLanguage, restoreFocus: (projectId: string) => void) {
+  const [target, setTarget] = useState<ProjectRecord>();
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const copy = getLanguageCopy(language).sidebar;
+  const open = (project: ProjectRecord) => {
+    setTarget(project);
+    setDraft(project.name);
+    setError(undefined);
+  };
+  const close = () => {
+    if (busy) return;
+    const projectId = target?.id;
+    setTarget(undefined);
+    setDraft('');
+    setError(undefined);
+    if (projectId) window.requestAnimationFrame(() => restoreFocus(projectId));
+  };
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!target || busy) return;
+    const displayName = draft.trim();
+    if (!displayName) {
+      setError(copy.renameRequired);
+      return;
+    }
+    setBusy(true);
+    setError(undefined);
+    try {
+      await props.onRenameProject(target.id, displayName);
+      const projectId = target.id;
+      setTarget(undefined);
+      setDraft('');
+      window.requestAnimationFrame(() => restoreFocus(projectId));
+    } catch (cause) {
+      setError(errorToLocalUiMessage(cause, language));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const dialog = (
+    <MotionPresence>
+      {target ? (
+        <ProjectRenameDialog
+          project={target}
+          draft={draft}
+          busy={busy}
+          error={error}
+          copy={copy}
+          onDraftChange={(value) => {
+            setDraft(value);
+            setError(undefined);
+          }}
+          onClose={close}
+          onSubmit={(event) => void submit(event)}
+        />
+      ) : null}
+    </MotionPresence>
+  );
+  return { open, dialog };
+}
+
 /** 项目切换器固定在左上角，活动栏保留会话、任务与源码入口。 */
-export function ProjectWorkspaceNavigation(props: {
-  notificationCenter?: ReactNode;
-  attentionAction?: ReactNode;
-  project: ProjectRecord;
-  projects: ProjectRecord[];
-  onSelectProject: (project: ProjectRecord) => void;
-  /** 关闭槽位前先收口该项目持有的后台终端。 */
-  onCloseProject: (project: ProjectRecord) => Promise<void>;
-  canCreateProject: boolean;
-  createProjectBusy: boolean;
-  activeNavTarget: WorkspaceViewId;
-  section: ProjectWorkspaceSection;
-  codeMode: ProjectCodeWorkspaceMode;
-  language: AppLanguage;
-  onOpen: (section: ProjectWorkspaceSection, codeMode?: ProjectCodeWorkspaceMode) => void;
-  onNavigate: (target: WorkspaceViewId) => void;
-  onCreateProject: () => void;
-  onCreateConversation: () => void;
-  tasks: TaskRecord[];
-  conversationGroups: ProjectConversationGroup[];
-  conversationStates?: Record<string, ConversationTreeRuntimeState>;
-  onOpenTask: (task: TaskRecord) => void;
-  onOpenConversation: (conversation: NativeConversationChoice) => void;
-  onOpenSourceMatch: (project: ProjectRecord, match: ProjectSourceContentMatch) => void;
-}) {
+export function ProjectWorkspaceNavigation(
+  props: ProjectActionsProps & {
+    notificationCenter?: ReactNode;
+    attentionAction?: ReactNode;
+    project: ProjectRecord;
+    projects: ProjectRecord[];
+    onSelectProject: (project: ProjectRecord) => void;
+    /** 关闭槽位前先收口该项目持有的后台终端。 */
+    onCloseProject: (project: ProjectRecord) => Promise<void>;
+    canCreateProject: boolean;
+    createProjectBusy: boolean;
+    activeNavTarget: WorkspaceViewId;
+    section: ProjectWorkspaceSection;
+    codeMode: ProjectCodeWorkspaceMode;
+    language: AppLanguage;
+    onOpen: (section: ProjectWorkspaceSection, codeMode?: ProjectCodeWorkspaceMode) => void;
+    onNavigate: (target: WorkspaceViewId) => void;
+    onCreateProject: () => void;
+    onCreateConversation: () => void;
+    tasks: TaskRecord[];
+    conversationGroups: ProjectConversationGroup[];
+    conversationStates?: Record<string, ConversationTreeRuntimeState>;
+    onOpenTask: (task: TaskRecord) => void;
+    onOpenConversation: (conversation: NativeConversationChoice) => void;
+    onOpenSourceMatch: (project: ProjectRecord, match: ProjectSourceContentMatch) => void;
+  },
+) {
+  const [projectMenu, setProjectMenu] = useState<{ projectId: string; left: number; top: number }>();
+  const projectTabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const projectRename = useProjectRename(props, props.language, (projectId) => projectTabRefs.current.get(projectId)?.focus({ preventScroll: true }));
+  const menuProject = props.projects.find((project) => project.id === projectMenu?.projectId && project.id !== temporaryWorkspaceId);
+  const closeProjectMenu = () => setProjectMenu(undefined);
+  const menuHost = typeof document === 'undefined' ? null : document.querySelector('.macos-ai-app.zeus-shell');
   /** 导航文案跟随当前应用语言。 */
   const zh = props.language === 'zh-CN';
   /** 会话入口支持 Option 点击创建新会话。 */
@@ -765,10 +921,33 @@ export function ProjectWorkspaceNavigation(props: {
                   onDragOver={(event) => handleProjectSlotDragOver(event, slot.id)}
                   onDrop={(event) => handleProjectSlotDrop(event, slot.id)}
                   onDragEnd={handleProjectSlotDragEnd}
+                  onContextMenu={(event) => {
+                    if (!slotProject || slotProject.id === temporaryWorkspaceId || projectCloseBusy) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    projectTabRefs.current.get(slotProject.id)?.focus({ preventScroll: true });
+                    setProjectMenu({ projectId: slotProject.id, left: event.clientX, top: event.clientY });
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+                    if (!slotProject || slotProject.id === temporaryWorkspaceId || projectCloseBusy) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    projectTabRefs.current.get(slotProject.id)?.focus({ preventScroll: true });
+                    setProjectMenu({ projectId: slotProject.id, left: rect.left, top: rect.bottom + 6 });
+                  }}
                 >
                   <button
                     type="button"
                     className="project-workspace-project-slot-primary"
+                    ref={(button) => {
+                      if (!slotProject) return;
+                      if (button) projectTabRefs.current.set(slotProject.id, button);
+                      else projectTabRefs.current.delete(slotProject.id);
+                    }}
+                    aria-haspopup={slotProject && slotProject.id !== temporaryWorkspaceId ? 'menu' : undefined}
+                    aria-controls={projectMenu && projectMenu.projectId === slotProject?.id ? 'project-tab-context-menu' : undefined}
                     aria-label={projectStatus ? `${selectLabel}，${projectStatus.label}` : selectLabel}
                     title={projectStatus?.label}
                     aria-pressed={active}
@@ -1024,6 +1203,24 @@ export function ProjectWorkspaceNavigation(props: {
           <span className="project-workspace-mode-label">{zh ? '设置' : 'Settings'}</span>
         </button>
       </nav>
+      {createPortal(
+        <MotionPresence>
+          {projectMenu && menuProject ? (
+            <MenuSurface
+              key={menuProject.id}
+              id="project-tab-context-menu"
+              className="project-more-popover zeus-quiet-more-menu"
+              aria-label={`${menuProject.name} ${getLanguageCopy(props.language).sidebar.moreProjectActionsPrefix}`}
+              style={{ left: projectMenu.left, top: projectMenu.top }}
+              onClose={closeProjectMenu}
+            >
+              <ProjectMenuActions actions={props} project={menuProject} language={props.language} onClose={closeProjectMenu} onRename={projectRename.open} />
+            </MenuSurface>
+          ) : null}
+        </MotionPresence>,
+        menuHost ?? document.body,
+      )}
+      {projectRename.dialog}
     </>
   );
 }
@@ -1102,10 +1299,6 @@ export function SidebarNav(props: {
     props.onConversationFiltersChange(next);
   }
   const [visibleConversationCountByProject, setVisibleConversationCountByProject] = useState<Record<string, number>>({});
-  const [projectRenameTarget, setProjectRenameTarget] = useState<ProjectRecord | undefined>();
-  const [projectRenameDraft, setProjectRenameDraft] = useState('');
-  const [projectRenameBusy, setProjectRenameBusy] = useState(false);
-  const [projectRenameError, setProjectRenameError] = useState<string | undefined>();
   const openProjectMenuIdsRef = useRef(openProjectMenuIds);
   const projectMenuButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const projectMenuCloseTimerRefs = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -1383,42 +1576,7 @@ export function SidebarNav(props: {
                   : zh
                     ? '会话'
                     : 'Conversations';
-  const openProjectRenameDialog = (project: ProjectRecord) => {
-    closeOpenProjectMoreMenusWithMotion();
-    setProjectRenameTarget(project);
-    setProjectRenameDraft(project.name);
-    setProjectRenameError(undefined);
-  };
-  const closeProjectRenameDialog = () => {
-    if (projectRenameBusy) return;
-    const projectId = projectRenameTarget?.id;
-    setProjectRenameTarget(undefined);
-    setProjectRenameDraft('');
-    setProjectRenameError(undefined);
-    if (projectId) window.requestAnimationFrame(() => projectMenuButtonRefs.current.get(projectId)?.focus());
-  };
-  const submitProjectRename = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!projectRenameTarget || projectRenameBusy) return;
-    const displayName = projectRenameDraft.trim();
-    if (!displayName) {
-      setProjectRenameError(copy.renameRequired);
-      return;
-    }
-    setProjectRenameBusy(true);
-    setProjectRenameError(undefined);
-    try {
-      await props.onRenameProject(projectRenameTarget.id, displayName);
-      const projectId = projectRenameTarget.id;
-      setProjectRenameTarget(undefined);
-      setProjectRenameDraft('');
-      window.requestAnimationFrame(() => projectMenuButtonRefs.current.get(projectId)?.focus());
-    } catch (error) {
-      setProjectRenameError(errorToLocalUiMessage(error, props.appLanguage));
-    } finally {
-      setProjectRenameBusy(false);
-    }
-  };
+  const projectRename = useProjectRename(props, props.appLanguage, (projectId) => projectMenuButtonRefs.current.get(projectId)?.focus());
   /** 相同状态身份合并为一个选项；项目自定义名称不同则并列显示，避免误读。 */
   const statusLabelsById = new Map<string, Set<string>>();
   for (const group of scopedConversationGroups) {
@@ -1728,7 +1886,6 @@ export function SidebarNav(props: {
                   props.activeNavTarget !== 'digital-employees' &&
                   props.activeNavTarget !== 'digital-teams' &&
                   props.activeNavTarget !== 'automations';
-                const pinned = props.pinnedProjectIds.includes(project.id);
                 const expanded = Boolean(scopeToCurrentProject) || !props.collapsedProjectIds.includes(project.id);
                 const menuOpen = openProjectMenuIds.has(project.id);
                 const menuClosing = closingProjectMenuIds.has(project.id);
@@ -1753,62 +1910,16 @@ export function SidebarNav(props: {
                       style={{ left: menuPosition.left, top: menuPosition.top }}
                       onKeyDown={(event) => handleProjectMoreMenuKeyDown(event, project.id)}
                     >
-                      {/* 项目菜单提升到应用壳层，位置只由“更多”按钮的视口坐标决定，避免被侧栏滚动容器横向裁剪。 */}
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          props.onTogglePinnedProject(project.id);
-                          closeProjectMoreMenuWithMotion(project.id);
+                      <ProjectMenuActions
+                        actions={props}
+                        project={project}
+                        language={props.appLanguage}
+                        onClose={() => closeProjectMoreMenuWithMotion(project.id)}
+                        onRename={(target) => {
+                          closeOpenProjectMoreMenusWithMotion();
+                          projectRename.open(target);
                         }}
-                      >
-                        <span className="project-more-menu-icon" aria-hidden="true">
-                          {pinned ? <PushPinSlash weight="regular" /> : <PushPin weight="regular" />}
-                        </span>
-                        <span>{pinned ? copy.unpinProject : copy.pinProject}</span>
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeProjectMoreMenuWithMotion(project.id);
-                          void props.onRevealProjectInFinder(project.localPath).catch(() => undefined);
-                        }}
-                      >
-                        <span className="project-more-menu-icon" aria-hidden="true">
-                          <FolderOpen weight="regular" />
-                        </span>
-                        <span>{copy.revealProjectInFinder}</span>
-                      </button>
-                      <button type="button" role="menuitem" onClick={() => openProjectRenameDialog(project)}>
-                        <span className="project-more-menu-icon" aria-hidden="true">
-                          <PencilSimple weight="regular" />
-                        </span>
-                        <span>{copy.renameProject}</span>
-                      </button>
-                      <button type="button" role="menuitem" className="project-menu-remove-action" onClick={() => props.onPrepareProjectDelete(project.id)}>
-                        <span className="project-more-menu-icon" aria-hidden="true">
-                          <X weight="regular" />
-                        </span>
-                        <span>{copy.deleteProject}</span>
-                      </button>
-                      {props.pendingProjectDeleteId === project.id ? (
-                        <button
-                          data-icon-tooltip={`${expanded ? copy.collapseProjectPrefix : copy.expandProjectPrefix}${copy.labelSeparator}${project.name}`}
-                          type="button"
-                          role="menuitem"
-                          className="danger-action project-menu-confirm-remove-action"
-                          onClick={() => {
-                            props.onConfirmProjectDelete(project.id);
-                            closeProjectMoreMenuWithMotion(project.id);
-                          }}
-                        >
-                          <span className="project-more-menu-icon" aria-hidden="true">
-                            <X weight="bold" />
-                          </span>
-                          <span>{copy.confirmDeleteProject}</span>
-                        </button>
-                      ) : null}
+                      />
                     </div>
                   ) : null;
                 return (
@@ -1972,23 +2083,7 @@ export function SidebarNav(props: {
           </section>
         ) : null}
       </footer>
-      <MotionPresence>
-        {projectRenameTarget ? (
-          <ProjectRenameDialog
-            project={projectRenameTarget}
-            draft={projectRenameDraft}
-            busy={projectRenameBusy}
-            error={projectRenameError}
-            copy={copy}
-            onDraftChange={(draft) => {
-              setProjectRenameDraft(draft);
-              if (projectRenameError) setProjectRenameError(undefined);
-            }}
-            onClose={closeProjectRenameDialog}
-            onSubmit={(event) => void submitProjectRename(event)}
-          />
-        ) : null}
-      </MotionPresence>
+      {projectRename.dialog}
     </aside>
   );
 }

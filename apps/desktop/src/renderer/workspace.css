@@ -1,0 +1,9 @@
+/* 将本地基础样式与主题放在同一 CSS 入口，避免代码分块改变覆盖顺序。 */
+@import '@xterm/xterm/css/xterm.css';
+@import './styles.css';
+@import './tooling/tools/base.css';
+@import './session/session.css';
+@import './ui/primitives.css';
+@import './agentdesk-theme.css';
+@import './tooling/tools/theme.css';
+@import './settings/settings.css';

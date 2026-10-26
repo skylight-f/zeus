@@ -1759,7 +1759,8 @@ body:has(.macos-ai-app.zeus-shell) {
 .macos-ai-app.zeus-shell .project-git-navigator .project-git-repository-scope strong {
   color: var(--zeus-brand-text);
 }
-.macos-ai-app.zeus-shell .project-git-navigator button > span {
+/* 只有文字参与剩余宽度分配，当前分支圆点沿用固定尺寸。 */
+.macos-ai-app.zeus-shell .project-git-navigator button > span:where(:not(.git-current-branch-dot)) {
   flex: 1;
   min-inline-size: 0;
   overflow-wrap: anywhere;

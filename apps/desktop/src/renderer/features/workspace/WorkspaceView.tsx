@@ -941,6 +941,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           attentionAction={<AttentionToggle open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} />}
           project={selectedProject}
           projects={orderedProjects}
+          pinnedProjectIds={appShellSettings.pinnedProjectIds}
+          onTogglePinnedProject={togglePinnedProject}
+          onRevealProjectInFinder={revealProjectInFinder}
+          onRenameProject={renameProjectDisplayName}
+          onPrepareProjectDelete={setPendingProjectDeleteId}
+          onConfirmProjectDelete={deleteProject}
+          pendingProjectDeleteId={pendingProjectDeleteId}
           onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection, projectCodeWorkspaceMode)}
           onCloseProject={async (project) => {
             await terminateProjectTerminalSessions(props.commandClient ?? null, project.id);
