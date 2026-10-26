@@ -1,4 +1,4 @@
-import { basename, extname } from 'node:path';
+import { basename, extname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 
@@ -21,7 +21,8 @@ export type TaskClipboardReadOptions = {
   readSystemFileReferences?: () => Promise<string[]>;
 };
 
-const fileReferenceClipboardFormats = ['public.file-url', 'text/uri-list', 'text/plain', 'public.utf8-plain-text', 'NSStringPboardType', 'NSFilenamesPboardType'] as const;
+/** 只有声明为文件列表的格式才授予文件读取语义；普通正文和 HTML 不隐式授权路径。 */
+const fileReferenceClipboardFormats = ['public.file-url', 'text/uri-list', 'NSFilenamesPboardType'] as const;
 const maxDecodedClipboardReferenceBytes = 8 * 1024 * 1024;
 const supportedImageInputMimeTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
@@ -134,14 +135,17 @@ export async function readTaskClipboardAttachmentsFromClipboard(reader: NativeTa
   /** 标准格式已有文件引用时无需启动系统回退读取，避免每次粘贴都等待外部进程。 */
   const fileReferences = extractTaskClipboardFileReferences(clipboardTexts);
   if (fileReferences.length === 0) fileReferences.push(...extractTaskClipboardFileReferences(await readSystemClipboardFileReferences(options)));
-  if (isSingleUnsupportedImageReference(fileReferences)) {
+  // Windows 的文件剪贴板图片可能只是资源管理器图标，必须保留原文件。
+  if (process.platform !== 'win32' && isSingleUnsupportedImageReference(fileReferences)) {
     const normalizedImageAttachment = safelyReadTaskClipboardImageAttachment(reader);
     if (normalizedImageAttachment) return [normalizedImageAttachment];
   }
   const fileReferenceAttachments = await readTaskAttachmentFilePathPayloads(fileReferences);
   if (fileReferenceAttachments.length > 0) return fileReferenceAttachments;
+  // Windows 禁止把资源管理器图标当附件；其他平台保持原有图片回退顺序。
+  if (process.platform === 'win32' && fileReferences.length > 0) throw new Error('剪贴板引用的文件无法读取，请确认文件仍存在且具有访问权限。');
 
-  const inlineImageAttachments = extractTaskClipboardInlineImageAttachments(clipboardTexts);
+  const inlineImageAttachments = extractTaskClipboardInlineImageAttachments([safelyReadClipboardHtml(reader)]);
   if (inlineImageAttachments.length > 0) return inlineImageAttachments;
 
   const imageAttachment = safelyReadTaskClipboardImageAttachment(reader);
@@ -159,16 +163,18 @@ export async function readTaskClipboardFileReferencesFromClipboard(reader: Nativ
   /** Electron 能识别真实路径时直接授权；私有格式才需要系统读取。 */
   const fileReferences = extractTaskClipboardFileReferences(clipboardTexts);
   if (fileReferences.length === 0) fileReferences.push(...extractTaskClipboardFileReferences(await readSystemClipboardFileReferences(options)));
-  if (isSingleUnsupportedImageReference(fileReferences) && hasReadableClipboardImage(reader)) return [];
+  if (process.platform !== 'win32' && isSingleUnsupportedImageReference(fileReferences) && hasReadableClipboardImage(reader)) return [];
   return fileReferences;
 }
 
+/** Windows 必须报告原生文件读取失败；其他平台沿用既有图片回退契约。 */
 async function readSystemClipboardFileReferences(options: TaskClipboardReadOptions): Promise<string[]> {
   if (!options.readSystemFileReferences) return [];
   try {
     return await options.readSystemFileReferences();
-  } catch {
-    // 系统剪贴板私有格式不可读时继续走 Electron 标准格式和 bitmap 回退。
+  } catch (error) {
+    // Windows 读取失败或超限不能伪装为无文件，避免把资源管理器图标当成原文件。
+    if (process.platform === 'win32') throw error;
     return [];
   }
 }
@@ -187,7 +193,8 @@ function hasReadableClipboardImage(reader: NativeTaskClipboardReader): boolean {
   }
 }
 
-function safelyReadTaskClipboardImageAttachment(reader: NativeTaskClipboardReader): TaskClipboardAttachmentPayload | null {
+/** 立即读取剪贴板图片快照；无图片或格式不可读时返回空值。 */
+export function safelyReadTaskClipboardImageAttachment(reader: NativeTaskClipboardReader): TaskClipboardAttachmentPayload | null {
   try {
     return readTaskClipboardImageAttachment(reader.readImage());
   } catch {
@@ -251,45 +258,33 @@ function readTaskClipboardImageAttachment(image: NativeClipboardImage): TaskClip
   };
 }
 
+/** 只解码显式文件引用格式，其他私有格式及正文交由对应的图片或文本入口处理。 */
 function readNativeClipboardReferenceTexts(reader: NativeTaskClipboardReader): string[] {
+  /** 标准文件格式中的候选由路径解析器继续校验。 */
   const values: string[] = [];
+  /** 一次读取格式列表，避免同轮读取中反复探测系统剪贴板。 */
   const formats = new Set(reader.availableFormats());
-  const decodedFormats = new Set<string>();
-  try {
-    const text = reader.readText();
-    if (text) values.push(text);
-  } catch {
-    // 默认文本剪贴板在部分环境不可读时继续解析格式化 buffer。
-  }
   for (const format of fileReferenceClipboardFormats) {
     if (!formats.has(format)) continue;
     try {
+      /** 文件列表只允许有界元数据，不解码任意大块内容。 */
       const buffer = reader.readBuffer(format);
-      decodedFormats.add(format);
+      if (buffer.byteLength > maxDecodedClipboardReferenceBytes) throw new Error('剪贴板文件列表超过大小限制。');
       values.push(...decodeClipboardBuffer(buffer));
     } catch {
-      // 无法读取的私有格式直接忽略；真正的 bitmap 已在 readImage 处理。
+      // 平台格式不可读时由现有系统文件列表读取处理，不猜测正文中的路径。
     }
-  }
-  for (const format of formats) {
-    if (decodedFormats.has(format) || nativeClipboardImageFormats.has(format.toLowerCase())) continue;
-    try {
-      const buffer = reader.readBuffer(format);
-      if (buffer.byteLength > maxDecodedClipboardReferenceBytes) continue;
-      // Paste.app、Finder 和部分 macOS 来源会把 file:// 或 /Users/... 路径塞进私有/动态格式；
-      // 这里只解码小块文本候选，真正的图片二进制仍由 readImage/native image formats 处理。
-      values.push(...decodeClipboardBuffer(buffer));
-    } catch {
-      // 私有格式不保证可读；跳过即可，继续尝试其他格式和 HTML。
-    }
-  }
-  try {
-    const html = reader.readHTML();
-    if (html) values.push(html);
-  } catch {
-    // Electron 在部分受限运行环境可能没有 HTML clipboard，跳过即可。
   }
   return values;
+}
+
+/** HTML 只提供内联图片数据，不将其中的本地链接变成文件授权。 */
+function safelyReadClipboardHtml(reader: NativeTaskClipboardReader): string {
+  try {
+    return reader.readHTML();
+  } catch {
+    return '';
+  }
 }
 
 function decodeClipboardBuffer(data: Uint8Array): string[] {
@@ -332,7 +327,7 @@ function extractEmbeddedFileReferenceCandidates(value: string): string[] {
 }
 
 /** 剪贴板正文里的 file:// 链接；附件识别与正文剥离共用同一条规则。 */
-const clipboardFileUrlPattern = /\bfile:\/\/\/[^\s"'<>]+/giu;
+const clipboardFileUrlPattern = /\bfile:\/\/[^\s"'<>]+/giu;
 
 /** 判断一段候选文本是否整段都已经变成附件，只有整段命中才允许从正文里移除。 */
 function isConsumedFileReference(candidate: string, consumedPaths: ReadonlySet<string>): boolean {
@@ -363,6 +358,7 @@ function extractFileReferencesFromHtml(value: string): string[] {
   return references;
 }
 
+/** 只把当前系统的绝对路径或合法文件 URL 识别为文件，保留普通正文。 */
 function fileReferenceToPath(value: string): string[] {
   const trimmed = value.trim().replace(/^["']|["']$/gu, '');
   if (!trimmed) return [];
@@ -373,7 +369,9 @@ function fileReferenceToPath(value: string): string[] {
       return [];
     }
   }
-  if (trimmed.startsWith('/')) {
+  if (isAbsolute(trimmed)) {
+    // Windows 文件列表提供原始路径，百分号是文件名内容，不是 URL 转义。
+    if (process.platform === 'win32') return [trimmed];
     try {
       return [decodeURIComponent(trimmed)];
     } catch {

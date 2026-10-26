@@ -1,4 +1,5 @@
-import type { EstimatedMoney } from '@zeus/shared';
+import type { ConversationInformation, EstimatedMoney } from '@zeus/shared';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { CaretUpIcon as CaretUp } from '@phosphor-icons/react/dist/csr/CaretUp';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
@@ -17,12 +18,37 @@ interface RuntimeDetailsProps {
   language: SessionUiLanguage;
   scope: 'session' | 'subagent';
   mcpStartup?: Record<string, unknown> | null;
+  onLoadInformation?: (signal: AbortSignal) => Promise<ConversationInformation>;
+  resources?: ConversationInformation['resources'];
 }
 
 /** 使用原生折叠面板展示摘要及按用途分组的运行事实。 */
 export function RuntimeDetails(props: RuntimeDetailsProps) {
   /** 原生详情节点保留自身展开状态，外部点击只负责收起。 */
   const detailsRef = useRef<HTMLDetailsElement>(null);
+  const [open, setOpen] = useState(false);
+  const [information, setInformation] = useState<ConversationInformation | null>(null);
+  const [informationError, setInformationError] = useState<unknown>(null);
+  const [reload, setReload] = useState(0);
+  const loadInformationRef = useRef(props.onLoadInformation);
+  useEffect(() => {
+    loadInformationRef.current = props.onLoadInformation;
+  });
+  const informationRevision = JSON.stringify([props.runtime.usage.totalTokens, props.runtime.activity.toolOrCommandCount]);
+  useEffect(() => {
+    if (!open || !loadInformationRef.current) return;
+    const abort = new AbortController();
+    setInformationError(null);
+    void loadInformationRef
+      .current(abort.signal)
+      .then((value) => {
+        if (!abort.signal.aborted) setInformation(value);
+      })
+      .catch((cause) => {
+        if (!abort.signal.aborted) setInformationError(cause);
+      });
+    return () => abort.abort();
+  }, [open, informationRevision, reload]);
   useEffect(() => {
     /** 捕获阶段判断命中范围，详情内部的复制和文本选择不会触发收起。 */
     const closeFromOutside = (event: PointerEvent): void => {
@@ -45,7 +71,15 @@ export function RuntimeDetails(props: RuntimeDetailsProps) {
     props.runtime.usage.historyComplete.value;
   const tokenScopeLabel = props.scope === 'subagent' ? (zh ? '智能体累计 Token' : 'Agent tokens') : zh ? '会话累计 Token' : 'Session tokens';
   return (
-    <details ref={detailsRef} className="session-runtime-details" data-language={props.language} data-severity={warning ? 'warning' : 'ready'} data-scope={props.scope} aria-label={copy.runtimeDetails}>
+    <details
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      ref={detailsRef}
+      className="session-runtime-details"
+      data-language={props.language}
+      data-severity={warning ? 'warning' : 'ready'}
+      data-scope={props.scope}
+      aria-label={copy.runtimeDetails}
+    >
       <summary>
         <span className="session-runtime-summary-primary">
           <RuntimeSummaryMetric label={zh ? '累计 Token' : tokenScopeLabel} value={formatTokenFact(props.runtime.usage.totalTokens, props.language, true)} />
@@ -129,6 +163,28 @@ export function RuntimeDetails(props: RuntimeDetailsProps) {
         >
           <CaretUp aria-hidden="true" />
         </button>
+        {props.onLoadInformation || props.resources ? (
+          <RuntimeDetailGroup title={zh ? '费用明细与已记录使用' : 'Cost details and recorded usage'} kind="usage">
+            {information ? (
+              <>
+                <RuntimeUsageRow label={zh ? '输入费用' : 'Input cost'} value={formatRuntimeCosts(information.cost.input, props.language) || '—'} />
+                <RuntimeUsageRow label={zh ? '输出费用' : 'Output cost'} value={formatRuntimeCosts(information.cost.output, props.language) || '—'} />
+                <RuntimeUsageRow label={zh ? '按次费用' : 'Request cost'} value={formatRuntimeCosts(information.cost.perRequest, props.language) || '—'} />
+                {!information.cost.complete ? <p>{zh ? '部分费用缺少完整价格依据。' : 'Some costs have incomplete pricing evidence.'}</p> : null}
+              </>
+            ) : null}
+            <RuntimeUsageRow label={zh ? '已触发 MCP' : 'MCP tools used'} value={(information?.resources ?? props.resources)?.mcp.join('、') || '—'} />
+            <RuntimeUsageRow label={zh ? '已使用 Skills' : 'Skills used'} value={(information?.resources ?? props.resources)?.skills.join('、') || '—'} />
+            {informationError ? (
+              <>
+                <VisibleApplicationError error={informationError} language={zh ? 'zh-CN' : 'en'} />
+                <button type="button" onClick={() => setReload((value) => value + 1)}>
+                  {zh ? '重试' : 'Retry'}
+                </button>
+              </>
+            ) : null}
+          </RuntimeDetailGroup>
+        ) : null}
       </div>
     </details>
   );
@@ -191,7 +247,7 @@ function RuntimeCode(props: { fact: NativeRuntimeFact<string>; language: Session
   );
 }
 
-function RuntimeCopyButton(props: { text: string; label: string; copiedLabel: string }) {
+export function RuntimeCopyButton(props: { text: string; label: string; copiedLabel: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;

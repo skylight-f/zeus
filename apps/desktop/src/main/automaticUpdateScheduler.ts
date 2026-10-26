@@ -18,7 +18,7 @@ interface CreateAutomaticUpdateSchedulerOptions {
   failedCheckRetryMs?: number;
   controller: HomebrewUpdateController;
   onIndicatorChange: (state: HomebrewUpdateIndicatorState) => void;
-  notifyReady: (latestVersion: string, showProgress: () => void) => boolean;
+  notifyReady: (latestVersion: string, showProgress: () => Promise<void>) => boolean;
   /** 与 Zeus 检测共用到期触发，只检查配套程序，不授权安装。 */
   checkCompanionUpdate?: () => Promise<void>;
 }
@@ -111,7 +111,7 @@ export function createAutomaticUpdateScheduler(options: CreateAutomaticUpdateSch
     broadcastIndicator(state);
     schedulePersistence();
     if (state.phase !== 'ready' || !state.latestVersion || state.latestVersion === persisted.lastNotifiedVersion) return;
-    const notified = options.notifyReady(state.latestVersion, () => void options.controller.showOrCheck());
+    const notified = options.notifyReady(state.latestVersion, () => options.controller.showOrCheck());
     if (!notified) return;
     persisted = { ...persisted, lastNotifiedVersion: state.latestVersion };
     schedulePersistence();

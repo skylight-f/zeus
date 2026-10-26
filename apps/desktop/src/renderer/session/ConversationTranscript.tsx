@@ -32,7 +32,8 @@ import { isAssistantDeliverableItem } from './sessionTypes.js';
 import { type ConversationFileLocation, type ConversationOpenTarget, type ConversationResponseAnnotation, type ConversationResponseTextAnchor, parseCanonicalRequestUserInputQuestions } from '@zeus/shared';
 import { useThreadScrollController } from './useThreadScrollController.js';
 import { TurnChangeCard } from './TurnChanges.js';
-import { latestReasoningSummaryText, reasoningSummaryStatus, SessionReasoningSummary, SessionSweepText } from './SessionReasoningSummary.js';
+import { latestReasoningSummaryText, reasoningSummaryStatus, SessionReasoningSummary } from './SessionReasoningSummary.js';
+import { SessionSweepText } from './SessionSweepText.js';
 import { AnsweredRequestHistory, isAnsweredUserInputRequest, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
 import { newItemMotionDurationMs, useNewItemMotionIds } from '../ui/useNewItemMotion.js';
 import { captureTranscriptViewportAnchor, compensateTranscriptViewportAnchor, type TranscriptViewportAnchor, useTranscriptViewportVirtualizer } from './transcriptViewportVirtualizer.js';
@@ -52,8 +53,12 @@ export interface ConversationTranscriptProps {
   onLoadNavigationTurn?: (turnId: string) => Promise<void>;
   state: NativeSessionState;
   language: SessionUiLanguage;
+  /** 创建期与持久会话交接共用导航身份，只有真正切换会话才重建正文。 */
+  navigationId?: string;
   assistantLabel?: string;
   historyOnly?: boolean;
+  /** 输入框排队区实际挂载时才允许它接管正文中的同一用户消息。 */
+  composerQueueVisible?: boolean;
   /** 子线程等只读投影没有主会话快照时，仍可明确声明时间线已完成水合。 */
   transcriptHydrated?: boolean;
   /** 从历史入口打开后持续补齐已持久化计划；首次续聊不能让旧计划从时间线消失。 */
@@ -69,6 +74,8 @@ export interface ConversationTranscriptProps {
   onLatestContentVisibilityChange?: (visible: boolean) => void;
   historyLoading?: boolean;
   creationStatus?: SessionCreationStatus;
+  /** 选区作为右侧会话的评论引用，不写入主会话草稿。 */
+  onAskInSidebar?: (anchor: ConversationResponseTextAnchor) => void;
   onAddResponseAnnotation?: (anchor: ConversationResponseTextAnchor) => string;
   onUpdateResponseAnnotation?: (id: string, note: string) => void;
   onRemoveResponseAnnotation?: (id: string) => void;
@@ -254,8 +261,13 @@ function useStableOptionalCallback<Arguments extends unknown[], Result>(callback
   return callback ? stableCallback : undefined;
 }
 
-/** 会话正文、历史过程与当前状态共用原始事件，仅在展示时分配提示职责。 */
+/** 会话身份隔离滚动、展开和动效状态；主会话与子线程共用同一切换边界。 */
 export function ConversationTranscript(props: ConversationTranscriptProps) {
+  return <ConversationTranscriptContent key={systemMessageScope(props.state.projectId ?? '', props.navigationId ?? props.state.conversationId)} {...props} />;
+}
+
+/** 渲染会话正文、渐进资源、完整目录和历史定位。 */
+function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   /** 产品会话隔离待确认消息，子线程只读投影不接管主会话写入。 */
   const systemScope = systemMessageScope(props.state.projectId ?? '', props.state.conversationId);
   /** 补写中的消息与权威回执共享身份。 */
@@ -317,6 +329,12 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const [completedAnnouncement, setCompletedAnnouncement] = useState<{ key: string; text: string } | null>(null);
   const completedAnnouncementTrackerRef = useRef<CompletedItemAnnouncementTracker>({ hydrated: false, lastCompletedKey: null });
   const positionedConversationIdRef = useRef<string | null>(null);
+  /** 首次虚拟行测量和贴底收敛后才展示正文，后续更新不重复隐藏已读内容。 */
+  const [historyPositioned, setHistoryPositioned] = useState(false);
+  /** 本地首发一旦已显示，后续历史接管也不能重新播放整段淡入。 */
+  const initialLocalSubmissionRef = useRef(false);
+  /** 冷读取等待正文；本地创建和读取失败仍可展示已有消息与恢复入口。 */
+  const canRevealHistoryRef = useRef(false);
   const trackedUserMessageRef = useRef<{ conversationId: string | null; key: string | null; initialized: boolean }>({ conversationId: null, key: null, initialized: false });
   const awaitingReplyMessageIdsRef = useRef<Set<string>>(new Set());
   const awaitingReplyConversationIdRef = useRef<string | null>(null);
@@ -387,9 +405,27 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const activeTurnId = props.historyOnly ? null : props.state.activeTurnId;
   /** 实时事件和 V2 快照可能在同一帧分别携带 Provider 与本地轮次身份，展示层必须把它们视为同一活动轮次。 */
   const activeTurnIdentities = useMemo(() => turnIdentitySet(props.state, activeTurnId), [activeTurnId, props.state.items, props.state.snapshot?.snapshotV2?.activeTurn, props.state.snapshot?.turns, props.state.turnsByProviderId]);
+  /** 正文先接管首帧；完整目录只能在已有可见历史后渐进读取。 */
+  const historyHydrated = props.transcriptHydrated ?? props.state.snapshot !== null;
+  /** 本地首发已经有正文，不等历史读取或后台定位循环才向用户显示。 */
+  const hasLocalSubmission = !historyHydrated && props.state.itemOrder.some((key) => props.state.items[key]?.optimistic && itemRole(props.state.items[key]!) === 'user');
+  if (!historyPositioned && hasLocalSubmission) initialLocalSubmissionRef.current = true;
+  /** 本地首帧直接可见；定位完成后保持可见，不随服务端身份接管重新隐藏。 */
+  const historyReady = historyPositioned || hasLocalSubmission;
+  /** 最新轮次取实时状态，不能等待旧首屏快照刷新后才开放重试。 */
+  const latestTurn = useMemo(
+    () =>
+      Object.values(props.state.turnsByProviderId)
+        .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+        .at(-1),
+    [props.state.turnsByProviderId],
+  );
   const queuedSubmissions = useMemo(() => visibleQueuedSubmissions(props.state.queue), [props.state.queue]);
   /** 输入框卡片接管的提交不能同时出现在会话时间线。 */
-  const composerQueue = useMemo(() => composerQueuedSubmissions(props.state), [props.state.itemOrder, props.state.items, props.state.queue]);
+  const composerQueue = useMemo(
+    () => (props.composerQueueVisible === false ? [] : composerQueuedSubmissions(props.state)),
+    [props.composerQueueVisible, props.state.itemOrder, props.state.items, props.state.queue, props.state.snapshot?.providerState],
+  );
   /** 稳定提交身份覆盖冷开时由持久 submission 重建的本地消息。 */
   const composerQueueSubmissionIds = useMemo(() => new Set(composerQueue.map((submission) => submission.id)), [composerQueue]);
   /** 客户端消息身份覆盖首次提交后尚未取得本地提交身份的乐观消息。 */
@@ -405,8 +441,8 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     .filter(isAnsweredUserInputRequest)
     .map((request) => `${request.id}:${request.resolvedAt}`)
     .join('|')}`;
-  /** 完整目录与首屏正文并行取得，绝不要求用户先滚到更早历史。 */
-  const navigation = useConversationNavigation({ scopeKey: props.state.conversationId, refreshKey: navigationRefreshKey, load: props.onLoadNavigation });
+  /** 完整目录覆盖深历史，但不能与首屏正文争抢 Core 的同步读取。 */
+  const navigation = useConversationNavigation({ scopeKey: props.state.conversationId, refreshKey: navigationRefreshKey, load: historyHydrated ? props.onLoadNavigation : undefined });
   useEffect(() => {
     if (!props.onSaveSystemMessage) return;
     /** 同一后台故障已被接纳时不因自动刷新再创建记录。 */
@@ -431,7 +467,9 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     props.state.terminalTurnIds,
     props.state.turnsByProviderId,
     props.state.snapshot?.snapshotV2,
+    props.state.snapshot?.providerState,
     props.historyOnly,
+    props.composerQueueVisible,
     props.projectPersistedPlans,
     props.creationStatus,
   ];
@@ -488,13 +526,15 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   );
   // 原始思考摘要完整保留在会话状态中；会话记录的当前态选择统一交给行投影处理。
   const items = transcriptItems;
-  const historyHydrated = props.transcriptHydrated ?? props.state.snapshot !== null;
-  latestContentReadyRef.current = historyHydrated && !props.historyLoading && props.state.transportState === 'ready';
+  canRevealHistoryRef.current = historyHydrated || !props.historyLoading;
+  latestContentReadyRef.current = historyPositioned && historyHydrated && !props.historyLoading && props.state.transportState === 'ready';
   const enteringItemIds = useNewItemMotionIds(
-    items.map((item) => item.key),
+    // 空的助手事件尚无正文可展示；首段文字或资源到达时才启动已有入场动效。
+    items.filter((item) => !['assistant', 'commentary'].includes(itemRole(item)) || Boolean(transcriptItemText(item, props.language).trim()) || item.resources.length > 0).map((item) => item.key),
     newItemMotionDurationMs,
     historyHydrated,
-    props.state.transcriptLiveItemKeys ?? [],
+    // 本地发送和实时回执共用同一入场资格；历史首次水合仍由动效钩子建立基线。
+    [...(props.state.transcriptLiveItemKeys ?? []), ...items.filter((item) => item.optimistic).map((item) => item.key)],
   );
   /** 输入样式也承载智能体来信，不能把后台来信当作当前用户发送。 */
   const lastUserItem = [...items].reverse().find((entry) => `${entry.type}`.toLocaleLowerCase().includes('user'));
@@ -630,7 +670,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     [turnRowsByKey, expandedRowKeys],
   );
   const viewportVirtualizer = useTranscriptViewportVirtualizer({
-    scopeKey: props.state.conversationId,
+    scopeKey: props.navigationId ?? props.state.conversationId,
     rowKeys: turnRowKeys,
     rowLayoutSignature,
     pinnedRowKeys,
@@ -643,7 +683,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   const synchronizeTranscriptViewport = viewportVirtualizer.synchronizeViewport;
   const positionLatest = useCallback(
     (container: HTMLElement): void => {
-      scrollToLatest(container, latestContentMarkerRef.current);
+      scrollToLatest(container);
       // scrollTop 可能已被浏览器随高度变化钳制到同一数值，此时不会再产生 scroll 事件。
       // 程序化贴底必须同时刷新虚拟窗口，不能等用户滚轮来补这次投影。
       synchronizeTranscriptViewport(container);
@@ -689,6 +729,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     onLoadResourcePreview: useStableOptionalCallback(props.onLoadResourcePreview),
     onReviewTurnChanges: useStableOptionalCallback(props.onReviewTurnChanges),
     onOperateTurnChangeSet: useStableOptionalCallback(props.onOperateTurnChangeSet),
+    onAskInSidebar: useStableOptionalCallback(props.onAskInSidebar),
     onAddResponseAnnotation: useStableOptionalCallback(props.onAddResponseAnnotation),
     onUpdateResponseAnnotation: useStableOptionalCallback(props.onUpdateResponseAnnotation),
     onRemoveResponseAnnotation: useStableOptionalCallback(props.onRemoveResponseAnnotation),
@@ -802,7 +843,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     // 即使底部位置未变化，加载完成或会话身份变化后也必须重新报告可见事实。
     lastReportedLatestVisibilityRef.current = null;
     scheduleLatestContentVisibility();
-  }, [historyHydrated, props.historyLoading, props.state.transportState, props.state.conversationId, props.onLatestContentVisibilityChange, scheduleLatestContentVisibility]);
+  }, [historyHydrated, historyPositioned, props.historyLoading, props.state.transportState, props.state.conversationId, props.onLatestContentVisibilityChange, scheduleLatestContentVisibility]);
 
   /** 只读取已经挂载的可见行，当前刻度变化才刷新状态。 */
   const updateNavigationCurrent = useCallback(
@@ -903,6 +944,9 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
   }, [props.state.conversationId]);
 
   const maintainLatestPosition = useCallback(() => {
+    /** 高度变化和贴底在绘制前同时生效，不能先显示新布局、下一帧再把整段正文拉回底部。 */
+    const container = containerRef.current;
+    if (container && !userScrollIntentRef.current && scrollController.onDelta().type === 'scroll_to_bottom') positionLatest(container);
     latestPositionConvergenceRequestedRef.current = true;
     if (latestPositionFrameRef.current !== null || latestPositionFallbackTimerRef.current !== null) return;
     let pass = 0;
@@ -938,12 +982,14 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
       if (userScrollIntentRef.current) {
         latestPositionFrameRef.current = null;
         latestPositionConvergenceRequestedRef.current = false;
+        if (canRevealHistoryRef.current) setHistoryPositioned(true);
         return;
       }
       const effect = scrollController.onDelta();
       if (effect.type !== 'scroll_to_bottom') {
         latestPositionFrameRef.current = null;
         latestPositionConvergenceRequestedRef.current = false;
+        if (canRevealHistoryRef.current) setHistoryPositioned(true);
         scheduleLatestContentVisibility();
         return;
       }
@@ -964,6 +1010,8 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
       }
       latestPositionFrameRef.current = null;
       latestPositionConvergenceRequestedRef.current = false;
+      // 沿用有上限的定位循环；不额外等待网络、图片或持续输出结束。
+      if (canRevealHistoryRef.current) setHistoryPositioned(true);
     };
     schedulePass();
   }, [positionLatest, scheduleLatestContentVisibility, scrollController]);
@@ -1014,6 +1062,13 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
     },
     [],
   );
+
+  useLayoutEffect(() => {
+    if (!hasLocalSubmission || !containerRef.current) return;
+    // 本地消息在绘制前直接贴底；后续资源仍沿用原有滚动收敛，不重新隐藏正文。
+    positionLatest(containerRef.current);
+    setHistoryPositioned(true);
+  }, [hasLocalSubmission, positionLatest]);
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -1128,7 +1183,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
 
   useLayoutEffect(() => {
     maintainLatestPosition();
-  }, [maintainLatestPosition, props.creationStatus?.error, props.creationStatus?.state, props.state.transcriptRevision]);
+  }, [historyHydrated, maintainLatestPosition, props.creationStatus?.error, props.creationStatus?.state, props.historyLoading, props.state.transcriptRevision]);
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -1215,20 +1270,14 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
         />
       );
     if (row.kind === 'turn_failure') {
-      /** 后台仍在核对本轮时只显示统一运行状态，避免错误卡和重连状态同时闪烁。 */
-      const recovering = props.state.providerReconnectTurnId === row.turnId && props.state.providerReconnectAttempt > 0;
-      // 已由后续尝试接管的失败不再作为独立错误卡；重启后最后一次失败仍可手动恢复。
-      const continuedFailure =
-        row.failure.code === 'ZEUS_MODEL_RESPONSE_RETRYING' &&
-        (props.state.providerReconnectAttempt > 0 || props.state.snapshot?.turns.toSorted((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)).at(-1)?.providerTurnId !== row.turnId);
-      if (recovering || continuedFailure) return null;
       /** 只对最新停止的网络失败提供续跑，历史轮次不重复提交。 */
       const retryable =
         !props.historyOnly &&
         row.failure.category === 'network' &&
         // 送达尚未核对的提交只开放原恢复入口，不能从旧失败卡发起另一条续接。
         !props.state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)) &&
-        props.state.snapshot?.turns.toSorted((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)).at(-1)?.providerTurnId === row.turnId;
+        !props.state.activeTurnId &&
+        latestTurn?.providerTurnId === row.turnId;
       return (
         <TurnFailureCard
           failure={row.failure}
@@ -1462,7 +1511,16 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
           </button>
         </div>
       ) : null}
-      <div ref={shellRef} className="session-transcript-shell" data-navigation-ready={(showNavigation && !navigation.error) || undefined}>
+      <div
+        ref={shellRef}
+        className="session-transcript-shell"
+        data-history-hydrated={historyHydrated || undefined}
+        data-history-ready={historyReady || undefined}
+        data-history-loading={!historyReady || undefined}
+        data-local-submission={initialLocalSubmissionRef.current || undefined}
+        aria-busy={!historyReady || undefined}
+        data-navigation-ready={(showNavigation && !navigation.error) || undefined}
+      >
         <section
           ref={containerRef}
           className="session-transcript"
@@ -1571,7 +1629,7 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
                 language={props.language}
                 kind={activeStatusKind}
                 reconnectAttempt={props.state.providerReconnectAttempt || props.state.reconnectAttempt}
-                reconnectAttempts={props.state.providerReconnectAttempts || 5}
+                reconnectAttempts={props.state.providerReconnectAttempt > 0 ? props.state.providerReconnectAttempts : 5}
               />
             )
           ) : null}
@@ -1610,7 +1668,11 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
         >
           {props.language === 'zh-CN' ? '返回最新消息' : 'Return to latest'}
         </button>
-        <TranscriptHistoryLoading visible={Boolean(props.historyLoading)} initializing={Boolean(props.state?.transcriptInitializing)} language={props.language} />
+        <TranscriptHistoryLoading
+          visible={!historyReady && (Boolean(props.historyLoading) || (!props.creationStatus && props.state.transportState !== 'failed'))}
+          initializing={Boolean(props.state?.transcriptInitializing)}
+          language={props.language}
+        />
       </div>
     </ConversationImageResourcesContext.Provider>
   );
@@ -1620,8 +1682,16 @@ export function ConversationTranscript(props: ConversationTranscriptProps) {
 function TranscriptHistoryLoading(props: { visible: boolean; initializing: boolean; language: SessionUiLanguage }) {
   return (
     <section className="session-transcript-loading" data-visible={props.visible || undefined} role={props.visible ? 'status' : undefined} aria-hidden={!props.visible} aria-live={props.visible ? 'polite' : undefined}>
-      <span className="session-loading-line" />
-      <span className="session-loading-line" />
+      <span className="session-transcript-loading-content" aria-hidden="true">
+        <span className="session-transcript-loading-turn" data-speaker="user">
+          <span className="session-loading-line" />
+        </span>
+        <span className="session-transcript-loading-turn" data-speaker="assistant">
+          <span className="session-loading-line" />
+          <span className="session-loading-line" />
+          <span className="session-loading-line" />
+        </span>
+      </span>
       <strong>{props.initializing ? (props.language === 'zh-CN' ? '正在准备会话历史' : 'Preparing conversation history') : props.language === 'zh-CN' ? '正在加载会话' : 'Loading conversation'}</strong>
     </section>
   );
@@ -1780,6 +1850,7 @@ export function SystemMessageNotice(props: { message: ConversationSystemMessageI
   );
 }
 
+/** 失败卡保留官方原因，显式续跑只针对调用方确认可重试的轮次。 */
 function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: SessionUiLanguage; retainedAnswer: boolean; onRetry?: () => void | Promise<void> }) {
   /** 请求提交期间禁用重复点击，失败原因保留在原提示中。 */
   const [pending, setPending] = useState(false);
@@ -1800,7 +1871,7 @@ function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: 
   }
   /** 错误名称和详情入口使用同一语言。 */
   const zh = props.language === 'zh-CN';
-  /** 连接失败只显示停止状态和重试，原始诊断保留在轮次记录中。 */
+  /** 连接失败复用现有错误详情窗口，原始原因和手动重试同时可用。 */
   const connectionFailure = props.failure.category === 'network';
   /** 重试结果接管同一条状态文案，原始错误仍由详情入口说明。 */
   const connectionMessage = pending ? (zh ? '正在重新连接…' : 'Reconnecting…') : retryError ? (zh ? '重试失败，请查看原因。' : 'Retry failed. View details.') : zh ? '连接失败，已停止。' : 'Connection failed. Stopped.';
@@ -1820,9 +1891,14 @@ function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: 
     <ConversationNotice label={connectionFailure ? (zh ? '连接失败' : 'Connection failed') : zh ? '模型返回错误' : 'Model error'}>
       {connectionFailure ? <span>{connectionMessage}</span> : <VisibleApplicationError error={props.failure} language={zh ? 'zh-CN' : 'en'} />}
       <span className="session-message-delivery-actions">
+        {connectionFailure ? (
+          <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(props.failure, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
+            {zh ? '查看原因' : 'View details'}
+          </button>
+        ) : null}
         {retryError ? (
           <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(retryError, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
-            {zh ? '查看原因' : 'View details'}
+            {zh ? '重试失败原因' : 'Retry failure details'}
           </button>
         ) : null}
         {props.onRetry ? (
@@ -1995,8 +2071,12 @@ export function projectSystemMessageRows(rows: readonly TranscriptViewportRow[],
 /** 失败属于发生时的会话记录，不依附最后一条消息或整个列表的底部。 */
 export function projectTranscriptFailureRows(rows: readonly TranscriptViewportRow[], turns: NativeSessionState['turnsByProviderId']): TranscriptViewportRow[] {
   /** 本地与服务端身份可能指向同一轮，失败记录按持久轮次身份去重。 */
-  const failures: Extract<TranscriptViewportRow, { kind: 'turn_failure' }>[] = [...new Map(Object.values(turns).map((turn) => [turn.id, turn])).values()]
-    .filter((turn) => turn.status === 'failed' && turn.error)
+  const knownTurns = [...new Map(Object.values(turns).map((turn) => [turn.id, turn])).values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  /** 已由后续轮次接管的旧续接错误不进入虚拟列表，避免空行留下估算高度。 */
+  const latestTurn = knownTurns.at(-1);
+  /** 最新失败必须保留，不能因残留重连标记而隐藏终态。 */
+  const failures: Extract<TranscriptViewportRow, { kind: 'turn_failure' }>[] = knownTurns
+    .filter((turn) => turn.status === 'failed' && turn.error && (turn.error.code !== 'ZEUS_MODEL_RESPONSE_RETRYING' || turn === latestTurn))
     .map<Extract<TranscriptViewportRow, { kind: 'turn_failure' }>>((turn) => ({
       kind: 'turn_failure',
       key: `turn-failure:${turn.id}`,
@@ -2339,12 +2419,14 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
     <TranscriptV2ContentBoundary item={row.item} language={options.props.language} onLoadContent={options.props.onLoadV2Content}>
       <ThreadItemView
         item={row.item}
+        turnUsage={options.props.state.sessionMetrics?.turnUsage?.[row.item.turnId]}
         questionAnswer={row.questionAnswer}
         language={options.props.language}
         assistantLabel={options.props.assistantLabel}
         isLatest={options.activityPresentation === 'detail' && row.item.key === options.items[options.items.length - 1]?.key && !options.showThinking}
         animateEntrance={options.enteringItemIds.has(row.item.key)}
-        showAssistantActions={options.activityPresentation === 'detail' && isFinalAnswerItem(row.item) && !options.showThinking}
+        // 最终回复的底栏只按自身内容类型显示，新一轮运行状态不能隐藏历史回复的时间与用量。
+        showAssistantActions={options.activityPresentation === 'detail' && isFinalAnswerItem(row.item)}
         isLatestUser={row.item.key === options.lastUserKey}
         motionActive={row.item.key === options.motionFocus?.itemKey}
         onEdit={options.props.onEditUserItem}
@@ -2354,6 +2436,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
         onCallMcpAppTool={options.props.onCallMcpAppTool}
         onVisibleContentChange={options.onVisibleContentChange}
         responseAnnotations={options.responseAnnotationsByItemId.get(row.item.itemId) ?? emptyResponseAnnotations}
+        onAskInSidebar={options.props.onAskInSidebar}
         onAddResponseAnnotation={options.props.onAddResponseAnnotation}
         onUpdateResponseAnnotation={options.props.onUpdateResponseAnnotation}
         onRemoveResponseAnnotation={options.props.onRemoveResponseAnnotation}
@@ -2432,10 +2515,11 @@ function isSamePlanItem(openItem: NativeSessionItemBuffer | null | undefined, it
 }
 
 /** 运行状态只读取权威队列、轮次、请求、连接和过程事件，不从计时或正文猜测。 */
-export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'executing' | 'compacting' | 'waiting_input' | 'waiting_approval' | 'reconnecting' | null {
+export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'checking_plugin' | 'executing' | 'compacting' | 'waiting_input' | 'waiting_approval' | 'reconnecting' | null {
   // 暂停或未知送达不代表模型继续运行，错误与核对入口由系统操作行承载。
   if (state.queue?.state.type === 'paused' || state.queue?.submissions.some((submission) => submission.internalOperation && submission.pausedReason === 'outcome_unknown')) return null;
-  if (state.providerReconnectAttempt > 0) return 'reconnecting';
+  if (state.providerReconnectAttempt > 0 && state.providerReconnectTurnId && !state.terminalTurnIds[state.providerReconnectTurnId]) return 'reconnecting';
+  if (state.queue?.waitReason === 'plugin_hook') return 'checking_plugin';
   if (state.conversationState === 'starting_turn') return 'starting';
   /** 安全队首已经保存但尚未交给模型时，继续使用底部准备状态，不能因运行态暂为空闲而隐藏。 */
   const head = visibleQueuedSubmissions(state.queue).find((submission) => submission.status === 'queued' && !submission.providerTurnId);
@@ -2464,6 +2548,7 @@ function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonN
   // 整理状态与活动记录沿用同一套用户表述，由当前状态位置统一承载进度。
   const labels = {
     starting: ['正在准备发送', 'Preparing to send'],
+    checking_plugin: ['正在等待 Plugin Hook 检查', 'Waiting for Plugin Hook checks'],
     executing: ['正在执行', 'Executing'],
     compacting: ['正在整理较早对话以继续工作', 'Organizing earlier conversation to continue'],
     waiting_input: ['等待回答，请处理问题表单', 'Waiting for your answer'],
@@ -2521,8 +2606,8 @@ export function MessageDeliveryOutcomeFeedback(props: {
   onRetryPendingSend?: (clientUserMessageId: string, intent: 'check' | 'continue') => void | Promise<void>;
   onCancelPendingSend?: (clientUserMessageId: string) => void | Promise<void>;
 }): ReactNode {
-  /** 操作期间禁用按钮，失败原因仍留在原消息旁。 */
-  const [pending, setPending] = useState(false);
+  /** 同一失败消息一次只执行一个恢复动作，失败原因仍留在原消息旁。 */
+  const [pendingAction, setPendingAction] = useState<'retry' | 'cancel' | null>(null);
   /** 保留本次重试或核对的错误，不覆盖原消息的持久送达记录。 */
   const [actionError, setActionError] = useState<unknown>(null);
   const pausedReason = props.item.payload.pausedReason;
@@ -2567,12 +2652,13 @@ export function MessageDeliveryOutcomeFeedback(props: {
           ? '消息尚未发送。'
           : 'This message has not been sent.';
   /** 已落库消息沿用提交身份，本地发送失败沿用原客户端消息身份。 */
-  const canAct = props.submissionId ? Boolean(props.onRetryQueuedSubmission) : Boolean(props.clientUserMessageId && props.onRetryPendingSend);
-  const canCancel = props.submissionId ? Boolean(props.onCancelQueuedSubmission) : Boolean(props.clientUserMessageId && props.onCancelPendingSend);
+  const canRetry = props.submissionId ? Boolean(props.onRetryQueuedSubmission) : Boolean(props.clientUserMessageId && props.onRetryPendingSend);
+  /** 只有明确失败消息可以本地取消；结果未知不能伪装成未发送。 */
+  const canCancelLocalSend = failed && !props.submissionId && Boolean(props.clientUserMessageId && props.onCancelPendingSend);
   /** 现有重试先读取原请求，只有确认未发送才发送；组件不创建新的恢复或重发流程。 */
   async function retryDelivery(): Promise<void> {
-    if (pending || !canAct) return;
-    setPending(true);
+    if (pendingAction || !canRetry) return;
+    setPendingAction('retry');
     setActionError(null);
     try {
       if (props.submissionId) {
@@ -2583,43 +2669,42 @@ export function MessageDeliveryOutcomeFeedback(props: {
     } catch (error) {
       setActionError(error);
     } finally {
-      setPending(false);
+      setPendingAction(null);
     }
   }
 
-  /** 取消入口仍由 Controller 先做权威核对，送达未知时不会误删已接收消息。 */
+  /** 取消只清理原消息；明确失败已经提前释放会话发送锁。 */
   async function cancelDelivery(): Promise<void> {
-    if (pending || !canCancel) return;
-    setPending(true);
+    if (pendingAction || !canCancelLocalSend || !props.clientUserMessageId) return;
+    setPendingAction('cancel');
     setActionError(null);
     try {
-      if (props.submissionId) await props.onCancelQueuedSubmission?.(props.submissionId);
-      else if (props.clientUserMessageId) await props.onCancelPendingSend?.(props.clientUserMessageId);
+      await props.onCancelPendingSend?.(props.clientUserMessageId);
     } catch (error) {
       setActionError(error);
     } finally {
-      setPending(false);
+      setPendingAction(null);
     }
   }
 
   return (
     <ConversationNotice deliveryState={feedbackState} label={zh ? '请求错误' : 'Request error'}>
       <span data-zeus-selectable="text">{message}</span>
-      {canAct || canCancel || feedbackError ? (
+      {canRetry || canCancelLocalSend || feedbackError ? (
         <div className="session-message-delivery-actions">
-          {canCancel ? (
-            <button type="button" disabled={pending} onClick={() => void cancelDelivery()}>
-              {zh ? '取消消息' : 'Cancel message'}
-            </button>
-          ) : null}
           {feedbackError ? (
             <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(feedbackError, { language: zh ? 'zh-CN' : 'en', summary: message, showDetails: true })}>
               {zh ? '查看原因' : 'View details'}
             </button>
           ) : null}
-          {canAct ? (
-            <button type="button" disabled={pending} onClick={() => void retryDelivery()}>
-              {pending ? (zh ? '正在重试…' : 'Retrying…') : zh ? '重试' : 'Retry'}
+          {canRetry ? (
+            <button type="button" disabled={pendingAction !== null} onClick={() => void retryDelivery()}>
+              {pendingAction === 'retry' ? (zh ? '正在重试…' : 'Retrying…') : zh ? '重试' : 'Retry'}
+            </button>
+          ) : null}
+          {canCancelLocalSend ? (
+            <button type="button" disabled={pendingAction !== null} onClick={() => void cancelDelivery()}>
+              {pendingAction === 'cancel' ? (zh ? '正在取消…' : 'Cancelling…') : zh ? '取消发送' : 'Cancel send'}
             </button>
           ) : null}
         </div>
@@ -3569,10 +3654,9 @@ function metrics(element: HTMLElement) {
   return { scrollTop: element.scrollTop, scrollHeight: element.scrollHeight, clientHeight: element.clientHeight };
 }
 
-function scrollToLatest(container: Pick<HTMLElement, 'clientHeight' | 'scrollHeight' | 'scrollTop'>, marker?: Pick<HTMLElement, 'scrollIntoView'> | null): void {
-  // 先让底部锚点参与布局，唤醒 content-visibility 跳过的历史高度，再做无动画定位。
-  marker?.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'auto' });
-  // 自动跟随必须即时定位，避免程序滚动事件被误判为用户主动阅读历史。
+/** 只移动正文自己的滚动容器，不能通过 scrollIntoView 连带滚动外层工作面。 */
+function scrollToLatest(container: Pick<HTMLElement, 'clientHeight' | 'scrollHeight' | 'scrollTop'>): void {
+  // 虚拟列表已负责屏外占位；直接读取本容器高度，不再唤醒或移动祖先滚动区域。
   container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
 }
 

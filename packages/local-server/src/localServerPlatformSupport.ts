@@ -1,8 +1,7 @@
-import { userInfo } from 'node:os';
-import { listAiCliAdapters, type AiCliAdapterDescriptor } from '@zeus/ai-runtime';
+import { listAiCliAdapters, resolveInteractiveShell, type AiCliAdapterDescriptor } from '@zeus/ai-runtime';
 import { type CommandEnvelope, commandEnvelopeSchemaGeneration } from '@zeus/shared';
 import type { FastifyReply } from 'fastify';
-import { relative, resolve } from 'node:path';
+import { pathIsInside } from '@zeus/storage/platform-security';
 import { stableIdentity } from './imTelegramService.js';
 
 /** 将 IM 平台输入封装为可审计的内部命令。 */
@@ -62,7 +61,7 @@ export function normalizeHeaderValue(value: string | string[] | undefined): stri
 
 /** 读取用户配置或系统登记的 shell；前端展示与启动校验使用同一来源。 */
 export function resolveInteractiveRuntimeShell(shell: { path: string | null; login: boolean }): { command: string; args: string[] } {
-  return { command: shell.path || process.env.SHELL?.trim() || userInfo().shell || '/bin/sh', args: shell.login ? ['-l', '-i'] : ['-i'] };
+  return resolveInteractiveShell(shell);
 }
 
 /** Runtime 只允许已登记命令，交互终端额外接纳服务端解析的准确 shell 路径。 */
@@ -75,8 +74,7 @@ export function resolveRegisteredRuntimeAdapter(command: string, shellCommand?: 
 
 /** 判断 Runtime cwd 是否仍位于项目根目录内；相等也允许，避免本地 API 变成项目外 shell 入口。 */
 export function isPathInsideProjectRoot(candidatePath: string, projectRoot: string): boolean {
-  const relativePath = relative(resolve(projectRoot), resolve(candidatePath));
-  return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !relativePath.startsWith('/') && !relativePath.startsWith('\\'));
+  return pathIsInside(candidatePath, projectRoot);
 }
 
 /** 读取历史 JSON 对象；损坏或非对象内容按空上下文处理。 */

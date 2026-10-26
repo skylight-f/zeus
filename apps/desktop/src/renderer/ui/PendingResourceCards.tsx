@@ -32,12 +32,13 @@ export interface PendingResourceCardItem {
   previewLoading?: boolean;
   /** 读取失败后停止动画，保留文件打开入口。 */
   previewFailed?: boolean;
-  /** 临时卡片只提供即时反馈，宿主确认前不能打开、移除或恢复。 */
+  /** 临时卡片只提供即时反馈，宿主确认前不能打开或移除。 */
   pending?: boolean;
   /** 任务表单用字段定位临时卡片，不写入附件持久化。 */
   scope?: string;
-  restorable?: boolean;
   title?: string;
+  /** 明确的源文件引用显示独立标识，避免与固定副本混淆。 */
+  reference?: boolean;
 }
 
 export interface PendingResourceCardsProps {
@@ -47,7 +48,6 @@ export interface PendingResourceCardsProps {
   disabled?: boolean;
   className?: string;
   onRemove?: (resource: PendingResourceCardItem) => void;
-  onRestoreText?: (resource: PendingResourceCardItem) => void;
   onActivate?: (resource: PendingResourceCardItem, trigger: HTMLButtonElement) => void;
   onLoadPreview?: (resource: PendingResourceCardItem) => Promise<{ previewUrl: string; mimeType: string } | null>;
 }
@@ -59,16 +59,7 @@ export function PendingResourceCards(props: PendingResourceCardsProps) {
   return (
     <ul className={className} aria-label={props.ariaLabel ?? (props.language === 'zh-CN' ? '待提交资源' : 'Pending resources')}>
       {props.resources.map((resource) => (
-        <PendingResourceCard
-          key={resource.id}
-          resource={resource}
-          language={props.language}
-          disabled={Boolean(props.disabled)}
-          onRemove={props.onRemove}
-          onRestoreText={props.onRestoreText}
-          onActivate={props.onActivate}
-          onLoadPreview={props.onLoadPreview}
-        />
+        <PendingResourceCard key={resource.id} resource={resource} language={props.language} disabled={Boolean(props.disabled)} onRemove={props.onRemove} onActivate={props.onActivate} onLoadPreview={props.onLoadPreview} />
       ))}
     </ul>
   );
@@ -87,7 +78,8 @@ function PendingResourceCard(props: Omit<PendingResourceCardsProps, 'resources' 
   const previewUrl = props.resource.previewUrl ?? loadedPreviewUrl;
   const previewLoaderAvailable = Boolean(props.onLoadPreview);
   const extension = pendingResourceExtension(props.resource.name);
-  const typeLabel = pendingResourceTypeLabel(props.resource, props.language);
+  /** 引用语义优先于扩展名显示，用户能直接区分实时来源和固定副本。 */
+  const typeLabel = props.resource.reference ? (props.language === 'zh-CN' ? '源文件引用' : 'Live reference') : pendingResourceTypeLabel(props.resource, props.language);
   /** 外部读取与内部读取共用失败状态，失败不能一直显示加载动画。 */
   const failed = previewFailed || props.resource.previewFailed;
   /** 导入、读取和解码都显示同一骨架，不把等待状态画成文件图标。 */
@@ -152,8 +144,13 @@ function PendingResourceCard(props: Omit<PendingResourceCardsProps, 'resources' 
       data-icon-tooltip={props.resource.kind === 'image' ? pendingResourceOpenLabel(props.resource.kind, props.language) : (props.resource.title ?? props.resource.name)}
     >
       {props.onActivate && !props.resource.pending ? (
-        /* 预览只读取附件；提交中和只读界面只禁用移除、恢复等修改操作。 */
-        <button type="button" className="pending-resource-activate" aria-label={`${pendingResourceOpenLabel(props.resource.kind, props.language)}: ${props.resource.name}`} onClick={activate}>
+        /* 预览只读取附件；提交中和只读界面只禁用移除操作。 */
+        <button
+          type="button"
+          className="pending-resource-activate"
+          aria-label={`${props.resource.reference ? `${typeLabel}: ` : ''}${pendingResourceOpenLabel(props.resource.kind, props.language)}: ${props.resource.name}`}
+          onClick={activate}
+        >
           {visual}
         </button>
       ) : (
@@ -164,14 +161,10 @@ function PendingResourceCard(props: Omit<PendingResourceCardsProps, 'resources' 
           <strong>{pendingResourceDisplayName(props.resource.name, props.language, props.resource.kind)}</strong>
           <span className="pending-resource-meta">
             <small>{props.resource.pending ? (props.language === 'zh-CN' ? '正在导入…' : 'Importing…') : typeLabel}</small>
-            {props.resource.kind === 'pasted_text' && props.resource.restorable && props.onRestoreText ? (
-              <button type="button" className="pending-resource-restore" disabled={props.disabled} onClick={() => props.onRestoreText?.(props.resource)}>
-                {props.language === 'zh-CN' ? '恢复' : 'Restore'}
-              </button>
-            ) : null}
           </span>
         </span>
       )}
+      {props.resource.kind === 'image' && props.resource.reference ? <small className="pending-resource-reference-label">{typeLabel}</small> : null}
       {props.resource.pending && !previewLoading ? <ResourceLoading label={loadingLabel} overlay /> : null}
       {props.onRemove && !props.resource.pending ? (
         <button

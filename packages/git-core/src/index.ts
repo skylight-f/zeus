@@ -1,3 +1,5 @@
+import { withGitRepositoryOperation } from './repositoryOperation.js';
+export { withGitRepositoryOperation } from './repositoryOperation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -5,9 +7,69 @@ import { constants, realpathSync } from 'node:fs';
 import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import { defaultTaskBranchPrefix, normalizeTaskBranchPrefix } from '@zeus/shared';
+import { defaultTaskBranchPrefix, normalizeTaskBranchPrefix, type FilePreviewSource, type FileReview } from '@zeus/shared';
+import { businessProcessEnvironment, spawnManagedProcess } from '@zeus/ai-runtime';
 
-const execFileAsync = promisify(execFile);
+/** 非 Windows 保留原有 execFile 的编码、输出和错误约定。 */
+const execFilePosix = promisify(execFile);
+
+/** Windows 所有 Git 和格式化程序均归属原生 Job，超时或取消收口凭据助手等后代。 */
+async function execFileAsync(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+  if (process.platform !== 'win32') return execFilePosix(command, args, { ...options, env: businessProcessEnvironment(options.env) });
+  /** 当前工作台操作的取消和凭据仍与其他并发操作隔离。 */
+  const execution = projectGitExecution.getStore();
+  execution?.signal?.throwIfAborted();
+  return new Promise((resolveResult, reject) => {
+    /** 同一启动入口解析 git.exe 与 PATH，并负责 Job 生命周期。 */
+    const child = spawnManagedProcess(command, args, { cwd: options.cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...execution?.env, ...options.env } });
+    /** 与 execFile 相同，输出按 UTF-8 解码并保留 stdout/stderr 错误字段。 */
+    let stdout = '';
+    /** 错误输出保持独立，交给既有调用方分类。 */
+    let stderr = '';
+    /** 记录先发生的超时或取消，后续退出不会覆盖原因。 */
+    let stopped: Error | undefined;
+    /** 输出限制沿用 execFile 的每条流独立计算。 */
+    const bytes = { stdout: 0, stderr: 0 };
+    /** 只停止当前 Job，不通过进程名称或可复用 PID 搜索进程。 */
+    const stop = (reason: string) => {
+      stopped ??= new Error(reason);
+      child.kill('SIGKILL');
+    };
+    /** 当前工作台取消只影响本次子程序。 */
+    const cancel = () => stop('Git 操作已中止。');
+    /** 未指定超时时沿用工作台命令的两分钟上限。 */
+    const timer = setTimeout(() => stop('ETIMEDOUT: Git 操作超时。'), options.timeout || 120_000);
+    /** 所有退出路径都移除定时器和取消监听。 */
+    const cleanup = () => {
+      clearTimeout(timer);
+      execution?.signal?.removeEventListener('abort', cancel);
+    };
+    execution?.signal?.addEventListener('abort', cancel, { once: true });
+    if (execution?.signal?.aborted) cancel();
+    for (const stream of ['stdout', 'stderr'] as const) {
+      child[stream].setEncoding('utf8');
+      child[stream].on('data', (text: string) => {
+        bytes[stream] += Buffer.byteLength(text);
+        if (bytes[stream] > (options.maxBuffer ?? 1024 * 1024)) {
+          stop(`Git ${stream} 超过输出上限。`);
+          return;
+        }
+        if (stream === 'stdout') stdout += text;
+        else stderr += text;
+      });
+    }
+    child.once('error', (error) => {
+      cleanup();
+      reject(error);
+    });
+    child.once('close', (code) => {
+      cleanup();
+      if (stopped || code !== 0) reject(Object.assign(stopped ?? new Error(stderr || `Git 命令退出码：${code}`), { code, stdout, stderr, interrupted: Boolean(stopped) }));
+      else resolveResult({ stdout, stderr });
+    });
+    child.stdin.end();
+  });
+}
 /** 当前工作台操作的取消、凭据环境和命令记录回调，彼此隔离。 */
 const projectGitExecution = new AsyncLocalStorage<{ signal?: AbortSignal; env?: NodeJS.ProcessEnv; onCommand?: (command: string) => Promise<void> }>();
 
@@ -484,6 +546,36 @@ export interface ProjectGitCommitDetail {
   diff: GitDiffSummary;
 }
 
+/** 推送预览只接受分支与已配置远端，不接受本机路径或任意 Git 参数。 */
+export interface ProjectGitPushPreviewInput {
+  /** 要推送的本地分支。 */
+  sourceBranch: string;
+  /** 仓库已配置的远端名称。 */
+  remote: string;
+  /** 远端目标分支，不含远端前缀。 */
+  targetBranch: string;
+  /** 提交列表的分页位置，默认从头读取。 */
+  offset?: number;
+}
+
+/** 预览依据本地远端跟踪记录；不会抓取远端或改变工作区。 */
+export interface ProjectGitPushPreview {
+  /** 本次读取固定的来源提交，供分页一致性核对。 */
+  sourceHeadSha: string;
+  /** 本地记录的目标提交；空值表示本地没有该目标记录。 */
+  targetHeadSha: string | null;
+  /** 来源分支中尚未包含在目标记录内的提交。 */
+  commits: GitRecentCommit[];
+  /** 待推送提交总数，不受分页上限影响。 */
+  total: number;
+  /** 目标记录中尚未包含在来源分支内的提交数。 */
+  behind: number;
+  /** 是否还有下一页提交。 */
+  hasMore: boolean;
+  /** 第一页携带整个范围的净差异；后续页不重复读取补丁。 */
+  diff: GitDiffSummary | null;
+}
+
 export interface GitDiffSummary {
   isRepository: boolean;
   files: string[];
@@ -553,8 +645,13 @@ export async function getGitRepositoryContext(cwd: string): Promise<GitRepositor
   }
 }
 
+/** 解析全部 worktree 共用的 Git 目录；真实路径统一系统路径别名，读取失败不生成虚假身份。 */
+export async function getGitCommonDirectory(cwd: string): Promise<string> {
+  return realpath(await requireGitStdout(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+}
+
 /**
- * 在项目容器内完整发现真实 Git 根目录；只返回候选，不替用户登记仓库。
+ * 在项目容器内完整发现独立 Git 仓库；同仓库优先保留较浅路径，只返回候选，不替用户登记仓库。
  * 扫描跳过依赖、构建产物和 Zeus 自己的 worktree 根，避免把缓存仓库误纳入项目。
  * 目录或仓库不可读时抛出错误，禁止把不完整扫描伪装成空清单；退出可中止遍历。
  */
@@ -595,7 +692,30 @@ export async function discoverGitRepositories(containerPath: string, maxDepth = 
     });
     currentLevel = nested.flat();
   }
-  const discovered = await mapWithConcurrency(candidates, 4, async (localPath) => {
+  /** 先按深度和路径固定顺序，使主目录优先于嵌套工作树，结果不受并发读取顺序影响。 */
+  const identities = await mapWithConcurrency(
+    candidates.sort((left, right) => left.split(sep).length - right.split(sep).length || left.localeCompare(right)),
+    4,
+    async (localPath) => {
+      signal?.throwIfAborted();
+      return { localPath, commonDirectory: await getGitCommonDirectory(localPath) };
+    },
+  );
+  /** 同一公共 Git 目录只占一个项目仓库身份。 */
+  const commonDirectories = new Set<string>();
+  /** 重复工作树内的子仓库属于那份副本，不扩展当前项目的仓库范围。 */
+  const excludedWorktrees: string[] = [];
+  /** 独立子仓库拥有不同的公共 Git 目录，继续保留。 */
+  const independentCandidates = identities.filter(({ localPath, commonDirectory }) => {
+    if (excludedWorktrees.some((worktree) => isPathInside(worktree, localPath))) return false;
+    if (commonDirectories.has(commonDirectory)) {
+      excludedWorktrees.push(localPath);
+      return false;
+    }
+    commonDirectories.add(commonDirectory);
+    return true;
+  });
+  const discovered = await mapWithConcurrency(independentCandidates, 4, async ({ localPath }) => {
     signal?.throwIfAborted();
     const [context, clean] = await Promise.all([getGitRepositoryContext(localPath), getGitWorktreeClean(localPath)]);
     if (!context.isRepository || canonicalFilesystemPath(context.topLevel) !== localPath) throw new Error(`无法读取 Git 仓库 ${localPath}，请检查目录权限和仓库状态。`);
@@ -925,6 +1045,21 @@ export async function getTaskWorkspaceReview(cwd: string, ignoredPaths: string[]
   const stagedFiles = fileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?');
   const unstagedFiles = fileStatuses.filter((file) => file.workingTreeStatus !== ' ' && file.workingTreeStatus !== '?');
   const untrackedFiles = fileStatuses.filter((file) => file.indexStatus === '?' && file.workingTreeStatus === '?');
+  /** 新文件与空文件比较行数，最多并发 4 次、单文件限时 15 秒；目录占位不递归扫描。 */
+  const untrackedStats = await mapWithConcurrency(
+    untrackedFiles.filter((file) => !file.path.endsWith('/')),
+    4,
+    async (file) => {
+      try {
+        return (await execFileAsync('git', ['diff', '--no-index', '--numstat', '-z', '--', '/dev/null', requireSafeWorkspacePath(file.path)], { cwd, timeout: 15_000 })).stdout;
+      } catch (error) {
+        /** Git 比较发现变化时退出码为 1；其他错误必须保留，不能当作零行。 */
+        const result = error as { code?: unknown; stdout?: unknown };
+        if (result.code === 1 && typeof result.stdout === 'string') return result.stdout;
+        throw error;
+      }
+    },
+  );
   return {
     cwd: resolve(cwd),
     branch: context.branch,
@@ -938,7 +1073,7 @@ export async function getTaskWorkspaceReview(cwd: string, ignoredPaths: string[]
     unstagedFiles,
     untrackedFiles,
     stagedDiff: gitDiffStatSummary(stagedStat, stagedFiles),
-    unstagedDiff: gitDiffStatSummary(unstagedStat, unstagedFiles),
+    unstagedDiff: gitDiffStatSummary([unstagedStat, ...untrackedStats].join(''), [...unstagedFiles, ...untrackedFiles.map((file) => ({ ...file, category: 'added' as const }))]),
   };
 }
 
@@ -1798,7 +1933,22 @@ export async function finalizeTaskBranchIntegration(input: { repositoryPath: str
   };
 }
 
-/** 只回收已登记在 Zeus worktree 容器内的临时合入目录。 */
+/** 校验未登记的合入目录仍是 Zeus 创建的精确目录形态，避免递归删除任意用户路径。 */
+async function assertOrphanTaskIntegrationPath(containerRoot: string, integrationPath: string): Promise<void> {
+  const relativePath = relative(containerRoot, integrationPath);
+  const segments = relativePath.split(sep);
+  const matchesIntegration = segments.length === 3 && segments[1] === '.integration';
+  const matchesAttempt = segments.length === 4 && segments[1] === '.integration-attempts';
+  if ((!matchesIntegration && !matchesAttempt) || segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw gitCoreError('ZEUS_GIT_PATH_INVALID', 'Integration worktree path does not match a Zeus-managed layout.');
+  }
+  const status = await lstat(integrationPath);
+  if (!status.isDirectory() || status.isSymbolicLink()) throw gitCoreError('ZEUS_GIT_PATH_INVALID', 'Integration worktree path is not a physical directory.');
+  const [realContainerRoot, realIntegrationPath] = await Promise.all([realpath(containerRoot), realpath(integrationPath)]);
+  if (!isPathInside(realContainerRoot, realIntegrationPath)) throw gitCoreError('ZEUS_GIT_PATH_INVALID', 'Integration worktree resolves outside the Zeus worktree container.');
+}
+
+/** 回收 Zeus worktree 容器内的临时合入目录，并收敛已丢失 Git 登记的孤儿目录。 */
 export async function cleanupTaskIntegrationWorktree(input: { repositoryPath: string; integrationPath: string }): Promise<boolean> {
   const context = await getGitRepositoryContext(input.repositoryPath);
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected project is not a Git repository.');
@@ -1806,8 +1956,18 @@ export async function cleanupTaskIntegrationWorktree(input: { repositoryPath: st
   const containerRoot = resolve(join(dirname(context.topLevel), '.zeus-worktrees'));
   if (!isPathInside(containerRoot, integrationPath)) throw gitCoreError('ZEUS_GIT_PATH_INVALID', 'Integration worktree is outside the Zeus worktree container.');
   const registered = context.worktrees.find((entry) => canonicalFilesystemPath(entry.path) === canonicalFilesystemPath(integrationPath));
-  if (!registered) return false;
-  await runGit(context.topLevel, ['worktree', 'remove', '--force', integrationPath]);
+  if (registered) await runGit(context.topLevel, ['worktree', 'remove', '--force', registered.path]);
+  else {
+    const exists = await lstat(integrationPath).then(
+      () => true,
+      (error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw error;
+      },
+    );
+    if (!exists) return false;
+    await assertOrphanTaskIntegrationPath(containerRoot, integrationPath);
+  }
   await rm(integrationPath, { recursive: true, force: true });
   return true;
 }
@@ -2322,12 +2482,18 @@ async function defaultGitCommandRunner(cwd: string, args: string[], input?: stri
   await execution?.onCommand?.(formatGitCommand(args, input !== undefined));
   execution?.signal?.throwIfAborted();
   return new Promise((resolveResult, reject) => {
-    const child = spawn('git', args, {
-      cwd,
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...execution?.env },
-    });
+    const child =
+      process.platform === 'win32'
+        ? spawnManagedProcess('git', args, {
+            cwd,
+            env: businessProcessEnvironment({ ...process.env, GIT_TERMINAL_PROMPT: '0', ...execution?.env }),
+          })
+        : spawn('git', args, {
+            cwd,
+            detached: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: businessProcessEnvironment({ ...process.env, GIT_TERMINAL_PROMPT: '0', ...execution?.env }),
+          });
     let stdout = '';
     let stderr = '';
     let bytes = 0;
@@ -2859,6 +3025,46 @@ export async function getProjectGitHistory(cwd: string, offset = 0, ref?: string
   return { commits: commits.slice(0, 200), hasMore: commits.length > 200 };
 }
 
+/** 按显式推送目标读取提交与净差异，查询全过程不写对象、索引或远端。 */
+export async function getProjectGitPushPreview(cwd: string, input: ProjectGitPushPreviewInput): Promise<ProjectGitPushPreview> {
+  /** 分页位置与历史查询采用同一边界。 */
+  const offset = input.offset ?? 0;
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) throw gitCoreError('ZEUS_GIT_HISTORY_OFFSET_INVALID', '提交分页位置无效。');
+  if (typeof input.sourceBranch !== 'string' || typeof input.remote !== 'string' || typeof input.targetBranch !== 'string') throw gitCoreError('ZEUS_GIT_PUSH_PREVIEW_INVALID', '推送预览参数无效。');
+  if (!input.remote.trim()) throw gitCoreError('ZEUS_GIT_REMOTE_REQUIRED', '必须选择已配置的远端。');
+  /** 仓库身份由调用层解析，此处再次确认 Git 元数据。 */
+  const context = await getGitRepositoryContext(cwd);
+  if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', '仓库不可用。');
+  /** 来源必须是确实存在的本地分支。 */
+  const source = await assertNamedBranchExists(context.topLevel, input.sourceBranch);
+  /** 远端只从仓库配置中选择，不能将 URL 作为查询输入。 */
+  const remote = requireKnownRemote(context, input.remote);
+  /** 目标名称沿用实际推送的 Git 校验。 */
+  const target = await assertGitBranchFormat(context.topLevel, input.targetBranch, 'push target branch');
+  /** 用固定提交号读取，避免同一次查询中分支移动造成范围不一致。 */
+  const sourceHeadSha = await resolveCommit(context.topLevel, localBranchRef(source));
+  /** 没有本地记录只表示目标未知，不声明远端分支确实不存在。 */
+  const targetHeadSha = context.remoteBranches.includes(`${remote}/${target}`) ? await resolveCommit(context.topLevel, `refs/remotes/${remote}/${target}`) : null;
+  /** 已知目标使用提交差集；未知目标展示来源分支完整历史。 */
+  const range = targetHeadSha ? `${targetHeadSha}..${sourceHeadSha}` : sourceHeadSha;
+  /** 独立读取提交页、总数、远端独有提交与首屏补丁。 */
+  const [history, total, behind, diff] = await Promise.all([
+    requireGitStdout(context.topLevel, ['log', '--topo-order', `--skip=${offset}`, '-n', '101', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P', range, '--']),
+    requireGitStdout(context.topLevel, ['rev-list', '--count', range, '--']),
+    targetHeadSha ? requireGitStdout(context.topLevel, ['rev-list', '--count', `${sourceHeadSha}..${targetHeadSha}`, '--']) : Promise.resolve('0'),
+    offset === 0
+      ? (async () => {
+          /** hash-object 不带 -w，只计算当前对象格式的空树哈希，兼容不同平台与对象格式。 */
+          const base = targetHeadSha ?? (await runGit(context.topLevel, ['hash-object', '-t', 'tree', '--stdin'], '')).stdout.trim();
+          return diffSummaryFromText(await requireGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--find-renames', base, sourceHeadSha, '--']));
+        })()
+      : Promise.resolve(null),
+  ]);
+  /** 多读取一条，仅用于判断是否还有下一页。 */
+  const commits = parseRecentCommits(history);
+  return { sourceHeadSha, targetHeadSha, commits: commits.slice(0, 100), total: Number(total), behind: Number(behind), hasMore: commits.length > 100, diff };
+}
+
 async function readRegisteredSubmodules(cwd: string): Promise<{ path: string; initialized: boolean }[]> {
   const raw = await readGitStdout(cwd, ['config', '-z', '--file', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$']);
   const paths = raw
@@ -2900,8 +3106,13 @@ async function readIntegrationState(cwd: string): Promise<'merge' | 'rebase' | n
 }
 
 /** 执行项目 Git 工作台白名单动作；调用方不能传入任意子命令或任意工作目录。 */
+/** 后台交付退出时沿用 Git runner 的进程组取消，覆盖嵌套任务合入命令。 */
+export function withGitOperationSignal<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  return projectGitExecution.run({ ...projectGitExecution.getStore(), signal }, operation);
+}
+
 export async function executeProjectGitAction(cwd: string, action: ProjectGitAction, signal?: AbortSignal, env?: NodeJS.ProcessEnv, onCommand?: (command: string) => Promise<void>): Promise<ProjectGitActionResult> {
-  return projectGitExecution.run({ signal, env, onCommand }, () => executeProjectGitActionInternal(cwd, action));
+  return withGitRepositoryOperation(cwd, () => projectGitExecution.run({ signal, env, onCommand }, () => executeProjectGitActionInternal(cwd, action)));
 }
 
 async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAction): Promise<ProjectGitActionResult> {
@@ -3703,12 +3914,13 @@ export function parseGitUnifiedDiff(diffText: string): GitFileDiff[] {
       currentFile.changeType = 'copied';
       continue;
     }
-    if (line.startsWith('--- ')) {
+    // 文件头只出现在首个区块前；区块内的 Markdown 分隔线也是普通删除正文。
+    if (!currentHunk && line.startsWith('--- ')) {
       const path = parseDiffMarkerPath(line.slice(4));
       if (path && path !== '/dev/null') currentFile.oldPath = path;
       continue;
     }
-    if (line.startsWith('+++ ')) {
+    if (!currentHunk && line.startsWith('+++ ')) {
       const path = parseDiffMarkerPath(line.slice(4));
       if (path && path !== '/dev/null') currentFile.newPath = path;
       if (path === '/dev/null') currentFile.changeType = 'deleted';
@@ -3723,7 +3935,7 @@ export function parseGitUnifiedDiff(diffText: string): GitFileDiff[] {
     }
     if (!currentHunk) continue;
 
-    if (line.startsWith('+') && !line.startsWith('+++')) {
+    if (line.startsWith('+')) {
       currentHunk.lines.push({
         type: 'addition',
         content: line.slice(1),
@@ -3734,7 +3946,7 @@ export function parseGitUnifiedDiff(diffText: string): GitFileDiff[] {
       newLine += 1;
       continue;
     }
-    if (line.startsWith('-') && !line.startsWith('---')) {
+    if (line.startsWith('-')) {
       currentHunk.lines.push({
         type: 'deletion',
         content: line.slice(1),
@@ -3822,18 +4034,25 @@ function splitNullRecords(value: string): string[] {
   return value.split('\0').filter(Boolean);
 }
 
-/** 只读取指定文件相对 HEAD 的差异；没有提交或未跟踪时以空文件为基线。 */
-export async function getFileReviewDiff(absolutePath: string): Promise<GitFileDiff | null | undefined> {
+/** 只读取指定文件的状态与相对 HEAD 的差异；未跟踪文件不伪装成已暂存新增。 */
+export async function getFileReview(absolutePath: string): Promise<FileReview> {
   /** Git 返回真实仓库路径，先统一 macOS 临时目录等符号链接别名。 */
   absolutePath = await realpath(absolutePath);
   /** 从文件目录识别所属仓库，支持嵌套仓库与独立工作树。 */
   const cwd = dirname(absolutePath);
   /** 非仓库文件保留普通预览，不伪装成干净仓库。 */
   const root = await readGitStdout(cwd, ['rev-parse', '--show-toplevel']);
-  if (!root) return undefined;
+  if (!root) return {};
   /** 只允许字面量相对路径，不将文件名解释成 Git 路径表达式。 */
   const path = requireSafeWorkspacePath(relative(root, absolutePath));
   if (path.split('/').includes('.git')) throw new Error('不能审阅 Git 管理目录。');
+  /** 使用零分隔记录保留含空格、中文的路径；禁止状态读取刷新索引。 */
+  const porcelain = await execFileAsync('git', ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all', '--ignored', '--', `:(literal)${path}`], { cwd: root, timeout: 30_000, maxBuffer: 20 * 1024 * 1024 });
+  /** 忽略目录可能由 Git 汇总返回，单文件路径限定确保结果只属于本次审阅。 */
+  const entry = parseGitPorcelainEntries(porcelain.stdout)[0];
+  /** 干净文件没有状态行，忽略文件的状态码为双感叹号。 */
+  const status: FileReview['status'] = entry?.indexStatus === '!' ? 'ignored' : (entry?.category ?? 'unchanged');
+  if (status === 'ignored') return { status };
   /** HEAD 中存在该文件时合并展示暂存与未暂存结果。 */
   const tracked = await readGitStdout(root, ['ls-tree', '-z', 'HEAD', '--', `:(literal)${path}`]);
   /** 禁用外部差异程序与文本转换，避免读取文件时执行仓库配置的命令。 */
@@ -3848,7 +4067,7 @@ export async function getFileReviewDiff(absolutePath: string): Promise<GitFileDi
   }
   /** 复用 Git 解析器，新增文件的显示路径仍保持仓库相对路径。 */
   const diff = parseGitUnifiedDiff(output)[0];
-  return diff ? { ...diff, oldPath: tracked ? diff.oldPath : '/dev/null', newPath: path } : null;
+  return { status, diff: diff ? { ...diff, oldPath: tracked ? diff.oldPath : '/dev/null', newPath: path } : null };
 }
 
 /** 按差异语义解析可预览的两端；仅返回文件授权和固定对象，不读取二进制到补丁中。 */
@@ -3868,7 +4087,7 @@ export async function getGitFilePreviewSources(
     /** 已确认的任务分支两端。 */
     revisions?: [string, string];
   },
-): Promise<Array<{ name: string; label: string; root?: string; path?: string; blob?: string; reason?: string }>> {
+): Promise<FilePreviewSource[]> {
   /** 路径沿用工作区校验，Git 管理目录不作为用户文件开放。 */
   const path = requireSafeWorkspacePath(input.path);
   if (path.split('/').includes('.git')) throw new Error('不能预览 Git 管理目录。');
@@ -3916,16 +4135,77 @@ export async function getGitFilePreviewSources(
       break;
     }
   }
+  /** 未暂存比较可能建立在已暂存的重命名上，归属仍追溯 HEAD 的原路径。 */
+  let blamePath = oldPath;
+  if (before === 'index' && head) {
+    /** 只读取名称映射，避免为归属重新加载全部补丁。 */
+    const stagedNames = (await runGit(cwd, ['diff', '--cached', head, '--no-ext-diff', '--find-renames', '--name-status', '-z', '--'])).stdout.split('\0');
+    for (let index = 0; index < stagedNames.length - 1;) {
+      /** 每条记录先读状态，再按重命名或复制规则读取前后路径。 */
+      const status = stagedNames[index++]!;
+      /** HEAD 中用于追溯归属的路径。 */
+      const left = stagedNames[index++]!;
+      /** 索引中的目标路径；普通变更沿用原路径。 */
+      const right = /^[RC]/u.test(status) ? stagedNames[index++]! : left;
+      if (right === oldPath) {
+        blamePath = left;
+        break;
+      }
+    }
+  }
   /** 使用 Git 树记录获取对象，拒绝符号链接和子模块作为普通文件解码。 */
-  async function side(revision: string | null, name: string, prefix: string, fallback?: string | null) {
+  async function side(revision: string | null, name: string, prefix: string, fallback?: string | null): Promise<FilePreviewSource> {
     const label = `${prefix} · ${revision === 'worktree' ? '工作区' : revision === 'index' ? '暂存区' : (revision?.slice(0, 12) ?? '不存在')}`;
-    if (!revision) return { name, label, reason: '此版本中不存在该文件。' };
-    if (revision === 'worktree') return { name, label, root: cwd, path: resolve(cwd, requireSafeWorkspacePath(name)) };
+    /** 所有历史侧编辑都指向当前工作区的新路径，不打开历史副本。 */
+    const edit = { root: cwd, path: resolve(cwd, requireSafeWorkspacePath(newPath)) };
+    if (!revision) return { name, label, edit, missing: true, reason: '此版本中不存在该文件。' };
+    if (revision === 'worktree') return { name, label, edit, root: cwd, path: resolve(cwd, requireSafeWorkspacePath(name)), git: { root: cwd, path: blamePath, baseRef: head } };
     const output = revision === 'index' ? (await runGit(cwd, ['ls-files', '--stage', '-z', '--', `:(literal)${name}`])).stdout : (await runGit(cwd, ['ls-tree', '-z', revision, '--', `:(literal)${name}`])).stdout;
     const entry = output.split('\0').find((item) => item.slice(item.indexOf('\t') + 1) === name);
     const match = entry?.match(/^(100[0-7]{3}) (?:blob )?([a-f0-9]{40,64})(?: 0)?\t/u);
     if (!match && !entry && fallback) return side(fallback, name, prefix);
-    return match ? { name, label, root: cwd, blob: match[2] } : { name, label, reason: entry ? '符号链接、冲突索引或子模块不能作为普通文件预览。' : '此版本中不存在该文件。' };
+    return match
+      ? { name, label, edit, root: cwd, blob: match[2], git: { root: cwd, path: revision === 'index' ? blamePath : name, ...(revision === 'index' ? { baseRef: head } : { ref: revision }) } }
+      : { name, label, edit, missing: !entry, reason: entry ? '符号链接、冲突索引或子模块不能作为普通文件预览。' : '此版本中不存在该文件。' };
   }
   return Promise.all([side(before, oldPath, '变更前'), side(after, newPath, '变更后', untrackedTree)]);
+}
+
+/** 按已授权预览版本计算逐行归属；工作区与索引使用固定内容，历史使用固定提交。 */
+export async function getFilePreviewBlame(source: NonNullable<FilePreviewSource['git']>, contentPath: string): Promise<GitFileBlame> {
+  /** 路径只作为 Git 的路径参数，不参与 shell 或版本表达式拼接。 */
+  const requested = requireSafeWorkspacePath(source.path);
+  if (requested.split('/').includes('.git')) throw new Error('不能读取 Git 管理目录的归属。');
+  /** Git 返回真实根目录，先统一 macOS 临时目录或工作区别名，避免合法路径被误判为越界。 */
+  const sourceRoot = await realpath(source.root);
+  /** 当前文件可能属于项目下的独立子仓库；历史路径所在目录可以已经删除。 */
+  const context = await getGitRepositoryContext(source.ref || source.baseRef !== undefined ? sourceRoot : dirname(resolve(sourceRoot, requested)));
+  if (!context.isRepository) throw new Error('此文件不属于 Git 仓库。');
+  /** Git 命令始终使用实际仓库根及其相对路径。 */
+  const root = context.topLevel;
+  const path = relative(root, resolve(sourceRoot, requested)).split(sep).join('/');
+  requireSafeWorkspacePath(path);
+  /** 固定历史提交；当前内容使用 HEAD 作为归属基线。 */
+  const ref = source.ref ? await resolveCommit(root, source.ref) : await readGitStdout(root, ['rev-parse', '--verify', 'HEAD']);
+  if (source.baseRef !== undefined && source.baseRef !== ref) throw new Error('Git 基线已变化，请刷新后查看提交人。');
+  /** 未跟踪文件与空仓库没有历史作者，所有真实行明确标为未提交。 */
+  const tracked = ref ? await readGitStdout(root, ['ls-tree', '-z', ref, '--', `:(literal)${path}`]) : '';
+  if (!source.ref && !tracked) {
+    /** 未提交记录保持与 Git porcelain 相同的全零身份。 */
+    const content = (await readFile(contentPath, 'utf8')).split(/\r\n?|\n/u);
+    if (content.at(-1) === '') content.pop();
+    return { path, lines: content.map((_line, index) => ({ line: index + 1, author: '', authorTime: 0, commitHash: '0'.repeat(40), shortHash: '0000000', subject: '' })) };
+  }
+  /** 禁用文本转换，统一作者编码并保留根提交；两端均读取当前授权版本。 */
+  const { stdout } = await execFileAsync(
+    'git',
+    ['-c', 'core.quotePath=false', '-c', 'blame.blankBoundary=false', '--no-pager', 'blame', '--encoding=UTF-8', '--root', '--no-textconv', '--line-porcelain', ...(source.ref ? [ref] : ['--contents', contentPath]), '--', path],
+    {
+      cwd: root,
+      timeout: 30_000,
+      maxBuffer: 32 * 1024 * 1024,
+    },
+  );
+  if (!source.ref && ref !== (await readGitStdout(root, ['rev-parse', '--verify', 'HEAD']))) throw new Error('归属读取期间 Git 基线已变化，请刷新。');
+  return { path, lines: parseGitBlamePorcelain(stdout) };
 }

@@ -1,6 +1,6 @@
 import { distributionAppName } from '../tooling/distribution.js';
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageOverviewSnapshot, UsageProviderSummary, UsageOverviewRange, CodexLocalUsageTotals } from '@zeus/shared';
+import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageModelOutputRateBreakdown, UsageOverviewSnapshot, UsageProviderSummary, UsageOverviewRange, CodexLocalUsageTotals } from '@zeus/shared';
 import { isCodexSubscriptionUsage, hasPositiveCodexCredits, formatCodexCredits } from '@zeus/shared';
 import type { AppShellSettings, DashboardClient } from '../apiClient.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
@@ -539,7 +539,7 @@ function ProviderDetail(props: { provider: UsageProviderSummary; language: Langu
         <Metric label={text.tokens} value={formatIncompleteTokens(local.totalTokens, summary.complete, language)} />
         <Metric label={text.cache} value={!complete ? '—' : provider.cacheUsageAvailable ? formatPercent(local.cacheHitRate, language, '—') : text.cacheUnsupported} />
         <Metric label={costLabel} accessibleLabel={equivalentCost ? text.equivalentCostHint : costLabel} value={complete ? formatCost(local, language, text.noPrice) : '—'} costBreakdown={summary.costBreakdown} language={language} />
-        <Metric label={text.outputRate} value={local.outputTokensPerSecond == null ? '—' : `${formatTokens(local.outputTokensPerSecond, language)} / s`} />
+        <Metric label={text.outputRate} value={local.outputTokensPerSecond == null ? '—' : `${formatTokens(local.outputTokensPerSecond, language)} / s`} outputRateBreakdown={summary.outputRateBreakdown} language={language} />
       </dl>
       {local.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
       <DailyBars key={provider.providerId} provider={provider} language={language} />
@@ -706,7 +706,7 @@ function DailyBars(props: { provider: UsageProviderSummary; language: Language }
 }
 
 /** 菜单栏指标只显示名称和数值，减少重复说明占用的空间。 */
-function Metric(props: { label: string; accessibleLabel?: string; value: string; costBreakdown?: UsageModelCostBreakdown[]; language?: Language }) {
+function Metric(props: { label: string; accessibleLabel?: string; value: string; costBreakdown?: UsageModelCostBreakdown[]; outputRateBreakdown?: UsageModelOutputRateBreakdown[]; language?: Language }) {
   const detailId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const detailRef = useRef<HTMLDivElement>(null);
@@ -729,7 +729,7 @@ function Metric(props: { label: string; accessibleLabel?: string; value: string;
       window.removeEventListener('scroll', positionDetail, true);
     };
   }, [positionDetail]);
-  const hasDetail = Boolean(props.costBreakdown?.length && props.language);
+  const hasDetail = Boolean((props.costBreakdown?.length || props.outputRateBreakdown?.length) && props.language);
   const text = props.language ? copy[props.language] : null;
   return (
     <div>
@@ -740,10 +740,10 @@ function Metric(props: { label: string; accessibleLabel?: string; value: string;
             ref={triggerRef}
             className="menu-bar-usage-cost-detail-trigger"
             type="button"
-            aria-label={text?.costDetail}
+            aria-label={props.outputRateBreakdown ? props.label : text?.costDetail}
             aria-controls={detailId}
             aria-expanded={detailOpen}
-            title={text?.costDetail}
+            title={props.outputRateBreakdown ? props.label : text?.costDetail}
             onClick={() => {
               const panel = detailRef.current;
               if (!panel) return;
@@ -772,7 +772,25 @@ function Metric(props: { label: string; accessibleLabel?: string; value: string;
           }}
         >
           <strong>{props.accessibleLabel ?? props.label}</strong>
-          <table>
+          {props.outputRateBreakdown ? (
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">{text?.model}</th>
+                  <th scope="col">{props.label}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.outputRateBreakdown.map((entry) => (
+                  <tr key={entry.model}>
+                    <th scope="row">{entry.model}</th>
+                    <td>{formatTokens(entry.outputTokensPerSecond, props.language!)} Token / s</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : null}
+          <table hidden={Boolean(props.outputRateBreakdown)}>
             <thead>
               <tr>
                 <th scope="col">{text?.model}</th>
@@ -973,6 +991,7 @@ function readStoredSnapshot(): UsageOverviewSnapshot | null {
         overviewRangeOrder.every(
           (range) =>
             Boolean(provider.overviewRanges?.[range]?.local) &&
+            Array.isArray(provider.overviewRanges[range].outputRateBreakdown) &&
             Array.isArray(provider.overviewRanges[range].costBreakdown) &&
             provider.overviewRanges[range].costBreakdown.every((entry) => typeof entry.longContext === 'boolean' && (entry.serviceTier === null || typeof entry.serviceTier === 'string')),
         ),

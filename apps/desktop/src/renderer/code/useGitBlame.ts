@@ -3,6 +3,8 @@ import type { GitFileBlame } from '../features/git/gitContracts.js';
 import { invalidateGitBlame, readCachedGitBlame } from './gitBlameCache.js';
 
 export interface UseGitBlameOptions {
+  /** 预览版本使用窗口私有令牌，不回退到项目工作区。 */
+  previewId?: string;
   projectId?: string;
   filePath?: string;
   ref?: string;
@@ -31,10 +33,14 @@ export function useGitBlame(options: UseGitBlameOptions): UseGitBlameResult {
   const filePath = options.filePath ?? '';
   const ref = options.ref?.trim() || undefined;
   const { conversationId, resourceId, content, revision, suspended = false } = options;
+  const previewId = options.previewId;
   const resource = Boolean(conversationId || resourceId);
-  const cacheKey = projectId ? JSON.stringify(resource ? ['resource', projectId, conversationId, resourceId] : ['project', projectId, filePath, ref]) : '';
+  /** 缓存身份区分项目文件与会话资源。 */
+  const cacheKey = previewId ? JSON.stringify(['preview', previewId]) : projectId ? JSON.stringify(resource ? ['resource', projectId, conversationId, resourceId] : ['project', projectId, filePath, ref]) : '';
+  /** 桌面能力不可用时保留纯源码显示。 */
   const available = Boolean(
-    projectId && typeof window !== 'undefined' && (resource ? conversationId && resourceId && content !== undefined && window.zeus?.loadConversationSourceBlame : filePath.trim() && window.zeus?.loadProjectSourceBlame),
+    typeof window !== 'undefined' &&
+    (previewId ? window.zeus?.loadFilePreviewBlame : projectId && (resource ? conversationId && resourceId && content !== undefined && window.zeus?.loadConversationSourceBlame : filePath.trim() && window.zeus?.loadProjectSourceBlame)),
   );
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [blame, setBlame] = useState<{ key: string; revision?: string; content?: string; value: GitFileBlame } | null>(null);
@@ -60,10 +66,11 @@ export function useGitBlame(options: UseGitBlameOptions): UseGitBlameResult {
         cacheKey,
         expectedSha256 ?? '',
         () =>
-          resource
-            ? window.zeus!.loadConversationSourceBlame({ projectId, conversationId: conversationId!, resourceId: resourceId!, expectedSha256: expectedSha256! })
-            : window.zeus!.loadProjectSourceBlame({ projectId, relativePath: filePath, ...(ref ? { ref } : {}), ...(expectedSha256 ? { expectedSha256 } : {}) }),
-        // 保存内容相同不代表 HEAD 没变；重新激活文件时刷新归属，同时合并并发请求。
+          previewId
+            ? window.zeus!.loadFilePreviewBlame(previewId).then((value) => value ?? { path: '', lines: [] })
+            : resource
+              ? window.zeus!.loadConversationSourceBlame({ projectId, conversationId: conversationId!, resourceId: resourceId!, expectedSha256: expectedSha256! })
+              : window.zeus!.loadProjectSourceBlame({ projectId, relativePath: filePath, ...(ref ? { ref } : {}), ...(expectedSha256 ? { expectedSha256 } : {}) }),
         true,
       );
     };
@@ -83,7 +90,7 @@ export function useGitBlame(options: UseGitBlameOptions): UseGitBlameResult {
     return () => {
       active = false;
     };
-  }, [available, cacheKey, filePath, projectId, ref, refreshVersion, resource, conversationId, resourceId, content, revision, suspended]);
+  }, [available, cacheKey, filePath, projectId, ref, refreshVersion, resource, conversationId, resourceId, content, revision, suspended, previewId]);
 
   const reload = useCallback(() => {
     if (cacheKey) invalidateGitBlame(cacheKey);
@@ -91,7 +98,7 @@ export function useGitBlame(options: UseGitBlameOptions): UseGitBlameResult {
   }, [cacheKey]);
 
   useEffect(() => {
-    if (!available || suspended) return;
+    if (!available || suspended || previewId) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const refresh = () => {
       clearTimeout(timer);
@@ -111,7 +118,7 @@ export function useGitBlame(options: UseGitBlameOptions): UseGitBlameResult {
       window.removeEventListener('focus', refresh);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, [available, suspended, projectId, filePath, reload]);
+  }, [available, suspended, projectId, filePath, reload, previewId]);
 
   return { blame: blame?.key === cacheKey && blame.revision === revision && blame.content === content ? blame.value : null, loading, available, error, reload };
 }

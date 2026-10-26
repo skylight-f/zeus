@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { inspectReadOnlyValidationManifest, verifyReadOnlyValidationDescriptor } from '@zeus/local-server';
 import type { ReadOnlyValidationDescriptor } from '@zeus/shared';
+import { assertPrivatePathSync, windowsSecurityRequest } from '@zeus/storage/platform-security';
 
 export const readOnlyValidationManifestEnvironmentName = 'ZEUS_READ_ONLY_VALIDATION_MANIFEST';
 
@@ -21,7 +22,7 @@ export function loadDesktopReadOnlyValidationDescriptor(input: {
   if (!configured) return undefined;
   const executablePath = resolve(input.executablePath);
   const executableName = basename(executablePath, extname(executablePath));
-  const bundleId = readMacOSBundleIdentifier(executablePath, input.packaged);
+  const bundleId = readPackagedDesktopApplicationId(executablePath, input.packaged);
   const descriptor = inspectReadOnlyValidationManifest(resolve(configured), {
     packaged: input.packaged,
     executableName,
@@ -33,6 +34,7 @@ export function loadDesktopReadOnlyValidationDescriptor(input: {
   });
 }
 
+/** 默认 Test 启动与只读验收共用唯一绝对根，避免再次拼接用户 home。 */
 export function resolveDesktopTestDataRoot(executablePathInput: string, homeDirectory = homedir()): string {
   const executablePath = resolve(executablePathInput);
   const identityHash = createHash('sha256').update(executablePath).digest('hex').slice(0, 16);
@@ -66,6 +68,7 @@ export function assertDesktopReadOnlyValidationTrustBoundary(
     join(homeDirectory, '.zeus-development'),
     join(homeDirectory, 'Library', 'Application Support', '@zeus', 'desktop'),
     join(homeDirectory, 'Library', 'Application Support', 'Zeus'),
+    ...(process.platform === 'win32' && process.env.APPDATA ? [join(process.env.APPDATA, '@zeus', 'desktop'), join(process.env.APPDATA, 'Zeus')] : []),
     descriptor.source.inferredDataRoot,
     dirname(descriptor.source.path),
     ...(input.additionalForbiddenDataRoots ?? []),
@@ -85,8 +88,17 @@ export async function verifyDesktopReadOnlyValidationDescriptor(descriptor: Read
   return verifyReadOnlyValidationDescriptor(descriptor);
 }
 
-function readMacOSBundleIdentifier(executablePath: string, packaged: boolean): string {
-  if (!packaged || process.platform !== 'darwin') throw validationApplicationError('只读验证只允许 macOS 打包 Zeus Test。');
+/** 普通启动可接受产品与文件名一致的无签名 PE；只读验收仍默认要求有效签名。 */
+export function readPackagedDesktopApplicationId(executablePath: string, packaged: boolean, allowUnsigned = false): string {
+  if (!packaged) throw validationApplicationError('应用身份核验只允许打包产物。');
+  if (process.platform === 'win32') {
+    const signature = windowsSecurityRequest<{ valid: boolean; status?: number; productName: string | null }>({ operation: 'verify-authenticode', path: executablePath });
+    // 原生助手只在证书表为空且返回 TRUST_E_NOSIGNATURE 时提供产品字段，不接受损坏或不可信签名。
+    const unsignedApplication = allowUnsigned && signature.status === -2146762496 && basename(executablePath) === `${signature.productName}.exe`;
+    if ((!signature.valid && !unsignedApplication) || (signature.productName !== 'Zeus Test' && signature.productName !== 'Zeus')) throw validationApplicationError('Windows 应用签名或产品身份无效。');
+    return signature.productName === 'Zeus Test' ? 'dev.hypha.zeus.test' : 'dev.hypha.zeus';
+  }
+  if (process.platform !== 'darwin') throw validationApplicationError('当前平台没有打包应用身份校验器。');
   const bundlePath = findApplicationBundle(executablePath);
   const informationPropertyListPath = join(bundlePath, 'Contents', 'Info.plist');
   try {
@@ -122,7 +134,8 @@ function requireCanonicalPrivateDirectory(pathInput: string, label: string): str
   if (!isAbsolute(pathInput) || resolve(pathInput) !== pathInput) throw validationTrustError(`${label} 必须是规范绝对路径。`);
   const stats = lstatSync(pathInput, { bigint: true });
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw validationTrustError(`${label} 必须是普通目录且不能是符号链接。`);
-  if ((stats.mode & 0o077n) !== 0n) throw validationTrustError(`${label} 权限范围过宽。`);
+  if (process.platform === 'win32') assertPrivatePathSync(pathInput, 'directory');
+  else if ((stats.mode & 0o077n) !== 0n) throw validationTrustError(`${label} 权限范围过宽。`);
   if (typeof process.getuid === 'function' && stats.uid !== BigInt(process.getuid())) throw validationTrustError(`${label} 不属于当前用户。`);
   const canonical = realpathSync(pathInput);
   if (canonical !== pathInput) throw validationTrustError(`${label} 不是规范真实路径。`);

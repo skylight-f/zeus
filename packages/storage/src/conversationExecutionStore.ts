@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { randomId } from './randomId.js';
 import type { ArtifactRef } from './artifactStore.js';
 import type { ZeusDatabasePort } from './databasePort.js';
-import { conversationProcessProviderItemId } from '@zeus/shared';
+import { conversationProcessProviderItemId, splitEstimatedUsageCosts, sumEstimatedCosts, type CodexUsageEstimate, type ConversationTurnUsage, type TokenUsageBreakdown } from '@zeus/shared';
 import { ConversationTranscriptRepository, hashConversationTranscriptContent, providerEntryId } from './conversationTranscriptStore.js';
 
 /** 菜单栏与会话共用测速条件；历史记录中混入用户回答、审批或 MCP 交互的请求也必须排除。 */
@@ -134,8 +134,10 @@ export interface ConversationOutputRateMeasurement {
   providerThreadId: string;
   /** 原生轮次身份。 */
   providerTurnId: string;
-  /** 不含推理 Token 的可见输出量。 */
-  visibleOutputTokens: number;
+  /** 请求实际使用的模型标识。 */
+  modelId: string;
+  /** 首个可见 Token 之后的生成间隔数。 */
+  outputTokenIntervals: number;
   /** 从首个文本增量到请求完成的毫秒数。 */
   durationMs: number;
 }
@@ -222,6 +224,8 @@ export interface ConversationContextCompactionStatus {
 
 export interface ConversationSessionMetricsSnapshot {
   usage: ConversationUsageSnapshot;
+  /** 同一摘要兼容持久轮次与实时轮次身份，历史分页无需另取账本。 */
+  turnUsage: Record<string, ConversationTurnUsage>;
   cost: {
     /** 原币费用，与美元兼容字段独立。 */
     costs?: import('@zeus/shared').EstimatedMoney[];
@@ -233,6 +237,7 @@ export interface ConversationSessionMetricsSnapshot {
     complete: boolean;
   };
   performance: {
+    /** 本会话全部可测速请求的加权平均输出速率；属性名沿用现有跨层协议。 */
     latestOutputTokensPerSecond: number | null;
     latestFirstVisibleResponseMs: number | null;
     cumulativeProcessedDurationMs: number | null;
@@ -1642,12 +1647,13 @@ export class ConversationExecutionRepository {
       conversation_id: string;
       provider_thread_id: string;
       provider_turn_id: string;
+      model_id: string;
       output_tokens: number;
       reasoning_output_tokens: number;
       first_text_output_at: string;
       completed_at: string;
     }>(
-      `SELECT r.conversation_id, t.provider_thread_id, t.provider_turn_id,
+      `SELECT r.conversation_id, t.provider_thread_id, t.provider_turn_id, r.model_id,
               r.output_tokens, r.reasoning_output_tokens, r.first_text_output_at, r.completed_at
          FROM conversation_model_requests r
          JOIN conversation_turns t ON t.id = r.turn_id
@@ -1656,9 +1662,8 @@ export class ConversationExecutionRepository {
         ORDER BY r.request_sequence`,
     );
     return rows.flatMap((row) => {
-      const durationMs = elapsedMs(row.first_text_output_at, row.completed_at);
-      const visibleOutputTokens = row.output_tokens - row.reasoning_output_tokens;
-      return durationMs !== null && durationMs > 0 && visibleOutputTokens > 0 ? [{ conversationId: row.conversation_id, providerThreadId: row.provider_thread_id, providerTurnId: row.provider_turn_id, visibleOutputTokens, durationMs }] : [];
+      const sample = outputRateSample(row.output_tokens, row.reasoning_output_tokens, row.first_text_output_at, row.completed_at);
+      return sample ? [{ conversationId: row.conversation_id, providerThreadId: row.provider_thread_id, providerTurnId: row.provider_turn_id, modelId: row.model_id, ...sample }] : [];
     });
   }
 
@@ -2591,17 +2596,34 @@ function stringOrNull(value: unknown): string | null {
 export function readConversationSessionMetrics(db: ZeusDatabasePort, conversationId: string, turnId?: string | null): ConversationSessionMetricsSnapshot {
   const usage = readConversationUsageSnapshot(db, conversationId, turnId);
   const providerUsage = readProviderUsageMetrics(db, conversationId);
-  /** 工具调用或交互等待等不可测速请求不能覆盖最近一次完整的文本输出速率。 */
-  const latestOutputTokensPerSecond =
-    db
-      .select<ModelRequestRow>(
-        `SELECT r.* FROM conversation_model_requests r
+  /** 本会话全部可测速请求共用菜单栏的筛选与请求级样本口径，再按总间隔和总时长聚合。 */
+  const outputRateTotals = db
+    .select<{
+      output_tokens: number;
+      reasoning_output_tokens: number;
+      first_text_output_at: string;
+      completed_at: string;
+    }>(
+      `SELECT r.output_tokens, r.reasoning_output_tokens, r.first_text_output_at, r.completed_at
+         FROM conversation_model_requests r
         WHERE r.conversation_id = ? AND ${outputRateMeasurementCondition}
-        ORDER BY r.request_sequence DESC`,
-        [conversationId],
-      )
-      .map((row) => outputRate(mapModelRequest(row)))
-      .find((rate): rate is number => rate !== null) ?? null;
+        ORDER BY r.request_sequence`,
+      [conversationId],
+    )
+    .reduce(
+      (totals, row) => {
+        /** 单个请求仍使用统一的可见输出 Token 间隔和真实生成时长。 */
+        const sample = outputRateSample(row.output_tokens, row.reasoning_output_tokens, row.first_text_output_at, row.completed_at);
+        if (sample) {
+          totals.outputTokenIntervals += sample.outputTokenIntervals;
+          totals.durationMs += sample.durationMs;
+        }
+        return totals;
+      },
+      { outputTokenIntervals: 0, durationMs: 0 },
+    );
+  /** 会话速率按总间隔除以总时长计算，不直接平均各请求速率。 */
+  const outputTokensPerSecond = outputRateTotals.durationMs > 0 ? (outputRateTotals.outputTokenIntervals * 1_000) / outputRateTotals.durationMs : null;
   const latestTurn = db.get<{ id: string; started_at: string | null }>(`SELECT id, started_at FROM conversation_turns WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, [conversationId]);
   const latestFirstVisibleAt = latestTurn
     ? (db.get<{ first_visible_output_at: string | null }>(
@@ -2646,12 +2668,13 @@ export function readConversationSessionMetrics(db: ZeusDatabasePort, conversatio
   );
   return {
     usage,
+    turnUsage: readConversationTurnUsage(db, conversationId),
     cost: providerUsage,
     performance: {
-      latestOutputTokensPerSecond,
+      latestOutputTokensPerSecond: outputTokensPerSecond,
       latestFirstVisibleResponseMs,
       cumulativeProcessedDurationMs,
-      complete: latestOutputTokensPerSecond !== null && latestFirstVisibleResponseMs !== null && cumulativeProcessedDurationMs !== null,
+      complete: outputTokensPerSecond !== null && latestFirstVisibleResponseMs !== null && cumulativeProcessedDurationMs !== null,
     },
     activity: {
       turnCount: activity?.turn_count ?? 0,
@@ -2666,13 +2689,90 @@ export function readConversationSessionMetrics(db: ZeusDatabasePort, conversatio
   };
 }
 
-/** 仅在文本请求的 Token 与首尾时间都完整时计算输出速率。 */
-function outputRate(request: ConversationModelRequestUsageRecord | null): number | null {
-  if (!request?.measurementComplete || request.outputTokens === null || request.reasoningOutputTokens === null) return null;
-  const durationMs = elapsedMs(request.firstTextOutputAt, request.completedAt);
-  const visibleOutputTokens = request.outputTokens - request.reasoningOutputTokens;
-  if (durationMs === null || durationMs <= 0 || visibleOutputTokens <= 0) return null;
-  return (visibleOutputTokens * 1_000) / durationMs;
+/** 按会话、线程及轮次关联账本，在存储层拆分输入输出费用，只向正文传输汇总。 */
+export function readConversationTurnUsage(db: Pick<ZeusDatabasePort, 'select'>, conversationId: string): Record<string, ConversationTurnUsage> {
+  /** 账本已在写入时校验；金额保留原币，缺价与免费严格区分。 */
+  const rows = db.select<{
+    turn_id: string;
+    provider_turn_id: string;
+    total_tokens: number;
+    /** 账本中的本轮输入总量。 */
+    input_tokens: number;
+    /** 输入中已单列的缓存读取 Token。 */
+    cached_input_tokens: number;
+    /** 输入中已单列的缓存写入 Token。 */
+    cache_write_input_tokens: number;
+    /** 账本中的本轮输出总量。 */
+    output_tokens: number;
+    /** 输出中已包含的推理 Token，不额外计费。 */
+    reasoning_output_tokens: number;
+    usage_complete: number;
+    /** 历史整轮与逐请求价格快照，只在此处用于费用投影。 */
+    estimate_json: string;
+  }>(
+    `SELECT t.id AS turn_id, l.provider_turn_id, l.total_tokens, l.input_tokens, l.output_tokens, l.usage_complete,
+            l.cached_input_tokens, l.cache_write_input_tokens, l.reasoning_output_tokens, l.estimate_json
+       FROM codex_usage_ledger l
+       JOIN conversation_turns t ON t.conversation_id = l.conversation_id
+        AND t.provider_thread_id = l.provider_thread_id AND t.provider_turn_id = l.provider_turn_id
+      WHERE l.conversation_id = ?`,
+    [conversationId],
+  );
+  /** 同一轮可能包含多个供应源账本，按币种合并后供两种身份复用。 */
+  const usageByTurn: Record<string, ConversationTurnUsage> = Object.create(null);
+  for (const row of rows) {
+    /** 金额与费率来自同一条已校验账本，不读取当前模型价格。 */
+    const estimate = JSON.parse(row.estimate_json) as CodexUsageEstimate;
+    /** 已有美元账本沿用原金额，不从当前价格反推历史费用。 */
+    const costs = sumEstimatedCosts([estimate]);
+    /** 旧整轮账本拆分时也保留缓存和推理分类，避免重复计费。 */
+    const tokens: TokenUsageBreakdown = {
+      totalTokens: row.total_tokens,
+      inputTokens: row.input_tokens,
+      cachedInputTokens: row.cached_input_tokens,
+      cacheWriteInputTokens: row.cache_write_input_tokens,
+      outputTokens: row.output_tokens,
+      reasoningOutputTokens: row.reasoning_output_tokens,
+    };
+    /** 新账本逐请求拆分，汇总结果保留各侧缺价状态。 */
+    const breakdown = splitEstimatedUsageCosts(tokens, estimate);
+    /** 每个账本的覆盖状态独立保留，不能用已定价部分冒充全部。 */
+    const complete = row.usage_complete === 1;
+    /** 持久轮次是汇总身份，实时身份只作为同一摘要的读取别名。 */
+    const previous = usageByTurn[row.turn_id];
+    /** 金额为零仍是有效记录；缺价则保留空数组。 */
+    const usage: ConversationTurnUsage = {
+      totalTokens: (previous?.totalTokens ?? 0) + row.total_tokens,
+      inputTokens: (previous?.inputTokens ?? 0) + row.input_tokens,
+      outputTokens: (previous?.outputTokens ?? 0) + row.output_tokens,
+      usageComplete: (previous?.usageComplete ?? true) && complete,
+      costs: sumEstimatedCosts([
+        { costs: previous?.costs ?? [], apiEquivalentUsd: null },
+        { costs, apiEquivalentUsd: null },
+      ]),
+      costComplete: (previous?.costComplete ?? true) && complete && estimate.coverage === 1 && costs.length > 0,
+      inputCosts: sumEstimatedCosts([
+        { costs: previous?.inputCosts ?? [], apiEquivalentUsd: null },
+        { costs: breakdown.inputCosts, apiEquivalentUsd: null },
+      ]),
+      outputCosts: sumEstimatedCosts([
+        { costs: previous?.outputCosts ?? [], apiEquivalentUsd: null },
+        { costs: breakdown.outputCosts, apiEquivalentUsd: null },
+      ]),
+      inputCostComplete: (previous?.inputCostComplete ?? true) && complete && breakdown.inputCostComplete,
+      outputCostComplete: (previous?.outputCostComplete ?? true) && complete && breakdown.outputCostComplete,
+    };
+    usageByTurn[row.turn_id] = usage;
+    usageByTurn[row.provider_turn_id] = usage;
+  }
+  return usageByTurn;
+}
+
+/** 把完整文本请求转换为行业通用的 TPOT 倒数计算依据，首个 Token 不属于后续生成间隔。 */
+function outputRateSample(outputTokens: number, reasoningOutputTokens: number, firstTextOutputAt: string | null, completedAt: string | null): Pick<ConversationOutputRateMeasurement, 'outputTokenIntervals' | 'durationMs'> | null {
+  const durationMs = elapsedMs(firstTextOutputAt, completedAt);
+  const outputTokenIntervals = outputTokens - reasoningOutputTokens - 1;
+  return durationMs !== null && durationMs > 0 && outputTokenIntervals > 0 ? { outputTokenIntervals, durationMs } : null;
 }
 
 function readProviderUsageMetrics(db: ZeusDatabasePort, conversationId: string): ConversationSessionMetricsSnapshot['cost'] {

@@ -1,5 +1,6 @@
 import type { AiCliAdapterDescriptor, AiCliAdapterStatus, AiRuntimeLogEntry, AiRuntimeSession, AiRuntimeTerminalReplayOperation, AiRuntimeTerminalSnapshot } from '@zeus/ai-runtime';
-import { isAbsolute, resolve } from 'node:path';
+import type { CommandShell } from '@zeus/shared';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { RuntimeLogStream, RuntimeSessionRepository, TerminalEventRepository, ZeusRuntimeLogRecord, ZeusRuntimeSessionRecord, ZeusTerminalEventRecord } from '@zeus/storage';
 
 export type RuntimeAutoConfirmationPolicy = 'never' | 'low_risk_only';
@@ -12,6 +13,8 @@ export interface RuntimeSettingsSnapshot {
   terminalEnv: Record<string, string>;
   /** 每个新交互终端输入一次，空字符串表示不执行。 */
   terminalStartupCommand: string;
+  /** 启动脚本的解释器类别，跨平台导入不能静默转换。 */
+  terminalStartupShell?: CommandShell;
   shell: {
     path: string | null;
     login: boolean;
@@ -46,14 +49,14 @@ export interface RuntimeAdapterReadEffectPort {
   listAdapters(): AiCliAdapterDescriptor[];
   /** 用户显式进入单个 check 路由时才允许探测 CLI；不得启动会话或保存探测结果。 */
   checkAdapter(adapterId: string, configuredCommandPath?: string): Promise<AiCliAdapterStatus>;
-  /** 用户明确检测 Codex 更新时才访问官方发布源。 */
+  /** 仅为 Zeus 管理的 Codex 检测官方更新，外部安装不查询新版。 */
   checkCodexUpdate(adapter: AiCliAdapterStatus): Promise<CodexRuntimeUpdateStatus>;
 }
 
 /** Codex 程序版本检测结果；模型权限仍由运行时目录单独决定。 */
 export interface CodexRuntimeUpdateStatus {
   adapter: AiCliAdapterStatus;
-  /** 只有 Zeus 管理的安装才允许由设置页执行更新。 */
+  /** 只有 Zeus 管理的安装才参与版本更新检查、提醒和安装。 */
   managedInstallation: boolean;
   status: 'available' | 'up_to_date' | 'unavailable';
   currentVersion: string | null;
@@ -64,7 +67,9 @@ export interface CodexRuntimeUpdateStatus {
 /** 只认探针解析出的绝对程序路径；目录名称相似或用户全局安装都不属于 Zeus。 */
 export function isManagedCodexStandalone(commandPath: string | null | undefined, codexHome: string | undefined): codexHome is string {
   if (!commandPath || !isAbsolute(commandPath) || !codexHome || !isAbsolute(codexHome)) return false;
-  return resolve(commandPath).startsWith(`${resolve(codexHome, 'packages', 'standalone')}/`);
+  /** path.relative 同时遵守 Windows 盘符与路径分隔符，不能用斜杠字符串前缀认领。 */
+  const child = relative(resolve(codexHome, 'packages', 'standalone'), resolve(commandPath));
+  return Boolean(child) && !isAbsolute(child) && child !== '..' && !child.startsWith('../') && !child.startsWith('..\\');
 }
 
 /** 安装前重验归属和用户确认的版本，禁止空请求触发更新或把新发布的版本偷偷替换进去。 */
@@ -72,7 +77,7 @@ export function assertCodexUpdateTarget(update: Pick<CodexRuntimeUpdateStatus, '
   if (typeof targetVersion !== 'string' || !/^\d+\.\d+\.\d+(?:-(?:alpha|beta)(?:\.\d+)*)?$/u.test(targetVersion)) {
     throw queryError('ZEUS_CODEX_UPDATE_CONFIRMATION_REQUIRED', '请先检测更新，再选择要安装的 Codex 版本。', 400);
   }
-  if (!update.managedInstallation) throw queryError('ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION', '这份 Codex 由用户自行安装，请使用原安装方式更新。', 409);
+  if (!update.managedInstallation) throw queryError('ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION', 'Zeus 不管理这份 Codex。', 409);
   if (update.status === 'unavailable') throw queryError('ZEUS_CODEX_UPDATE_NOT_AVAILABLE', '当前 Codex 程序不可更新，请重新检测。', 409);
   /** 已安装目标版本时只允许复核运行状态，不重新下载或降级。 */
   const expectedVersion = update.status === 'available' ? update.latestVersion : update.currentVersion;

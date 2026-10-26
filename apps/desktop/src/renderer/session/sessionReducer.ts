@@ -29,6 +29,7 @@ import type {
   TransportState,
 } from './sessionTypes.js';
 import { isAssistantDeliverableItem } from './sessionTypes.js';
+import { hasUnfinishedConversationTurn } from './conversationQueuePresentation.js';
 import type { ZeusBrowserComment, ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { type ConversationContextDraft, emptyConversationContextDraft, type TaskPushMessageLayout } from '@zeus/shared';
 import { mergeConversationContentV2, reconcileConversationHistoryCache } from './conversationSnapshotV2Adapter.js';
@@ -118,8 +119,7 @@ export type NativeSessionAction =
       error?: NativeSessionError;
     }
   | { type: 'send_accepted'; clientUserMessageId: string; status: string; messageCreatedAt?: string; submissionId?: string; providerTurnId?: string }
-  | { type: 'send_reconciliation_failed'; error: NativeSessionError }
-  | { type: 'send_succeeded' };
+  | { type: 'send_terminal'; clientUserMessageId: string };
 
 export function nativeSessionItemKey(conversationId: string, threadId: string, turnId: string, itemId: string): string {
   return [conversationId, threadId, turnId, itemId].map((part) => encodeURIComponent(part)).join('/');
@@ -341,8 +341,6 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
             }
           : {}),
         transcriptRevision: state.transcriptRevision + (optimisticEntry ? 1 : 0),
-        conversationState: action.previousConversationState,
-        error: action.error,
       };
     }
     case 'send_uncertain': {
@@ -366,8 +364,6 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
               },
             }
           : {}),
-        conversationState: action.previousConversationState,
-        ...(action.error ? { error: action.error } : {}),
         transcriptRevision: state.transcriptRevision + (optimistic ? 1 : 0),
       };
     }
@@ -375,23 +371,21 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
       const optimisticEntry = optimisticUserItemEntry(state, action.clientUserMessageId);
       const optimisticKey = optimisticEntry?.[0] ?? optimisticUserItemKey(state, action.clientUserMessageId);
       const optimistic = optimisticEntry?.[1];
-      if (!optimistic) return { ...state, error: null };
-      // 接纳到提交队列即完成本地交接；初始回执不能把已删除或已执行的队列项重新写回正文。
-      if (action.submissionId && isUnacceptedTranscriptMessage(optimistic) && !action.providerTurnId) {
-        return {
-          ...state,
-          items: Object.fromEntries(Object.entries(state.items).filter(([key]) => key !== optimisticKey)),
-          itemOrder: state.itemOrder.filter((key) => key !== optimisticKey),
-          error: null,
-          transcriptRevision: state.transcriptRevision + 1,
-        };
-      }
+      if (!optimistic) return state;
+      /** 较晚返回的接纳回执只补身份，不能覆盖已经收到的队列暂停或失败。 */
+      const queuedSubmission = !action.providerTurnId ? state.queue?.submissions.find((submission) => submission.id === action.submissionId || submission.clientUserMessageId === action.clientUserMessageId) : undefined;
+      // 接纳只补充稳定身份；本地消息必须保留到同一 Provider 消息在一次状态更新中原位接管。
       const terminal = action.providerTurnId ? state.terminalTurnIds[action.providerTurnId] : undefined;
       const payload: Record<string, unknown> = {
         ...optimistic.payload,
         ...(action.submissionId ? { submissionId: action.submissionId } : {}),
       };
-      if (action.status === 'active' || action.status === 'completed' || action.status === 'resolved' || terminal) {
+      if (queuedSubmission) Object.assign(payload, mergeSubmissionUserMessagePayload(payload, queuedSubmission));
+      // 服务端已经接纳，不再保留本地等待恢复的临时标记。
+      delete payload.queuedUntilHydrated;
+      /** 实时队列优先于迟到回执，已确认轮次终态优先于两者。 */
+      const acceptedStatus = terminal ? 'completed' : (queuedSubmission?.status ?? action.status);
+      if (acceptedStatus === 'active' || acceptedStatus === 'completed' || acceptedStatus === 'resolved') {
         delete payload.pausedReason;
         delete payload.error;
         delete payload.deliveryError;
@@ -404,19 +398,27 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
             ...optimistic,
             messageCreatedAt: action.messageCreatedAt ?? optimistic.messageCreatedAt,
             ...(action.providerTurnId ? { turnId: action.providerTurnId } : {}),
-            status: terminal ? 'completed' : action.status,
+            status: acceptedStatus,
             payload,
-            optimistic: terminal || action.status === 'completed' || action.status === 'resolved' ? false : optimistic.optimistic,
+            // 提交终态只证明调度结束；持久正文到达前仍由本地显示记录持有，不能伪装成 Provider 正文。
+            optimistic: optimistic.optimistic,
           },
         },
         transcriptRevision: state.transcriptRevision + 1,
-        error: null,
       };
     }
-    case 'send_reconciliation_failed':
-      return { ...state, error: action.error };
-    case 'send_succeeded':
-      return { ...state, error: null };
+    case 'send_terminal': {
+      /** 明确未执行或已删除只移除本地临时项，已经持久化的同身份正文继续保留。 */
+      const optimisticEntry = optimisticUserItemEntry(state, action.clientUserMessageId);
+      if (!optimisticEntry) return state;
+      const [optimisticKey] = optimisticEntry;
+      return {
+        ...state,
+        items: Object.fromEntries(Object.entries(state.items).filter(([key]) => key !== optimisticKey)),
+        itemOrder: state.itemOrder.filter((key) => key !== optimisticKey),
+        transcriptRevision: state.transcriptRevision + 1,
+      };
+    }
   }
 }
 
@@ -651,17 +653,16 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     orderedItems.push({ key, order: null, stableIndex: stableIndexForClient(clientUserMessageId) });
   }
 
-  // A pending user message is renderer-owned until a durable conversation_message with
-  // either the renderer id or the server-acknowledged canonical id appears in a snapshot.
+  // 本地用户消息由 Renderer 持有，直到同一客户端身份的持久正文在本次归约中原位接管。
   const submissionsByClientId = new Map(snapshot.submissions.flatMap((submission) => (submission.clientUserMessageId ? [[submission.clientUserMessageId, submission] as const] : [])));
   for (const key of state.itemOrder) {
     const item = state.items[key];
     if (!item?.optimistic || item.conversationId !== snapshot.id || key in items) continue;
-    const knownSubmission = userMessageClientIds(item)
+    /** 明确失败、删除、取消或人工确认不会产生 Provider 用户正文，本地临时项应按权威终态退出。 */
+    const terminalSubmission = userMessageClientIds(item)
       .map((clientId) => submissionsByClientId.get(clientId))
-      .find((submission): submission is NativeQueuedSubmission => Boolean(submission));
-    // 权威队列接管后不再保留本地副本；接纳后的正文由持久消息来源提供。
-    if (knownSubmission) continue;
+      .find((submission) => submission && (['failed', 'deleted', 'cancelled'].includes(submission.status) || submission.pausedReason === 'user_confirmation'));
+    if (terminalSubmission) continue;
     if ((item.clientUserMessageId && durableClientIds.has(item.clientUserMessageId)) || (item.durableClientUserMessageId && durableClientIds.has(item.durableClientUserMessageId))) continue;
     items[key] = item;
     orderedItems.push({ key, order: item.transcript?.placement.order ?? null, stableIndex: stableIndexForClient(item.clientUserMessageId ?? item.durableClientUserMessageId ?? null) });
@@ -725,8 +726,8 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
   /** 旧快照不能覆盖比它更新的实时摘要。 */
   const currentReasoningItem =
     reasoningSnapshot && reasoningBuffer ? { ...reasoningBuffer, text: reasoningSnapshot.text, payload: reasoningSnapshot.payload, transcript: reasoningSnapshot.transcript, updatedAt: reasoningSnapshot.updatedAt } : null;
-  /** 同线程同轮次的快照刷新不能清掉仍在进行的连接提示；正式结束事件负责收口。 */
-  const retainProviderRetry = state.providerThreadId === snapshot.providerThreadId && snapshot.turns.some((turn) => turn.providerTurnId === state.providerReconnectTurnId && ['running', 'waiting', 'failed'].includes(turn.status));
+  /** 仅活动轮次保留连接提示；权威终态快照也能清除漏收结束事件留下的进度。 */
+  const retainProviderRetry = state.providerThreadId === snapshot.providerThreadId && snapshot.turns.some((turn) => turn.providerTurnId === state.providerReconnectTurnId && ['running', 'waiting'].includes(turn.status));
   return {
     ...state,
     systemMessages: mergeSystemMessages(state.conversationId === snapshot.id ? state.systemMessages : undefined, snapshot.systemMessages?.items ?? []),
@@ -795,7 +796,8 @@ const boundedProcessItemTypes = new Set(['commandexecution', 'command', 'mcptool
 function shouldPreserveBoundedTranscriptItem(item: NativeSessionItemBuffer, activeTurnIdentities: ReadonlySet<string>, preserveCachedHistory: boolean): boolean {
   // 有界首屏不包含较早输入，不代表该输入被删除；已接纳身份由显示位置接口校正或移除。
   if (isUserMessageItem(item) && !isUnacceptedTranscriptMessage(item) && sessionTranscriptEntryId(item)) return true;
-  if (item.optimistic) return false;
+  // 弱网水合不能删除尚未被服务端持久条目接管的本地输入；相同身份到达时会在上游原位合并。
+  if (item.optimistic) return isUserMessageItem(item);
   // resources 分页会为没有 Provider 正文 item 的交付物合成稳定条目。后续首屏权威
   // 快照不重复携带 resources，不能因此把已取回的图片或文件从正文时间线删除。
   if (typeof item.payload.v2SyntheticAssistantDeliverableItemId === 'string' && isAssistantDeliverableItem(item)) return true;
@@ -1199,6 +1201,10 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         terminalTurnIds,
         items,
         turnsByProviderId: { ...base.turnsByProviderId, [canonicalTurnId]: turn },
+        // 终态自身结束重连，不能依赖先到的 transport 事件才能显示错误。
+        ...(event.type === 'conversation.turn.completed' && base.providerReconnectTurnId && turnIdentities.has(base.providerReconnectTurnId)
+          ? { providerReconnectAttempt: 0, providerReconnectAttempts: 0, providerReconnectTurnId: null }
+          : {}),
         transcriptRevision: base.transcriptRevision + 1,
       };
       // 自动恢复只封存上一次尝试，保留停止入口和正在连接状态。
@@ -1603,6 +1609,7 @@ function reduceTranscriptPlacements(state: NativeSessionState, batch: NativeConv
   for (const id of removed) removedTranscriptEntryIds[id] = Math.max(removedTranscriptEntryIds[id] ?? 0, batch.revision);
   const items = Object.fromEntries(
     Object.entries(state.items).flatMap(([key, item]) => {
+      /** 先按客户端身份接管正式位置；Provider 别名退休不代表用户正文被删除。 */
       const entryId = sessionTranscriptEntryId(item);
       if (!entryId || removed.has(entryId)) return entryId && removed.has(entryId) ? [] : [[key, item]];
       const placement = placements.get(entryId);
@@ -1664,19 +1671,17 @@ function sortSessionItemOrder(order: readonly string[], items: Readonly<Record<s
  * 用户消息的持久显示身份：落库后统一是 user-message:<客户端身份>。
  * 本地乐观气泡也用它提前声明“我将来就是这一条正文”，因此同身份只能存在一条消息。
  */
-export function durableUserMessageIdentity(item: NativeSessionItemBuffer): string | null {
-  if (!isUserMessageItem(item)) return null;
-  if (item.transcript) return item.transcript.placement.entryId;
+export function durableUserMessageIdentity(item: Pick<NativeSessionItemBuffer, 'type' | 'payload' | 'transcript' | 'clientUserMessageId' | 'durableClientUserMessageId'>): string | null {
+  if (!isUserMessageType(item.type)) return null;
   /** 优先使用正式提交身份；Provider 回显只补充关联，不重新编号用户输入。 */
   const clientId = item.durableClientUserMessageId ?? item.clientUserMessageId ?? stringValue(item.payload.clientUserMessageId) ?? stringValue(item.payload.clientId);
-  return clientId ? `user-message:${clientId}` : null;
+  return clientId ? `user-message:${clientId}` : (item.transcript?.placement.entryId ?? null);
 }
 
 /** 已接纳输入可按持久客户端身份核对原位置；未发送输入不猜位置，也不进入恢复请求。 */
 export function sessionTranscriptEntryId(item: NativeSessionItemBuffer): string | null {
-  if (item.transcript) return item.transcript.placement.entryId;
-  if (!isUserMessageItem(item) || isUnacceptedTranscriptMessage(item)) return null;
-  return durableUserMessageIdentity(item);
+  if (isUserMessageItem(item) && (item.transcript || !isUnacceptedTranscriptMessage(item))) return durableUserMessageIdentity(item);
+  return item.transcript?.placement.entryId ?? null;
 }
 
 function durableUserMessageText(state: NativeSessionState, clientUserMessageId: string): string | null {
@@ -1747,23 +1752,14 @@ function mergeStableUserMessagePresentation(previous: Record<string, unknown> | 
   };
 }
 
+/** 本地提交立即进入显示；重复派发只更新原消息，不能被自己的运行状态误判成排队。 */
 function addOptimisticUserItem(state: NativeSessionState, action: Extract<NativeSessionAction, { type: 'send_started' }>): NativeSessionState {
   const existingOptimisticEntry = optimisticUserItemEntry(state, action.clientUserMessageId);
   const key = existingOptimisticEntry?.[0] ?? optimisticUserItemKey(state, action.clientUserMessageId);
   const conversationId = state.conversationId ?? 'pending-conversation';
   const threadId = state.providerThreadId ?? 'pending-thread';
-  /** 活跃轮次后的普通发送进入输入框排队区；任务推送首条消息仍属于新会话正文。 */
-  const queuedForActiveTurn =
-    !action.taskPushLayout &&
-    action.delivery === 'queue' &&
-    (action.previousConversationState === 'starting_turn' ||
-      action.previousConversationState === 'active_prework' ||
-      action.previousConversationState === 'active_final_answer' ||
-      action.previousConversationState === 'waiting_approval' ||
-      action.previousConversationState === 'waiting_user_input' ||
-      state.queue?.state.type === 'active' ||
-      state.queue?.state.type === 'waiting' ||
-      state.queue?.state.type === 'dispatching');
+  /** 只在首次提交时判断等待关系；任务首发和已在正文中的输入不因自身派发改到排队区。 */
+  const queuedForActiveTurn = !action.taskPushLayout && action.delivery === 'queue' && (existingOptimisticEntry ? existingOptimisticEntry[1].payload.queuedForActiveTurn === true : hasUnfinishedConversationTurn(state));
   const item: NativeSessionItemBuffer = {
     key,
     conversationId,
@@ -1792,14 +1788,13 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
     timelineAt: action.startedAt,
     updatedAt: action.startedAt,
   };
-  const keepActiveState =
-    action.previousConversationState === 'active_prework' || action.previousConversationState === 'active_final_answer' || action.previousConversationState === 'waiting_approval' || action.previousConversationState === 'waiting_user_input';
   return {
     ...state,
     items: { ...state.items, [key]: item },
     itemOrder: existingOptimisticEntry || state.items[key] ? state.itemOrder : [...state.itemOrder, key],
     transcriptRevision: state.transcriptRevision + 1,
-    conversationState: action.queuedUntilHydrated ? action.previousConversationState : keepActiveState ? action.previousConversationState : 'starting_turn',
+    /** 本地消息状态不推导会话运行状态；队列、轮次和快照拥有该权威状态。 */
+    conversationState: action.previousConversationState,
     ...(action.preserveComposer
       ? {}
       : {
@@ -1808,37 +1803,36 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
           browserSubmission: null,
           contextDraft: structuredClone(emptyConversationContextDraft),
         }),
-    error: null,
   };
 }
 
+/** 队列更新已有消息的送达状态；正文、附件和稳定身份仍由时间线持有。 */
 function projectQueueSubmissionMessages(state: NativeSessionState, queue: NativeQueueSnapshot): NativeSessionState {
   if (state.queue && queue.throughEventSeq < state.queue.throughEventSeq) return state;
-  /** 同一次提交仅凭稳定身份交接，普通重复文本仍是两条消息。 */
-  const submissionIds = new Set(queue.submissions.map((submission) => submission.id));
-  /** HTTP 回执到达前也能用客户端身份确认归属。 */
-  const clientIds = new Set(queue.submissions.map((submission) => submission.clientUserMessageId));
-  /** 明确拒绝后由替代提交接管原气泡，不能把原引导留在已结束轮次中。 */
-  const replacedSubmissionIds = new Set(queue.submissions.map((submission) => submission.replacementOfSubmissionId).filter((id): id is string => Boolean(id)));
-  /** 只移交未接纳的本地输入，持久正文及已进入轮次的插话保留。 */
-  const removedKeys = new Set(
-    state.itemOrder.filter((key) => {
-      const item = state.items[key];
-      return (
-        item &&
-        isUserMessageItem(item) &&
-        ((isUnacceptedTranscriptMessage(item) && (submissionIds.has(stringValue(item.payload.submissionId) ?? '') || userMessageClientIds(item).some((id) => clientIds.has(id)))) ||
-          (!item.providerItemId && replacedSubmissionIds.has(stringValue(item.payload.submissionId) ?? '')))
-      );
-    }),
-  );
+  /** 两种持久身份分别索引，禁止用相同正文合并不同提交。 */
+  const bySubmission = new Map(queue.submissions.map((submission) => [submission.id, submission]));
+  /** 跨过 HTTP 回执丢失的情况，队列仍能凭客户端身份接管原消息。 */
+  const byClientMessage = new Map(queue.submissions.filter((submission) => submission.clientUserMessageId).map((submission) => [submission.clientUserMessageId, submission]));
+  /** 只复制发生接管的消息，不创建或删除时间线条目。 */
+  let items = state.items;
+  for (const [key, item] of Object.entries(state.items)) {
+    if (!item.optimistic || !isUserMessageItem(item) || item.providerItemId || item.status === 'completed' || item.status === 'resolved') continue;
+    /** 提交身份优先；尚未收到回执时才使用原始客户端身份。 */
+    const submission =
+      bySubmission.get(stringValue(item.payload.submissionId) ?? '') ??
+      userMessageClientIds(item)
+        .map((id) => byClientMessage.get(id))
+        .find(Boolean);
+    if (!submission) continue;
+    if (items === state.items) items = { ...state.items };
+    items[key] = { ...item, status: submission.status, payload: mergeSubmissionUserMessagePayload(item.payload, submission) };
+  }
   return {
     ...state,
-    items: removedKeys.size ? Object.fromEntries(Object.entries(state.items).filter(([key]) => !removedKeys.has(key))) : state.items,
-    itemOrder: removedKeys.size ? state.itemOrder.filter((key) => !removedKeys.has(key)) : state.itemOrder,
+    items,
+    transcriptRevision: state.transcriptRevision + (items === state.items ? 0 : 1),
     queue,
     conversationState: conversationStateFromQueue(queue, state),
-    transcriptRevision: state.transcriptRevision + (removedKeys.size ? 1 : 0),
   };
 }
 
@@ -2018,8 +2012,13 @@ function submissionUserMessagePayload(submission: NativeQueuedSubmission): Recor
   };
 }
 
+/** 合并权威送达状态，并保留已展示但本次队列未附带的附件。 */
 function mergeSubmissionUserMessagePayload(previous: Record<string, unknown>, submission: NativeQueuedSubmission): Record<string, unknown> {
+  /** 原正文由时间线保存，队列只补充同一提交的状态和资源。 */
   const next = { ...previous, ...submissionUserMessagePayload(submission) };
+  if (!submission.attachments?.length && previous.attachments) next.attachments = previous.attachments;
+  // 持久队列已经确认消息状态，恢复等待标记不能盖住暂停原因。
+  delete next.queuedUntilHydrated;
   if (!submission.pausedReason) delete next.pausedReason;
   if (!submission.error && submission.pausedReason !== 'user_confirmation') {
     delete next.error;
@@ -2076,6 +2075,7 @@ function eventNamesKnownQueuedSubmission(state: NativeSessionState, payload: Rec
   return Boolean(queueState?.type === 'active' && turnId && providerTurnId === turnId && providerThreadId && stringValue(queueState.turnId) === turnId);
 }
 
+/** 合并 Provider 身份和原生连接进度，线程切换时清除旧轮次运行状态。 */
 function applyProviderIdentityChange(state: NativeSessionState, payload: Record<string, unknown>, updateTransport: boolean): NativeSessionState {
   const providerThreadId = stringValue(payload.providerThreadId) ?? stringValue(payload.threadId) ?? state.providerThreadId;
   const providerState = stringValue(payload.providerState);
@@ -2084,13 +2084,13 @@ function applyProviderIdentityChange(state: NativeSessionState, payload: Record<
   const recoveryState = stringValue(payload.recoveryState);
   /** 非负整数才可进入进度显示，异常协议值按未提供处理。 */
   const reconnectAttempt = numberValue(payload.reconnectAttempt);
-  /** 总次数至少为一，避免生成无意义的零分母。 */
+  /** 总次数为零表示 Provider 未提供计数，界面只显示连接状态。 */
   const reconnectAttempts = numberValue(payload.reconnectAttempts);
   /** 回复流恢复绑定原失败轮次，不能借当前活动轮次猜测。 */
   const providerReconnectTurnId = stringValue(payload.providerTurnId) ?? stringValue(payload.turnId);
   /** idle 明确结束本轮恢复；其他普通 transport 事件不清空正在运行的 Provider 核对。 */
   const providerRecovery =
-    recoveryState === 'reconnecting' && reconnectAttempt !== null && reconnectAttempt > 0 && reconnectAttempts !== null && reconnectAttempts > 0
+    recoveryState === 'reconnecting' && reconnectAttempt !== null && reconnectAttempt > 0 && reconnectAttempts !== null && reconnectAttempts >= 0
       ? {
           providerReconnectAttempt: Math.floor(reconnectAttempt),
           providerReconnectAttempts: Math.floor(reconnectAttempts),

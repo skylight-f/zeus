@@ -613,3 +613,19 @@
   font-weight: 600;
   color: var(--zeus-product-muted);
 }
+.macos-ai-app.zeus-shell .project-git-workbench .project-git-navigator > :is(.git-toolbar-identity, .git-workspace-navigation, details) {
+  padding-inline: 8px;
+}
+.git-delivery-folder-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  min-inline-size: 0;
+}
+.git-delivery-folder-filter > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}

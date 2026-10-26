@@ -97,24 +97,13 @@ export function readNativeSubmissionSkillReferences(submission: ZeusConversation
   return values.map(readPersistedSkillReference);
 }
 
-/** 只允许显式选择命中本轮冻结目录，避免回退到源文件路径。 */
-export function resolveFrozenNativeSkills(skills: readonly NativeConversationSkillInput[], skillCatalog: readonly NativeConversationSkillInput[]): NativeConversationSkillInput[] {
+/** 显式选择按当前目录重新解析；已删除的技能必须重新选择，不能沿用旧路径。 */
+export function resolveCurrentNativeSkills(skills: readonly NativeConversationSkillInput[], skillCatalog: readonly NativeConversationSkillInput[]): NativeConversationSkillInput[] {
   return skills.map((skill) => {
-    const frozen = skillCatalog.find((candidate) => candidate.id === skill.id);
-    if (!frozen) throw coordinatorError('ZEUS_SKILL_NOT_FOUND', `本轮 Skill “${skill.name}” 不在冻结目录中，请重新发送。`);
-    return frozen;
+    const current = skillCatalog.find((candidate) => candidate.id === skill.id);
+    if (!current) throw coordinatorError('ZEUS_SKILL_NOT_FOUND', `Skill “${skill.name}” 已不在当前目录中，请重新选择。`);
+    return current;
   });
-}
-
-/** 显式选择只能回指本轮冻结目录；找不到时拒绝回退到源文件路径。 */
-export function resolveFrozenNativeSubmissionSkills(submission: ZeusConversationSubmissionRecord, skillCatalog: readonly NativeConversationSkillInput[]): NativeConversationSkillInput[] {
-  return resolveFrozenNativeSkills(readNativeSubmissionSkillReferences(submission), skillCatalog);
-}
-
-/** Codex 的自动选择与显式选择共用同一份本轮冻结路径目录。 */
-export function frozenNativeSkillCatalogPrompt(skillCatalog: readonly NativeConversationSkillInput[]): string | null {
-  if (skillCatalog.length === 0) return null;
-  return `本轮普通 Skill 已冻结；自动选择和显式选择均读取以下路径，参考文件和脚本相对于同一目录解析：\n${JSON.stringify(skillCatalog.map(({ id, name, description, path }) => ({ id, name, description, path })))}`;
 }
 
 /** 校验一个持久化 Skill，避免模型请求使用未经目录确认的路径。 */

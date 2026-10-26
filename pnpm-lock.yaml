@@ -13,6 +13,9 @@ patchedDependencies:
   '@jimp/core@0.22.12':
     hash: dcb3dc8fcd3f4cc917a30778daed0185f11a9d500766833e2274df8bd0d2485c
     path: patches/@jimp__core@0.22.12.patch
+  app-builder-lib@26.15.3:
+    hash: 904f396146894b14242865c71e53a945e15ac98bc55deb5406e239e2f29a2ca2
+    path: patches/app-builder-lib@26.15.3.patch
   markstream-react@2.0.6:
     hash: d6cab364f2b93a1e9f22f785630e31886d4fd0ebef2b2d3e8876121bc76f7ef9
     path: patches/markstream-react@2.0.6.patch
@@ -154,6 +157,9 @@ importers:
       '@zeus/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@zeus/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
       ag-grid-community:
         specifier: 36.1.0
         version: 36.1.0
@@ -233,6 +239,9 @@ importers:
       '@codemirror/legacy-modes':
         specifier: ^6.5.4
         version: 6.5.4
+      '@codemirror/merge':
+        specifier: ^6.12.3
+        version: 6.12.3
       '@codemirror/search':
         specifier: ^6.7.2
         version: 6.7.2
@@ -287,6 +296,9 @@ importers:
       '@zeus/shared':
         specifier: workspace:*
         version: link:../shared
+      cross-spawn:
+        specifier: 7.0.6
+        version: 7.0.6
       node-pty:
         specifier: ^1.1.0
         version: 1.1.0(patch_hash=03acd11208e90e06aed135ba98bb017a1101e68a132436e28b1d5fac56d50943)
@@ -305,6 +317,9 @@ importers:
 
   packages/git-core:
     dependencies:
+      '@zeus/ai-runtime':
+        specifier: workspace:*
+        version: link:../ai-runtime
       '@zeus/shared':
         specifier: workspace:*
         version: link:../shared
@@ -517,6 +532,9 @@ packages:
 
   '@codemirror/lint@6.9.7':
     resolution: {integrity: sha512-28/+iWLYxKxsvGYhSYL7zaCZqLz5+FFFDq9tVsvGv9kv8RY4fFAchJ5WX9M3YrrRlTIsECjsXPqeNgnSmNP2dg==}
+
+  '@codemirror/merge@6.12.3':
+    resolution: {integrity: sha512-Wq9wXrp41cW/nIpi1CQPyNwD+36kg8KIX676ym0Hyfn3Dpr+XQHNAIsZYVNlaivuVB4SAASbreG3V0VXinbqZA==}
 
   '@codemirror/search@6.7.2':
     resolution: {integrity: sha512-gUYkYhT2+n/+VGZ+8EzE5WFkYZUZYm1VOKDudIsNqh42uRVQJ0a6Yss9sdKT3MeOYfuL1N6AZA57oza0Oyr0LA==}
@@ -4441,6 +4459,14 @@ snapshots:
       '@codemirror/view': 6.43.13
       crelt: 1.0.7
 
+  '@codemirror/merge@6.12.3':
+    dependencies:
+      '@codemirror/language': 6.12.4
+      '@codemirror/state': 6.7.6
+      '@codemirror/view': 6.43.13
+      '@lezer/highlight': 1.2.5
+      style-mod: 4.1.4
+
   '@codemirror/search@6.7.2':
     dependencies:
       '@codemirror/state': 6.7.6
@@ -5915,7 +5941,7 @@ snapshots:
 
   any-base@1.1.0: {}
 
-  app-builder-lib@26.15.3(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3):
+  app-builder-lib@26.15.3(patch_hash=904f396146894b14242865c71e53a945e15ac98bc55deb5406e239e2f29a2ca2)(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3):
     dependencies:
       '@electron/asar': 3.4.1
       '@electron/fuses': 1.8.0
@@ -6419,7 +6445,7 @@ snapshots:
 
   dmg-builder@26.15.3(electron-builder-squirrel-windows@26.15.3):
     dependencies:
-      app-builder-lib: 26.15.3(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
+      app-builder-lib: 26.15.3(patch_hash=904f396146894b14242865c71e53a945e15ac98bc55deb5406e239e2f29a2ca2)(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
       builder-util: 26.15.3
       fs-extra: 10.1.0
       js-yaml: 4.3.2
@@ -6470,7 +6496,7 @@ snapshots:
 
   electron-builder-squirrel-windows@26.15.3(dmg-builder@26.15.3):
     dependencies:
-      app-builder-lib: 26.15.3(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
+      app-builder-lib: 26.15.3(patch_hash=904f396146894b14242865c71e53a945e15ac98bc55deb5406e239e2f29a2ca2)(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
       builder-util: 26.15.3
       electron-winstaller: 5.4.0
     transitivePeerDependencies:
@@ -6479,7 +6505,7 @@ snapshots:
 
   electron-builder@26.15.3(electron-builder-squirrel-windows@26.15.3):
     dependencies:
-      app-builder-lib: 26.15.3(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
+      app-builder-lib: 26.15.3(patch_hash=904f396146894b14242865c71e53a945e15ac98bc55deb5406e239e2f29a2ca2)(dmg-builder@26.15.3)(electron-builder-squirrel-windows@26.15.3)
       builder-util: 26.15.3
       builder-util-runtime: 9.7.0
       chalk: 4.1.2

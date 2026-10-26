@@ -98,8 +98,6 @@ export function filterCompatibilitySnapshotItemAliases(items: readonly ZeusConve
 }
 
 export interface CodexProviderHistoryProjectionDependencies {
-  /** 自动续接仍在执行时，历史读取不能提前结算原请求。 */
-  isProviderConnectionRetryPending(conversationId: string, providerTurnId: string): boolean;
   options: CreateCodexNativeConversationCoordinatorOptions;
   failedTurnResults: Map<string, Error & { code: string }>;
   processProjector: TurnProcessProjector;
@@ -535,8 +533,6 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       });
     }
 
-    if (dependencies.isProviderConnectionRetryPending(conversation.id, providerTurn.id)) return turn;
-
     if (classification === 'active') {
       if (matchedSubmission && (matchedSubmission.status === 'dispatching' || matchedSubmission.status === 'queued')) {
         options.submissions.updateStatus(matchedSubmission.id, 'active', { providerTurnId: providerTurn.id, dispatchedAt: startedAt });
@@ -581,8 +577,6 @@ export function createCodexProviderHistoryProjection(dependencies: CodexProvider
       runStates.set(conversation.id, classification === 'failed' || recoveryRequired ? { type: 'paused', reason: 'recovery_required' } : interruptedWithQueue ? { type: 'paused', reason: 'interrupted' } : { type: 'idle' });
       options.execution.resolveWarning(conversation.id, 'provider_interaction_authority_missing', completedAt ?? timestamp);
       if (!wasTerminal) {
-        // 补收终态与实时结束事件共用完整快照，不漏掉连接中断期间的脚本修改。
-        await options.changeSets.finishWorkspace({ conversation, turn, timestamp });
         options.changeSets.seal({ conversation, turn, timestamp });
       }
       if (!wasTerminal && !options.goals.get(conversation.id)) {

@@ -6,19 +6,7 @@ import { GitMergeIcon as GitMerge } from '@phosphor-icons/react/dist/csr/GitMerg
 import { ArrowDownIcon as ArrowDown } from '@phosphor-icons/react/dist/csr/ArrowDown';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { projectGitWorkbenchCacheEntry, readCachedProjectGitWorkbench, requestProjectGitWorkbench, subscribeProjectGitRefresh, notifyProjectGitChanged, visibleRepositoryFiles } from './projectGitWorkbenchState.js';
-import {
-  BranchSwitcher,
-  MergeBranchDialog,
-  UpdateProjectDialog,
-  NewBranchDialog,
-  RemoteBranchCheckoutDialog,
-  CheckoutRevisionDialog,
-  BranchDirectoryTree,
-  BranchContextMenu,
-  StashDialog,
-  PullDialog,
-  PushDialog,
-} from './GitRepositoryControls.js';
+import { BranchSwitcher, MergeBranchDialog, UpdateProjectDialog, NewBranchDialog, RemoteBranchCheckoutDialog, CheckoutRevisionDialog, BranchDirectoryTree, BranchContextMenu, StashDialog, PullDialog } from './GitRepositoryControls.js';
 import type { ExecutionOutcome } from './gitWorkbenchTypes.js';
 import type { BranchKind } from './gitWorkbenchTypes.js';
 import type { OperationTone } from './gitWorkbenchTypes.js';
@@ -64,6 +52,7 @@ import type {
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { PushDialog } from './GitPushDialog.js';
 import { SideBySideDiff } from './ProjectGitDiffViewer.js';
 
 type GitTab = 'changes' | 'stash' | 'log' | 'console';
@@ -88,7 +77,15 @@ export interface ProjectGitWorkbenchProps {
   project: ProjectRecord;
   client: Pick<
     DashboardClient,
-    'loadConversationGitHistory' | 'loadProjectGitWorkbench' | 'loadProjectGitOperations' | 'loadProjectGitCommit' | 'loadProjectGitComparisonDiff' | 'executeProjectGitAction' | 'generateGitCommitMessage' | 'loadGitCommitModels'
+    | 'loadConversationGitHistory'
+    | 'loadProjectGitPushPreview'
+    | 'loadProjectGitWorkbench'
+    | 'loadProjectGitOperations'
+    | 'loadProjectGitCommit'
+    | 'loadProjectGitComparisonDiff'
+    | 'executeProjectGitAction'
+    | 'generateGitCommitMessage'
+    | 'loadGitCommitModels'
   >;
   language: 'zh-CN' | 'en-US';
 }
@@ -150,7 +147,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   const [stashRepositoryId, setStashRepositoryId] = useState<string | null>(null);
   const operationsTriggerRef = useRef<HTMLButtonElement>(null);
   const [commitOpen, setCommitOpen] = useState(false);
-  const [commitRequest, setCommitRequest] = useState(0);
+  const [commitRequest] = useState(0);
   const [mergeOpen, setMergeOpen] = useState(false);
   const [fileQuery, setFileQuery] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; title: string; items: GitMenuItem[] } | null>(null);
@@ -686,10 +683,18 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   }
 
   /** 提交入口先展开底栏，再显示现有提交表单。 */
+  /** 所有变更入口直接使用既有原生交付窗口服务，工作台不挂载交付页面。 */
+  function openDelivery(repositoryId?: string, pathPrefix?: string): void {
+    if (!window.zeus?.openTaskGitDeliveryWindow) {
+      setError(errorMessage(new Error(zh ? '当前环境无法打开代码交付窗口。' : 'The code delivery window is unavailable in this environment.'), zh));
+      return;
+    }
+    void window.zeus.openTaskGitDeliveryWindow(repositoryId ? { projectId: props.project.id, repositoryId, pathPrefix } : { projectId: props.project.id }).catch((reason: unknown) => setError(errorMessage(reason, zh)));
+  }
+
+  /** 全局提交与冲突入口覆盖项目内全部仓库，文件树负责后续选择。 */
   function openCommit(): void {
-    props.onOpenPanel?.();
-    setTab('changes');
-    setCommitRequest((value) => value + 1);
+    if (repositories.length) openDelivery();
   }
 
   function openDiffWindow(repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { stage?: 'combined' | ChangeStage; commitHash?: string; comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }): void {
@@ -1324,6 +1329,9 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       <MotionPresence>
         {pushOpen ? (
           <PushDialog
+            projectId={props.project.id}
+            client={props.client}
+            revision={snapshot?.refreshedAt ?? ''}
             open={pushOpen}
             zh={zh}
             repositories={repositories}

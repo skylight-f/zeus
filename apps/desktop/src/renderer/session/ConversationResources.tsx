@@ -1,4 +1,9 @@
+import { useWindowDocument } from '../ui/windowDocument.js';
+import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
+import { MotionPresence } from '../ui/MotionPresence.js';
+import { useMotionPresence } from '../ui/useMotionPresence.js';
 import { type ComponentType, type CSSProperties, type KeyboardEvent, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { FileArchiveIcon as FileArchive } from '@phosphor-icons/react/dist/csr/FileArchive';
@@ -19,12 +24,6 @@ import { GithubLogoIcon as GithubLogo } from '@phosphor-icons/react/dist/csr/Git
 import { AppWindowIcon as AppWindow } from '@phosphor-icons/react/dist/csr/AppWindow';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
-
-import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
-import { MotionPresence } from '../ui/MotionPresence.js';
-import { useMotionPresence } from '../ui/useMotionPresence.js';
-
-import { createPortal } from 'react-dom';
 
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 
@@ -539,6 +538,10 @@ export function OpenWithMenu(props: {
   disabled: boolean;
   onOpen: (target: ConversationOpenTarget) => void | Promise<void>;
 }) {
+  /** 文件菜单跟随当前预览窗口，桥接调用仍使用原授权。 */
+  const document = useWindowDocument();
+  /** 浮层位置按当前窗口的客户区计算。 */
+  const viewport = document.defaultView!;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
@@ -555,8 +558,8 @@ export function OpenWithMenu(props: {
       if (rootRef.current?.contains(event.target as Node) || menuRef.current?.contains(event.target as Node)) return;
       setOpen(false);
     };
-    window.addEventListener('pointerdown', close, true);
-    return () => window.removeEventListener('pointerdown', close, true);
+    viewport.addEventListener('pointerdown', close, true);
+    return () => viewport.removeEventListener('pointerdown', close, true);
   }, [open]);
 
   useLayoutEffect(() => {
@@ -572,18 +575,18 @@ export function OpenWithMenu(props: {
       const menuRect = menu.getBoundingClientRect();
       const margin = 8;
       const gap = 6;
-      const left = Math.max(margin, Math.min(triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - margin));
+      const left = Math.max(margin, Math.min(triggerRect.right - menuRect.width, viewport.innerWidth - menuRect.width - margin));
       const above = triggerRect.top - menuRect.height - gap;
       const below = triggerRect.bottom + gap;
-      const top = props.preferBelow && below + menuRect.height <= window.innerHeight - margin ? below : above >= margin ? above : Math.max(margin, Math.min(below, window.innerHeight - menuRect.height - margin));
+      const top = props.preferBelow && below + menuRect.height <= viewport.innerHeight - margin ? below : above >= margin ? above : Math.max(margin, Math.min(below, viewport.innerHeight - menuRect.height - margin));
       setMenuPosition({ left, top });
     };
     position();
-    window.addEventListener('resize', position);
-    window.addEventListener('scroll', position, true);
+    viewport.addEventListener('resize', position);
+    viewport.addEventListener('scroll', position, true);
     return () => {
-      window.removeEventListener('resize', position);
-      window.removeEventListener('scroll', position, true);
+      viewport.removeEventListener('resize', position);
+      viewport.removeEventListener('scroll', position, true);
     };
   }, [error, loading, open, targets.length, props.preferBelow]);
 
@@ -680,7 +683,7 @@ export function OpenWithMenu(props: {
       </button>
       {menuPresent
         ? createPortal(
-            <div className={openWithPortalClassName()}>
+            <div className={openWithPortalClassName(document)}>
               <div
                 className={`session-open-with-menu${props.applicationsOnly ? ' session-open-with-app-menu' : ''}`}
                 data-motion-surface="popover"
@@ -754,7 +757,7 @@ function menuPositionStyle(position: { left: number; top: number } | null): CSSP
   return position ? { left: position.left, top: position.top } : { left: 0, top: 0, visibility: 'hidden' };
 }
 
-function openWithPortalClassName(): string {
+function openWithPortalClassName(document: Document): string {
   const app = document.querySelector('.macos-ai-app.zeus-shell');
   const theme = app?.classList.contains('theme-dark') ? 'theme-dark' : app?.classList.contains('theme-light') ? 'theme-light' : 'theme-system';
   return `macos-ai-app session-open-with-portal session-codex-parity-v1 ${theme}`;
@@ -766,8 +769,10 @@ function menuButtons(menu: HTMLDivElement | null): HTMLButtonElement[] {
 
 function focusAdjacentDocumentControl(trigger: HTMLButtonElement | null, backwards: boolean): void {
   if (!trigger) return;
+  /** Tab 仅访问触发器所属文档的控件。 */
+  const document = trigger.ownerDocument;
   const controls = [...document.querySelectorAll<HTMLElement>(['a[href]', 'button:not(:disabled)', 'input:not(:disabled)', 'select:not(:disabled)', 'textarea:not(:disabled)', '[tabindex]:not([tabindex="-1"])'].join(','))].filter(
-    (element) => !element.closest('.session-open-with-portal') && element.getAttribute('aria-hidden') !== 'true' && element.getClientRects().length > 0 && window.getComputedStyle(element).visibility !== 'hidden',
+    (element) => !element.closest('.session-open-with-portal') && element.getAttribute('aria-hidden') !== 'true' && element.getClientRects().length > 0 && element.ownerDocument.defaultView!.getComputedStyle(element).visibility !== 'hidden',
   );
   const currentIndex = controls.indexOf(trigger);
   if (currentIndex < 0 || controls.length < 2) {

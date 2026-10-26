@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type ComponentProps } from 'react';
-import type { TaskGitFileStatus, TaskWorkspaceIndexSnapshot, TaskWorkspaceSnapshot, TaskGitDiffSummary } from '../session/sessionTypes.js';
+import type { TaskWorkspaceIndexSnapshot, TaskWorkspaceSnapshot, TaskGitDiffSummary } from '../session/sessionTypes.js';
 import { Button } from '../ui/Button.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
@@ -10,6 +10,7 @@ import { CheckIcon } from '@phosphor-icons/react/dist/csr/Check';
 import { WarningCircleIcon } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import { FolderIcon } from '@phosphor-icons/react/dist/csr/Folder';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
+import { fileStatusLabel, type FileStatus } from '../code/fileStatus.js';
 import { groupDirectoryFiles } from '../code/groupDirectoryFiles.js';
 import { GitCommitGenerationSettingsButton } from './GitCommitGenerationSettings.js';
 import type { GitCommitModelsClient } from './gitCommitModels.js';
@@ -21,11 +22,14 @@ export type BusyAction = 'loading' | 'commit' | 'commit-message' | 'push' | 'mer
 
 /** 文件树保留真实仓库相对路径。 */
 export interface DeliveryFile {
+  /** 仓库相对路径保持文件操作身份。 */
   path: string;
-  label: string;
+  /** 工作区使用 Git 状态，已提交成果使用比较类型。 */
+  status: FileStatus;
+  /** 当前比较中的新增行数。 */
   additions: number;
+  /** 当前比较中的删除行数。 */
   deletions: number;
-  workingFile?: TaskGitFileStatus;
 }
 /** 操作反馈保留逐仓结果。 */
 export interface DeliveryFeedback {
@@ -58,6 +62,8 @@ export interface DeliveryRepositoryGroup {
   detail: Pick<TaskWorkspaceSnapshot, 'review'> | undefined;
   files: DeliveryFile[];
   statusLabel: string;
+  /** 未完成或失败的读取不能被当成空目录。 */
+  loadState?: 'loading' | 'error';
 }
 
 /** 本机读取失败保留重试，不能把未加载误报为没有变化。 */
@@ -71,20 +77,6 @@ export function InitialLoadState(props: { zh: boolean; error?: string | null; on
           {props.zh ? '重新读取' : 'Retry'}
         </Button>
       ) : null}
-    </section>
-  );
-}
-
-/** 仓库与文件采用同一选择口径。 */
-export function DeliveryScopeBar(props: { selectedRepositories: number; totalRepositories: number; selectedFiles: number; zh: boolean }) {
-  return (
-    <section className="task-git-delivery-scopebar" aria-label={props.zh ? '当前交付选择' : 'Current delivery selection'}>
-      <strong>{props.zh ? '按文件审查，按仓库交付' : 'Review by file, deliver by repository'}</strong>
-      <span>
-        {props.zh
-          ? `已选 ${props.selectedRepositories}/${props.totalRepositories} 个仓库 · ${props.selectedFiles} 个待提交文件`
-          : `${props.selectedRepositories}/${props.totalRepositories} repositories · ${props.selectedFiles} uncommitted files selected`}
-      </span>
     </section>
   );
 }
@@ -124,7 +116,9 @@ export function DeliveryRepositoryFileTree(props: {
     return () => window.clearTimeout(timer);
   }, [copiedBranch]);
   /** 同一任务分支下的仓库保持现有排序与交付范围。 */
-  const branchGroups = groupDeliveryRepositoriesByBranch(props.groups);
+  const visibleGroups = props.groups.filter((group) => group.files.length > 0 || group.loadState || props.detailStates[group.workspace.id]);
+  /** 分支全选只作用于当前文件范围中的可见仓库。 */
+  const branchGroups = groupDeliveryRepositoriesByBranch(visibleGroups);
   return (
     <aside className="task-git-delivery-file-browser" aria-label={props.zh ? '按仓库分组的交付文件' : 'Delivery files grouped by repository'}>
       <header className="task-git-review-pane-title task-git-delivery-diff-tabs">
@@ -152,7 +146,7 @@ export function DeliveryRepositoryFileTree(props: {
         </span>
       </header>
       <div className="task-git-delivery-file-tree">
-        {props.groups.length === 0 ? <p className="task-git-delivery-repository-state">{props.zh ? '当前范围没有可交付的 Git 仓库。' : 'No Git repositories are available in this scope.'}</p> : null}
+        {visibleGroups.length === 0 ? <p className="task-git-delivery-repository-state">{props.zh ? '当前范围没有变动文件。' : 'No changed files in this scope.'}</p> : null}
         {branchGroups.map((branchGroup) => {
           /** 分支勾选只覆盖当前分组中的仓库。 */
           const workspaceIds = branchGroup.repositories.map((group) => group.workspace.id);
@@ -216,7 +210,7 @@ export function DeliveryRepositoryFileTree(props: {
                         </span>
                       </label>
                     </summary>
-                    {props.detailStates[workspaceId] === 'loading' ? <small className="task-git-delivery-repository-state">{props.zh ? '正在读取文件…' : 'Loading files…'}</small> : null}
+                    {(group.loadState ?? props.detailStates[workspaceId]) === 'loading' ? <small className="task-git-delivery-repository-state">{props.zh ? '正在读取文件…' : 'Loading files…'}</small> : null}
                     {group.files.length > 0 ? (
                       <DeliveryDirectoryFiles
                         files={group.files}
@@ -230,7 +224,7 @@ export function DeliveryRepositoryFileTree(props: {
                         onSelect={(path) => props.onSelectFile(workspaceId, path)}
                         onOpen={(path) => props.onOpenFile(workspaceId, path)}
                       />
-                    ) : !props.detailStates[workspaceId] ? (
+                    ) : !(group.loadState ?? props.detailStates[workspaceId]) ? (
                       <small className="task-git-delivery-repository-state">{props.diffScope === 'working' ? (props.zh ? '没有未提交文件' : 'No uncommitted files') : props.zh ? '没有已提交成果' : 'No committed result'}</small>
                     ) : null}
                   </details>
@@ -267,6 +261,50 @@ function DeliveryDirectoryFiles(props: {
   /** 双击打开独立窗口。 */
   onOpen: (path: string) => void;
 }) {
+  // 仓库根目录将未跟踪文件排在已有版本控制文件之后，复用目录勾选与展开行为。
+  if (!props.prefix && props.files.some((file) => file.status === 'untracked')) {
+    /** 已纳入版本控制的文件不受未跟踪分组选择影响。 */
+    const tracked = props.files.filter((file) => file.status !== 'untracked');
+    /** 仅真实未跟踪状态进入此分组，已暂存新增仍在上方。 */
+    const untracked = props.files.filter((file) => file.status === 'untracked');
+    /** 分组勾选直接使用现有路径集合，支持半选。 */
+    const selectedCount = untracked.filter((file) => props.selectedPaths.has(file.path)).length;
+    return (
+      <>
+        <DeliveryDirectoryFiles {...props} files={tracked} />
+        <details open className="task-git-delivery-directory">
+          <summary>
+            {props.working ? (
+              <input
+                type="checkbox"
+                checked={selectedCount === untracked.length}
+                ref={(element) => {
+                  if (element) element.indeterminate = selectedCount > 0 && selectedCount < untracked.length;
+                }}
+                aria-checked={selectedCount > 0 && selectedCount < untracked.length ? 'mixed' : selectedCount === untracked.length}
+                aria-label={props.zh ? '选择未跟踪文件' : 'Select untracked files'}
+                onChange={(event) =>
+                  props.onToggle(
+                    untracked.map((file) => file.path),
+                    event.target.checked,
+                  )
+                }
+                disabled={props.disabled}
+              />
+            ) : null}
+            <span>{props.zh ? '未跟踪文件' : 'Unversioned Files'}</span>
+            <small>{untracked.length}</small>
+          </summary>
+          <DeliveryDirectoryEntries {...props} files={untracked} />
+        </details>
+      </>
+    );
+  }
+  return <DeliveryDirectoryEntries {...props} />;
+}
+
+/** 目录与分组共用同一文件树，展开状态不改变真实路径。 */
+function DeliveryDirectoryEntries(props: Parameters<typeof DeliveryDirectoryFiles>[0]) {
   /** 文件按下一级路径分组，目录排序在普通文件之前。 */
   const entries = useMemo(() => groupDirectoryFiles(props.files, props.prefix), [props.files, props.prefix]);
   return (
@@ -313,13 +351,18 @@ function DeliveryDirectoryFiles(props: {
             ) : (
               <div className={`task-git-delivery-file-row${props.selectedFile === path ? ' is-active' : ''}`}>
                 {checkbox}
-                <button type="button" data-icon-tooltip={path} aria-pressed={props.selectedFile === path} onClick={() => props.onSelect(path)} onDoubleClick={() => props.onOpen(path)} disabled={props.disabled}>
+                <button
+                  type="button"
+                  data-icon-tooltip={`${path} · ${fileStatusLabel(files[0].status, props.zh)}`}
+                  aria-label={`${path} · ${fileStatusLabel(files[0].status, props.zh)}`}
+                  aria-pressed={props.selectedFile === path}
+                  onClick={() => props.onSelect(path)}
+                  onDoubleClick={() => props.onOpen(path)}
+                  disabled={props.disabled}
+                >
                   <DeliveryEntryIcon path={path} />
-                  <span>{name}</span>
-                  <small>
-                    {files[0].label}
-                    {files[0].additions || files[0].deletions ? ` · +${files[0].additions} −${files[0].deletions}` : ''}
-                  </small>
+                  <span data-file-status={files[0].status}>{name}</span>
+                  {files[0].additions || files[0].deletions ? <small>{`+${files[0].additions} −${files[0].deletions}`}</small> : null}
                 </button>
               </div>
             )}
@@ -480,30 +523,32 @@ export function repositoryLabel(workspace: Pick<TaskWorkspaceIndexSnapshot, 'rep
 /** 普通目录和任务工作树共用同一文件审查、操作区及差异布局。 */
 export function GitDeliveryWorkspace(props: {
   zh: boolean;
-  selectedRepositories: number;
-  totalRepositories: number;
-  selectedFiles: number;
   fileBrowser: ReactNode;
   actions: ReactNode;
   selectedFile: string;
   diffTitle: string;
+  /** 与文件树使用同一状态，未跟踪文件不由补丁推断。 */
+  fileStatus?: FileStatus;
   diffLoading: boolean;
   diff: TaskGitDiffSummary | null;
   revision: string | number;
+  /** Diff 保存后复用业务页的快照刷新，保持文件树和数量一致。 */
+  onFileSaved?: () => void | Promise<void>;
   previewRequest?: ComponentProps<typeof SideBySideDiff>['previewRequest'];
   onShowCommitted?: () => void;
   busy: boolean;
 }) {
   return (
     <div className="task-git-delivery-content">
-      <DeliveryScopeBar {...props} />
       <div className="task-git-review-layout task-git-delivery-layout">
         {props.fileBrowser}
         {props.actions}
         <GitPaneSeparator name="delivery-height" label={props.zh ? '调整文件区与差异区高度' : 'Resize files and diff'} axis="y" initial={42} min={25} max={65} />
         <main className="task-git-review-main task-git-delivery-diff-main">
           <header className="task-git-review-pane-title">
-            <strong data-icon-tooltip={props.selectedFile}>{props.diffTitle}</strong>
+            <strong data-icon-tooltip={props.selectedFile} data-file-status={props.fileStatus}>
+              {props.diffTitle}
+            </strong>
           </header>
           {!props.selectedFile ? (
             <div className="task-git-delivery-empty">
@@ -519,7 +564,7 @@ export function GitDeliveryWorkspace(props: {
               {props.zh ? '正在读取差异…' : 'Loading diff…'}
             </p>
           ) : (
-            <SideBySideDiff previewRequest={props.previewRequest} revision={props.revision} diff={props.diff} zh={props.zh} title={props.diffTitle} fill />
+            <SideBySideDiff fileStatus={props.fileStatus} previewRequest={props.previewRequest} revision={props.revision} onSaved={props.onFileSaved} diff={props.diff} zh={props.zh} title={props.diffTitle} fill />
           )}
         </main>
       </div>
@@ -544,8 +589,8 @@ export function GitDeliveryActions(props: {
   onCommit: () => void;
   beforeCommit?: ReactNode;
   commitFeedback?: ReactNode;
-  mergeTitle?: string;
-  mergeDescription?: string;
+  /** 合入选择器标明来源或目标，避免额外常驻说明段落。 */
+  mergeLabel?: string;
   mergeTarget: string;
   mergeOptions: ComponentProps<typeof ZeusSelect>['options'];
   onMergeTargetChange: (value: string) => void;
@@ -559,6 +604,8 @@ export function GitDeliveryActions(props: {
   pushCount: number;
   onPush: () => void;
   pushFeedback?: ReactNode;
+  /** 两种交付入口共用后台运行入口。 */
+  combination?: ReactNode;
 }) {
   /** 两种入口都在操作期间锁定文件选择。 */
   const busy = props.busyAction !== null;
@@ -566,7 +613,7 @@ export function GitDeliveryActions(props: {
     <aside className="task-git-review-options task-git-delivery-actions">
       <section className="task-git-delivery-action-step">
         <div className="task-git-delivery-step-heading">
-          <strong>{props.zh ? '1. 提交文件' : '1. Commit files'}</strong>
+          <strong>{props.zh ? '提交文件' : 'Commit files'}</strong>
           <span className="task-git-generation-controls">
             <Button
               variant="secondary"
@@ -583,27 +630,48 @@ export function GitDeliveryActions(props: {
         </div>
         {props.beforeCommit}
         {props.commitCount > 0 ? (
-          <textarea value={props.message} onChange={(event) => props.onMessageChange(event.target.value)} disabled={busy && props.busyAction !== 'commit-message'} aria-label={props.zh ? '提交说明' : 'Commit message'} />
+          <textarea rows={3} value={props.message} onChange={(event) => props.onMessageChange(event.target.value)} disabled={busy && props.busyAction !== 'commit-message'} aria-label={props.zh ? '提交说明' : 'Commit message'} />
         ) : null}
         {props.generationFeedback ? <small role="status">{props.generationFeedback}</small> : null}
-        <Button variant="secondary" size="compact" busy={props.busyAction === 'commit'} onClick={props.onCommit} disabled={busy || props.commitCount === 0}>
-          {props.zh ? `提交所选文件（${props.commitCount}）` : `Commit selected files (${props.commitCount})`}
+        <Button
+          variant={props.combination ? 'secondary' : 'primary'}
+          size="compact"
+          aria-label={props.zh ? `提交所选文件（${props.commitCount}）` : `Commit selected files (${props.commitCount})`}
+          busy={props.busyAction === 'commit'}
+          onClick={props.onCommit}
+          disabled={busy || props.commitCount === 0}
+        >
+          {props.zh ? '提交' : 'Commit'}
+          {props.commitCount > 0 ? `（${props.commitCount}）` : ''}
         </Button>
         {props.commitFeedback}
       </section>
-      <section className="task-git-delivery-action-step">
-        <strong>{props.mergeTitle ?? (props.zh ? '2. 合入目标分支' : '2. Merge into target branch')}</strong>
-        {props.mergeDescription ? <small>{props.mergeDescription}</small> : null}
-        <ZeusSelect
-          size="compact"
-          ariaLabel={props.mergeTitle ?? (props.zh ? '统一合入目标分支' : 'Merge target for all selected repositories')}
-          value={props.mergeTarget}
-          options={props.mergeOptions}
-          onChange={props.onMergeTargetChange}
-          disabled={busy || props.mergeDisabled}
-          searchPlaceholder={props.zh ? '搜索本地分支' : 'Search local branches'}
-        />
-        {props.mergeIssues}
+      <section className="task-git-delivery-action-step" aria-label={props.zh ? '合入' : 'Merge'}>
+        <div className="task-git-delivery-step-heading">
+          <strong>{props.zh ? '合入分支' : 'Merge branch'}</strong>
+        </div>
+        <div className="task-git-delivery-merge-row">
+          <ZeusSelect
+            size="compact"
+            ariaLabel={props.mergeLabel ?? (props.zh ? '合入目标分支' : 'Target branch')}
+            value={props.mergeTarget}
+            options={props.mergeOptions}
+            onChange={props.onMergeTargetChange}
+            disabled={busy || props.mergeDisabled}
+            searchPlaceholder={props.zh ? '搜索本地分支' : 'Search local branches'}
+          />
+          <Button
+            variant="secondary"
+            size="compact"
+            aria-label={props.zh ? `合入所选仓库（${props.mergeCount}）` : `Merge selected repositories (${props.mergeCount})`}
+            busy={props.busyAction === 'merge'}
+            onClick={props.onMerge}
+            disabled={busy || props.mergeCount === 0}
+          >
+            {props.zh ? '合入' : 'Merge'}
+            {props.mergeCount > 0 ? `（${props.mergeCount}）` : ''}
+          </Button>
+        </div>
         {props.onModeChange ? (
           <ZeusSelect
             size="compact"
@@ -618,20 +686,27 @@ export function GitDeliveryActions(props: {
             searchable={false}
           />
         ) : null}
-        <Button variant="primary" size="compact" busy={props.busyAction === 'merge'} onClick={props.onMerge} disabled={busy || props.mergeCount === 0}>
-          {props.zh ? `合入所选仓库（${props.mergeCount}）` : `Merge selected repositories (${props.mergeCount})`}
-        </Button>
+        {props.mergeIssues}
         {props.mergeFeedback}
       </section>
       <section className="task-git-delivery-action-step">
         <div className="task-git-delivery-step-heading">
-          <strong>{props.zh ? '3. 推送到远端' : '3. Push to remote'}</strong>
-          <Button variant="secondary" size="compact" busy={props.busyAction === 'push'} onClick={props.onPush} disabled={busy || props.pushCount === 0}>
-            {props.zh ? `推送（${props.pushCount}）` : `Push (${props.pushCount})`}
+          <strong>{props.zh ? '推送到远端' : 'Push to remote'}</strong>
+          <Button
+            variant="secondary"
+            size="compact"
+            aria-label={props.zh ? `推送到远端（${props.pushCount}）` : `Push to remote (${props.pushCount})`}
+            busy={props.busyAction === 'push'}
+            onClick={props.onPush}
+            disabled={busy || props.pushCount === 0}
+          >
+            {props.zh ? '推送' : 'Push'}
+            {props.pushCount > 0 ? `（${props.pushCount}）` : ''}
           </Button>
         </div>
         {props.pushFeedback}
       </section>
+      {props.combination}
     </aside>
   );
 }

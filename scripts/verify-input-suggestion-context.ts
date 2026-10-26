@@ -1,6 +1,6 @@
 /** 输入建议核心检查：pnpm exec tsx scripts/verify-input-suggestion-context.ts，不调用外部模型。 */
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -13,6 +13,7 @@ import { SettingRepository } from '../packages/storage/src/index.js';
 import { createZeusDatabase, ProjectRepository, ConversationRepository, ConversationExecutionRepository, ConversationSnapshotV2Repository as SnapshotRepository, LongTermMemoryRepository } from '../packages/storage/src/index.js';
 import type { ConversationModelHistoryPageItem, ConversationSnapshotV2, ConversationSnapshotV2Repository, LongTermMemoryRecord } from '../packages/storage/src/index.js';
 import { createInputSuggestionContextReader, inputSuggestionSourcesFingerprint } from '../packages/local-server/src/inputSuggestionContext.js';
+import { ContextSourceCatalog } from '../packages/local-server/src/contextSourceCatalog.js';
 import { getInputSuggestionSession } from '../apps/desktop/src/renderer/session/inputSuggestionStore.js';
 
 /** 检查材料使用稳定身份和真实角色，正文并不包含可执行命令。 */
@@ -59,6 +60,7 @@ const snapshot = {
 } as unknown as ConversationSnapshotV2;
 /** 记忆由宿主解析过有效期；取材层还须核对确认级别和作用范围。 */
 const sources = {
+  agentRules: null,
   task: null,
   memories: [
     { id: 'style', scope: { kind: 'global', id: '*' }, confirmationLevel: 'explicit', kind: 'preference', memoryKey: '表达', content: '用简洁自然的中文，先说结论。' },
@@ -105,10 +107,15 @@ for (const status of ['failed', 'interrupted', 'completed']) {
   snapshot.activeTurn!.status = status;
   assert.match(reader.read({ snapshot, projectId: 'project', sources }).text, status === 'completed' ? /不代表任务已经验收/ : /本轮失败或中断/);
 }
-assert.equal(reader.read({ snapshot: null, projectId: 'project', sources: { task: null, memories: [] }, draft: '请帮我润色' }).hasDialogue, false);
+assert.equal(reader.read({ snapshot: null, projectId: 'project', sources: { agentRules: null, task: null, memories: [] }, draft: '请帮我润色' }).hasDialogue, false);
 
 /** 状态层只采纳当前请求的回执，迟到结果不能覆盖新草稿或新要求。 */
 const session = getInputSuggestionSession('input-suggestion-check');
+/** 编辑事件按输入框身份阻止自动触发，取消后不重放同一完成事件。 */
+const editorOwner = Symbol('input-suggestion-check');
+/** 释放模拟输入框时移除即时限制。 */
+const releaseEditor = session.observeAutomaticEligibility(editorOwner, true);
+assert.equal(session.consumeAutomaticTurn('turn'), true);
 /** 可控回执模拟用户输入发生在模型返回之前。 */
 let complete: (result: { completedTurnId: null; modelRef: string; text: string; reason: null }) => void = () => {};
 /** 记录取消传播，不调用模型或创建任务。 */
@@ -116,7 +123,6 @@ let aborted = false;
 session.start({
   key: 'request',
   modelKey: 'model',
-  turnKey: 'turn',
   sourceDraft: '继续',
   modelRef: 'model',
   request: { mode: 'polish', trigger: 'manual', draft: '继续' },
@@ -130,16 +136,19 @@ session.start({
 });
 session.dismissAutomatic();
 assert.equal(session.getSnapshot()?.pending, true);
-session.observeUserInput('new-user-input');
+session.beginEditing(editorOwner);
 assert.equal(aborted, true);
+assert.equal(session.automaticAllowed, false);
 complete({ completedTurnId: null, modelRef: 'model', text: '旧要求的迟到润色', reason: null });
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(session.getSnapshot(), null);
+session.observeAutomaticEligibility(editorOwner, true);
+assert.equal(session.consumeAutomaticTurn('turn'), false);
+session.observeUserInput('new-user-input');
 /** 取消后可以重新生成；重复用户事件不能取消后来发起的请求。 */
 session.start({
   key: 'new-request',
   modelKey: 'model',
-  turnKey: 'turn',
   sourceDraft: '新草稿',
   modelRef: 'model',
   request: { mode: 'polish', trigger: 'manual', draft: '新草稿' },
@@ -149,7 +158,41 @@ session.observeUserInput('new-user-input');
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(session.getSnapshot()?.text, '新草稿的润色');
 assert.equal(getInputSuggestionSession('another-conversation').getSnapshot(), null);
-session.dismiss();
+/** 相同候选只展开一次，关闭旧预览不能取消后发的请求。 */
+const previousRequestId = session.getSnapshot()!.requestId;
+assert.equal(session.claimPreview(previousRequestId), true);
+assert.equal(session.claimPreview(previousRequestId), false);
+session.start({
+  key: 'new-request',
+  modelKey: 'model',
+  sourceDraft: '新草稿',
+  modelRef: 'model',
+  request: { mode: 'polish', trigger: 'manual', draft: '新草稿' },
+  generate: async () => ({ completedTurnId: null, modelRef: 'model', text: '新草稿的润色', reason: null }),
+});
+session.dismiss(previousRequestId);
+assert.equal(session.getSnapshot()?.pending, true);
+await new Promise((resolve) => setTimeout(resolve, 0));
+/** 文本相同的新请求仍能首次展开，不能按候选文字去重。 */
+const currentRequestId = session.getSnapshot()!.requestId;
+assert.notEqual(currentRequestId, previousRequestId);
+assert.equal(session.claimPreview(currentRequestId), true);
+session.dismiss(currentRequestId);
+assert.equal(session.getSnapshot(), null);
+assert.equal(session.claimPreview(currentRequestId), false);
+/** 自动生成期间新增附件或其他限制也立即失效，迟到回执不能恢复。 */
+session.start({
+  key: 'automatic-request',
+  modelKey: 'model',
+  sourceDraft: '',
+  modelRef: 'model',
+  request: { mode: 'suggest', trigger: 'automatic', completedTurnId: 'next-turn' },
+  generate: async () => ({ completedTurnId: 'next-turn', modelRef: 'model', text: '失效的自动建议', reason: null }),
+});
+session.observeAutomaticEligibility(editorOwner, false);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(session.getSnapshot(), null);
+releaseEditor();
 reader.clear();
 /** 使用任务自有临时库核对实际 SQL、正文句柄和记忆有效期，不读取用户数据库。 */
 const directory = await mkdtemp(join(tmpdir(), 'zeus-0821-context-'));
@@ -260,6 +303,31 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   }
   /** 正式仓库负责创建项目和会话，避免伪造外部身份。 */
   const project = new ProjectRepository(db).create({ name: '输入建议检查', localPath: directory });
+  /** 规则只写入本次临时目录，隐藏的全局目录不进入项目子目录索引。 */
+  const globalRulesDirectory = await mkdtemp(join(directory, '.global-rules-'));
+  /** 项目根规则用于检查正文注入与生成期间修改失效。 */
+  const projectRulesPath = join(directory, 'AGENTS.md');
+  await writeFile(join(globalRulesDirectory, 'AGENTS.md'), '全局规则样例：使用中文。');
+  await writeFile(projectRulesPath, '项目规则样例：说明验收依据。');
+  await mkdir(join(directory, 'feature'));
+  await writeFile(join(directory, 'feature', 'AGENTS.md'), '子目录规则正文不应自动注入。');
+  /** 与正常会话及建议入口共用同一个真实规则读取器。 */
+  const rulesCatalog = new ContextSourceCatalog([
+    { id: 'global', path: globalRulesDirectory },
+    { id: 'project', path: directory },
+  ]);
+  /** 项目身份与根一起提供，避免把全局目录伪装成项目。 */
+  const rulesInput = { globalRootId: 'global', projectRootId: 'project', projectId: project.id, idPrefix: 'agent-rules' };
+  /** 合并正文保持全局在前、项目在后，子目录仅列路径。 */
+  const mergedRules = (await rulesCatalog.agentRulesFragment(rulesInput)).fragment!.content;
+  assert.ok(mergedRules.indexOf('全局规则样例') < mergedRules.indexOf('项目规则样例'));
+  assert.match(mergedRules, /feature\/AGENTS\.md/);
+  assert.doesNotMatch(mergedRules, /子目录规则正文不应自动注入/);
+  /** 无项目草稿只读全局正文，不携带项目正文或子目录索引。 */
+  const globalOnly = (await rulesCatalog.agentRulesFragment({ globalRootId: 'global', idPrefix: 'agent-rules' })).fragment!.content;
+  assert.match(globalOnly, /全局规则样例/);
+  assert.doesNotMatch(globalOnly, /项目规则样例|feature\/AGENTS\.md/);
+  await assert.rejects(rulesCatalog.agentRulesFragment({ globalRootId: 'global', projectId: project.id, idPrefix: 'agent-rules' }));
   /** 原文只写入临时会话。 */
   const conversation = new ConversationRepository(db).create({ projectId: project.id, title: '输入建议检查' });
   /** 持久化历史与正式取材使用同一实现。 */
@@ -287,7 +355,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   /** 真实受控正文页也遵守 16,000 字符预算。 */
   const actualSnapshot = { ...snapshot, conversation: { ...snapshot.conversation, id: conversation.id, projectId: project.id }, collections: { modelHistory: { throughSequence: 21 } } } as ConversationSnapshotV2;
   /** 长回复通过内容句柄读取，不能绕过预算或串入其他会话。 */
-  const actual = createInputSuggestionContextReader(storage).read({ snapshot: actualSnapshot, projectId: project.id, sources: { task: null, memories: [] } });
+  const actual = createInputSuggestionContextReader(storage).read({ snapshot: actualSnapshot, projectId: project.id, sources: { agentRules: null, task: null, memories: [] } });
   assert.match(actual.text, /最多重试 3 次/);
   assert.match(actual.text, /不能自动提交/);
   assert.ok(actual.text.length <= 16_000);
@@ -320,7 +388,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   /** 实际发送材料仅用于断言，不写入日志。 */
   let material = '';
   /** 在回执前模拟主会话变化。 */
-  let beforeReply = () => {};
+  let beforeReply: () => void | Promise<void> = () => {};
   /** 回执覆盖正常结果、原样返回和空建议。 */
   let answer = '请按已明确的要求继续完善。';
   /** 故障和挂起分别检查不重试与总期限。 */
@@ -332,10 +400,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     request.on('data', (chunk) => {
       body += chunk;
     });
-    request.on('end', () => {
+    request.on('end', async () => {
       requests += 1;
       material = body;
-      beforeReply();
+      await beforeReply();
       if (behavior === 'stalled') return;
       if (behavior === 'failed') {
         response.writeHead(503, { 'Content-Type': 'application/json' });
@@ -392,7 +460,11 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       const model = (await connections.listSelectableModels(ref)).find((item) => item.id === ref);
       return model ? { id: model.id, label: model.displayName, supportedReasoningEfforts: model.supportedReasoningEfforts } : undefined;
     },
-    readSources: () => ({ task: null, memories: memories.resolveForContext({ projectId: project.id, asOf: '2026-10-14T00:00:00.000Z' }).selected }),
+    readSources: async () => ({
+      agentRules: (await rulesCatalog.agentRulesFragment(rulesInput)).fragment?.content ?? null,
+      task: null,
+      memories: memories.resolveForContext({ projectId: project.id, asOf: '2026-10-14T00:00:00.000Z' }).selected,
+    }),
     codexOptions: () => {
       throw new Error('API 生成不得读取 Codex 配置');
     },
@@ -402,13 +474,30 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   /** 同一路由支持按原文润色与空输入建议。 */
   const generate = async (input = payload) => (await api.inject({ method: 'POST', url: '/api/input-suggestions/generate', payload: input })).json();
   try {
+    /** 历史建议字段已删除，必须在调用模型前拒绝旧材料。 */
+    const obsolete = await api.inject({ method: 'POST', url: '/api/input-suggestions/generate', payload: { ...payload, suggestion: '旧候选不能夹带到新草稿' } });
+    assert.equal(obsolete.statusCode, 400);
+    assert.equal(requests, 0);
     assert.equal((await generate()).text, answer);
     assert.equal(requests, 1);
-    for (const required of ['不能自动提交', '不能代替用户确认和验收', '继续完善']) assert.ok(material.includes(required), required);
+    for (const required of ['不能自动提交', '也不新增执行授权', '继续完善', '全局规则样例', '项目规则样例', 'feature/AGENTS.md']) assert.ok(material.includes(required), required);
+    /** 建议与润色都显式携带规则，每次只产生一次模型请求。 */
+    assert.equal((await generate({ ...payload, mode: 'suggest', draft: '' })).text, answer);
+    assert.equal(requests, 2);
+    assert.ok(material.includes('全局规则样例') && material.includes('项目规则样例'));
+    /** 生成期间规则修改或删除时，不能返回依据旧规则生成的候选。 */
+    beforeReply = () => writeFile(projectRulesPath, '项目规则已更新。');
+    assert.equal((await generate()).reason, 'cancelled');
+    beforeReply = () => rm(projectRulesPath);
+    assert.equal((await generate()).reason, 'cancelled');
+    beforeReply = () => {};
     answer = payload.draft;
     assert.equal((await generate()).reason, 'no_change');
     answer = 'NO_SUGGESTION';
-    assert.equal((await generate({ ...payload, mode: 'suggest', draft: '' })).reason, 'no_suggestion');
+    /** 放弃标记属于无效输出，不再作为正常空建议返回。 */
+    const invalidOutput = await generate({ ...payload, mode: 'suggest', draft: '' });
+    assert.equal(invalidOutput.reason, 'failed');
+    assert.equal(invalidOutput.cause.code, 'ZEUS_INPUT_SUGGESTION_OUTPUT_INVALID');
     answer = '助手普通进度不会打断润色。';
     beforeReply = () => {
       execution.appendModelHistory({ conversationId: conversation.id, turnId: 'current', segmentId: 'check-segment', role: 'assistant', content: { text: '普通进度', phase: 'commentary' }, confirmedAt: '2026-10-14T09:31:00.000Z' });

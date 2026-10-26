@@ -43,6 +43,12 @@ export default defineConfig(({ command }) => ({
               priority: 110,
             },
             {
+              // Vite 预加载助手也要独立，避免它把 Markdown 等业务运行库重新带回启动入口。
+              name: 'startup-runtime',
+              test: /(?:src[\\/]renderer[\\/]bootstrap\.ts$|vite\/preload-helper\.js$)/u,
+              priority: 120,
+            },
+            {
               name: 'react-runtime',
               test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/u,
               priority: 100,
@@ -118,7 +124,7 @@ export default defineConfig(({ command }) => ({
             {
               name: 'renderer-runtime',
               // 源码预览与高亮重模块必须保留为动态入口；renderer-runtime 若吞入它们，Vite 会重新在首屏预加载全部语法解析器。
-              test: /src[\\/]renderer[\\/](?!code[\\/](?:CodeEditor|CodeDiffView|ConflictCodeEditor|SourceCodePreview|ProjectSourceEditor|sourceLanguageRegistry|monacoRuntime|monacoGrammars|monacoSourceDecorations|monacoConflictAlignment|sourceLanguageProviders)\.(?:ts|tsx)$)/u,
+              test: /src[\\/]renderer[\\/](?!bootstrap\.ts$|code[\\/](?:CodeEditor|CodeDiffView|ConflictCodeEditor|SourceCodePreview|ProjectSourceEditor|sourceLanguageRegistry|monacoRuntime|monacoGrammars|monacoSourceDecorations|monacoConflictAlignment|sourceLanguageProviders)\.(?:ts|tsx)$)/u,
               priority: 10,
             },
           ],

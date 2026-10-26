@@ -159,6 +159,8 @@ export const languageCopy = {
       expandProjectPrefix: '展开项目',
       collapseProjectPrefix: '折叠项目',
       moreProjectActionsPrefix: '更多项目操作',
+      /** 整行用于开合后，右键菜单保留任务页入口。 */
+      openProjectTasks: '打开项目任务',
       projectMenuSuffix: '项目菜单',
       pinProject: '置顶该项目',
       unpinProject: '取消置顶',
@@ -1079,6 +1081,8 @@ export const languageCopy = {
         artifactKindLabels: {
           dmg: 'DMG 安装包',
           zip: 'ZIP 压缩包',
+          // Windows 使用签名的 NSIS 可执行安装包。
+          exe: 'Windows 安装包',
         },
         waitingArtifact: '等待匹配本机架构',
         noArtifact: '暂无匹配本机架构的安装包。',
@@ -1380,6 +1384,8 @@ export const languageCopy = {
       expandProjectPrefix: 'Expand project',
       collapseProjectPrefix: 'Collapse project',
       moreProjectActionsPrefix: 'More project actions',
+      /** 英文菜单复用同一个项目任务入口。 */
+      openProjectTasks: 'Open project tasks',
       projectMenuSuffix: 'project menu',
       pinProject: 'Pin project',
       unpinProject: 'Unpin project',
@@ -2300,6 +2306,8 @@ export const languageCopy = {
         artifactKindLabels: {
           dmg: 'DMG',
           zip: 'ZIP',
+          // Windows 使用签名的 NSIS 可执行安装包。
+          exe: 'Windows installer',
         },
         waitingArtifact: 'Waiting for a matching local architecture',
         noArtifact: 'No installer matches this Mac architecture yet.',

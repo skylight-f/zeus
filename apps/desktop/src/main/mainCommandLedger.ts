@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { chmod, lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { canonicalCommandInputJson, parseCommandEnvelope, userFacingErrorCause, type CommandEnvelope, type UserFacingErrorCause } from '@zeus/shared';
+import { canonicalCommandInputJson, type CommandEnvelope, parseCommandEnvelope, userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
+import { openRegularFileNoFollow, windowsSecurityRequestAsync } from '@zeus/storage/platform-security';
 
 export interface MainCommandRequest<TBody = unknown> {
   envelope: unknown;
@@ -97,6 +98,9 @@ const maximumInlineReceiptBytes = 64 * 1024;
 const maximumArtifactReceiptBytes = 64 * 1024 * 1024;
 const maximumLedgerJsonBytes = 2 * 1024 * 1024;
 
+/** 附件取消、纯文字读取或明确失败可无副本写入；写入与读取回执共用同一命令策略。 */
+const readOnlyCompletionCommandTypes = new Set(['desktop.conversation_resources.choose', 'desktop.conversation_resources.store_paths', 'desktop.conversation_resources.materialize', 'desktop.conversation_resources.read_clipboard']);
+
 export class MainCommandLedgerError extends Error {
   readonly name = 'MainCommandLedgerError';
 
@@ -144,6 +148,7 @@ export class MainCommandLedger {
     this.#inlineReceiptByteLimit = options.inlineReceiptByteLimit ?? maximumInlineReceiptBytes;
   }
 
+  /** 命令类型决定是否允许无写入完成，避免执行方与重启读取采用不同规则。 */
   async execute<TBody, TResult>(request: MainCommandRequest<TBody>, expectedCommandType: string, effect: (body: TBody, context: MainCommandExecutionContext) => Promise<TResult> | TResult): Promise<TResult> {
     const parsed = parseMainCommandRequest<TBody>(request, expectedCommandType);
     const requestSha256 = hashMainCommandBody(parsed.body);
@@ -172,6 +177,35 @@ export class MainCommandLedger {
     const path = this.#outcomePath(safeCommandId);
     if (!(await lexicalPathExists(path))) return null;
     return this.#readOutcome(path, safeCommandId);
+  }
+
+  /** 只凭原命令身份与已落盘结果恢复回执，绝不执行原操作。 */
+  async reconcile<TResult>(request: MainCommandRequest, expectedCommandType: string, recover: (commandId: string, requestSha256: string) => Promise<TResult | null>): Promise<TResult | null> {
+    await this.#prepare();
+    /** 重新校验请求，不能用其他范围或内容借用既有结果。 */
+    const parsed = parseMainCommandRequest(request, expectedCommandType);
+    /** 命令身份固定结果文件位置。 */
+    const commandId = parsed.envelope.commandId;
+    /** 请求正文摘要必须与首次接纳一致。 */
+    const requestSha256 = hashMainCommandBody(parsed.body);
+    if (this.#inFlight.has(commandId)) return null;
+    if (!(await lexicalPathExists(this.#envelopePath(commandId))) || !(await lexicalPathExists(this.#outcomePath(commandId)))) return null;
+    /** 原始 Envelope 与载荷摘要共同约束核对范围。 */
+    const recorded = await this.#readEnvelopeRecord(this.#envelopePath(commandId), commandId);
+    if (recorded.requestSha256 !== requestSha256 || canonicalCommandInputJson(recorded.envelope) !== canonicalCommandInputJson(parsed.envelope))
+      throw new MainCommandLedgerError('ZEUS_MAIN_COMMAND_IDENTITY_CONFLICT', 'Main command reconciliation supplied a different immutable request.', { commandId });
+    /** 仅未知状态可以凭外部完成证据前进。 */
+    const outcome = await this.#readOutcome(this.#outcomePath(commandId), commandId);
+    if (outcome.state === 'receipted' && outcome.result) return (await this.#loadResult(outcome.result)) as TResult;
+    if (!outcome.writeMarker || !['accepted', 'unknown_after_write'].includes(outcome.state)) return null;
+    /** 调用方必须核对完整证据，空值表示不能确认。 */
+    const result = await recover(commandId, requestSha256);
+    if (result === null) return null;
+    /** 恢复只推进回执，不重新执行副作用。 */
+    const recovered: MainCommandOutcome = { ...outcome, state: 'receipted', result: await this.#storeResult(commandId, result), updatedAt: this.#now() };
+    delete recovered.failure;
+    await writeAtomicJson(this.#outcomePath(commandId), recovered);
+    return result;
   }
 
   /** 按可信调用方限定的范围分页，逐条投影并释放大结果，避免累积仓库快照。 */
@@ -281,7 +315,7 @@ export class MainCommandLedger {
             writeMarker: { externalOperationId, startedAt },
             updatedAt: startedAt,
           };
-          // 只有 marker 的原子文件与目录都 fsync 成功后，才允许内存态进入 after-write。
+          // 平台持久发布完成后才允许进入 after-write；Windows 使用写穿透移动。
           await writeAtomicJson(outcomePath, durableMarkerOutcome);
           outcome = durableMarkerOutcome;
           writeStarted = true;
@@ -297,20 +331,21 @@ export class MainCommandLedger {
     try {
       const result = await effect(body, context);
       await commandRecording;
-      if (!writeStarted) {
+      if (!writeStarted && !readOnlyCompletionCommandTypes.has(envelope.commandType)) {
         throw new MainCommandLedgerError('ZEUS_MAIN_COMMAND_REQUEST_INVALID', 'Main mutation completed without a durable pre-write marker.', {
           commandId: envelope.commandId,
           commandType: envelope.commandType,
         });
       }
       const completedAt = this.#now();
-      outcome = {
+      /** 成功回执发布完成前不改内存状态，避免发布失败后的失败回执混入成功 result。 */
+      const completedOutcome: MainCommandOutcome = {
         ...outcome,
         state: 'receipted',
         result: await this.#storeResult(envelope.commandId, result),
         updatedAt: completedAt,
       };
-      await writeAtomicJson(outcomePath, outcome);
+      await writeAtomicJson(outcomePath, completedOutcome);
       return result;
     } catch (error) {
       // 写入终态前先等已开始的记录写完，不能让记录覆盖终态。
@@ -328,7 +363,10 @@ export class MainCommandLedger {
       const errorCode = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : '';
       throw new MainCommandLedgerError(
         'ZEUS_MAIN_COMMAND_OUTCOME_UNKNOWN_AFTER_WRITE',
-        'Main command outcome is unknown after a durable write marker; automatic retry is forbidden.',
+        // Electron IPC 只保证传递 message；附件错误同时携带已脱敏原因，仍保留禁止自动重试的状态。
+        envelope.commandType.startsWith('desktop.conversation_resources.')
+          ? `附件处理未完成，操作结果尚未确认，未自动重试。${userFacingErrorCause(error).message.slice(0, 512)}`
+          : 'Main command outcome is unknown after a durable write marker; automatic retry is forbidden.',
         {
           commandId: envelope.commandId,
           commandType: envelope.commandType,
@@ -616,7 +654,7 @@ function parseMainCommandOutcome(value: unknown, expectedCommandId: string, path
     (state === 'accepted' && result === undefined && failure === undefined) ||
     (state === 'failed_before_write' && writeMarker === undefined && result === undefined && failure !== undefined) ||
     (state === 'unknown_after_write' && writeMarker !== undefined && result === undefined && failure !== undefined) ||
-    (state === 'receipted' && writeMarker !== undefined && result !== undefined && failure === undefined);
+    (state === 'receipted' && (writeMarker !== undefined || readOnlyCompletionCommandTypes.has(record.commandType)) && result !== undefined && failure === undefined);
   if (!validStateShape) throw receiptCorrupt('Main command outcome fields do not match its state.', path);
 
   return {
@@ -805,8 +843,10 @@ async function writeImmutableJson(path: string, value: unknown): Promise<boolean
   return writeImmutableBytes(path, Buffer.from(`${canonicalCommandInputJson(value)}\n`, 'utf8'));
 }
 
+/** 不可变记录只允许首次发布，已有记录交给调用方校验身份。 */
 async function writeImmutableBytes(path: string, bytes: Buffer): Promise<boolean> {
   await ensureSecureDirectory(dirname(path));
+  if (process.platform === 'win32') return writeWindowsLedgerBytes(path, bytes, false);
   let handle;
   try {
     handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
@@ -833,9 +873,14 @@ async function writeImmutableBytes(path: string, bytes: Buffer): Promise<boolean
   return true;
 }
 
+/** 状态推进必须持久发布，不能用 Windows 不支持的目录 fsync 代替。 */
 async function writeAtomicJson(path: string, value: unknown): Promise<void> {
   await ensureSecureDirectory(dirname(path));
   if (await lexicalPathExists(path)) await assertSecureRegularFile(path);
+  if (process.platform === 'win32') {
+    await writeWindowsLedgerBytes(path, Buffer.from(`${canonicalCommandInputJson(value)}\n`, 'utf8'), true);
+    return;
+  }
   const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   const handle = await open(temporaryPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
   let published = false;
@@ -851,6 +896,36 @@ async function writeAtomicJson(path: string, value: unknown): Promise<void> {
     await fsyncDirectory(dirname(path));
   } finally {
     if (!published) await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+/** Windows 暂存文件继承私有目录 ACL，刷新内容后通过原生写穿透移动发布。 */
+async function writeWindowsLedgerBytes(path: string, bytes: Buffer, replace: boolean): Promise<boolean> {
+  /** 同目录暂存保证原子移动不跨卷；随机文件名不会成为账本身份。 */
+  const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  /** 独占创建拒绝已有文件，父目录已通过 Windows 私有 ACL 与重解析点检查。 */
+  const handle = await open(temporaryPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+  try {
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await assertSecureRegularFile(temporaryPath);
+    await windowsSecurityRequestAsync({ operation: 'publish-file', source: temporaryPath, target: path, replace });
+    return true;
+  } catch (error) {
+    if (!replace && isFileExistsError(error)) {
+      await assertSecureRegularFile(path);
+      return false;
+    }
+    throw error;
+  } finally {
+    // 只回收本次暂存项；发布结果未知时不删除目标、不重试移动。
+    await unlink(temporaryPath).catch((error: unknown) => {
+      if (!isMissingFileError(error)) throw error;
+    });
   }
 }
 
@@ -871,10 +946,12 @@ async function readBoundedJson<T>(path: string, maximumBytes: number): Promise<T
   return parseLedgerJson(bytes, path) as T;
 }
 
+/** 有界读取同时核对真实文件身份及本平台权限，不以 Windows mode 位代替 ACL。 */
 async function readBoundedBytes(path: string, maximumBytes: number): Promise<Buffer> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) throw receiptCorrupt('Main command bounded read budget is invalid.', path);
   await assertSecureDirectory(dirname(path));
-  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW).catch(() => {
+  if (process.platform === 'win32') await assertSecureRegularFile(path);
+  const handle = await openRegularFileNoFollow(path, fsConstants.O_RDONLY).catch(() => {
     throw receiptCorrupt('Main command ledger file could not be opened without following links.', path);
   });
   try {
@@ -910,6 +987,7 @@ async function readBoundedBytes(path: string, maximumBytes: number): Promise<Buf
     ) {
       throw receiptCorrupt('Main command ledger file changed while it was being read.', path);
     }
+    if (process.platform === 'win32') await assertSecureRegularFile(path);
     return Buffer.concat(chunks, totalBytes);
   } finally {
     await handle.close();
@@ -924,7 +1002,12 @@ function parseLedgerJson(bytes: Buffer, path: string): unknown {
   }
 }
 
+/** 按平台创建私有账本目录，Windows 由原生助手验证所有者和重解析路径。 */
 async function ensureSecureDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') {
+    await windowsSecurityRequestAsync({ operation: 'ensure-private', path, kind: 'directory' });
+    return;
+  }
   const target = resolve(path);
   const missing: string[] = [];
   let cursor = target;
@@ -963,7 +1046,12 @@ async function ensureSecureDirectory(path: string): Promise<void> {
   await assertSecureDirectory(target);
 }
 
+/** Windows 校验 DACL，POSIX 保留严格的所有者、规范路径和权限位检查。 */
 async function assertSecureDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') {
+    await windowsSecurityRequestAsync({ operation: 'assert-private', path, kind: 'directory' });
+    return;
+  }
   const target = resolve(path);
   const status = await lstat(target).catch(() => {
     throw receiptCorrupt('Main command ledger directory is missing.', target);
@@ -974,17 +1062,23 @@ async function assertSecureDirectory(path: string): Promise<void> {
   }
 }
 
+/** 文件权限验证复用平台安全边界，Windows 不接受仅检查只读属性。 */
 async function assertSecureRegularFile(path: string): Promise<void> {
+  if (process.platform === 'win32') {
+    await windowsSecurityRequestAsync({ operation: 'assert-private', path, kind: 'file' });
+    return;
+  }
   const status = await lstat(path);
   if (status.isSymbolicLink()) throw new MainCommandLedgerError('ZEUS_MAIN_COMMAND_RECEIPT_CORRUPT', 'Main command ledger refuses symbolic-link files.', { file: basename(path) });
   assertSecureRegularStat(status, path);
 }
 
+/** 句柄始终要求普通文件；Windows ACL 由读取前后的路径检查负责。 */
 function assertSecureRegularStat(status: Awaited<ReturnType<typeof lstat>>, path: string): void {
   const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
   const mode = Number(status.mode) & 0o777;
   const uid = Number(status.uid);
-  if (!status.isFile() || mode !== 0o600 || (currentUid !== null && uid !== currentUid)) {
+  if (!status.isFile() || (process.platform !== 'win32' && mode !== 0o600) || (currentUid !== null && uid !== currentUid)) {
     throw new MainCommandLedgerError('ZEUS_MAIN_COMMAND_RECEIPT_CORRUPT', 'Main command ledger file must be a current-user regular file with mode 0600.', {
       file: basename(path),
       mode,

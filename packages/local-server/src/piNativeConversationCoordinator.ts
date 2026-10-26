@@ -65,7 +65,7 @@ import { isQueueMemberStatus, projectConversationTurnFailure } from '@zeus/stora
 import type { ModelConnectionService } from './modelConnectionService.js';
 import type { BrowserAutomationPort } from './browserAutomation.js';
 import type { CreateCodexNativeConversationCoordinatorOptions, NativeConversationAttachmentInput, NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { appendConversationResourceContext, conversationTurnHasCompletedOutput, readNativeSubmissionSkillReferences, resolveFrozenNativeSkills } from './nativeConversationSubmissionInputs.js';
+import { appendConversationResourceContext, conversationTurnHasCompletedOutput, readNativeSubmissionSkillReferences, resolveCurrentNativeSkills } from './nativeConversationSubmissionInputs.js';
 import { hasUnwrittenSubmissionEvidence } from './unboundConversationArchiveApplication.js';
 import type { ConversationSegmentLifecycle } from './conversationExecutionCoordinator.js';
 import type { ManagedConversationToolResultStore } from './conversationPortableContext.js';
@@ -78,7 +78,8 @@ import { projectLocallyAcceptedUserMessage } from './localUserSubmissionProjecti
 import type { ZeusConversationPluginRuntime, ZeusPluginConversationPreparation } from './zeusConversationPluginRuntime.js';
 import type { ZeusConfiguredMcpPreparation, ZeusConfiguredMcpRuntime, ZeusConfiguredMcpTool } from './zeusConfiguredMcpRuntime.js';
 import { emitPluginCompactionHook } from './codexConversationDispatchContext.js';
-import type { ZeusPluginDynamicTool } from './zeusPluginMcpBroker.js';
+import { createZeusPluginMcpApprovalEvidence, type ZeusPluginDynamicTool, type ZeusPluginMcpApprovalSource } from './zeusPluginMcpBroker.js';
+import { pluginDispatchHookWaitLimitMs } from './zeusPluginHookRuntime.js';
 import { createZeusToolBroker, isZeusNativeToolMutation, type ZeusToolAuditEvent } from './zeusToolRegistry.js';
 import { searchPiWorkspace } from './piWorkspaceSearch.js';
 import { effectiveToolPermission, resolveConversationToolPath } from './conversationToolPolicy.js';
@@ -98,7 +99,7 @@ interface PiConversationContext {
   attachmentRoots: string[];
   /** 当前会话由服务端冻结的可写项目目录。 */
   writableRoots: string[];
-  /** 与模型收到的冻结插件 Skill 清单一致，仅供文件工具只读访问。 */
+  /** 与模型收到的当前普通 Skill 和已激活插件 Skill 一致，仅供文件工具只读访问。 */
   pluginSkillRoots: string[];
   /** 当前执行快照的模式，不能由正在编辑的下一轮设置覆盖。 */
   workMode: 'default' | 'plan';
@@ -174,7 +175,7 @@ export interface CreatePiNativeConversationCoordinatorOptions {
   /** 把 Zeus Codex Home 中的普通 MCP 配置投影给 Pi；Codex 仍使用其原生 MCP 链路。 */
   configuredMcp?: ZeusConfiguredMcpRuntime;
   /** 与界面、app-server 共用的本地 Skill 目录。 */
-  loadSkills?(cwd: string, identity: string): Promise<NativeConversationSkillInput[]>;
+  loadSkills?(cwd: string): Promise<NativeConversationSkillInput[]>;
   /** 宿主管理的长命令通道，不随 SDK 回合或界面关闭而丢失。 */
   processes: ConversationToolProcesses;
   /** Zeus 拥有的 Pi 目标控制器，沿用目标面板和提交队列。 */
@@ -272,6 +273,39 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   const pendingApprovals = new Map<string, { resolve: (response: unknown) => void; session: AgentSessionIdentity; conversationId: string }>();
   let eventSequence = 0;
   const zeusToolBroker = options.browserAutomation || options.workTools ? createZeusToolBroker(options.browserAutomation, { audit: options.auditNativeTool, work: options.workTools }) : undefined;
+
+  /** 将 Pi 发送前的 Plugin 检查写入权威队列；异常时保留消息并进入人工重试状态。 */
+  async function runPluginDispatchCheck<T>(conversationId: string, submissionId: string, operation: () => Promise<T>): Promise<T> {
+    /** 等待标记只覆盖 Hook 执行；成功后恢复原调度阶段，Provider 边界仍由既有流程推进。 */
+    const previous = options.submissions.getById(submissionId);
+    if (!previous || (previous.status !== 'queued' && previous.status !== 'dispatching')) throw piError('ZEUS_PLUGIN_HOOK_SUBMISSION_INVALID', 'Plugin Hook 对应的消息已不在可派发状态。');
+    options.submissions.updateStatus(submissionId, 'dispatching', { pausedReason: 'plugin_hook', preserveError: true, preserveSubmissionOutcome: true, updatedAt: options.now() });
+    await options.db.save();
+    publish('conversation.queue.changed', conversationId, { submissionId });
+    try {
+      return await operation();
+    } catch (error) {
+      const current = options.submissions.getById(submissionId);
+      if (current?.status === 'dispatching' && current.pausedReason === 'plugin_hook') {
+        const failure = asRecord(error);
+        options.submissions.updateStatus(submissionId, 'paused', {
+          pausedReason: 'preflight_failed',
+          error: { code: typeof failure.code === 'string' ? failure.code : null, message: error instanceof Error ? error.message : String(error) },
+          updatedAt: options.now(),
+        });
+        await options.db.save();
+        publish('conversation.queue.changed', conversationId, { submissionId });
+      }
+      throw error;
+    } finally {
+      const current = options.submissions.getById(submissionId);
+      if (current?.status === 'dispatching' && current.pausedReason === 'plugin_hook') {
+        options.submissions.updateStatus(submissionId, previous.status, { pausedReason: null, preserveError: true, preserveSubmissionOutcome: true, updatedAt: options.now() });
+        await options.db.save();
+        publish('conversation.queue.changed', conversationId, { submissionId });
+      }
+    }
+  }
 
   const broker: PiZeusToolBroker = {
     execute: async (request) => executeTool(request),
@@ -615,8 +649,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     /** 需要真实压缩的导入历史必须分批写入并逐批压缩，不能在创建会话时一次播种。 */
     const historyCompaction = input.segmentLifecycle?.contextCompactionPlan ? { lifecycle: input.segmentLifecycle, plan: input.segmentLifecycle.contextCompactionPlan } : null;
     try {
-      skillCatalog = (await options.loadSkills?.(input.cwd, input.submissionId)) ?? [];
-      selectedSkills = resolveFrozenNativeSkills(selectedSkills, skillCatalog);
+      skillCatalog = (await options.loadSkills?.(input.cwd)) ?? [];
+      selectedSkills = resolveCurrentNativeSkills(selectedSkills, skillCatalog);
       allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? []), ...writableRoots, ...selectedSkills.map(resolveSkillResourceRoot)]);
       attachmentInput = await resolvePiAttachmentInput(orderedAttachments, allowedResourceRoots, input.cwd);
       providerPrompt = appendConversationResourceContext(
@@ -626,21 +660,29 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         input.conversationContext,
       );
       if (options.plugins) {
-        pluginPreparation = await options.plugins.prepare({
-          conversationId: input.conversationId,
-          projectId: input.projectId,
-          cwd: input.cwd,
-          model: piModelIdentity(input.model),
-          source: 'startup',
-          prompt: providerPrompt,
+        const plugins = options.plugins;
+        const pluginResult = await runPluginDispatchCheck(input.conversationId, submission.id, async () => {
+          const preparation = await plugins.prepare({
+            conversationId: input.conversationId,
+            projectId: input.projectId,
+            cwd: input.cwd,
+            model: piModelIdentity(input.model),
+            source: 'startup',
+            prompt: providerPrompt,
+          });
+          return {
+            preparation,
+            prompt: await applyPiPromptHooks(plugins, preparation, {
+              conversationId: input.conversationId,
+              cwd: input.cwd,
+              model: piModelIdentity(input.model),
+              prompt: providerPrompt,
+              permissionMode: input.permissionMode,
+            }),
+          };
         });
-        providerPrompt = await applyPiPromptHooks(options.plugins, pluginPreparation, {
-          conversationId: input.conversationId,
-          cwd: input.cwd,
-          model: piModelIdentity(input.model),
-          prompt: providerPrompt,
-          permissionMode: input.permissionMode,
-        });
+        pluginPreparation = pluginResult.preparation;
+        providerPrompt = pluginResult.prompt;
       }
       configuredMcpPreparation = (await options.configuredMcp?.prepare(input.conversationId)) ?? null;
       providerMetadata = { ...piRuntimeMetadata(pluginPreparation, configuredMcpPreparation, historyCompaction ? null : input.segmentLifecycle?.portableContext), zeusSkills: skillCatalog };
@@ -1083,17 +1125,20 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     await input.segmentLifecycle?.prepare(submission);
     await options.db.save();
     await input.providerWriteLifecycle?.markPrepared(submission.id);
-    const skillCatalog = (await options.loadSkills?.(cwd, submission.id)) ?? [];
-    selectedSkills = resolveFrozenNativeSkills(selectedSkills, skillCatalog);
+    const skillCatalog = (await options.loadSkills?.(cwd)) ?? [];
+    selectedSkills = resolveCurrentNativeSkills(selectedSkills, skillCatalog);
     allowedResourceRoots = uniquePaths([...(input.allowedAttachmentRoots ?? context?.attachmentRoots ?? [cwd]), ...writableRoots, ...selectedSkills.map(resolveSkillResourceRoot)]);
-    const pluginPreparation = options.plugins
-      ? await options.plugins.prepare({
-          conversationId: input.conversation.id,
-          projectId: input.conversation.projectId,
-          cwd,
-          model: piModelIdentity(input.model),
-          source: 'resume',
-        })
+    const plugins = options.plugins;
+    const pluginPreparation = plugins
+      ? await runPluginDispatchCheck(input.conversation.id, submission.id, () =>
+          plugins.prepare({
+            conversationId: input.conversation.id,
+            projectId: input.conversation.projectId,
+            cwd,
+            model: piModelIdentity(input.model),
+            source: 'resume',
+          }),
+        )
       : null;
     const configuredMcpPreparation = (await options.configuredMcp?.prepare(input.conversation.id)) ?? null;
     const providerMetadata = { ...piRuntimeMetadata(pluginPreparation, configuredMcpPreparation), zeusSkills: skillCatalog };
@@ -1144,14 +1189,16 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       attachmentInput = await resolvePiAttachmentInput(input.attachments ?? [], allowedResourceRoots, cwd);
       context.attachmentRoots = attachmentInput.allowedRoots;
       providerContent = appendConversationResourceContext(appendPiAttachmentReferences(input.content, attachmentInput.pathReferences), input.browserCommentContent, input.browserComments, input.conversationContext);
-      if (options.plugins && pluginPreparation) {
-        providerContent = await applyPiPromptHooks(options.plugins, pluginPreparation, {
-          conversationId: input.conversation.id,
-          cwd,
-          model: piModelIdentity(input.model),
-          prompt: providerContent,
-          permissionMode: input.permissionMode,
-        });
+      if (plugins && pluginPreparation) {
+        providerContent = await runPluginDispatchCheck(input.conversation.id, submission.id, () =>
+          applyPiPromptHooks(plugins, pluginPreparation, {
+            conversationId: input.conversation.id,
+            cwd,
+            model: piModelIdentity(input.model),
+            prompt: providerContent,
+            permissionMode: input.permissionMode,
+          }),
+        );
       }
       compiledDispatchContext = options.compileDispatchContext
         ? await options.compileDispatchContext({
@@ -1556,8 +1603,8 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     const segment = options.execution.segmentByNativeSession(context.session.nativeSessionId, input.conversation.id);
     if (!segment?.executionSnapshotId) throw piError('ZEUS_PI_SESSION_NOT_LOADED', 'Pi 引导目标缺少已冻结的当前会话分段。');
     const attachmentInput = await resolvePiAttachmentInput(input.attachments ?? [], uniquePaths([...context.attachmentRoots, ...(input.allowedAttachmentRoots ?? [])]), context.cwd);
-    const selectedCatalog = input.skills?.length ? ((await options.loadSkills?.(context.cwd, input.submissionId)) ?? []) : [];
-    const selectedSkills = resolveFrozenNativeSkills(input.skills ?? [], selectedCatalog);
+    const selectedCatalog = input.skills?.length ? ((await options.loadSkills?.(context.cwd)) ?? []) : [];
+    const selectedSkills = resolveCurrentNativeSkills(input.skills ?? [], selectedCatalog);
     const skillRoots = selectedSkills.map(resolveSkillResourceRoot);
     const skillContents = await Promise.all(selectedSkills.map(async (skill) => `本次显式 Skill ${JSON.stringify({ name: skill.name, path: skill.path })}：\n${await readFile(skill.path, 'utf8')}`));
     const providerContent = [
@@ -2435,6 +2482,30 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     }
     if (options.plugins) {
       const catalog = await options.plugins.getCatalog(context.conversationId);
+      if (request.toolName === 'zeus_plugin_catalog') {
+        const requestedName = typeof request.args.name === 'string' ? request.args.name.trim() : '';
+        const query = typeof request.args.query === 'string' ? request.args.query.trim().toLocaleLowerCase() : '';
+        const selected = requestedName
+          ? catalog.tools.filter((candidate) => candidate.name === requestedName)
+          : catalog.tools.filter((candidate) => !query || `${candidate.name}\n${candidate.description}`.toLocaleLowerCase().includes(query)).slice(0, 20);
+        return {
+          text: JSON.stringify(
+            selected.map((candidate) => ({
+              name: candidate.name,
+              label: candidate.label,
+              description: candidate.description,
+              readOnly: candidate.readOnly === true,
+              ...(requestedName ? { inputSchema: candidate.inputSchema } : {}),
+            })),
+          ),
+          details: { returned: selected.length, exact: Boolean(requestedName), connectionFailures: catalog.failures },
+        };
+      }
+      if (request.toolName === 'zeus_plugin_invoke') {
+        const pluginTool = catalog.tools.find((candidate) => candidate.name === stringArg(request.args.name, 'Plugin 工具名'));
+        if (!pluginTool) throw piError('ZEUS_PLUGIN_MCP_TOOL_NOT_FOUND', '该 MCP 工具在当前 Plugin 状态下不可用。');
+        return executePluginTool(context, { ...request, args: asRecord(request.args.arguments) }, pluginTool);
+      }
       const pluginTool = catalog.tools.find((candidate) => candidate.name === request.toolName);
       if (pluginTool) return executePluginTool(context, request, pluginTool);
     }
@@ -2566,7 +2637,9 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     });
     if (pre.permissionDecision === 'deny') throw piError('ZEUS_PLUGIN_HOOK_TOOL_DENIED', pre.permissionDecisionReason ?? 'Plugin Hook 已阻断工具。');
     const args = pre.updatedInput ?? request.args;
-    if (tool.approvalMode === 'prompt' && pre.permissionDecision !== 'allow') {
+    if (tool.approvalMode === 'deny') throw piError('ZEUS_PLUGIN_MCP_TOOL_DENIED', 'Plugin MCP 工具策略已拒绝执行。');
+    let approvalSource: ZeusPluginMcpApprovalSource | null = tool.approvalMode === 'approve' ? 'policy' : pre.permissionDecision === 'allow' ? 'pre_tool_hook' : null;
+    if (!approvalSource && tool.approvalMode === 'prompt') {
       const permission = await options.plugins.emitHook({
         event: 'PermissionRequest',
         conversationId: context.conversationId,
@@ -2576,9 +2649,15 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         payload: { tool_name: tool.name, tool_input: args },
       });
       if (permission.permissionDecision === 'deny') throw piError('ZEUS_PLUGIN_HOOK_PERMISSION_DENIED', permission.permissionDecisionReason ?? 'Plugin Hook 已拒绝工具审批。');
-      if (permission.permissionDecision !== 'allow' && !(await requestApproval(context, { ...request, args }))) throw piError('ZEUS_PLUGIN_MCP_TOOL_DECLINED', '用户已拒绝 Plugin MCP 工具。');
+      if (permission.permissionDecision === 'allow') approvalSource = 'permission_hook';
+      else {
+        if (!(await requestApproval(context, { ...request, args }))) throw piError('ZEUS_PLUGIN_MCP_TOOL_DECLINED', '用户已拒绝 Plugin MCP 工具。');
+        approvalSource = 'user';
+      }
     }
-    const result = await options.plugins.invokeMcp({ conversationId: context.conversationId, toolName: tool.name, args, ...(request.signal ? { signal: request.signal } : {}) });
+    if (!approvalSource) throw piError('ZEUS_PLUGIN_MCP_APPROVAL_REQUIRED', 'Plugin MCP 工具缺少当前调用的审批依据。');
+    const approval = createZeusPluginMcpApprovalEvidence(tool, args, approvalSource);
+    const result = await options.plugins.invokeMcp({ conversationId: context.conversationId, tool, args, approval, ...(request.signal ? { signal: request.signal } : {}) });
     const post = await options.plugins.emitHook({
       event: 'PostToolUse',
       conversationId: context.conversationId,
@@ -2838,14 +2917,22 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     return conversation;
   }
 
+  /** 归档保留已确认未发送的暂停内容，执行中和送达未确认的消息仍需先处理。 */
   function assertConversationCanBeArchived(conversation: ZeusConversationWithMessagesRecord): void {
     const activeRun = [...runs.values()].find((run) => run.conversationId === conversation.id);
     const pendingApproval = [...pendingApprovals.values()].find((approval) => approval.conversationId === conversation.id);
     const pendingRequest = options.requests.listByConversation(conversation.id).find((request) => request.status === 'pending');
     const unfinishedTurn = options.turns.listByConversation(conversation.id).find((turn) => turn.status === 'dispatching' || turn.status === 'running' || turn.status === 'waiting');
+    /** 与 Codex 共用写出证据，不用缺少 Provider turn 单独判断消息是否发送。 */
     const pendingSubmission = options.submissions
       .listByConversation(conversation.id)
-      .find((submission) => submission.status === 'queued' || submission.status === 'dispatching' || submission.status === 'active' || (submission.status === 'paused' && !submission.providerTurnId));
+      .find(
+        (submission) =>
+          submission.status === 'queued' ||
+          submission.status === 'dispatching' ||
+          submission.status === 'active' ||
+          (submission.status === 'paused' && !submission.providerTurnId && !hasUnwrittenSubmissionEvidence(options.commandDeliveries, submission)),
+      );
     if (activeRun || pendingApproval || pendingRequest || unfinishedTurn || pendingSubmission || conversation.providerState === 'binding' || conversation.providerState === 'active' || conversation.providerState === 'waiting') {
       throw Object.assign(piError('ZEUS_NATIVE_CONVERSATION_IN_PROGRESS', 'The conversation still has unfinished work and cannot be archived.'), {
         cause: {
@@ -3294,7 +3381,9 @@ async function applyPiPromptHooks(
     model: input.model,
     permissionMode: input.permissionMode,
     payload: { prompt: input.prompt },
+    maximumWaitMs: pluginDispatchHookWaitLimitMs,
   });
+  if (result.runs.some((run) => run.state === 'timed_out')) throw piError('ZEUS_PLUGIN_HOOK_DISPATCH_TIMEOUT', 'Plugin Hook 等待超时，本次消息尚未发送。请检查 Plugin 后重试。');
   if (!result.continue) throw piError('ZEUS_PLUGIN_HOOK_PROMPT_BLOCKED', result.stopReasons.join('\n') || 'Plugin Hook 已阻断本次提示。');
   const context = [...result.systemMessages, ...result.additionalContext].filter(Boolean);
   return context.length > 0 ? `${input.prompt}\n\n[ZEUS_PLUGIN_HOOK_CONTEXT]\n${context.join('\n')}\n[/ZEUS_PLUGIN_HOOK_CONTEXT]` : input.prompt;

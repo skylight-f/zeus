@@ -326,6 +326,7 @@ export type NativeQueueWaitReason =
   | 'conversation_restoring'
   | 'current_turn'
   | 'dispatching'
+  | 'plugin_hook'
   | 'user_input'
   | 'approval'
   | 'plan_confirmation'
@@ -480,6 +481,8 @@ export interface NativeContextCompactionStatus {
 
 export interface NativeSessionMetricsSnapshot {
   usage: NativeUnifiedUsageSnapshot;
+  /** 持久轮次与实时轮次共用的账本摘要；无账本时保留缺项。 */
+  turnUsage?: Record<string, import('@zeus/shared').ConversationTurnUsage>;
   cost: {
     /** 供应商原币估算。 */
     costs?: import('@zeus/shared').EstimatedMoney[];
@@ -967,6 +970,8 @@ export interface NativeConversationChoice {
   updatedAt: string;
   /** 最近一次真实会话活动；不包含打开、水合、统计刷新等维护写入。 */
   activityAt?: string;
+  /** 最近创建或主动输入的固定时间；后台状态不推进，辅助会话为空。 */
+  workStartedAt?: string | null;
   archived: boolean;
   hasUnreadAttention: boolean;
   attentionKind: NativeConversationAttentionKind;
@@ -978,6 +983,8 @@ export interface NativeConversationChoice {
   listRuntimeState?: 'connecting' | 'reconnecting' | 'paused' | 'queued' | 'ready' | 'streaming' | 'pending_approval' | 'pending_user_input' | 'error' | 'legacy_readonly';
   /** 与列表状态同源的任务运行状态，避免客户端从不完整元数据重复猜测。 */
   taskRunStatus?: 'not_started' | 'connecting' | 'reconnecting' | 'running' | 'waiting_user' | 'waiting_approval' | 'paused' | 'idle' | 'failed' | 'legacy_readonly';
+  /** 异步待回复独立于运行状态；后台会话和历史未载入时仍显示提醒。 */
+  hasPendingAsyncQuestion?: boolean;
   resumable: boolean;
   readOnly: boolean;
   permissionMode?: NativePermissionMode;
@@ -1524,6 +1531,8 @@ export type StartNativeConversationRequest =
       /** 本次创建选择的上下文窗口容量。 */
       contextCapacityTokens?: number | null;
       mode: 'create';
+      /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
+      conversationContext?: ConversationContextDraft;
       source?: 'code_review';
       stageId?: string;
       content?: string;
@@ -1567,6 +1576,8 @@ export type StartNativeConversationRequest =
     };
 
 export interface StartProjectConversationRequest {
+  /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
+  conversationContext?: ConversationContextDraft;
   /** 首条消息的结构化网页批注，复用后续消息的处理链路。 */
   browserComments?: ZeusBrowserComment[];
   /** 首条消息的网页批注提示词。 */

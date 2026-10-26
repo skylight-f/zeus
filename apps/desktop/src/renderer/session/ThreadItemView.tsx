@@ -1,15 +1,15 @@
 import { BrowserCommentPreview } from './BrowserCommentPreview.js';
-import type { ZeusBrowserComment } from '@zeus/shared';
+import type { ConversationTurnUsage, ZeusBrowserComment } from '@zeus/shared';
+import { formatRuntimeCosts, formatTokenCount } from './tokenUsageFormat.js';
 import { AnimatedSize } from '../ui/AnimatedSize.js';
 import { describeUserFacingError } from '@zeus/shared';
-import { type FormEvent, type KeyboardEvent, memo, type ReactNode, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { type FormEvent, type KeyboardEvent, memo, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { ArrowBendUpRightIcon as ArrowBendUpRight } from '@phosphor-icons/react/dist/csr/ArrowBendUpRight';
 import { ClockIcon as Clock } from '@phosphor-icons/react/dist/csr/Clock';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
-import { MessageCheckIcon, MessageCopyIcon, MessageEditIcon, MessageExpandIcon, MessageRemoteDeviceIcon, MessageThumbIcon } from './SessionMessageIcons.js';
+import { MessageCheckIcon, MessageCopyIcon, MessageCostIcon, MessageEditIcon, MessageExpandIcon, MessageRemoteDeviceIcon, MessageThumbIcon, MessageTokenIcon } from './SessionMessageIcons.js';
 import { isAssistantDeliverableItem, type NativeConversationAttachment, type NativeSessionItemBuffer } from './sessionTypes.js';
-import { autosizeTextarea } from './textareaAutosize.js';
 import {
   type ConversationContextDraft,
   type ConversationFileLocation,
@@ -31,6 +31,7 @@ import { McpAppFrame, type McpAppToolCall, type McpAppToolResult } from './McpAp
 import { AnsweredRequestHistory, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
 import { modelSourceDisplayName } from '../modelOptionPresentation.js';
 import { ConversationComposerAttachments } from './ConversationComposerAttachments.js';
+import { SessionSweepText } from './SessionSweepText.js';
 
 export type SessionUiLanguage = 'zh-CN' | 'en-US';
 export type ThreadItemRole = 'user' | 'assistant' | 'commentary' | 'notice' | 'tool' | 'file' | 'image' | 'request' | 'error' | 'unknown';
@@ -144,6 +145,8 @@ const copy = {
 
 export interface ThreadItemViewProps {
   item: NativeSessionItemBuffer;
+  /** 所属轮次的累计消耗，不能用单次请求或会话累计值代替。 */
+  turnUsage?: ConversationTurnUsage;
   /** 异步回答复用询问历史卡片，消息操作与真实送达状态仍由本组件保留。 */
   questionAnswer?: AnsweredRequestHistoryProps['request'];
   language: SessionUiLanguage;
@@ -160,6 +163,8 @@ export interface ThreadItemViewProps {
   onCallMcpAppTool?: (input: McpAppToolCall) => Promise<McpAppToolResult>;
   onVisibleContentChange?: () => void;
   responseAnnotations?: ConversationResponseAnnotation[];
+  /** 选区作为右侧会话的评论引用，不写入主会话草稿。 */
+  onAskInSidebar?: (anchor: ConversationResponseTextAnchor) => void;
   onAddResponseAnnotation?: (anchor: ConversationResponseTextAnchor) => string;
   onUpdateResponseAnnotation?: (id: string, note: string) => void;
   onRemoveResponseAnnotation?: (id: string) => void;
@@ -571,12 +576,8 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
     void Promise.resolve(props.onLoadResources(props.item.turnId)).catch(() => undefined);
   }, [needsAuthoritativeAttachmentResources, props.item.turnId, props.onLoadResources]);
 
-  useLayoutEffect(() => {
-    if (!editing || !editTextareaRef.current) return;
-    autosizeTextarea(editTextareaRef.current, 72, 0.48);
-  }, [editDraft, editing]);
-
-  useEffect(() => setMarkdownSettled(false), [itemText, props.item.itemId, props.item.status]);
+  // 本地消息交给 Provider 后沿用显示身份，不能只因原生条目编号变化就重置正文。
+  useEffect(() => setMarkdownSettled(false), [itemText, props.item.key, props.item.status]);
 
   const handleMarkdownSettled = useCallback(() => setMarkdownSettled(true), []);
 
@@ -627,7 +628,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
     }
   }
 
-  /** 消息正文只组装一次，排队时由独立气泡承载附件、正文和上下文。 */
+  /** 消息正文只组装一次，轮次指标与消息操作统一放在正文底栏。 */
   const messageBody = (
     <>
       {showMeta ? (
@@ -686,7 +687,14 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       ) : role === 'error' ? (
         <VisibleApplicationError error={visibleThreadItemError(props.item)} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
       ) : role === 'image' ? (
-        <GeneratedImageItem item={props.item} language={props.language} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} onVisibleContentChange={props.onVisibleContentChange} />
+        <GeneratedImageItem
+          item={props.item}
+          language={props.language}
+          motionActive={props.motionActive}
+          onOpenResource={props.onOpenResource}
+          onLoadResourcePreview={props.onLoadResourcePreview}
+          onVisibleContentChange={props.onVisibleContentChange}
+        />
       ) : mcpApp ? (
         <McpAppFrame value={props.item.payload.app} context={props.item.payload} language={props.language} onCallTool={props.onCallMcpAppTool} />
       ) : command ? (
@@ -695,8 +703,9 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
         <div className="session-commentary-flow" data-streaming={streamActive || undefined}>
           <ConversationMarkdown
             text={visibleText}
-            streamId={`thread-item:${props.item.itemId}`}
+            streamId={`thread-item:${props.item.key}`}
             phase={markdownPhase}
+            animateArrival={props.animateEntrance}
             language={props.language}
             resources={props.item.resources}
             onOpenResource={props.onOpenResource}
@@ -708,7 +717,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       ) : role === 'user' && taskPushLayout ? (
         <TaskPushMessageContent
           layout={taskPushLayout}
-          streamIdPrefix={`task-push:${props.item.itemId}`}
+          streamIdPrefix={`task-push:${props.item.key}`}
           resources={props.item.resources}
           pendingAttachments={pendingAttachments}
           language={props.language}
@@ -721,7 +730,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
           <AnimatedSize changeKey={expanded}>
             <ConversationMarkdown
               text={visibleText}
-              streamId={`thread-item:${props.item.itemId}`}
+              streamId={`thread-item:${props.item.key}`}
               phase="final"
               language={props.language}
               resources={props.item.resources}
@@ -741,7 +750,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
         <div className="session-service-tier-notice" role="status">
           <ConversationMarkdown
             text={visibleText}
-            streamId={`thread-item:${props.item.itemId}`}
+            streamId={`thread-item:${props.item.key}`}
             phase="final"
             language={props.language}
             resources={props.item.resources}
@@ -753,8 +762,9 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       ) : naturalLanguageStream && (visibleText || (streamActive && itemText)) ? (
         <ConversationMarkdown
           text={visibleText}
-          streamId={`thread-item:${props.item.itemId}`}
+          streamId={`thread-item:${props.item.key}`}
           phase={markdownPhase}
+          animateArrival={props.animateEntrance}
           language={props.language}
           resources={props.item.resources}
           onOpenResource={props.onOpenResource}
@@ -763,7 +773,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
           onRenderSettled={handleMarkdownSettled}
         />
       ) : role === 'assistant' && props.item.status !== 'completed' ? (
-        <span className="session-thinking-indicator">{labels.thinking}</span>
+        <SessionSweepText className="session-current-status-text" text={labels.thinking} active={Boolean(props.motionActive)} />
       ) : null}
       {!command && !mcpApp && !recoveredRequestUserInput ? <TypedItemFacts item={props.item} role={role} language={props.language} /> : null}
       {role !== 'error' && conversationContext ? <UserConversationContextSummary draft={conversationContext} language={props.language} /> : null}
@@ -855,7 +865,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       data-motion-block="markdown"
       aria-label={accessibleLabel}
     >
-      {showQueuedFooter ? <div className="session-queued-message-bubble">{messageBody}</div> : messageBody}
+      {showQueuedFooter || (role === 'user' && hasActions) ? <div className="session-user-message-bubble">{messageBody}</div> : messageBody}
       {showQueuedFooter ? (
         <div className="session-queued-thread-footer">
           {optimisticStatus ? (
@@ -907,14 +917,24 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       <ResponseSelectionActions
         articleRef={articleRef}
         itemId={props.item.itemId}
-        enabled={role === 'assistant' && props.item.status === 'completed' && markdownSettled && Boolean(visibleText) && Boolean(props.onAddResponseAnnotation)}
+        enabled={role === 'assistant' && props.item.status === 'completed' && markdownSettled && Boolean(visibleText) && Boolean(props.onAddResponseAnnotation || props.onAskInSidebar)}
         language={props.language}
         annotations={props.responseAnnotations ?? []}
+        onAskInSidebar={props.onAskInSidebar}
         onAddAnnotation={props.onAddResponseAnnotation}
         onUpdateAnnotation={props.onUpdateResponseAnnotation}
         onRemoveAnnotation={props.onRemoveResponseAnnotation}
       />
-      {!showQueuedFooter ? messageActions : null}
+      {!showQueuedFooter ? (
+        role === 'assistant' && hasActions ? (
+          <div className="session-assistant-message-footer">
+            {messageActions}
+            {props.turnUsage && messageTimestamp && timestampSource ? <MessageTurnUsage language={props.language} usage={props.turnUsage} /> : null}
+          </div>
+        ) : (
+          messageActions
+        )
+      ) : null}
     </article>
   );
 });
@@ -1191,6 +1211,8 @@ function TypedItemFacts(props: { item: NativeSessionItemBuffer; role: ThreadItem
 function GeneratedImageItem(props: {
   item: NativeSessionItemBuffer;
   language: SessionUiLanguage;
+  /** 只让当前活动消息播放扫光，历史或失焦消息沿用静态显示。 */
+  motionActive?: boolean;
   onOpenResource?: (resource: ConversationResource, target: ConversationOpenTarget, location?: ConversationFileLocation) => void | Promise<void>;
   onLoadResourcePreview?: (resource: ConversationResource) => Promise<ConversationResourcePreview>;
   onVisibleContentChange?: () => void;
@@ -1198,7 +1220,7 @@ function GeneratedImageItem(props: {
   if (props.item.status !== 'completed') {
     return (
       <div className="session-generated-image-progress" role="status">
-        <span className="session-thinking-indicator">{props.language === 'zh-CN' ? '正在生成图片' : 'Generating image'}</span>
+        <SessionSweepText className="session-current-status-text" text={props.language === 'zh-CN' ? '正在生成图片' : 'Generating image'} active={Boolean(props.motionActive)} />
       </div>
     );
   }
@@ -1333,11 +1355,46 @@ function MessageIconButton(props: { label: string; pressed?: boolean; expanded?:
   );
 }
 
+/** 时间保留在消息操作栏，使用所属正文原有的时间来源。 */
 function MessageTimestamp(props: { dateTime: string; value: string }) {
   return (
     <time className="session-message-timestamp" dateTime={props.dateTime}>
       {props.value}
     </time>
+  );
+}
+
+/** 有账本的助手正文显示轮次指标，输入与输出明细放在悬停和无障碍说明中。 */
+function MessageTurnUsage(props: { language: SessionUiLanguage; usage: ConversationTurnUsage }) {
+  /** 展示文案沿用当前会话语言。 */
+  const zh = props.language === 'zh-CN';
+  /** 可见文本保留总量，浮层使用精确数值。 */
+  const tokens = formatTokenCount(props.usage.totalTokens, props.language);
+  /** 用量与价格完整性分别提示，运行中显示当前已记录值。 */
+  const partial = zh ? '（部分）' : ' (partial)';
+  /** 金额复用运行详情的两位小数和原币符号，不引入汇率。 */
+  const cost = props.usage.costs.length ? formatRuntimeCosts(props.usage.costs, props.language) : null;
+  /** 共享提示支持换行，按账本口径分别列出本轮输入与输出。 */
+  const tokenLabel = `${zh ? '本轮消耗' : 'Turn usage'} ${tokens.exact} Token${props.usage.usageComplete ? '' : partial}\n${zh ? '输入' : 'Input'} ${formatTokenCount(props.usage.inputTokens, props.language).exact} Token\n${zh ? '输出' : 'Output'} ${formatTokenCount(props.usage.outputTokens, props.language).exact} Token`;
+  /** 缺少拆分依据时明确显示暂无明细，与真实零费用区分。 */
+  const unavailableBreakdown = zh ? '暂无明细' : 'Breakdown unavailable';
+  /** 输入费用包含缓存读取与写入，沿用账本逐请求价格快照。 */
+  const inputCost = props.usage.inputCosts?.length ? `${formatRuntimeCosts(props.usage.inputCosts, props.language)}${props.usage.inputCostComplete ? '' : partial}` : unavailableBreakdown;
+  /** 输出费用单独展示，输入侧缺价不影响输出侧的完整性。 */
+  const outputCost = props.usage.outputCosts?.length ? `${formatRuntimeCosts(props.usage.outputCosts, props.language)}${props.usage.outputCostComplete ? '' : partial}` : unavailableBreakdown;
+  /** 费用与 Token 使用同一三行提示结构；总费用继续保留缺价和部分标识。 */
+  const costLabel = `${zh ? '本轮费用' : 'Turn cost'} ${cost ? `${cost}${props.usage.costComplete ? '' : partial}` : zh ? '暂无价格' : 'Price unavailable'}\n${zh ? '输入' : 'Input'} ${inputCost}\n${zh ? '输出' : 'Output'} ${outputCost}`;
+  return (
+    <div className="session-message-turn-usage">
+      <span role="group" aria-label={tokenLabel} data-icon-tooltip={tokenLabel} tabIndex={0}>
+        <MessageTokenIcon />
+        <span>{`${tokens.compact}${props.usage.usageComplete ? '' : '*'}`}</span>
+      </span>
+      <span role="group" aria-label={costLabel} data-icon-tooltip={costLabel} tabIndex={0}>
+        <MessageCostIcon />
+        <span>{cost ? `${cost}${props.usage.costComplete ? '' : '*'}` : '—'}</span>
+      </span>
+    </div>
   );
 }
 
@@ -1512,31 +1569,57 @@ function isConversationContextPlaceholder(value: string): boolean {
 /** 历史消息统一展示评论名称，回答原文和代码来源继续保留。 */
 function UserConversationContextSummary(props: { draft: ConversationContextDraft; language: SessionUiLanguage }) {
   const annotations = props.draft.responseAnnotations;
-  const comments = props.draft.codeComments.length;
-  if (!annotations.length && !comments) return null;
+  /** 代码评论保留文件、位置、引用原文和可选评论正文。 */
+  const codeComments = props.draft.codeComments;
+  if (!annotations.length && !codeComments.length) return null;
   const zh = props.language === 'zh-CN';
-  if (annotations.length > 0) {
-    return (
-      <section className="session-message-context-summary" aria-label={zh ? '回答评论' : 'Response comments'}>
-        <header>
-          <strong>{zh ? '回答评论' : 'Response comments'}</strong>
-          <span>{annotations.length}</span>
-        </header>
-        <div className="session-message-response-annotations">
-          {annotations.map((annotation, index) => (
-            <article key={annotation.id}>
-              <span>{zh ? `评论 ${index + 1}` : `Comment ${index + 1}`}</span>
-              <blockquote>{annotation.anchor.selectedText}</blockquote>
-              {annotation.note?.trim() ? <p>{annotation.note.trim()}</p> : null}
-            </article>
-          ))}
-        </div>
-        {comments ? <small>{zh ? `${comments} 条代码评论` : `${comments} ${comments === 1 ? 'code comment' : 'code comments'}`}</small> : null}
-      </section>
-    );
-  }
-  const label = zh ? `${comments} 条评论` : `${comments} ${comments === 1 ? 'comment' : 'comments'}`;
-  return <span className="session-message-context-summary">{label}</span>;
+  /** 标题区统一显示回答和文件评论的总数。 */
+  const count = annotations.length + codeComments.length;
+  return (
+    <section className="session-message-context-summary" aria-label={zh ? '评论' : 'Comments'}>
+      <header>
+        <strong>{zh ? '评论' : 'Comments'}</strong>
+        <span>{count}</span>
+      </header>
+      <div className="session-message-response-annotations">
+        {codeComments.map((comment, index) => (
+          <article key={comment.id}>
+            <span>
+              {zh ? `文件评论 ${index + 1}` : `File comment ${index + 1}`} · {comment.position.path}:
+              {comment.position.startLine && comment.position.startLine !== comment.position.line ? `${comment.position.startLine}-${comment.position.line}` : comment.position.line}
+            </span>
+            {comment.position.selectedText?.trim() ? (
+              <blockquote>
+                <span className="session-response-annotation-label">{zh ? '引用原文' : 'Quoted text'}</span>
+                {comment.position.selectedText}
+              </blockquote>
+            ) : null}
+            {comment.body.trim() ? (
+              <p>
+                {comment.position.selectedText?.trim() ? <span className="session-response-annotation-label">{zh ? '我的评论' : 'My comment'}</span> : null}
+                {comment.body.trim()}
+              </p>
+            ) : null}
+          </article>
+        ))}
+        {annotations.map((annotation, index) => (
+          <article key={annotation.id}>
+            <span>{zh ? `回答评论 ${index + 1}` : `Response comment ${index + 1}`}</span>
+            <blockquote>
+              <span className="session-response-annotation-label">{zh ? '引用原文' : 'Quoted text'}</span>
+              {annotation.anchor.selectedText}
+            </blockquote>
+            {annotation.note?.trim() ? (
+              <p>
+                <span className="session-response-annotation-label">{zh ? '我的评论' : 'My comment'}</span>
+                {annotation.note.trim()}
+              </p>
+            ) : null}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
 }
 function primitiveText(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : null;

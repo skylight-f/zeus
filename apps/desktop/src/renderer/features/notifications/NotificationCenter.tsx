@@ -2,20 +2,22 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { BellIcon } from '@phosphor-icons/react/dist/csr/Bell';
 import { CheckIcon } from '@phosphor-icons/react/dist/csr/Check';
-import { formatTaskDeadline, type AutomationNotificationStatus } from '@zeus/shared';
+import { formatTaskDeadline, type AutomationNotificationStatus, type CommandRunNotification } from '@zeus/shared';
 import type { NotificationsModel } from './useNotifications.js';
 import { Button } from '../../ui/Button.js';
 import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import './notifications.css';
 
 /** 没有具体异常时用结果说明补齐描述，不额外显示状态字段。 */
-const notificationDescriptions: Record<AutomationNotificationStatus, [string, string]> = {
+const notificationDescriptions: Record<AutomationNotificationStatus | CommandRunNotification['status'], [string, string]> = {
   awaiting_review: ['执行结果等待验收。', 'The result is awaiting review.'],
   succeeded: ['执行已完成。', 'The run has completed.'],
   failed: ['执行失败。', 'The run failed.'],
   blocked: ['执行受阻，等待处理。', 'The run is blocked and needs attention.'],
   cancelled: ['执行已取消。', 'The run was cancelled.'],
   outcome_unknown: ['执行结果尚未确认。', 'The result has not been confirmed.'],
+  /** 命令超时保留独立结果说明。 */
+  timed_out: ['执行已超时。', 'The run timed out.'],
 };
 
 /** 原生顶层弹层提供统一列表，正文导航与已读管理各自独立。 */
@@ -159,11 +161,22 @@ export function NotificationCenter({
                     /** 不同来源的相同业务身份仍是独立通知。 */
                     const key = `${item.source}:${item.id}`;
                     /** 标题沿用原对象名称，不展示技术来源分类。 */
-                    const title = item.source === 'task' ? item.title : item.automationName;
+                    const title = item.source !== 'automation' ? item.title : item.automationName;
                     /** 描述说明截止时间或执行结果，具体异常优先展示原有完整说明组件。 */
-                    const description = item.source === 'task' ? `${zh ? '截止时间：' : 'Due: '}${formatTaskDeadline(item.deadline)}` : notificationDescriptions[item.status][zh ? 0 : 1];
+                    const description =
+                      item.source === 'git_delivery'
+                        ? item.status === 'succeeded'
+                          ? zh
+                            ? '代码交付已完成'
+                            : 'Code delivery completed'
+                          : zh
+                            ? '代码交付需要处理'
+                            : 'Code delivery needs attention'
+                        : item.source === 'task'
+                          ? `${zh ? '截止时间：' : 'Due: '}${formatTaskDeadline(item.deadline)}`
+                          : notificationDescriptions[item.status][zh ? 0 : 1];
                     /** 无会话异常不能伪装成可导航的标题。 */
-                    const canOpen = item.source === 'task' || Boolean(item.conversationId);
+                    const canOpen = item.source !== 'automation' || Boolean(item.conversationId);
                     return (
                       <li key={key} className="automation-notification-item">
                         <div className="automation-notification-item-header">

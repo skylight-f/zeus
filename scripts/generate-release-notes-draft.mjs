@@ -291,8 +291,10 @@ async function requestDeepSeekReleaseNotes(prompt) {
   }
 }
 
+/** 模型不可用时仍生成覆盖两端安装入口、且符合真实发布门禁的确定性正文。 */
 function buildDeterministicFallback() {
-  const validationLine = automatedRelease ? '- 公开 Release 只在固定候选提交通过类型检查、正式打包、DMG 完整性和更新清单一致性校验后创建。' : '- 当前为候选草稿，正式结果待发布门禁确认。';
+  /** 只描述公开门禁契约，不把尚未执行的发布写成已通过。 */
+  const validationLine = automatedRelease ? '- 公开 Release 只在固定候选提交通过静态检查、macOS 与 Windows 双架构正式打包及安装包完整性校验后创建；两端更新清单与安装包摘要核对一致后公开。' : '- 当前为候选草稿，正式结果待发布门禁确认。';
   return {
     markdown: [
       `# ${distributionAppName} ${releaseVersion} 更新内容`,
@@ -309,7 +311,9 @@ function buildDeterministicFallback() {
       '## 系统要求与已知限制',
       '',
       `- 最低系统版本：macOS ${readMinimumSystemVersion() ?? '以公开安装包配置为准'}。`,
+      '- Windows 支持 Windows 10 22H2 和 Windows 11，提供 x64 与 ARM64 安装包。',
       '- 若公开清单显示应用尚未完成 Developer ID 签名或 Apple 公证，首次启动可能需要按 macOS 提示手动确认。',
+      '- 若 Windows 清单标记为未签名，系统可能提示未知发布者；请核对官方来源后手动安装。',
       '',
       '## 发布验证',
       '',
@@ -331,6 +335,7 @@ function normalizeMarkdown(value) {
   return `${value.replace(/\r\n/gu, '\n').trim()}\n`;
 }
 
+/** 当前候选正文必须包含两端升级入口；历史已发布正文不套用新增的候选要求。 */
 function validateDraft(markdown) {
   const requiredTitle = `# ${distributionAppName} ${releaseVersion} 更新内容`;
   if (!markdown.startsWith(`${requiredTitle}\n`)) throw new Error(`发布内容标题必须是：${requiredTitle}`);
@@ -342,6 +347,10 @@ function validateDraft(markdown) {
   }
   if (!markdown.includes(`${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg`)) {
     throw new Error(`发布内容缺少版本化 DMG 名称：${distributionArtifactPrefix}-${releaseVersion}-arm64.dmg。`);
+  }
+  // 统一发布的两个 Windows 架构均应有可辨认的安装文件名。
+  for (const arch of ['x64', 'arm64']) {
+    if (!markdown.includes(`Zeus-${releaseVersion}-win32-${arch}.exe`)) throw new Error(`发布内容缺少 Windows ${arch} 安装包名称。`);
   }
   if (!automatedRelease && !markdown.includes('待发布门禁确认')) {
     throw new Error('发布内容没有保留“待发布门禁确认”的验证边界。');

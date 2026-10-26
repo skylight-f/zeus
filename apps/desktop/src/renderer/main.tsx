@@ -9,6 +9,7 @@ import { initializeNativeCloseLayerRouting } from './ui/nativeCloseLayer.js';
 import { ApplicationErrorDialogHost, reportApplicationError } from './ui/ApplicationErrorDialog.js';
 import { RendererPerformanceCollector } from './rendererPerformanceObservability.js';
 import { installIconTooltips } from '../preload/iconTooltip.js';
+import { installMarkdownListInput } from '../preload/markdownListInput.js';
 // 启动失败可能早于工作台模块加载，恢复页样式必须随入口就绪。
 import './styles.css';
 
@@ -34,6 +35,9 @@ initializeNativeCloseLayerRouting();
 /** 所有独立窗口共享提示机制；页面退出时移除监听。 */
 const disposeIconTooltips = installIconTooltips(document);
 window.addEventListener('pagehide', disposeIconTooltips, { once: true });
+/** 主窗口与各独立窗口统一支持多行列表编辑，随文档关闭释放。 */
+const disposeMarkdownListInput = installMarkdownListInput(document);
+window.addEventListener('pagehide', disposeMarkdownListInput, { once: true });
 const rendererPerformance = new RendererPerformanceCollector();
 const rendererHydrationStartedAt = performance.now();
 rendererPerformance.install();
@@ -363,11 +367,15 @@ async function renderMenuBarUsageWithClient(client: DashboardClient): Promise<vo
 async function renderTaskGitDeliveryWithClient(client: DashboardClient, parameters: URLSearchParams): Promise<void> {
   /** URL 只携带真实业务身份，记录和工作目录由已有接口重新读取。 */
   const taskId = parameters.get('taskId')?.trim();
-  /** 普通会话必须同时指定归属项目与会话。 */
+  /** 项目范围由已登记项目身份决定，普通会话另带会话身份。 */
   const projectId = parameters.get('projectId')?.trim();
-  /** 任务和会话两种范围不能混用。 */
+  /** 会话身份不能与任务或仓库范围混用。 */
   const conversationId = parameters.get('conversationId')?.trim();
-  if (taskId ? projectId || conversationId : !projectId || !conversationId) throw new Error('代码交付窗口范围无效。');
+  /** 单仓入口使用真实仓库身份，项目全量入口不指定仓库。 */
+  const repositoryId = parameters.get('repositoryId')?.trim();
+  /** 子树筛选来自原生窗口校验后的相对路径。 */
+  const pathPrefix = parameters.get('pathPrefix') ?? undefined;
+  if (taskId ? projectId || conversationId || repositoryId || pathPrefix : !projectId || (conversationId && repositoryId) || (pathPrefix && !repositoryId)) throw new Error('代码交付窗口范围无效。');
   /** 元数据与设置并行读取，完整交付页只创建一次。 */
   const [{ TaskGitDeliveryWindow }, task, conversation, snapshot, appShellSettings, currentContext] = await Promise.all([
     import('./task/TaskGitDeliveryWindow.js'),
@@ -382,11 +390,18 @@ async function renderTaskGitDeliveryWithClient(client: DashboardClient, paramete
   if (!root) throw new Error('Zeus renderer root element is missing');
   /** 不接受从其他项目借用的会话或缺失记录。 */
   const project = snapshot.projects.find((item) => item.id === (task?.projectId ?? projectId));
-  if (!task && (!project || !conversation || conversation.projectId !== project.id || conversation.id !== conversationId || conversation.taskId)) throw new Error('代码交付会话归属无效，请从当前会话重新打开。');
+  if (!task && !project) throw new Error('代码交付项目不存在，请从当前项目重新打开。');
+  if (conversationId && (!conversation || conversation.projectId !== project?.id || conversation.id !== conversationId || conversation.taskId)) throw new Error('代码交付会话归属无效，请从当前会话重新打开。');
   /** 控制器能力由真实记录选择，原生窗口壳与交付视图保持一致。 */
-  const scope: import('./task/TaskGitDeliveryWindow.js').GitDeliveryWindowScope = task ? { kind: 'task', task, projectName: project?.name } : { kind: 'conversation', project: project!, conversation: conversation! };
+  const scope: import('./task/TaskGitDeliveryWindow.js').GitDeliveryWindowScope = task
+    ? { kind: 'task', task, projectName: project?.name }
+    : repositoryId
+      ? { kind: 'repository', project: project!, repositoryId, pathPrefix }
+      : conversation
+        ? { kind: 'conversation', project: project!, conversation }
+        : { kind: 'project', project: project! };
   document.body.dataset.surface = 'task-git-delivery';
-  document.title = `${appShellSettings.appLanguage === 'zh-CN' ? '代码交付' : 'Code Delivery'} · ${task ? (task.taskCode ?? task.id) : conversation!.title}`;
+  document.title = `${appShellSettings.appLanguage === 'zh-CN' ? '代码交付' : 'Code Delivery'} · ${task ? (task.taskCode ?? task.id) : (conversation?.title ?? project!.name)}`;
   startupLanguage = appShellSettings.appLanguage;
   const errorLanguage = appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en';
   createRoot(root).render(
@@ -402,16 +417,21 @@ async function renderTaskGitDeliveryWithClient(client: DashboardClient, paramete
 
 async function renderProjectGitDiffWithClient(client: DashboardClient, parameters: URLSearchParams): Promise<void> {
   const [{ ProjectGitDiffWindow }, appShellSettings] = await Promise.all([import('./git/ProjectGitDiffViewer.js'), client.settings.loadAppShellSettings()]);
+  /** 快照来源由主进程固定到当前窗口，不从地址栏接收补丁正文。 */
+  const snapshotMode = parameters.get('snapshot') === 'true';
+  /** 系统窗口只读取自己的预览快照，保留推送时的比较范围。 */
+  const snapshot = snapshotMode ? await window.zeus?.loadProjectGitDiffSnapshot?.() : undefined;
+  if (snapshotMode && !snapshot) throw new Error('当前桌面窗口无法读取差异快照。');
   const projectId = parameters.get('projectId')?.trim();
   const repositoryId = parameters.get('repositoryId')?.trim();
-  const filePath = parameters.get('filePath') ?? '';
+  const filePath = snapshot?.filePath ?? parameters.get('filePath') ?? '';
   /** 任务来源必须同时指定工作区和比较范围。 */
   const taskId = parameters.get('taskId');
   /** 任务工作区与项目仓库使用不同的身份。 */
   const workspaceId = parameters.get('workspaceId');
   /** 任务差异明确区分未提交文件和已提交成果。 */
   const scope = parameters.get('scope');
-  if (taskId ? !workspaceId || !filePath || (scope !== 'working' && scope !== 'committed') : !projectId || !repositoryId) throw new Error('差异窗口缺少有效的读取身份。');
+  if (!snapshot && (taskId ? !workspaceId || !filePath || (scope !== 'working' && scope !== 'committed') : !projectId || !repositoryId)) throw new Error('差异窗口缺少有效的读取身份。');
   const stage = parameters.get('stage') === 'staged' || parameters.get('stage') === 'unstaged' ? (parameters.get('stage') as 'staged' | 'unstaged') : 'combined';
   const root = document.getElementById('root');
   if (!root) throw new Error('Zeus renderer root element is missing');
@@ -424,24 +444,26 @@ async function renderProjectGitDiffWithClient(client: DashboardClient, parameter
         <ProjectGitDiffWindow
           client={client}
           source={
-            taskId && workspaceId && (scope === 'working' || scope === 'committed')
-              ? {
-                  kind: 'task-git',
-                  taskId,
-                  workspaceId,
-                  path: filePath,
-                  scope,
-                }
-              : {
-                  kind: 'project-git',
-                  projectId: projectId!,
-                  repositoryId: repositoryId!,
-                  path: filePath,
-                  stage,
-                  commitHash: parameters.get('commitHash') ?? undefined,
-                  comparisonRef: parameters.get('comparisonRef') ?? undefined,
-                  comparisonMode: parameters.get('comparisonMode') === 'working-tree' ? 'working-tree' : 'current',
-                }
+            snapshot
+              ? { kind: 'snapshot', path: snapshot.filePath, diff: snapshot.diff }
+              : taskId && workspaceId && (scope === 'working' || scope === 'committed')
+                ? {
+                    kind: 'task-git',
+                    taskId,
+                    workspaceId,
+                    path: filePath,
+                    scope,
+                  }
+                : {
+                    kind: 'project-git',
+                    projectId: projectId!,
+                    repositoryId: repositoryId!,
+                    path: filePath,
+                    stage,
+                    commitHash: parameters.get('commitHash') ?? undefined,
+                    comparisonRef: parameters.get('comparisonRef') ?? undefined,
+                    comparisonMode: parameters.get('comparisonMode') === 'working-tree' ? 'working-tree' : 'current',
+                  }
           }
           language={appShellSettings.appLanguage}
           appearance={appShellSettings.appearance}
@@ -520,6 +542,8 @@ async function hydrateRenderer(): Promise<void> {
             /** 桌面历史与动作执行使用同一主进程。 */
             loadOperations: (projectId, cursor) => window.zeus!.loadProjectGitOperations({ projectId, cursor }),
             loadCommit: (projectId, repositoryId, commitHash) => window.zeus!.loadProjectGitCommit({ projectId, repositoryId, commitHash }),
+            /** 推送预览与实际操作使用同一桌面仓库解析器。 */
+            loadPushPreview: (projectId, repositoryId, selection) => window.zeus!.loadProjectGitPushPreview({ projectId, repositoryId, selection }),
             loadComparison: (projectId, repositoryId, ref, mode) => window.zeus!.loadProjectGitComparisonDiff({ projectId, repositoryId, ref, mode }),
             execute: async (projectId, repositoryId, action) => unwrapProjectGitActionIpcResult(await window.zeus!.executeProjectGitAction({ projectId, repositoryId, action })),
           },
@@ -630,6 +654,8 @@ async function waitForConversationStoreMigration(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 180));
   let status = await bridge.getConversationStoreMigrationStatus();
   if (!status || status.phase === 'completed' || status.phase === 'not_required') return;
+  /** 保留 HTML 的原有启动图标；迁移结束后，业务模块和后台服务仍可能尚未就绪。 */
+  const startupLoader = document.querySelector('#root > .zeus-startup-loader');
   bridge.reportRendererBootstrapReady?.();
   while (status && status.phase !== 'completed' && status.phase !== 'not_required') {
     renderConversationStoreMigration(status);
@@ -637,7 +663,8 @@ async function waitForConversationStoreMigration(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 250));
     status = await bridge.getConversationStoreMigrationStatus();
   }
-  document.getElementById('root')?.replaceChildren();
+  // 不能先清空页面；恢复原有加载状态，待业务页面或错误页实际就绪后再替换。
+  if (startupLoader) document.getElementById('root')?.replaceChildren(startupLoader);
 }
 
 function renderConversationStoreMigration(status: NonNullable<Awaited<ReturnType<NonNullable<Window['zeus']>['getConversationStoreMigrationStatus']>>>): void {

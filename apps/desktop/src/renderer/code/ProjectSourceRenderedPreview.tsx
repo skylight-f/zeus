@@ -140,8 +140,8 @@ export function ProjectSourceRenderedPreview(props: {
         />
       ) : (
         <div className="project-source-markdown-preview">
-          <Suspense fallback={<p role="status">{zh ? '正在打开文档…' : 'Opening document…'}</p>}>
-            <Markdown text={preview.content} streamId={`source:${props.projectId}:${props.path}`} phase="final" language={props.language} renderImmediately filePreview={filePreview} />
+          <Suspense fallback={null}>
+            <Markdown text={preview.content} streamId={`source:${props.projectId}:${props.path}`} phase="final" language={props.language} documentMode renderImmediately filePreview={filePreview} />
           </Suspense>
         </div>
       )}

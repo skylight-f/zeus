@@ -1,6 +1,7 @@
+import type { FilePreviewSourceWorkspace } from '@zeus/shared';
 import { formatVisibleApplicationError, modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
 import { useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
-import { cloneTaskManagementStatusConfig, type TaskManagementStatusConfig } from '@zeus/shared';
+import { temporaryWorkspaceId, cloneTaskManagementStatusConfig, type TaskManagementStatusConfig } from '@zeus/shared';
 import { notifyMainAppShellSettingsChanged, recordManualUpdateCheckInMain } from '../../appShellBridge.js';
 import { ConnectedSessionWorkspace, SessionWorkspace, NewConversationComposer, type NewConversationDraftStore } from '../../session/SessionWorkspace.js';
 import type { SessionTerminalClient } from '../../session/SessionTerminal.js';
@@ -186,6 +187,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setTaskDetailPresentation,
     setTaskEvents,
     setTaskGitReviewState,
+    setTaskGitMergeTaskId,
     setTaskManagementStatusReplacements,
     setTaskTableLayoutDraft,
     setTaskTableLayoutLeaveDialogOpen,
@@ -205,6 +207,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     taskModelPushError,
     taskModelPushTaskId,
     sourceWorkspaceDirty,
+    sourceWorkspaceTarget,
+    setSourceWorkspaceTarget,
     taskBoardSnapshots,
     taskConversationReopenState,
     taskEvents,
@@ -1469,7 +1473,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         window.history.replaceState(null, '', `#${target}`);
       }
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      onNavigated?.();
+      if (typeof onNavigated === 'function') onNavigated();
     };
     if (target === activeNavTarget) {
       navigate();
@@ -1478,7 +1482,14 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     requestWorkspaceLeave(navigate);
   }
 
-  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = 'source', onNavigated?: () => void): void {
+  function openProjectSection(
+    project: ProjectRecord,
+    section: ProjectWorkspaceSection,
+    codeMode: ProjectCodeWorkspaceMode = 'source',
+    onNavigated?: (() => void) | FilePreviewSourceWorkspace,
+    explicitSourceTarget: FilePreviewSourceWorkspace | null = null,
+  ): void {
+    const sourceTarget = typeof onNavigated === 'object' ? onNavigated : explicitSourceTarget;
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
@@ -1489,46 +1500,40 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         setProjectCodeWorkspaceMode(codeMode);
         setVisitedCodeWorkspaceModes((current) => new Set(current).add(codeMode));
       }
+      setSourceWorkspaceTarget(section === 'code' ? sourceTarget : null);
+      if (sourceTarget) {
+        // 原生源码页接管显示后关闭当前审阅层，避免旧弹层遮挡编辑器。
+        setTaskGitReviewState(null);
+        setTaskGitMergeTaskId(null);
+      }
       setProjectCommandsProjectId(null);
       // 项目设置直接进入数字员工，不再自动打开旧项目配置抽屉。
       setProjectPanel(undefined);
       if (typeof window !== 'undefined') window.history.replaceState(null, '', section === 'code' ? `#project-code-${codeMode}` : `#project-${section}`);
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      onNavigated?.();
+      if (typeof onNavigated === 'function') onNavigated();
     };
-    if (project.id === activeProjectId && activeNavTarget === (section === 'sessions' ? 'conversations' : 'projects') && section === activeProjectSection) {
+    if (
+      project.id === activeProjectId &&
+      activeNavTarget === (section === 'sessions' ? 'conversations' : 'projects') &&
+      section === activeProjectSection &&
+      (sourceWorkspaceTarget?.project.id ?? activeProjectId) === (sourceTarget?.project.id ?? project.id)
+    ) {
       navigate();
       return;
     }
     requestWorkspaceLeave(navigate);
   }
 
-  /** 命令始终绑定请求项目；在当前源码或 Git 中打开时不触发离开检查。 */
+  /** 命令弹窗绑定请求项目，所有入口均保留点击时的页面和草稿。 */
   function openProjectCommands(projectId: string): void {
     /** 项目必须仍存在，避免旧会话误用当前项目执行命令。 */
     const project = snapshot.projects.find((candidate) => candidate.id === projectId);
-    if (!project) {
+    if (!project || project.id === temporaryWorkspaceId) {
       recordLocalError('project-commands-open', new Error('The conversation project is no longer available.'));
       return;
     }
-    /** 从其他页面进入源码后打开命令，同项目 Git 视图保持原位。 */
-    const navigate = () => {
-      activeProjectIdRef.current = project.id;
-      setProjectDetail(project);
-      setConversationDraftOpen(false);
-      setActiveNavTarget('projects');
-      setActiveProjectSection('code');
-      setProjectCodeWorkspaceMode('source');
-      setProjectCommandsProjectId(project.id);
-      setProjectPanel(undefined);
-      if (typeof window !== 'undefined') window.history.replaceState(null, '', '#project-code-source');
-      workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-    };
-    if (project.id === activeProjectId && activeNavTarget === 'projects' && activeProjectSection === 'code') {
-      setProjectCommandsProjectId(project.id);
-      return;
-    }
-    requestWorkspaceLeave(navigate);
+    openProjectSection(project, 'code', 'commands');
   }
 
   async function togglePinnedProject(projectId: string): Promise<void> {
@@ -1847,7 +1852,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
           gitContext={props.commandClient && selectedProject ? { client: props.commandClient, project: selectedProject } : undefined}
           taskGitDeliveryRevision={state.taskGitDeliveryRevision}
-          onOpenTaskGitReview={(taskId, workspaceId, mode) => setTaskGitReviewState({ taskId, workspaceId, mode })}
           onOpenTaskGitDelivery={(taskId, workspaceId) => openTaskGitDelivery(taskId, workspaceId)}
           onLatestContentVisibilityChange={setLatestConversationContentVisible}
         />
@@ -1913,9 +1917,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
           gitContext={props.commandClient && selectedProject ? { client: props.commandClient, project: selectedProject } : undefined}
           taskGitDeliveryRevision={state.taskGitDeliveryRevision}
-          onOpenTaskGitReview={(taskId, workspaceId, mode) => setTaskGitReviewState({ taskId, workspaceId, mode })}
           onOpenTaskGitDelivery={(taskId, workspaceId) => openTaskGitDelivery(taskId, workspaceId)}
-          onOpenProjectCommands={() => openProjectCommands(selectedNativeConversation.projectId)}
           onLatestContentVisibilityChange={setLatestConversationContentVisible}
         />
       );
@@ -1992,6 +1994,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     return (
       <TaskDetailPaneContent
         key={taskDetailPaneTask.id}
+        zentaoClient={props.commandClient}
+        onZentaoTaskUpdated={mergeTaskRecord}
         language={appShellSettings.appLanguage}
         task={taskDetailPaneTask}
         projects={snapshot.projects}

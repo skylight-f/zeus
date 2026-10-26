@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, realpath, stat } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
+import { openRegularFileNoFollow } from '@zeus/storage/platform-security';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { filePreviewLimits, filePreviewMime, projectSourcePreviewKind, type ProjectSourcePreviewGrant, type ProjectSourcePreviewRequest } from '@zeus/shared';
 
@@ -79,6 +80,11 @@ export class ProjectSourcePreviewService {
     for (const [id, grant] of this.grants) if (grant.owner === owner && (!ids || ids.includes(id))) this.grants.delete(id);
   }
 
+  /** 协议分发只按已登记令牌寻找所属工作区，不接受页面指定根目录。 */
+  owns(id: string): boolean {
+    return this.grants.has(id);
+  }
+
   /** GET/HEAD 只读取本次项目内的已知资源，其他方法与失效授权返回明确失败。 */
   async respond(id: string, pathname: string, request: Request): Promise<Response> {
     /** 当前活动的窗口授权。 */
@@ -105,7 +111,7 @@ export class ProjectSourcePreviewService {
         const expected = await stat(path);
         if (expected.size > filePreviewLimits.image) return new Response(null, { status: 413 });
         /** 不跟随最后一级被替换的符号链接。 */
-        const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const handle = await openRegularFileNoFollow(path, constants.O_RDONLY);
         try {
           /** 打开后的真实文件身份。 */
           const actual = await handle.stat();

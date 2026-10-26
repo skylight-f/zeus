@@ -1,3 +1,5 @@
+import type { UsageCostBreakdown } from './modelPricing.js';
+
 export interface TokenUsageBreakdown {
   totalTokens: number;
   inputTokens: number;
@@ -5,6 +7,22 @@ export interface TokenUsageBreakdown {
   cacheWriteInputTokens: number;
   outputTokens: number;
   reasoningOutputTokens: number;
+}
+
+/** 助手正文底部的轮次消耗，缺少账本时不生成摘要。 */
+export interface ConversationTurnUsage extends UsageCostBreakdown {
+  /** 本轮已记录的 Token 总数，不是单条正文或会话累计量。 */
+  totalTokens: number;
+  /** 本轮账本记录的输入 Token，沿用供应商的输入统计口径。 */
+  inputTokens: number;
+  /** 本轮账本记录的输出 Token，沿用供应商的输出统计口径。 */
+  outputTokens: number;
+  /** 已记录用量是否覆盖完整轮次。 */
+  usageComplete: boolean;
+  /** 按请求价格快照汇总的原币等价费用，不表示实际扣款。 */
+  costs: import('./modelPricing.js').EstimatedMoney[];
+  /** 用量与价格均完整时才为真。 */
+  costComplete: boolean;
 }
 
 /** 固定字段顺序比较供应商用量，避免对象字段顺序影响请求关联。 */
@@ -133,6 +151,14 @@ export interface UsageModelCostBreakdown {
   estimatedCosts: import('./modelPricing.js').EstimatedMoney[];
 }
 
+/** 同一模型的可测速文本请求按生成间隔和真实时长加权后的输出速率。 */
+export interface UsageModelOutputRateBreakdown {
+  /** 请求实际使用的模型标识。 */
+  model: string;
+  /** 首个可见 Token 之后的平均生成速率。 */
+  outputTokensPerSecond: number;
+}
+
 /** 菜单栏概览支持的快捷时间范围。 */
 export type UsageOverviewRange = 'today' | '7d' | '30d' | 'all';
 
@@ -142,6 +168,8 @@ export interface UsageOverviewRangeSummary {
   local: CodexLocalUsageTotals;
   /** 当前范围内按模型和历史单价归组的费用依据。 */
   costBreakdown: UsageModelCostBreakdown[];
+  /** 当前范围内按实际请求模型归组的输出速率。 */
+  outputRateBreakdown: UsageModelOutputRateBreakdown[];
   /** 当前范围内所有账本记录是否都包含完整用量。 */
   complete: boolean;
 }
@@ -204,7 +232,7 @@ export interface CodexLocalUsageTotals extends TokenUsageBreakdown {
   conversationCount: number;
   turnCount: number;
   cacheHitRate: number | null;
-  /** 当前范围内可测文本请求按 Token 与生成时长加权后的输出速率。 */
+  /** 当前范围内可测文本请求按生成间隔与真实时长加权后的输出速率。 */
   outputTokensPerSecond: number | null;
   estimatedCredits: number | null;
   apiEquivalentUsd: number | null;

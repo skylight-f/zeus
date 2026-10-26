@@ -1,3 +1,6 @@
+import { useZentaoInstances } from '../../task/useZentaoInstances.js';
+import type { ProjectSourceWorkspaceHandle } from '../../code/ProjectSourceWorkspace.js';
+import type { CommandRun, CommandRunNotification } from '@zeus/shared';
 import { zeusDistribution, toolPages } from '../../tooling/index.js';
 import { temporaryWorkspaceId } from '@zeus/shared';
 import type { AttentionItem } from '@zeus/shared';
@@ -136,11 +139,19 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const attention = useAttention(input.state.props.commandClient ?? null);
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
   const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string; presentation?: 'full_page' } | null>(null);
+  const [sourceReady, setSourceReady] = useState(false);
   const [pendingGlobalSource, setPendingGlobalSource] = useState<{ projectId: string; relativePath: string; line: number } | null>(null);
   /** 一次编辑一个字段，新增字段无需继续拉长页面。 */
   const [taskField, setTaskField] = useState<'status' | 'priority' | 'runStatus'>('status');
   const [zentaoImportOpen, setZentaoImportOpen] = useState(false);
   const { state, domainActions, operations } = input;
+  const [notificationCommand, setNotificationCommand] = useState<CommandRunNotification | null>(null);
+  const [visibleNotificationCommandRun, setVisibleNotificationCommandRun] = useState<CommandRun | null>(null);
+  const notificationCommandProject = state.snapshot.projects.find((project) => project.id === notificationCommand?.projectId);
+  const zentaoInstances = useZentaoInstances(state.props.commandClient);
+  useEffect(() => {
+    if (state.taskCreateForm.zentao && !zentaoInstances.some((instance) => instance.id === state.taskCreateForm.zentao?.instanceId)) state.setTaskCreateForm((current) => ({ ...current, zentao: undefined }));
+  }, [zentaoInstances, state.taskCreateForm.zentao?.instanceId, state.setTaskCreateForm]);
   /** 进入会话后通知状态仍驻留，等待准确正文可见再确认已读。 */
   const notifications = useNotifications({
     client: state.props.commandClient ?? null,
@@ -165,6 +176,14 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       const task = await client.loadTask(item.taskId);
       if (!state.snapshot.projects.some((project) => project.id === task.projectId)) throw new Error('任务所属项目不可用。');
       openSearchedTask(task.id, task.projectId);
+    },
+    visibleCommandRun: visibleNotificationCommandRun,
+    commandContentVisible: state.zeusWindowForeground && Boolean(notificationCommand && notificationCommandProject),
+    /** 只叠加原详情弹窗，同一已打开执行保留真实可见回执。 */
+    onOpenCommand: async (item) => {
+      if (!state.props.commandClient) throw new Error('命令服务尚未连接。');
+      if (!state.snapshot.projects.some((project) => project.id === item.projectId)) throw new Error('命令所属项目不可用。');
+      setNotificationCommand(item);
     },
   });
   useEffect(
@@ -246,6 +265,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     projectDirectoryChoosing,
     projectSidebarResizing,
     projectSourceWorkspaceRef,
+    sourceWorkspaceTarget,
     globalAgentSettingsRef,
     globalAgentSettingsDirty,
     setGlobalAgentSettingsDirty,
@@ -520,17 +540,35 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     setPendingGlobalTask(null);
     void openTaskDetailPane(target.taskId, target.presentation);
   }, [activeProjectId, activeProjectSection, openTaskDetailPane, pendingGlobalTask]);
+  const bindSourceWorkspace = useMemo(
+    () => (handle: ProjectSourceWorkspaceHandle | null) => {
+      projectSourceWorkspaceRef.current = handle;
+      setSourceReady(Boolean(handle));
+    },
+    [projectSourceWorkspaceRef],
+  );
   useEffect(() => {
-    if (!pendingGlobalSource || pendingGlobalSource.projectId !== activeProjectId || activeProjectSection !== 'code' || projectCodeWorkspaceMode !== 'source') return;
-    const target = pendingGlobalSource;
-    const frame = window.requestAnimationFrame(() => {
-      const workspace = projectSourceWorkspaceRef.current;
-      if (!workspace) return;
-      setPendingGlobalSource(null);
-      void workspace.openFile(target.relativePath, target.line);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [activeProjectId, activeProjectSection, pendingGlobalSource, projectCodeWorkspaceMode, projectSourceWorkspaceRef]);
+    if (!sourceReady || !pendingGlobalSource || pendingGlobalSource.projectId !== activeProjectId || activeProjectSection !== 'code' || projectCodeWorkspaceMode !== 'source') return;
+    setPendingGlobalSource(null);
+    void projectSourceWorkspaceRef.current?.openFile(pendingGlobalSource.relativePath, pendingGlobalSource.line);
+  }, [sourceReady, activeProjectId, activeProjectSection, pendingGlobalSource, projectCodeWorkspaceMode, projectSourceWorkspaceRef]);
+  useEffect(
+    () =>
+      window.zeus?.onFilePreviewSourceWorkspaceRequested?.((workspace) => {
+        const project = snapshot.projects.find((candidate) => candidate.id === workspace.ownerProjectId);
+        if (!project) {
+          reportApplicationError(new Error('文件所属项目已不可用。'), { language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en' });
+          return;
+        }
+        openProjectSection(project, 'code', 'source', workspace);
+      }),
+    [snapshot.projects, appShellSettings.appLanguage, openProjectSection],
+  );
+  useEffect(() => {
+    if (sourceReady && sourceWorkspaceTarget?.ownerProjectId === activeProjectId && activeProjectSection === 'code') void projectSourceWorkspaceRef.current?.openFile(sourceWorkspaceTarget.relativePath, 1);
+  }, [sourceReady, sourceWorkspaceTarget, activeProjectId, activeProjectSection, projectSourceWorkspaceRef]);
+  const activeSourceTarget = sourceWorkspaceTarget?.ownerProjectId === selectedProject?.id ? sourceWorkspaceTarget : null;
+  const sourceProject = activeSourceTarget?.project ?? selectedProject;
   /** 任务详情也可从会话页打开；接入上下文仍由原工作面身份约束，关闭或切换后旧回执失效。 */
   const modelSetupTask = snapshot.tasks.find((task) => task.id === taskModelPushTaskId);
   /** 团队执行读取最新任务授权与修订，避免授权保存后继续携带旧任务进入下一次操作。 */
@@ -720,6 +758,31 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       >
         <MotionPresence>{modelSetup.step ? <ModelSetupDialog controller={modelSetup} /> : null}</MotionPresence>
       </Suspense>
+      <MotionPresence>
+        {notificationCommand && notificationCommandProject && props.commandClient ? (
+          <ModalPortal
+            role="dialog"
+            aria-label={`${notificationCommandProject.name} · ${appShellSettings.appLanguage === 'zh-CN' ? '命令' : 'Commands'}`}
+            rootClassName="project-command-portal"
+            onDismiss={() => setNotificationCommand(null)}
+          >
+            <section className="project-command-dialog zeus-solid-form-surface" data-modal-surface="dialog">
+              <Suspense fallback={null}>
+                <CommandCenterPanel
+                  key={notificationCommand.id}
+                  mode="project"
+                  project={notificationCommandProject}
+                  client={props.commandClient}
+                  language={appShellSettings.appLanguage}
+                  initialRunId={notificationCommand.id}
+                  onRunDetailVisible={setVisibleNotificationCommandRun}
+                  onClose={() => setNotificationCommand(null)}
+                />
+              </Suspense>
+            </section>
+          </ModalPortal>
+        ) : null}
+      </MotionPresence>
       {/* 删除确认属于工作台公共操作，会话中的任务详情也必须能立即显示。 */}
       <MotionPresence>
         {currentProjectTasks.find((task) => task.id === taskDeleteDialogTaskId) ? (
@@ -1099,15 +1162,15 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                 {projectCodeWorkspaceMode === 'source' ? (
                   <div className="project-code-mode-pane">
                     <ProjectSourceWorkspace
-                      key={selectedProject.id}
-                      ref={projectSourceWorkspaceRef}
+                      key={sourceProject!.id}
+                      ref={bindSourceWorkspace}
                       gitClient={props.nativeConversationClient ?? undefined}
-                      project={selectedProject}
+                      project={sourceProject!}
                       language={appShellSettings.appLanguage}
                       preference={appShellSettings.codeWorkspaceByProject?.[selectedProject.id]}
                       onPreferenceChange={(preference) => persistCodeWorkspacePreference(selectedProject.id, preference)}
                       onDirtyChange={setSourceWorkspaceDirty}
-                      onOpenExternal={(relativePath, line) => void props.onOpenSource?.({ sourceRef: relativePath, lineStart: line, projectRoot: selectedProject.localPath })}
+                      onOpenExternal={(relativePath, line) => void props.onOpenSource?.({ sourceRef: relativePath, lineStart: line, projectRoot: sourceProject!.localPath })}
                     />
                   </div>
                 ) : null}
@@ -1216,7 +1279,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                         onTaskTableColumnsChange={(preferences) => setTaskTableLayoutDraft({ preferences })}
                         onSaveTaskTableLayout={() => void saveTaskTableLayout()}
                         onCreateTask={() => openTaskCreateModal()}
-                        onOpenZentaoImport={() => setZentaoImportOpen(true)}
+                        onOpenZentaoImport={zentaoInstances.length ? () => setZentaoImportOpen(true) : undefined}
                         onOpenTaskDetail={(taskId, mode) => void openTaskDetailPane(taskId, mode)}
                         onPushTaskToNewConversation={(taskId) => void openTaskModelPush(taskId)}
                         onOpenTaskCodeDelivery={(taskId) => openTaskGitDelivery(taskId)}
@@ -1241,6 +1304,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                     )}
 
                     <ZentaoImportModal
+                      instances={zentaoInstances}
                       open={zentaoImportOpen}
                       language={appShellSettings.appLanguage}
                       client={props.commandClient}

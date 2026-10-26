@@ -32,6 +32,8 @@ type ErrorExplanation = readonly [zh: string, en: string, action?: UserFacingErr
 const explanations: ReadonlyArray<readonly [codes: readonly string[], explanation: ErrorExplanation]> = [
   // 草稿生成的输入边界需要在现有错误入口明确说明。
   [['ZEUS_INPUT_SUGGESTION_INVALID'], ['输入建议请求无效，草稿最多支持 16,000 个字符。', 'The suggestion request is invalid. Drafts can contain up to 16,000 characters.']],
+  // 空白或放弃标记属于无效正文，只提供主动重试入口。
+  [['ZEUS_INPUT_SUGGESTION_OUTPUT_INVALID'], ['未生成有效的输入建议，请重试。', 'No valid input suggestion was generated. Please retry.', 'retry']],
   // 独立文本生成保留确定的终止原因，不把输出截断引导到连接设置。
   [['ZEUS_MODEL_TEXT_OUTPUT_LIMIT'], ['模型达到输出上限，未生成完整结果。', 'The model reached its output limit before completing the result.']],
   [['ZEUS_MODEL_TEXT_INCOMPLETE'], ['模型提前结束，未生成完整结果。', 'The model ended before completing the result.']],
@@ -217,6 +219,7 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
       'ZEUS_TASK_WORK_STOP_OUTCOME_UNKNOWN',
       'ZEUS_AUTOMATION_DISPATCH_OUTCOME_UNKNOWN',
       'ZEUS_WORKSPACE_GIT_COMMAND_OUTCOME_UNKNOWN',
+      'ZEUS_WORK_MANAGEMENT_EXTERNAL_OUTCOME_UNKNOWN',
       'ZEUS_EXECUTION_HOST_STOP_OUTCOME_UNKNOWN',
     ],
     ['上次操作的结果尚未确认，Zeus 已暂停继续执行，避免重复操作。请检查实际处理状态。', 'The previous action’s result is unconfirmed. Zeus paused further execution to avoid duplicate actions. Check the actual processing state.'],
@@ -466,6 +469,14 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['这个任务工作目录已关闭或移除，请选择可用目录或新建独立工作目录。', 'This task working folder was closed or removed. Select an available folder or create a separate working folder.'],
   ],
   [['ZEUS_TARGET_HEAD_CHANGED'], ['合入期间目标分支发生了变化，请重新合入。', 'The target branch changed during the merge. Start the merge again.']],
+  // 重复仓库应先刷新登记，不引导用户重复创建同名分支。
+  [
+    ['ZEUS_PROJECT_REPOSITORY_DUPLICATED'],
+    [
+      '同一 Git 仓库被重复登记。请刷新本地仓库后重新推送；已有分支和工作区保持不变。',
+      'The same Git repository is registered more than once. Refresh local repositories and start the task again. Existing branches and worktrees are unchanged.',
+    ],
+  ],
   [
     ['ZEUS_TASK_REPOSITORY_SNAPSHOT_CHANGED', 'ZEUS_TASK_PUSH_CONTEXT_CHANGED', 'ZEUS_TASK_HEAD_CHANGED', 'ZEUS_TASK_INTEGRATION_ATTEMPT_STALE'],
     ['任务或代码分支已发生变化，当前预览已过期。请重新打开预览，确认最新内容后继续。', 'The task or code branch has changed, so this preview is out of date. Reopen it and review the current content before continuing.'],

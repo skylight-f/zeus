@@ -1,8 +1,8 @@
-import { piSdkBinaryVersion } from '@zeus/ai-runtime';
+import { piSdkBinaryVersion, codexInstallationCommand, codexStandaloneCandidates, findExecutable } from '@zeus/ai-runtime';
 /** 桌面动态价格读取复用受限公网访问边界。 */
 export { readPricingDocument } from './modelPricingDocument.js';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
-import { assertContextCapacitySupported } from '@zeus/shared';
+import { assertContextCapacitySupported, asyncMessageQuestions } from '@zeus/shared';
 import type { ConversationWorktreeOptions } from '@zeus/shared';
 import { createDistributionContext, type DistributionConfig } from '@zeus/shared';
 
@@ -30,7 +30,7 @@ import {
 } from '@zeus/ai-runtime';
 import { type GitDiffSummary, type GitStatusSummary } from '@zeus/git-core';
 import { type AutoUpdatePolicy, type ReleaseReadiness } from './releaseCore.js';
-import { createMacOSKeychainStore, type SecretPresenceLabel, type SecretStore } from './securityCore.js';
+import { createPlatformSecretStore, type SecretPresenceLabel, type SecretStore } from './securityCore.js';
 import { normalizeNetworkProxySettings } from '@zeus/shared';
 import { applyNetworkProxyAtStartup } from './networkProxyRuntime.js';
 export { applyNetworkProxyAtStartup, networkProxyRuntimeEnvironment } from './networkProxyRuntime.js';
@@ -146,7 +146,7 @@ import { ConversationExecutionCoordinator, type ConversationExecutionRoute } fro
 import { ManagedConversationToolResultStore } from './conversationPortableContext.js';
 import { ConversationQueueCoreMutationApplication, selectAutomaticQueueDispatchCandidate } from './conversationQueueCoreMutationApplication.js';
 import { ConversationQueueDispatchScheduler, mustWaitForInProcessRuntimeTurn, shouldRequestConversationQueueDispatch } from './conversationQueueDispatchScheduler.js';
-import { isObjectLike, quotePosixShellArgument } from './conversationResourcePreview.js';
+import { isObjectLike } from './conversationResourcePreview.js';
 import { normalizeConversationResources, syncConversationResources } from './conversationResources.js';
 import { readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
 import { ConversationSyncProtocol } from './conversationSyncProtocol.js';
@@ -201,7 +201,7 @@ import { createZeusDataLayoutForDatabase, type ZeusDataLayout } from './zeusData
 
 export { inspectReadOnlyValidationManifest, verifyReadOnlyValidationDescriptor, type ReadOnlyValidationApplicationIdentity } from './readOnlyValidation.js';
 import { isReadOnlyValidationExternalRead, readOnlyValidationCapabilityError, readOnlyValidationSkippedCapabilities } from './readOnlyValidation.js';
-export { createMacOSKeychainStore, getSecretPresenceLabel, type SecretPresenceLabel, type SecretStore } from './securityCore.js';
+export { createMacOSKeychainStore, createPlatformSecretStore, getSecretPresenceLabel, type SecretPresenceLabel, type SecretStore } from './securityCore.js';
 export { prepareUnifiedConversationStoreMigration, readUnifiedConversationStoreMigrationStatus, type ConversationStoreMigrationStatus } from './conversationStoreMigration.js';
 
 export type { BrowserAutomationContentItem, BrowserAutomationPort, BrowserAutomationToolCall, BrowserAutomationToolResult } from './browserAutomation.js';
@@ -238,16 +238,6 @@ const nativeConversationAttentionEventTypes = new Set([
 ]);
 /** 只有条目事件需要附加显示位置，其他事件保持原有有界载荷。 */
 const nativeConversationTranscriptItemEventTypes = new Set(['conversation.item.started', 'conversation.item.delta', 'conversation.item.completed']);
-
-function providerToolSchemaRejection(payload: Record<string, unknown>): boolean {
-  const error = isObjectLike(payload.error) ? payload.error : payload;
-  const code = typeof Reflect.get(error, 'code') === 'string' ? String(Reflect.get(error, 'code')) : '';
-  const message = typeof Reflect.get(error, 'message') === 'string' ? String(Reflect.get(error, 'message')) : '';
-  const normalized = `${code} ${message}`.toLocaleLowerCase();
-  const namesTools = normalized.includes('tool') || normalized.includes('function');
-  const rejectsCapability = normalized.includes('unsupported') || normalized.includes('not supported') || normalized.includes('invalid') || normalized.includes('schema');
-  return namesTools && rejectsCapability;
-}
 
 /**
  * 非枚举启动失败元数据：表示新 local-server 已取得并尝试完成 Codex finalization。
@@ -558,6 +548,8 @@ export interface NativeConversationAttachment {
 export type StartTaskConversationBody = (
   | {
       mode: 'create';
+      /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
+      conversationContext?: Record<string, unknown>;
       /** 缺省继承项目；null 明确使用默认。 */
       contextCapacityTokens?: number | null;
       content?: string;
@@ -627,11 +619,15 @@ export type StartTaskConversationBody = (
 };
 
 export interface StartProjectConversationBody {
+  /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
+  conversationContext?: Record<string, unknown>;
   /** 新对话首条消息的结构化网页批注。 */
   browserComments?: unknown;
   /** 新对话首条消息的网页批注提示词。 */
   browserCommentContent?: string;
-  source?: 'code_review';
+  source?: 'code_review' | 'delivery_conflict';
+  /** 已接纳的普通会话交付冲突步骤。 */
+  deliveryStepId?: string;
   inheritConversationId?: string;
   worktree?: ConversationWorktreeOptions;
   workspaceMode?: 'direct' | 'worktree';
@@ -675,7 +671,7 @@ const telegramSecuritySettingsKey = 'telegram.securitySettings';
 
 function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean, distribution?: DistributionConfig): string {
   const { zeusReleaseManifestUrl, isZeusReleaseUrl } = createDistributionContext(distribution);
-  const fallback = zeusReleaseManifestUrl;
+  const fallback = process.platform === 'win32' ? zeusReleaseManifestUrl.replace('zeus-release-manifest.json', 'zeus-release-manifest-win32.json') : zeusReleaseManifestUrl;
   const candidate = configured?.trim() || fallback;
   const url = new URL(candidate);
   if (isZeusReleaseUrl(candidate)) return url.toString();
@@ -1207,7 +1203,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           throw readOnlyValidationCapabilityError('Keychain 删除');
         },
       }
-    : createMacOSKeychainStore({ service: options.keychainService });
+    : createPlatformSecretStore({ service: options.keychainService, dataRootPath: dataLayout.root });
   let submitPluginHookContinuation: ((input: { conversationId: string; sourceTurnId: string | null; prompt: string; source?: 'goal' }) => Promise<void>) | null = null;
   const dangerouslyBypassPluginHookTrust = process.argv.includes('--dangerously-bypass-plugin-hook-trust');
   const zeusPluginService = readOnlyValidation
@@ -1525,6 +1521,28 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
           events: terminalEvents,
           save: () => db.save(),
           scratchRoot: join(runtimeSessionDirectory, 'command-scratch'),
+          /** 广域工作区不能递归授权 Zeus 私有树；明确 Skill/附件根另行按当前会话授权。 */
+          privateDirectories: [dataLayout.root, ...(options.codexHome ? [options.codexHome] : [])],
+          /** 即使显式请求读取，也不允许受限命令获得当前宿主凭据、数据库或浏览器登录状态。 */
+          privateRoots: [
+            dataLayout.database,
+            `${dataLayout.database}-wal`,
+            `${dataLayout.database}-shm`,
+            `${dataLayout.database}-journal`,
+            dataLayout.localConfig,
+            dataLayout.rootIdentity,
+            dataLayout.conversationAttachmentGrantSecret,
+            join(dataLayout.runtimeDirectory, 'secrets'),
+            dataLayout.executionHost,
+            dataLayout.profileDirectory,
+            dataLayout.backupsDirectory,
+            dataLayout.localLogs,
+            dataLayout.pluginData,
+            dataLayout.pluginRuntime,
+            dataLayout.piConfig,
+            dataLayout.piSessions,
+            ...['auth.json', 'config.toml', 'sessions', 'archived_sessions', 'sqlite', 'logs', 'app-server-daemon'].map((name) => join(options.codexHome ?? dataLayout.codexHome, name)),
+          ],
           environment: () => buildRuntimeProcessEnv(),
         }),
         sessionDirectory: piSessionDirectory,
@@ -1690,10 +1708,10 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       return {
         available: false,
         commandPath: null,
-        installCommand: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
+        installCommand: codexInstallationCommand(),
       };
     }
-    const commandPath = join(codexHome, 'packages', 'standalone', 'current', 'codex');
+    const commandPath = codexStandaloneCandidates(codexHome).find((candidate) => findExecutable(candidate)) ?? codexStandaloneCandidates(codexHome)[0]!;
     let available = false;
     try {
       accessSync(commandPath, fsConstants.X_OK);
@@ -1701,11 +1719,10 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     } catch {
       // Remote Control 只能使用官方安装器在当前 CODEX_HOME 登记的固定入口。
     }
-    const installDirectory = join(codexHome, 'bin');
     return {
       available,
       commandPath,
-      installCommand: `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_HOME=${quotePosixShellArgument(codexHome)} CODEX_INSTALL_DIR=${quotePosixShellArgument(installDirectory)} sh`,
+      installCommand: codexInstallationCommand(codexHome),
     };
   };
   const requireCodexRemoteControlCommandPath = (): string => {
@@ -1929,13 +1946,9 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         now,
       })
     : undefined;
-  /** 子代理复用父轮次已经冻结的普通 Skill；恢复和换链不会读取更新后的源文件。 */
-  async function loadConversationSkills(cwd: string, identity: string) {
-    const submission = conversationSubmissions.getById(identity);
-    const relation = submission ? conversationRuntime.getSubagent(submission.conversationId) : undefined;
-    const inherited = relation ? (JSON.parse(relation.contextJson) as Record<string, unknown>) : {};
-    const sourceIdentity = typeof inherited.resourceSnapshotIdentity === 'string' ? inherited.resourceSnapshotIdentity : identity;
-    return (await zeusSkillService?.freeze({ cwd, identity: sourceIdentity }))?.skills ?? [];
+  /** Pi 每次从当前目录读取普通 Skill，文件修改或删除立即生效。 */
+  async function loadConversationSkills(cwd: string) {
+    return (await zeusSkillService?.list({ cwd, includeProvider: false }))?.skills ?? [];
   }
   resolveCodexDispatchModelBudget = (modelId, providerGenerationId) => {
     if (!providerGenerationId) return null;
@@ -2073,7 +2086,6 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         if (modelSourceId && modelSourceId !== 'codex') return;
         requireCodexDispatchModelBudget(modelId, providerGenerationId);
       },
-      loadSkills: loadConversationSkills,
       compileDispatchContext: compileProviderDispatchContext,
       broadcast: publishNativeConversationEvent,
       now: () => now().toISOString(),
@@ -2868,6 +2880,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     if (!expertRoute) return;
     const mappedType = expertRoute.type;
     payload = expertRoute.payload;
+    /** 异步问题完成后刷新项目待回复提示，普通条目和文本增量不增加聚合查询。 */
+    const asyncQuestionCompleted = mappedType === 'conversation.item.completed' && payload.itemPayload !== null && typeof payload.itemPayload === 'object' && asyncMessageQuestions(payload.itemPayload as Record<string, unknown>).length > 0;
     const conversationIds =
       typeof payload.conversationId === 'string'
         ? [payload.conversationId]
@@ -2908,15 +2922,14 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       // 实时事件只需要会话元数据；禁止在每个增量事件中加载整段消息历史。
       const conversation = conversations.getRecordById(conversationId);
       if (!conversation || conversation.transportKind !== 'codex_native') continue;
-      if (mappedType === 'plugin.mcp.tool_completed' || (mappedType === 'conversation.native.error' && pluginRepository.hasConversationActivationSet(conversationId) && providerToolSchemaRejection(payload))) {
-        const supported = mappedType === 'plugin.mcp.tool_completed';
+      if (mappedType === 'plugin.mcp.tool_completed') {
         agentCapabilitySnapshots.create({
           agentKind: conversation.agentKind === 'pi' ? 'pi' : 'codex',
           transportKind: conversation.agentKind === 'pi' ? 'sdk' : 'app_server',
-          supportStatus: supported ? 'verified' : 'experimental',
+          supportStatus: 'verified',
           protocolVersion: conversation.agentKind === 'pi' ? piRuntimeWorkerProtocolVersion : 'app-server',
-          capabilities: { tools: { state: supported ? 'supported' : 'unsupported', reason: supported ? 'Plugin MCP 工具完成了真实调用。' : 'Provider 实际拒绝了 Plugin 工具 Schema。' } },
-          evidence: { source: supported ? 'plugin_mcp_tool_completed' : 'provider_tool_schema_rejection', conversationId, model: conversation.modelId ?? conversation.providerModel ?? null, eventType: mappedType },
+          capabilities: { tools: { state: 'supported', reason: 'Plugin MCP 工具完成了真实调用。' } },
+          evidence: { source: 'plugin_mcp_tool_completed', conversationId, model: conversation.modelId ?? conversation.providerModel ?? null, eventType: mappedType },
           checkedAt: now().toISOString(),
         });
       }
@@ -2946,7 +2959,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
               queue: toNativeQueueApiSnapshot(conversation),
             }
           : {}),
-        ...(nativeConversationAttentionEventTypes.has(mappedType)
+        ...(nativeConversationAttentionEventTypes.has(mappedType) || asyncQuestionCompleted
           ? {
               conversationAttentionState: conversationChoiceQueries.attentionByProject([conversation.projectId])[conversation.projectId] ?? 'idle',
               conversationUnreadCount: conversationChoiceQueries.unreadCountByProject([conversation.projectId])[conversation.projectId] ?? 0,
@@ -3062,8 +3075,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     codexNativeCoordinator,
     codexNativeEnabled,
     conversationCapabilityQueries: {
-      unavailableCodexAccount: (...args: Parameters<ConversationCapabilityQueryApplication['unavailableCodexAccount']>) => conversationCapabilityQueries.unavailableCodexAccount(...args),
-      buildConversationCapabilities: (...args: Parameters<ConversationCapabilityQueryApplication['buildConversationCapabilities']>) => conversationCapabilityQueries.buildConversationCapabilities(...args),
+      /** 运行预检与界面共用本地能力目录；仅选中 Codex 时才由运行预检准备该服务。 */
+      readConversation: (...args: Parameters<ConversationCapabilityQueryApplication['readConversation']>) => conversationCapabilityQueries.readConversation(...args),
     },
     conversations,
     createNonCodexTaskRuntimeInvocation: (...args: Parameters<ReturnType<typeof createLocalServerSupportOperations>['createNonCodexTaskRuntimeInvocation']>) => supportOperations.createNonCodexTaskRuntimeInvocation(...args),
@@ -3277,6 +3290,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     projectSharedPaths,
     projects,
     publishNativeConversationEvent,
+    publishRealtimeEvent,
     readProjectConfig,
     readServiceTierOverride,
     readTaskWorkspaceReview: (...args: Parameters<typeof readTaskWorkspaceReview>) => readTaskWorkspaceReview(...args),
@@ -3400,6 +3414,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     retryTaskIntegrationAiPreparation,
     failTaskIntegrationAiPreparation,
     scheduleTaskIntegrationAiFinalization,
+    finalizeTaskIntegrationAfterAi,
   } = gitIntegrationOperations;
   /** 受管命令按原轮次保存真实退出证据，短等待结束不能被记为命令成功。 */
   function persistConversationCommandEvidence(session: AiRuntimeSession): void {
@@ -3820,6 +3835,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     resolveTaskWorkspaceRequest,
     restoreNativeConversation,
     retryTaskIntegrationAiPreparation,
+    finalizeTaskIntegrationAfterAi,
     revokeReleaseNotesCapability,
     runRuntimeLogRetention,
     runtimeEphemeralCapabilities,

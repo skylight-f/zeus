@@ -53,8 +53,9 @@ export class TranscriptRowMeasurementCache {
     return this.entries.get(key);
   }
 
+  /** 零高度也是有效测量，空行移出窗口后不能恢复为估高占位。 */
   remember(key: string, height: number): void {
-    if (!key || !Number.isFinite(height) || height <= 0) return;
+    if (!key || !Number.isFinite(height) || height < 0) return;
     this.entries.delete(key);
     this.entries.set(key, height);
     while (this.entries.size > this.limit) {
@@ -107,9 +108,10 @@ export class TranscriptViewportLayout {
     this.addHeight(index, this.estimatedRowHeight - previous);
   }
 
+  /** 同步真实高度，包括收起后的空行，保持挂载行与占位层的滚动尺度一致。 */
   updateMeasuredHeight(rowKey: string, height: number, measurements: TranscriptRowMeasurementCache): boolean {
     const index = this.indexByKey.get(rowKey);
-    if (index === undefined || !Number.isFinite(height) || height <= 0) return false;
+    if (index === undefined || !Number.isFinite(height) || height < 0) return false;
     measurements.remember(rowKey, height);
     const previous = this.heights[index] ?? this.estimatedRowHeight;
     if (Math.abs(previous - height) < 0.5) return false;
@@ -329,6 +331,8 @@ export function useTranscriptViewportVirtualizer(input: {
   const windowElementRef = useRef<HTMLElement | null>(null);
   const windowObserverRef = useRef<ResizeObserver | null>(null);
   const updateFrameRef = useRef<number | null>(null);
+  /** 行高与滚动位置可以在同一帧变化，两项更新必须分别保留。 */
+  const pendingMeasurementRef = useRef(false);
   const pendingViewportRef = useRef<{ scrollTop: number; viewportHeight: number } | null>(null);
   const measurementAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
   const [layoutRevision, setLayoutRevision] = useState(0);
@@ -345,15 +349,23 @@ export function useTranscriptViewportVirtualizer(input: {
   const layout = layoutRef.current;
   layout.syncKeys(input.rowKeys, cacheRef.current);
 
-  const scheduleUpdate = useCallback(() => {
+  /** 合并一帧内的测量与滚动更新，不能让滚动同步吞掉行高变化。 */
+  const scheduleUpdate = useCallback((measurementChanged = false) => {
+    pendingMeasurementRef.current ||= measurementChanged;
     if (updateFrameRef.current !== null) return;
     updateFrameRef.current = requestAnimationFrame(() => {
       updateFrameRef.current = null;
       const pending = pendingViewportRef.current;
       pendingViewportRef.current = null;
       if (pending) {
-        setViewport({ scopeKey: scopeRef.current, scrollTop: pending.scrollTop, viewportHeight: pending.viewportHeight });
-      } else {
+        setViewport((current) =>
+          current.scopeKey === scopeRef.current && current.scrollTop === pending.scrollTop && current.viewportHeight === pending.viewportHeight
+            ? current
+            : { scopeKey: scopeRef.current, scrollTop: pending.scrollTop, viewportHeight: pending.viewportHeight },
+        );
+      }
+      if (pendingMeasurementRef.current) {
+        pendingMeasurementRef.current = false;
         setLayoutRevision((revision) => revision + 1);
       }
     });
@@ -361,6 +373,8 @@ export function useTranscriptViewportVirtualizer(input: {
 
   const measureElement = useCallback(
     (element: HTMLElement): void => {
+      // 未进入布局或祖先隐藏时没有有效尺寸；有布局框的零高度行仍须记录。
+      if (element.getClientRects().length === 0) return;
       const rowKey = element.dataset.transcriptRowKey;
       if (!rowKey) return;
       const height = element.getBoundingClientRect().height;
@@ -372,7 +386,12 @@ export function useTranscriptViewportVirtualizer(input: {
       const candidateAnchor = !measurementAnchorRef.current && !input.suspendAutomaticAnchor && !followingLatest && container ? (input.getReadingAnchor?.() ?? captureTranscriptViewportAnchor(container)) : null;
       if (!layoutRef.current.updateMeasuredHeight(rowKey, height, cacheRef.current)) return;
       measurementAnchorRef.current ??= candidateAnchor;
-      scheduleUpdate();
+      // 已挂载内容先在本次绘制前补偿；占位层提交后仍沿用同一锚点核对剩余差值。
+      if (container && measurementAnchorRef.current && !input.suspendAutomaticAnchor && !followingLatest) {
+        compensateTranscriptViewportAnchor(container, measurementAnchorRef.current);
+        pendingViewportRef.current = { scrollTop: container.scrollTop, viewportHeight: positiveMetric(container.clientHeight, 720) };
+      }
+      scheduleUpdate(true);
       if (followingLatest) input.onFollowingLatestGeometryChange?.();
     },
     [input.containerRef, input.getReadingAnchor, input.isFollowingLatest, input.onFollowingLatestGeometryChange, input.suspendAutomaticAnchor, scheduleUpdate],

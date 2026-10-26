@@ -20,11 +20,29 @@ export interface FileReviewDiff {
   }>;
 }
 
+/** 差异行的提交归属；零哈希表示尚未提交，不生成作者占位文案。 */
+export interface FilePreviewBlameLine {
+  /** 完整提交哈希。 */
+  commitHash: string;
+  /** 光标行详情使用的短提交号。 */
+  shortHash: string;
+  /** Git 记录的作者姓名。 */
+  author: string;
+  /** 作者时间，Unix 秒。 */
+  authorTime: number;
+  /** 光标行显示的提交说明。 */
+  subject: string;
+  /** 对应当前版本的原始行号。 */
+  line: number;
+}
+
 /** 源码与通用文件审阅共用位置和当前 Git 状态。 */
 export interface FileReview {
+  /** 当前磁盘文件的真实状态；补丁新增不等于已暂存，忽略和未修改也不伪装为新增。 */
+  status?: FileReviewDiff['changeType'] | 'untracked' | 'conflict' | 'other' | 'unchanged' | 'ignored';
   /** 会话引用的原始位置。 */
   location?: ConversationFileLocation;
-  /** null 表示仓库内没有差异，缺省表示不属于 Git 仓库。 */
+  /** null 表示仓库内没有差异；非仓库或忽略文件不提供比较。 */
   diff?: FileReviewDiff | null;
   /** Git 读取失败仍允许阅读源码，并明确展示原因。 */
   error?: string;
@@ -43,7 +61,7 @@ export type FilePreviewRequest = (
   | { kind: 'source'; projectId: string; path: string }
   | { kind: 'task-git'; taskId: string; workspaceId: string; path: string; scope: 'working' | 'committed' }
   | { kind: 'project-git'; projectId: string; repositoryId: string; path: string; stage?: 'combined' | 'staged' | 'unstaged'; commitHash?: string; comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }
-  | { kind: 'resource'; projectId: string; conversationId: string; resourceId: string }
+  | { kind: 'resource'; projectId: string; conversationId: string; resourceId: string; comparison?: 'head' }
   | { kind: 'turn'; projectId: string; conversationId: string; turnId: string; changeSetId: string; fileId: string }
   | { kind: 'attachment'; localPath?: string; uploadRef?: string }
 ) & {
@@ -53,6 +71,12 @@ export type FilePreviewRequest = (
 
 /** 仅供受信主进程使用的读取授权，不向渲染层返回文件系统权限。 */
 export interface FilePreviewSource {
+  /** 逐行归属绑定仓库路径和固定提交；无 ref 时以本次预览内容计算未提交行。 */
+  git?: { root: string; path: string; ref?: string; baseRef?: string };
+  /** 编辑目标由宿主解析；历史副本与快照目录不能成为编辑目标。 */
+  edit?: { root: string; path: string };
+  /** 确认不存在的一侧可作为空文件；其他读取失败不得冒充空文件。 */
+  missing?: boolean;
   /** 会话文件的行定位与 Git 差异。 */
   review?: FileReview;
   /** 展示名称保留原始扩展名。 */
@@ -79,6 +103,18 @@ export interface FilePreviewIntent {
 
 /** 单个预览资源；令牌只能用于所属窗口且关闭后撤销。 */
 export interface FilePreviewItem {
+  /** 当前文本可按同次预览的旧侧恢复区块；历史副本和只读编码不提供此能力。 */
+  canRevert?: boolean;
+  /** 当前预览就是可写工作区正文，历史快照不授予此能力。 */
+  canEditInline?: boolean;
+  /** 与本次完整文本对应的逐行提交归属。 */
+  blame?: FilePreviewBlameLine[];
+  /** 归属读取失败不妨碍查看正文，但必须明确显示原因。 */
+  blameError?: string;
+  /** 对应工作区的当前文件已通过读取校验，可进入源码编辑。 */
+  canEdit?: boolean;
+  /** 确认不存在的一侧与普通读取错误分开处理。 */
+  missing?: boolean;
   /** 随授权内容返回审阅信息，不扩大文件读取权限。 */
   review?: FileReview;
   /** 主进程生成的不可猜测资源身份。 */
@@ -103,6 +139,33 @@ export interface FilePreviewItem {
   truncated?: boolean;
   /** 可理解的失败原因。 */
   reason?: string;
+}
+
+/** 区块坐标使用两端原文件的零基行边界，不包含显示补位和折叠行。 */
+export interface FilePreviewChangeRange {
+  /** 旧侧起始行及行数；纯新增的旧侧行数为零。 */
+  oldStart: number;
+  oldLines: number;
+  /** 当前侧起始行及行数；纯删除的当前侧行数为零。 */
+  newStart: number;
+  newLines: number;
+}
+
+/** 撤销只传窗口持有的版本令牌和区块边界，不接受路径或替换正文。 */
+export interface FilePreviewRevertInput extends FilePreviewChangeRange {
+  /** 同一次加载的旧版和工作区版本。 */
+  beforeId: string;
+  afterId: string;
+}
+
+/** 原生源码页只接收主进程固定的工作区身份，页面不能自行指定目录。 */
+export interface FilePreviewSourceWorkspace {
+  /** 业务项目保留导航身份，工作树目录另由临时作用域绑定。 */
+  ownerProjectId: string;
+  /** 临时作用域身份只在所属窗口内有效。 */
+  project: { id: string; name: string; localPath: string };
+  /** 第一次打开的工作区相对文件路径。 */
+  relativePath: string;
 }
 
 /** 页内文本与图片沿用小内容限制，媒体使用流式读取。 */
@@ -166,4 +229,12 @@ export function decodeFilePreviewText(bytes: Uint8Array, requested?: FilePreview
   const content = new TextDecoder(encoding, { fatal: true }).decode(bytes, { stream: truncated });
   if (content.includes('\0')) throw new Error('此文件包含二进制内容。');
   return { content, encoding };
+}
+
+/** 页内编辑仅提交授权令牌和完整正文，不能改变写入路径。 */
+export interface FilePreviewSaveInput {
+  /** 当前工作区预览的版本令牌。 */
+  id: string;
+  /** 完整 UTF-8 正文，换行和 BOM 由源码保存服务保留。 */
+  content: string;
 }

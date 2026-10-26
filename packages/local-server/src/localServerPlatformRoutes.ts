@@ -1,3 +1,4 @@
+import { GitDeliveryExecution } from './gitDeliveryExecution.js';
 import { registerTaskReminderService } from './taskReminderService.js';
 import { registerNotificationRoutes } from './notificationRoutes.js';
 import { repairTaskAttachmentReferences } from './taskAttachmentLifecycle.js';
@@ -17,6 +18,10 @@ import { createAutomationNotificationService } from './automationNotificationSer
 import { probeCodexConversation } from './codexConnectionDiagnostic.js';
 import {
   checkAiCliAdapter,
+  codexInstallationCommand,
+  powerShellCommandArguments,
+  resolveInteractiveShell,
+  spawnManagedProcess,
   type AiCliAdapterStatus,
   type CodexRuntimeMaintenanceControl,
   type CodexModelCapability,
@@ -30,9 +35,11 @@ import {
 import {
   buildGitPatchExport,
   getGitRepositoryContext,
+  getGitBranchHead,
   getGitWorkingContext,
   getGitWorktreeClean,
   getProjectGitCommitDetail,
+  getProjectGitPushPreview,
   getProjectGitComparisonDiff,
   getProjectGitRepositorySnapshot,
   getProjectGitHistory,
@@ -92,10 +99,9 @@ import {
 import { type TaskStatus } from './taskCore.js';
 import { createTelegramBotMessageClient, getTelegramConfigurationState, type TelegramMessageSender, type TelegramPollingService } from './telegramAdapter.js';
 import { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { existsSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { type CodexRemoteControlSnapshot, registerCodexPublicCommandRoutes } from './codexPublicCommandRoutes.js';
 import { CodexSubagentQueryApplication } from './codexSubagentQueryApplication.js';
 import { registerCodexSubagentQueryRoutes } from './codexSubagentQueryRoutes.js';
@@ -178,6 +184,7 @@ import { ProjectQueryApplication } from './projectQueryApplication.js';
 import { registerProjectQueryRoutes } from './projectQueryRoutes.js';
 import { createCommitCodexPool } from './gitCommitCodexGeneration.js';
 import { registerInputSuggestionRoutes } from './inputSuggestionRoutes.js';
+import { ContextSourceCatalog } from './contextSourceCatalog.js';
 import { createInputSuggestionDiagnosticLog } from './inputSuggestionDiagnostics.js';
 import { readGitCommitContext, readCommitFingerprint, resolveCommitRepository, resolveTaskCommitRepository } from './gitCommitContext.js';
 import { PassThrough } from 'node:stream';
@@ -227,7 +234,7 @@ export { inspectReadOnlyValidationManifest, verifyReadOnlyValidationDescriptor, 
 /** 官方安装器使用的稳定版发布元数据入口。 */
 const codexLatestReleaseUrl = 'https://releases.openai.com/codex/channels/latest';
 /** Zeus 管理的 standalone 由官方安装器原子切换版本。 */
-const codexInstallerUrl = 'https://releases.openai.com/codex/install.sh';
+const codexInstallerUrl = process.platform === 'win32' ? 'https://releases.openai.com/codex/install.ps1' : 'https://releases.openai.com/codex/install.sh';
 /** 发布元数据只需读取版本标签，限制正文避免异常响应占满内存。 */
 const codexReleaseMetadataMaximumBytes = 512_000;
 /** 安装脚本体积远小于发布元数据，单独限制避免执行异常响应。 */
@@ -248,11 +255,11 @@ function parseLatestCodexVersion(value: unknown): string {
   return match[1]!;
 }
 
-/** 检查官方稳定版；只读取公开元数据，不下载或切换用户正在使用的程序。 */
+/** 仅为 Zeus 管理的安装检查官方稳定版，外部安装不访问发布源。 */
 async function checkPublishedCodexUpdate(adapter: AiCliAdapterStatus, checkedAt: string, codexHome: string | undefined): Promise<CodexRuntimeUpdateStatus> {
   /** 安装归属来自实际程序路径，不相信界面提供的安装方式。 */
   const managedInstallation = isManagedCodexStandalone(adapter.resolvedCommandPath, codexHome);
-  if (!adapter.version) return { adapter, managedInstallation, status: 'unavailable', currentVersion: null, latestVersion: null, checkedAt };
+  if (!managedInstallation || !adapter.version) return { adapter, managedInstallation, status: 'unavailable', currentVersion: adapter.version, latestVersion: null, checkedAt };
   /** 单次检查总等待上限，页面不会因公网异常长期锁住。 */
   const signal = AbortSignal.timeout(10_000);
   /** 固定官方 HTTPS 来源且禁止重定向，避免版本判断漂移到未知站点。 */
@@ -293,7 +300,7 @@ async function readOfficialCodexInstaller(onProgress: (progress: number | null, 
   /** 安装脚本和资产下载共用更新总等待上限。 */
   const signal = AbortSignal.timeout(codexUpdateTimeoutMs);
   /** 直接访问最终官方地址且禁止重定向，避免执行未知站点内容。 */
-  const response = await fetch(codexInstallerUrl, { headers: { accept: 'text/x-sh' }, redirect: 'error', signal }).catch((cause: unknown) => {
+  const response = await fetch(codexInstallerUrl, { headers: { accept: 'text/plain' }, redirect: 'error', signal }).catch((cause: unknown) => {
     throw Object.assign(new Error('无法下载 Codex 官方安装脚本。', { cause }), { code: signal.aborted ? 'ZEUS_CODEX_UPDATE_TIMEOUT' : 'ZEUS_CODEX_UPDATE_NETWORK' });
   });
   /** 响应必须成功且满足脚本大小上限。 */
@@ -307,6 +314,11 @@ async function readOfficialCodexInstaller(onProgress: (progress: number | null, 
   if (script.byteLength > codexInstallerMaximumBytes) throw Object.assign(new Error('Codex 官方安装脚本超过读取上限。'), { code: 'ZEUS_CODEX_UPDATE_UNAVAILABLE' });
   /** 成功状态不能替代脚本身份，拒绝 HTML 或未知正文。 */
   const header = script.subarray(0, Math.min(script.byteLength, 4_096)).toString('utf8');
+  if (process.platform === 'win32') {
+    if (!script.toString('utf8').includes('$ReleasesBaseUri = "https://releases.openai.com/codex"') || !script.toString('utf8').includes('CODEX_RELEASE'))
+      throw Object.assign(new Error('Codex 官方 Windows 安装脚本格式无法识别。'), { code: 'ZEUS_CODEX_UPDATE_INVALID' });
+    return script;
+  }
   if (!header.startsWith('#!/bin/sh\n') || !header.includes('RELEASES_BASE_URL="https://releases.openai.com/codex"')) {
     throw Object.assign(new Error('Codex 官方安装脚本格式无法识别。'), { code: 'ZEUS_CODEX_UPDATE_INVALID' });
   }
@@ -331,7 +343,7 @@ async function readOfficialCodexInstaller(onProgress: (progress: number | null, 
 
 /** 只调用受管安装的官方安装器；全局程序不会被当作更新命令执行。 */
 async function runCodexSelfUpdate(commandPath: string, codexHome: string | undefined, targetVersion: string, onProgress: (progress: number | null, stage: string) => void): Promise<void> {
-  if (!isManagedCodexStandalone(commandPath, codexHome)) throw Object.assign(new Error('请使用原安装方式更新这份 Codex。'), { code: 'ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION' });
+  if (!isManagedCodexStandalone(commandPath, codexHome)) throw Object.assign(new Error('Zeus 不管理这份 Codex。'), { code: 'ZEUS_CODEX_UPDATE_EXTERNAL_INSTALLATION' });
   /** 受管脚本只作为标准输入交给系统 sh，目标版本固定为用户确认的版本。 */
   const installer = await readOfficialCodexInstaller(onProgress);
   /** 更新命令只继承当前服务环境，并显式固定 Zeus 的 Codex 数据目录。 */
@@ -344,11 +356,11 @@ async function runCodexSelfUpdate(commandPath: string, codexHome: string | undef
   };
   return new Promise((resolveUpdate, rejectUpdate) => {
     /** stdout 与 stderr 只用于有界错误诊断，安装脚本通过标准输入传递。 */
-    const child = spawn('/bin/sh', ['-s'], {
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: environment,
-    });
+    const invocation =
+      process.platform === 'win32'
+        ? { command: resolveInteractiveShell({ path: null, login: false }, environment).command, args: powerShellCommandArguments('& ([scriptblock]::Create([Console]::In.ReadToEnd()))') }
+        : { command: '/bin/sh', args: ['-s'] };
+    const child = spawnManagedProcess(invocation.command, invocation.args, { env: environment });
     /** stdout 与 stderr 共同使用同一诊断预算。 */
     let output = Buffer.alloc(0);
     /** 防止 error、close 和超时重复收口。 */
@@ -428,11 +440,8 @@ async function stopCodexRemoteControlDaemon(commandPath: string, codexHome: stri
   const environment = { ...process.env, ...(codexHome ? { CODEX_HOME: codexHome } : {}) };
   return new Promise((resolveStop, rejectStop) => {
     /** 官方 stop 命令负责找到并有序结束匹配的数据目录实例。 */
-    const child = spawn(commandPath, ['remote-control', 'stop', '--json'], {
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: environment,
-    });
+    const child = spawnManagedProcess(commandPath, ['remote-control', 'stop', '--json'], { env: environment });
+    child.stdin.end();
     /** stdout 与 stderr 共用更新链已有的诊断上限。 */
     let output = Buffer.alloc(0);
     /** error、close 与超时只允许一个路径完成 Promise。 */
@@ -726,6 +735,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     resolveTaskWorkspaceRequest,
     restoreNativeConversation,
     retryTaskIntegrationAiPreparation,
+    finalizeTaskIntegrationAfterAi,
     revokeReleaseNotesCapability,
     runRuntimeLogRetention,
     runtimeEphemeralCapabilities,
@@ -909,6 +919,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       readHistory: getProjectGitHistory,
       readRepositorySnapshot: (localPath) => getProjectGitRepositorySnapshot(localPath),
       readCommit: (localPath, commitHash) => getProjectGitCommitDetail(localPath, commitHash),
+      /** 预览不会刷新远端或写入仓库。 */
+      readPushPreview: getProjectGitPushPreview,
       readComparison: (localPath, ref, mode) => getProjectGitComparisonDiff(localPath, ref, mode),
     },
     now,
@@ -949,9 +961,18 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     let warning = '';
     try {
       if (!codexNativeEnabled) throw new Error('Codex 尚未启用。');
-      const capabilities = await codexAppServerManager.ensureReady({ commandPath: currentCodexRuntimeCommandPath(), ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) });
-      const account = await codexAppServerManager.readAccount();
-      if (!account.signedIn && account.requiresOpenaiAuth) throw new Error('请先在 Zeus 中登录 Codex，再刷新模型列表。');
+      /** 展示目录只读现有世代；明确使用 Codex 生成内容时才准备该服务。 */
+      const transport = codexAppServerManager.getState();
+      /** 其他供应商的目录不能等待 Codex 网络恢复。 */
+      const capabilities = selectedModelRef
+        ? await codexAppServerManager.ensureReady({ commandPath: currentCodexRuntimeCommandPath(), ...(codexExternalAgentHome ? { externalAgentHome: codexExternalAgentHome } : {}) })
+        : transport.type === 'ready'
+          ? transport.capabilities
+          : null;
+      if (!capabilities) throw new Error('Codex 尚未就绪，其他供应商的模型仍可选择。');
+      /** 缺少账户缓存不等于未登录，实际生成仍由 Codex 执行认证。 */
+      const account = await codexAppServerManager.readAccount({ cachedOnly: true }).catch(() => null);
+      if (account?.requiresOpenaiAuth && !account.signedIn) throw new Error('请先在 Zeus 中登录 Codex，再刷新模型列表。');
       items.push(
         ...capabilities.models
           .filter((model: CodexModelCapability) => model.raw.hidden !== true)
@@ -1210,7 +1231,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           installation: {
             mode: remote ? ('remote' as const) : ('local' as const),
             configuredCommandPath: remote ? null : configuredCommandPath?.trim() || null,
-            command: standalone?.installCommand ?? 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
+            command: standalone?.installCommand ?? codexInstallationCommand(),
           },
         };
       },
@@ -1369,6 +1390,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           return updated;
         });
         reportProgress(1, 'completed');
+        /** 安装和运行实例核验完成后发布实际版本；请求方断线不影响已打开设置页刷新。 */
+        publishRealtimeEvent('codex.update.checked', { ...result });
         return result;
       });
       codexUpdateChain = operation.then(
@@ -1423,7 +1446,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     submissions: conversationSubmissions,
     provider: {
       getState: () => codexAppServerManager.getState(),
-      readAccount: () => codexAppServerManager.readAccount(),
+      readAccount: (input) => codexAppServerManager.readAccount(input),
     },
     modelCatalog: {
       hasConfiguredProvider: () => modelConnections.listMetadata().length > 0,
@@ -1460,12 +1483,21 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     flushDiagnostics: inputSuggestionDiagnostics?.flush,
     loadModels: loadTextGenerationModels,
     loadModel: async (selectedModelRef) => (await loadTextGenerationModels(selectedModelRef)).items.find((model) => model.id === selectedModelRef),
-    readSources: (projectId, conversationId) => {
+    readSources: async (projectId, conversationId) => {
+      /** 项目规则使用登记的项目根，与正常会话一致；新草稿不猜测项目归属。 */
+      const project = projectId ? projects.getById(projectId) : undefined;
+      // 请求指定的项目失效时直接停止，不能降级成只带全局规则的请求。
+      if (projectId && !project) throw Object.assign(new Error('输入建议所属项目已不可用。'), { code: 'ZEUS_PROJECT_NOT_FOUND' });
+      /** 全局与项目规则复用正常会话的受控读取、合并顺序和子目录索引。 */
+      const catalog = new ContextSourceCatalog([{ id: 'zeus:agent-rules', path: dataLayout.agentRules }, ...(project ? [{ id: `project:${project.id}`, path: project.localPath }] : [])]);
+      /** 无项目草稿仍读取全局规则，不扫描无关项目。 */
+      const agentRules = await catalog.agentRulesFragment({ globalRootId: 'zeus:agent-rules', ...(project ? { projectRootId: `project:${project.id}`, projectId: project.id } : {}), idPrefix: 'agent-rules' });
       /** 任务归属来自当前会话，禁止按任务名称寻找其他项目材料。 */
       const conversation = conversationId ? conversations.getRecordById(conversationId) : undefined;
       /** 新草稿没有任务身份，不猜测用户当前选中了哪项任务。 */
       const task = conversation?.taskId ? tasks.getById(conversation.taskId) : undefined;
       return {
+        agentRules: agentRules.fragment ? redactSensitiveText(agentRules.fragment.content).text : null,
         task:
           task?.projectId === projectId && task
             ? {
@@ -1639,6 +1671,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     buildRuntimeProcessEnv,
     createReleaseNotesCapability,
     revokeReleaseNotesCapability,
+    ensureWechatApplication: options.browserAutomation?.ensureWechatApplication?.bind(options.browserAutomation),
     resolveRuntimeSessionLogFiles: (sessionId) => {
       const sessionDirectory = runtimeSessionDataDirectory(sessionId);
       return [
@@ -2317,7 +2350,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       /** 源码与通用文件审阅使用相同的授权和 Git 比较口径。 */
       const intent = toConversationResourceOpenIntent(record);
       const preview = readConversationResourcePreview(resource, intent);
-      return preview.kind === 'source' ? { ...preview, review: await readConversationFileReview(resource, intent) } : preview;
+      return { ...preview, review: await readConversationFileReview(resource, intent) };
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String((error as Error & { code?: unknown }).code ?? '') : '';
       const status = code === 'ZEUS_CONVERSATION_RESOURCE_FORBIDDEN' ? 403 : code === 'ZEUS_CONVERSATION_RESOURCE_TOO_LARGE' ? 413 : 409;
@@ -2764,7 +2797,18 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       if (input.kind === 'source') {
         const project = projects.getById(input.projectId);
         if (!project?.localPath || typeof input.path !== 'string') throw new Error('项目文件不可用。');
-        intent = { sides: [{ name: input.path, label: '当前文件', root: project.localPath, path: resolve(project.localPath, input.path) }] };
+        intent = {
+          sides: [
+            {
+              name: input.path,
+              label: '当前文件',
+              root: project.localPath,
+              path: resolve(project.localPath, input.path),
+              edit: { root: project.localPath, path: resolve(project.localPath, input.path) },
+              git: { root: project.localPath, path: input.path },
+            },
+          ],
+        };
       } else if (input.kind === 'project-git') {
         const project = projects.getById(input.projectId);
         if (!project || typeof input.repositoryId !== 'string' || !input.repositoryId.startsWith('conversation:')) throw new Error('会话工作树预览身份无效。');
@@ -2780,7 +2824,13 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         const root = input.scope === 'committed' ? workspace.repositoryPath || resolved.project.localPath : workspace.worktreePath;
         if (!root) throw new Error('任务工作区已不可用。');
         const comparison = input.scope === 'committed' ? await getTaskBranchComparison(root, workspace.sourceBranch, workspace.branchName, workspace.sourceHeadSha) : null;
-        intent = { sides: await getGitFilePreviewSources(root, { path: input.path, ...(comparison ? { revisions: [comparison.mergeBaseSha, comparison.taskHeadSha] } : {}) }) };
+        intent = {
+          sides: (await getGitFilePreviewSources(root, { path: input.path, ...(comparison ? { revisions: [comparison.mergeBaseSha, comparison.taskHeadSha] } : {}) })).map((side) => ({
+            ...side,
+            // 已提交成果仍编辑任务工作树，不能跳到比较用的主仓库。
+            edit: workspace.worktreePath && side.edit ? { root: workspace.worktreePath, path: resolve(workspace.worktreePath, relative(root, side.edit.path)) } : undefined,
+          })),
+        };
       } else if (input.kind === 'resource') {
         const record = conversationResources.getById(input.resourceId);
         if (!record || record.projectId !== input.projectId || record.conversationId !== input.conversationId) throw new Error('会话资源不属于当前会话。');
@@ -2790,9 +2840,32 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         const resource = toConversationResource(record);
         const review = resource && resource.kind !== 'website' ? await readConversationFileReview(resource, grant) : undefined;
         // 预览格式依据真实文件名，正文链接标题可能完全省略扩展名。
-        intent = { sides: [{ name: basename(String(grant.target.absolutePath || '')), label: '会话文件', root: String(grant.authority.allowedRoot || ''), path: String(grant.target.absolutePath || ''), review }] };
+        /** 当前文件位置完全来自会话授权，渲染层不能另指定路径。 */
+        const root = String(grant.authority.allowedRoot || '');
+        /** 工作树文件与资源展示名称分别保存。 */
+        const path = String(grant.target.absolutePath || '');
+        if (input.comparison !== undefined && input.comparison !== 'head') throw new Error('会话文件比较范围无效。');
+        if (input.comparison === 'head') {
+          /** 子仓库比较必须使用文件所属仓库，仍先核对原资源授权边界。 */
+          if (!isPathInsideRoot(realpathSync(path), realpathSync(root))) throw new Error('会话文件已离开授权目录。');
+          const repository = await getGitRepositoryContext(dirname(path));
+          if (!repository.isRepository) throw new Error('此文件不属于 Git 仓库。');
+          intent = {
+            sides: (await getGitFilePreviewSources(repository.topLevel, { path: relative(repository.topLevel, path).split(sep).join('/') })).map((side) => ({
+              ...side,
+              // 编辑只保留原资源允许的目录，不扩大到仓库的其他上级目录。
+              edit: { root, path },
+            })),
+          };
+        } else {
+          intent = { sides: [{ name: basename(path), label: '会话文件', root, path, review, edit: { root, path }, git: { root, path: relative(root, path).split(sep).join('/') } }] };
+        }
       } else if (input.kind === 'turn') {
-        const { file } = resolveTurnChangeFileRecord(input);
+        const { conversation, changeSet, file } = resolveTurnChangeFileRecord(input);
+        /** 编辑只定位会话当前执行目录，不使用轮次证据目录。 */
+        const executionRoot = resolveNativeConversationExecutionRoot(conversation);
+        /** 撤销后的当前文件沿用旧路径。 */
+        const currentPath = changeSet.state === 'undone' ? file.oldPath : file.newPath;
         intent = {
           sides: (['pre', 'post'] as const).map((phase) => {
             const path = phase === 'pre' ? file.preBlobRef : file.postBlobRef;
@@ -2801,6 +2874,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
             return {
               name: (phase === 'pre' ? file.oldPath : file.newPath) || file.newPath || file.oldPath || '文件',
               label: phase === 'pre' ? '变更前 · 轮次快照' : '变更后 · 轮次快照',
+              edit: executionRoot && currentPath ? { root: executionRoot, path: resolve(executionRoot, currentPath) } : undefined,
+              missing: !exists,
               // 预览协议只传纯 SHA-256；存储哈希保留算法前缀。
               ...(exists && path && hash
                 ? { path, root: join(dataLayout.turnChangeSets, input.changeSetId, 'blobs'), sha256: hash.replace(/^sha256:/u, '') }
@@ -3575,7 +3650,53 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     redact: (message) => redactSensitiveText(message).text,
     publish: publishRealtimeEvent,
   });
-  registerNotificationRoutes({ server, db, automations: automationNotifications, tasks: taskReminders, readOnly: readOnlyValidation });
+  /** 后台交付只复用当前宿主已授权的项目、工作区和命令应用层。 */
+  const gitDelivery = new GitDeliveryExecution({
+    server,
+    db,
+    apiToken: options.apiToken,
+    readOnly: readOnlyValidation,
+    projects,
+    projectRepositories,
+    tasks,
+    taskWorkspaces,
+    taskIntegrations,
+    taskIntegrationAttempts,
+    conversations,
+    conversationSubmissions,
+    commands: workspaceGitCommands,
+    publish: publishRealtimeEvent,
+    statusOptions: (projectId) => resolveTaskManagementStatusConfigForProject(projectId).statuses,
+    finalizeTaskConflict: async (integrationId, conversationId) => {
+      /** 使用当前会话的原尝试，不另建冲突任务或改变固定目标。 */
+      const attempt = taskIntegrationAttempts.getByConversationId(conversationId);
+      if (attempt && attempt.integrationId !== integrationId) throw new Error('冲突会话不属于本次合入。');
+      /** 合入授权固定到原候选，分支推进时不自动重建或扩大范围。 */
+      const integration = taskIntegrations.getById(integrationId);
+      const workspace = integration ? taskWorkspaces.getById(integration.workspaceId) : undefined;
+      if (!integration || !workspace) throw new Error('原冲突合入现场不存在。');
+      const path = workspace.repositoryPath || projects.getById(workspace.projectId)?.localPath;
+      if (!path) throw new Error('原仓库不可用。');
+      const [taskHead, targetHead] = await Promise.all([getGitBranchHead(path, workspace.branchName), getGitBranchHead(path, integration.targetBranch)]);
+      if (taskHead !== integration.taskHeadSha || targetHead !== integration.targetHeadSha) return { integration, message: '原任务分支或目标分支已推进，请重新审阅；不会自动扩大合入范围。' };
+      await finalizeTaskIntegrationAfterAi(attempt?.id ?? integrationId, conversationId);
+      return { integration: taskIntegrations.getById(integrationId), message: attempt ? (taskIntegrationAttempts.getById(attempt.id)?.lastError ?? undefined) : undefined };
+    },
+    conversationState: (id) => {
+      /** 真实等待优先于最近完成的历史轮次。 */
+      const conversation = conversations.getRecordById(id);
+      if (!conversation) return 'failed';
+      const state = inferNativeConversationSnapshotState(conversation);
+      if (state.type === 'waiting') return 'waiting';
+      if (state.type === 'paused' && state.reason !== 'conflict_preparing') return 'failed';
+      if (state.type === 'active' || state.type === 'dispatching' || (state.type === 'paused' && state.reason === 'conflict_preparing')) return 'running';
+      if (conversationSubmissions.listByConversation(id).some((item: { status: string }) => ['queued', 'dispatching', 'active'].includes(item.status))) return 'running';
+      const turn = conversationTurns.listByConversation(id).at(-1);
+      return turn?.status === 'completed' ? 'completed' : 'failed';
+    },
+  });
+  gitDelivery.register();
+  registerNotificationRoutes({ server, db, automations: automationNotifications, tasks: taskReminders, deliveries: gitDelivery.repository, readOnly: readOnlyValidation });
   /** 自动化存储统一接收 ISO 时间，避免 Date 被 SQLite 静默绑定为 NULL。 */
   const automationNow = (): string => now().toISOString();
   /** 无项目自动化复用产品已有临时会话工作区，不创建普通项目。 */
@@ -3688,6 +3809,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     managedRoot: join(dataLayout.artifactsDirectory, 'task-docs'),
   });
 
+  /** Skill 删除即失效；启动时移除旧设计留下的可执行物化副本。 */
+  rmSync(join(dataLayout.artifactsDirectory, 'task-work-skill-snapshots'), { recursive: true, force: true });
   taskWorkManagement = registerTaskWorkManagement({
     server,
     apiToken: options.apiToken,
@@ -3718,7 +3841,6 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     artifacts: artifactStore,
     workArtifacts,
     acceptProjectWorkflowAssignment,
-    skillSnapshotRoot: join(dataLayout.artifactsDirectory, 'task-work-skill-snapshots'),
     skills: zeusSkillService,
     plugins: zeusPluginService,
     conversationCapabilities: conversationCapabilityQueries,
@@ -4462,7 +4584,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       if (
         previousSettings.inputSuggestions?.enabled !== mutation.result.inputSuggestions?.enabled ||
         previousSettings.inputSuggestions?.modelRef !== mutation.result.inputSuggestions?.modelRef ||
-        previousSettings.inputSuggestions?.effort !== mutation.result.inputSuggestions?.effort
+        previousSettings.inputSuggestions?.effort !== mutation.result.inputSuggestions?.effort ||
+        previousSettings.inputSuggestions?.serviceTier !== mutation.result.inputSuggestions?.serviceTier
       )
         cancelInputSuggestions();
       return platformMutableState.appShellSettings;
@@ -4656,7 +4779,19 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       return root && existsSync(root) && statSync(root).isDirectory() ? root : null;
     },
     readProjectAllowsShell: (projectId) => readProjectConfig(projectId).security.allowShell,
-    readTerminalStartupCommand: () => platformMutableState.runtimeSettings.terminalStartupCommand,
+    readTerminalStartupCommand: (shellCommand) => {
+      /** Unix 启动脚本不能在导入后直接交给 Windows 解释器执行。 */
+      const command = platformMutableState.runtimeSettings.terminalStartupCommand;
+      const expected = platformMutableState.runtimeSettings.terminalStartupShell ?? 'sh';
+      const name = (shellCommand ?? '')
+        .split(/[\\/]/u)
+        .at(-1)
+        ?.toLowerCase()
+        .replace(/\.exe$/u, '');
+      const actual = name === 'powershell' || name === 'pwsh' ? 'powershell' : name === 'cmd' ? 'cmd' : 'sh';
+      if (command && actual !== (expected === 'zsh' ? 'sh' : expected)) throw new Error('终端启动命令的解释器与当前终端不同。请在终端设置中确认并适配脚本，或清空启动命令。');
+      return command;
+    },
     buildRuntimeProcessEnv,
     resolveTaskDefaultManagementStatus: (projectId) => resolveTaskManagementStatusConfigForProject(projectId).roles.defaultStatusId,
     stopPersistedOrphanRuntimeSession,
@@ -4839,6 +4974,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   // eslint-disable-next-line prefer-const
   closeLocalServerResources = async () => {
+    await gitDelivery.close();
     const cleanupErrors: unknown[] = [];
     await closeHeavyWorkerJobs();
     platformMutableState.removeStorageWriteFaultListener?.();
@@ -4967,6 +5103,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     },
     recover: () => {
       if (!readOnlyValidation) {
+        gitDelivery.recover();
         workManagementTaskEffects.recover();
         repositoryDiscovery.recover();
         digitalTeamWorkflowCoordinator?.kick();

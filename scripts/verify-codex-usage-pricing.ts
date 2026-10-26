@@ -762,7 +762,8 @@ try {
     rateExecution.listOutputRateMeasurements().map((row) => row.providerTurnId),
     ['rate-pure-first', 'rate-pure-latest'],
   );
-  assert.equal(rateExecution.sessionMetrics('output-rate').performance.latestOutputTokensPerSecond, 40);
+  // 首 Token 不形成输出间隔，两次请求共 198 个间隔、6 秒。
+  assert.equal(rateExecution.sessionMetrics('output-rate').performance.latestOutputTokensPerSecond, 198 / 6);
   assert.equal(rateExecution.sessionMetrics('rate-only-wait').performance.latestOutputTokensPerSecond, null);
   /** 菜单栏必须按 Token 与时长总和加权，不能直接平均两条请求的速率。 */
   const rateOverview = await createUsageOverviewService({
@@ -776,7 +777,7 @@ try {
   }).read();
   /** 各范围包含相同两条有效样本，应显示相同速率。 */
   for (const range of ['today', '7d', '30d', 'all'] as const) {
-    assert.equal(rateOverview.providers.find((provider) => provider.providerId === 'codex')!.overviewRanges[range].local.outputTokensPerSecond, 200 / 6);
+    assert.equal(rateOverview.providers.find((provider) => provider.providerId === 'codex')!.overviewRanges[range].local.outputTokensPerSecond, 198 / 6);
   }
   assert.deepEqual(ledger.list(), beforeRateLedger);
   assert.deepEqual(db.select('SELECT * FROM conversation_model_requests ORDER BY id'), beforeRateRequests);

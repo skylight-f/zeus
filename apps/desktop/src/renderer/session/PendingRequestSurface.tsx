@@ -1,4 +1,4 @@
-import { type CSSProperties, type KeyboardEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRightIcon as ArrowRight } from '@phosphor-icons/react/dist/csr/ArrowRight';
 import { BookOpenIcon as BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
 import { InfoIcon as Info } from '@phosphor-icons/react/dist/csr/Info';
@@ -17,7 +17,6 @@ import { FullAccessConfirmation } from './PermissionModeControl.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { NativeConversationAttachment, NativePendingRequest, NativePermissionMode } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
-import { autosizeTextarea } from './textareaAutosize.js';
 import { conversationAttachmentIdentity, ConversationComposerAttachments } from './ConversationComposerAttachments.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 
@@ -243,7 +242,8 @@ export function PendingRequestSurface(props: PendingRequestSurfaceProps) {
           {acceptsMcpJson ? (
             <label className="session-mcp-response">
               <span>{copy.mcpResponse}</span>
-              <textarea value={mcpResponseJson} onChange={(event) => setMcpResponseJson(event.currentTarget.value)} spellCheck={false} />
+              {/* 结构化响应保留原文，不能由列表编辑改写 JSON。 */}
+              <textarea data-markdown-lists="off" value={mcpResponseJson} onChange={(event) => setMcpResponseJson(event.currentTarget.value)} spellCheck={false} />
             </label>
           ) : null}
           {mcpUrl ? (
@@ -676,7 +676,6 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
       }
       setAnswerAttachments((current) => ({ ...current, [currentQuestion.id]: mergeAnswerAttachments(current[currentQuestion.id] ?? [], attachments) }));
     },
-    onRemoveAttachment: (attachment) => removeAnswerAttachment(currentQuestion.id, attachment),
     onError: setResourceError,
   });
 
@@ -701,11 +700,6 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
   useEffect(() => {
     persistRuiDraft(props.request.id, props.questions, answers, otherAnswers, answerAttachments);
   }, [answerAttachments, answers, otherAnswers, props.questions, props.request.id]);
-
-  useLayoutEffect(() => {
-    if (currentQuestion.secret || !(otherAnswerRef.current instanceof HTMLTextAreaElement)) return;
-    autosizeTextarea(otherAnswerRef.current, 30, 0.24);
-  }, [currentOtherAnswer, currentQuestion.id, currentQuestion.secret]);
 
   useEffect(() => {
     window.zeus?.notifySensitiveRequestDraft?.({ requestId: props.request.id, present: hasSensitiveDraft });
@@ -765,35 +759,16 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
     setAnswers(nextAnswers);
     if (switchingFromOther) {
       setAnswerAttachments(nextAttachments);
-      void discardAnswerAttachmentResources(currentAttachments);
     }
     if (currentQuestion.kind === 'single' && optionLabel !== otherAnswerControlValue(currentQuestion)) advance(nextAnswers, otherAnswers, nextAttachments);
   }
 
+  /** 仅移除当前草稿的引用，不删除可能仍被已发送消息使用的副本。 */
   function removeAnswerAttachment(questionId: string, attachment: NativeConversationAttachment): void {
     setAnswerAttachments((current) => ({
       ...current,
       [questionId]: (current[questionId] ?? []).filter((candidate) => conversationAttachmentIdentity(candidate) !== conversationAttachmentIdentity(attachment)),
     }));
-    void discardAnswerAttachmentResources([attachment]);
-  }
-
-  async function chooseAnswerAttachments(): Promise<void> {
-    if (!answerAttachmentsEnabled || !props.onChooseAttachments) return;
-    setResourceError(null);
-    try {
-      const selected = await props.onChooseAttachments();
-      if (selected.length > 0) {
-        void snooze();
-        if (currentQuestion.kind !== 'freeform' && !otherSelected) {
-          const controlValue = otherAnswerControlValue(currentQuestion);
-          setAnswers((current) => updateQuestionAnswers(current, currentQuestion, controlValue, true));
-        }
-        setAnswerAttachments((current) => ({ ...current, [currentQuestion.id]: mergeAnswerAttachments(current[currentQuestion.id] ?? [], selected) }));
-      }
-    } catch (error) {
-      setResourceError(error);
-    }
   }
 
   function handleAnswerInputKeyDown(event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>): void {
@@ -873,7 +848,6 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
       await (snoozePromiseRef.current ?? Promise.resolve());
       await props.onRespond(props.request.id, { type: 'userInput', answers: {} });
       if (!props.retainDraft) clearRuiDraft(props.request.id);
-      await discardAnswerAttachmentResources(Object.values(answerAttachments).flat());
     } finally {
       setLocallyResponding(false);
     }
@@ -1031,7 +1005,6 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                       disabled={responding || inputResources.processing}
                       className="session-question-answer-attachments"
                       onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
-                      onRestorePastedText={inputResources.restorePastedText}
                     />
                     <textarea
                       ref={(element) => {
@@ -1070,7 +1043,8 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                     className="session-question-attachment-button"
                     aria-label={zh ? '添加附件' : 'Add attachment'}
                     disabled={inputResources.processing}
-                    onClick={() => void chooseAnswerAttachments()}
+                    aria-haspopup="menu"
+                    onClick={inputResources.chooseAttachments}
                   >
                     <Paperclip aria-hidden="true" />
                   </button>
@@ -1116,7 +1090,6 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                     disabled={responding || inputResources.processing}
                     className="session-question-answer-attachments"
                     onRemove={(attachment) => removeAnswerAttachment(currentQuestion.id, attachment)}
-                    onRestorePastedText={inputResources.restorePastedText}
                   />
                   <textarea
                     ref={(element) => {
@@ -1147,7 +1120,8 @@ export function RequestUserInputPanel(props: RequestUserInputPanelProps) {
                       className="session-question-attachment-button"
                       aria-label={zh ? '添加附件' : 'Add attachment'}
                       disabled={inputResources.processing}
-                      onClick={() => void chooseAnswerAttachments()}
+                      aria-haspopup="menu"
+                      onClick={inputResources.chooseAttachments}
                     >
                       <Paperclip aria-hidden="true" />
                     </button>
@@ -1288,15 +1262,6 @@ function activeRequestAnswerAttachments(questions: readonly RequestQuestion[], a
       return active ? [[question.id, attachments]] : [];
     }),
   );
-}
-
-async function discardAnswerAttachmentResources(attachments: NativeConversationAttachment[]): Promise<void> {
-  if (attachments.length === 0 || !window.zeus?.discardConversationResources) return;
-  try {
-    await window.zeus.discardConversationResources(attachments.map((attachment) => ({ ...(attachment.localPath ? { localPath: attachment.localPath } : {}), ...(attachment.uploadRef ? { uploadRef: attachment.uploadRef } : {}) })));
-  } catch {
-    // 清理失败不能伪造回答失败；Main 仍会拒绝删除任何非托管资源。
-  }
 }
 
 function permissionModeLabel(permissionMode: NativePermissionMode, language: SessionUiLanguage): string {

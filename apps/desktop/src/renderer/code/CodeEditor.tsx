@@ -17,6 +17,8 @@ export interface CodeEditorProps {
   savedContent?: string;
   readOnly: boolean;
   label?: string;
+  blameLines?: import('@zeus/shared').FilePreviewBlameLine[];
+  locale?: string;
   revealLine?: number | null;
   revealColumn?: number | null;
   /** 文件引用的每次定位身份。 */
@@ -141,10 +143,42 @@ export const CodeEditor = memo(function CodeEditor(props: CodeEditorProps) {
   useEffect(() => {
     const view = viewRef.current;
     if (!view || !(props.location?.line ?? props.revealLine)) return;
-    const position = { lineNumber: props.location?.line ?? props.revealLine!, column: props.revealColumn ?? 1 };
+    const position = { lineNumber: props.location?.line ?? props.revealLine!, column: props.location?.column ?? props.revealColumn ?? 1 };
     view.setPosition(position);
     view.revealPositionInCenterIfOutsideViewport(position);
   }, [props.location, props.revealLine, props.revealColumn, props.path, ready]);
+
+  // 预览归属绑定已授权的准确版本；输入后立即隐藏，避免把旧行号映射到草稿。
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !props.blameLines?.length) return;
+    const marks = view.createDecorationsCollection();
+    const update = () => {
+      const model = view.getModel(),
+        position = view.getPosition();
+      const line = position ? props.blameLines?.find((entry) => entry.line === position.lineNumber) : undefined;
+      if (!model || !line || !position || !view.hasTextFocus() || !view.getSelection()?.isEmpty() || model.getValue() !== props.content || /^0+$/.test(line.commitHash)) {
+        marks.clear();
+        return;
+      }
+      const column = model.getLineMaxColumn(position.lineNumber);
+      marks.set([
+        {
+          range: new monaco.Range(position.lineNumber, column, position.lineNumber, column),
+          options: {
+            after: { content: '  ' + line.author + ' · ' + (line.subject || line.shortHash), inlineClassName: 'source-blame-inline', cursorStops: monaco.editor.InjectedTextCursorStops.None },
+            hoverMessage: { value: line.shortHash + ' · ' + line.author + '\n\n' + line.subject, isTrusted: false },
+          },
+        },
+      ]);
+    };
+    update();
+    const subscriptions = [view.onDidChangeCursorSelection(update), view.onDidFocusEditorText(update), view.onDidBlurEditorText(update), view.onDidChangeModelContent(() => marks.clear())];
+    return () => {
+      subscriptions.forEach((item) => item.dispose());
+      marks.clear();
+    };
+  }, [ready, props.blameLines, props.content]);
 
   return (
     <div className="project-source-code-editor zeus-monaco-editor" style={{ height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden', position: 'relative' }}>

@@ -10,10 +10,17 @@ import { ConnectedSessionWorkspace, SessionWorkspace } from '../src/renderer/ses
 import { createConversationApiClient } from '../src/renderer/features/conversations/conversationApiClient.js';
 import { Button } from '../src/renderer/ui/Button.js';
 import { ConversationMarkdown } from '../src/renderer/session/ConversationMarkdown.js';
+import { FilePreview } from '../src/renderer/code/FilePreview.js';
+import { ProjectSourceRenderedPreview } from '../src/renderer/code/ProjectSourceRenderedPreview.js';
+import { SourceWorkspace, type SourceWorkspaceState } from '../src/renderer/session/SourceWorkspace.js';
+import { TaskDeliverableContent } from '../src/renderer/features/digital-employees/TaskDeliverableReader.js';
+import '../src/renderer/code/projectSourceWorkspace.css';
+import '../src/renderer/features/digital-employees/digitalEmployees.css';
 import { ConversationInlineResource, ConversationResourceCards, defaultOpenTarget } from '../src/renderer/session/ConversationResources.js';
 import { ConversationComposer, type ComposerRuntimeSettings } from '../src/renderer/session/ConversationComposer.js';
 import type { ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { QueuedConversationMessages } from '../src/renderer/session/QueuedConversationMessages.js';
+import { composerQueuedSubmissions } from '../src/renderer/session/conversationQueuePresentation.js';
 import { SessionActivityGroup } from '../src/renderer/session/SessionActivity.js';
 import { SubagentWorkspace } from '../src/renderer/session/SubagentWorkspace.js';
 import { RuntimeDetails } from '../src/renderer/session/RuntimeDetails.js';
@@ -195,7 +202,7 @@ export function SessionQaApp(props: { scene: QaScene }) {
   if (props.scene.query === 'error-layout') return <ErrorLayoutQa />;
   if (props.scene.query === 'paste-focus') return <TaskPasteFocusQa />;
   if (props.scene.query === 'composer') return <ComposerMarkdownQa />;
-  if (props.scene.query === 'review') return <MarkdownReviewQa />;
+  if (props.scene.query === 'review') return new URLSearchParams(window.location.search).has('long') ? <LongMarkdownFileQa /> : <MarkdownReviewQa />;
   if (props.scene.query === 'questions') return <QuestionQa />;
   if (props.scene.query === 'plan-implementation') return <PlanImplementationQa />;
   if (props.scene.query === 'images') return <TaskPushImagesQa />;
@@ -595,6 +602,7 @@ function QueueActionsQa() {
   }
   /** 沿用既有运行检查，确认状态变化没有重新开放未知送达消息的操作。 */
   function checkActions(): void {
+    checkImmediateSendProjection();
     /** 已接纳消息退出队列操作，其余按真实状态计算可见入口。 */
     const pendingCount = submissions.filter((submission) => submission.status !== 'resolved').length;
     /** 只有普通 queued 和安全 paused 项进入输入框卡片。 */
@@ -612,6 +620,14 @@ function QueueActionsQa() {
       [...(surface.current?.querySelectorAll('button') ?? [])].filter((button) => button.textContent === (language === 'zh-CN' ? '重试' : 'Retry')).length !== expectedRetry
     )
       throw new Error(`队列操作检查失败：${scenario}`);
+    /** 普通多消息样本同时核对实际行序，防止回调成功但页面仍按原顺序排列。 */
+    if (scenario === 'queued' && sample === 'multiple') {
+      /** 只读取排队区，正文历史不参与顺序比较。 */
+      const rows = [...(surface.current?.querySelectorAll('.session-queued-message-preview') ?? [])];
+      /** 已接纳项退出待发送区，剩余项沿用模拟权威快照的位置。 */
+      const pending = submissions.filter((submission) => submission.status !== 'resolved');
+      if (rows.some((row, index) => row.textContent !== pending[index]?.content)) throw new Error('排队消息显示顺序与回执不一致');
+    }
     setResult(`运行检查通过：${scenario} / ${sample} / ${language}`);
   }
   return (
@@ -691,7 +707,9 @@ function QueueActionsQa() {
               setScenario('queued');
               setResult('继续发送回调已触发，原消息恢复排队');
             }}
-            onReorder={(orderedIds) => {
+            onReorder={async (orderedIds) => {
+              await nextQaTask();
+              if (failAction) throw new Error('排序失败，原队列已保留。');
               setQueueOrder(orderedIds);
               setResult(`重排回调已触发：${orderedIds.join(' → ')}`);
             }}
@@ -874,6 +892,7 @@ function MessageLayoutQa() {
       /** 松手点放在文字行内，验证右侧与上方各保留 6px。 */
       const clientX = backward ? releaseRect.left + 1 : releaseRect.right - 1;
       const clientY = releaseRect.bottom - 2;
+      paragraph.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX, clientY }));
       paragraph.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX, clientY }));
       await settle();
       window.dispatchEvent(new Event('resize'));
@@ -1214,6 +1233,29 @@ function MessageLayoutQa() {
         ]
       : []),
     ...(!active && parameters.has('deliverable') ? [{ type: 'fileChange', phase: 'prework', text: '', payload: {}, status: 'completed' }] : []),
+    // 评论样例只使用本地预览数据，由生产消息组件展示引用和用户输入。
+    ...(parameters.has('response-comments')
+      ? [
+          {
+            type: 'userMessage',
+            phase: 'user',
+            text: '回答评论',
+            payload: {
+              conversationContext: {
+                responseAnnotations: [
+                  {
+                    id: 'qa-sent-response-comment',
+                    anchor: { itemId: 'qa-response', startOffset: 0, endOffset: 28, selectedText: '已检查会话布局，正文前显示真实用时；展开处理过程后，各段操作仍按需查看。' },
+                    note: '请保留处理过程的展开状态。\n窄窗口下也要能看清引用和我的评论。',
+                  },
+                ],
+                codeComments: [],
+              },
+            },
+            status: 'completed',
+          },
+        ]
+      : []),
     ...Array.from({ length: followupCount }, (_, index) => ({
       type: 'userMessage',
       phase: 'user',
@@ -1254,6 +1296,8 @@ function MessageLayoutQa() {
     conversationState: active ? 'active_prework' : 'idle',
     items: Object.fromEntries(items.map((item) => [item.key, item])),
     itemOrder: items.map((item) => item.key),
+    /** 手动输出与真实实时消息使用相同的动效资格，空正文仍等待首段文字。 */
+    transcriptLiveItemKeys: replyTransition ? items.filter((item) => item.type === 'agentMessage').map((item) => item.key) : [],
     turnsByProviderId: {
       'qa-layout-turn': {
         id: 'qa-layout-turn',
@@ -1990,7 +2034,6 @@ function PlanImplementationQa() {
           uploadRef: 'qa:pasted-text',
         })),
       readConversationClipboardResources: async () => ({ resources: [{ name: '剪贴板附件.txt', kind: 'file', mime: 'text/plain', size: 12, source: 'paste', uploadRef: 'qa:clipboard-file' }], text: '' }),
-      discardConversationResources: async (resources) => ({ discardedCount: resources.length }),
     } as NonNullable<Window['zeus']>;
     return () => {
       delete window.zeus;
@@ -2358,6 +2401,46 @@ function ComposerMarkdownQa() {
 /** 让浏览器提交本轮 React 更新，模拟附件读取跨越事件循环。 */
 function nextQaTask(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** 复用实际 Reducer 核对本地首帧与交错回执，不连接 Provider 或创建真实提交。 */
+export function checkImmediateSendProjection(): void {
+  /** 已结束轮次的队列刷新尚未到达，是误显示排队的关键状态。 */
+  const idle: NativeSessionState = {
+    ...createInitialSessionState(),
+    conversationId: 'qa-send-continuity',
+    conversationState: 'native_idle',
+    queue: { throughEventSeq: 0, state: { type: 'active', turnId: 'previous-turn', phase: 'prework' }, submissions: [] },
+    terminalTurnIds: { 'previous-turn': 'completed' },
+  };
+  /** 首次发送与连接恢复复用同一消息身份和原文。 */
+  const action = {
+    type: 'send_started' as const,
+    clientUserMessageId: 'qa-immediate-send',
+    draft: '这条输入应立即出现在会话正文。',
+    attachments: [],
+    submittedAttachments: [],
+    browserSubmission: null,
+    browserComments: [],
+    contextDraft: idle.contextDraft,
+    delivery: 'queue' as const,
+    previousConversationState: idle.conversationState,
+    startedAt: '2026-10-20T02:00:00Z',
+  };
+  /** 首帧直接拥有正文，旧队列不能接管它。 */
+  const submitted = sessionReducer(idle, action);
+  if (submitted.items[submitted.itemOrder[0]!]!.text !== action.draft || composerQueuedSubmissions(submitted).length) throw new Error('已结束轮次后的发送未立即进入正文');
+  /** 权威排队回执先到、旧轮次队列未清理时，队首同样保留在正文。 */
+  const receipt = { id: 'qa-submission', clientUserMessageId: action.clientUserMessageId, content: action.draft, status: 'queued', delivery: 'queue' as const, position: 0, pausedReason: null };
+  if (composerQueuedSubmissions({ ...submitted, queue: { ...idle.queue!, waitReason: 'current_turn', submissions: [receipt] } }).length) throw new Error('接纳回执把空闲队首误移入排队区');
+  /** 自身派发后再次投影原消息，不能将它改成等待自身结束。 */
+  const active: NativeSessionState = { ...submitted, activeTurnId: 'own-turn', queue: { throughEventSeq: 1, state: { type: 'active', turnId: 'own-turn', phase: 'prework' }, submissions: [] } };
+  if (composerQueuedSubmissions(sessionReducer(active, action)).length) throw new Error('原消息被自己的运行状态移入队列');
+  if (composerQueuedSubmissions({ ...active, queue: { ...active.queue!, submissions: [receipt] } }).length !== 1) throw new Error('权威活动队列的等待输入被隐藏');
+  /** 真正追加到活动轮次后的另一条输入仍保留排队语义。 */
+  const queued = sessionReducer(active, { ...action, clientUserMessageId: 'qa-next-message' });
+  if (composerQueuedSubmissions(queued).length !== 1) throw new Error('活动轮次后的真实排队丢失');
+  if (composerQueuedSubmissions({ ...queued, terminalTurnIds: { ...queued.terminalTurnIds, 'own-turn': 'completed' } }).length) throw new Error('轮次结束后本地消息仍卡在队列');
 }
 
 /** 在既有浏览器场景中重放真实输入事件，核对表格编辑、撤销和原文一致性。 */
@@ -3073,6 +3156,127 @@ function CopyErrorQa() {
   );
 }
 
+/** 用真实文件预览检查长文档；浏览器数据同时超过原字符、节点和代码块限制。 */
+function LongMarkdownFileQa() {
+  /** 同一入口覆盖完整长文、无标题和重复标题，语言和主题沿用既有参数。 */
+  const parameters = new URLSearchParams(window.location.search);
+  /** 只切换真实预览组件，不替换其中的大纲实现。 */
+  const [surface, setSurface] = useState('file');
+  /** 会话预览的标签与原文切换由原组件管理。 */
+  const [sourceState, setSourceState] = useState<SourceWorkspaceState | null>(null);
+  /** 文案与实际 Markdown 组件使用相同语言。 */
+  const language = parameters.has('en') ? 'en-US' : 'zh-CN';
+  /** 检查只读取当前样本渲染结果。 */
+  const root = useRef<HTMLElement>(null);
+  /** 仅在模拟读取能力安装后挂载真实预览，避免读取结果受挂载顺序影响。 */
+  const [ready, setReady] = useState(false);
+  /** 文末检查结果供人工核对。 */
+  const [checked, setChecked] = useState(false);
+  /** 预览内容与当前主题、窗口尺寸无关，切换展示不会重建样本。 */
+  const content = useMemo(
+    () =>
+      parameters.has('empty')
+        ? '此文档只有正文，没有标题。'
+        : parameters.has('outline')
+          ? '# Markdown 阅读\n\n文件正文保持完整。\n\n## 开始阅读\n\n点击右侧目录可以定位。\n\n### macOS\n\n沿用系统入口。\n\n### Windows\n\n沿用系统入口。\n\n## 操作说明\n\n第一处相同标题。\n\n## 操作说明\n\n第二处相同标题。\n\n```markdown\n# 代码块里的标题不进入目录\n```\n\n## 结束\n\n完整文档结束标记'
+          : `# 长文档阅读检查\n\n${Array.from({ length: 600 }, (_, index) => `## 第 ${index + 1} 节\n\n**重点**与\`数据\`保留格式。${'此段用于检查文件超过会话限制后仍能阅读。'.repeat(20)}\n\n`).join('')}\n\n\`\`\`text\n${'代码正文\n'.repeat(12_000)}代码结束标记\n\`\`\`\n\n完整文档结束标记`,
+    [],
+  );
+  /** 会话入口使用真实资源结构，避免预览状态随普通重渲染变化。 */
+  const preview = useMemo<ConversationResourcePreview>(
+    () => ({
+      kind: 'source',
+      language: 'markdown',
+      content,
+      lineCount: content.split('\n').length,
+      truncated: false,
+      resource: {
+        id: 'qa-outline-resource',
+        kind: 'file',
+        presentation: 'inline',
+        displayName: '长文档.md',
+        projectRelativePath: '长文档.md',
+        iconKind: 'markdown',
+        projectId: 'qa-project',
+        conversationId: 'qa',
+        turnId: 'qa',
+        itemId: 'qa',
+        createdAt: '',
+        updatedAt: '',
+      },
+    }),
+    [content],
+  );
+  useEffect(() => {
+    /** 独立浏览器页面使用固定内容，禁止替换原生应用桥接。 */
+    if (window.zeus) return;
+    /** 离开场景时撤销模拟能力，不连接正式数据。 */
+    const previous = window.zeus;
+    window.zeus = {
+      loadFilePreview: async () => [{ id: `qa-long-${crypto.randomUUID()}`, name: '长文档.md', label: '完整文件', kind: 'text', mime: 'text/markdown', byteLength: new TextEncoder().encode(content).length, content }],
+      releaseFilePreview: async () => {},
+      prepareProjectSourcePreview: async () => ({ id: 'qa-source-grant', url: `${location.origin}/qa/长文档.md`, rootUrl: `${location.origin}/qa/` }),
+      releaseProjectSourcePreview: async () => {},
+    } as NonNullable<typeof window.zeus>;
+    setReady(true);
+    return () => {
+      window.zeus = previous;
+    };
+  }, [content]);
+  /** 真实正文、章节数和代码尾部缺失时立即报错，防止只隐藏截断提示。 */
+  function checkEnd() {
+    /** 查询范围限定在当前真实文件预览。 */
+    const markdown = root.current?.querySelector('.session-conversation-markdown > .markstream-react');
+    if (
+      markdown?.querySelectorAll('h2').length !== 600 ||
+      !markdown.textContent?.endsWith('完整文档结束标记') ||
+      !markdown.querySelector('.session-code-block code')?.textContent?.includes('代码结束标记') ||
+      markdown.parentElement?.hasAttribute('data-truncated')
+    )
+      throw new Error('长文档正文或代码被截断。');
+    /** 展开目录时必须覆盖全部章节，避免大纲另设节点上限。 */
+    const outline = root.current?.querySelector('.session-markdown-outline');
+    if (outline && outline.querySelectorAll('li').length !== 601) throw new Error('大纲未包含全部标题。');
+    markdown.lastElementChild?.scrollIntoView({ block: 'end' });
+    setChecked(true);
+  }
+  return (
+    <main
+      ref={root}
+      className={`macos-ai-app session-codex-parity-v1${parameters.has('dark') ? ' theme-dark' : ''}`}
+      data-theme={parameters.has('dark') ? 'dark' : 'light'}
+      style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}
+    >
+      <div style={{ display: 'flex', flexShrink: 0, gap: 8 }}>
+        <select aria-label="预览入口" value={surface} onChange={(event) => setSurface(event.target.value)}>
+          <option value="file">文件预览</option>
+          <option value="session">会话审阅</option>
+          <option value="project">项目源码预览</option>
+          <option value="deliverable">成果阅读</option>
+        </select>
+        {!parameters.has('empty') && !parameters.has('outline') ? (
+          <Button onClick={checkEnd} disabled={!ready}>
+            {checked ? '文末检查通过' : '检查文末'}
+          </Button>
+        ) : null}
+      </div>
+      {!ready ? (
+        <p role="status">正在准备长文档…</p>
+      ) : surface === 'session' ? (
+        <SourceWorkspace preview={preview} viewMode="preview" onViewModeChange={() => {}} language={language} fullWidth onFullWidthChange={() => {}} onClose={() => {}} state={sourceState} onStateChange={setSourceState} />
+      ) : surface === 'project' ? (
+        <ProjectSourceRenderedPreview projectId="qa-project" path="长文档.md" kind="markdown" draft={content} language={language} openFile={async () => {}} />
+      ) : surface === 'deliverable' ? (
+        <div className="task-deliverable-reader-body">
+          <TaskDeliverableContent id="qa-deliverable" title="成果文档" content={content} language={language} />
+        </div>
+      ) : (
+        <FilePreview request={{ kind: 'source', projectId: 'qa-project', path: '长文档.md' }} zh={language === 'zh-CN'} />
+      )}
+    </main>
+  );
+}
+
 /** 在既有验收入口运行真实审核组件；仅模拟文件读取与撤销结果。 */
 function MarkdownReviewQa() {
   /** 通过查询参数覆盖窄分栏、深色和英文场景。 */
@@ -3262,6 +3466,8 @@ function NavigationQa() {
   const [count, setCount] = useState(Math.max(0, Math.min(10000, Number(parameters.get('count') ?? 1000) || 0)));
   /** 在同一个组件内切换会话，检查旧目录不会残留。 */
   const [conversationId, setConversationId] = useState('qa-navigation');
+  /** 冷切换由按钮分别开始和完成，便于观察加载接管且不需要网络或计时脚本。 */
+  const [historyLoading, setHistoryLoading] = useState(false);
   /** 启动时只读取最后四轮正文。 */
   const [loaded, setLoaded] = useState(() => new Set(Array.from({ length: 4 }, (_, index) => count - 4 + index).filter((index) => index >= 0)));
   /** 持续生成只向最后一轮追加文字。 */
@@ -3577,6 +3783,14 @@ function NavigationQa() {
         <Button onClick={recordFrames}>记录帧耗时</Button>
         <Button
           onClick={() => {
+            if (!historyLoading) setConversationId((value) => (value === 'qa-navigation' ? 'qa-navigation-next' : 'qa-navigation'));
+            setHistoryLoading(!historyLoading);
+          }}
+        >
+          {historyLoading ? '显示已加载正文' : '开始冷切换'}
+        </Button>
+        <Button
+          onClick={() => {
             setConversationId((value) => (value === 'qa-navigation' ? 'qa-navigation-next' : 'qa-navigation'));
             setCount(1);
             setLoaded(new Set([0]));
@@ -3611,6 +3825,10 @@ function NavigationQa() {
             const first = ticks?.[0];
             /** 正文虚拟窗口的节点数独立于目录总量。 */
             const rows = surface.current?.querySelectorAll('[data-transcript-row-key]');
+            /** 首屏接管必须完成定位且原位显示，隐藏或位移残留直接报告失败。 */
+            const transcript = surface.current?.querySelector<HTMLElement>('.session-transcript');
+            /** 读取浏览器实际计算样式，避免只核对 React 标记。 */
+            const transcriptStyle = transcript ? getComputedStyle(transcript) : null;
             setReport(
               JSON.stringify(
                 {
@@ -3623,6 +3841,12 @@ function NavigationQa() {
                   lineWidth: first?.firstElementChild?.getBoundingClientRect().width,
                   lineHeight: first?.firstElementChild?.getBoundingClientRect().height,
                   renderedRows: rows?.length,
+                  transcriptPresentationCheck: historyLoading
+                    ? '等待读取完成'
+                    : transcript?.parentElement?.dataset.historyReady === 'true' && transcriptStyle?.opacity === '1' && transcriptStyle.transform === 'none'
+                      ? '通过'
+                      : '失败：正文仍被隐藏或滚动容器存在位移',
+                  distanceFromBottom: transcript ? transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop : null,
                   loadedTurns: loaded.size,
                   railHeight: surface.current?.querySelector('.session-navigation-rail')?.getBoundingClientRect().height,
                   ...(questionHistory
@@ -3660,7 +3884,7 @@ function NavigationQa() {
         {report}
       </pre>
       <div ref={surface} className="ai-workspace" style={{ width: narrow ? 360 : '100%', maxWidth: '100%', flex: 1, minHeight: 0, display: 'flex' }}>
-        <ConversationTranscript state={state} language="zh-CN" transcriptHydrated onLoadNavigation={loadNavigation} onLoadNavigationTurn={loadTurn} />
+        <ConversationTranscript state={state} language="zh-CN" transcriptHydrated={!historyLoading} historyLoading={historyLoading} onLoadNavigation={loadNavigation} onLoadNavigationTurn={loadTurn} />
       </div>
     </main>
   );

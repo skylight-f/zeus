@@ -1,5 +1,5 @@
 import { classifyAssistantMessage } from '@zeus/shared';
-import { type HTMLAttributes, type KeyboardEvent, type RefObject, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type HTMLAttributes, type KeyboardEvent, type RefObject, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useHoverIntent } from '../ui/useHoverIntent.js';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
@@ -22,7 +22,6 @@ import type {
 import { ComposerDropdown } from './ComposerDropdown.js';
 import { PermissionModeControl } from './PermissionModeControl.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
-import { autosizeTextarea } from './textareaAutosize.js';
 import { CollaborationModeControl } from './CollaborationModeControl.js';
 import { ConversationComposerAttachments } from './ConversationComposerAttachments.js';
 import { ContextUsageIndicator } from './ContextUsageIndicator.js';
@@ -208,7 +207,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
       recoverInputOperation('input_resource');
       props.onAddAttachments?.(attachments);
     },
-    onRemoveAttachment: (attachment) => props.onRemoveAttachment?.(attachment),
     onError: setInputResourceError,
   });
   useEffect(() => {
@@ -225,10 +223,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
     if (nextEffort !== selectedEffort) setSelectedEffort(nextEffort);
     if (serviceTierSelectionValue(nextServiceTier) !== serviceTierSelectionValue(selectedServiceTier)) setSelectedServiceTier(nextServiceTier);
   }, [props.capabilities, props.runtimeSettings, props.state.snapshot?.nextTurnSettings, props.state.providerSettings?.effort, props.state.providerSettings?.model, selectedEffort, selectedModel, selectedServiceTier]);
-
-  useLayoutEffect(() => {
-    if (textareaRef.current instanceof HTMLTextAreaElement) autosizeTextarea(textareaRef.current);
-  }, [editorValue, goalDraft, goalInputActive, textareaRef]);
 
   /** 自动预测要求空输入且无待处理交互；手动生成可以与主会话并行。 */
   const suggestion = useInputSuggestion({
@@ -257,16 +251,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
     setGoalInputOpen(false);
     setGoalDraft('');
   }, [props.goal]);
-
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!(textarea instanceof HTMLTextAreaElement)) return;
-    const view = textarea.ownerDocument.defaultView;
-    if (!textarea || !view) return;
-    const resize = () => autosizeTextarea(textarea);
-    view.addEventListener('resize', resize);
-    return () => view.removeEventListener('resize', resize);
-  }, [textareaRef]);
 
   /** 发送按钮明确允许采纳灰字；输入框 Enter 沿用原有草稿发送行为。 */
   function submit(nextDelivery: 'queue' | 'steer_now', acceptSuggestion = false): void {
@@ -363,21 +347,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
 
   /** 普通输入与 Markdown 输入共用发送条件和附件快捷键。 */
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement | HTMLDivElement>): void {
-    // 输入法和候选菜单先处理按键；仅真正有焦点的空编辑器可以采纳灰字。
-    if (!isComposing && !composingRef.current && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
-      if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && suggestion.text && textareaRef.current?.insertSuggestion?.(suggestion.text)) {
-        event.preventDefault();
-        event.stopPropagation();
-        suggestion.dismiss();
-        return;
-      }
-      if (event.key === 'Escape' && (suggestion.text || suggestion.polishedText || suggestion.pending || suggestion.reason)) {
-        event.preventDefault();
-        event.stopPropagation();
-        suggestion.dismiss();
-        return;
-      }
-    }
+    // 输入法和命令菜单优先，建议的生成、采用和取消共用统一入口。
+    if (!isComposing && !composingRef.current && suggestion.handleKeyDown(event, textareaRef.current)) return;
     if (!goalInputActive) inputResources.handlePasteShortcut(event);
     const intent = resolveComposerKeyIntent({
       key: event.key,
@@ -462,7 +433,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
           language={props.language}
           disabled={!inputWritable || busy || inputResources.processing}
           onRemove={(attachment) => props.onRemoveAttachment?.(attachment)}
-          onRestorePastedText={goalInputActive ? undefined : inputResources.restorePastedText}
         />
         {goalInputActive ? (
           <textarea
@@ -475,7 +445,6 @@ export function ConversationComposer(props: ConversationComposerProps) {
             value={goalDraft}
             disabled={!inputWritable || busy || goalOperationBusy}
             onChange={(event) => {
-              autosizeTextarea(event.currentTarget);
               setGoalDraft(event.currentTarget.value);
             }}
             onCompositionStart={() => setIsComposing(true)}
@@ -488,7 +457,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             <StructuredComposerInput
               value={editorValue}
               onValueChange={(nextValue) => {
-                suggestion.dismiss();
+                if (nextValue !== editorValue) suggestion.beginEditing();
                 setEditorValue(nextValue);
                 if (!composingRef.current) props.onDraftChange(nextValue);
               }}
@@ -500,7 +469,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               language={props.language}
               disabled={!inputWritable || busy || goalOperationBusy}
               ariaLabel={inputLabel}
-              ariaKeyShortcuts="Enter Shift+Enter Escape Meta+A Control+A"
+              ariaKeyShortcuts="Tab Enter Shift+Enter Escape Meta+A Control+A"
               placeholder={props.inputBlocked ? copy.recoveredInputBlocked : copy.placeholder}
               suggestion={suggestion.text}
               loadCatalog={props.onLoadExtensions}
@@ -521,7 +490,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               }}
               onOpenComputerSettings={props.onOpenComputerSettings}
               onCompositionStart={() => {
-                suggestion.dismiss();
+                suggestion.beginEditing();
                 composingRef.current = true;
                 setIsComposing(true);
               }}
@@ -539,7 +508,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 props.onDraftChange(nextValue);
               }}
               onPaste={(event) => {
-                suggestion.dismiss();
+                suggestion.beginEditing();
                 inputResources.handlePaste(event);
               }}
               onKeyDown={handleKeyDown}
@@ -551,20 +520,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             {/* 附件入口直接显示功能提示，禁用时仍可识别用途。 */}
             {props.onChooseAttachments ? (
               <IconTooltip label={copy.attach}>
-                <button
-                  type="button"
-                  className="session-attachment-button"
-                  aria-label={copy.attach}
-                  onClick={() => {
-                    setInputResourceError(null);
-                    void Promise.resolve()
-                      .then(() => props.onChooseAttachments?.())
-                      .catch((error: unknown) => {
-                        setInputResourceError(error);
-                      });
-                  }}
-                  disabled={!inputWritable || busy || inputResources.processing}
-                >
+                <button type="button" className="session-attachment-button" aria-label={copy.attach} aria-haspopup="menu" onClick={inputResources.chooseAttachments} disabled={!inputWritable || busy || inputResources.processing}>
                   <Paperclip aria-hidden="true" weight="regular" />
                 </button>
               </IconTooltip>
@@ -817,14 +773,33 @@ function ContextDraftAttachment(props: { draft: ConversationContextDraft; langua
                 {zh ? `代码评论 ${index + 1}` : `Code comment ${index + 1}`} · {comment.position.path}:
                 {comment.position.startLine && comment.position.startLine !== comment.position.line ? `${comment.position.startLine}-${comment.position.line}` : comment.position.line}
               </span>
-              <p>{comment.body}</p>
+              {comment.position.selectedText?.trim() ? (
+                <blockquote>
+                  <span className="session-response-annotation-label">{zh ? '引用原文' : 'Quoted text'}</span>
+                  {comment.position.selectedText}
+                </blockquote>
+              ) : null}
+              {comment.body.trim() ? (
+                <p>
+                  {comment.position.selectedText?.trim() ? <span className="session-response-annotation-label">{zh ? '我的评论' : 'My comment'}</span> : null}
+                  {comment.body}
+                </p>
+              ) : null}
             </article>
           ))}
           {props.draft.responseAnnotations.map((annotation, index) => (
             <article key={annotation.id}>
               <span>{zh ? `回答评论 ${index + 1}` : `Response comment ${index + 1}`}</span>
-              <blockquote>{annotation.anchor.selectedText}</blockquote>
-              {annotation.note?.trim() ? <p>{annotation.note}</p> : null}
+              <blockquote>
+                <span className="session-response-annotation-label">{zh ? '引用原文' : 'Quoted text'}</span>
+                {annotation.anchor.selectedText}
+              </blockquote>
+              {annotation.note?.trim() ? (
+                <p>
+                  <span className="session-response-annotation-label">{zh ? '我的评论' : 'My comment'}</span>
+                  {annotation.note}
+                </p>
+              ) : null}
             </article>
           ))}
         </div>

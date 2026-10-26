@@ -1,17 +1,15 @@
+import type { FilePreviewSourceWorkspace } from '@zeus/shared';
+import { compareConversationWorkStartedDesc, cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig, matchesTaskDeadline, projectTerminalOutput, type TaskDeadlineFilter, temporaryWorkspaceId } from '@zeus/shared';
 import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
-import { matchesTaskDeadline, type TaskDeadlineFilter } from '@zeus/shared';
 import type { DigitalTeamEntrySelection } from '../digital-teams/DigitalTeamWorkspace.js';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GlobalAgentSettingsHandle } from '../../settings/GlobalAgentSettingsPane.js';
-import { projectTerminalOutput, temporaryWorkspaceId } from '@zeus/shared';
-import { cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig } from '@zeus/shared';
 import { type AutomaticUpdateIndicatorState, loadAutomaticUpdateIndicatorFromMain } from '../../appShellBridge.js';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation, conversationTreeRuntimeStateFromSession, type ProjectConversationGroup } from '../../session/ProjectConversationTree.js';
 import { createNativeConversationStartEnvelopeManager, createProjectConversationStartEnvelopeManager, preloadCodexConversationCapabilities, type SessionWorkspaceTask } from '../../session/SessionWorkspace.js';
-import { forgetConversationStartCommandRequest, conversationStartClientCommandTypes } from '../conversations/conversationStartCommandClient.js';
+import { conversationStartClientCommandTypes, forgetConversationStartCommandRequest } from '../conversations/conversationStartCommandClient.js';
 import type { CodexConversationCapabilities, CodexTaskPushCapabilities, NativeConversationChoice, NativeSessionState, SessionConversationOwner, StartTaskModelPushRequest } from '../../session/sessionTypes.js';
-import { compareConversationStageUpdatedDesc } from '../../session/conversationOrdering.js';
-import { buildPersistedSessionViewCache, initialSessionHotCache, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
+import { buildPersistedSessionViewCache, initialSessionHotCache, refreshSessionHotState, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
 import { type TaskModelPushForm, type TaskModelPushModalStatus } from '../../task/TaskModelPushModal.js';
 import { projectTaskModelPushConversationChoices } from '../../task/TaskModelPushPendingWorkspace.js';
 import { useConversationFeatureController } from '../conversations/useConversationFeatureController.js';
@@ -29,13 +27,12 @@ import {
   type AiRuntimeAdapterStatus,
   type AiRuntimeLogEntry,
   type AiRuntimeSession,
-  type CodexConfigImportResult,
   type CodexConfigImportPreview,
+  type CodexConfigImportResult,
+  type ConversationHistoryItem,
   createEmptyWorkspaceSnapshot,
-  type WorkspaceSnapshot,
   type GitDiffSummary,
   type GitOperationConfirmation,
-  type ConversationHistoryItem,
   type ProjectConfig,
   type ProjectDatabaseSecretSnapshot,
   type ProjectRecord,
@@ -61,6 +58,7 @@ import {
   type TelegramPollingLogEntry,
   type TelegramPollingStatus,
   type TelegramSecuritySettings,
+  type WorkspaceSnapshot,
   type ZeusRealtimeConnectionState,
 } from '../../apiClient.js';
 import {
@@ -95,11 +93,12 @@ import {
   getLanguageCopy,
   inferInitialMainNavTarget,
   inferInitialProjectSection,
+  isTaskModelPushOriginCurrent,
   type LocalUiErrorSnapshot,
   type MainNavTarget,
   type NativeConversationChoiceTaskLoadState,
   normalizeRendererAppShellSettings,
-  orderProjectsByPinnedIds,
+  orderProjects,
   type ProjectCodeWorkspaceMode,
   type ProjectCreateFormState,
   type ProjectDetailPanel,
@@ -116,14 +115,13 @@ import {
   type RuntimeConfirmationStatusState,
   type RuntimeLogCopyStatusState,
   type RuntimeLogExportStatusState,
+  type SessionDrawerTarget,
   type SettingsCategory,
   syncRecordFromSnapshot,
   type TaskBulkActionStatusState,
-  type SessionDrawerTarget,
   type TaskConversationReopenState,
   type TaskCreateFormState,
   type TaskModelPushNavigationTarget,
-  isTaskModelPushOriginCurrent,
   taskTableColumnPreferencesEqual,
   type TrackedTaskModelPushState,
 } from './workspaceSupport.js';
@@ -144,6 +142,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [projectCommandsProjectId, setProjectCommandsProjectId] = useState<string | null>(null);
   const projectSourceWorkspaceRef = useRef<ProjectSourceWorkspaceHandle | null>(null);
   const [sourceWorkspaceDirty, setSourceWorkspaceDirty] = useState(false);
+  /** 预览编辑使用原生源码页，工作树身份与业务项目分开保存。 */
+  const [sourceWorkspaceTarget, setSourceWorkspaceTarget] = useState<FilePreviewSourceWorkspace | null>(null);
   /** 全局规则草稿复用工作区离开确认。 */
   const globalAgentSettingsRef = useRef<GlobalAgentSettingsHandle | null>(null);
   /** 同时用于设置切换和原生窗口关闭保护。 */
@@ -151,14 +151,13 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const workspaceScrollRef = useRef<HTMLElement | null>(null);
   const [dashboardSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot>(() => props.snapshot ?? createEmptyWorkspaceSnapshot());
   /** 附属摘要分别保留加载与失败状态，不能把读取失败当成空数据。 */
-  const [homeSectionStates, setHomeSectionStates] = useState<Record<'attention' | 'runtime' | 'git', { state: 'unloaded' | 'loading' | 'ready' | 'error'; error?: unknown }>>({
+  const [homeSectionStates, setHomeSectionStates] = useState<Record<'attention' | 'runtime', { state: 'unloaded' | 'loading' | 'ready' | 'error'; error?: unknown }>>({
     attention: { state: 'unloaded' },
     runtime: { state: 'unloaded' },
-    git: { state: 'unloaded' },
   });
   /** 显式重试只刷新附属摘要，不重读项目和完整任务。 */
   const [homeRefreshRevision, setHomeRefreshRevision] = useState(0);
-  const { snapshot: projectQuery, replace: replaceProjectQuery } = useProjectFeatureController({ client: props.nativeConversationClient?.projects ?? null, initialItems: dashboardSnapshot.projects });
+  const { snapshot: projectQuery, replace: replaceProjectQuery, load: reloadProjects } = useProjectFeatureController({ client: props.nativeConversationClient?.projects ?? null, initialItems: dashboardSnapshot.projects });
   const {
     snapshot: taskQuery,
     replace: replaceTaskQuery,
@@ -182,7 +181,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
             }
           : received;
       snapshotRef.current = next;
-      replaceProjectQuery(next.projects);
+      // 函数式局部更新和命令回执都不是新读取的完整统计，不能消耗首次活跃机会。
+      replaceProjectQuery(next.projects, typeof updater !== 'function' && received.kind !== 'change');
       replaceTaskQuery(next.tasks);
       setWorkspaceSnapshot(next);
     },
@@ -641,7 +641,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
         automaticInstallEnabled: false,
         recommendedAction: 'open_download_page',
         label: '暂未检查更新',
-        reason: '点击检查更新后读取 GitHub Release 发布清单；实际升级由 macOS 原生 Homebrew 更新窗口承载。',
+        reason: '点击检查更新后读取 GitHub Release 发布清单；实际升级由当前系统的原生更新窗口承载。',
         checkedAt: '',
       },
   );
@@ -699,15 +699,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     language: appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en',
   });
   const projectCreationReady = Boolean(props.onChooseProjectDirectory && props.onCreateCurrentProject);
-  const gitLabel = snapshot.git
-    ? snapshot.git.isRepository
-      ? `Git ${snapshot.git.branch}`
-      : codeWorkspaceCopy.gitNotDetected
-    : homeSectionStates.git.state === 'error'
-      ? 'Git · 读取失败'
-      : homeSectionStates.git.state === 'loading'
-        ? 'Git · 读取中'
-        : 'Git · 未加载';
   useEffect(() => {
     if (!taskCreateModalOpen) return;
     const focusTitleInput = window.setTimeout(() => taskCreateTitleInputRef.current?.focus(), 0);
@@ -726,7 +717,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   }, [props.shellNavigation]);
 
   const visibleProjects = useMemo(() => dedupeProjectRecordsByLocalPath(snapshot.projects), [snapshot.projects]);
-  const orderedProjects = useMemo(() => orderProjectsByPinnedIds(visibleProjects, appShellSettings.pinnedProjectIds), [visibleProjects, appShellSettings.pinnedProjectIds]);
+  /** 项目工作区与侧栏共用冻结的小时顺序，手动置顶即时生效。 */
+  const orderedProjects = useMemo(() => orderProjects(visibleProjects, appShellSettings.pinnedProjectIds), [visibleProjects, appShellSettings.pinnedProjectIds]);
   const firstProject = orderedProjects[0];
   const firstProjectId = firstProject?.id;
   const runtime = runtimeStatus ?? {
@@ -816,13 +808,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const selectedProject = projectDetail ?? firstProject;
   const activeProjectId = selectedProject?.id ?? firstProjectId;
   useEffect(() => {
-    // 初始项目就绪后消化旧页面链接，后续导航只写源码工作区地址。
+    // 初始命令链接打开弹窗，背景保留当前任务或会话页面。
     if (!activeProjectId || typeof window === 'undefined') return;
     if (window.location.hash === '#project-commands') {
       setProjectCommandsProjectId(activeProjectId);
-      window.history.replaceState(null, '', '#project-code-source');
-    } else if (window.location.hash === '#project-git') {
-      window.history.replaceState(null, '', '#project-code-git');
+      window.history.replaceState(null, '', `#project-${activeProjectSection}`);
     }
   }, [activeProjectId]);
   useEffect(() => {
@@ -1029,26 +1019,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       active = false;
     };
   }, [props.nativeConversationClient, homeRefreshRevision]);
-  useEffect(() => {
-    const client = props.nativeConversationClient;
-    if (!client || !activeProjectId) return;
-    let active = true;
-    setWorkspaceSnapshot((current) => ({ ...current, git: null }));
-    setHomeSectionStates((current) => ({ ...current, git: { state: 'loading' } }));
-    void client.git
-      .loadProjectGitStatus(activeProjectId)
-      .then((git) => {
-        if (!active) return;
-        setWorkspaceSnapshot((current) => ({ ...current, git }));
-        setHomeSectionStates((current) => ({ ...current, git: { state: 'ready' } }));
-      })
-      .catch((error: unknown) => {
-        if (active) setHomeSectionStates((current) => ({ ...current, git: { state: 'error', error } }));
-      });
-    return () => {
-      active = false;
-    };
-  }, [activeProjectId, props.nativeConversationClient, homeRefreshRevision]);
   /** 任务页已取得真实首批数据并完成绘制，才上报首次可操作。 */
   const homeInteractiveReportedRef = useRef(false);
   useEffect(() => {
@@ -1102,7 +1072,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       for (const choice of choices) choicesById.set(choice.navigationId ?? choice.id, choice);
     }
     if (focusedArchivedConversation) choicesById.set(focusedArchivedConversation.navigationId ?? focusedArchivedConversation.id, focusedArchivedConversation);
-    return [...choicesById.values()].sort(compareConversationStageUpdatedDesc);
+    return [...choicesById.values()].sort(compareConversationWorkStartedDesc);
   }, [focusedArchivedConversation, nativeConversationChoicesByProject, projectedTaskConversationChoices]);
   const selectedNativeConversation = useMemo(
     () => resolveSelectedNativeConversationForProject(nativeConversationChoices, selectedNativeConversationId, activeProjectId),
@@ -1204,7 +1174,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
         return {
           projectId: project.id,
           projectName: project.name,
-          conversations: [...(nativeConversationChoicesByProject[project.id]?.choices ?? [])].filter((conversation) => !conversation.archived).sort(compareConversationStageUpdatedDesc),
+          conversations: [...(nativeConversationChoicesByProject[project.id]?.choices ?? [])].filter((conversation) => !conversation.archived).sort(compareConversationWorkStartedDesc),
           taskStatuses: statusConfig.statuses.map((status) => ({
             id: status.id,
             label: formatConfiguredTaskManagementStatus(status, statusConfig, appShellSettings.appLanguage),
@@ -1217,7 +1187,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
               taskCode: task.taskCode?.trim() || task.id,
               taskTitle: task.title,
               managementStatus: resolveTaskManagementStatus(task),
-              conversations: conversationTreeHiddenTaskIds.has(task.id) ? [] : [...(projectedTaskConversationChoices[task.id] ?? [])].filter((conversation) => !conversation.archived).sort(compareConversationStageUpdatedDesc),
+              conversations: conversationTreeHiddenTaskIds.has(task.id) ? [] : [...(projectedTaskConversationChoices[task.id] ?? [])].filter((conversation) => !conversation.archived).sort(compareConversationWorkStartedDesc),
             })),
         };
       }),
@@ -1232,6 +1202,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       snapshot.tasks,
     ],
   );
+  /** 会话投影只更新状态，项目顺序由独立的小时统计决定。 */
   const reconcileNativeConversationProjectionStates = useCallback((choices: readonly NativeConversationChoice[]): void => {
     if (choices.length === 0) return;
     setNativeConversationRuntimeStates((current) => {
@@ -1250,17 +1221,19 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const persistNativeConversationViewCache = useCallback((): void => {
     sessionViewCachePersistTimerRef.current = null;
     const persist = window.zeus?.persistSessionViewCache;
-    if (!persist || nativeConversationHotCacheRef.current.size === 0) return;
+    if (nativeConversationHotCacheRef.current.size === 0) return;
     for (const conversationId of dirtySessionViewCacheRef.current) {
+      /** 空闲边界重新测量最新状态，并在序列化落盘前执行原有体积淘汰。 */
+      const current = nativeConversationHotCacheRef.current.get(conversationId);
+      if (current) rememberSessionHotState(nativeConversationHotCacheRef.current, conversationId, current.state, { cachedAt: current.cachedAt });
       const entry = nativeConversationHotCacheRef.current.get(conversationId);
       if (!entry) continue;
       const snapshot = buildPersistedSessionViewCache(new Map([[conversationId, entry]]));
-      if (snapshot.entries.length > 0) persist(snapshot);
+      if (persist && snapshot.entries.length > 0) persist(snapshot);
     }
     dirtySessionViewCacheRef.current.clear();
   }, []);
   const scheduleNativeConversationViewCachePersistence = useCallback((): void => {
-    if (!window.zeus?.persistSessionViewCache) return;
     if (sessionViewCachePersistTimerRef.current !== null) window.clearTimeout(sessionViewCachePersistTimerRef.current);
     sessionViewCachePersistTimerRef.current = window.setTimeout(persistNativeConversationViewCache, 2_500);
   }, [persistNativeConversationViewCache]);
@@ -1280,7 +1253,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       // 冷切换的 controller 只有视图加载态，不能覆盖服务端已经给出的会话运行态；
       // 否则用户快速切走后该临时状态无人收尾，会在侧栏永久留下假转圈。
       if (!state.snapshot && (state.transportState === 'connecting' || state.transportState === 'hydrating' || state.transportState === 'reconnecting' || state.transportState === 'disconnected')) return;
-      const remembered = rememberSessionHotState(nativeConversationHotCacheRef.current, conversationId, state);
+      const remembered = refreshSessionHotState(nativeConversationHotCacheRef.current, conversationId, state);
       // 只有本次进程已经完成权威水合，才把显示缓存推进到磁盘；旧缓存刷新失败不能续期。
       if (remembered && state.transportState === 'ready') {
         dirtySessionViewCacheRef.current.add(conversationId);
@@ -1310,7 +1283,9 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     for (const projectId of JSON.parse(conversationChoiceScopeSignature) as string[]) {
       const taskIds = snapshotRef.current.tasks.filter((task) => task.projectId === projectId).map((task) => task.id);
       const projectRequestVersion = nativeProjectConversationChoiceLoadCoordinator.begin(projectId);
-      const taskLoads = taskIds.map((taskId) => ({ taskId, requestVersion: nativeConversationChoiceLoadCoordinator.begin(taskId) }));
+      /** 已知与响应中新发现的任务共用请求发出时的顺序。 */
+      const taskSnapshotVersion = nativeConversationChoiceLoadCoordinator.beginSnapshot(taskIds);
+      const taskLoads = taskIds.map((taskId) => ({ taskId, requestVersion: taskSnapshotVersion }));
       setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: beginNativeConversationChoiceTaskLoad(current[projectId]) }));
       setNativeConversationChoiceTaskStates((current) => ({
         ...current,
@@ -1325,7 +1300,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
             : null;
           mergeTaskSummaries(snapshot.tasks);
           for (const taskId of Object.keys(snapshot.taskChoicesByTaskId)) {
-            if (!taskLoads.some((entry) => entry.taskId === taskId)) taskLoads.push({ taskId, requestVersion: nativeConversationChoiceLoadCoordinator.begin(taskId) });
+            if (!taskLoads.some((entry) => entry.taskId === taskId))
+              taskLoads.push({
+                taskId,
+                requestVersion: taskSnapshotVersion,
+              });
           }
           const mergedTaskChoices = taskLoads.flatMap(({ taskId, requestVersion }) => {
             const loaded = snapshot.taskChoicesByTaskId[taskId] ?? {
@@ -1336,7 +1315,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
               choices: [],
               items: [],
             };
-            const merged = nativeConversationChoiceLoadCoordinator.commit(taskId, requestVersion, loaded);
+            const merged = nativeConversationChoiceLoadCoordinator.commitSnapshot(taskId, requestVersion, loaded);
             return merged ? ([[taskId, merged]] as const) : [];
           });
           if (mergedProjectChoices) setNativeConversationChoicesByProject((current) => ({ ...current, [projectId]: mergedProjectChoices }));
@@ -1375,11 +1354,12 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       const client = props.nativeConversationClient;
       if (!client) return;
       const projectRequestVersion = nativeProjectConversationChoiceLoadCoordinator.begin(projectId);
+      /** 校准请求返回前到达的实时结果必须保留，不能在返回后重新分配顺序。 */
+      const taskSnapshotVersion = nativeConversationChoiceLoadCoordinator.beginSnapshot(snapshotRef.current.tasks.filter((task) => task.projectId === projectId).map((task) => task.id));
       const loaded = await client.loadProjectConversationChoiceGroups(projectId);
       const projectChoices = nativeProjectConversationChoiceLoadCoordinator.commit(projectId, projectRequestVersion, loaded.projectChoices);
       const taskChoices = Object.entries(loaded.taskChoicesByTaskId).flatMap(([taskId, choices]) => {
-        const requestVersion = nativeConversationChoiceLoadCoordinator.begin(taskId);
-        const merged = nativeConversationChoiceLoadCoordinator.commit(taskId, requestVersion, choices);
+        const merged = nativeConversationChoiceLoadCoordinator.commitSnapshot(taskId, taskSnapshotVersion, choices);
         return merged ? ([[taskId, merged]] as const) : [];
       });
 
@@ -1536,7 +1516,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     gitDiff,
     gitDiffCopy,
     gitHunkDecisions,
-    gitLabel,
     homeSectionStates,
     setHomeRefreshRevision,
     gitOperationStatus,
@@ -1623,6 +1602,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     projectedTaskConversationChoices,
     reconcileNativeConversationProjectSnapshot,
     reconcileNativeConversationProjectionStates,
+    reloadProjects,
     recordNativeConversationRuntimeState,
     recoveringConflictAiStartsRef,
     recoveringNativeConversationStartsRef,
@@ -1814,6 +1794,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     settingsWorkspaceCopy,
     snapshot,
     sourceWorkspaceDirty,
+    sourceWorkspaceTarget,
+    setSourceWorkspaceTarget,
     sourceWorkspaceLeaveDialogOpen,
     sourceWorkspaceSaveBusy,
     storageRecoveryFault,

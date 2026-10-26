@@ -1,6 +1,6 @@
 {
   "name": "zeus",
-  "version": "0.3.200",
+  "version": "0.4.21",
   "private": true,
   "type": "module",
   "scripts": {
@@ -52,7 +52,10 @@
     "verify:quick": "pnpm verify:publish",
     "release:config": "node scripts/distribution-config.mjs",
     "release:distribution:prepare": "node scripts/prepare-distribution-release.mjs",
-    "upstream:check": "node scripts/sync-upstream.mjs"
+    "upstream:check": "node scripts/sync-upstream.mjs",
+    "build:windows": "pnpm --filter @zeus/desktop build:windows",
+    "package:windows": "pnpm --filter @zeus/desktop package:windows",
+    "package:windows:release": "pnpm --filter @zeus/desktop package:windows:release"
   },
   "dependencies": {
     "@fastify/websocket": "^11.3.1",
@@ -99,6 +102,7 @@
       "@jimp/core>file-type": "21.3.4"
     },
     "patchedDependencies": {
+      "app-builder-lib@26.15.3": "patches/app-builder-lib@26.15.3.patch",
       "node-pty@1.1.0": "patches/node-pty@1.1.0.patch",
       "@jimp/core@0.22.12": "patches/@jimp__core@0.22.12.patch",
       "markstream-react@2.0.6": "patches/markstream-react@2.0.6.patch"

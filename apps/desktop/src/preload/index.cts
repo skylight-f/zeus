@@ -15,7 +15,8 @@ function mainCommandScopeId(value: unknown, fallback: string): string {
   return normalized || fallback;
 }
 
-function invokeMainCommand(channel: string, commandType: string, scopeKind: MainCommandScopeKind, scopeId: string, body: unknown = null): Promise<unknown> {
+/** 每次用户操作固定命令身份；附件出错后仅核对原结果，不重放来源读取。 */
+async function invokeMainCommand(channel: string, commandType: string, scopeKind: MainCommandScopeKind, scopeId: string, body: unknown = null): Promise<unknown> {
   const commandId = globalThis.crypto.randomUUID();
   const envelope = Object.freeze({
     schemaGeneration: 'zeus-command-envelope-v1',
@@ -28,7 +29,20 @@ function invokeMainCommand(channel: string, commandType: string, scopeKind: Main
     issuedAt: new Date().toISOString(),
     payload: Object.freeze({ transport: 'electron-ipc', channel }),
   });
-  return ipcRenderer.invoke(channel, Object.freeze({ envelope, body }));
+  /** 核对与首次执行使用同一载荷，禁止生成新的命令身份。 */
+  const request = Object.freeze({ envelope, body });
+  try {
+    return await ipcRenderer.invoke(channel, request);
+  } catch (error) {
+    if (!['desktop.conversation_resources.choose', 'desktop.conversation_resources.store_paths', 'desktop.conversation_resources.materialize', 'desktop.conversation_resources.read_clipboard'].includes(commandType)) throw error;
+    /** 核对入口只读副本和回执；核对本身失败时保留首次错误。 */
+    const recovery = (await ipcRenderer.invoke('zeus:reconcile-conversation-resources', request).catch(() => null)) as { recovered?: boolean; value?: unknown; error?: string } | null;
+    if (recovery?.recovered) {
+      if (typeof recovery.error === 'string') throw new Error(recovery.error);
+      return recovery.value;
+    }
+    throw error;
+  }
 }
 
 function invokeProjectSourceCommand(channel: string, commandType: string, input: unknown): Promise<unknown> {
@@ -68,7 +82,9 @@ globalThis.addEventListener(
   'error',
   (event) => {
     if (!shouldReportRendererWindowError(rendererBootstrapReporter.getState(), event)) return;
-    rendererBootstrapReporter.reportFailure(event.error ?? event.message);
+    /** 资源加载失败没有 ErrorEvent.message，保留实际入口地址用于定位安装包缺失文件。 */
+    const resource = event.target instanceof Element ? event.target.getAttribute('src') || event.target.getAttribute('href') : null;
+    rendererBootstrapReporter.reportFailure(event.error ?? (event.message || `Renderer startup resource failed: ${resource ?? 'unknown'}`));
   },
   true,
 );
@@ -76,7 +92,17 @@ globalThis.addEventListener('unhandledrejection', (event) => {
   rendererBootstrapReporter.reportFailure(event.reason);
 });
 
-async function authorizePendingResourceFiles(files: File[], source: 'paste' | 'drop', pathChannel: string, materializeChannel: string): Promise<{ resources: unknown[]; failedCount: number }> {
+/** 原生文件与无路径图片共用导入结果，保留每个阶段的具体失败原因。 */
+async function authorizePendingResourceFiles(
+  files: File[],
+  source: 'paste' | 'drop',
+  pathChannel: string,
+  materializeChannel: string,
+): Promise<{
+  resources: unknown[];
+  failedCount: number;
+  failureMessage?: string;
+}> {
   if (source === 'paste' && files.length === 1 && isUnsupportedPastedImage(files[0])) {
     const normalized =
       pathChannel === 'zeus:store-task-resource-paths'
@@ -87,9 +113,12 @@ async function authorizePendingResourceFiles(files: File[], source: 'paste' | 'd
     const resources = Array.isArray(normalized.resources) ? normalized.resources : [];
     if (resources.length > 0) return { resources, failedCount: 0 };
   }
+  /** 有磁盘来源的文件继续通过宿主流式保存，不提前装入页面内存。 */
   const nativePaths: string[] = [];
+  /** 无磁盘路径的图片从本次 File 读取，不重新访问剪贴板。 */
   const pathlessFiles: File[] = [];
   for (const file of files) {
+    /** 路径仅从 Electron 文件对象提取，不接受页面自行声明路径。 */
     let nativePath = '';
     try {
       nativePath = webUtils.getPathForFile(file);
@@ -99,6 +128,7 @@ async function authorizePendingResourceFiles(files: File[], source: 'paste' | 'd
     if (nativePath) nativePaths.push(nativePath);
     else pathlessFiles.push(file);
   }
+  /** 逐项保存读取结果，失败原因随同资源回执返回。 */
   const pathlessPayloadResults = await Promise.allSettled(
     pathlessFiles.map(async (file) => ({
       name: file.name,
@@ -107,16 +137,20 @@ async function authorizePendingResourceFiles(files: File[], source: 'paste' | 'd
       source,
     })),
   );
+  /** 只有读取完整的内存内容才能交给宿主持久化。 */
   const pathlessPayloads = pathlessPayloadResults.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []));
+  /** 两类资源沿用各自命令身份，不因其中一类失败重放另一类。 */
   const storeNativePaths = (): Promise<unknown> => {
     if (!nativePaths.length) return Promise.resolve([]);
     if (pathChannel === 'zeus:store-task-resource-paths') {
       return invokeMainCommand(pathChannel, 'desktop.task_resources.store_paths', 'artifact', 'task-input-resources', nativePaths);
     }
-    return ipcRenderer.invoke(pathChannel, nativePaths, source);
+    return invokeMainCommand(pathChannel, 'desktop.conversation_resources.store_paths', 'artifact', 'conversation-input-resources', { paths: nativePaths, source });
   };
+  /** 二进制载荷沿用现有大小校验、副本保存与结果核对。 */
   const materializePayloads = (): Promise<unknown> => {
     if (!pathlessPayloads.length) return Promise.resolve([]);
+    /** 会话与任务使用各自既有的保存通道。 */
     const conversation = materializeChannel === 'zeus:materialize-conversation-resources';
     return invokeMainCommand(
       materializeChannel,
@@ -126,11 +160,30 @@ async function authorizePendingResourceFiles(files: File[], source: 'paste' | 'd
       pathlessPayloads,
     );
   };
+  /** 两路独立导入都完成后再报告，保留成功资源及失败原因。 */
   const [authorizedResult, materializedResult] = await Promise.allSettled([storeNativePaths(), materializePayloads()]);
+  /** 原生文件导入的成功结果。 */
   const authorized = authorizedResult.status === 'fulfilled' && Array.isArray(authorizedResult.value) ? authorizedResult.value : [];
+  /** 无路径图片导入的成功结果。 */
   const materialized = materializedResult.status === 'fulfilled' && Array.isArray(materializedResult.value) ? materializedResult.value : [];
+  /** 成功附件不能因为其他项失败而丢失。 */
   const resources = [...authorized, ...materialized];
-  return { resources, failedCount: Math.max(0, files.length - resources.length) };
+  /** 读取错误与保存错误都保留，不再将异常转换成没有文件。 */
+  const failures = [...pathlessPayloadResults, authorizedResult, materializedResult].filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+  /** 首个真实原因足够定位本批失败，避免重复堆叠同类错误。 */
+  const failureMessage = failures.length > 0 ? pendingResourceFailureMessage(failures[0]!.reason) : undefined;
+  if (resources.length === 0 && failureMessage) throw new Error(failureMessage);
+  return {
+    resources,
+    failedCount: Math.max(0, files.length - resources.length),
+    ...(failureMessage ? { failureMessage } : {}),
+  };
+}
+
+/** 跨上下文错误不依赖原型，保留宿主已提供的具体失败信息。 */
+function pendingResourceFailureMessage(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' && error.message.trim()) return error.message;
+  return typeof error === 'string' && error.trim() ? error : '附件读取或保存失败，未取得具体原因。';
 }
 
 function isUnsupportedPastedImage(file: File): boolean {
@@ -166,11 +219,15 @@ contextBridge.exposeInMainWorld('zeus', {
   /** 使用任务工作区及比较范围打开只读差异窗口。 */
   openTaskGitDiffWindow: (input: unknown) => ipcRenderer.invoke('zeus:task-git-diff:open', input),
   openProjectGitDiffWindow: (input: unknown) => ipcRenderer.invoke('zeus:project-git-diff:open', input),
+  /** 仅返回当前系统差异窗口的只读快照。 */
+  loadProjectGitDiffSnapshot: () => ipcRenderer.invoke('zeus:project-git-diff:load-snapshot'),
   loadProjectGitWorkbench: (projectId: string) => ipcRenderer.invoke('zeus:project-git:load-workbench', projectId),
   loadProjectGitHistory: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-history', input),
   /** 分页读取桌面工作台已落盘的操作记录，不触发 Git 执行。 */
   loadProjectGitOperations: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-operations', input),
   loadProjectGitCommit: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-commit', input),
+  /** 只读预览复用可信主框架通道。 */
+  loadProjectGitPushPreview: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-push-preview', input),
   loadProjectGitComparisonDiff: (input: unknown) => ipcRenderer.invoke('zeus:project-git:load-comparison', input),
   cancelProjectGitAction: (repositoryId: string) => ipcRenderer.invoke('zeus:project-git:cancel-action', repositoryId),
   executeProjectGitAction: (input: unknown) => {
@@ -244,10 +301,23 @@ contextBridge.exposeInMainWorld('zeus', {
 
   // 预览只传递业务身份，资源地址与系统操作均由主进程授权。
   loadFilePreview: (input: unknown) => ipcRenderer.invoke('zeus:file-preview:load', input),
+  /** 区块写入使用独立命令身份，不自动重试未知结果。 */
+  /** 页内保存沿用命令回执及版本令牌，不接收本地路径。 */
+  saveFilePreview: (input: { id: string; content: string }) => invokeMainCommand('zeus:file-preview:save', 'desktop.file_preview.save', 'artifact', input.id, input),
+  revertFilePreviewBlock: (input: { afterId: string }) => invokeMainCommand('zeus:file-preview:revert-block', 'desktop.file_preview.revert_block', 'artifact', input.afterId, input),
   releaseFilePreview: (ids: string[]) => ipcRenderer.invoke('zeus:file-preview:release', ids),
   actOnFilePreview: (id: string, action: string) => ipcRenderer.invoke('zeus:file-preview:action', id, action),
   requestProjectSourceLanguage: (input: unknown) => ipcRenderer.invoke('zeus:project-source:language', input),
   releaseProjectSourceLanguage: (projectId: string) => ipcRenderer.invoke('zeus:project-source:release-language', projectId),
+  /** 按当前窗口的预览令牌读取准确版本归属。 */
+  loadFilePreviewBlame: (id: string) => ipcRenderer.invoke('zeus:file-preview:blame', id),
+  /** 编辑目标只来自主进程固定的项目与工作树授权。 */
+  onFilePreviewSourceWorkspaceRequested: (listener: (workspace: unknown) => void) => {
+    /** 事件不接受页面自行传入的绝对目录。 */
+    const handler = (_event: unknown, workspace: unknown) => listener(workspace);
+    ipcRenderer.on('zeus:file-preview:source-open-workspace', handler);
+    return () => ipcRenderer.removeListener('zeus:file-preview:source-open-workspace', handler);
+  },
   readProjectSourceFile: (input: unknown) => ipcRenderer.invoke('zeus:project-source:read-file', input),
   /** 只向受信源码页提供草稿效果预览。 */
   prepareProjectSourcePreview: (input: unknown) => ipcRenderer.invoke('zeus:project-source:prepare-preview', input),
@@ -273,13 +343,13 @@ contextBridge.exposeInMainWorld('zeus', {
   reportRendererBootstrapReady: () => rendererBootstrapReporter.reportReady(),
   chooseProjectDirectory: () => ipcRenderer.invoke('zeus:choose-project-directory'),
   revealProjectInFinder: (projectPath: string) => ipcRenderer.invoke('zeus:reveal-project-in-finder', projectPath),
-  chooseConversationResources: () => ipcRenderer.invoke('zeus:choose-conversation-resources'),
+  /** 选择图片包含持久化副本，使用同一命令身份接收原生结果。 */
+  chooseConversationResources: () => invokeMainCommand('zeus:choose-conversation-resources', 'desktop.conversation_resources.choose', 'artifact', 'conversation-input-resources'),
   authorizeConversationFiles: (files: File[], source: 'paste' | 'drop') => authorizePendingResourceFiles(files, source, 'zeus:authorize-conversation-files', 'zeus:materialize-conversation-resources'),
   materializeConversationResources: (resources: unknown[]) => invokeMainCommand('zeus:materialize-conversation-resources', 'desktop.conversation_resources.materialize', 'artifact', 'conversation-input-resources', resources),
   readConversationClipboardResources: () => invokeMainCommand('zeus:read-conversation-clipboard-resources', 'desktop.conversation_resources.read_clipboard', 'artifact', 'conversation-input-resources'),
   getConversationResourcePreview: (resource: unknown) => ipcRenderer.invoke('zeus:get-conversation-resource-preview', resource),
   openConversationInputResource: (resource: unknown) => ipcRenderer.invoke('zeus:open-conversation-input-resource', resource),
-  discardConversationResources: (resources: unknown[]) => invokeMainCommand('zeus:discard-conversation-resources', 'desktop.conversation_resources.discard', 'artifact', 'conversation-input-resources', resources),
   chooseTaskAttachments: () => invokeMainCommand('zeus:choose-task-attachments', 'desktop.task_resources.choose', 'artifact', 'task-input-resources'),
   authorizeTaskFiles: (files: File[], source: 'paste' | 'drop') => authorizePendingResourceFiles(files, source, 'zeus:store-task-resource-paths', 'zeus:materialize-task-resources'),
   materializeTaskResources: (resources: unknown[]) => invokeMainCommand('zeus:materialize-task-resources', 'desktop.task_resources.materialize', 'artifact', 'task-input-resources', resources),
@@ -325,6 +395,15 @@ contextBridge.exposeInMainWorld('zeus', {
   notifyTerminalActivity: (active: boolean) => ipcRenderer.send('zeus:terminal-activity-changed', active),
   notifySessionContextActivity: (payload: unknown) => ipcRenderer.send('zeus:session-context-activity-changed', payload),
   notifyAppCloseLayerActivity: (active: boolean) => ipcRenderer.send('zeus:app-close-layer-activity-changed', active),
+  /** 只管理当前工作区创建的空白系统窗口。 */
+  updateSystemWindow: (name: string, action: 'show' | 'close'): Promise<void> => ipcRenderer.invoke('zeus:system-window:update', name, action),
+  /** 原生关闭操作交回原表单，提交中禁用关闭规则保持一致。 */
+  onSystemWindowCloseRequest: (listener: (name: string) => void) => {
+    /** 事件只携带主进程登记的窗口身份。 */
+    const handler = (_event: Electron.IpcRendererEvent, name: string) => listener(name);
+    ipcRenderer.on('zeus:system-window:close-request', handler);
+    return () => ipcRenderer.removeListener('zeus:system-window:close-request', handler);
+  },
   resolveTaskTableLayoutCloseRequest: (proceed: boolean) => ipcRenderer.send('zeus:task-table-layout-close-resolution', { proceed }),
   resolveUnsavedChangesCloseRequest: (proceed: boolean) => ipcRenderer.send('zeus:unsaved-changes-close-resolution', { proceed }),
   onTaskTableLayoutCloseRequested: (listener: () => void) => {
@@ -353,8 +432,9 @@ contextBridge.exposeInMainWorld('zeus', {
     ipcRenderer.on('zeus:terminal-close-active-tab', handler);
     return () => ipcRenderer.removeListener('zeus:terminal-close-active-tab', handler);
   },
-  onNativeCloseActiveContextTab: (listener: () => void) => {
-    const handler = () => listener();
+  onNativeCloseActiveContextTab: (listener: (ownerConversationId?: string) => void) => {
+    /** 主进程冻结焦点归属，前一个监听器移动焦点不会改变本次关闭目标。 */
+    const handler = (_event: Electron.IpcRendererEvent, ownerConversationId?: string) => listener(ownerConversationId);
     ipcRenderer.on('zeus:session-context-close-active-tab', handler);
     return () => ipcRenderer.removeListener('zeus:session-context-close-active-tab', handler);
   },

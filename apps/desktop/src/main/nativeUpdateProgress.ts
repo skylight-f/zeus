@@ -29,6 +29,8 @@ export interface NativeUpdateProgressHost {
   update(state: NativeUpdateProgressState): void;
   relaunchAfterProcessExit(input: { pid: number; appPath: string; bundleId: string; version: string }): void;
   close(): void;
+  /** 安装前等待原生助手实际退出，超时必须阻止替换仍被占用的应用。 */
+  closeAndWait(): Promise<void>;
   onAction(listener: (action: NativeUpdateProgressAction) => void): () => void;
   onExit(listener: () => void): () => void;
 }
@@ -39,20 +41,19 @@ interface CreateNativeUpdateProgressHostOptions {
 }
 
 /**
- * AppKit 辅助程序只承载原生窗口；下载和安装责任始终留在 Main 的受控服务中。
+ * 系统原生辅助程序只承载窗口；下载和安装责任始终留在 Main 的受控服务中。
  */
 export async function createNativeUpdateProgressHost(options: CreateNativeUpdateProgressHostOptions): Promise<NativeUpdateProgressHost> {
   await access(options.executablePath);
-  const child = spawn(options.executablePath, [], {
+  const child = spawn(options.executablePath, process.platform === 'win32' ? ['--update-progress'] : [], {
     stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  await new Promise<void>((resolveSpawn, rejectSpawn) => {
-    child.once('spawn', resolveSpawn);
-    child.once('error', rejectSpawn);
+    windowsHide: true,
   });
   const actionListeners = new Set<(action: NativeUpdateProgressAction) => void>();
   const exitListeners = new Set<() => void>();
   let closed = false;
+  /** 多个退出等待者共享一次 quit，避免关闭输入管道后继续写入。 */
+  let stopping = false;
 
   child.on('error', (error) => {
     console.warn('Zeus 原生更新进度窗口运行失败。', error);
@@ -62,9 +63,38 @@ export async function createNativeUpdateProgressHost(options: CreateNativeUpdate
   });
 
   const stdout = createInterface({ input: child.stdout });
+  /** 进程创建不代表窗口就绪；等待原生消息循环回执，启动失败及时交给入口展示。 */
+  const ready = new Promise<void>((resolveReady, rejectReady) => {
+    /** 就绪、退出与超时共用清理，避免留下启动阶段的监听。 */
+    function finish(error?: Error): void {
+      clearTimeout(timeout);
+      stdout.removeListener('line', onReady);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onEarlyExit);
+      if (error) rejectReady(error);
+      else resolveReady();
+    }
+    /** 只有原生窗口的明确回执才允许调用方宣告打开成功。 */
+    function onReady(line: string): void {
+      if (parseAction(line) === 'ready') finish();
+    }
+    /** 启动失败保留原始原因，供统一错误说明处理。 */
+    function onError(error: Error): void {
+      finish(new Error('原生更新窗口启动失败。', { cause: error }));
+    }
+    /** 助手提前退出不能被误认为窗口正常关闭。 */
+    function onEarlyExit(): void {
+      finish(new Error('原生更新窗口在就绪前退出，请检查 Zeus 安装和运行日志。'));
+    }
+    /** 冷启动最多等待十秒，不让用户点击后无限等待。 */
+    const timeout = setTimeout(() => finish(new Error('原生更新窗口启动超时，请检查 Zeus 安装和运行日志。')), 10_000);
+    stdout.on('line', onReady);
+    child.once('error', onError);
+    child.once('exit', onEarlyExit);
+  });
   stdout.on('line', (line) => {
     const action = parseAction(line);
-    if (!action) return;
+    if (!action || action === 'ready') return;
     for (const listener of actionListeners) listener(action);
   });
   child.stderr.on('data', (chunk: Buffer) => {
@@ -91,16 +121,47 @@ export async function createNativeUpdateProgressHost(options: CreateNativeUpdate
   nativeTheme.on('updated', syncAppearance);
   syncAppearance();
 
+  /** 普通关闭发送结束命令；是否需要等待由调用方的退出协议决定。 */
+  function close(): void {
+    if (closed || stopping) return;
+    stopping = true;
+    nativeTheme.removeListener('updated', syncAppearance);
+    send({ type: 'quit' });
+    child.stdin.end();
+  }
+
+  try {
+    await ready;
+    if (closed) throw new Error('原生更新窗口已退出，无法显示更新状态。');
+  } catch (error) {
+    close();
+    // 这里只终止本次未就绪的显示助手，不接触下载任务或独立安装器。
+    if (!closed) child.kill();
+    throw error;
+  }
+
   return {
     show: () => send({ type: 'show' }),
     hide: () => send({ type: 'hide' }),
     update: (state) => send({ type: 'state', ...state }),
     relaunchAfterProcessExit: (input) => send({ type: 'relaunch', ...input }),
-    close: () => {
+    close,
+    closeAndWait: async () => {
       if (closed) return;
-      nativeTheme.removeListener('updated', syncAppearance);
-      send({ type: 'quit' });
-      child.stdin.end();
+      await new Promise<void>((resolveExit, rejectExit) => {
+        /** 监听实际进程退出，不能把成功写入 quit 当作文件已解除占用。 */
+        const onExit = (): void => {
+          clearTimeout(timeout);
+          resolveExit();
+        };
+        /** 最多等待十秒，失败交给主进程阻止安装，不强杀后伪造成功。 */
+        const timeout = setTimeout(() => {
+          child.removeListener('exit', onExit);
+          rejectExit(new Error('Windows 更新窗口尚未退出，已停止安装。'));
+        }, 10_000);
+        child.once('exit', onExit);
+        close();
+      });
     },
     onAction: (listener) => {
       actionListeners.add(listener);
@@ -113,12 +174,14 @@ export async function createNativeUpdateProgressHost(options: CreateNativeUpdate
   };
 }
 
-function parseAction(line: string): NativeUpdateProgressAction | null {
+/** 就绪回执只用于启动握手，其他动作继续交给共享更新控制器。 */
+function parseAction(line: string): NativeUpdateProgressAction | 'ready' | null {
   try {
     const value = JSON.parse(line) as unknown;
     if (!isRecord(value)) return null;
     const action = value.action;
-    return action === 'download' ||
+    return action === 'ready' ||
+      action === 'download' ||
       action === 'check' ||
       action === 'open_download_page' ||
       action === 'open_installer' ||

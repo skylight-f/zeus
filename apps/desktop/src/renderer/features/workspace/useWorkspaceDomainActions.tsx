@@ -1,17 +1,40 @@
+import { transitionConversation } from '../../session/conversationTransition.js';
 import { useBackgroundInputSuggestions } from '../../session/useBackgroundInputSuggestions.js';
+import { notifyProjectGitChanged } from '../../git/projectGitWorkbenchState.js';
+import { isZentaoDestinationComplete, type ZentaoTaskDestination } from '../../task/ZentaoSyncModal.js';
 import type { ProjectRecord } from '../../apiClient.js';
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { temporaryWorkspaceId, describeUserFacingError, isTaskPriority, type ProjectCodeWorkspacePreference, renderTaskPushLayoutText, type ThirdPartyTaskExtract } from '@zeus/shared';
-import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation } from '../../session/ProjectConversationTree.js';
 import {
-  loadLegacyConversationDetail,
+  type ConversationHistoryItem,
+  isLikelyLocalServerConnectionError,
+  type ProjectGitAction,
+  type ProjectGitActionResponse,
+  type SaveProjectConfigRequest,
+  type TaskBoardOpenMode,
+  type TaskManagementStatus,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskStageRecord,
+  type TaskType,
+  type UpdateTaskRelationshipsRequest,
+  type UpdateTaskRequest,
+  type WorkspaceSnapshot,
+  ZeusApiError,
+  type ZeusRealtimeConnectionState,
+  type ZeusRealtimeEvent,
+} from '../../apiClient.js';
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { describeUserFacingError, isTaskPriority, type ProjectCodeWorkspacePreference, renderTaskPushLayoutText, temporaryWorkspaceId, type ThirdPartyTaskExtract } from '@zeus/shared';
+import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation } from '../../session/ProjectConversationTree.js';
+import { focusTaskPushWindow } from '../../ui/windowDocument.js';
+import {
   cacheCodexConversationCapabilities,
-  preloadCodexConversationCapabilities,
-  readCachedCodexConversationCapabilities,
+  loadLegacyConversationDetail,
   nativeConversationChoiceFromAcceptance,
   type NativeConversationStartFailure,
   type NativeConversationStartPreparation,
+  preloadCodexConversationCapabilities,
   type ProjectSessionWorkspaceStartInput,
+  readCachedCodexConversationCapabilities,
   type SessionWorkspaceActions,
   type SessionWorkspaceStartInput,
   startNativeConversationWithDurableAcceptance,
@@ -34,8 +57,8 @@ import {
   normalizeTaskModelPushCapabilities,
   readTaskModelPushPreferences,
   reconcileTaskPushRepositories,
-  resolveTaskModelPushInitialForm,
   resolveTaskModelPushEntry,
+  resolveTaskModelPushInitialForm,
   selectedTaskPushCurrentConversationPaths,
   selectedTaskPushParentContexts,
   selectedTaskPushRelatedContexts,
@@ -65,28 +88,8 @@ import { modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
 import { reportStorageReadOnlyFault } from '../../storageRecoveryError.js';
 import { readSkillWorkflowDefault, workflowSkillSelectionRequest } from '../skills/skillWorkflowPreferences.js';
 import { createSessionOperationId } from '../../sessionOperationIdentity.js';
-import {
-  type WorkspaceSnapshot,
-  type ConversationHistoryItem,
-  type ProjectGitAction,
-  type ProjectGitActionResponse,
-  type SaveProjectConfigRequest,
-  type TaskBoardOpenMode,
-  type TaskManagementStatus,
-  type TaskPriority,
-  type TaskRecord,
-  type TaskStageRecord,
-  type TaskType,
-  type UpdateTaskRelationshipsRequest,
-  type UpdateTaskRequest,
-  isLikelyLocalServerConnectionError,
-  ZeusApiError,
-  type ZeusRealtimeConnectionState,
-  type ZeusRealtimeEvent,
-} from '../../apiClient.js';
 import { errorToLocalUiMessage, normalizeProjectConfig, redactLocalUiErrorMessage, toProjectConfigForm } from './WorkspaceChrome.js';
 import {
-  isTaskModelPushOriginCurrent,
   appendRuntimeOutputEventsToConversation,
   beginNativeConversationChoiceTaskLoad,
   browserNativeConversationStartStorage,
@@ -101,14 +104,15 @@ import {
   isDefinitiveNativeConversationStartRejection,
   isProjectConversationAttentionState,
   isRuntimeConversationOutputEvent,
+  isTaskModelPushOriginCurrent,
   type NativeConversationAppClient,
   normalizeCodeWorkspaceByProject,
   normalizeProjectLocalPath,
   normalizeRendererAppShellSettings,
   normalizeTaskCreateDraft,
   resolveConversationNavigationId,
-  resolveSelectedNativeConversationForProject,
   resolveNativeConversationSelectionPresentation,
+  resolveSelectedNativeConversationForProject,
   resolveTaskManagementStatusConfig,
   selectCreatedProjectTask,
   shouldRefreshConversationForRuntimeEvent,
@@ -117,9 +121,9 @@ import {
   type TaskCreateAttachmentCandidate,
   type TaskCreateDraft,
   type TaskCreateTextField,
+  type TaskModelPushNavigationTarget,
   toAppShellSettingsSavePayload,
   type TrackedTaskModelPushState,
-  type TaskModelPushNavigationTarget,
   upsertProjectConversationChoiceSnapshot,
   upsertTaskConversationChoiceSnapshot,
 } from './workspaceSupport.js';
@@ -189,6 +193,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     props,
     reconcileNativeConversationProjectSnapshot,
     reconcileNativeConversationProjectionStates,
+    reloadProjects,
     requestWorkspaceLeaveRef,
     repeatRealtimeNativeConversationRefreshIdsRef,
     restoringArchivedConversationId,
@@ -568,6 +573,10 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     const unsubscribe = subscribeRealtimeEvents(
       (event) => {
         observeInputSuggestion(event);
+        // 原生用户发送及旧运行时首条消息刷新完整统计；普通会话状态变化不进入此路径。
+        if (props.nativeConversationClient && (event.type === 'conversation.submission.accepted' || event.type === 'runtime.session.created')) {
+          void reloadProjects().catch((error: unknown) => recordRealtimeSynchronizationError('project-activity-refresh', error));
+        }
         if (event.type === 'codex.models.changed') {
           // 当前连接发布新目录后，所有模型选择器共用一次能力变更通知。
           if (event.payload.succeeded === true) window.dispatchEvent(new Event(codexCapabilitiesChangedEvent));
@@ -661,7 +670,13 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           else if (projectId) void refreshNativeProjectConversationChoices(projectId);
           void refreshArchivedConversations();
         }
-        if (event.type === 'task.git_delivery.changed' && typeof event.payload.taskId === 'string') {
+        if (event.type === 'project.git_delivery.changed' && typeof event.payload.projectId === 'string') {
+          // 后台组合不依赖交付窗口存活，任务与普通会话都从服务端事件刷新真实 Git 快照。
+          if (typeof event.payload.taskId === 'string') taskGitDeliveryChangedRef.current(event.payload.taskId);
+          else setTaskGitDeliveryRevision((current) => current + 1);
+          // 项目工作台沿用同一个失效通知，避免其他入口继续显示旧文件列表。
+          notifyProjectGitChanged(event.payload.projectId);
+        } else if (event.type === 'task.git_delivery.changed' && typeof event.payload.taskId === 'string') {
           taskGitDeliveryChangedRef.current(event.payload.taskId);
         }
         if (event.type === 'task.board.updated' && typeof event.payload.projectId === 'string') {
@@ -707,6 +722,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         statusSyncGeneration += 1;
         clearStatusSyncRetry();
         if (state === 'connected') {
+          // 补读断线期间的完整项目统计；仅尚未记录的本小时首次活跃允许重排。
+          if (props.nativeConversationClient) void reloadProjects().catch((error: unknown) => recordRealtimeSynchronizationError('project-activity-reconciliation', error));
           // 断线期间可能错过目录事件，连接恢复后补读当前快照。
           window.dispatchEvent(new Event(codexCapabilitiesChangedEvent));
           statusSyncAttempt = 0;
@@ -740,6 +757,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     observeInputSuggestion,
     reconcileNativeConversationProjectSnapshot,
     reconcileNativeConversationProjectionStates,
+    reloadProjects,
     resumeNativeConversationAttentionAcknowledgements,
     updateTaskModelPushPendingByTask,
   ]);
@@ -1283,7 +1301,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   }
 
   /** 新建与复制共用提交身份，目标项目参与去重以免重试落入错误项目。 */
-  async function createProjectTaskFromDraft(draft: TaskCreateDraft, projectId = activeProjectId, pushAfterCreate = false): Promise<boolean> {
+  async function createProjectTaskFromDraft(draft: TaskCreateDraft, projectId = activeProjectId, pushAfterCreate = false, zentao?: ZentaoTaskDestination): Promise<boolean> {
     if (!props.onCreateTaskDraft || !projectId) return false;
     const previousTaskIds = new Set(snapshot.tasks.map((task) => task.id));
     setActionState('creating-task');
@@ -1320,6 +1338,25 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
             .onLoadTaskEvents(createdTask.id)
             .then(setTaskEvents)
             .catch((error: unknown) => recordLocalError('task-event-refresh', error));
+        }
+        if (zentao && props.commandClient) {
+          // 本地创建已成功；远端失败只报告同步结果，不返回到创建重试流程。
+          try {
+            /** 只同步此次保存得到的真实任务编号。 */
+            const synced = await props.commandClient.syncTaskToZentao(zentao.instanceId, {
+              taskId: createdTask.id,
+              expectedUpdatedAt: createdTask.updatedAt ?? '',
+              kind: 'task',
+              projectId: zentao.projectId,
+              executionId: zentao.executionId,
+              estStarted: zentao.estStarted,
+              deadline: zentao.deadline,
+              estimate: zentao.estimate === '' ? undefined : Number(zentao.estimate),
+            });
+            mergeTaskRecord(synced.task);
+          } catch (error) {
+            recordLocalError('本地任务已创建，禅道同步未完成', error);
+          }
         }
       }
       setActionState('idle');
@@ -1448,13 +1485,17 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const result = await props.onAuthorizeTaskFiles(files, source);
       if (result.resources.length > 0 && result.failedCount === 0) setTaskCreateError('');
       else if (result.failedCount > 0) {
-        setTaskCreateError(appShellSettings.appLanguage === 'zh-CN' ? `已添加可读取资源，另有 ${result.failedCount} 项读取失败。` : `Readable resources were added; ${result.failedCount} item(s) failed.`);
+        setTaskCreateError(
+          [appShellSettings.appLanguage === 'zh-CN' ? `已添加可读取资源，另有 ${result.failedCount} 项读取失败。` : `Readable resources were added; ${result.failedCount} item(s) failed.`, result.failureMessage].filter(Boolean).join('\n'),
+        );
       }
       return result;
     } catch (error) {
       recordLocalError('renderer-action', error);
-      setTaskCreateError(taskWorkspaceCopy.taskCreatePasteAttachmentFailed);
-      return { resources: [], failedCount: files.length };
+      /** 向任务创建界面保留读取或保存阶段的真实原因。 */
+      const failureMessage = describeUserFacingError(error, appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en').message;
+      setTaskCreateError(failureMessage);
+      return { resources: [], failedCount: files.length, failureMessage };
     }
   }
 
@@ -1507,12 +1548,29 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       return;
     }
     taskCreateSubmittingRef.current = true;
+    setActionState('creating-task');
     try {
+      /** 必填目标和登录事实在创建本地任务之前完成校验。 */
+      const zentao = taskCreateForm.zentao;
+      if (zentao) {
+        if (!isZentaoDestinationComplete(zentao) || !props.commandClient) {
+          setTaskCreateError('请选择完整的禅道目标并填写有效预计工时。');
+          return;
+        }
+        const instances = await props.commandClient.loadZentaoInstances();
+        if (!instances.some((instance) => instance.id === zentao.instanceId && instance.authenticationStatus === 'authenticated')) {
+          setTaskCreateError('禅道登录已失效，请在设置中重新登录。');
+          return;
+        }
+      }
       /** 创建成功与推送检查成功是独立事实，推送失败不重复创建。 */
-      const created = await createProjectTaskFromDraft(normalized.draft, taskCreateForm.projectId, pushAfterCreate);
+      const created = await createProjectTaskFromDraft(normalized.draft, taskCreateForm.projectId, pushAfterCreate, zentao);
       if (created) closeTaskCreateModal();
+    } catch (error) {
+      setTaskCreateError(errorToLocalUiMessage(error, appShellSettings.appLanguage));
     } finally {
       taskCreateSubmittingRef.current = false;
+      setActionState('idle');
     }
   }
 
@@ -1535,6 +1593,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const merged = nativeConversationChoiceLoadCoordinator.commit(taskId, requestVersion, choices);
       if (!merged) return choices;
       setNativeConversationChoicesByTask((current) => ({ ...current, [taskId]: merged }));
+      reconcileNativeConversationProjectionStates(merged.choices);
       setNativeConversationChoiceTaskStates((current) => ({ ...current, [taskId]: completeNativeConversationChoiceTaskLoad(current[taskId]) }));
       return merged;
     } catch (error) {
@@ -1556,6 +1615,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       const merged = nativeProjectConversationChoiceLoadCoordinator.commit(projectId, requestVersion, choices);
       if (!merged) return choices;
       setNativeConversationChoicesByProject((current) => ({ ...current, [projectId]: merged }));
+      reconcileNativeConversationProjectionStates(merged.choices);
       setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: completeNativeConversationChoiceTaskLoad(current[projectId]) }));
       return merged;
     } catch (error) {
@@ -1694,39 +1754,47 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     if (selectionRevision !== nativeConversationSelectionRevision.current) return;
     if (!targetProject || targetProject.id !== conversation.projectId) throw new Error('原会话所属项目无法读取。');
     if (conversation.taskId && (!task || task.id !== conversation.taskId || task.projectId !== targetProject.id)) throw new Error('原会话所属任务无法读取。');
-    /** 查看无项目会话也只读取已存在的托管工作区，不创建替代项目。 */
-    setSnapshot((current) => (current.projects.some((project) => project.id === targetProject.id) ? current : { ...current, projects: [...current.projects, targetProject] }));
-    activeProjectIdRef.current = targetProject.id;
-    setProjectDetail(targetProject);
-    if (task) mergeTaskRecord(task);
-    setTaskDetail(task);
-    /** 自动化等入口可先于列表拿到会话；选择前补齐列表事实，页面才能解析实际会话。 */
+    /** 已有推送工作面继续使用稳定导航身份，重复选择不重播切换动画。 */
     const listedConversation = resolveSelectedNativeConversationForProject(state.nativeConversationChoices, conversation.id, conversation.projectId);
-    // 创建期入口只属于本地工作面，不能写入正式目录或被当作已接纳会话保留。
-    if (!listedConversation && !conversation.archived && conversation.id !== conversation.navigationId) {
-      if (conversation.taskId) {
-        // 已读取的持久会话不能被迟到的列表快照移除。
-        nativeConversationChoiceLoadCoordinator.preserveAccepted(conversation);
-        setNativeConversationChoicesByTask((current) => ({ ...current, [conversation.taskId!]: upsertTaskConversationChoiceSnapshot(conversation.taskId!, current[conversation.taskId!], conversation) }));
-      } else {
-        // 项目会话复用已有的快照保护，切换页面后的目录刷新也保留本次选择。
-        nativeProjectConversationChoiceLoadCoordinator.preserveAccepted(conversation);
-        setNativeConversationChoicesByProject((current) => ({ ...current, [conversation.projectId]: upsertProjectConversationChoiceSnapshot(current[conversation.projectId], conversation) }));
-      }
-    }
-    /** 已有推送工作面继续使用稳定导航身份。 */
     const navigationId = resolveConversationNavigationId(listedConversation ?? conversation);
-    const resolvedPresentation =
-      presentation ?? resolveNativeConversationSelectionPresentation(conversation, nativeConversationRuntimeStates[navigationId] ?? nativeConversationRuntimeStates[conversation.id] ?? conversation.listRuntimeState);
-    selectedNativeConversationIdRef.current = navigationId;
-    setSelectedNativeConversationId(navigationId);
-    setSelectedNativeConversationPresentation(resolvedPresentation);
-    setFocusedArchivedConversation(conversation.archived ? conversation : null);
-    setConversationDraftOpen(false);
-    if (navigation === 'page') {
-      setActiveNavTarget('conversations');
-      setActiveProjectSection('sessions');
-    }
+    /** 原生快照回调可能晚于下一次点击，必须再次核对选择代次。 */
+    const applySelection = (): boolean => {
+      if (selectionRevision !== nativeConversationSelectionRevision.current) return false;
+      /** 查看无项目会话也只读取已存在的托管工作区，不创建替代项目。 */
+      setSnapshot((current) => (current.projects.some((project) => project.id === targetProject.id) ? current : { ...current, projects: [...current.projects, targetProject] }));
+      activeProjectIdRef.current = targetProject.id;
+      setProjectDetail(targetProject);
+      if (task) mergeTaskRecord(task);
+      setTaskDetail(task);
+      /** 自动化等入口可先于列表拿到会话；选择前补齐列表事实，页面才能解析实际会话。 */
+      // 创建期入口只属于本地工作面，不能写入正式目录或被当作已接纳会话保留。
+      if (!listedConversation && !conversation.archived && conversation.id !== conversation.navigationId) {
+        if (conversation.taskId) {
+          // 已读取的持久会话不能被迟到的列表快照移除。
+          nativeConversationChoiceLoadCoordinator.preserveAccepted(conversation);
+          setNativeConversationChoicesByTask((current) => ({ ...current, [conversation.taskId!]: upsertTaskConversationChoiceSnapshot(conversation.taskId!, current[conversation.taskId!], conversation) }));
+        } else {
+          // 项目会话复用已有的快照保护，切换页面后的目录刷新也保留本次选择。
+          nativeProjectConversationChoiceLoadCoordinator.preserveAccepted(conversation);
+          setNativeConversationChoicesByProject((current) => ({ ...current, [conversation.projectId]: upsertProjectConversationChoiceSnapshot(current[conversation.projectId], conversation) }));
+        }
+      }
+      const resolvedPresentation =
+        presentation ?? resolveNativeConversationSelectionPresentation(conversation, nativeConversationRuntimeStates[navigationId] ?? nativeConversationRuntimeStates[conversation.id] ?? conversation.listRuntimeState);
+      selectedNativeConversationIdRef.current = navigationId;
+      setSelectedNativeConversationId(navigationId);
+      setSelectedNativeConversationPresentation(resolvedPresentation);
+      setFocusedArchivedConversation(conversation.archived ? conversation : null);
+      setConversationDraftOpen(false);
+      if (navigation === 'page') {
+        setActiveNavTarget('conversations');
+        setActiveProjectSection('sessions');
+      }
+      return true;
+    };
+    if (selectedNativeConversationIdRef.current === navigationId) applySelection();
+    else await transitionConversation(applySelection);
+    if (selectionRevision !== nativeConversationSelectionRevision.current) return;
     if (conversation.transportKind === 'codex_native') {
       setNativeLegacyMessageLoadState('empty');
       setNativeLegacyMessageError(null);
@@ -1977,6 +2045,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         envelopeManager: nativeConversationStartEnvelopeManager,
         dispatch: (taskId, request) => client.startNativeConversation(taskId, request),
         onAccepted: async (choice) => {
+          reconcileNativeConversationProjectionStates([choice]);
           await adoptConversationBrowser(input, choice);
           // durable acceptance 到达后必须立即离开创建表单；历史摘要刷新只是 best-effort，
           // 不能把已接受操作重新暴露成使用新 ID 的第二次创建。
@@ -2047,6 +2116,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         envelopeManager: projectConversationStartEnvelopeManager,
         dispatch: (acceptedProjectId, request) => client.startProjectConversation(acceptedProjectId, request),
         onAccepted: async (choice) => {
+          reconcileNativeConversationProjectionStates([choice]);
           await adoptConversationBrowser(input, choice);
           nativeProjectConversationChoiceLoadCoordinator.preserveAccepted(choice);
           setNativeConversationChoicesByProject((current) => {
@@ -2314,6 +2384,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
 
   /** 点击后立即打开弹窗并异步读取完整资料；只有用户再次确认才会创建会话或执行任务。 */
   async function openTaskModelPush(taskId: string, stage?: TaskStageRecord): Promise<void> {
+    // 同一任务重复点击只唤回已打开的系统窗口，不覆盖补充说明和附件。
+    if (taskModelPushTaskId === taskId && focusTaskPushWindow() && !stage) return;
     /** 当前任务及客户端属于同一次入口操作。 */
     const task = snapshot.tasks.find((candidate) => candidate.id === taskId);
     const client = props.nativeConversationClient;

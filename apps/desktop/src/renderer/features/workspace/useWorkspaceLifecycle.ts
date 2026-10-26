@@ -1,5 +1,6 @@
 import { PROJECT_WORKSPACE_ENTRIES } from './workspaceSupport.js';
 import { useEffect } from 'react';
+import { isMacOSPlatform } from '../../platform.js';
 import { isDurableNativeConversationAcceptance } from '../../session/SessionWorkspace.js';
 import { clearPendingConflictAiStart, listPendingConflictAiStarts } from '../../task/TaskGitMergeModal.js';
 import { ZeusApiError } from '../../apiClient.js';
@@ -184,15 +185,16 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
   useEffect(() => {
     /** 快捷键沿用本地的独立工作区入口。 */
     function onProjectWorkspaceShortcut(event: globalThis.KeyboardEvent): void {
-      if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.repeat) return;
+      if (!(isMacOSPlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey || event.repeat || event.isComposing || event.defaultPrevented) return;
       // 已关闭但仍在退出动画中的弹层不继续屏蔽工作区快捷键。
-      if (!['1', '2', '3', '4'].includes(event.key) || activeNavTarget === 'settings' || !selectedProject || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
+      if (!['1', '2', '3', '4'].includes(event.key) || !selectedProject || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
       event.preventDefault();
+      event.stopPropagation();
       const entry = PROJECT_WORKSPACE_ENTRIES.find((item) => item.shortcutKey === event.key);
       if (entry) openProjectSection(selectedProject, entry.section, entry.codeMode);
     }
-    window.addEventListener('keydown', onProjectWorkspaceShortcut);
-    return () => window.removeEventListener('keydown', onProjectWorkspaceShortcut);
+    window.addEventListener('keydown', onProjectWorkspaceShortcut, true);
+    return () => window.removeEventListener('keydown', onProjectWorkspaceShortcut, true);
   }, [activeNavTarget, selectedProject, sourceWorkspaceDirty, taskTableLayoutDirty, openProjectSection]);
   useEffect(() => {
     const bridge = window.zeus;

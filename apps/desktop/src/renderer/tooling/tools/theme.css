@@ -136,3 +136,19 @@
   overflow-x: hidden;
   overflow-y: auto;
 }
+
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .project-tools-layout > .project-main-content > .automations-workspace {
+  background: var(--zeus-card-background) !important;
+  border: 1px solid var(--zeus-card-border);
+  border-radius: 12px;
+  box-shadow: none;
+  flex: 1 1 0;
+  block-size: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .project-tools-layout > .project-main-content > .workspace-view.extensions-workspace {
+  overflow-x: hidden;
+  overflow-y: auto;
+}

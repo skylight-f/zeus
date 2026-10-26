@@ -8,6 +8,14 @@ export interface ProjectRecord {
   localPath: string;
   description?: string | null;
   note?: string | null;
+  /** 项目原始创建时间，用于没有活跃记录时保持稳定顺序。 */
+  createdAt?: string;
+  /** 统计截止的 UTC 整点，以 Unix 小时数表示。 */
+  activityHour?: number;
+  /** 上一完整小时用户主动发送次数。 */
+  hourlyUserMessageCount?: number;
+  /** 当前小时用户主动发送次数，仅在项目首次活跃时触发全量排序。 */
+  currentHourUserMessageCount?: number;
 }
 
 export interface ProjectWorkspaceSharedPath {

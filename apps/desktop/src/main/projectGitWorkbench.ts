@@ -1,5 +1,4 @@
 import type { FilePreviewIntent, FilePreviewRequest } from '@zeus/shared';
-import { withProjectGitAuthentication } from './projectGitAuthentication.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
@@ -8,6 +7,8 @@ import {
   discoverGitRepositories,
   executeProjectGitAction,
   getProjectGitCommitDetail,
+  getProjectGitPushPreview,
+  type ProjectGitPushPreviewInput,
   getGitFilePreviewSources,
   getProjectGitHistory,
   getProjectGitComparisonDiff,
@@ -110,6 +111,13 @@ export class ProjectGitWorkbenchService {
     return getProjectGitCommitDetail(resolved.repository.localPath, commitHash);
   }
 
+  /** 复用项目发现的仓库身份，预览不接受 Renderer 指定的本机路径。 */
+  async loadPushPreview(projectId: string, repositoryId: string, input: ProjectGitPushPreviewInput) {
+    /** 只查询当前项目实际拥有的仓库。 */
+    const resolved = await this.resolveRepository(projectId, repositoryId);
+    return getProjectGitPushPreview(resolved.repository.localPath, input);
+  }
+
   async loadComparison(projectId: string, repositoryId: string, ref: string, mode: 'current' | 'working-tree'): Promise<GitDiffSummary> {
     const resolved = await this.resolveRepository(projectId, repositoryId);
     if (!ref.trim()) throw projectGitError('ZEUS_GIT_REF_REQUIRED', '必须选择一个比较分支。');
@@ -144,10 +152,8 @@ export class ProjectGitWorkbenchService {
     try {
       await beforeWrite(resolved.repository, action);
       signal?.throwIfAborted();
-      // 单独推送标签与分支推送共用凭据入口。
-      const remoteAction = action.type === 'subtree' || action.type === 'submodule_update' || action.type === 'fetch' || action.type === 'push' || action.type === 'push_tag' || action.type === 'pull' || action.type === 'update';
-      const run = (env?: NodeJS.ProcessEnv) => executeProjectGitAction(resolved.repository.localPath, action, signal, env, onCommand);
-      const result = await (remoteAction ? withProjectGitAuthentication(run) : run()).catch((error: unknown) => {
+      // 桌面、Core 和模型子进程继承同一系统认证入口，不为每次操作创建临时提示程序。
+      const result = await executeProjectGitAction(resolved.repository.localPath, action, signal, undefined, onCommand).catch((error: unknown) => {
         // 取消也保留底层的恢复信息，尤其是尚未恢复的智能暂存编号。
         const message = redactGitOutput(error instanceof Error ? error.message : String(error));
         const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';

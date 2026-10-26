@@ -162,7 +162,7 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     const projects = new ProjectRepository(db);
     /** 项目根与运行目录保持一致。 */
     const project = projects.create({ name: '快照验证', localPath: workspace });
-    /** 主会话和并发会话共用同一目录以验证归属保护。 */
+    /** 会话绑定真实目录以验证恢复范围。 */
     const conversations = new ConversationRepository(db);
     /** 唯一 Provider 身份隔离每个探针轮次。 */
     const conversation = conversations.getById(conversations.create({ projectId: project.id, title: '快照验证', transportKind: 'codex_native', providerId: 'codex', providerThreadId: 'snapshot-thread' }).id)!;
@@ -197,35 +197,28 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     const service = createTurnChangeSetService(serviceOptions);
     /** 本轮开始前的用户修改必须成为恢复起点。 */
     const turn = newTurn('mixed-edits');
-    await service.beginWorkspace(conversation, 'mixed-submission');
-    service.bindWorkspace(conversation.id, 'mixed-submission', turn.providerTurnId!);
-    /** 同一路径先补丁再脚本，只能算一个文件。 */
-    const changes = [{ path: paths[0]!, kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-user-dirty\n+patched\n' }];
-    service.capture({ conversation, turn, providerItemId: 'patch', changes, phase: 'pre', timestamp });
-    await writeFile(join(workspace, paths[0]!), 'patched\n');
-    service.capture({ conversation, turn, providerItemId: 'patch', changes, phase: 'post', timestamp });
+    /** 仅记录 Provider 明确报告的文件，发送前不再扫描整个工作目录。 */
+    const changes = [
+      ...paths.slice(0, 10).map((path, index) => ({ path, kind: { type: 'update' }, diff: `@@ -1 +1 @@\n-${index === 0 ? 'user-dirty' : 'original'}\n+script-final\n` })),
+      ...paths.slice(10).map((path) => ({ path, kind: { type: 'delete' }, diff: 'original\n' })),
+      { path: 'created.txt', kind: { type: 'add' }, diff: 'new-script-file\n' },
+      { path: 'docs/task.md', kind: { type: 'add' }, diff: '本地文档\n' },
+    ];
+    service.capture({ conversation, turn, providerItemId: 'reported-files', changes, phase: 'pre', timestamp });
     for (const path of paths.slice(0, 10)) await writeFile(join(workspace, path), 'script-final\n');
     for (const path of paths.slice(10)) await unlink(join(workspace, path));
     await writeFile(join(workspace, 'created.txt'), 'new-script-file\n');
-    /** 被忽略的文档保留 Provider 已明确记录的变化。 */
-    const documentChanges = [{ path: 'docs/task.md', kind: { type: 'add' }, diff: '本地文档\n' }];
-    service.capture({ conversation, turn, providerItemId: 'document', changes: documentChanges, phase: 'pre', timestamp });
     await mkdir(join(workspace, 'docs'));
     await writeFile(join(workspace, 'docs/task.md'), '本地文档\n');
-    service.capture({ conversation, turn, providerItemId: 'document', changes: documentChanges, phase: 'post', timestamp });
-    /** 补丁改动后恢复原值应被净变化过滤。 */
-    const reverted = [{ path: 'reverted.txt', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-original\n+temporary\n' }];
-    service.capture({ conversation, turn, providerItemId: 'reverted', changes: reverted, phase: 'pre', timestamp });
-    await writeFile(join(workspace, 'reverted.txt'), 'temporary\n');
-    service.capture({ conversation, turn, providerItemId: 'reverted', changes: reverted, phase: 'post', timestamp });
-    await writeFile(join(workspace, 'reverted.txt'), 'original\n');
-    await service.finishWorkspace({ conversation, turn, timestamp });
+    service.capture({ conversation, turn, providerItemId: 'reported-files', changes, phase: 'post', timestamp });
+    /** 同一工具事件重放不得重复计数或覆盖前像。 */
+    service.capture({ conversation, turn, providerItemId: 'reported-files', changes, phase: 'post', timestamp });
     /** 12 个原文件、1 个新文件、1 个明确记录的忽略文档。 */
     const changeSet = service.seal({ conversation, turn, timestamp });
-    assertBehavior(changeSet?.fileCount === 14, '脚本与补丁必须完整合并，且不计入轮次前的其他脏文件或已还原文件。');
+    assertBehavior(changeSet?.fileCount === 14, '只记录 Provider 明确报告的文件，不计入其他脏文件。');
     assertBehavior(changeSet.state === 'applied' && changeSet.files.every((file) => file.reversible), '完整首末快照必须可恢复。');
-    assertBehavior(changeSet.files.filter((file) => file.newPath === paths[0]).length === 1, '同路径补丁与脚本不能重复计数。');
-    assertBehavior(changeSet.addedLines === 12 && changeSet.deletedLines === 12, '行数必须使用首末净变化，不能累计中间补丁。');
+    assertBehavior(changeSet.files.filter((file) => file.newPath === paths[0]).length === 1, '同一工具事件重放不能重复计数。');
+    assertBehavior(changeSet.addedLines === 12 && changeSet.deletedLines === 12, '行数必须来自实际补丁，重复事件不能累计。');
     await service.operate({ projectId: project.id, conversationId: conversation.id, turnId: turn.id, action: 'undo', request: { changeSetId: changeSet.id, expectedState: 'applied', idempotencyKey: 'undo-mixed' } });
     assertBehavior((await readFile(join(workspace, paths[0]!), 'utf8')) === 'user-dirty\n', '撤销必须保留本轮前的脏内容。');
     assertBehavior((await readFile(join(workspace, 'unrelated.txt'), 'utf8')) === 'prior-user-change\n', '撤销不能触碰其他已有修改。');
@@ -249,17 +242,6 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
       );
     assertBehavior(conflicted, '后续修改必须拒绝整轮撤销。');
     assertBehavior((await readFile(join(workspace, paths[0]!), 'utf8')) === 'later-user-change\n', '撤销冲突不能覆盖后续用户修改。');
-    /** 重叠轮次只开放审阅，不猜测哪个会话拥有文件变化。 */
-    const overlapping = conversations.getById(conversations.create({ projectId: project.id, title: '并发验证', transportKind: 'codex_native', providerId: 'codex', providerThreadId: 'other-thread' }).id)!;
-    /** 第二轮复用真实目录，检验跨会话保护。 */
-    const overlapTurn = newTurn('overlap');
-    await service.beginWorkspace(conversation, 'overlap-main');
-    service.bindWorkspace(conversation.id, 'overlap-main', overlapTurn.providerTurnId!);
-    await service.beginWorkspace(overlapping, 'overlap-other');
-    await writeFile(join(workspace, paths[1]!), 'concurrent\n');
-    await service.finishWorkspace({ conversation, turn: overlapTurn, timestamp });
-    assertBehavior(service.seal({ conversation, turn: overlapTurn, timestamp })?.state === 'unavailable', '重叠目录变化不得自动撤销。');
-
     /** 独立执行目录位于项目目录之外；授权必须以会话目录为准。 */
     const executionRoot = join(root, 'execution');
     await mkdir(executionRoot);
@@ -270,7 +252,7 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     await symlink(outsidePath, join(executionRoot, 'linked.txt'));
     /** 复用正式根目录解析入口，不能回退到项目根来放行路径。 */
     const scopedOptions = { ...serviceOptions, getConversationRoot: () => executionRoot };
-    /** 实时记录、整轮补齐及封存共用同一实例。 */
+    /** 实时记录及封存共用同一实例。 */
     const scopedService = createTurnChangeSetService(scopedOptions);
     /** 共享目录名称不限于文档，目标内容始终留在工作目录外。 */
     const sharedDirectory = join(root, 'shared-content');
@@ -286,27 +268,21 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
       { path: 'shared-assets/old.txt', kind: { type: 'update', move_path: 'local-copy.txt' }, diff: '@@ -1 +1 @@\n-old\n+new\n' },
       { path: 'local-move.txt', kind: { type: 'update', move_path: 'shared-assets/new.txt' }, diff: '@@ -1 +1 @@\n-old\n+new\n' },
     ];
-    /** 纯共享变更不创建空卡片，已跟踪链接也不会使自动快照失败。 */
+    /** 纯共享变更不创建空卡片，不读取链接目标作为代码快照。 */
     const sharedTurn = newTurn('shared-only');
-    await scopedService.beginWorkspace(conversation, 'shared-only');
-    scopedService.bindWorkspace(conversation.id, 'shared-only', sharedTurn.providerTurnId!);
     assertBehavior(scopedService.capture({ conversation, turn: sharedTurn, providerItemId: 'shared-only', changes: sharedChanges, phase: 'pre', timestamp }) === null, '纯共享链接事件不应创建变更集。');
     await writeFile(join(executionRoot, 'linked.txt'), 'shared-edit\n');
     await mkdir(join(sharedDirectory, 'new'));
     await writeFile(join(executionRoot, 'shared-assets/new/note.txt'), 'shared-note\n');
     scopedService.capture({ conversation, turn: sharedTurn, providerItemId: 'shared-only', changes: sharedChanges, phase: 'post', timestamp });
-    await scopedService.finishWorkspace({ conversation, turn: sharedTurn, timestamp });
     assertBehavior(scopedService.seal({ conversation, turn: sharedTurn, timestamp }) === null && scopedService.getByTurn(conversation.id, sharedTurn.id) === null, '共享目标的真实写入不应产生警告或零文件卡片。');
     /** 共享事件排在代码事件之前，仍须保留代码事件的原始文件索引。 */
     const sharedCodeTurn = newTurn('shared-with-code');
     /** 普通代码文件沿用原来的撤销快照。 */
     const sharedCodeChanges = [...sharedChanges, { path: 'code.txt', kind: { type: 'add' }, diff: 'code\n' }];
-    await scopedService.beginWorkspace(conversation, 'shared-with-code');
-    scopedService.bindWorkspace(conversation.id, 'shared-with-code', sharedCodeTurn.providerTurnId!);
     scopedService.capture({ conversation, turn: sharedCodeTurn, providerItemId: 'shared-with-code', changes: sharedCodeChanges, phase: 'pre', timestamp });
     await writeFile(join(executionRoot, 'code.txt'), 'code\n');
     scopedService.capture({ conversation, turn: sharedCodeTurn, providerItemId: 'shared-with-code', changes: sharedCodeChanges, phase: 'post', timestamp });
-    await scopedService.finishWorkspace({ conversation, turn: sharedCodeTurn, timestamp });
     /** 链接只影响记录范围，不影响代码的实际恢复资格。 */
     const sharedCodeSet = scopedService.seal({ conversation, turn: sharedCodeTurn, timestamp });
     assertBehavior(sharedCodeSet?.state === 'applied' && !sharedCodeSet.conflict && sharedCodeSet.fileCount === 1 && sharedCodeSet.files[0]?.newPath === 'code.txt', '共享链接不能禁用同轮代码撤销。');
@@ -381,12 +357,9 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     const mixedChanges = [...rejectedChanges, { path: 'inside.txt', kind: { type: 'add' }, diff: 'inside\n' }];
     /** 路径拒绝只标记本轮记录不可恢复，不抛出会话级异常。 */
     const rejectedTurn = newTurn('rejected-paths');
-    await scopedService.beginWorkspace(conversation, 'rejected-paths');
-    scopedService.bindWorkspace(conversation.id, 'rejected-paths', rejectedTurn.providerTurnId!);
     scopedService.capture({ conversation, turn: rejectedTurn, providerItemId: 'mixed-paths', changes: mixedChanges, phase: 'pre', timestamp });
     await writeFile(join(executionRoot, 'inside.txt'), 'inside\n');
     scopedService.capture({ conversation, turn: rejectedTurn, providerItemId: 'mixed-paths', changes: mixedChanges, phase: 'post', timestamp });
-    await scopedService.finishWorkspace({ conversation, turn: rejectedTurn, timestamp });
     /** 正常快照不能清除路径拒绝原因或生成越界文件恢复记录。 */
     const rejectedSet = scopedService.seal({ conversation, turn: rejectedTurn, timestamp });
     assertBehavior(rejectedSet?.state === 'unavailable' && rejectedSet.fileCount === 1 && rejectedSet.files[0]?.newPath === 'inside.txt', '混合事件应只记录合法文件，并禁止整轮恢复。');
@@ -441,10 +414,10 @@ async function verifyWorkspaceTurnChanges(): Promise<Record<string, unknown>> {
     assertBehavior(outsideUndo && (await readFile(outsidePath, 'utf8')) === 'outside-original\n', '主动恢复必须拒绝链接越界且不得修改目录外文件。');
     return {
       files: changeSet.fileCount,
-      scriptAndPatchMerged: true,
+      providerReportedChangesCaptured: true,
       dirtyBaselinePreserved: true,
       undoReapply: true,
-      concurrentUndoBlocked: true,
+      repeatedProviderEventDeduplicated: true,
       sharedLinksExcluded: true,
       previousSharedWarningsRemoved: true,
       rejectedPathsLocalized: true,
@@ -749,7 +722,7 @@ function verifyStageSummaryProcessGrouping(): Record<string, unknown> {
   };
 }
 
-/** 回放同一身份在本地、队列、明确接纳之间的交接，正文不保存待发副本。 */
+/** 回放同一身份在本地、队列、明确接纳之间的交接，稳定记录只投影一次。 */
 function verifyQueueMessageOwnership(): Record<string, unknown> {
   /** 原始创建时间早于重新排序的更新时间。 */
   const createdAt = '2026-09-28T10:04:10.104Z';
@@ -769,7 +742,7 @@ function verifyQueueMessageOwnership(): Record<string, unknown> {
     ...(position === 0 ? { attachments: [{ id: 'attachment', kind: 'file', name: '证据.txt', path: '/probe/证据.txt' }] } : {}),
   }));
   /** 直接经过生产 reducer，而非重写另一套队列归属逻辑。 */
-  let state: NativeSessionState = { ...createInitialSessionState(), conversationId: 'queue-owner', providerThreadId: 'thread', conversationState: 'active_prework' };
+  let state: NativeSessionState = { ...createInitialSessionState(), conversationId: 'queue-owner', providerThreadId: 'thread', activeTurnId: 'turn', conversationState: 'active_prework' };
   /** 本地发出、服务端尚未确认。 */
   for (const submission of submissions)
     state = sessionReducer(state, {
@@ -787,10 +760,11 @@ function verifyQueueMessageOwnership(): Record<string, unknown> {
       startedAt: createdAt,
     });
   assertBehavior(state.itemOrder.length === 2, '相同文本的两次本地发送必须保留两个身份。');
-  /** 队列接管后只展示权威提交，正文必须没有待发副本。 */
+  /** 队列接管状态和资源，但持久正文到达前保留原显示身份，避免消息跳动。 */
   const queued: NativeQueueSnapshot = { throughEventSeq: 10, state: { type: 'active', turnId: 'turn', phase: 'prework' }, submissions: submissions as NativeQueueSnapshot['submissions'] };
   state = sessionReducer(state, { type: 'queue_hydrated', queue: queued });
-  assertBehavior(state.itemOrder.length === 0 && composerQueuedSubmissions(state).length === 2, '队列接管必须移除本地正文副本，且不按内容去重。');
+  assertBehavior(state.itemOrder.length === 2 && composerQueuedSubmissions(state).length === 2, '队列接管必须保留两个稳定身份，且不按内容去重。');
+  assertBehavior(projectQueuedSubmissionItems(state, visibleQueuedSubmissions(state.queue), Object.values(state.items)).length === 0, '已有稳定身份时不得再投影第二份正文。');
   assertBehavior(composerQueuedSubmissions(state)[0]?.attachments?.length === 1, '附件必须随稳定提交身份保留。');
   /** 失败与结果未知同样直接从权威队列生成。 */
   const paused = { ...queued, throughEventSeq: 11, submissions: queued.submissions.map((submission) => ({ ...submission, status: 'paused', pausedReason: 'outcome_unknown' })) };
@@ -802,6 +776,7 @@ function verifyQueueMessageOwnership(): Record<string, unknown> {
   /** 跨窗口删除后的队列先到，旧 HTTP 回执和旧队列读取后到。 */
   const deleted: NativeQueueSnapshot = { ...queued, throughEventSeq: 12, submissions: [] };
   state = sessionReducer(state, { type: 'queue_hydrated', queue: deleted });
+  for (const submission of submissions) state = sessionReducer(state, { type: 'queued_submission_deleted', submissionId: submission.id, clientUserMessageId: submission.id, queue: deleted });
   state = sessionReducer(state, { type: 'queue_hydrated', queue: queued });
   state = sessionReducer(state, { type: 'send_accepted', clientUserMessageId: 'first', status: 'queued', submissionId: 'first' });
   assertBehavior(

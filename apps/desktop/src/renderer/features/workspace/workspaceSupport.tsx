@@ -1,29 +1,34 @@
-import { normalizeTaskDeadline, type TaskDeadline } from '@zeus/shared';
-import { normalizeInputSuggestionSettings, temporaryWorkspaceId } from '@zeus/shared';
+import {
+  asyncMessageQuestions,
+  compareConversationWorkStartedDesc,
+  defaultTaskBranchPrefix,
+  defaultTaskManagementStatusConfig,
+  extractThirdPartyTaskLink,
+  isTaskStatusFilter,
+  normalizeInputSuggestionSettings,
+  normalizeTaskBranchPrefix,
+  normalizeTaskDeadline,
+  normalizeTaskManagementStatusConfig,
+  type ProjectCodeWorkspacePreference,
+  type TaskDeadline,
+  type TaskManagementStatusConfig,
+  type TaskManagementStatusDefinition,
+  temporaryWorkspaceId,
+  type ThirdPartyTaskExtract,
+  type ZentaoInstanceRecord,
+} from '@zeus/shared';
+import { createZentaoTaskDestination, isZentaoDestinationComplete, type ZentaoTaskDestination, ZentaoTaskDestinationFields } from '../../task/ZentaoSyncModal.js';
 import { usePresenceOpen } from '../../ui/MotionPresence.js';
 import { retainInputFocus } from '../../ui/retainInputFocus.js';
 import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
-import {
-  defaultTaskBranchPrefix,
-  defaultTaskManagementStatusConfig,
-  extractThirdPartyTaskLink,
-  isTaskStatusFilter,
-  normalizeTaskBranchPrefix,
-  normalizeTaskManagementStatusConfig,
-  type ProjectCodeWorkspacePreference,
-  type TaskManagementStatusConfig,
-  type TaskManagementStatusDefinition,
-  type ThirdPartyTaskExtract,
-} from '@zeus/shared';
 import { PENDING_RESOURCE_LONG_TEXT_THRESHOLD } from '../../ui/pendingResourcePolicy.js';
 import { clipboardNeedsResourceRead, clipboardTextAfterResources, dataTransferFiles, usePendingResourcePreviews } from '../../ui/usePendingResourcePreviews.js';
 import type { PendingResourceCardItem } from '../../ui/PendingResourceCards.js';
 import { TaskAttachmentPreviewList } from '../../task/TaskAttachmentPreviewList.js';
 import { type NativeConversationStartStorage, type SessionWorkspaceTask } from '../../session/SessionWorkspace.js';
 import type { NativeConversationChoice, NativeConversationChoicesSnapshot, NativeProjectConversationChoicesSnapshot } from '../../session/sessionTypes.js';
-import { compareConversationStageUpdatedDesc } from '../../session/conversationOrdering.js';
 import type { SessionControllerClient } from '../../session/useSessionController.js';
 import { type TaskModelPushPendingState } from '../../task/TaskModelPushPendingWorkspace.js';
 import { type AppLanguage, languageCopy } from './workspaceCopy.js';
@@ -47,13 +52,12 @@ import {
   type AiRuntimeSession,
   type AiRuntimeSessionStatus,
   type AppShellSettings,
+  type ConversationHistoryItem,
   type DashboardClient,
-  type WorkspaceSnapshot,
   type DeleteTaskRequest,
   type ExecutionHostTransition,
   type GitDiffSummary,
   type GitOperationConfirmation,
-  type ConversationHistoryItem,
   type ProjectConfig,
   type ProjectConversationAttentionState,
   type ProjectDatabaseSecretSnapshot,
@@ -74,6 +78,7 @@ import {
   type TaskTableColumnPreferences,
   type TaskTemplateRecord,
   type TaskType,
+  type WorkspaceSnapshot,
   ZeusApiError,
   type ZeusRealtimeEvent,
 } from '../../apiClient.js';
@@ -155,6 +160,8 @@ export type ControlBusyProps = { 'aria-busy'?: true; 'data-loading'?: 'true' };
 export type TaskCreateAttachment = TaskAttachmentView;
 export type TaskCreateAttachmentCandidate = TaskAttachmentCandidate;
 export type TaskCreateFormState = {
+  /** 仅当前创建表单的可选同步意图，不进入本地任务创建请求。 */
+  zentao?: ZentaoTaskDestination;
   /** 独立的截止配置，不从父任务继承。 */
   deadline?: TaskDeadline | null;
   /** 草稿提交目标，与当前浏览的项目独立。 */
@@ -209,7 +216,8 @@ export function isTaskModelPushOriginCurrent(origin: TaskModelPushNavigationTarg
   return origin.projectId === current.projectId && origin.activeNavTarget === current.activeNavTarget && origin.activeProjectSection === current.activeProjectSection && origin.taskDetailPaneTaskId === current.taskDetailPaneTaskId;
 }
 export type TrackedTaskModelPushState = TaskModelPushPendingState & { origin: TaskModelPushNavigationTarget };
-export type NativeConversationAppClient = SessionControllerClient &
+export type NativeConversationAppClient = import('../../git/GitDeliveryRunControl.js').GitDeliveryClient &
+  SessionControllerClient &
   Pick<
     DashboardClient,
     | 'loadHomeAttention'
@@ -302,6 +310,8 @@ export type NativeConversationAppClient = SessionControllerClient &
     // 控制台与 Git 工作台通过同一个原生客户端读取耐久历史。
     | 'loadProjectGitOperations'
     | 'loadProjectGitCommit'
+    /** 项目 Git 弹窗与源码底栏共用显式推送范围预览。 */
+    | 'loadProjectGitPushPreview'
     | 'executeProjectGitAction'
     | 'generateGitCommitMessage'
     | 'loadGitCommitModels'
@@ -355,6 +365,12 @@ export function failNativeConversationChoiceTaskLoad(previous: NativeConversatio
 
 export interface NativeConversationChoiceLoadCoordinator {
   begin(taskId: string): number;
+
+  /** 项目批量读取在发出时固定顺序，包含响应中新发现的任务。 */
+  beginSnapshot(taskIds: readonly string[]): number;
+
+  /** 只接收读取期间未被较新请求或实时结果推进的任务。 */
+  commitSnapshot(taskId: string, requestVersion: number, snapshot: NativeConversationChoicesSnapshot): NativeConversationChoicesSnapshot | null;
   isCurrent(taskId: string, requestVersion: number): boolean;
   preserveAccepted(choice: NativeConversationChoice): void;
 
@@ -362,16 +378,53 @@ export interface NativeConversationChoiceLoadCoordinator {
   commit(taskId: string, requestVersion: number, snapshot: NativeConversationChoicesSnapshot): NativeConversationChoicesSnapshot | null;
 }
 
-/** Keeps durable POST acceptance authoritative while eventually consistent GET snapshots race. */
+/** 任务读取共用递增顺序，拒绝迟到快照并保留已经确认创建的会话。 */
 export function createNativeConversationChoiceLoadCoordinator(): NativeConversationChoiceLoadCoordinator {
+  /** 请求顺序在任务之间共享，使项目快照能够保护响应中新发现的任务。 */
+  let requestSequence = 0;
+  /** 每个任务最近发出的读取或已经接收的实时更新。 */
   const requestVersions = new Map<string, number>();
+  /** 创建已确认但尚未出现在目录快照中的会话。 */
   const acceptedByTask = new Map<string, Map<string, NativeConversationChoice>>();
+  /** 单任务读取只允许当前请求写回。 */
   const isCurrent = (taskId: string, requestVersion: number) => requestVersions.get(taskId) === requestVersion;
+  /** 批量与单任务结果共用创建回执保留和排序规则。 */
+  const commit = (taskId: string, requestVersion: number, snapshot: NativeConversationChoicesSnapshot): NativeConversationChoicesSnapshot | null => {
+    if (!isCurrent(taskId, requestVersion)) return null;
+    /** 已经进入快照的会话不再重复补入。 */
+    const loadedIds = new Set(snapshot.choices.map((choice) => choice.id));
+    /** 目录读取不能移除已确认创建但尚未被读取到的入口。 */
+    const preserved = [...(acceptedByTask.get(taskId)?.values() ?? [])].filter((choice) => !loadedIds.has(choice.id));
+    /** 合并后的列表沿用用户发起时间顺序。 */
+    const choices = [...preserved, ...snapshot.choices].sort(compareConversationWorkStartedDesc);
+    return {
+      ...snapshot,
+      hasHistory: choices.length > 0,
+      requiresChoice: choices.length > 0,
+      choices,
+      items: choices,
+    };
+  };
   return {
+    /** 发出单任务读取或接收实时结果时推进该任务的顺序。 */
     begin(taskId) {
-      const requestVersion = (requestVersions.get(taskId) ?? 0) + 1;
+      /** 本次操作在全部任务读取中的位置。 */
+      const requestVersion = ++requestSequence;
       requestVersions.set(taskId, requestVersion);
       return requestVersion;
+    },
+    /** 已知任务立即阻止旧请求；未知任务在响应返回时使用同一顺序。 */
+    beginSnapshot(taskIds) {
+      /** 批量请求的顺序必须在异步读取前确定。 */
+      const requestVersion = ++requestSequence;
+      for (const taskId of taskIds) requestVersions.set(taskId, requestVersion);
+      return requestVersion;
+    },
+    /** 响应中新发现的任务也不能覆盖读取期间已经收到的实时结果。 */
+    commitSnapshot(taskId, requestVersion, snapshot) {
+      if ((requestVersions.get(taskId) ?? 0) > requestVersion) return null;
+      requestVersions.set(taskId, requestVersion);
+      return commit(taskId, requestVersion, snapshot);
     },
     isCurrent,
     preserveAccepted(choice) {
@@ -382,25 +435,13 @@ export function createNativeConversationChoiceLoadCoordinator(): NativeConversat
     },
     forget(taskId, conversationId) {
       // 已确认归档后，让归档前发出的目录读取失效。
-      requestVersions.set(taskId, (requestVersions.get(taskId) ?? 0) + 1);
+      requestVersions.set(taskId, ++requestSequence);
       const accepted = acceptedByTask.get(taskId);
       if (!accepted) return;
       accepted.delete(conversationId);
       if (accepted.size === 0) acceptedByTask.delete(taskId);
     },
-    commit(taskId, requestVersion, snapshot) {
-      if (!isCurrent(taskId, requestVersion)) return null;
-      const loadedIds = new Set(snapshot.choices.map((choice) => choice.id));
-      const preserved = [...(acceptedByTask.get(taskId)?.values() ?? [])].filter((choice) => !loadedIds.has(choice.id));
-      const choices = [...preserved, ...snapshot.choices].sort(compareConversationStageUpdatedDesc);
-      return {
-        ...snapshot,
-        hasHistory: choices.length > 0,
-        requiresChoice: choices.length > 0,
-        choices,
-        items: choices,
-      };
-    },
+    commit,
   };
 }
 
@@ -442,7 +483,7 @@ export function createNativeProjectConversationChoiceLoadCoordinator(): NativePr
       if (!isCurrent(projectId, requestVersion) || snapshot.projectId !== projectId) return null;
       const loadedIds = new Set(snapshot.choices.map((choice) => choice.id));
       const preserved = [...(acceptedByProject.get(projectId)?.values() ?? [])].filter((choice) => !loadedIds.has(choice.id));
-      const choices = [...preserved, ...snapshot.choices].filter((choice) => choice.projectId === projectId && choice.taskId === null).sort(compareConversationStageUpdatedDesc);
+      const choices = [...preserved, ...snapshot.choices].filter((choice) => choice.projectId === projectId && choice.taskId === null).sort(compareConversationWorkStartedDesc);
       return { projectId, choices, items: choices };
     },
   };
@@ -593,8 +634,12 @@ export function isProjectConversationAttentionState(value: unknown): value is Pr
   return value === 'idle' || value === 'running' || value === 'unread' || value === 'completed' || value === 'failed' || value === 'interrupted' || value === 'reply_required';
 }
 
+/** 问题完成时刷新未打开的会话，普通工具输出与流式增量不触发列表查询。 */
 export function shouldRefreshNativeConversationListForRealtimeEvent(event: ZeusRealtimeEvent): boolean {
-  return nativeConversationListLifecycleEventTypes.has(event.type) && typeof event.payload.projectId === 'string' && typeof event.payload.conversationId === 'string';
+  /** 只接受协议中有效的异步问题，不能把普通消息完成当作待回复。 */
+  const asyncQuestionCompleted =
+    event.type === 'conversation.item.completed' && event.payload.itemPayload !== null && typeof event.payload.itemPayload === 'object' && asyncMessageQuestions(event.payload.itemPayload as Record<string, unknown>).length > 0;
+  return (nativeConversationListLifecycleEventTypes.has(event.type) || asyncQuestionCompleted) && typeof event.payload.projectId === 'string' && typeof event.payload.conversationId === 'string';
 }
 
 /** 工作模式属于当前任务或会话，不作为项目偏好。 */
@@ -801,13 +846,11 @@ export function resolveConversationNavigationId(conversation: NativeConversation
 
 export function resolveTaskConversationToView(snapshot: NativeConversationChoicesSnapshot | undefined): NativeConversationChoice | null {
   if (!snapshot?.choices.length) return null;
-  return [...snapshot.choices].sort(compareConversationStageUpdatedDesc)[0] ?? null;
+  return [...snapshot.choices].sort(compareConversationWorkStartedDesc)[0] ?? null;
 }
 
 export function upsertTaskConversationChoiceSnapshot(taskId: string, snapshot: NativeConversationChoicesSnapshot | undefined, metadata: NativeConversationChoice): NativeConversationChoicesSnapshot {
-  const choices = metadata.archived
-    ? (snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)
-    : [metadata, ...(snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)].sort(compareConversationStageUpdatedDesc);
+  const choices = metadata.archived ? (snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id) : [metadata, ...(snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)].sort(compareConversationWorkStartedDesc);
   return {
     taskId,
     projectId: metadata.projectId,
@@ -819,9 +862,7 @@ export function upsertTaskConversationChoiceSnapshot(taskId: string, snapshot: N
 }
 
 export function upsertProjectConversationChoiceSnapshot(snapshot: NativeProjectConversationChoicesSnapshot | undefined, metadata: NativeConversationChoice): NativeProjectConversationChoicesSnapshot {
-  const choices = metadata.archived
-    ? (snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)
-    : [metadata, ...(snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)].sort(compareConversationStageUpdatedDesc);
+  const choices = metadata.archived ? (snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id) : [metadata, ...(snapshot?.choices ?? []).filter((choice) => choice.id !== metadata.id)].sort(compareConversationWorkStartedDesc);
   return { projectId: metadata.projectId, choices, items: choices };
 }
 export const workModeValues = ['plan', 'develop', 'review', 'debug'] as const;
@@ -1365,6 +1406,7 @@ export function inferInitialMainNavTarget(props: {
   return 'projects';
 }
 
+/** 源码保持整页，Git 与命令入口保留任务或会话背景。 */
 export function inferInitialProjectSection(props: {
   initialMainNavTarget?: LegacyMainNavTarget;
   initialAppShellSettings?: AppShellSettings;
@@ -1390,7 +1432,8 @@ export function inferInitialProjectSection(props: {
   if (typeof window !== 'undefined' && (window.location.hash === '#project-tasks' || window.location.hash === '#tasks')) return 'tasks';
   if (typeof window !== 'undefined' && (window.location.hash === '#project-sessions' || window.location.hash === '#conversations')) return 'sessions';
   if (props.initialMainNavTarget === 'tasks') return 'tasks';
-  if (props.initialMainNavTarget === 'git-diff' || props.initialMainNavTarget === 'projects') return 'code';
+  if (props.initialMainNavTarget === 'git-diff') return 'tasks';
+  if (props.initialMainNavTarget === 'projects') return 'code';
   if (props.initialMainNavTarget === 'conversations' || props.initialMainNavTarget === 'runtime' || props.initialMainNavTarget === 'dashboard') return 'sessions';
   if (
     props.initialTaskEvents?.length ||
@@ -1448,11 +1491,14 @@ export function dedupeProjectRecordsByLocalPath(projects: ProjectRecord[]): Proj
   return deduped;
 }
 
-export function orderProjectsByPinnedIds(projects: ProjectRecord[], pinnedProjectIds: string[]): ProjectRecord[] {
-  if (pinnedProjectIds.length === 0) return projects;
+/** 置顶保持手动次序，其余沿用项目查询层在整点或首次活跃时确定的顺序。 */
+export function orderProjects(projects: ProjectRecord[], pinnedProjectIds: string[]): ProjectRecord[] {
+  /** 置顶顺序始终优先于自动活跃排序。 */
   const pinnedRank = new Map(pinnedProjectIds.map((projectId, index) => [projectId, index]));
   return [...projects].sort((left, right) => {
+    /** 左侧项目的手动置顶位置。 */
     const leftRank = pinnedRank.get(left.id);
+    /** 右侧项目的手动置顶位置。 */
     const rightRank = pinnedRank.get(right.id);
     if (leftRank !== undefined && rightRank !== undefined) return leftRank - rightRank;
     if (leftRank !== undefined) return -1;
@@ -1469,7 +1515,6 @@ export function TaskCreateFieldAttachments(props: {
   copy: ReturnType<typeof getLanguageCopy>['taskWorkspace'];
   disabled: boolean;
   onRemove: (path: string) => void;
-  onRestoreText: (attachment: TaskCreateAttachment) => void;
   onLoadPreview?: (path: string) => Promise<{ previewUrl: string; mimeType: string } | null>;
   onOpenAttachment?: (path: string) => Promise<{ opened: boolean; error?: string }>;
 }) {
@@ -1485,7 +1530,6 @@ export function TaskCreateFieldAttachments(props: {
         mode="editable"
         disabled={props.disabled}
         onRemove={props.onRemove}
-        onRestoreText={props.onRestoreText}
         onLoadPreview={props.onLoadPreview}
         onOpenAttachment={props.onOpenAttachment}
         copy={{
@@ -1509,6 +1553,12 @@ export function TaskCreateFieldAttachments(props: {
 
 /** 创建和复制共用内容表单，第三方读取完成后回到草稿确认。 */
 export function TaskCreateModal(props: {
+  /** 禅道控件与其他任务入口共用已验证实例。 */
+  zentaoInstances?: ZentaoInstanceRecord[];
+  /** 沿用现有集成客户端。 */
+  zentaoClient?: DashboardClient;
+  /** 勾选、取消和目标编辑均只修改本次草稿。 */
+  onZentaoChange?: (value: ZentaoTaskDestination | undefined) => void;
   open: boolean;
   /** 复制任务可选择目标项目；新建任务沿用打开时的项目。 */
   projects: ProjectRecord[];
@@ -1818,29 +1868,6 @@ export function TaskCreateModal(props: {
     );
   }
 
-  function restoreTaskCreateText(attachment: TaskCreateAttachment): void {
-    if (!attachment.restorableText || interactionBusy) return;
-    const defaultRestoreField = activeTaskCreateContentField(props.form.taskType);
-    const restoreTarget = attachment.restoreTarget ?? {
-      field: defaultRestoreField,
-      start: props.form[defaultRestoreField].length,
-      end: props.form[defaultRestoreField].length,
-    };
-    const currentValue = props.form[restoreTarget.field];
-    const start = Math.min(restoreTarget.start, currentValue.length);
-    const end = Math.min(Math.max(start, restoreTarget.end), currentValue.length);
-    const nextValue = `${currentValue.slice(0, start)}${attachment.restorableText}${currentValue.slice(end)}`;
-    const nextCaretPosition = start + attachment.restorableText.length;
-    props.onFormChange(restoreTarget.field, nextValue);
-    props.onRemoveAttachment(attachment.path);
-    window.requestAnimationFrame(() => {
-      const control = document.getElementById(taskCreateControlId(restoreTarget.field));
-      if (!(control instanceof HTMLInputElement) && !(control instanceof HTMLTextAreaElement)) return;
-      control.focus();
-      control.setSelectionRange(nextCaretPosition, nextCaretPosition);
-    });
-  }
-
   /** 异步回填使用粘贴时的选区，保留处理期间继续输入的正文。 */
   function insertTaskCreatePlainTextPaste(field: TaskCreateTextField, control: HTMLInputElement | HTMLTextAreaElement, text: string, selection?: Pick<TaskAttachmentRestoreTarget, 'start' | 'end'>): void {
     if (!text) return;
@@ -2034,7 +2061,6 @@ export function TaskCreateModal(props: {
                     copy={props.copy}
                     disabled={interactionBusy}
                     onRemove={props.onRemoveAttachment}
-                    onRestoreText={restoreTaskCreateText}
                     onLoadPreview={props.onLoadAttachmentPreview}
                     onOpenAttachment={props.onOpenAttachment}
                   />
@@ -2060,7 +2086,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2083,7 +2108,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2106,7 +2130,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2133,7 +2156,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2156,7 +2178,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2171,6 +2192,29 @@ export function TaskCreateModal(props: {
                     />
                   </div>
                 </>
+              ) : null}
+              {props.zentaoInstances?.length ? (
+                <section className="task-create-zentao-options">
+                  <label className="task-create-zentao-toggle">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(props.form.zentao)}
+                      onChange={(event) => props.onZentaoChange?.(event.currentTarget.checked ? createZentaoTaskDestination(props.zentaoInstances?.[0]?.id) : undefined)}
+                      disabled={interactionBusy}
+                    />
+                    <span>{props.copy.taskCountPrefix === 'Tasks' ? 'Create in ZenTao too' : '同步创建到禅道'}</span>
+                  </label>
+                  {props.form.zentao ? (
+                    <ZentaoTaskDestinationFields
+                      client={props.zentaoClient}
+                      instances={props.zentaoInstances}
+                      value={props.form.zentao}
+                      onChange={(value) => props.onZentaoChange?.(value)}
+                      zh={props.copy.taskCountPrefix !== 'Tasks'}
+                      disabled={interactionBusy}
+                    />
+                  ) : null}
+                </section>
               ) : null}
               {settingsOpen ? (
                 <div ref={settingsPanelRef} id="task-create-options" className="task-create-options">
@@ -2199,7 +2243,6 @@ export function TaskCreateModal(props: {
                       copy={props.copy}
                       disabled={interactionBusy}
                       onRemove={props.onRemoveAttachment}
-                      onRestoreText={restoreTaskCreateText}
                       onLoadPreview={props.onLoadAttachmentPreview}
                       onOpenAttachment={props.onOpenAttachment}
                     />
@@ -2241,10 +2284,18 @@ export function TaskCreateModal(props: {
               <Button variant="secondary" size="regular" className="task-create-settings-toggle" aria-expanded={settingsOpen} aria-controls="task-create-options" onClick={() => setSettingsOpen((open) => !open)} disabled={interactionBusy}>
                 {props.copy.taskCreateMoreSettings}
               </Button>
-              <Button type="submit" variant="secondary" size="regular" className="task-create-submit-button" busy={props.busy} disabled={interactionBusy}>
+              <Button type="submit" variant="secondary" size="regular" className="task-create-submit-button" busy={props.busy} disabled={interactionBusy || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}>
                 {props.busy ? props.copy.taskCreateSubmitting : props.copy.taskCreateSubmit}
               </Button>
-              <Button type="submit" name="task-create-action" value="create-and-push" variant="primary" size="regular" className="task-create-push-button" disabled={interactionBusy}>
+              <Button
+                type="submit"
+                name="task-create-action"
+                value="create-and-push"
+                variant="primary"
+                size="regular"
+                className="task-create-push-button"
+                disabled={interactionBusy || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}
+              >
                 {props.copy.taskCreateSubmitAndPush}
               </Button>
             </>

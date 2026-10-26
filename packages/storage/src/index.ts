@@ -1,3 +1,5 @@
+import { migrateGitDelivery } from './gitDeliveryStore.js';
+export * from './gitDeliveryStore.js';
 import { migrateTaskReminders } from './taskReminderStore.js';
 /** 任务提醒与任务共用数据库和耐久事务。 */
 export { TaskReminderRepository } from './taskReminderStore.js';
@@ -7,6 +9,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, lstatSync, realpathSync } from 'node:fs';
 import { chmod, mkdir, open, rename, stat, statfs, unlink } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { assertPrivatePathSync } from './platformSecurity.js';
 import { backup, DatabaseSync } from 'node:sqlite';
 import type { ReadOnlyValidationDescriptor, TokenUsageBreakdown } from '@zeus/shared';
 import { migrateCommandCenterSchema } from './commands.js';
@@ -38,7 +41,7 @@ import { migrateTaskStageSchema } from './taskStageStore.js';
 import { migrateTaskWorkReviewSchema } from './taskWorkReviewStore.js';
 import { migrateTaskWorkDeploymentSchema } from './taskWorkDeploymentStore.js';
 import { migrateTaskWorkPlanningSchema } from './taskWorkPlanningStore.js';
-import { migrateTaskWorkSchema, migrateTaskWorkWorkspaceBindingSchema } from './taskWorkStore.js';
+import { migrateTaskWorkCurrentSkillReferences, migrateTaskWorkSchema, migrateTaskWorkWorkspaceBindingSchema } from './taskWorkStore.js';
 import { migrateDigitalTeamWorkflowSchema, migrateLegacyEmployeeTeamTemplates } from './digitalTeamWorkflowStore.js';
 import { migrateDefectWorkflowSchema } from './defectWorkflowStore.js';
 import { migrateWorkArtifactSchema } from './workArtifactStore.js';
@@ -1011,6 +1014,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     }
     migrateCoreSchema(zeusDb);
     migrateTaskReminders(zeusDb);
+    migrateGitDelivery(zeusDb);
     migrateRetiredCodeGraph(zeusDb);
     migrateTaskBoardSchema(zeusDb);
     migrateRetiredUnitTestTemplate(zeusDb);
@@ -1058,6 +1062,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateConversationTranscriptStoreSchema(zeusDb);
     await initializeConversationTranscriptIndexes(zeusDb, true);
     migrateArtifactStoreSchema(zeusDb);
+    migrateTaskWorkCurrentSkillReferences(zeusDb);
     migrateConversationSyncEventStoreSchema(zeusDb);
     migrateConversationSyncProtocolV2(zeusDb);
     migrateLongTermMemorySchema(zeusDb);
@@ -1115,7 +1120,8 @@ export function captureReadOnlyValidationDatabasePathIdentity(filePath: string, 
   }
   const stats = lstatSync(filePath, { bigint: true });
   if (!stats.isFile() || stats.isSymbolicLink()) throw readOnlyValidationDatabaseIdentityError('数据库必须是普通文件且不能是符号链接。');
-  if (Number(stats.mode & 0o777n) !== 0o600) throw readOnlyValidationDatabaseIdentityError('数据库权限必须为 0600。');
+  if (process.platform === 'win32') assertPrivatePathSync(filePath, 'file');
+  else if (Number(stats.mode & 0o777n) !== 0o600) throw readOnlyValidationDatabaseIdentityError('数据库权限必须为 0600。');
   if (typeof process.getuid === 'function' && stats.uid !== BigInt(process.getuid())) throw readOnlyValidationDatabaseIdentityError('数据库不属于当前用户。');
   const identity = toReadOnlyValidationDatabasePathIdentity(stats);
   if (identity.device.toString() !== descriptor.database.device || identity.inode.toString() !== descriptor.database.inode || identity.bytes !== BigInt(descriptor.database.bytes) || identity.links !== 1n) {

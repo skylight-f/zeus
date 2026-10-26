@@ -91,7 +91,9 @@ export type ConversationOpenTarget =
   | 'editor:rider'
   | 'editor:webstorm'
   | 'terminal:terminal'
-  | 'terminal:ghostty';
+  | 'terminal:ghostty'
+  | 'terminal:windows-terminal'
+  | 'terminal:powershell';
 
 export interface ConversationResourceOpenTarget {
   id: ConversationOpenTarget;
@@ -104,6 +106,8 @@ export interface ConversationResourceOpenTarget {
 }
 
 export interface ConversationSourcePreview {
+  /** 宿主按已授权真实路径生成的文件标识；缺省时只能按资源记录区分标签。 */
+  fileIdentity?: string;
   /** 当前文件的 Git 审阅状态。 */
   review?: FileReview;
   kind: 'source';
@@ -116,6 +120,10 @@ export interface ConversationSourcePreview {
 }
 
 export interface ConversationImagePreview {
+  /** 与源码预览共用文件标识，不包含明文路径或文件访问权限。 */
+  fileIdentity?: string;
+  /** 项目内图片与文本预览共用真实 Git 文件状态。 */
+  review?: FileReview;
   kind: 'image';
   resource: ConversationFileResource | ConversationAttachmentResource;
   mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | 'image/avif' | 'image/bmp' | 'image/x-icon' | 'image/svg+xml';

@@ -602,13 +602,15 @@ function UsageCalendarCard(props: UsageCalendarCardProps) {
   const zh = props.language === 'zh-CN';
   const hide = useCallback(() => setHover(null), []);
   useEffect(() => {
+    // 未展开时的滚动取消交给共用控制器；这里只关闭已显示的详情。
+    if (!hover) return;
     window.addEventListener('scroll', hide, true);
     window.addEventListener('resize', hide);
     return () => {
       window.removeEventListener('scroll', hide, true);
       window.removeEventListener('resize', hide);
     };
-  }, [hide]);
+  }, [hide, hover]);
   const show = (day: UsageCalendarCell, element: HTMLElement) => {
     if (day.future) return;
     const rect = element.getBoundingClientRect();

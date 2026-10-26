@@ -10,7 +10,7 @@ import {
   createCodexAppServerManager,
   type ExternalAgentImportEvent,
 } from './codexAppServerManager.js';
-import { spawn as nodeSpawn } from 'node:child_process';
+import { spawnManagedProcess } from './managedProcess.js';
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { resolveCliSearchPath } from './cliSearchPath.js';
@@ -101,6 +101,8 @@ export function createCodexRuntimeGenerationManager(
     toolRuntimeCodexHome?: string;
     readMcpThreadConfig?: ReturnType<typeof createCodexMcpConfiguration>['threadConfig'];
     runtimeEnvironment?: Record<string, string>;
+    /** 固定 Main 能力负责 Windows daemon，普通 Provider 进程仍受 Core Job 管理。 */
+    ensureRemoteControlDaemon?: () => Promise<{ socketPath: string }>;
     providerVersionProbe?: (commandPath: string) => Promise<string | null>;
     /** 目录检查间隔；官方组件仍自行决定是否需要联网。 */
     modelCatalogRefreshIntervalMs?: number;
@@ -118,6 +120,7 @@ export function createCodexRuntimeGenerationManager(
   let closePromise: Promise<void> | null = null;
   let activationChain: Promise<unknown> = Promise.resolve();
   let activationSequence = 0;
+  /** 已请求的接管模式独立于启动成功状态，失败后仍约束后续线程的传输选择。 */
   let remoteControlEnabled = false;
   /** 维护窗口只阻止写操作，账号和状态读取仍可完成。 */
   let maintenanceActive = false;
@@ -424,8 +427,11 @@ export function createCodexRuntimeGenerationManager(
     }
   }
 
+  /** 按当前配置复用或建立运行实例，启动失败不改变已请求的接管模式。 */
   async function activate(input: CodexRuntimeActivationInput, forceFreshGeneration = false): Promise<CodexCapabilitiesSnapshot> {
     if (preparingForShutdown) throw managerError('ZEUS_CODEX_CLOSED', 'Codex runtime generation manager is closing.');
+    // 启动回执失败时 daemon 仍可能持有线程；后续省略配置的恢复必须沿用同一传输，不能另起 stdio writer。
+    if (input.remoteControl === true) remoteControlEnabled = true;
     const requestedHome = input.externalAgentHome ?? null;
     const requestedRemoteControl = input.remoteControl ?? remoteControlEnabled;
     const normalizedInput = { ...input, remoteControl: requestedRemoteControl };
@@ -469,6 +475,7 @@ export function createCodexRuntimeGenerationManager(
       readMcpThreadConfig: options.readMcpThreadConfig,
       ...(appServerFlags.length > 0 ? { appServerFlags } : {}),
       providerVersionFallback,
+      ensureRemoteControlDaemon: options.ensureRemoteControlDaemon,
     });
     const provisional: RuntimeEntry = {
       manager,
@@ -655,11 +662,13 @@ export function createCodexRuntimeGenerationManager(
     async readThread(input) {
       return routeThread(input.threadId).manager.readThread(input);
     },
+    /** 历史查询只能补充本实例已加载的线程，不能迁移现有写入归属。 */
     async listThreads(input) {
       const routeId = input.ancestorThreadId ?? input.parentThreadId;
       const entry = routeId ? routeThread(routeId) : requireActiveEntry();
       const page = await entry.manager.listThreads(input);
-      for (const thread of page.data) bindThread(entry, thread.id);
+      // 历史列表不代表写入所有权；只补充本实例已加载且尚未绑定的线程，保留其他实例的现有归属。
+      for (const thread of page.data) if (!entriesByThread.has(thread.id) && thread.status && thread.status.type !== 'notLoaded') bindThread(entry, thread.id);
       return page;
     },
     async readThreadGoal(input) {
@@ -890,7 +899,8 @@ export function createCodexRuntimeGenerationManager(
 function probeCodexProviderVersion(commandPath: string, runtimeEnvironment: Record<string, string>): Promise<string | null> {
   return new Promise((resolve) => {
     /** 版本探针与同一运行实例共用 Codex 和解释器的搜索目录。 */
-    const child = nodeSpawn(commandPath, ['--version'], { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...runtimeEnvironment } });
+    const child = spawnManagedProcess(commandPath, ['--version'], { env: { ...process.env, ...runtimeEnvironment } });
+    child.stdin.end();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;

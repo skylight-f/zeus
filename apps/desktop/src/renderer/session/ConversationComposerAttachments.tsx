@@ -15,7 +15,6 @@ export interface ConversationComposerAttachmentsProps {
   className?: string;
   onActivate?: (attachment: NativeConversationAttachment, trigger: HTMLButtonElement) => void;
   onRemove?: (attachment: NativeConversationAttachment) => void;
-  onRestorePastedText?: (attachment: NativeConversationAttachment) => void;
 }
 
 /** 草稿附件共享缩略图、放大预览和安全打开入口。 */
@@ -58,14 +57,6 @@ export function ConversationComposerAttachments(props: ConversationComposerAttac
               }
             : undefined
         }
-        onRestoreText={
-          props.onRestorePastedText
-            ? (resource) => {
-                const attachment = byId.get(resource.id);
-                if (attachment) props.onRestorePastedText?.(attachment);
-              }
-            : undefined
-        }
       />
       <MotionPresence>{previewAttachment ? <FilePreviewDialog request={{ kind: 'attachment', ...attachmentResource(previewAttachment) }} zh={props.language === 'zh-CN'} onClose={() => setPreviewAttachment(null)} /> : null}</MotionPresence>
     </>
@@ -82,6 +73,7 @@ async function loadAttachmentPreview(attachment: NativeConversationAttachment): 
   return (await window.zeus?.getConversationResourcePreview(attachmentResource(attachment))) ?? null;
 }
 
+/** 上传授权代表实时源文件引用；受管路径代表固定附件副本。 */
 function toPendingResource(attachment: NativeConversationAttachment): PendingResourceCardItem {
   return {
     id: conversationAttachmentIdentity(attachment),
@@ -89,8 +81,8 @@ function toPendingResource(attachment: NativeConversationAttachment): PendingRes
     kind: attachmentKind(attachment),
     mimeType: attachment.mime,
     size: attachment.size,
+    reference: Boolean(attachment.uploadRef),
     ...(attachment.characterCount !== undefined ? { characterCount: attachment.characterCount } : {}),
-    ...(attachment.restorableText ? { restorable: true } : {}),
   };
 }
 

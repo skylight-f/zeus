@@ -1,3 +1,4 @@
+import { resolveGitDeliveryConflictWorkspace } from './gitDeliveryExecution.js';
 import { piSdkBinaryVersion } from '@zeus/ai-runtime';
 import { projectConversationTurnFailure } from '@zeus/storage';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
@@ -124,8 +125,10 @@ export type ConversationApplicationOperationDependencies = Record<string, any> &
   projectRepositories: ProjectRepositoryRegistrationRepository;
   projectSharedPaths: ProjectSharedPathRepository;
   projects: ProjectRepository;
-  resolveConversationCapabilities(project: ZeusProjectRecord, options?: { refreshCodexAccount?: boolean; requestedModel?: string | null }): ReturnType<ConversationCapabilityQueryApplication['buildConversationCapabilities']>;
-  resolveTaskPushExecutionCapabilities(project: ZeusProjectRecord, requestedModel?: string | null): Promise<ConversationCapabilitiesSnapshot>;
+  /** 根据本次实际模型准备对应服务，不触发其他供应商的初始化。 */
+  resolveConversationCapabilities(project: ZeusProjectRecord, selectedModelRef?: string | null): ReturnType<ConversationCapabilityQueryApplication['buildConversationCapabilities']>;
+  /** 任务推送使用已冻结的模型身份复验能力。 */
+  resolveTaskPushExecutionCapabilities(project: ZeusProjectRecord, selectedModelRef: string): Promise<ConversationCapabilitiesSnapshot>;
   resolveModelCapability<T extends { id: string; model: string }>(models: readonly T[], identity: string | null | undefined): T | null;
   normalizeTaskPushAttachments(task: ZeusTaskRecord, projectLocalPath: string): { attachments: NativeConversationAttachment[]; allowedRoots: string[]; promptAttachments: TaskPushPromptAttachment[] };
   normalizeTaskPushSupplementalAttachments(value: unknown, projectLocalPath: string): { attachments: NativeConversationAttachment[]; allowedRoots: string[]; promptAttachments: TaskPushSupplementalAttachment[] };
@@ -170,6 +173,8 @@ export interface PreparedConversationQueueReroute {
   };
 }
 export interface NativeTaskConversationStartPlan {
+  /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
+  conversationContext?: Record<string, unknown>;
   /** 从经过校验的首发输入冻结网页批注。 */
   browserComments?: Record<string, unknown>[];
   /** 从经过校验的首发输入冻结批注提示词。 */
@@ -278,6 +283,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
     prepareTaskIntegrationAiAttempt,
     projects,
     publishNativeConversationEvent,
+    publishRealtimeEvent,
     readServiceTierOverride,
     readTaskWorkspaceReview,
     reconnectNonCodexLegacyConversationRuntime,
@@ -287,6 +293,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
     resolveModelCapability,
     resolveNonCodexLiveSession,
     resolveSelectedTaskPushContext,
+    resolveTaskEnvironmentWritableRoots,
     resolveTaskIntegrationRequest,
     resolveTaskPushEnvironment,
     resolveTaskPushExecutionCapabilities,
@@ -468,16 +475,14 @@ export function createConversationApplicationOperations(dependencies: Conversati
     const taskAttachments = input.task ? normalizeTaskPushAttachments(input.task, input.project.localPath) : null;
     const attachments = [...(taskAttachments?.attachments ?? []), ...normalizeNativeConversationAttachments(input.body.attachments, input.project.localPath)];
     const taskPrompt = input.task ? renderTaskPushLayoutText(buildTaskPushLayoutForTask(input.task, content, taskAttachments?.promptAttachments ?? [], [], [], [], [])) : content;
-    const inheritedModel = input.conversation?.modelId;
-    const modelSelection =
-      typeof input.body.model === 'string' && input.body.model.trim()
-        ? input.body.model.trim()
-        : inheritedModel && input.conversation?.modelSourceId && input.conversation.modelSourceId !== 'codex'
-          ? modelRef(input.conversation.modelSourceId, inheritedModel)
-          : (inheritedModel ?? input.conversation?.providerModel ?? null);
-    const capabilities = await resolveConversationCapabilities(input.project, { requestedModel: modelSelection });
-    const requestedModel = modelSelection ?? capabilities.preferredModel;
-    const selectedModel = resolveModelCapability(capabilities.models, requestedModel) ?? capabilities.models[0];
+    /** 继续讨论使用原模型的完整来源身份，避免同名模型触发其他供应商。 */
+    const inheritedModel =
+      input.conversation?.modelId && input.conversation.modelSourceId && input.conversation.modelSourceId !== 'codex'
+        ? modelRef(input.conversation.modelSourceId, input.conversation.modelId)
+        : (input.conversation?.modelId ?? input.conversation?.providerModel);
+    const requestedModel = typeof input.body.model === 'string' && input.body.model.trim() ? input.body.model.trim() : inheritedModel;
+    const capabilities = await resolveConversationCapabilities(input.project, requestedModel);
+    const selectedModel = resolveModelCapability(capabilities.models, requestedModel ?? capabilities.preferredModel) ?? capabilities.models[0];
     if (!selectedModel || selectedModel.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', selectedModel?.availabilityReason || '所选模型当前不可运行。');
     const requestedEffort = typeof input.body.effort === 'string' && input.body.effort.trim() ? input.body.effort.trim() : null;
     // 陈旧档位按默认档归一，不报错：档位的合法性由模型自己的清单决定，界面只会给出清单里的值。
@@ -684,6 +689,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
       })),
     });
     await db.save();
+    // 专家会话父轮次承载用户发送，内部专家执行仍由项目统计排除。
+    publishNativeConversationEvent('conversation.submission.accepted', { conversationId: parentConversation.id, submissionId });
     publishNativeConversationEvent('conversation.expert.round.changed', {
       conversationId: parentConversation.id,
       submissionId,
@@ -842,7 +849,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       }
       const project = projects.getById(parent.projectId)!;
       const model = typeof input.args.model === 'string' ? input.args.model : modelRef(snapshot.connectionId ?? 'codex', snapshot.modelId);
-      const capabilities = await resolveConversationCapabilities(project, { requestedModel: model });
+      const capabilities = await resolveConversationCapabilities(project, model);
       const selected = resolveModelCapability(capabilities.models, model);
       if (!selected || selected.available === false) throw new Error('指定的子模型不可用。');
       const ancestor = conversationRuntime.getSubagent(parent.id);
@@ -853,7 +860,6 @@ export function createConversationApplicationOperations(dependencies: Conversati
       const sourceInput = submission ? parseJsonObject(submission.inputJson) : {};
       const contextJson = JSON.stringify({
         snapshot,
-        resourceSnapshotIdentity: submission!.id,
         history: conversationExecution.confirmedModelHistory(parent.id),
         skills: submission ? readNativeSubmissionSkillReferences(submission) : [],
         attachments: sourceInput.attachments ?? [],
@@ -888,7 +894,6 @@ export function createConversationApplicationOperations(dependencies: Conversati
         conversationRuntime.bindSubagent({ conversationId: childId, parentId: parent.id, rootId, depth, requestHash: hash, permissionMode, contextJson });
       });
       await db.save();
-      await zeusPluginService?.inheritConversationActivations(parent.id, childId);
     } else throw new Error('未知子代理操作。');
     const child = conversations.getById(childId)!;
     const relation = conversationRuntime.getSubagent(childId)!;
@@ -1223,7 +1228,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
     // HTTP 快照与实时 queue.changed 都从同一个恢复入口读取当前阶段。
     if (conversation.agentKind === 'codex' && codexNativeCoordinator.isRecovering(conversation.id)) return 'conversation_restoring' as const;
     if (state.type === 'active') return 'current_turn' as const;
-    if (state.type === 'dispatching') return 'dispatching' as const;
+    if (state.type === 'dispatching') return submissions.find((submission) => submission.id === state.submissionId)?.pausedReason === 'plugin_hook' ? ('plugin_hook' as const) : ('dispatching' as const);
     if (state.type === 'waiting') return state.reason;
     if (state.type === 'paused') return state.reason;
     if (conversationPlanActions.listByConversation(conversation.id).some((request) => request.status === 'pending')) return 'plan_confirmation' as const;
@@ -1485,6 +1490,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
     await db.save();
     const updatedConversation = conversations.getById(conversation.id);
     if (!updatedConversation) throw new Error(`Zeus conversation not found: ${conversation.id}`);
+    // 旧运行时的用户追问同样更新项目活跃统计，通知在消息保存后发送。
+    publishRealtimeEvent('conversation.submission.accepted', { projectId: project.id, conversationId: conversation.id });
     return {
       statusCode: 201,
       body: {
@@ -1510,7 +1517,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
     if (original.pausedReason === 'outcome_unknown' || original.submissionOutcome === 'outcome_unknown') throw nativeApiError('ZEUS_NATIVE_SUBMISSION_OUTCOME_UNKNOWN', '接纳结果未知的提交禁止改路由，必须先完成恢复核对或取消。');
     const requestedModel = typeof input.settings.model === 'string' ? input.settings.model.trim() : '';
     if (!requestedModel) throw nativeApiError('ZEUS_INVALID_CONVERSATION_SETTINGS', '改路由必须指定输入框当前模型。');
-    const capabilities = await resolveConversationCapabilities(project, { requestedModel });
+    const capabilities = await resolveConversationCapabilities(project, requestedModel);
     const selectedModel = resolveModelCapability(capabilities.models, requestedModel);
     if (!selectedModel || selectedModel.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', selectedModel?.availabilityReason || '所选模型当前不可运行。');
     /** 暂停队首改模型时仍保留原提交容量，隔离随后设置的下一轮偏好。 */
@@ -1750,23 +1757,11 @@ export function createConversationApplicationOperations(dependencies: Conversati
     const conversationContext = normalizeNativeConversationContext(body.conversationContext);
     if (body.pluginReferences !== undefined) {
       if (!zeusPluginService) throw nativeApiError('ZEUS_PLUGINS_UNAVAILABLE', 'Zeus Plugin Host 当前不可用，不能接受结构化 Plugin/Skill 引用。');
-      await zeusPluginService.validateConversationReferences({ conversationId: conversation.id, references: body.pluginReferences });
+      await zeusPluginService.validateExplicitReferences({ projectId: conversation.projectId, references: body.pluginReferences });
     }
     const skillReferences = normalizeSkillReferences(body.skillReferences);
     if (skillReferences.length > 0 && !zeusSkillService) throw nativeApiError('ZEUS_SKILLS_UNAVAILABLE', '当前执行宿主不支持 Zeus Skill。');
-    const relation = conversationRuntime.getSubagent(conversation.id);
-    const inherited = relation ? parseJsonObject(relation.contextJson) : {};
-    const inheritedCatalog = zeusSkillService && typeof inherited.resourceSnapshotIdentity === 'string' ? (await zeusSkillService.freeze({ cwd: project.localPath, identity: inherited.resourceSnapshotIdentity })).skills : null;
-    const resolvedSkills = zeusSkillService
-      ? await Promise.all(
-          skillReferences.map((reference) => {
-            if (!inheritedCatalog) return zeusSkillService.resolve({ cwd: project.localPath, skillId: reference.id });
-            const skill = inheritedCatalog.find((item) => item.id === reference.id);
-            if (!skill) throw nativeApiError('ZEUS_SKILL_NOT_FOUND', '父会话的冻结资源中不存在该 Skill。');
-            return skill;
-          }),
-        )
-      : [];
+    const resolvedSkills = zeusSkillService ? await Promise.all(skillReferences.map((reference) => zeusSkillService.resolve({ cwd: project.localPath, skillId: reference.id }))) : [];
 
     const providerContent = resolvedSkills.length > 1 ? `${resolvedSkills.map((skill) => `$${skill.name}`).join(' ')}\n\n${content}` : content;
     if (body.computerUseRequested !== undefined && typeof body.computerUseRequested !== 'boolean') {
@@ -1818,11 +1813,11 @@ export function createConversationApplicationOperations(dependencies: Conversati
     let selectedServiceTier: string | null | undefined;
     let selectedContextWindow: number | null = null;
     if (requestedModel || requestedEffort || requestedServiceTier.present) {
-      // 继承连接身份，避免仅凭模型短名误选同名的另一个执行内核。
-      const inheritedModel = conversation.modelId;
-      const model = requestedModel ?? (inheritedModel && conversation.modelSourceId && conversation.modelSourceId !== 'codex' ? modelRef(conversation.modelSourceId, inheritedModel) : (inheritedModel ?? conversation.providerModel));
-      const capabilities = await resolveConversationCapabilities(project, { requestedModel: model });
-      const capability = resolveModelCapability(capabilities.models, model ?? capabilities.preferredModel);
+      /** 只修改推理档位时仍绑定原供应商，不能按同名模型重新猜测连接。 */
+      const inheritedModel = conversation.modelId && conversation.modelSourceId && conversation.modelSourceId !== 'codex' ? modelRef(conversation.modelSourceId, conversation.modelId) : (conversation.modelId ?? conversation.providerModel);
+      const capabilities = await resolveConversationCapabilities(project, requestedModel ?? inheritedModel);
+      const model = requestedModel ?? inheritedModel ?? capabilities.preferredModel;
+      const capability = resolveModelCapability(capabilities.models, model);
       if (!capability) throw nativeApiError('ZEUS_INVALID_CONVERSATION_SETTINGS', 'Selected Codex model is not available in the current app-server generation.');
       if (capability.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', capability.availabilityReason || '所选模型当前不可运行。');
       if (requestedEffort && !capability.supportedReasoningEfforts.some((effort) => effort === requestedEffort)) {
@@ -2504,7 +2499,22 @@ export function createConversationApplicationOperations(dependencies: Conversati
   ) {
     await validateNewConversationCapacity(project, body, reservation.contextCapacityTokens);
     if (!isNativeApiRecord(body) || body.mode !== 'create') throw nativeApiError('ZEUS_INVALID_CONVERSATION_START', 'Project conversations require mode create.');
-    if (body.source !== undefined && body.source !== 'code_review') throw nativeApiError('ZEUS_INVALID_CODE_REVIEW', '不支持的项目会话来源。');
+    if (body.source !== undefined && body.source !== 'code_review' && body.source !== 'delivery_conflict') throw nativeApiError('ZEUS_INVALID_CODE_REVIEW', '不支持的项目会话来源。');
+    /** 组合冲突会话由已接纳步骤提供隔离目录，客户端不能指定 cwd。 */
+    const deliveryWorkspace = body.source === 'delivery_conflict' ? resolveGitDeliveryConflictWorkspace(db, project.id, body.deliveryStepId) : null;
+    if (deliveryWorkspace && body.permissionMode !== deliveryWorkspace.permissionMode) throw nativeApiError('ZEUS_INVALID_DELIVERY_CONFLICT', '冲突权限必须与本次交付授权一致。');
+    // 请求字段仍是未知类型，直接比对允许值，拒绝缺失值和非字符串权限。
+    if (
+      deliveryWorkspace &&
+      (body.collaborationMode !== 'default' ||
+        (body.permissionMode !== 'auto' && body.permissionMode !== 'full-access') ||
+        hasExpertMentions(body) ||
+        body.goalObjective ||
+        body.worktree ||
+        body.workspaceMode ||
+        body.attachments !== undefined)
+    )
+      throw nativeApiError('ZEUS_INVALID_DELIVERY_CONFLICT', '交付冲突只能在该步骤的独立工作区中执行。');
     const reviewWorkspace = body.source === 'code_review' ? await resolveConversationGitWorkspace(project, typeof body.inheritConversationId === 'string' ? body.inheritConversationId : '', conversations, conversationSubmissions) : null;
     if (
       reviewWorkspace &&
@@ -2512,7 +2522,10 @@ export function createConversationApplicationOperations(dependencies: Conversati
     ) {
       throw nativeApiError('ZEUS_INVALID_CODE_REVIEW', '代码审查必须以只读模式使用原会话工作目录。');
     }
-    if (!reviewWorkspace && body.inheritConversationId !== undefined) throw nativeApiError('ZEUS_INVALID_CODE_REVIEW', '继承工作目录仅用于代码审查。');
+    /** 普通侧边提问只接受源会话身份，目录由服务端持久记录解析。 */
+    const inheritedWorkspace = !body.source && typeof body.inheritConversationId === 'string' ? await resolveConversationGitWorkspace(project, body.inheritConversationId, conversations, conversationSubmissions) : reviewWorkspace;
+    if (body.inheritConversationId !== undefined && !inheritedWorkspace) throw nativeApiError('ZEUS_CONVERSATION_WORKTREE_UNAVAILABLE', '无法确认源会话工作目录。');
+    if (!reviewWorkspace && inheritedWorkspace && (body.worktree || body.workspaceMode || hasExpertMentions(body))) throw nativeApiError('ZEUS_INVALID_CONVERSATION_START', '继承会话目录时不能另建工作树或切换讨论归属。');
     if (hasExpertMentions(body)) {
       return acceptExpertRound({
         project,
@@ -2533,6 +2546,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
     const browserComments = normalizeNativeBrowserComments(body.browserComments).map((comment) => ({ ...comment, conversationId: reservation.conversationId }));
     /** 批注提示词经过与后续消息相同的校验。 */
     const browserCommentContent = normalizeNativeBrowserCommentContent(body.browserCommentContent);
+    /** 首发评论使用后续消息相同的长度与结构校验。 */
+    const conversationContext = normalizeNativeConversationContext(body.conversationContext) ?? undefined;
     const content = reviewWorkspace
       ? [
           '请审查当前会话工作树的代码变化。',
@@ -2550,14 +2565,14 @@ export function createConversationApplicationOperations(dependencies: Conversati
     }
     const displayText = normalizeComposerDisplayText(body.displayText, content);
     const skillReferences = normalizeSkillReferences(body.skillReferences);
+    if (deliveryWorkspace && (skillReferences.length !== (deliveryWorkspace.skillId ? 1 : 0) || (deliveryWorkspace.skillId && skillReferences[0]?.id !== deliveryWorkspace.skillId)))
+      throw nativeApiError('ZEUS_INVALID_DELIVERY_CONFLICT', '冲突 Skill 必须与本次交付授权一致。');
     if (skillReferences.length > 0 && !zeusSkillService) throw nativeApiError('ZEUS_SKILLS_UNAVAILABLE', '当前执行宿主不支持 Zeus Skill。');
     const skills = zeusSkillService ? await Promise.all(skillReferences.map((reference) => zeusSkillService.resolve({ cwd: project.localPath, skillId: reference.id }))) : [];
     const providerContent = skills.length > 1 ? `${skills.map((skill) => `$${skill.name}`).join(' ')}\n\n${content}` : content;
     if (body.computerUseRequested !== undefined && typeof body.computerUseRequested !== 'boolean') throw nativeApiError('ZEUS_COMPUTER_USE_REQUEST_INVALID', 'computerUseRequested 必须是布尔值。');
     const explicitModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null;
-    const capabilities = await resolveConversationCapabilities(project, {
-      requestedModel: explicitModel,
-    });
+    const capabilities = await resolveConversationCapabilities(project, explicitModel);
     const requestedModel = explicitModel ?? capabilities.preferredModel;
     if (reviewWorkspace && (!explicitModel || !resolveModelCapability(capabilities.models, explicitModel))) throw nativeApiError('ZEUS_MODEL_UNAVAILABLE', '所选审查模型已不可用，请重新选择。');
     const selectedModel = resolveModelCapability(capabilities.models, requestedModel) ?? capabilities.models[0]!;
@@ -2588,9 +2603,12 @@ export function createConversationApplicationOperations(dependencies: Conversati
         return providerWriteLifecycle.markRpcStarted(resourceId);
       },
     };
-    const executionRoot = reviewWorkspace?.localPath ?? (await prepareProjectConversationWorkspace(project, reservation.conversationId, body.workspaceMode, body.worktree, platformMutableState.appShellSettings.taskBranchPrefix));
+    const executionRoot =
+      deliveryWorkspace?.localPath ??
+      inheritedWorkspace?.localPath ??
+      (await prepareProjectConversationWorkspace(project, reservation.conversationId, body.workspaceMode, body.worktree, platformMutableState.appShellSettings.taskBranchPrefix));
     /** 首项目始终使用实际执行目录，普通工作树不能授权回原项目。 */
-    const executionRoots = reviewWorkspace ? [executionRoot] : [executionRoot, ...executionProjects.slice(1).map((target) => target.localPath)];
+    const executionRoots = inheritedWorkspace || deliveryWorkspace ? [executionRoot] : [executionRoot, ...executionProjects.slice(1).map((target) => target.localPath)];
     /** 目录清单保存授权上限；只读和计划模式由运行策略统一禁止写入。 */
     const writableRoots = executionRoots;
     const resolvedRoute = await resolveConversationExecutionRoute({
@@ -2614,7 +2632,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         // 跨会话延续时保留媒体，由模型接口返回实际支持结果。
         media: true,
         contextWindow: resolvedRoute.configuredModel?.contextWindow ?? selectedModel.contextWindow,
-        currentInputUtf8Bytes: Buffer.byteLength(appendConversationResourceContext(providerContent, browserCommentContent, browserComments, undefined), 'utf8') + Buffer.byteLength(JSON.stringify(attachments), 'utf8'),
+        currentInputUtf8Bytes: Buffer.byteLength(appendConversationResourceContext(providerContent, browserCommentContent, browserComments, conversationContext), 'utf8') + Buffer.byteLength(JSON.stringify(attachments), 'utf8'),
       },
       userHistoryContent: {
         text: providerContent,
@@ -2622,6 +2640,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         ...(attachments.length ? { attachments } : {}),
         ...(browserComments.length ? { browserComments } : {}),
         ...(browserCommentContent ? { browserCommentContent } : {}),
+        ...(conversationContext ? { conversationContext } : {}),
       },
     });
     zeusConversationPluginRuntime?.bindExplicitReferences({ conversationId: reservation.conversationId, projectId: project.id, references: pluginReferences });
@@ -2634,11 +2653,12 @@ export function createConversationApplicationOperations(dependencies: Conversati
             projectId: project.id,
             conversationTitle: (displayText || providerContent).slice(0, 120),
             cwd: executionRoot,
-            executionWorkspaceMode: reviewWorkspace?.workspaceMode ?? (body.workspaceMode === 'worktree' ? 'worktree' : 'direct'),
+            executionWorkspaceMode: deliveryWorkspace?.workspaceMode ?? inheritedWorkspace?.workspaceMode ?? (body.workspaceMode === 'worktree' ? 'worktree' : 'direct'),
             ...(goalObjective ? { goalObjective } : {}),
             prompt: providerContent,
             browserComments,
             browserCommentContent,
+            conversationContext,
             ...(displayText !== providerContent ? { displayText } : {}),
             model: {
               sourceId: selectedModel.sourceId ?? null,
@@ -2664,10 +2684,11 @@ export function createConversationApplicationOperations(dependencies: Conversati
             submissionId: reservation.submissionId,
             projectId: project.id,
             projectLocalPath: executionRoot,
-            executionWorkspaceMode: reviewWorkspace?.workspaceMode ?? (body.workspaceMode === 'worktree' ? 'worktree' : 'direct'),
+            executionWorkspaceMode: deliveryWorkspace?.workspaceMode ?? inheritedWorkspace?.workspaceMode ?? (body.workspaceMode === 'worktree' ? 'worktree' : 'direct'),
             prompt: providerContent,
             browserComments,
             browserCommentContent,
+            conversationContext,
             ...(displayText !== providerContent ? { displayText } : {}),
             attachments,
             allowedAttachmentRoots: executionRoots,
@@ -2755,8 +2776,10 @@ export function createConversationApplicationOperations(dependencies: Conversati
   async function validateNewConversationCapacity(project: ZeusProjectRecord, body: unknown, budget: number | null): Promise<void> {
     assertContextCapacity(budget);
     if (budget === null) return;
-    const capabilities = await resolveConversationCapabilities(project);
-    const requested = isNativeApiRecord(body) && typeof body.model === 'string' ? body.model : capabilities.preferredModel;
+    /** 容量复验沿用本次明确选择，不能先准备全局默认模型。 */
+    const explicitModel = isNativeApiRecord(body) && typeof body.model === 'string' ? body.model : null;
+    const capabilities = await resolveConversationCapabilities(project, explicitModel);
+    const requested = explicitModel ?? capabilities.preferredModel;
     const model = requested ? resolveModelCapability(capabilities.models, requested) : capabilities.models[0];
     if (!model?.contextCapacity?.choices.includes(budget)) throw nativeApiError('ZEUS_CONTEXT_CAPACITY_UNSUPPORTED', contextCapacityUnavailableReason(model?.contextCapacity));
   }
@@ -2919,13 +2942,14 @@ export function createConversationApplicationOperations(dependencies: Conversati
         media: true,
         contextWindow: resolvedRoute.configuredModel?.contextWindow ?? null,
         currentInputUtf8Bytes:
-          Buffer.byteLength(appendConversationResourceContext(plan.prompt, plan.browserCommentContent, plan.browserComments, undefined), 'utf8') +
+          Buffer.byteLength(appendConversationResourceContext(plan.prompt, plan.browserCommentContent, plan.browserComments, plan.conversationContext), 'utf8') +
           Buffer.byteLength(JSON.stringify({ attachments: plan.attachments ?? [], taskPushLayout: plan.taskPushLayout ?? null, legacyReference: plan.legacyReference ?? null }), 'utf8'),
       },
       userHistoryContent: {
         text: plan.prompt,
         ...(plan.browserComments?.length ? { browserComments: plan.browserComments } : {}),
         ...(plan.browserCommentContent ? { browserCommentContent: plan.browserCommentContent } : {}),
+        ...(plan.conversationContext ? { conversationContext: plan.conversationContext } : {}),
         ...(plan.displayText ? { displayText: plan.displayText } : {}),
         ...(plan.attachments?.length ? { attachments: plan.attachments } : {}),
         ...(plan.taskPushLayout ? { taskPushLayout: plan.taskPushLayout } : {}),
@@ -2950,6 +2974,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         prompt: plan.prompt,
         browserComments: plan.browserComments,
         browserCommentContent: plan.browserCommentContent,
+        conversationContext: plan.conversationContext,
         ...(plan.displayText ? { displayText: plan.displayText } : {}),
         model: plan.model,
         ...(plan.effort ? { thinkingLevel: plan.effort } : {}),
@@ -2989,6 +3014,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       prompt: plan.prompt,
       browserComments: plan.browserComments,
       browserCommentContent: plan.browserCommentContent,
+      conversationContext: plan.conversationContext,
       ...(plan.displayText ? { displayText: plan.displayText } : {}),
       ...(plan.attachments ? { attachments: plan.attachments } : {}),
       ...(plan.allowedAttachmentRoots ? { allowedAttachmentRoots: plan.allowedAttachmentRoots } : {}),
@@ -3442,7 +3468,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
           throw nativeApiError('ZEUS_CODE_REVIEW_PERMISSION_MISMATCH', 'Code review permission is fixed to read-only.');
         }
 
-        const capabilities = await resolveConversationCapabilities(project, { requestedModel: modelName });
+        const capabilities = await resolveConversationCapabilities(project, modelName);
         const selectedModel = resolveModelCapability(capabilities.models, modelName);
         if (!selectedModel) throw nativeApiError('ZEUS_MODEL_UNAVAILABLE', `Configured review model is unavailable: ${modelName}`);
         if (selectedModel.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', selectedModel.availabilityReason || '所选模型当前不可运行。');
@@ -3701,6 +3727,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
         const browserComments = normalizeNativeBrowserComments(body.browserComments).map((comment) => ({ ...comment, conversationId: reservation.conversationId }));
         /** 校验提示词后再冻结派发计划。 */
         const browserCommentContent = normalizeNativeBrowserCommentContent(body.browserCommentContent);
+        /** 首发评论使用后续消息相同的长度与结构校验。 */
+        const conversationContext = normalizeNativeConversationContext(body.conversationContext) ?? undefined;
         const explicitContent = typeof body.content === 'string' ? body.content.trim() : '';
         const canonicalAttachmentInput = body.attachments === undefined && !explicitContent && !browserComments.length ? normalizeTaskPushAttachments(task, project.localPath) : null;
         const attachments = canonicalAttachmentInput?.attachments ?? explicitAttachments;
@@ -3712,9 +3740,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         if (body.computerUseRequested !== undefined && typeof body.computerUseRequested !== 'boolean') throw nativeApiError('ZEUS_COMPUTER_USE_REQUEST_INVALID', 'computerUseRequested 必须是布尔值。');
         const pluginReferences = await resolveNewConversationPluginReferences(project.id, content, body.pluginReferences);
         const explicitModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null;
-        const capabilities = await resolveConversationCapabilities(project, {
-          requestedModel: explicitModel,
-        });
+        const capabilities = await resolveConversationCapabilities(project, explicitModel);
         const selectedModel = resolveModelCapability(capabilities.models, explicitModel ?? capabilities.preferredModel) ?? capabilities.models[0]!;
         if (selectedModel.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', selectedModel.availabilityReason || '所选模型当前不可运行。');
         const selectedAgentKind = selectedModel.agentKind === 'pi' ? 'pi' : 'codex';
@@ -3731,24 +3757,46 @@ export function createConversationApplicationOperations(dependencies: Conversati
         // 同上：陈旧档位按默认档归一，不因为配置过时就拦住用户。
         const selectedEffort = requestedEffort && selectedModel.supportedReasoningEfforts.includes(requestedEffort) ? requestedEffort : (selectedModel.defaultReasoningEffort ?? selectedModel.supportedReasoningEfforts[0] ?? null);
         const inheritConversationId = typeof body.inheritConversationId === 'string' ? body.inheritConversationId.trim() : '';
-        let inheritedEnvironment: Awaited<ReturnType<typeof resolveTaskPushEnvironment>> | null = null;
+        /** 新会话保存原任务的精确环境与仓库身份，不重新准备或重开工作树。 */
+        let inheritedBinding: { environmentId?: string; workspaceId?: string; writableRoots: string[] } | null = null;
+        /** 源目录不可用时明确失败，不能退回项目根。 */
+        let inheritedCwd: string | null = null;
         if (inheritConversationId) {
+          /** 原会话归属必须与当前创建目标一致。 */
           const sourceConversation = conversations.getById(inheritConversationId);
-          if (!sourceConversation || sourceConversation.projectId !== project.id || sourceConversation.taskId !== task.id) {
-            throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_INVALID', 'The source conversation does not belong to this task.');
+          if (!sourceConversation || sourceConversation.projectId !== project.id || sourceConversation.taskId !== task.id) throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_INVALID', '源会话不属于当前任务。');
+          inheritedCwd = resolveNativeConversationExecutionRoot(sourceConversation);
+          if (!inheritedCwd) throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_REQUIRED', '源任务会话的工作目录已不可用。');
+          inheritedCwd = realpathSync(inheritedCwd);
+          if (sourceConversation.workspaceId || sourceConversation.environmentId) {
+            /** 只读审阅和开发目录共用原仓库记录，但不能互换各自的执行根。 */
+            const workspace = sourceConversation.workspaceId ? taskWorkspaces.getById(sourceConversation.workspaceId) : undefined;
+            /** 旧记录可从工作区补全所属环境。 */
+            const environmentId = sourceConversation.environmentId ?? workspace?.environmentId;
+            /** 只读提问不恢复环境或更改交付状态。 */
+            const environment = environmentId ? taskEnvironments.getById(environmentId) : undefined;
+            if (
+              !workspace ||
+              workspace.projectId !== project.id ||
+              workspace.taskId !== task.id ||
+              (environmentId && (!environment || environment.projectId !== project.id || environment.taskId !== task.id || environment.state !== 'ready' || workspace.environmentId !== environmentId))
+            )
+              throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_INVALID', '源任务工作区归属或状态已变化。');
+            /** 新会话后续恢复也会使用此目录，首发前先校验两者一致。 */
+            const targetCwd = permissionMode === 'read-only' ? resolveTaskReadOnlyWorkspacePath(project, task.id, workspace, environment) : (environment?.rootPath ?? workspace.worktreePath);
+            if (!targetCwd || realpathSync(targetCwd) !== inheritedCwd) throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_INVALID', '当前权限选择会改变执行目录，请保持源会话的权限模式。');
+            /** 可写会话只能继承仍处于开发状态的环境成员。 */
+            const members: ZeusTaskWorkspaceRecord[] = environment ? taskWorkspaces.listByEnvironment(environment.id) : [workspace];
+            if (permissionMode !== 'read-only' && (!members.length || members.some((member) => member.state !== 'ready' || !member.worktreePath)))
+              throw nativeApiError('ZEUS_TASK_WORKSPACE_CLOSED', '原工作区已结束开发，不能以可写模式创建侧栏会话。');
+            inheritedBinding = { ...(environmentId ? { environmentId } : {}), workspaceId: workspace.id, writableRoots: permissionMode === 'read-only' ? [] : resolveTaskEnvironmentWritableRoots(project, members) };
+          } else if (inheritedCwd !== realpathSync(project.localPath)) {
+            throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_REQUIRED', '源任务会话缺少工作区归属。');
           }
-          if (!sourceConversation.environmentId && !sourceConversation.workspaceId) {
-            throw nativeApiError('ZEUS_TASK_EXECUTION_CONTEXT_REQUIRED', 'The source task conversation has no persisted execution workspace.');
-          }
-          inheritedEnvironment = await resolveTaskPushEnvironment(
-            project,
-            task,
-            sourceConversation.environmentId ? { mode: 'existing', environmentId: sourceConversation.environmentId } : { mode: 'existing', workspaceId: sourceConversation.workspaceId },
-            stableOperationId,
-          );
         }
-        const executionCwd = inheritedEnvironment?.cwd ?? project.localPath;
-        const skills = inheritedEnvironment && zeusSkillService ? await Promise.all(skillReferences.map((reference) => zeusSkillService.resolve({ cwd: executionCwd, skillId: reference.id }))) : projectSkills;
+        /** 首发与恢复使用相同的服务端解析目录。 */
+        const executionCwd = inheritedCwd ?? project.localPath;
+        const skills = inheritedCwd && zeusSkillService ? await Promise.all(skillReferences.map((reference) => zeusSkillService.resolve({ cwd: executionCwd, skillId: reference.id }))) : projectSkills;
         const providerContent = skills.length > 1 ? `${skills.map((skill) => `$${skill.name}`).join(' ')}\n\n${content}` : content;
         nativeOperation = await startNativeTaskConversationFromPlan({
           agentKind: selectedAgentKind,
@@ -3762,6 +3810,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
           prompt: providerContent,
           browserComments,
           browserCommentContent,
+          conversationContext,
           ...(displayText !== providerContent ? { displayText } : {}),
           model: { sourceId: selectedModel.sourceId ?? null, modelId: selectedModel.model, displayName: selectedModel.displayName ?? null },
           ...(selectedEffort ? { effort: selectedEffort } : {}),
@@ -3770,14 +3819,10 @@ export function createConversationApplicationOperations(dependencies: Conversati
           ...(requestedServiceTier.present ? { requestedServiceTier: requestedServiceTier.value } : {}),
           permissionMode,
           workMode: collaborationMode,
-          ...(inheritedEnvironment
-            ? {
-                environmentId: inheritedEnvironment.environment.id,
-                ...(inheritedEnvironment.workspaces[0] ? { workspaceId: inheritedEnvironment.workspaces[0].id } : {}),
-              }
-            : {}),
-          executionWorkspaceMode: inheritedEnvironment ? 'worktree' : 'direct',
-          writableRoots: inheritedEnvironment?.writableRoots ?? [project.localPath],
+          ...(inheritedBinding?.environmentId ? { environmentId: inheritedBinding.environmentId } : {}),
+          ...(inheritedBinding?.workspaceId ? { workspaceId: inheritedBinding.workspaceId } : {}),
+          executionWorkspaceMode: realpathSync(executionCwd) === realpathSync(project.localPath) ? 'direct' : 'worktree',
+          writableRoots: inheritedBinding?.writableRoots ?? [project.localPath],
           allowCodeChanges: task.allowCodeChanges,
           allowTests: task.allowTests,
           allowGitCommit: task.allowGitCommit,
@@ -3828,8 +3873,9 @@ export function createConversationApplicationOperations(dependencies: Conversati
       if (!permissionMode) throw nativeApiError('ZEUS_INVALID_PERMISSION_MODE', 'permissionMode must be read-only, auto, auto-review, or full-access.');
       const collaborationMode = body.collaborationMode === undefined ? 'default' : parseConversationCollaborationMode(body.collaborationMode);
       if (!collaborationMode) throw nativeApiError('ZEUS_INVALID_COLLABORATION_MODE', 'collaborationMode must be default or plan.');
+      /** 旧会话引用固定使用 Codex，不能被全局 API 默认模型替换预检来源。 */
       const selectedModelId = await resolveCodexModel();
-      const capabilities = await resolveConversationCapabilities(project, { requestedModel: selectedModelId });
+      const capabilities = await resolveConversationCapabilities(project, modelRef('codex', selectedModelId));
       const selectedModel = resolveModelCapability(capabilities.models, selectedModelId);
       if (!selectedModel || selectedModel.agentKind === 'pi') throw nativeApiError('ZEUS_MODEL_NOT_READY', '旧会话引用需要可用的 Codex App Server 模型。');
       nativeOperation = await startNativeTaskConversationFromPlan({

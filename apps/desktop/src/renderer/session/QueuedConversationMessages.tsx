@@ -1,4 +1,5 @@
-import { type FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { platformShortcutLabel } from '../platform.js';
+import { type FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowBendUpRightIcon as ArrowBendUpRight } from '@phosphor-icons/react/dist/csr/ArrowBendUpRight';
 import { ArrowDownIcon as ArrowDown } from '@phosphor-icons/react/dist/csr/ArrowDown';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
@@ -9,11 +10,10 @@ import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
 import { canSteerActiveTurn } from './ConversationComposer.js';
 import { ConversationComposerAttachments, conversationAttachmentIdentity } from './ConversationComposerAttachments.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-import { composerQueuedSubmissions, reorderableQueuedSubmissions } from './conversationQueuePresentation.js';
+import { useQueuedMessageReorder, type ReorderQueuedMessages } from './useQueuedMessageReorder.js';
 import type { NativeConversationAttachment, NativeQueuedSubmission, NativeSessionState } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
-import { autosizeTextarea } from './textareaAutosize.js';
 import { formatAsyncQuestionAnswer } from '@zeus/shared';
 
 /** 输入框上方排队卡片所需的权威操作。 */
@@ -26,7 +26,8 @@ export interface QueuedConversationMessagesProps {
   onSendNow?: (submissionId: string) => void | Promise<void>;
   /** 中断后由用户明确继续原队列，沿用既有恢复命令。 */
   onResumeQueue?: () => void | Promise<void>;
-  onReorder?: (orderedSubmissionIds: string[]) => void | Promise<void>;
+  /** 调序回执用于等待权威队列接管即时位置。 */
+  onReorder?: ReorderQueuedMessages;
 }
 
 /** 排队卡片只保留当前操作需要的短文案。 */
@@ -43,7 +44,7 @@ const labels = {
     editLabel: '编辑排队消息内容',
     editPlaceholder: '输入消息内容',
     editAttachmentPlaceholder: '添加说明（可选）',
-    editShortcut: '⌘ Enter 保存',
+    editShortcut: platformShortcutLabel('⌘ Enter 保存'),
     attachments: (count: number) => `${count} 个附件`,
     addAttachments: '添加附件',
     save: '保存',
@@ -71,7 +72,7 @@ const labels = {
     editLabel: 'Edit queued message content',
     editPlaceholder: 'Enter message content',
     editAttachmentPlaceholder: 'Add a note (optional)',
-    editShortcut: '⌘ Enter to save',
+    editShortcut: platformShortcutLabel('⌘ Enter to save'),
     attachments: (count: number) => `${count} attachment${count === 1 ? '' : 's'}`,
     addAttachments: 'Add attachments',
     save: 'Save',
@@ -93,27 +94,56 @@ const labels = {
 export function QueuedConversationMessages(props: QueuedConversationMessagesProps) {
   /** 当前语言对应的短文案。 */
   const copy = labels[props.language];
-  /** 卡片只展示可安全编辑的普通等待项。 */
-  const queue = useMemo(() => composerQueuedSubmissions(props.state), [props.state.itemOrder, props.state.items, props.state.queue]);
-  /** 服务端重排要求携带完整可重排队列，不能只提交当前可见卡片。 */
-  const reorderableQueue = useMemo(() => reorderableQueuedSubmissions(props.state.queue), [props.state.queue]);
   /** 当前展开编辑器的提交身份。 */
   const [editingId, setEditingId] = useState<string | null>(null);
   /** 当前进行中的操作用于阻止重复点击。 */
   const [actionId, setActionId] = useState<string | null>(null);
   /** 操作失败紧邻原消息展示，不污染整段会话。 */
   const [actionError, setActionError] = useState<{ submissionId: string; message: string } | null>(null);
-  /** 排序结果通过礼貌播报提供给辅助技术。 */
-  const [announcement, setAnnouncement] = useState('');
+  /** 原消息的高亮与辅助播报使用稳定提交身份。 */
+  const [reorderFeedback, setReorderFeedback] = useState<{ submissionId: string } | null>(null);
+  /** 移动后在当前排队区查找原消息，不依赖改变后的行号。 */
+  const regionRef = useRef<HTMLElement>(null);
+  /** 换位后立即恢复原按钮焦点，不等待保存回执。 */
+  const reorderFocusRef = useRef<HTMLButtonElement | null>(null);
+  /** 展示顺序即时更新，持久化仍走原会话队列入口。 */
+  const ordering = useQueuedMessageReorder({
+    state: props.state,
+    blocked: Boolean(actionId),
+    onReorder: props.onReorder,
+    /** 保存失败恢复原卡片的错误展示并清除本次位置反馈。 */
+    onError(submissionId, error) {
+      setActionError({ submissionId, message: actionErrorMessage(error, copy.actionFailed) });
+      setReorderFeedback(null);
+      reorderFocusRef.current = null;
+    },
+  });
+  /** 完整队列保留隐藏成员，卡片列表仅保留普通等待项。 */
+  const { queue, fullQueue: reorderableQueue } = ordering;
+  /** 辅助播报读取当前实际行序，隐藏或删除后不再报告旧位置。 */
+  const reorderedIndex = reorderFeedback ? queue.findIndex((submission) => submission.id === reorderFeedback.submissionId) : -1;
   /** 只有真实可写连接允许修改权威队列。 */
   const writable = props.state.transportState === 'ready' && props.state.conversationState !== 'legacy_readonly';
   /** 控制器操作和组件本地操作共同锁定按钮。 */
-  const busy = Boolean(props.state.busyOperation || actionId);
+  const busy = Boolean(props.state.busyOperation || actionId || ordering.saving);
 
   useEffect(() => {
     if (!editingId || queue.some((submission) => submission.id === editingId)) return;
     setEditingId(null);
   }, [editingId, queue]);
+
+  useLayoutEffect(() => {
+    if (!reorderFeedback || !reorderFocusRef.current) return;
+    /** React 移动已有节点或禁用按钮时可能丢失焦点，只恢复本次操作的目标。 */
+    const button = reorderFocusRef.current;
+    reorderFocusRef.current = null;
+    if (document.activeElement !== document.body && document.activeElement !== button) return;
+    /** 到达首尾后原方向禁用，消息本身接管焦点，不跳到另一条消息。 */
+    const row = regionRef.current?.querySelector<HTMLElement>('[data-reordered="true"]');
+    if (!row) return;
+    (button.disabled ? row : button).focus({ preventScroll: true });
+    row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [reorderFeedback, queue]);
 
   if (queue.length === 0 || props.state.snapshot?.providerState === 'failed' || props.state.snapshot?.providerState === 'closed') return null;
 
@@ -121,6 +151,7 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
   function startEdit(submission: NativeQueuedSubmission): void {
     setEditingId(submission.id);
     setActionError(null);
+    setReorderFeedback(null);
   }
 
   /** 退出编辑态但不触碰权威排队内容。 */
@@ -149,6 +180,7 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
     if (!operation || busy) return false;
     setActionId(`${action}:${submissionId}`);
     setActionError(null);
+    setReorderFeedback(null);
     try {
       await operation();
       return true;
@@ -160,21 +192,20 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
     }
   }
 
-  /** 按完整队列移动一位，避免遗漏隐藏的控制或恢复提交。 */
-  async function reorder(submission: NativeQueuedSubmission, direction: -1 | 1): Promise<void> {
-    if (!props.onReorder || busy || !canMoveQueueSubmission(reorderableQueue, queue, submission.id, direction)) return;
-    /** 新顺序包含服务端认定的全部可重排成员。 */
-    const orderedIds = moveQueueSubmission(reorderableQueue, submission.id, direction);
-    /** 辅助技术播报使用真实完整队列位置。 */
-    const position = orderedIds.indexOf(submission.id) + 1;
-    if (await runAction(submission.id, 'reorder', () => props.onReorder?.(orderedIds))) setAnnouncement(copy.reordered(position, orderedIds.length));
+  /** 按完整队列立即移动一位，连续点击由共享调序逻辑串行保存。 */
+  function reorder(submission: NativeQueuedSubmission, direction: -1 | 1, button: HTMLButtonElement): void {
+    if (!ordering.canMove(submission.id, direction)) return;
+    reorderFocusRef.current = button;
+    setActionError(null);
+    setReorderFeedback({ submissionId: submission.id });
+    ordering.move(submission.id, direction);
   }
 
   return (
-    <section className="session-queued-messages" aria-label={copy.region}>
+    <section ref={regionRef} className="session-queued-messages" aria-label={copy.region}>
       <h2 className="session-sr-only">{copy.heading(queue.length)}</h2>
       <output className="session-sr-only" aria-live="polite" aria-atomic="true">
-        {announcement}
+        {reorderedIndex >= 0 ? copy.reordered(reorderedIndex + 1, queue.length) : ''}
       </output>
       <ol>
         {queue.map((submission) => {
@@ -193,9 +224,9 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
           /** 引导保持可聚焦，禁用原因通过标题和可访问名称说明。 */
           const steerReason = resumable ? null : submission.localOnly ? copy.steerUnavailable : queuedSteerUnavailableReason(props.state, reorderableQueue, submission, copy);
           /** 上移只允许与相邻普通排队项交换。 */
-          const canMoveUp = canMoveQueueSubmission(reorderableQueue, queue, submission.id, -1);
+          const canMoveUp = ordering.canMove(submission.id, -1);
           /** 下移只允许与相邻普通排队项交换。 */
-          const canMoveDown = canMoveQueueSubmission(reorderableQueue, queue, submission.id, 1);
+          const canMoveDown = ordering.canMove(submission.id, 1);
           /** 当前行的错误保持在原提交旁。 */
           const rowError = actionError?.submissionId === submission.id ? actionError.message : submission.error?.message;
           /** 附件与正文分别投影，纯附件消息不再退化成空白或泛化占位。 */
@@ -204,7 +235,14 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
           const textPreview = queuedMessageTextPreview(submission);
           return (
             <li key={submission.id}>
-              <article className="session-queued-message" data-queue-status={submission.status} data-editing={editingId === submission.id || undefined} aria-busy={actionId?.endsWith(submission.id) || undefined}>
+              <article
+                className="session-queued-message"
+                tabIndex={-1}
+                data-reordered={reorderFeedback?.submissionId === submission.id || undefined}
+                data-queue-status={submission.status}
+                data-editing={editingId === submission.id || undefined}
+                aria-busy={actionId?.endsWith(submission.id) || (ordering.saving && reorderFeedback?.submissionId === submission.id) || undefined}
+              >
                 {editingId === submission.id ? (
                   <QueuedMessageEditor
                     submission={submission}
@@ -255,10 +293,10 @@ export function QueuedConversationMessages(props: QueuedConversationMessagesProp
                     >
                       <Trash aria-hidden="true" />
                     </button>
-                    <button type="button" data-icon-tooltip={copy.moveUp} aria-label={copy.moveUp} onClick={() => void reorder(submission, -1)} disabled={!submissionWritable || busy || !props.onReorder || !canMoveUp}>
+                    <button type="button" data-icon-tooltip={copy.moveUp} aria-label={copy.moveUp} onClick={(event) => reorder(submission, -1, event.currentTarget)} disabled={!submissionWritable || !canMoveUp}>
                       <ArrowUp aria-hidden="true" />
                     </button>
-                    <button type="button" data-icon-tooltip={copy.moveDown} aria-label={copy.moveDown} onClick={() => void reorder(submission, 1)} disabled={!submissionWritable || busy || !props.onReorder || !canMoveDown}>
+                    <button type="button" data-icon-tooltip={copy.moveDown} aria-label={copy.moveDown} onClick={(event) => reorder(submission, 1, event.currentTarget)} disabled={!submissionWritable || !canMoveDown}>
                       <ArrowDown aria-hidden="true" />
                     </button>
                   </footer>
@@ -320,7 +358,6 @@ function QueuedMessageEditor(props: {
         return [...byIdentity.values()];
       });
     },
-    onRemoveAttachment: removeAttachment,
     onError: props.onError,
   });
   /** 导入尚未完成时不能保存一份缺少附件的消息。 */
@@ -329,9 +366,6 @@ function QueuedMessageEditor(props: {
   useLayoutEffect(() => {
     textareaRef.current?.focus();
   }, []);
-  useLayoutEffect(() => {
-    if (textareaRef.current) autosizeTextarea(textareaRef.current, 42, 0.34);
-  }, [draft]);
 
   /** 表单和快捷键使用同一保存门禁。 */
   function submit(event: FormEvent<HTMLFormElement>): void {
@@ -358,7 +392,6 @@ function QueuedMessageEditor(props: {
         ariaLabel={copy.attachments(attachments.length)}
         className="session-queued-message-attachments"
         onRemove={removeAttachment}
-        onRestorePastedText={inputResources.restorePastedText}
       />
       <label className="session-sr-only" htmlFor={`queued-message-${props.submission.id}`}>
         {copy.editLabel}
@@ -387,7 +420,7 @@ function QueuedMessageEditor(props: {
       />
       <footer>
         <small aria-hidden="true">{copy.editShortcut}</small>
-        <button type="button" data-icon-tooltip={copy.addAttachments} aria-label={copy.addAttachments} onClick={inputResources.chooseAttachments} disabled={props.busy || inputResources.processing}>
+        <button type="button" data-icon-tooltip={copy.addAttachments} aria-label={copy.addAttachments} aria-haspopup="menu" onClick={inputResources.chooseAttachments} disabled={props.busy || inputResources.processing}>
           <Paperclip aria-hidden="true" />
         </button>
         <button type="button" className="session-queued-message-editor-cancel" onClick={props.onCancel} disabled={props.busy}>
@@ -444,33 +477,6 @@ function queuedSteerUnavailableReason(state: NativeSessionState, queue: readonly
   if (queue[0]?.id !== submission.id) return copy.steerHeadOnly;
   if (submission.status !== 'queued' || !canSteerActiveTurn(state)) return copy.steerUnavailable;
   return null;
-}
-
-/** 排序只交换相邻的可见普通 queued 项，不跨越控制、失败或恢复边界。 */
-function canMoveQueueSubmission(fullQueue: readonly NativeQueuedSubmission[], visibleQueue: readonly NativeQueuedSubmission[], submissionId: string, direction: -1 | 1): boolean {
-  /** 当前项必须仍是普通 queued，暂停项不能绕开队首闸机。 */
-  const currentIndex = fullQueue.findIndex((submission) => submission.id === submissionId);
-  /** 目标项必须同样出现在当前卡片区。 */
-  const target = fullQueue[currentIndex + direction];
-  /** 可见身份集合只用于约束相邻交换，不改变服务端完整顺序。 */
-  const visibleIds = new Set(visibleQueue.map((submission) => submission.id));
-  return currentIndex >= 0 && fullQueue[currentIndex]?.status === 'queued' && target?.status === 'queued' && visibleIds.has(target.id);
-}
-
-/** 返回服务端要求的完整新顺序，不原地修改 React 派生数组。 */
-function moveQueueSubmission(queue: readonly NativeQueuedSubmission[], submissionId: string, direction: -1 | 1): string[] {
-  /** 新数组保护权威快照不被视图层修改。 */
-  const ids = queue.map((submission) => submission.id);
-  /** 当前索引决定一次只移动一个相邻位置。 */
-  const currentIndex = ids.indexOf(submissionId);
-  if (currentIndex < 0) return ids;
-  /** 目标索引严格限制在队列范围内。 */
-  const targetIndex = Math.max(0, Math.min(ids.length - 1, currentIndex + direction));
-  if (targetIndex === currentIndex) return ids;
-  /** 被移动身份由 splice 原子取出后插入目标位置。 */
-  const [moved] = ids.splice(currentIndex, 1);
-  if (moved) ids.splice(targetIndex, 0, moved);
-  return ids;
 }
 
 /** 将未知异常收敛为简短的用户可读反馈。 */

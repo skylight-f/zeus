@@ -1,8 +1,20 @@
 import { randomId } from './randomId.js';
 import { createHash } from 'node:crypto';
-import { type CommandArtifact, type CommandDefinition, type CommandDefinitionInput, type CommandRun, type CommandRunStatus, type CommandRunTrigger, type CommandScope, defaultCommandRiskFlags } from '@zeus/shared';
+import {
+  type CommandArtifact,
+  type CommandDefinition,
+  type CommandDefinitionInput,
+  type CommandRun,
+  type CommandRunNotification,
+  type CommandRunStatus,
+  type CommandRunTrigger,
+  type CommandScope,
+  type CommandShell,
+  type NotificationPosition,
+  defaultCommandRiskFlags,
+} from '@zeus/shared';
 import type { ArtifactRef, ArtifactStore } from './artifactStore.js';
-import type { ZeusDatabasePort } from './databasePort.js';
+import type { SqlValue, ZeusDatabasePort } from './databasePort.js';
 
 interface DbCommandDefinitionRow {
   id: string;
@@ -12,6 +24,8 @@ interface DbCommandDefinitionRow {
   title: string;
   description: string;
   command_text: string;
+  /** 保存脚本解释器，历史记录明确为 sh。 */
+  command_shell: CommandShell;
   parameters_json: string;
   timeout_seconds: number;
   enabled: number;
@@ -103,6 +117,8 @@ export function migrateCommandCenterSchema(db: ZeusDatabasePort): void {
   const migrationId = '20260728_0009_command_center';
   if (db.get<{ migration_id: string }>(`SELECT migration_id FROM schema_migrations WHERE migration_id = ?`, [migrationId])) {
     migrateCommandArtifactRefColumn(db);
+    migrateCommandShell(db);
+    migrateCommandRunNotifications(db);
     return;
   }
   db.transaction(() => {
@@ -183,6 +199,38 @@ export function migrateCommandCenterSchema(db: ZeusDatabasePort): void {
     db.execute(`INSERT INTO schema_migrations (migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)`, [migrationId, '增加通用命令定义、别名、执行记录与产物持久化', checksum, nowIso()]);
   });
   migrateCommandArtifactRefColumn(db);
+  migrateCommandShell(db);
+  migrateCommandRunNotifications(db);
+}
+
+/** 新增执行结果未读状态；历史执行默认已读，不在升级时集中补发。 */
+function migrateCommandRunNotifications(db: ZeusDatabasePort): void {
+  /** 独立登记迁移，保持已有迁移记录不变。 */
+  const migrationId = '20261016_command_run_notifications';
+  if (db.get('SELECT migration_id FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    // 一表示执行结果尚未确认，零表示已读或尚未结束；由命令仓库维护。
+    db.execute('ALTER TABLE command_runs ADD COLUMN notification_unread INTEGER NOT NULL DEFAULT 0 CHECK(notification_unread IN (0, 1))');
+    // 仅索引未读执行，匹配通知列表的结束时间及身份倒序读取。
+    db.execute('CREATE INDEX idx_command_runs_notification_unread ON command_runs(ended_at DESC, id DESC) WHERE notification_unread = 1');
+    db.execute('INSERT INTO schema_migrations (migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [migrationId, '命令执行结果的耐久未读状态', createHash('sha256').update(migrationId).digest('hex'), nowIso()]);
+  });
+}
+
+/** 用独立迁移固定旧脚本的 sh 语义，不改变已有迁移校验和。 */
+function migrateCommandShell(db: ZeusDatabasePort): void {
+  /** 此迁移只登记解释器，不转换用户脚本。 */
+  const migrationId = '20261015_command_shell';
+  if (db.get('SELECT migration_id FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    db.execute("ALTER TABLE command_definitions ADD COLUMN command_shell TEXT NOT NULL DEFAULT 'sh' CHECK(command_shell IN ('sh', 'zsh', 'powershell', 'cmd'))");
+    db.execute('INSERT INTO schema_migrations (migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [
+      migrationId,
+      '明确命令脚本解释器，历史脚本保留 sh',
+      `sha256:${createHash('sha256').update('command_definitions.command_shell:sh,zsh,powershell,cmd').digest('hex')}`,
+      nowIso(),
+    ]);
+  });
 }
 
 function migrateCommandArtifactRefColumn(db: ZeusDatabasePort): void {
@@ -202,10 +250,10 @@ export class CommandDefinitionRepository {
     this.db.transaction(() => {
       this.db.execute(
         `INSERT INTO command_definitions
-           (id, scope, project_id, name, normalized_name, title, description, command_text,
+           (id, scope, project_id, name, normalized_name, title, description, command_text, command_shell,
             parameters_json, timeout_seconds, enabled, telegram_enabled, risk_flags_json,
             revision, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         [
           id,
           input.scope,
@@ -215,6 +263,7 @@ export class CommandDefinitionRepository {
           input.title.trim(),
           input.description?.trim() ?? '',
           input.command.trim(),
+          input.shell ?? 'sh',
           JSON.stringify(input.parameters ?? []),
           input.timeoutSeconds ?? 300,
           input.enabled === false ? 0 : 1,
@@ -237,7 +286,7 @@ export class CommandDefinitionRepository {
     this.db.transaction(() => {
       this.db.execute(
         `UPDATE command_definitions
-         SET name = ?, normalized_name = ?, title = ?, description = ?, command_text = ?,
+         SET name = ?, normalized_name = ?, title = ?, description = ?, command_text = ?, command_shell = ?,
              parameters_json = ?, timeout_seconds = ?, enabled = ?, telegram_enabled = ?,
              risk_flags_json = ?, revision = ?, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL`,
@@ -247,6 +296,7 @@ export class CommandDefinitionRepository {
           input.title.trim(),
           input.description?.trim() ?? '',
           input.command.trim(),
+          input.shell ?? existing.shell ?? 'sh',
           JSON.stringify(input.parameters ?? []),
           input.timeoutSeconds ?? 300,
           input.enabled === false ? 0 : 1,
@@ -374,6 +424,7 @@ export class CommandDefinitionRepository {
       title: row.title,
       description: row.description,
       command: row.command_text,
+      shell: row.command_shell,
       parameters: parseJsonArray(row.parameters_json),
       timeoutSeconds: row.timeout_seconds,
       enabled: row.enabled === 1,
@@ -386,7 +437,9 @@ export class CommandDefinitionRepository {
   }
 }
 
+/** 命令执行结果与通知状态共用同一权威记录。 */
 export class CommandRunRepository {
+  /** 复用命令执行及通知确认的事务边界。 */
   constructor(private readonly db: ZeusDatabasePort) {}
 
   create(input: CreateCommandRunRecordInput): CommandRun {
@@ -403,6 +456,7 @@ export class CommandRunRepository {
     return this.getById(id)!;
   }
 
+  /** 首次结束执行时同时置为未读；重复终态更新不会重新提醒。 */
   update(id: string, input: UpdateCommandRunRecordInput): CommandRun {
     const existing = this.getById(id);
     if (!existing) throw new Error(`Command run not found: ${id}`);
@@ -410,7 +464,9 @@ export class CommandRunRepository {
     this.db.execute(
       `UPDATE command_runs
        SET status = ?, runtime_session_id = ?, exit_code = ?, failure_reason = ?,
-           started_at = ?, ended_at = ?, updated_at = ?
+           started_at = ?, ended_at = ?, updated_at = ?,
+           notification_unread = CASE WHEN ended_at IS NULL AND ? IS NOT NULL
+             AND ? IN ('succeeded', 'failed', 'timed_out', 'cancelled') THEN 1 ELSE notification_unread END
        WHERE id = ?`,
       [
         input.status ?? existing.status,
@@ -420,6 +476,8 @@ export class CommandRunRepository {
         input.startedAt === undefined ? existing.startedAt : input.startedAt,
         input.endedAt === undefined ? existing.endedAt : input.endedAt,
         updatedAt,
+        input.endedAt === undefined ? existing.endedAt : input.endedAt,
+        input.status ?? existing.status,
         id,
       ],
     );
@@ -442,6 +500,29 @@ export class CommandRunRepository {
 
   listActive(): CommandRun[] {
     return this.db.select<DbCommandRunRow>(`${commandRunSelectSql()} WHERE status IN ('pending_confirmation', 'starting', 'running', 'stopping') ORDER BY created_at`).map(mapCommandRunRow);
+  }
+
+  /** 与统一通知采用相同全局边界；多读一条以判断下一页，计数覆盖全部未读。 */
+  notifications(before?: NotificationPosition): { items: CommandRunNotification[]; unreadCount: number } {
+    /** 已删除项目的结果不再出现在可导航列表中。 */
+    const unreadWhere = "notification_unread = 1 AND ended_at IS NOT NULL AND status IN ('succeeded', 'failed', 'timed_out', 'cancelled') AND project_id IN (SELECT id FROM projects WHERE deleted_at IS NULL)";
+    /** 相同时间时先比较来源，再比较原执行身份，保持跨来源分页稳定。 */
+    const boundary = before ? " AND (ended_at < ? OR (ended_at = ? AND ('command' < ? OR ('command' = ? AND id < ?))))" : '';
+    /** 所有边界值均使用绑定参数，不拼接外部输入。 */
+    const params: SqlValue[] = before ? [before.occurredAt, before.occurredAt, before.source, before.source, before.id] : [];
+    return {
+      items: this.db.select<DbCommandRunRow>(`${commandRunSelectSql()} WHERE ${unreadWhere}${boundary} ORDER BY ended_at DESC, id DESC LIMIT 21`, params).map((row) => {
+        /** 仅提取可展示摘要，状态和结束时间由查询条件保证。 */
+        const run = mapCommandRunRow(row);
+        return { id: run.id, projectId: run.projectId, title: run.commandSnapshot.title, status: run.status as CommandRunNotification['status'], occurredAt: run.endedAt! };
+      }),
+      unreadCount: this.db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM command_runs WHERE ${unreadWhere}`)?.count ?? 0,
+    };
+  }
+
+  /** 单条及全部确认都由统一通知的耐久幂等事务调用，不修改执行结果。 */
+  acknowledgeNotifications(id?: string): void {
+    this.db.execute('UPDATE command_runs SET notification_unread = 0 WHERE notification_unread = 1 AND (? IS NULL OR id = ?)', [id ?? null, id ?? null]);
   }
 }
 
@@ -504,7 +585,7 @@ export class CommandArtifactRepository {
 function commandDefinitionSelectSql(): string {
   return `SELECT command_definitions.id, command_definitions.scope, command_definitions.project_id,
                  command_definitions.name, command_definitions.title, command_definitions.description,
-                 command_definitions.command_text, command_definitions.parameters_json,
+                 command_definitions.command_text, command_definitions.command_shell, command_definitions.parameters_json,
                  command_definitions.timeout_seconds, command_definitions.enabled,
                  command_definitions.telegram_enabled, command_definitions.risk_flags_json,
                  command_definitions.revision, command_definitions.created_at, command_definitions.updated_at
@@ -531,7 +612,7 @@ function mapCommandRunRow(row: DbCommandRunRow): CommandRun {
     runtimeSessionId: row.runtime_session_id,
     trigger: row.trigger,
     status: row.status,
-    commandSnapshot: JSON.parse(row.command_snapshot_json) as CommandDefinition,
+    commandSnapshot: { shell: 'sh', ...JSON.parse(row.command_snapshot_json) } as CommandDefinition,
     parameterSnapshot: parseJsonObject(row.parameter_snapshot_json),
     cwd: row.cwd,
     timeoutSeconds: row.timeout_seconds,

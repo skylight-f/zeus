@@ -26,14 +26,17 @@ export interface HomebrewUpdateController {
   onIndicatorState(listener: (state: HomebrewUpdateIndicatorState) => void): () => void;
   onCheckCompleted(listener: (checkedAt: string) => void): () => void;
   close(): void;
+  /** Windows 安装需确认原生窗口进程已退出，才能替换其可执行文件。 */
+  closeAndWait(): Promise<void>;
 }
 
 interface CreateHomebrewUpdateControllerOptions {
   helperPath: string;
   language: () => 'zh-CN' | 'en-US';
   loadUpdateStatus: () => Promise<DesktopReleaseUpdateStatus>;
-  homebrew: HomebrewUpdateService;
-  /** DMG 安装复用已有直接更新与安装交接。 */
+  /** Windows 不提供 Homebrew，直接使用同一状态机的安装包路径。 */
+  homebrew?: HomebrewUpdateService;
+  /** 平台安装包复用已有直接更新与安装交接。 */
   direct: ReleaseUpdateService;
   /** 仅在用户点击后打开经过 Main 校验的官方发布页。 */
   openDownloadPage: (url: string) => Promise<void>;
@@ -57,6 +60,8 @@ const defaultRetryDelaysMs = [60_000, 5 * 60_000] as const;
 /** 原生窗口可以隐藏或重启，但唯一后台更新任务不因窗口生命周期重复执行。 */
 export function createHomebrewUpdateController(options: CreateHomebrewUpdateControllerOptions): HomebrewUpdateController {
   let host: NativeUpdateProgressHost | null = null;
+  /** 并发进度回调共用一次启动，退出也必须等待正在创建的窗口。 */
+  let hostCreation: Promise<NativeUpdateProgressHost> | null = null;
   let phase: ControllerPhase = 'idle';
   let hidden = false;
   let closed = false;
@@ -74,11 +79,20 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
   const retryDelaysMs = options.retryDelaysMs ?? defaultRetryDelaysMs;
 
   async function ensureHost(): Promise<NativeUpdateProgressHost> {
+    if (closed) throw new Error('更新控制器已关闭。');
     if (host) return host;
-    const created = await createNativeUpdateProgressHost({
+    const created = await (hostCreation ??= createNativeUpdateProgressHost({
       executablePath: options.helperPath,
       language: options.language,
-    });
+    }).catch((error) => {
+      hostCreation = null;
+      throw error;
+    }));
+    if (closed) {
+      await created.closeAndWait();
+      throw new Error('更新控制器已关闭。');
+    }
+    if (host) return host;
     host = created;
     created.onAction((action) => {
       if (action === 'closed' || action === 'later' || action === 'close') {
@@ -90,7 +104,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       else if (action === 'check') void runExclusive(() => checkForUpdate(true, true).then(() => undefined));
       else if (action === 'open_download_page') void runExclusive(openDownloadPage);
       else if (action === 'open_installer') void runExclusive(openDownloadedUpdate);
-      else if (action === 'reconnect' && updateMethod === 'homebrew') options.homebrew.reconnectDownload();
+      else if (action === 'reconnect' && updateMethod === 'homebrew') options.homebrew?.reconnectDownload();
       else if (action === 'restart') void runExclusive(installPreparedUpdate);
       else if (action === 'retry') {
         if (lastFailureStep === 'install' && prepared) void runExclusive(installPreparedUpdate);
@@ -99,7 +113,10 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       }
     });
     created.onExit(() => {
-      if (host === created) host = null;
+      if (host === created) {
+        host = null;
+        hostCreation = null;
+      }
       hidden = true;
     });
     if (lastState) created.update({ ...lastState, present: !hidden });
@@ -107,6 +124,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
   }
 
   function runExclusive(task: () => Promise<void>): Promise<void> {
+    if (closed) return Promise.resolve();
     if (operation) return operation;
     const running = task().finally(() => {
       if (operation === running) operation = null;
@@ -124,19 +142,19 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
   }
 
   async function publish(state: NativeUpdateProgressState): Promise<void> {
+    if (closed) return;
     lastState = { ...state, present: !hidden };
     if (hidden && !host) return;
     const currentHost = await ensureHost();
     currentHost.update(lastState);
   }
 
+  /** 后台检查也保存当前窗口状态，用户中途打开时立即显示真实检查进度。 */
   async function checkForUpdate(present: boolean, updateIndicator: boolean): Promise<DesktopReleaseUpdateStatus | null> {
     phase = 'checking';
     lastFailureStep = 'check';
-    if (present) {
-      await publish(copyFor(options.language(), 'checking', options.currentVersion));
-      (await ensureHost()).show();
-    }
+    await publish(copyFor(options.language(), 'checking', options.currentVersion));
+    if (present) (await ensureHost()).show();
     try {
       const update = await retryOperation(options.loadUpdateStatus, 2);
       currentUpdate = update;
@@ -147,7 +165,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         installed = null;
         phase = 'upToDate';
         if (updateIndicator) setIndicator(idleIndicator(options.currentVersion));
-        if (present) await publish(copyFor(options.language(), 'upToDate', options.currentVersion, update));
+        if (!hidden) await publish(copyFor(options.language(), 'upToDate', options.currentVersion, update));
         return update;
       }
       if (update.status !== 'available' || !update.artifact) {
@@ -155,7 +173,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         await publishManualUpdate(update);
         return update;
       }
-      updateMethod = (await options.homebrew.isManaged()) ? 'homebrew' : 'direct';
+      updateMethod = (await options.homebrew?.isManaged()) ? 'homebrew' : 'direct';
       const manualReason = updateMethod === 'direct' ? await options.direct.manualInstallReason(update) : null;
       if (manualReason) {
         await publishManualUpdate(update);
@@ -164,14 +182,14 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       if (prepared && prepared.method === updateMethod && samePreparedUpdate(prepared, update)) {
         phase = 'ready';
         if (updateIndicator) setIndicator(indicatorForReady(options.language(), update));
-        if (present) await publish(copyFor(options.language(), 'ready', options.currentVersion, update));
+        if (!hidden) await publish(copyFor(options.language(), 'ready', options.currentVersion, update));
         return update;
       }
       prepared = null;
       installed = null;
       phase = 'available';
       if (updateIndicator) setIndicator(indicatorForAvailable(options.language(), update));
-      if (present) await publish(copyFor(options.language(), 'available', options.currentVersion, update));
+      if (!hidden) await publish(copyFor(options.language(), 'available', options.currentVersion, update));
       return update;
     } catch (error) {
       await publishFailure(error, 'check');
@@ -198,7 +216,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
           setIndicator(indicatorFromProgress(options.language(), progress, update));
           void publish(progressCopy(options.language(), progress, update, updateMethod === 'direct'));
         };
-        if (updateMethod === 'homebrew') {
+        if (updateMethod === 'homebrew' && options.homebrew) {
           prepared = { ...(await options.homebrew.prepare(update, onProgress)), method: 'homebrew' };
         } else {
           const result = await options.direct.download(onProgress);
@@ -247,7 +265,7 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       options.canInstall();
       phase = 'installing';
       await publish(copyFor(options.language(), 'installing', options.currentVersion, prepared.update));
-      if ((await options.homebrew.isManaged()) !== (prepared.method === 'homebrew')) throw new Error('Zeus 的安装管理方式已变化，请重新检查更新。');
+      if (Boolean(await options.homebrew?.isManaged()) !== (prepared.method === 'homebrew')) throw new Error('Zeus 的安装管理方式已变化，请重新检查更新。');
       /** 用户取消退出时保留下载结果；直接安装由原安装器完成退出后的替换。 */
       let accepted: boolean;
       if (prepared.method === 'direct') {
@@ -261,9 +279,12 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       } else {
         /** 保留本次下载结果，只有用户确认退出后才允许替换正在运行的应用。 */
         const preparedHomebrew = prepared;
+        /** 安装管理方式已经核验；缺少服务不能退回另一种安装行为。 */
+        const homebrew = options.homebrew;
+        if (!homebrew) throw new Error('当前平台没有 Homebrew 更新服务。');
         accepted = await options.onInstallReady(prepared.update.executionHostProtocolVersion, async () => {
           const currentHost = await ensureHost();
-          installed ??= await options.homebrew.install(preparedHomebrew, (progress) => {
+          installed ??= await homebrew.install(preparedHomebrew, (progress) => {
             void publish(progressCopy(options.language(), progress, preparedHomebrew.update));
           });
           currentHost.relaunchAfterProcessExit({ pid: process.pid, ...installed! });
@@ -345,7 +366,9 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     currentHost.show();
   }
 
+  /** 自动调度不改变正在执行的手动操作或窗口可见性。 */
   async function checkAutomatically(input?: { blockedPrepareVersion?: string | null }): Promise<boolean> {
+    if (operation) return false;
     hidden = true;
     let loaded = false;
     await runExclusive(async () => {
@@ -377,6 +400,8 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
 
   return {
     showOrCheck: () => {
+      // 手动点击先显示正在执行的任务，不能只等待隐藏的自动检查结束。
+      if (operation) return showCurrent();
       if (phase === 'preparing' || phase === 'installing' || (phase === 'available' && currentUpdate) || (phase === 'failed' && lastState?.state === 'failed')) return showCurrent();
       hidden = false;
       return runExclusive(() => checkForUpdate(true, true).then(() => undefined));
@@ -401,7 +426,16 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     close: () => {
       closed = true;
       host?.close();
+      void hostCreation?.then((created) => created.close()).catch(() => undefined);
       host = null;
+      indicatorListeners.clear();
+      checkCompletedListeners.clear();
+    },
+    closeAndWait: async () => {
+      closed = true;
+      await (host ?? (await hostCreation))?.closeAndWait();
+      host = null;
+      hostCreation = null;
       indicatorListeners.clear();
       checkCompletedListeners.clear();
     },

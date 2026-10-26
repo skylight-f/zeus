@@ -23,6 +23,8 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
   const document = root.ownerDocument ?? (root as Document);
   /** 当前窗口提供视口尺寸与窗口事件。 */
   const window = document.defaultView!;
+  /** 跨窗口门户中的节点必须使用所属窗口的构造器判断。 */
+  const { Document, HTMLElement, Node } = window as Window & typeof globalThis;
   /** 样式只注入当前根，避免污染被评论的网页。 */
   const style = document.createElement('style');
   style.textContent = iconTooltipStyles;
@@ -49,10 +51,22 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
     else update();
   });
 
+  /** 只有回到触发器或提示内容时才撤销离开计时。 */
+  function cancelClose(): void {
+    clearTimeout(leaveTimer);
+    leaveTimer = undefined;
+  }
+
+  /** 离开后的关闭只安排一次，空白区域内的连续移动不延后收起。 */
+  function closeLater(): void {
+    if (!active || leaveTimer !== undefined || described?.matches(':focus-visible')) return;
+    leaveTimer = setTimeout(hide, 200);
+  }
+
   /** 关闭提示并保留其他功能建立的说明。 */
   function hide(): void {
     hoverIntent.cancel();
-    clearTimeout(leaveTimer);
+    cancelClose();
     observer.disconnect();
     if (described) {
       /** 其他功能的说明仍然保留。 */
@@ -91,7 +105,7 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
   /** 提示跟随当前模态或菜单，并使用顶层浮层避免裁切。 */
   function show(trigger: HTMLElement, focused?: HTMLElement): void {
     if (!trigger.getAttribute('data-icon-tooltip')) return;
-    clearTimeout(leaveTimer);
+    cancelClose();
     /** 文本可能位于按钮内部；键盘入口始终关联实际获得焦点的控件。 */
     const control = focused ?? trigger.closest<HTMLElement>('button, input, select, [tabindex]') ?? trigger.querySelector<HTMLElement>('button, input, select, [tabindex]');
     if (active === trigger && described === control) {
@@ -121,35 +135,43 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
     return null;
   }
 
-  /** 鼠标连续停留后显示；进入气泡后保持，触摸不触发。 */
+  /** 移动时按真实目标维护等待；同目标不重计时，取消后须有新的鼠标移动才能再等待。 */
   function enter(event: Event): void {
-    clearTimeout(leaveTimer);
     if ((event as PointerEvent).pointerType === 'touch' || (event as PointerEvent).buttons > 0) return;
     if (event.composedPath().includes(tooltip)) {
+      cancelClose();
+      hoverIntent.cancel();
       hovered = active;
       return;
     }
     /** 子节点之间的移动仍属于同一个真实触发器。 */
     const next = triggerFor(event);
-    if (next === hovered) return;
-    hoverIntent.cancel();
-    if (next && active && active !== next) hide();
+    if (!next) {
+      hoverIntent.cancel();
+      hovered = null;
+      closeLater();
+      return;
+    }
+    cancelClose();
+    // 同目标的子节点或布局变化不重启已取消的等待；恢复等待由真实移动负责。
+    if (next === hovered && event.type === 'pointerover') return;
+    if (next !== hovered) hoverIntent.cancel();
+    if (active && active !== next) hide();
     hovered = next;
-    if (next) {
-      if (active === next) update();
-      else hoverIntent.schedule(next, () => show(next));
-    } else if (!described?.matches(':focus-visible')) leaveTimer = setTimeout(hide, 200);
+    if (active === next) {
+      // 气泡已显示时，连续移动不重复测量布局；重入时再校准位置。
+      if (event.type === 'pointerover') update();
+    } else hoverIntent.schedule(next, () => show(next));
   }
 
   /** 鼠标离开控件和气泡后关闭，键盘焦点仍在时保留。 */
   function leave(event: Event): void {
-    clearTimeout(leaveTimer);
     /** 下一步目标可以是图标内部节点或提示文字。 */
     const next = (event as PointerEvent).relatedTarget;
     if (next instanceof Node && (hovered?.contains(next) || active?.contains(next) || tooltip.contains(next))) return;
     hoverIntent.cancel();
     hovered = null;
-    if (!described?.matches(':focus-visible')) leaveTimer = setTimeout(hide, 200);
+    closeLater();
   }
 
   /** 键盘聚焦显示，鼠标点击产生的焦点不会重新打开提示。 */
@@ -167,6 +189,8 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
 
   /** Tab 自动滚入视口后重新定位；鼠标滚动或控件已离开视口时关闭。 */
   function scroll(event: Event): void {
+    // 尚未显示时由共用控制器判断滚动范围，避免相邻区域滚动取消等待。
+    if (!active) return;
     // 原生长标题迁移后允许在气泡内滚动阅读，不关闭正在阅读的提示。
     if (event.composedPath().includes(tooltip)) return;
     hoverIntent.cancel();
@@ -192,7 +216,9 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
   }
 
   root.addEventListener('pointerover', enter, true);
+  root.addEventListener('pointermove', enter, true);
   root.addEventListener('pointerout', leave, true);
+  root.addEventListener('pointercancel', hide, true);
   root.addEventListener('focusin', focus, true);
   root.addEventListener('focusout', blur, true);
   root.addEventListener('keydown', keydown, true);
@@ -206,7 +232,9 @@ export function installIconTooltips(root: Document | ShadowRoot): () => void {
     hide();
     style.remove();
     root.removeEventListener('pointerover', enter, true);
+    root.removeEventListener('pointermove', enter, true);
     root.removeEventListener('pointerout', leave, true);
+    root.removeEventListener('pointercancel', hide, true);
     root.removeEventListener('focusin', focus, true);
     root.removeEventListener('focusout', blur, true);
     root.removeEventListener('keydown', keydown, true);

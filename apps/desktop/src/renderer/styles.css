@@ -24473,3 +24473,406 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   outline: 2px solid var(--brand);
   outline-offset: 2px;
 }
+.project-git-diff-preview > header > span {
+  color: var(--zeus-code-addition-text);
+}
+
+.macos-ai-app .project-first-sidebar button:hover:not(:disabled):not([aria-disabled='true']),
+.macos-ai-app .project-first-sidebar button:focus-visible {
+  background: var(--zeus-native-row-hover);
+  border-color: var(--zeus-product-line-soft);
+}
+.macos-ai-app .task-git-delivery-file-row button > [data-file-status] {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.macos-ai-app .task-git-delivery-file-row button > small {
+  flex-shrink: 0;
+}
+.macos-ai-app .task-git-delivery-repository :is(summary, button):focus-visible {
+  outline: 2px solid var(--zeus-control-accent);
+  outline-offset: -2px;
+}
+.macos-ai-app .task-git-delivery-merge-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.macos-ai-app .task-git-delivery-merge-row > * {
+  min-inline-size: 0;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label small {
+  color: var(--zeus-product-muted);
+  line-height: 1.5;
+}
+
+.macos-ai-app .git-delivery-conflict-permissions {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) legend {
+  margin-block-end: 7px;
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-block-size: 50px;
+  padding: 7px 2px;
+  border: 0;
+  border-block-end: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label:first-of-type {
+  border-block-start: 0;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label.is-selected {
+  color: var(--zeus-product-text);
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label.is-selected > span > strong {
+  color: var(--zeus-accent, #3977db);
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > input {
+  appearance: none;
+  -webkit-appearance: none;
+  inline-size: 14px;
+  block-size: 14px;
+  min-inline-size: 14px;
+  min-block-size: 14px;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid var(--zeus-control-border);
+  border-radius: 50%;
+  background: var(--zeus-product-panel);
+  box-shadow: none;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > input::before {
+  inline-size: 6px;
+  block-size: 6px;
+  border-radius: 50%;
+  background: var(--zeus-accent, #3977db);
+  content: '';
+  transform: scale(0);
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > input:checked {
+  border-color: var(--zeus-accent, #3977db);
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > input:checked::before {
+  transform: scale(1);
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > input:focus-visible {
+  outline: 3px solid color-mix(in oklab, var(--zeus-accent, #3977db) 28%, transparent);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.macos-ai-app :is(.task-git-conflict-ai-permission, .git-delivery-conflict-permissions) label > span {
+  display: grid;
+  gap: 3px;
+}
+.macos-ai-app .pending-resource-reference-label {
+  position: absolute;
+  inset-inline-start: 4px;
+  inset-block-end: 4px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--zeus-product-panel);
+  color: var(--zeus-product-text);
+  font-size: 10px;
+  pointer-events: none;
+}
+.project-sidebar-group-header {
+  position: relative;
+}
+.project-sidebar-group-header .project-quick-action-label {
+  padding-inline-end: 54px;
+}
+.macos-ai-app.zeus-shell .project-first-sidebar .project-sidebar-group-header .project-sidebar-heading-actions {
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block-start: 0;
+}
+.macos-ai-app .zentao-sync-source-link {
+  align-items: center;
+  align-self: flex-start;
+  border-radius: 6px;
+  color: var(--zeus-product-muted);
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 4px;
+  line-height: 20px;
+  margin-inline-start: -6px;
+  max-inline-size: 100%;
+  padding: 4px 6px;
+  text-decoration: none;
+}
+
+.macos-ai-app .zentao-sync-source-link:is(:hover, :focus-visible) {
+  background: var(--zeus-product-panel-muted);
+  color: var(--zeus-brand-text);
+}
+
+.macos-ai-app .zentao-sync-source-link:focus-visible {
+  outline: 2px solid var(--zeus-brand-text);
+  outline-offset: 2px;
+}
+
+.macos-ai-app .zentao-sync-field :where(select, input, textarea) {
+  background: var(--zeus-control-bg);
+  border: 1px solid var(--zeus-control-border);
+  border-radius: 7px;
+  color: var(--zeus-product-text);
+  min-block-size: 32px;
+  min-inline-size: 0;
+  padding: 0 9px;
+}
+.macos-ai-app :where(.zentao-sync-target-fields, .task-create-zentao-options) {
+  display: grid;
+  gap: 12px;
+  min-inline-size: 0;
+}
+.macos-ai-app .task-create-zentao-options {
+  border-block-start: 1px solid var(--zeus-product-line-soft);
+  padding-block-start: 12px;
+}
+
+.macos-ai-app .task-create-zentao-toggle {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.macos-ai-app .zentao-sync-field textarea {
+  padding-block: 8px;
+  resize: vertical;
+}
+.macos-ai-app .zentao-effort-dialog {
+  inline-size: min(640px, 100%);
+}
+
+.macos-ai-app .zentao-effort-task {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.macos-ai-app .zentao-effort-task > div {
+  min-inline-size: 0;
+}
+
+.macos-ai-app .zentao-effort-task > div > span {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+}
+
+.macos-ai-app .zentao-effort-task p {
+  font-weight: 550;
+  line-height: 1.5;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.macos-ai-app .zentao-effort-task .zentao-sync-source-link {
+  align-self: center;
+  flex-shrink: 0;
+  font-size: 12px;
+  margin-inline-start: 0;
+}
+.macos-ai-app .zentao-effort-summary {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding-block: 4px 6px;
+}
+
+.macos-ai-app .zentao-effort-summary dt {
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+}
+
+.macos-ai-app .zentao-effort-summary dd {
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+  margin: 7px 0 0;
+}
+
+.macos-ai-app .zentao-effort-summary dd small {
+  font-weight: 400;
+  margin-inline-start: 2px;
+}
+.macos-ai-app .zentao-effort-entry {
+  display: grid;
+  gap: 12px;
+}
+
+.macos-ai-app .zentao-effort-fields {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.macos-ai-app .zentao-effort-entry label > span {
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.macos-ai-app .zentao-effort-history {
+  border-block-start: 1px solid var(--zeus-product-line-soft);
+  min-inline-size: 0;
+  padding-block-start: 12px;
+}
+
+.macos-ai-app .zentao-effort-history-heading {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.macos-ai-app .zentao-effort-history-heading h3 {
+  align-items: center;
+  display: inline-flex;
+  font: inherit;
+  font-weight: 550;
+  gap: 6px;
+  margin: 0;
+}
+
+.macos-ai-app .zentao-effort-history-count {
+  color: var(--zeus-product-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.macos-ai-app .zentao-effort-log {
+  margin-block-start: 10px;
+  max-block-size: 220px;
+  min-inline-size: 0;
+  overflow: auto;
+}
+
+.macos-ai-app .zentao-effort-log table {
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  inline-size: 100%;
+  line-height: 1.6;
+  min-inline-size: 500px;
+  text-align: start;
+}
+
+.macos-ai-app .zentao-effort-log th {
+  background: var(--zeus-solid-surface-bg);
+  color: var(--zeus-product-muted);
+  font-weight: 500;
+  position: sticky;
+  inset-block-start: 0;
+  text-align: start;
+}
+
+.macos-ai-app .zentao-effort-log :where(th, td) {
+  border-block-end: 1px solid var(--zeus-product-line-soft);
+  overflow-wrap: anywhere;
+  padding: 9px 8px;
+  vertical-align: top;
+}
+
+.macos-ai-app .zentao-effort-log :where(th, td):first-child {
+  padding-inline-start: 0;
+  white-space: nowrap;
+}
+
+.macos-ai-app .zentao-effort-log :where(th, td):is(:nth-child(3), :nth-child(4)) {
+  text-align: end;
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .macos-ai-app .zentao-effort-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .macos-ai-app .zentao-effort-fields > label:first-child {
+    grid-column: 1 / -1;
+  }
+}
+.git-delivery-combination {
+  border-block-start: 1px solid var(--border-color, #ddd);
+  padding-block-start: 10px;
+  min-inline-size: 0;
+}
+.git-delivery-combination-buttons {
+  display: flex;
+  gap: 6px;
+}
+.git-delivery-combination-buttons > :first-child {
+  flex: 1;
+}
+.git-delivery-run {
+  min-inline-size: 0;
+  font-size: 12px;
+}
+.git-delivery-run ul {
+  padding: 0;
+  margin-block: 4px;
+  list-style: none;
+}
+.git-delivery-run li {
+  margin-block: 6px;
+  overflow-wrap: anywhere;
+}
+.git-delivery-run small,
+.git-delivery-run li > span {
+  display: block;
+}
+.git-delivery-operation-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+}
+.git-delivery-checkbox {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+}
+.git-delivery-checkbox input {
+  flex: none;
+}
+.git-delivery-checkbox[aria-disabled='true'] {
+  opacity: 0.6;
+}
+.git-delivery-conflict-dialog {
+  inline-size: min(1200px, 94vw);
+  max-inline-size: 94vw;
+}
+.git-delivery-conflict-dialog .zeus-form-fields {
+  min-block-size: 300px;
+}

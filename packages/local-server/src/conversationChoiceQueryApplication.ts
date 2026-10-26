@@ -1,4 +1,5 @@
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { compareConversationWorkStartedDesc } from '@zeus/shared';
 import {
   isInFlightSubmission,
   type ConversationAttentionKind,
@@ -20,6 +21,10 @@ type ChoiceSubmission = ReturnType<ConversationSubmissionRepository['listRecover
 type ChoiceTurn = ReturnType<ConversationTurnRepository['listInProgress']>[number];
 
 export interface NativeConversationChoiceProjectionContext {
+  /** 同批投影复用项目路径，避免逐条会话重复读取项目活跃聚合。 */
+  projectLocalPath: string | null;
+  /** 异步问题只影响侧栏注意力，不改变真实运行状态。 */
+  pendingAsyncQuestionConversationIds: ReadonlySet<string>;
   pendingRequestKindByConversationId: ReadonlyMap<string, 'approval' | 'user_input'>;
   workspaceById: ReadonlyMap<string, ZeusTaskWorkspaceRecord>;
   recoverableSubmissionsByConversationId: ReadonlyMap<string, readonly ChoiceSubmission[]>;
@@ -27,11 +32,11 @@ export interface NativeConversationChoiceProjectionContext {
 }
 
 interface ConversationChoiceQueryPorts {
-  /** 正文查询复用持久历史 Repository，目录层只确定可搜索会话。 */
-  snapshots: Pick<ConversationSnapshotV2Repository, 'searchContent'>;
+  /** 正文和异步问题状态复用持久历史 Repository，目录层只读取投影。 */
+  snapshots: Pick<ConversationSnapshotV2Repository, 'searchContent' | 'pendingAsyncQuestionConversationIds'>;
   projects: Pick<ProjectRepository, 'list' | 'listArchived' | 'getById'>;
   tasks: Pick<TaskRepository, 'getById' | 'listByProject' | 'summariesByIds'>;
-  conversations: Pick<ConversationRepository, 'getById' | 'hasMessages' | 'listRecordsByProject' | 'listRecordsByTask' | 'listUnarchivedRecords' | 'meaningfulActivityAt'>;
+  conversations: Pick<ConversationRepository, 'getById' | 'hasMessages' | 'listRecordsByProject' | 'listRecordsByTask' | 'listUnarchivedRecords' | 'meaningfulActivityAt' | 'workStartedAt'>;
   requests: Pick<ConversationServerRequestRepository, 'listPending' | 'listPendingByConversation'>;
   submissions: Pick<ConversationSubmissionRepository, 'listRecoverable' | 'getEarliestCreatedByConversation' | 'getEarliestOperationIdentityByConversation'>;
   turns: Pick<ConversationTurnRepository, 'listInProgress'>;
@@ -75,6 +80,8 @@ export class ConversationChoiceQueryApplication {
       inProgressTurnsByConversationId.set(turn.conversationId, entries);
     }
     return {
+      projectLocalPath: this.ports.projects.getById(projectId)?.localPath ?? null,
+      pendingAsyncQuestionConversationIds: this.ports.snapshots.pendingAsyncQuestionConversationIds([projectId]),
       pendingRequestKindByConversationId,
       workspaceById: new Map(this.ports.workspaces.listByProject(projectId).map((workspace) => [workspace.id, workspace])),
       recoverableSubmissionsByConversationId,
@@ -84,7 +91,9 @@ export class ConversationChoiceQueryApplication {
 
   listProjectChoices(projectId: string) {
     const context = this.buildContext(projectId);
-    return this.listProjectHistory(projectId).map((conversation) => this.toChoice(conversation, context));
+    return this.listProjectHistory(projectId)
+      .map((conversation) => this.toChoice(conversation, context))
+      .sort(compareConversationWorkStartedDesc);
   }
 
   listTaskChoices(taskId: string, projectId: string) {
@@ -112,7 +121,7 @@ export class ConversationChoiceQueryApplication {
       choices.push(this.toChoice(conversation, context));
       taskChoices.set(conversation.taskId, choices);
     }
-    const sortedProjectChoices = projectChoices.sort(compareConversationStageUpdatedDesc);
+    const sortedProjectChoices = projectChoices.sort(compareConversationWorkStartedDesc);
     return {
       projectId,
       projectChoices: { projectId, choices: sortedProjectChoices, items: sortedProjectChoices },
@@ -132,7 +141,7 @@ export class ConversationChoiceQueryApplication {
       const context = this.buildContext(project.id);
       choices.push(...history.map((conversation) => this.toChoice(conversation, context)));
     }
-    return choices.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return choices.sort(compareConversationWorkStartedDesc);
   }
 
   toChoice(conversation: ZeusConversationRecord, context: NativeConversationChoiceProjectionContext = this.buildContext(conversation.projectId)) {
@@ -149,6 +158,8 @@ export class ConversationChoiceQueryApplication {
   }
 
   attentionByProject(projectIds: readonly string[]): Record<string, ProjectConversationAttentionState> {
+    /** 未回答的异步问题跨页面保留提醒，不依赖消息是否已读。 */
+    const pendingAsyncQuestionConversationIds = this.ports.snapshots.pendingAsyncQuestionConversationIds(projectIds);
     const targetProjectIds = new Set(projectIds);
     const states = new Map<string, ProjectConversationAttentionState>(projectIds.map((projectId) => [projectId, 'idle']));
     const pendingRequestConversationIds = new Set(this.ports.requests.listPending().map((request) => request.conversationId));
@@ -160,7 +171,7 @@ export class ConversationChoiceQueryApplication {
     );
     for (const conversation of this.ports.conversations.listUnarchivedRecords()) {
       if (!targetProjectIds.has(conversation.projectId) || this.isEphemeral(conversation)) continue;
-      const replyRequired = pendingRequestConversationIds.has(conversation.id) || conversation.providerState === 'waiting';
+      const replyRequired = pendingRequestConversationIds.has(conversation.id) || pendingAsyncQuestionConversationIds.has(conversation.id) || conversation.providerState === 'waiting' || conversation.stage === 'waiting_user';
       const legacyRuntimeRunning = conversation.transportKind === 'legacy_cli' && (conversation.status === 'starting' || conversation.status === 'running');
       const running = runningSubmissionConversationIds.has(conversation.id) || conversation.providerState === 'binding' || conversation.providerState === 'active' || legacyRuntimeRunning;
       if (replyRequired) {
@@ -235,7 +246,7 @@ export class ConversationChoiceQueryApplication {
   }
 
   private toTaskSnapshot(taskId: string, projectId: string, choices: ReturnType<ConversationChoiceQueryApplication['toChoice']>[]) {
-    const sortedChoices = [...choices].sort(compareConversationStageUpdatedDesc);
+    const sortedChoices = [...choices].sort(compareConversationWorkStartedDesc);
     return { taskId, projectId, hasHistory: sortedChoices.length > 0, requiresChoice: sortedChoices.length > 0, choices: sortedChoices, items: sortedChoices };
   }
 
@@ -243,7 +254,7 @@ export class ConversationChoiceQueryApplication {
     const pendingRequestKind = context.pendingRequestKindByConversationId.get(conversation.id) ?? null;
     const firstSubmission = this.ports.submissions.getEarliestCreatedByConversation(conversation.id);
     const execution = firstSubmission ? parseJsonObject(firstSubmission.inputJson).context : undefined;
-    const projectPath = this.ports.projects.getById(conversation.projectId)?.localPath;
+    const projectPath = context.projectLocalPath;
     const workspace = conversation.workspaceId ? (context.workspaceById.get(conversation.workspaceId) ?? this.ports.workspaces.getById(conversation.workspaceId)) : undefined;
     const executionPath = isRecord(execution) && typeof execution.projectLocalPath === 'string' ? execution.projectLocalPath : (workspace?.worktreePath ?? projectPath ?? null);
     const relativeWorktreePath = projectPath && executionPath ? relative(join(dirname(resolve(projectPath)), '.zeus-worktrees'), resolve(executionPath)) : null;
@@ -283,6 +294,7 @@ export class ConversationChoiceQueryApplication {
       permissionMode: conversation.permissionMode,
       collaborationMode: conversation.collaborationMode,
       hasUnreadAttention: conversation.attentionUnread,
+      hasPendingAsyncQuestion: context.pendingAsyncQuestionConversationIds.has(conversation.id),
       attentionKind: conversation.attentionKind,
       attentionRevision: conversation.attentionRevision,
       attentionTurnId: conversation.attentionTurnId,
@@ -300,6 +312,8 @@ export class ConversationChoiceQueryApplication {
       createdAt: conversation.createdAt,
       updatedAt: conversation.updatedAt,
       activityAt: this.ports.conversations.meaningfulActivityAt(conversation.id),
+      /** 项目与会话导航共用发起时间，后台状态和历史补齐不推进排序。 */
+      workStartedAt: this.ports.conversations.workStartedAt(conversation.id),
       archived: conversation.archived,
     };
   }

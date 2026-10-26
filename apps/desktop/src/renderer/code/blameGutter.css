@@ -115,3 +115,30 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+:is(.project-source-code-editor, .session-source-code-preview) .cm-content,
+:is(.project-source-code-editor, .session-source-code-preview) .cm-line {
+  -webkit-user-select: text;
+  user-select: text;
+}
+.code-author-gutter .cm-gutterElement {
+  padding-inline: 8px;
+  text-align: left;
+  overflow: hidden;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  /* 源码编辑与预览的正文字号不同，作者栏仍使用同一字号和主题颜色。 */
+  font-size: 12px;
+  color: var(--session-text, #1f2937);
+  font-variant-numeric: tabular-nums;
+}
+.code-author-gutter .cm-gutterElement > span {
+  display: block;
+  /* 保留完整日期和常见作者名，超长名称通过悬停详情查看。 */
+  max-inline-size: clamp(150px, 18vw, 220px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.code-reading-menu button > span {
+  display: inline-block;
+  width: 20px;
+}

@@ -1,5 +1,42 @@
 import { userFacingErrorCause, type InputSuggestionRequest, type InputSuggestionResult, type InputSuggestionSettings, type InputSuggestionUiDiagnostic } from '@zeus/shared';
 
+/** 仅对无工具的建议生成恢复已知临时故障，不复用主会话发送的重试规则。 */
+const transientSuggestionErrors = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'ZEUS_EXECUTION_HOST_DRAINING',
+  'ZEUS_CODEX_RPC_TIMEOUT',
+  'ZEUS_CODEX_MODEL_AT_CAPACITY',
+  'serverOverloaded',
+  'ZEUS_MODEL_HTTP_408',
+  'ZEUS_MODEL_HTTP_429',
+  'ZEUS_MODEL_HTTP_500',
+  'ZEUS_MODEL_HTTP_502',
+  'ZEUS_MODEL_HTTP_503',
+  'ZEUS_MODEL_HTTP_504',
+  'ZEUS_MODEL_CATALOG_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECT_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECTION_RESET',
+  'ZEUS_MODEL_CATALOG_NETWORK_FAILED',
+  'ZEUS_MODEL_TEXT_INCOMPLETE',
+]);
+
+/** 首次临时失败等待两秒，再次等待五秒；无需改写、无效输出和明确配置错误不重复请求。 */
+export function inputSuggestionRetryDelay(result: Pick<InputSuggestionResult, 'reason' | 'cause'>, retries: number): number | null {
+  if (retries >= 2 || (result.reason !== 'timed_out' && result.reason !== 'failed')) return null;
+  // 无结构化原因的生成失败也受同一上限约束；不通过报错正文猜测权限或网络状态。
+  for (let cause = result.cause; cause; cause = cause.cause) {
+    if (cause.code && !transientSuggestionErrors.has(cause.code)) return null;
+  }
+  return retries === 0 ? 2_000 : 5_000;
+}
+
 /** 后台触发和输入框读取共用完全相同的会话、模型及轮次身份。 */
 export function inputSuggestionIdentity(options: {
   /** 项目与会话共同隔离候选。 */
@@ -15,8 +52,8 @@ export function inputSuggestionIdentity(options: {
 }) {
   /** 显式元组防止分隔字符造成身份冲突。 */
   const sessionKey = JSON.stringify(options.conversationId ? ['conversation', options.projectId, options.conversationId] : ['draft', options.projectId ?? '', options.scopeKey ?? '']);
-  /** 专用模型和深度共同确定配置身份。 */
-  const modelKey = JSON.stringify([options.settings?.modelRef ?? null, options.settings?.effort ?? null]);
+  /** 专用模型、推理深度和速度共同确定配置身份。 */
+  const modelKey = JSON.stringify([options.settings?.modelRef ?? null, options.settings?.effort ?? null, options.settings?.serviceTier ?? null]);
   /** 手动结果不随主会话轮次推进失效。 */
   const resultKey = JSON.stringify([sessionKey, modelKey]);
   return { sessionKey, modelKey, resultKey, automaticResultKey: JSON.stringify([resultKey, options.turnId ?? null]) };
@@ -24,11 +61,13 @@ export function inputSuggestionIdentity(options: {
 
 /** 请求和结果属于会话，输入框只订阅当前会话的快照。 */
 interface InputSuggestionSnapshot extends Pick<InputSuggestionResult, 'text' | 'reason' | 'cause'> {
+  /** 每次主动或自动生成的稳定身份，重试不创建另一份候选。 */
+  requestId: string;
   /** 手动结果绑定会话与模型，自动结果另绑定完成轮次。 */
   key: string;
-  /** 专用模型与推理深度共同决定请求配置。 */
+  /** 专用模型、推理深度和速度共同决定请求配置。 */
   modelKey: string;
-  /** 采用前必须与当前草稿逐字相同。 */
+  /** 请求时的原文用于预览和失效核对，编辑后不得继续使用。 */
   sourceDraft: string;
   /** 空输入建议与草稿润色使用原有生成通路。 */
   mode: InputSuggestionRequest['mode'];
@@ -36,6 +75,10 @@ interface InputSuggestionSnapshot extends Pick<InputSuggestionResult, 'text' | '
   trigger: InputSuggestionRequest['trigger'];
   /** 后台运行时继续更新快照，切回只显示当前状态。 */
   pending: boolean;
+  /** 从零开始记录重试次数，切换页面不重置。 */
+  retryAttempt: number;
+  /** 等待自动重试时保留计划时刻，生成中与结束后为空。 */
+  retryAt: number | null;
 }
 
 /** 一个会话最多持有一个正在生成的请求，不依赖组件挂载。 */
@@ -44,8 +87,8 @@ class InputSuggestionSession {
   private result: InputSuggestionSnapshot | null = null;
   /** 只有明确取消或失效才终止生成，退订不会触发取消。 */
   private controller: AbortController | null = null;
-  /** 已采纳的灰字仍可作为同轮润色的辅助材料。 */
-  private lastSuggestion: { key: string; text: string; modelKey: string } | null = null;
+  /** 已展示预览的请求不因输入框重新挂载而再次弹出。 */
+  private presentedRequestId: string | null = null;
   /** 自动完成事件跨页面去重，重开会话不能重复产生用量。 */
   private requestedTurn: string | null = null;
   /** 用户消息事件可能重复送达，只在新的稳定身份出现时清除旧候选。 */
@@ -67,8 +110,12 @@ class InputSuggestionSession {
   /** 同一结果始终返回同一引用，避免重复渲染。 */
   getSnapshot = (): InputSuggestionSnapshot | null => this.result;
 
-  /** 只为同一会话、轮次和模型提供先前生成的建议。 */
-  getLastSuggestion = (key: string): string | undefined => (this.lastSuggestion?.key === key ? this.lastSuggestion.text : undefined);
+  /** 只有当前手动请求的有效结果可以首次展开预览。 */
+  claimPreview = (requestId: string): boolean => {
+    if (this.result?.requestId !== requestId || this.result.trigger !== 'manual' || this.result.pending || !this.result.text || this.presentedRequestId === requestId) return false;
+    this.presentedRequestId = requestId;
+    return true;
+  };
 
   /** 消费完成事件后不再重放，清空草稿或切换页面都不能重置。 */
   consumeAutomaticTurn(key: string): boolean {
@@ -77,12 +124,19 @@ class InputSuggestionSession {
     return true;
   }
 
-  /** 输入法、目标输入或待处理附件只在该输入框实际挂载时阻止自动生成。 */
+  /** 输入法、目标输入或待处理附件立即阻止并取消自动生成，卸载只释放限制。 */
   observeAutomaticEligibility(owner: symbol, eligible: boolean): () => void {
     this.automaticEligibility.set(owner, eligible);
+    if (!eligible) this.dismissAutomatic();
     return () => {
       this.automaticEligibility.delete(owner);
     };
+  }
+
+  /** 编辑事件立即阻止自动启动并取消旧请求，不等待 React 更新或输入法提交文字。 */
+  beginEditing(owner: symbol): void {
+    this.automaticEligibility.set(owner, false);
+    this.dismiss();
   }
 
   /** 后台事件不覆盖用户正在处理的输入，也不抢占手动结果。 */
@@ -95,12 +149,11 @@ class InputSuggestionSession {
     if (this.result?.trigger === 'automatic') this.dismiss();
   }
 
-  /** 已发送要求变化时同时清除手动润色和辅助建议，普通助手进度不走此入口。 */
+  /** 已发送要求变化时清除候选，普通助手进度不走此入口。 */
   observeUserInput(identity: string): void {
     if (this.observedUserInputs.has(identity)) return;
     this.observedUserInputs.add(identity);
     if (this.observedUserInputs.size > 64) this.observedUserInputs.delete(this.observedUserInputs.values().next().value!);
-    this.lastSuggestion = null;
     this.dismiss();
   }
 
@@ -109,16 +162,17 @@ class InputSuggestionSession {
     return this.controller !== null || this.listeners.size > 0;
   }
 
-  /** 原文改变、发送、采用或主动取消时清理本会话。 */
-  dismiss = (): void => {
+  /** 编辑、发送、采用或取消时清理；旧浮层的关闭事件不能取消新请求。 */
+  dismiss = (requestId?: string): void => {
+    if (requestId !== undefined && this.result?.requestId !== requestId) return;
     this.controller?.abort();
     this.controller = null;
+    this.presentedRequestId = null;
     this.publish(null);
   };
 
   /** 配置变化也清理不可见会话，旧模型的迟到结果不能恢复。 */
   invalidateSettings(modelKey: string, automaticEnabled: boolean): void {
-    if (this.lastSuggestion?.modelKey !== modelKey) this.lastSuggestion = null;
     if (this.result && (this.result.modelKey !== modelKey || (this.result.trigger === 'automatic' && !automaticEnabled))) this.dismiss();
   }
 
@@ -128,9 +182,7 @@ class InputSuggestionSession {
     key: string;
     /** 捕获本次所选模型配置。 */
     modelKey: string;
-    /** 辅助建议身份始终包含当前完成轮次。 */
-    turnKey: string;
-    /** 原文快照供重新显示与采用时校验。 */
+    /** 原文快照用于说明候选依据，继续输入必须取消本次生成。 */
     sourceDraft: string;
     /** 服务端回执必须匹配实际请求模型。 */
     modelRef: string;
@@ -144,9 +196,9 @@ class InputSuggestionSession {
     const controller = new AbortController();
     this.controller = controller;
     /** 同一次点击跨界面、HTTP 和模型阶段共用身份，不复用上一轮的编号。 */
-    const diagnosticId = crypto.randomUUID();
+    let diagnosticId = crypto.randomUUID();
     /** 单调计时不受系统时钟调整影响。 */
-    const startedAt = performance.now();
+    let startedAt = performance.now();
     /** 仅把状态、枚举和字数发送给本机 Main，禁止附带草稿与建议正文。 */
     const record = (event: InputSuggestionUiDiagnostic['event'], outcome?: string, outputCharacters?: number): void => {
       try {
@@ -156,10 +208,10 @@ class InputSuggestionSession {
         /* 诊断不可用不阻断用户的生成操作。 */
       }
     };
-    record('ui_started');
     controller.signal.addEventListener('abort', () => record('ui_cancelled', 'client_cancelled'), { once: true });
     /** 等待和完成使用同一份原文及请求归属。 */
     const snapshot: InputSuggestionSnapshot = {
+      requestId: diagnosticId,
       key: options.key,
       modelKey: options.modelKey,
       sourceDraft: options.sourceDraft,
@@ -168,28 +220,58 @@ class InputSuggestionSession {
       pending: true,
       text: null,
       reason: null,
+      retryAttempt: 0,
+      retryAt: null,
     };
     this.publish(snapshot);
     void (async () => {
       try {
-        /** 结果只写入发起请求的会话，后台完成不操作编辑器。 */
-        const response = await options.generate(options.request, controller.signal, diagnosticId);
-        record('ui_received', response.reason ?? 'generated', response.text?.length ?? 0);
-        if (this.controller !== controller || controller.signal.aborted) {
-          record('ui_discarded', 'request_replaced_or_cancelled');
-          return;
+        for (let retryAttempt = 0; !controller.signal.aborted; retryAttempt += 1) {
+          if (retryAttempt > 0) {
+            diagnosticId = crypto.randomUUID();
+            startedAt = performance.now();
+            this.publish({ ...snapshot, retryAttempt });
+          }
+          record('ui_started');
+          /** 响应失败和传输失败都进入同一条有界恢复通路。 */
+          let response: InputSuggestionResult;
+          try {
+            response = await options.generate(options.request, controller.signal, diagnosticId);
+            record('ui_received', response.reason ?? 'generated', response.text?.length ?? 0);
+          } catch (error: unknown) {
+            if (!controller.signal.aborted) record('ui_failed', 'request_failed');
+            response = { text: null, reason: 'failed', cause: userFacingErrorCause(error), modelRef: options.modelRef, completedTurnId: options.request.completedTurnId ?? null };
+          }
+          if (this.controller !== controller || controller.signal.aborted) {
+            record('ui_discarded', 'request_replaced_or_cancelled');
+            return;
+          }
+          if (response.modelRef !== options.modelRef || (options.request.trigger === 'automatic' && response.completedTurnId !== options.request.completedTurnId)) {
+            record('ui_discarded', 'identity_changed');
+            this.publish(null);
+            return;
+          }
+          /** 有效候选不重复生成，剩余失败按明确原因决定是否等待。 */
+          const retryDelay = response.text ? null : inputSuggestionRetryDelay(response, retryAttempt);
+          if (retryDelay === null) {
+            this.publish({ ...snapshot, text: response.text, reason: response.reason, cause: response.cause, pending: false, retryAttempt });
+            record('ui_result_stored', response.reason ?? 'generated', response.text?.length ?? 0);
+            return;
+          }
+          this.publish({ ...snapshot, retryAttempt: retryAttempt + 1, retryAt: Date.now() + retryDelay });
+          await new Promise<void>((resolve) => {
+            /** 取消立即结束等待并移除监听，发送或改设置后不能留下定时请求。 */
+            const finish = (): void => {
+              clearTimeout(timer);
+              controller.signal.removeEventListener('abort', finish);
+              resolve();
+            };
+            /** 等待期间继续持有会话控制器，卸载不取消，连续 Tab 不重复请求。 */
+            const timer = setTimeout(finish, retryDelay);
+            controller.signal.addEventListener('abort', finish, { once: true });
+            if (controller.signal.aborted) finish();
+          });
         }
-        if (response.modelRef !== options.modelRef || (options.request.trigger === 'automatic' && response.completedTurnId !== options.request.completedTurnId)) {
-          record('ui_discarded', 'identity_changed');
-          this.publish(null);
-          return;
-        }
-        if (options.request.mode === 'suggest' && response.text) this.lastSuggestion = { key: options.turnKey, text: response.text, modelKey: options.modelKey };
-        this.publish({ ...snapshot, text: response.text, reason: response.reason, cause: response.cause, pending: false });
-        record('ui_result_stored', response.reason ?? 'generated', response.text?.length ?? 0);
-      } catch (error: unknown) {
-        if (!controller.signal.aborted) record('ui_failed', 'request_failed');
-        if (this.controller === controller && !controller.signal.aborted) this.publish({ ...snapshot, pending: false, reason: 'failed', cause: userFacingErrorCause(error) });
       } finally {
         if (this.controller === controller) this.controller = null;
         pruneInputSuggestionSessions();

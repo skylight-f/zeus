@@ -3325,3 +3325,11 @@
   color: var(--zeus-control-muted);
   overflow-wrap: anywhere;
 }
+.macos-ai-app .workspace.ai-workspace:has(.digital-employee-settings-pane) {
+  overflow: auto;
+}
+
+.macos-ai-app .workspace.ai-workspace > .project-tools-layout > .project-main-content > .digital-employee-settings-pane {
+  flex: 0 0 auto;
+  padding: 24px;
+}

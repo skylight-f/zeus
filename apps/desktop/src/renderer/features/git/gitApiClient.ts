@@ -1,3 +1,4 @@
+import type { GitDeliveryInput, GitDeliveryRun, TaskManagementStatusDefinition } from '@zeus/shared';
 import type {
   CreateGitConfirmationRequest,
   ExecuteGitOperationRequest,
@@ -9,6 +10,8 @@ import type {
   ProjectGitAction,
   ProjectGitActionResponse,
   ProjectGitCommitDetail,
+  ProjectGitPushPreview,
+  ProjectGitPushPreviewInput,
   ProjectGitSnapshotResult,
   ProjectGitWorkbenchSnapshot,
   ProjectGitOperationPage,
@@ -23,6 +26,28 @@ import type { CodexTaskPushModelCapability } from '../../session/sessionTypes.js
 export type GitCommitModelOption = CodexTaskPushModelCapability & { label: string };
 
 export interface GitApiClient {
+  /** 后台交付查询只返回同一真实入口的记录。 */
+  loadGitDeliveryRuns(projectId: string, scopeId: string): Promise<{ items: GitDeliveryRun[] }>;
+  /** 读取真实项目管理状态。 */
+  loadGitDeliveryOptions(projectId: string): Promise<{ statuses: TaskManagementStatusDefinition[] }>;
+  /** 接纳时使用稳定用户动作身份。 */
+  startGitDeliveryRun(projectId: string, input: GitDeliveryInput, key: string): Promise<GitDeliveryRun>;
+  /** 手动继续不重新执行已成功步骤。 */
+  resumeGitDeliveryRun(projectId: string, runId: string, input?: { confirmWorktreeCleanup?: boolean }): Promise<GitDeliveryRun>;
+  /** 通知已读不会触发交付。 */
+  acknowledgeGitDelivery(runId: string): Promise<unknown>;
+  /** 普通会话复用冲突编辑器。 */
+  loadGitDeliveryConflict(
+    projectId: string,
+    runId: string,
+    stepId: string,
+    path?: string,
+  ): Promise<{ files: string[]; sourceBranch: string; targetBranch: string; file: import('../../session/sessionTypes.js').TaskIntegrationConflictFile | null }>;
+  /** 用户在冲突页明确授权本次 AI 接管。 */
+  startGitDeliveryConflictAi(projectId: string, runId: string, stepId: string, input: { path: string; content: string; fingerprint: string; permissionMode: 'auto' | 'full-access'; skillId?: string }): Promise<GitDeliveryRun>;
+  /** 保存冲突必须匹配当前三方指纹。 */
+  saveGitDeliveryConflict(projectId: string, runId: string, stepId: string, input: { path: string; content: string; fingerprint: string }): Promise<unknown>;
+
   forConversationGit: (conversationId: string) => GitApiClient;
   /** 操作账本属于桌面实例，不能回退到独立执行宿主的其他记录。 */
   loadProjectGitOperations: (projectId: string, cursor?: string) => Promise<ProjectGitOperationPage>;
@@ -47,10 +72,11 @@ export interface GitApiClient {
     signal?: AbortSignal,
   ) => Promise<{ message: string; model: string; truncated?: boolean }>;
   loadGitDiff: () => Promise<GitDiffSummary>;
-  loadProjectGitStatus: (projectId: string) => Promise<GitStatusSummary>;
   loadProjectGitWorkbench: (projectId: string) => Promise<ProjectGitWorkbenchSnapshot>;
   loadConversationGitHistory: (projectId: string, repositoryId: string, offset: number, ref?: string) => Promise<{ commits: NonNullable<GitStatusSummary['recentCommits']>; hasMore: boolean }>;
   loadProjectGitCommit: (projectId: string, repositoryId: string, commitHash: string) => Promise<ProjectGitCommitDetail>;
+  /** 按来源分支和目标远端读取本地推送预览。 */
+  loadProjectGitPushPreview: (projectId: string, repositoryId: string, input: ProjectGitPushPreviewInput) => Promise<ProjectGitPushPreview>;
   loadProjectGitComparisonDiff: (projectId: string, repositoryId: string, ref: string, mode: 'current' | 'working-tree') => Promise<GitDiffSummary>;
   executeProjectGitAction: (projectId: string, repositoryId: string, input: ProjectGitAction) => Promise<ProjectGitActionResponse>;
   loadProjectGitDiff: (projectId: string) => Promise<GitDiffSummary>;
@@ -88,6 +114,21 @@ export function createGitApiClient(transport: LocalApiTransport, bridge: () => P
     return transport.request<ExecutedGitOperationResult>(`${projectGitPath(projectId)}/${operation}`, jsonRequest('POST', body));
   };
   return {
+    loadGitDeliveryRuns: (projectId, scopeId) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs?${new URLSearchParams({ scopeId })}`),
+    loadGitDeliveryOptions: (projectId) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-options`),
+    startGitDeliveryRun: (projectId, input, key) => transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs`, { ...jsonRequest('POST', input), headers: { 'idempotency-key': key } }),
+    resumeGitDeliveryRun: (projectId, runId, input = {}) =>
+      transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs/${encodeURIComponent(runId)}/resume`, { ...jsonRequest('POST', input), headers: { 'idempotency-key': crypto.randomUUID() } }),
+    acknowledgeGitDelivery: (runId) => transport.request(`/api/notifications/git-delivery/${encodeURIComponent(runId)}/read`, { ...jsonRequest('POST', {}), headers: { 'idempotency-key': crypto.randomUUID() } }),
+    loadGitDeliveryConflict: (projectId, runId, stepId, path) =>
+      transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/conflict${path ? `?${new URLSearchParams({ path })}` : ''}`),
+    startGitDeliveryConflictAi: (projectId, runId, stepId, input) =>
+      transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/ai`, {
+        ...jsonRequest('POST', input),
+        headers: { 'idempotency-key': crypto.randomUUID() },
+      }),
+    saveGitDeliveryConflict: (projectId, runId, stepId, input) =>
+      transport.request(`/api/projects/${encodeURIComponent(projectId)}/git-delivery-runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/conflict`, jsonRequest('PUT', input)),
     forConversationGit: (id) => createGitApiClient(transport, () => undefined, id),
     /** 缺少桌面桥接时报告不可用，不能伪装为空历史。 */
     loadProjectGitOperations: async (projectId, cursor) => {
@@ -114,7 +155,6 @@ export function createGitApiClient(transport: LocalApiTransport, bridge: () => P
       return result;
     },
     loadGitDiff: () => transport.request<GitDiffSummary>('/api/git/diff'),
-    loadProjectGitStatus: (projectId) => transport.request<GitStatusSummary>(`${projectGitPath(projectId)}/status`),
     loadProjectGitWorkbench: async (projectId) => {
       const snapshot = await (bridge()?.loadWorkbench(projectId) ?? transport.request<ProjectGitWorkbenchSnapshot>(`${projectGitPath(projectId)}/workbench${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`));
       if (conversationId && (snapshot.repositories.length !== 1 || snapshot.repositories[0]?.id !== `conversation:${conversationId}`)) throw new Error('当前执行宿主尚不支持会话工作树交付，请更新后重试。');
@@ -125,6 +165,12 @@ export function createGitApiClient(transport: LocalApiTransport, bridge: () => P
     loadProjectGitCommit: async (projectId, repositoryId, commitHash) =>
       bridge()?.loadCommit(projectId, repositoryId, commitHash) ??
       transport.request<ProjectGitCommitDetail>(`${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/commits/${encodeURIComponent(commitHash)}`),
+    /** 桌面与会话工作树分别沿用各自可信仓库身份。 */
+    loadProjectGitPushPreview: async (projectId, repositoryId, input) =>
+      bridge()?.loadPushPreview(projectId, repositoryId, input) ??
+      transport.request<ProjectGitPushPreview>(
+        `${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/push-preview?${new URLSearchParams({ sourceBranch: input.sourceBranch, remote: input.remote, targetBranch: input.targetBranch, offset: String(input.offset ?? 0) })}`,
+      ),
     loadProjectGitComparisonDiff: async (projectId, repositoryId, ref, mode) =>
       bridge()?.loadComparison(projectId, repositoryId, ref, mode) ??
       transport.request<GitDiffSummary>(`${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/compare?ref=${encodeURIComponent(ref)}&mode=${mode}`),

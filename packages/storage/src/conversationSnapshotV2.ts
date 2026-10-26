@@ -3,6 +3,10 @@ import {
   asyncMessageQuestions,
   classifyAssistantMessage,
   conversationProcessProviderItemId,
+  conversationProcessPresentation,
+  conversationUsedResources,
+  conversationCostBreakdown,
+  type ConversationInformation,
   conversationNavigationExcerpt,
   conversationQuestionNavigationExcerpt,
   type ConversationNavigationEntry,
@@ -20,6 +24,7 @@ import {
   type ConversationSnapshotV2PageKind,
   type ConversationSnapshotV2ToolResult,
   type ConversationTranscriptEnvelope,
+  type ConversationTranscriptPlacement,
   type ConversationTranscriptPlacementBatch,
 } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
@@ -30,7 +35,7 @@ import { createHash } from 'node:crypto';
 import { ConversationSystemMessageRepository } from './conversationSystemMessageStore.js';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { conversationImageAttachmentRef } from './conversationStore.js';
+import { conversationImageAttachmentRef, CodexUsageLedgerRepository } from './conversationStore.js';
 
 export { conversationSnapshotV2StructureGeneration };
 
@@ -59,6 +64,32 @@ export const conversationSnapshotV2Limits = {
 type ConversationContentKind = 'timeline_payload' | 'model_content' | 'process_detail' | 'change_file_diff';
 type ConversationPageKind = ConversationSnapshotV2PageKind;
 type ConversationProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'waiting' | 'warning';
+
+/** 目录查询直接携带持久位置，避免逐条回查相同的来源别名和显示条目。 */
+interface ConversationNavigationPlacementRow {
+  transcript_entry_id: string | null;
+  transcript_display_order: number | null;
+  transcript_placement_revision: number | null;
+  transcript_turn_id: string | null;
+  transcript_opening_input_id: string | null;
+  transcript_display_stage_id: string | null;
+}
+
+/** 将目录联查结果还原为共享位置；缺失别名仍按原契约拒绝整份损坏目录。 */
+function conversationNavigationPlacement(row: ConversationNavigationPlacementRow, orderEpoch: number): ConversationTranscriptPlacement {
+  if (!row.transcript_entry_id || row.transcript_placement_revision === null) {
+    throw snapshotError('ZEUS_CONVERSATION_SNAPSHOT_V2_CONTENT_CHANGED', '会话显示位置尚未覆盖当前条目，请稍后重试。', 409);
+  }
+  return {
+    entryId: row.transcript_entry_id,
+    order: row.transcript_display_order,
+    orderEpoch,
+    placementRevision: row.transcript_placement_revision,
+    turnId: row.transcript_turn_id,
+    openingInputId: row.transcript_opening_input_id,
+    displayStageId: row.transcript_display_stage_id,
+  };
+}
 
 // 模型历史持久化的是结构化 JSON；普通会话正文只读取其中的可见文本，绝不能把内部 tool_call 包装层当作消息正文。
 // 用户消息的附件、任务布局、回答评论和网页评论是正文展示所需结构，保留原 JSON 交给 Renderer 还原；工具调用没有 text 字段，
@@ -757,6 +788,41 @@ export class ConversationSnapshotV2Repository {
     this.systemMessages = new ConversationSystemMessageRepository(db);
   }
 
+  /** 只读取未结束轮次的异步问题元数据与答复身份，侧栏不依赖历史分页或加载消息正文。 */
+  pendingAsyncQuestionConversationIds(projectIds: readonly string[]): Set<string> {
+    if (projectIds.length === 0) return new Set();
+    /** 正式终态和最终交付关闭提醒；活动轮次的答复失败、取消或删除后仍允许再次回答。 */
+    const questions = this.db.select<{ conversation_id: string; metadata_json: string }>(
+      `SELECT message.conversation_id, message.metadata_json
+         FROM conversation_messages AS message
+         JOIN conversations AS conversation ON conversation.id = message.conversation_id
+        WHERE conversation.project_id IN (SELECT value FROM json_each(?)) AND conversation.archived = 0
+          AND message.role = 'assistant' AND message.provider_turn_id IS NOT NULL AND message.provider_item_id IS NOT NULL
+          AND json_valid(message.metadata_json) AND json_extract(message.metadata_json, '$.delivery') = 'async'
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_turns AS turn
+             WHERE turn.conversation_id = message.conversation_id
+               AND (turn.provider_turn_id = message.provider_turn_id OR turn.id = message.provider_turn_id)
+               AND (turn.status IN ('completed', 'interrupted', 'failed') OR turn.completed_at IS NOT NULL)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_messages AS final_message
+             WHERE final_message.conversation_id = message.conversation_id
+               AND final_message.provider_turn_id = message.provider_turn_id AND final_message.role = 'assistant'
+               AND json_valid(final_message.metadata_json) AND json_extract(final_message.metadata_json, '$.messageKind') = 'final'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_submissions AS submission
+             WHERE submission.conversation_id = message.conversation_id
+               AND submission.status NOT IN ('failed', 'cancelled', 'deleted') AND json_valid(submission.input_json)
+               AND json_extract(submission.input_json, '$.questionAnswer.providerItemId') = message.provider_item_id
+               AND json_extract(submission.input_json, '$.questionAnswer.providerTurnId') = message.provider_turn_id
+          )`,
+      [JSON.stringify(projectIds)],
+    );
+    return new Set(questions.filter((question) => asyncMessageQuestions(parseJsonRecordOrNull(question.metadata_json) ?? {}).length > 0).map((question) => question.conversation_id));
+  }
+
   /** 只返回可见会话的正文命中身份；大历史保留元数据检索，不拖慢运行宿主。 */
   searchContent(conversationIds: readonly string[], query: string): { conversationIds: string[]; skipped: boolean } {
     /** 搜索范围由上游目录确定，用 JSON 参数避免大量会话超过 SQL 参数上限。 */
@@ -812,29 +878,33 @@ export class ConversationSnapshotV2Repository {
   readNavigation(conversationIdValue: string): ConversationNavigationSnapshot {
     /** 会话范围由路由校验，存储层仍拒绝空身份。 */
     const conversationId = requiredIdentity(conversationIdValue, 'conversationId');
+    /** 全份目录共享同一位置代次，不能为每条消息重复读取状态表。 */
+    const orderEpoch = this.transcript.orderEpoch(conversationId);
     /** 目录和事件进度处于同一次同步读取中。 */
     const throughEventSeq = this.throughEventSeq(conversationId);
     /** 沿现有会话顺序索引读取；数据库内截断，正文不进入目录响应。 */
-    const rows = this.db.select<{
-      id: string;
-      sequence: number;
-      turn_id: string;
-      provider_turn_id: string | null;
-      client_user_message_id: string | null;
-      message_created_at: string | null;
-      provider_item_id: string | null;
-      segment_id: string;
-      role: string;
-      confirmed_at: string;
-      status: string;
-      preview: string;
-      assistant_phase: string | null;
-      assistant_metadata_json: string | null;
-      formal_plan: number;
-      /** 正式计划可能来自思考摘要，位置别名须保持原始分面。 */
-      reasoning_summary: number;
-      question_answer_json: string | null;
-    }>(
+    const rows = this.db.select<
+      {
+        id: string;
+        sequence: number;
+        turn_id: string;
+        provider_turn_id: string | null;
+        client_user_message_id: string | null;
+        message_created_at: string | null;
+        provider_item_id: string | null;
+        segment_id: string;
+        role: string;
+        confirmed_at: string;
+        status: string;
+        preview: string;
+        assistant_phase: string | null;
+        assistant_metadata_json: string | null;
+        formal_plan: number;
+        /** 正式计划可能来自思考摘要，位置别名须保持原始分面。 */
+        reasoning_summary: number;
+        question_answer_json: string | null;
+      } & ConversationNavigationPlacementRow
+    >(
       `SELECT conversation_model_history.id, conversation_model_history.sequence,
         conversation_model_history.turn_id, turn.provider_turn_id, turn.status,
         submission.client_message_id AS client_user_message_id,
@@ -846,6 +916,12 @@ export class ConversationSnapshotV2Repository {
         ${modelHistoryFormalPlanSql} AS formal_plan,
         ${modelHistoryReasoningSummarySql} AS reasoning_summary,
         ${modelHistoryQuestionAnswerSql} AS question_answer_json,
+        transcript_entry.id AS transcript_entry_id,
+        transcript_entry.display_order AS transcript_display_order,
+        transcript_entry.placement_revision AS transcript_placement_revision,
+        transcript_entry.turn_id AS transcript_turn_id,
+        transcript_entry.opening_input_id AS transcript_opening_input_id,
+        transcript_entry.display_stage_id AS transcript_display_stage_id,
         substr(CASE WHEN json_valid(content_json) THEN COALESCE(
           NULLIF(json_extract(content_json, '$.displayText'), ''),
           NULLIF(json_extract(content_json, '$.text'), ''),
@@ -855,6 +931,14 @@ export class ConversationSnapshotV2Repository {
       FROM conversation_model_history
       JOIN conversation_turns AS turn ON turn.id = conversation_model_history.turn_id AND turn.conversation_id = conversation_model_history.conversation_id
       LEFT JOIN conversation_submissions AS submission ON submission.id = conversation_model_history.submission_id AND submission.conversation_id = conversation_model_history.conversation_id
+      LEFT JOIN conversation_transcript_aliases AS transcript_alias
+        ON transcript_alias.conversation_id = conversation_model_history.conversation_id
+       AND transcript_alias.source_domain = 'model_history'
+       AND transcript_alias.source_scope = conversation_model_history.segment_id
+       AND transcript_alias.source_id = conversation_model_history.id
+       AND transcript_alias.facet = CASE WHEN ${modelHistoryReasoningSummarySql} = 1 THEN 'reasoning_block' ELSE 'body' END
+      LEFT JOIN conversation_transcript_entries AS transcript_entry
+        ON transcript_entry.conversation_id = transcript_alias.conversation_id AND transcript_entry.id = transcript_alias.entry_id
       WHERE conversation_model_history.conversation_id = ?
         AND conversation_model_history.role IN ('user', 'assistant') AND tool_pair_id IS NULL
         AND (NOT json_valid(content_json) OR COALESCE(json_extract(content_json, '$.type'), '') <> 'tool_call')
@@ -863,13 +947,15 @@ export class ConversationSnapshotV2Repository {
       ORDER BY conversation_model_history.sequence`,
       [conversationId],
     );
+    /** 消息正文与过程边界复用同一批位置；原本不进入目录的空助手记录仍不要求位置。 */
+    const positionedRows = rows.map((row) => ({ ...row, placement: row.role === 'user' || row.preview.trim() ? conversationNavigationPlacement(row, orderEpoch) : null }));
     /** 同轮补充发言共用最终答复；正式计划只有在没有最终答复时使用。 */
     const answers = new Map<string, { text: string; final: boolean }>();
     /** 内容存在性不依赖最终答复，失败轮次也必须拥有补读入口。 */
     const contentTurnIds = new Set<string>();
     /** 每次用户发言独立占一条刻度，使用持久身份去重。 */
     const entries = new Map<string, ConversationNavigationEntry>();
-    for (const row of rows) {
+    for (const row of positionedRows) {
       /** 脱敏沿用现有历史预览规则。 */
       const text = redactSensitivePreview(row.preview).text;
       if (row.role === 'assistant') {
@@ -901,17 +987,28 @@ export class ConversationSnapshotV2Repository {
           prompt: questionExcerpt ? redactSensitivePreview(questionExcerpt.prompt).text : conversationNavigationExcerpt(text, 160),
           response: questionExcerpt ? redactSensitivePreview(questionExcerpt.response).text : '',
           status: row.status,
-          placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'model_history', sourceScope: row.segment_id, sourceId: row.id, facet: 'body' }).placement,
+          placement: row.placement!,
         });
     }
     /** 普通发言保持模型历史顺序，答题卡保留自己的答案摘录。 */
     const directory: ConversationNavigationEntry[] = [...entries.values()].map((entry) => ({ ...entry, hasContent: contentTurnIds.has(entry.turnId), response: entry.response || answers.get(entry.turnId)?.text || '' }));
     /** 同步询问独立存储，必须进入完整目录而不能只依赖已加载正文。 */
-    const requests = this.db.select<{ id: string; turn_id: string; provider_turn_id: string | null; payload_json: string; response_json: string; contains_secret: number; occurred_at: string }>(
+    const requests = this.db.select<{ id: string; turn_id: string; provider_turn_id: string | null; payload_json: string; response_json: string; contains_secret: number; occurred_at: string } & ConversationNavigationPlacementRow>(
       `SELECT request.id, request.turn_id, turn.provider_turn_id, request.payload_json, request.response_json, request.contains_secret,
-              COALESCE(request.resolved_at, request.created_at) AS occurred_at
+              COALESCE(request.resolved_at, request.created_at) AS occurred_at,
+              transcript_entry.id AS transcript_entry_id,
+              transcript_entry.display_order AS transcript_display_order,
+              transcript_entry.placement_revision AS transcript_placement_revision,
+              transcript_entry.turn_id AS transcript_turn_id,
+              transcript_entry.opening_input_id AS transcript_opening_input_id,
+              transcript_entry.display_stage_id AS transcript_display_stage_id
          FROM conversation_server_requests AS request
          JOIN conversation_turns AS turn ON turn.id = request.turn_id AND turn.conversation_id = request.conversation_id
+         LEFT JOIN conversation_transcript_aliases AS transcript_alias
+           ON transcript_alias.conversation_id = request.conversation_id AND transcript_alias.source_domain = 'request'
+          AND transcript_alias.source_scope = request.turn_id AND transcript_alias.source_id = request.id AND transcript_alias.facet = 'request_answer'
+         LEFT JOIN conversation_transcript_entries AS transcript_entry
+           ON transcript_entry.conversation_id = transcript_alias.conversation_id AND transcript_entry.id = transcript_alias.entry_id
         WHERE request.conversation_id = ? AND request.status = 'resolved'
           AND request.request_kind = 'request_user_input' AND request.response_json IS NOT NULL
         ORDER BY occurred_at, request.id`,
@@ -921,6 +1018,8 @@ export class ConversationSnapshotV2Repository {
       /** 与正文共享规范题目和脱敏答案口径，整张卡只建立一个身份。 */
       const excerpt = conversationQuestionNavigationExcerpt(parseJsonRecordOrNull(request.payload_json), parseJsonRecordOrNull(request.response_json), request.contains_secret === 1);
       if (!excerpt) continue;
+      /** 已回答卡片与普通发言共用本次目录的位置代次。 */
+      const placement = conversationNavigationPlacement(request, orderEpoch);
       /** 同步卡片没有模型消息序号，按答案提交时间插入并保持模型消息原顺序。
        * ponytail: 插入为 O(卡片数 × 目录数)，目录达到万级卡片时改为双游标合并。 */
       const index = directory.findIndex((entry) => entry.occurredAt > request.occurred_at);
@@ -936,17 +1035,17 @@ export class ConversationSnapshotV2Repository {
         prompt: redactSensitivePreview(excerpt.prompt).text,
         response: redactSensitivePreview(excerpt.response).text,
         status: 'resolved',
-        placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'request', sourceScope: request.turn_id, sourceId: request.id, facet: 'request_answer' }).placement,
+        placement,
       });
     }
     directory.sort((left, right) => (left.placement?.order ?? Number.MAX_SAFE_INTEGER) - (right.placement?.order ?? Number.MAX_SAFE_INTEGER) || left.id.localeCompare(right.id));
     /** 沟通边界来自持久消息位置，思考与操作详情不进入目录正文。 */
-    const messageBoundaries = rows
+    const messageBoundaries = positionedRows
       .filter((row) => row.preview.trim())
       .map((row) => ({
         turnId: row.turn_id,
         providerTurnId: row.provider_turn_id,
-        placement: this.requiredTranscriptEnvelope({ conversationId, sourceDomain: 'model_history', sourceScope: row.segment_id, sourceId: row.id, facet: row.reasoning_summary === 1 ? 'reasoning_block' : 'body' }).placement,
+        placement: row.placement!,
       }));
     /** 已回答询问也切断过程；同一消息的多个来源只登记一个边界。 */
     const boundaries = [
@@ -994,7 +1093,7 @@ export class ConversationSnapshotV2Repository {
     /** 空白区间不产生虚假的操作入口。 */
     const countById = new Map(counts.map((row) => [row.id, row.item_count]));
     const processGroups: ConversationProcessGroup[] = ranges.flatMap((range) => (countById.has(range.id) ? [{ ...range, itemCount: countById.get(range.id)! }] : []));
-    return { conversationId, throughEventSeq, orderEpoch: this.transcript.orderEpoch(conversationId), entries: directory, processGroups };
+    return { conversationId, throughEventSeq, orderEpoch, entries: directory, processGroups };
   }
 
   /** 独立文本生成只读取最近三轮已关闭对话，不扩大首屏快照的两轮载入上限。 */
@@ -1180,6 +1279,27 @@ export class ConversationSnapshotV2Repository {
     const activeTurnCandidate = this.latestTurnsByStatus(conversationId, ['running', 'dispatching', 'waiting'], 1)[0];
     const activeTurn = conversation.provider_state === 'active' || conversation.provider_state === 'waiting' || this.hasActiveExpertExecution(conversationId) ? activeTurnCandidate : undefined;
     return readConversationSessionMetrics(this.db, conversationId, activeTurn?.id ?? null);
+  }
+
+  /** 浮层打开后才扫描完整会话记录，首屏与实时指标不承担这些读取。 */
+  readSessionInformation(conversationIdValue: string): ConversationInformation {
+    /** 所有查询严格限制在同一个已授权会话内。 */
+    const conversationId = requiredIdentity(conversationIdValue, 'conversationId');
+    /** 账本入口校验金额与请求费率，已有汇总请求不重复累加。 */
+    const requests = new CodexUsageLedgerRepository(this.db).list({ conversationId }).flatMap((row) => row.estimate.requests ?? [{ id: row.id, occurredAt: row.occurredAt, usage: row.usage, estimate: row.estimate }]);
+    /** 队列中尚未被接受的技能不计入使用清单。 */
+    const selectedSkills = this.db.select<{ input_json: string }>(`SELECT input_json FROM conversation_submissions WHERE conversation_id = ? AND accepted_at IS NOT NULL ORDER BY created_at, id`, [conversationId]).flatMap((row) => {
+      /** 持久化输入只用于提取技能，不访问当前磁盘目录。 */
+      const input = parseJsonRecordOrNull(row.input_json);
+      /** 已有单选和多选提交使用相同的名称规则。 */
+      const skills = input?.skills ?? (input?.skill ? [input.skill] : []);
+      return Array.isArray(skills) ? skills.flatMap((skill) => (typeof skill?.name === 'string' && skill.name.trim() ? [skill.name.trim()] : [])) : [];
+    });
+    /** 复用实时和历史消息的工具归一化，清单不受前端消息分页影响。 */
+    const items = this.db
+      .select<{ kind: string; detail_json: string }>(`SELECT kind, detail_json FROM conversation_process_items WHERE conversation_id = ? AND kind IN ('tool', 'command') ORDER BY process_sequence`, [conversationId])
+      .map((row) => conversationProcessPresentation(row.kind, parseJsonRecordOrNull(row.detail_json)));
+    return { cost: conversationCostBreakdown(requests), resources: conversationUsedResources(items, selectedSkills) };
   }
 
   /** 有界核对当前已加载显示身份的位置和显式删除状态。 */
@@ -2500,7 +2620,10 @@ interface SequencePageContext {
   byteLimit: number;
 }
 
+/** 轮次摘要只读取有界诊断字段，避免加载完整 Provider 报文。 */
 function turnSummarySelectSql(): string {
+  /** 仅在合法 JSON 内选择官方错误对象；两种已存储结构共用有界字段读取。 */
+  const providerErrorJson = "CASE WHEN json_valid(error_json) THEN CASE WHEN json_type(error_json, '$.providerError') = 'object' THEN json_extract(error_json, '$.providerError') ELSE error_json END ELSE NULL END";
   return `SELECT id, provider_turn_id, client_submission_id, status,
                  CASE WHEN error_json IS NULL THEN 0 ELSE 1 END AS has_error,
                  CASE
@@ -2538,29 +2661,29 @@ function turnSummarySelectSql(): string {
                  CASE
                    WHEN json_valid(error_json) THEN
                      CASE
-                       WHEN json_type(error_json, '$.providerError.codexErrorInfo') = 'text'
-                         THEN substr(json_extract(error_json, '$.providerError.codexErrorInfo'), 1, 120)
-                       WHEN json_type(error_json, '$.providerError.codexErrorInfo') = 'object'
-                         THEN (SELECT substr(key, 1, 120) FROM json_each(json_extract(error_json, '$.providerError.codexErrorInfo')) LIMIT 1)
+                       WHEN json_type(${providerErrorJson}, '$.codexErrorInfo') = 'text'
+                         THEN substr(json_extract(${providerErrorJson}, '$.codexErrorInfo'), 1, 120)
+                       WHEN json_type(${providerErrorJson}, '$.codexErrorInfo') = 'object'
+                         THEN (SELECT substr(key, 1, 120) FROM json_each(json_extract(${providerErrorJson}, '$.codexErrorInfo')) LIMIT 1)
                        ELSE NULL
                      END
                    ELSE NULL
                  END AS error_provider_info,
                  CASE
                    WHEN json_valid(error_json)
-                    AND json_type(error_json, '$.providerError.codexErrorInfo') = 'object'
+                    AND json_type(${providerErrorJson}, '$.codexErrorInfo') = 'object'
                      THEN (SELECT CASE
                        WHEN json_type(value, '$.httpStatusCode') = 'integer'
                          THEN json_extract(value, '$.httpStatusCode')
                        ELSE NULL
-                     END FROM json_each(json_extract(error_json, '$.providerError.codexErrorInfo')) LIMIT 1)
+                     END FROM json_each(json_extract(${providerErrorJson}, '$.codexErrorInfo')) LIMIT 1)
                    ELSE NULL
                  END AS error_provider_http_status,
                  CASE
                    WHEN json_valid(error_json) THEN
                      CASE
-                       WHEN json_type(error_json, '$.providerError.additionalDetails') = 'text'
-                         THEN substr(json_extract(error_json, '$.providerError.additionalDetails'), 1, 1000)
+                       WHEN json_type(${providerErrorJson}, '$.additionalDetails') = 'text'
+                         THEN substr(json_extract(${providerErrorJson}, '$.additionalDetails'), 1, 1000)
                        ELSE NULL
                      END
                    ELSE NULL
@@ -2675,7 +2798,7 @@ function boundedHttpStatusCode(value: unknown): number | null {
 /** 判断官方结构化错误是否要求暂停会话与阻塞上层工作，禁止据此自动重发。 */
 export function isProviderBlockingTurnFailure(value: unknown): boolean {
   const failure = isRecord(value) ? value : {};
-  const providerError = isRecord(failure.providerError) ? failure.providerError : {};
+  const providerError = isRecord(failure.providerError) ? failure.providerError : failure;
   const rawMessage = (typeof failure.message === 'string' && failure.message.trim() ? failure.message : null) ?? (typeof providerError.message === 'string' && providerError.message.trim() ? providerError.message : null) ?? '';
   const identity = providerFailureIdentity(failure, providerError, rawMessage);
   return Boolean(
@@ -2690,7 +2813,7 @@ export function isProviderBlockingTurnFailure(value: unknown): boolean {
 /** 实时事件与 Snapshot V2 共用同一个有界脱敏投影，未经脱敏的 Provider 错误不进入客户端协议。 */
 export function projectConversationTurnFailure(value: unknown): ConversationSnapshotV2TurnFailure {
   const failure = isRecord(value) ? value : {};
-  const providerError = isRecord(failure.providerError) ? failure.providerError : {};
+  const providerError = isRecord(failure.providerError) ? failure.providerError : failure;
   const rawMessage =
     (typeof failure.message === 'string' && failure.message.trim() ? failure.message : null) ??
     (typeof providerError.message === 'string' && providerError.message.trim() ? providerError.message : null) ??
@@ -2708,7 +2831,7 @@ export function projectConversationTurnFailure(value: unknown): ConversationSnap
       : providerInfo
         ? { cause: userFacingErrorCause({ code: providerInfo, message, ...(diagnosticDetails.length > 0 ? { details: diagnosticDetails.join('\n') } : {}) }) }
         : {}),
-    category: classifyTurnFailure(providerInfo, providerIdentity.httpStatusCode, message, !providerIdentity.structured),
+    category: classifyTurnFailure(providerInfo ?? boundedFailureIdentity(typeof failure.code === 'string' ? failure.code : null), providerIdentity.httpStatusCode, message, !providerIdentity.structured),
     code: capacity ? 'ZEUS_CODEX_MODEL_AT_CAPACITY' : boundedFailureIdentity(typeof failure.code === 'string' ? failure.code : null),
     message,
     providerStatus: boundedFailureIdentity(typeof failure.providerStatus === 'string' ? failure.providerStatus : null),

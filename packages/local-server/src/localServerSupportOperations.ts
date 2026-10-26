@@ -4,6 +4,7 @@ import {
   type AiRuntimeLogEntry,
   type AiRuntimeSession,
   buildAiRuntimePrompt,
+  businessProcessEnvironment,
   createAiRuntimeSessionManager,
   createNonCodexAiCliAdapterInvocation,
   expandCliSearchPath,
@@ -347,13 +348,13 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
           ZEUS_SHELL_LOGIN: platformMutableState.runtimeSettings.shell.login ? '1' : '0',
         }
       : { ZEUS_SHELL_LOGIN: platformMutableState.runtimeSettings.shell.login ? '1' : '0' };
-    const mergedEnv: NodeJS.ProcessEnv = {
+    const mergedEnv = businessProcessEnvironment({
       ...process.env,
       ...platformMutableState.runtimeSettings.terminalEnv,
       ZEUS_RUNTIME_TIMEOUT_SECONDS: String(platformMutableState.runtimeSettings.executionTimeoutSeconds),
       ...(platformMutableState.runtimeSettings.adapterCliPaths.codex ? { ZEUS_CODEX_COMMAND_PATH: platformMutableState.runtimeSettings.adapterCliPaths.codex } : {}),
       ...shellEnv,
-    };
+    });
     return {
       ...mergedEnv,
       PATH: expandCliSearchPath(mergedEnv.PATH),
@@ -633,6 +634,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
         currentVersion,
         manifest,
         platformArch: resolveReleaseUpdateArch(),
+        platform: process.platform === 'win32' ? 'win32' : 'darwin',
         executionHostProtocolVersion: options.executionHost?.protocolVersion ?? 2,
         checkedAt,
       });
@@ -1163,6 +1165,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
       taskId: runningTask.id,
       command: invocation.command,
       args: invocation.args,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       cwd: project.localPath,
       env: buildRuntimeProcessEnv(),
     });
@@ -1242,6 +1245,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
       taskId: runningTask.id,
       command: invocation.command,
       args: invocation.args,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       cwd: project.localPath,
       env: buildRuntimeProcessEnv(),
     });
@@ -1494,7 +1498,13 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
     const candidates = new Map<AiCliAdapterDescriptor['id'], AiCliAdapterDescriptor>();
     for (const adapter of adapters) {
       if (platformMutableState.runtimeSettings.adapterCliPaths[adapter.id]?.trim() === command) candidates.set(adapter.id, adapter);
-      if (isAbsolute(command) && parse(command).base === adapter.command) candidates.set(adapter.id, adapter);
+      if (
+        isAbsolute(command) &&
+        parse(command)
+          .base.toLowerCase()
+          .replace(/\.(?:exe|cmd|bat|com)$/u, '') === adapter.command
+      )
+        candidates.set(adapter.id, adapter);
     }
     return candidates.size === 1 ? (candidates.values().next().value ?? null) : null;
   }
@@ -1592,6 +1602,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
         taskId: runningTask.id,
         command: invocation.command,
         args: invocation.args,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         cwd: project.localPath,
         env: buildRuntimeProcessEnv(),
       });

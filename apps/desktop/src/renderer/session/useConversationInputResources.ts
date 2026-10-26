@@ -1,4 +1,4 @@
-import { formatVisibleApplicationError, type ApplicationErrorLanguage } from '../ui/ApplicationErrorDialog.js';
+import { type ApplicationErrorLanguage, formatVisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { type ClipboardEvent, type DragEvent, type KeyboardEvent, type RefObject, useCallback, useEffect, useRef, useState } from 'react';
 import type { NativeConversationAttachment } from './sessionTypes.js';
 import { PENDING_RESOURCE_LONG_TEXT_THRESHOLD } from '../ui/pendingResourcePolicy.js';
@@ -17,7 +17,6 @@ interface UseConversationInputResourcesOptions {
   disabled: boolean;
   onTextChange: (text: string) => void;
   onAddAttachments: (attachments: NativeConversationAttachment[]) => void;
-  onRemoveAttachment: (attachment: NativeConversationAttachment) => void;
   onError: (message: string) => void;
 }
 
@@ -34,7 +33,6 @@ export interface ConversationInputResourceHandlers {
   handleDragOver(event: DragEvent<HTMLElement>): void;
   handleDragLeave(event: DragEvent<HTMLElement>): void;
   handleDrop(event: DragEvent<HTMLElement>): void;
-  restorePastedText(attachment: NativeConversationAttachment): void;
 }
 
 export function useConversationInputResources(options: UseConversationInputResourcesOptions): ConversationInputResourceHandlers {
@@ -82,14 +80,18 @@ export function useConversationInputResources(options: UseConversationInputResou
         if (!bridge) throw new Error('当前应用版本未提供会话附件导入能力。');
         const result = await bridge(files, source);
         if (!pending.current()) return;
-        if (result.resources.length === 0) throw new Error('没有可读取的文件或文件夹。');
+        if (result.resources.length === 0) throw new Error(result.failureMessage || '附件导入未返回可用资源。');
         pending.complete(
           result.resources.map((attachment) => ({ id: attachment.localPath ?? attachment.uploadRef, name: attachment.name, kind: attachment.kind ?? 'file' })),
           result.failedCount,
         );
         latest.current.onAddAttachments(result.resources);
         if (result.failedCount > 0) {
-          latest.current.onError(latest.current.language === 'zh-CN' ? `已添加可读取的附件，另有 ${result.failedCount} 项无法读取。` : `Readable attachments were added; ${result.failedCount} other item(s) could not be read.`);
+          latest.current.onError(
+            [latest.current.language === 'zh-CN' ? `已添加可读取的附件，另有 ${result.failedCount} 项无法读取。` : `Readable attachments were added; ${result.failedCount} other item(s) could not be read.`, result.failureMessage]
+              .filter(Boolean)
+              .join('\n'),
+          );
         }
       }, files);
     },
@@ -102,10 +104,12 @@ export function useConversationInputResources(options: UseConversationInputResou
       /** 选择器返回宿主已经授权的资源，保存消息时服务端仍会复验。 */
       const bridge = window.zeus?.chooseConversationResources;
       if (!bridge) throw new Error('当前应用版本未提供会话附件选择能力。');
+      /** 选择结果仍归打开菜单时的草稿，不能落入后来切换的提问字段。 */
+      const addAttachments = latest.current.onAddAttachments;
       /** 取消选择返回空列表，不视为导入失败。 */
       const attachments = await bridge();
       if (!pending.current() || attachments.length === 0) return;
-      latest.current.onAddAttachments(attachments);
+      addAttachments(attachments);
     });
   }, [runResourceOperation]);
 
@@ -206,13 +210,6 @@ export function useConversationInputResources(options: UseConversationInputResou
     [addFiles],
   );
 
-  const restorePastedText = useCallback((attachment: NativeConversationAttachment) => {
-    if (!attachment.restorableText || latest.current.disabled) return;
-    const textarea = latest.current.textareaRef.current;
-    insertText(latest.current, attachment.restorableText, textarea ? currentSelection(textarea) : { start: latest.current.text.length, end: latest.current.text.length });
-    latest.current.onRemoveAttachment(attachment);
-  }, []);
-
   return {
     pendingResources: previews.pendingResources,
     processing: previews.processing,
@@ -224,7 +221,6 @@ export function useConversationInputResources(options: UseConversationInputResou
     handleDragOver,
     handleDragLeave,
     handleDrop,
-    restorePastedText,
   };
 }
 

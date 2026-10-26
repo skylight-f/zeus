@@ -4351,3 +4351,187 @@ body:has(.macos-ai-app.zeus-shell) {
   border-radius: 0 !important;
   box-shadow: none !important;
 }
+
+.macos-ai-app.zeus-shell :is(.project-quick-action, .project-settings-button, .project-add-button, .project-conversation-organization-button, [role='tab'], [role='menuitem']) {
+  box-shadow: none;
+}
+.macos-ai-app.zeus-shell .ai-workspace:has(.project-start-guide) {
+  box-sizing: border-box;
+  padding: 48px 24px clamp(48px, 12vh, 120px);
+  overflow-y: auto;
+  background: var(--zeus-product-panel) !important;
+}
+
+.macos-ai-app.zeus-shell > .ai-workspace > .project-tools-layout > .project-main-content > .workspace-view {
+  background: transparent !important;
+  background-image: none !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+@media (min-width: 760px) {
+  .macos-ai-app.zeus-shell.settings-dedicated-shell > .ai-workspace > .project-tools-layout > .project-main-content > .settings-reference-shell {
+    grid-template-columns: calc(var(--zeus-project-sidebar-width, 248px) + 1px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+}
+.macos-ai-app.zeus-shell.main-layout-upstream .ai-workspace.classic-project-workspace > .project-tools-layout > .project-main-content > .workspace-view {
+  border: 1px solid var(--zeus-card-border) !important;
+}
+.macos-ai-app.zeus-shell .ai-workspace.classic-project-workspace > .project-tools-layout > .project-main-content > .workspace-view {
+  box-sizing: border-box;
+  flex: 1 1 0 !important;
+  block-size: auto !important;
+  height: auto !important;
+  inline-size: 100%;
+  min-block-size: 0;
+  min-inline-size: 0;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden;
+  border: 0 !important;
+  border-radius: 12px !important;
+  background: var(--zeus-card-background) !important;
+  box-shadow: none !important;
+}
+.macos-ai-app.zeus-shell[data-project-tools-visible='true'] {
+  --zeus-project-activity-rail-width: 40px;
+  --zeus-workspace-right-rail-width: 40px;
+  --zeus-workspace-status-bar-height: 28px;
+  background: var(--zeus-page-background) !important;
+}
+
+.macos-ai-app.zeus-shell :is(.project-workspace-mode-rail, .project-workspace-tool-rail) > button {
+  align-items: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: none;
+  color: var(--agentdesk-text-secondary);
+  display: inline-flex;
+  flex: 0 0 36px;
+  inline-size: 36px;
+  justify-content: center;
+  min-block-size: 36px;
+  padding: 0;
+  position: relative;
+  transition:
+    background-color 140ms var(--zeus-motion-ease-out),
+    color 140ms var(--zeus-motion-ease-out);
+  -webkit-app-region: no-drag;
+}
+
+.macos-ai-app.zeus-shell :is(.project-workspace-mode-rail, .project-workspace-tool-rail) > button:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--zeus-source-list-hover);
+  color: var(--agentdesk-text);
+}
+
+.macos-ai-app.zeus-shell :is(.project-workspace-mode-rail, .project-workspace-tool-rail) > button.is-active {
+  background: color-mix(in srgb, var(--agentdesk-accent) 9%, var(--zeus-card-background));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--agentdesk-accent) 24%, var(--zeus-card-border));
+  color: var(--agentdesk-accent-strong);
+}
+
+.macos-ai-app.zeus-shell :is(.project-workspace-mode-rail, .project-workspace-tool-rail) > button:focus-visible {
+  outline: 2px solid var(--agentdesk-accent);
+  outline-offset: -2px;
+}
+
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .project-tools-layout > .project-main-content > .workspace-view {
+  background: var(--zeus-card-background) !important;
+  block-size: auto !important;
+  border: 1px solid var(--zeus-card-border) !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+  box-sizing: border-box;
+  flex: 1 1 0 !important;
+  height: auto !important;
+  inline-size: 100%;
+  margin: 0 !important;
+  min-block-size: 0;
+  min-inline-size: 0;
+  overflow: hidden;
+  padding: 0 !important;
+}
+.macos-ai-app.zeus-shell.main-layout-upstream
+  .ai-workspace.classic-project-workspace
+  > .project-tools-layout
+  > .project-main-content
+  > :is(.workspace-view-project-sessions, .workspace-view-project-tasks, .workspace-view-project-git, .workspace-view-project-code),
+.macos-ai-app.zeus-shell.project-navigation-rail-shell
+  > .ai-workspace
+  > .project-tools-layout
+  > .project-main-content
+  > :is(.workspace-view-project-sessions, .workspace-view-project-tasks, .workspace-view-project-git, .workspace-view-project-code) {
+  background: var(--zeus-page-background) !important;
+  background-image: none !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+.macos-ai-app.zeus-shell.project-navigation-rail-shell > .ai-workspace > .project-tools-layout > .project-main-content > .workspace-view-project-git {
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+
+.macos-ai-app.zeus-shell :is(.project-workspace-mode-rail, .project-workspace-tool-rail) > button.is-active {
+  background: color-mix(in srgb, var(--agentdesk-accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--agentdesk-accent) 22%, transparent);
+}
+.macos-ai-app.zeus-shell .project-workspace-tool-rail > button {
+  border-radius: 8px;
+  flex-basis: calc(var(--zeus-workspace-right-rail-width) - 8px);
+  inline-size: calc(var(--zeus-workspace-right-rail-width) - 8px);
+  min-block-size: calc(var(--zeus-workspace-right-rail-width) - 8px);
+}
+.macos-ai-app.zeus-shell .project-workspace-tool-rail > button > svg {
+  block-size: 18px;
+  inline-size: 18px;
+}
+.macos-ai-app.zeus-shell.main-layout-upstream[data-project-tools-visible='true'] > .project-workspace-tool-rail {
+  grid-column: -2 / -1;
+  grid-row: 1 / -1;
+  padding-block-start: 44px;
+}
+.macos-ai-app.zeus-shell > .project-workspace-tool-rail.project-workspace-search-rail {
+  position: fixed;
+  inset: 0 0 auto auto;
+  z-index: 32;
+  inline-size: var(--zeus-workspace-right-rail-width);
+  block-size: 44px;
+  padding: 6px 4px;
+  overflow: visible;
+}
+
+@media (min-width: 760px) {
+  .macos-ai-app.zeus-shell.ai-native-shell.main-layout-upstream[data-project-tools-visible='true'] {
+    grid-template-columns: var(--zeus-project-sidebar-width) 1px minmax(0, 1fr) var(--zeus-workspace-right-rail-width);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .macos-ai-app.zeus-shell.ai-native-shell.main-layout-upstream.settings-dedicated-shell[data-project-tools-visible='true'] {
+    grid-template-columns: minmax(0, 1fr) var(--zeus-workspace-right-rail-width);
+  }
+}
+
+@media (max-width: 759px) {
+  .macos-ai-app.zeus-shell.ai-native-shell.main-layout-upstream[data-project-tools-visible='true'] {
+    --zeus-workspace-right-rail-width: 36px;
+    grid-template-columns: minmax(0, 1fr) var(--zeus-workspace-right-rail-width);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .macos-ai-app.zeus-shell.main-layout-upstream[data-project-tools-visible='true'] > :is(.project-first-sidebar, .ai-workspace) {
+    grid-column: 1;
+  }
+
+  .macos-ai-app.zeus-shell.main-layout-upstream[data-project-tools-visible='true'] > .project-sidebar-resizer {
+    display: none;
+  }
+
+  .macos-ai-app.zeus-shell.main-layout-upstream.settings-dedicated-shell[data-project-tools-visible='true'] > .ai-workspace {
+    grid-row: 1 / -1;
+  }
+}

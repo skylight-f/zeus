@@ -16,10 +16,33 @@ const computerNativeRevision = 'bf6c76786d938070f4ecf1e44004752f69f518b8';
 /** 固定提交中的 Cargo.lock 摘要，计算缓存键时无需联网下载源码。 */
 const computerNativeLockSha256 = '5fa39679b3fa4a44d8011dfe36bf9e4e2263d41fbd09980e51a6bbca28840968';
 /** 一次选择两个生产包，共享依赖特性解析，不构建整个工作区。 */
-// 显式关闭 Rust 的符号剥离，避免 LLVM 22 在 macOS 上生成 dyld 无法加载的宏依赖和 SDK。
-const computerNativeCargoArguments = ['build', '--release', '--locked', '--config', 'profile.release.strip="none"', '-p', 'cua-driver', '-p', 'cua-driver-sdk'];
+const computerNativeCargoArguments = [
+  'build',
+  '--release',
+  '--locked',
+  ...(process.platform === 'darwin' ? ['--config', 'profile.release.strip="none"'] : []),
+  '-p',
+  'cua-driver',
+  '-p',
+  'cua-driver-sdk',
+  ...(process.platform === 'win32' ? ['--target', process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'] : []),
+];
 /** 所有会影响编译配置的覆盖项参与缓存身份，不输出其原始值。 */
-const computerNativeCompilerEnvironment = ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_TARGET', 'MACOSX_DEPLOYMENT_TARGET', 'CC', 'CXX', 'CFLAGS', 'CXXFLAGS'];
+const computerNativeCompilerEnvironment = [
+  'RUSTFLAGS',
+  'CARGO_ENCODED_RUSTFLAGS',
+  'RUSTC',
+  'RUSTC_WRAPPER',
+  'RUSTC_WORKSPACE_WRAPPER',
+  'CARGO_BUILD_TARGET',
+  'MACOSX_DEPLOYMENT_TARGET',
+  'CC',
+  'CXX',
+  'CFLAGS',
+  'CXXFLAGS',
+  'VCToolsVersion',
+  'WindowsSDKVersion',
+];
 /** 同一工作树内等待其他原生构建结束的有限预算。 */
 const computerNativeLockWaitMs = 15 * 60_000;
 /** 不经过 shell 执行固定工具链和 Git 命令。 */
@@ -32,21 +55,22 @@ function hashComputerNativeBytes(bytes) {
 
 /** 从真实工具链和源码输入产生本地与 CI 共用的缓存身份。 */
 export async function resolveComputerNativeBuildInputs(desktopRoot, cacheRoot = resolve(desktopRoot, '../../.tmp')) {
-  if (process.platform !== 'darwin') throw new Error('CUA 原生程序只能在 macOS 上构建。');
+  if (!['darwin', 'win32'].includes(process.platform)) throw new Error('CUA 原生构建仅支持 macOS 和 Windows。');
   if (process.env.CARGO_BUILD_TARGET) throw new Error('CUA 原生构建使用当前宿主架构，请移除 CARGO_BUILD_TARGET。');
   /** 桌面依赖是唯一运行时 SDK 版本来源。 */
   const manifest = JSON.parse(await readFile(resolve(desktopRoot, 'package.json'), 'utf8'));
   if (manifest.dependencies['@trycua/cua-driver'] !== computerNativeVersion) throw new Error('CUA SDK 已变更，请同步核对固定源码、补丁和 Cargo.lock。');
   /** 工具链摘要与 CI 的操作系统、SDK 和编译器实际身份绑定。 */
   const toolchain = await Promise.all([
-    executeFile('/usr/bin/sw_vers', ['-productVersion']),
-    executeFile('/usr/bin/xcrun', ['--show-sdk-build-version']),
-    executeFile('/usr/bin/xcrun', ['clang', '--version']),
+    ...(process.platform === 'darwin'
+      ? [executeFile('/usr/bin/sw_vers', ['-productVersion']), executeFile('/usr/bin/xcrun', ['--show-sdk-build-version']), executeFile('/usr/bin/xcrun', ['clang', '--version'])]
+      : [executeFile('cmd.exe', ['/d', '/c', 'ver'])]),
     executeFile(process.env.RUSTC || 'rustc', ['-vV']),
     executeFile('cargo', ['-V']),
   ]);
   /** 补丁是应用审查过的唯一原生源码变更。 */
-  const patch = resolve(desktopRoot, 'native/cua-desktop.patch');
+  /** Windows 补丁依赖共享补丁的私有 worker 上下文，顺序也参与缓存身份。 */
+  const patches = [resolve(desktopRoot, 'native/cua-desktop.patch'), ...(process.platform === 'win32' ? [resolve(desktopRoot, 'native/cua-windows.patch')] : [])];
   /** 编译选项不随外层 Swift 构建或 SDK 文件组装变化。 */
   const configuration = {
     /** 操作系统限定原生中间结果的适用平台。 */
@@ -67,7 +91,9 @@ export async function resolveComputerNativeBuildInputs(desktopRoot, cacheRoot = 
   /** 中间缓存只在工具链、依赖和构建参数兼容时允许回退恢复。 */
   const cargoCompatibilitySha256 = hashComputerNativeBytes(JSON.stringify(configuration));
   /** 成品还必须精确匹配当前 CUA 模块和补丁，外层组装脚本不参与失效。 */
-  const nativeInputSha256 = hashComputerNativeBytes(JSON.stringify([cargoCompatibilitySha256, hashComputerNativeBytes(await readFile(patch)), hashComputerNativeBytes(await readFile(fileURLToPath(import.meta.url)))]));
+  const nativeInputSha256 = hashComputerNativeBytes(
+    JSON.stringify([cargoCompatibilitySha256, ...(await Promise.all(patches.map(async (patch) => hashComputerNativeBytes(await readFile(patch))))), hashComputerNativeBytes(await readFile(fileURLToPath(import.meta.url)))]),
+  );
   /** 每套精确输入单独保存成品，工作副本路径保持稳定以复用 Cargo 结果。 */
   const artifactDirectory = resolve(cacheRoot, `cua-native-artifacts-${nativeInputSha256}`);
   return {
@@ -76,27 +102,27 @@ export async function resolveComputerNativeBuildInputs(desktopRoot, cacheRoot = 
     /** 当前工作树拥有的缓存根目录。 */
     cacheRoot,
     /** 当前审查过的原生补丁路径。 */
-    patch,
+    patches,
     /** 成品凭证必须精确匹配的输入摘要。 */
     nativeInputSha256,
     /** 两份成品在 CI 中共用的精确主键。 */
-    nativeCacheKey: `zeus-cua-native-${process.arch}-${nativeInputSha256}`,
+    nativeCacheKey: `zeus-cua-native-${process.platform}-${process.arch}-${nativeInputSha256}`,
     /** 每次原生输入变化保存新的中间缓存快照。 */
-    cargoCacheKey: `zeus-cua-cargo-${process.arch}-${cargoCompatibilitySha256}-${nativeInputSha256}`,
+    cargoCacheKey: `zeus-cua-cargo-${process.platform}-${process.arch}-${cargoCompatibilitySha256}-${nativeInputSha256}`,
     /** 只回退到工具链与依赖兼容的中间快照。 */
-    cargoRestoreKey: `zeus-cua-cargo-${process.arch}-${cargoCompatibilitySha256}-`,
+    cargoRestoreKey: `zeus-cua-cargo-${process.platform}-${process.arch}-${cargoCompatibilitySha256}-`,
     /** 当前精确输入独占的两份成品目录。 */
     artifactDirectory,
     /** 从固定提交检出的原始源码，不写入补丁。 */
     repository: resolve(cacheRoot, `cua-driver-source-${computerNativeRevision}`),
     /** 稳定工作副本路径避免补丁摘要变化使 Cargo 路径失效。 */
-    workspace: resolve(cacheRoot, `cua-native-workspace-${computerNativeRevision}-${process.arch}`),
+    workspace: resolve(cacheRoot, `cua-native-workspace-${computerNativeRevision}-${process.platform}-${process.arch}`),
     /** 本地与 CI 恢复的 release 中间产物根目录。 */
-    targetDirectory: resolve(cacheRoot, `cua-driver-target-${process.arch}`),
+    targetDirectory: resolve(cacheRoot, `cua-driver-target-${process.platform}-${process.arch}`),
     /** 受控 worker 可执行文件。 */
-    workerPath: resolve(artifactDirectory, 'cua-driver'),
+    workerPath: resolve(artifactDirectory, process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver'),
     /** 与 worker 同次构建的 SDK 原生库。 */
-    sdkPath: resolve(artifactDirectory, 'libcua_driver_sdk.dylib'),
+    sdkPath: resolve(artifactDirectory, process.platform === 'win32' ? 'cua_driver_sdk.dll' : 'libcua_driver_sdk.dylib'),
     /** 两份成品全部成功之后才写入的完整凭证。 */
     receiptPath: resolve(artifactDirectory, 'build-receipt.json'),
   };
@@ -183,20 +209,41 @@ export async function prepareComputerNativeArtifacts(inputs) {
     try {
       await access(resolve(inputs.repository, '.git'));
     } catch {
-      await executeFile('git', ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', '--branch', `cua-driver-rs-v${computerNativeVersion}`, 'https://github.com/trycua/cua.git', inputs.repository]);
+      await executeFile('git', [
+        'clone',
+        ...(process.platform === 'win32' ? ['--config', 'core.autocrlf=false', '--config', 'core.eol=lf'] : []),
+        '--depth',
+        '1',
+        '--filter=blob:none',
+        '--no-checkout',
+        '--branch',
+        `cua-driver-rs-v${computerNativeVersion}`,
+        'https://github.com/trycua/cua.git',
+        inputs.repository,
+      ]);
     }
     if ((await executeFile('git', ['-C', inputs.repository, 'rev-parse', 'HEAD'])).stdout.trim() !== computerNativeRevision) throw new Error('CUA 发布源码提交不匹配。');
     await executeFile('git', ['-C', inputs.repository, 'sparse-checkout', 'set', '--cone', 'libs/cua-driver/rust']);
     await executeFile('git', ['-C', inputs.repository, 'checkout', '--detach', computerNativeRevision]);
     await executeFile('git', ['-C', inputs.repository, 'diff', '--quiet', computerNativeRevision, '--', 'libs/cua-driver/rust']);
     if ((await executeFile('git', ['-C', inputs.repository, 'ls-files', '--others', '--', 'libs/cua-driver/rust'])).stdout.trim()) throw new Error('CUA 源码缓存含未跟踪文件，不能用于原生构建。');
+    if (process.platform === 'win32') {
+      // 仅将已确认干净的依赖缓存检出为原始 LF，不修改用户或项目的全局 Git 配置。
+      await executeFile('git', ['-C', inputs.repository, 'config', '--local', 'core.autocrlf', 'false']);
+      await executeFile('git', ['-C', inputs.repository, 'config', '--local', 'core.eol', 'lf']);
+      await executeFile('git', ['-C', inputs.repository, 'checkout', '--force', computerNativeRevision, '--', 'libs/cua-driver/rust']);
+    }
     /** 原始副本不接受补丁，工作副本每次从已核对源码重建。 */
     const sourceDirectory = resolve(inputs.repository, 'libs/cua-driver/rust');
-    if (hashComputerNativeBytes(await readFile(resolve(sourceDirectory, 'Cargo.lock'))) !== computerNativeLockSha256) throw new Error('CUA Cargo.lock 与固定源码摘要不一致。');
+    /** 保留原始字节摘要，并在失败时给出可核对的实际值。 */
+    const actualLockSha256 = hashComputerNativeBytes(await readFile(resolve(sourceDirectory, 'Cargo.lock')));
+    if (actualLockSha256 !== computerNativeLockSha256) throw new Error(`CUA Cargo.lock 与固定源码摘要不一致：预期 ${computerNativeLockSha256}，实际 ${actualLockSha256}。`);
     await rm(inputs.workspace, { recursive: true, force: true });
     await cp(sourceDirectory, inputs.workspace, { recursive: true, preserveTimestamps: true });
-    await executeFile('git', ['apply', '--check', inputs.patch], { cwd: inputs.workspace, env: { ...process.env, GIT_CEILING_DIRECTORIES: inputs.cacheRoot } });
-    await executeFile('git', ['apply', inputs.patch], { cwd: inputs.workspace, env: { ...process.env, GIT_CEILING_DIRECTORIES: inputs.cacheRoot } });
+    for (const patch of inputs.patches) {
+      await executeFile('git', ['apply', '--check', patch], { cwd: inputs.workspace, env: { ...process.env, GIT_CEILING_DIRECTORIES: inputs.cacheRoot } });
+      await executeFile('git', ['apply', patch], { cwd: inputs.workspace, env: { ...process.env, GIT_CEILING_DIRECTORIES: inputs.cacheRoot } });
+    }
     console.log('CUA 原生成品缓存未命中：合并构建 worker 与 SDK，由 Cargo 复核中间缓存。');
     await new Promise((resolveBuild, rejectBuild) => {
       /** 同一调用解析两个生产包，日志保留 Cargo 的实际编译时间。 */
@@ -205,9 +252,20 @@ export async function prepareComputerNativeArtifacts(inputs) {
       child.once('exit', (code, signal) => (code === 0 ? resolveBuild() : rejectBuild(new Error(`CUA 原生源码构建失败：${signal ? `signal=${signal}` : `code=${code}`}`))));
     });
     await mkdir(inputs.artifactDirectory, { recursive: true });
-    await copyFile(resolve(inputs.targetDirectory, 'release/cua-driver'), inputs.workerPath);
+    await copyFile(
+      resolve(inputs.targetDirectory, ...(process.platform === 'win32' ? [process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'] : []), 'release', process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver'),
+      inputs.workerPath,
+    );
     await chmod(inputs.workerPath, 0o755);
-    await copyFile(resolve(inputs.targetDirectory, 'release/libcua_driver_sdk.dylib'), inputs.sdkPath);
+    await copyFile(
+      resolve(
+        inputs.targetDirectory,
+        ...(process.platform === 'win32' ? [process.arch === 'arm64' ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-msvc'] : []),
+        'release',
+        process.platform === 'win32' ? 'cua_driver_sdk.dll' : 'libcua_driver_sdk.dylib',
+      ),
+      inputs.sdkPath,
+    );
     await writeFile(
       inputs.receiptPath,
       JSON.stringify({ inputSha256: inputs.nativeInputSha256, workerSha256: hashComputerNativeBytes(await readFile(inputs.workerPath)), sdkSha256: hashComputerNativeBytes(await readFile(inputs.sdkPath)) }),

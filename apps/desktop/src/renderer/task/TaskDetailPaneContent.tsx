@@ -6,8 +6,7 @@ import { retainInputFocus } from '../ui/retainInputFocus.js';
 import { type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { isTaskPriority, type TaskAttachmentField, type TaskAttachmentReference, type TaskManagementStatusDefinition, type UserFacingErrorCause } from '@zeus/shared';
 import { type ProjectRecord, type TaskEventRecord, type TaskManagementStatus, type TaskPriority, type TaskRecord, type TaskType, type UpdateTaskRelationshipsRequest, type UpdateTaskRequest, ZeusApiError } from '../apiClient.js';
-import type { NativeConversationChoice } from '../session/sessionTypes.js';
-import type { CodexTaskPushCapabilities } from '../session/sessionTypes.js';
+import type { CodexTaskPushCapabilities, NativeConversationChoice } from '../session/sessionTypes.js';
 import { compareConversationCreatedAsc } from '../session/conversationOrdering.js';
 import { Button } from '../ui/Button.js';
 import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
@@ -34,6 +33,11 @@ import {
   toPersistedTaskAttachment,
 } from './taskAttachments.js';
 import { formatTaskEventTitle, formatTaskSource, formatTaskType, formatTaskUpdatedAt, resolveTaskManagementStatus, type TaskSourceLabels, taskTypes } from './taskWorkspaceModel.js';
+
+import type { DashboardClient } from '../dashboardClient.js';
+import { readTaskZentaoLink, ZentaoPushModal } from './ZentaoSyncModal.js';
+import { ZentaoEffortModal } from './ZentaoEffortModal.js';
+import { useZentaoInstances } from './useZentaoInstances.js';
 
 export interface TaskDetailPaneCopy {
   requestTitle: string;
@@ -75,6 +79,10 @@ export interface TaskDetailPaneCopy {
 }
 
 export interface TaskDetailPaneContentProps {
+  /** 各种详情呈现方式共用同一禅道客户端。 */
+  zentaoClient?: DashboardClient;
+  /** 同步后合并完整任务到现有共享缓存。 */
+  onZentaoTaskUpdated?: (task: TaskRecord) => void;
   /** 可选择的项目来自当前工作区快照。 */
   projects: ProjectRecord[];
   /** 复制先打开可编辑草稿，提交后才创建独立任务。 */
@@ -787,6 +795,22 @@ function TaskProjectActions(props: Pick<TaskDetailPaneContentProps, 'task' | 'pr
 
 /** 展示任务详情及其内容、项目和执行操作。 */
 export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
+  /** 登录验证控制所有禅道操作，不因旧任务含关联就展示入口。 */
+  const zentaoInstances = useZentaoInstances(props.zentaoClient);
+  /** 从任务来源上下文读取的受控关联。 */
+  const zentaoLink = readTaskZentaoLink(props.task);
+  /** 仅对当前已登录实例显示任务操作。 */
+  const zentaoAvailable = zentaoInstances.length > 0 && (!zentaoLink || zentaoInstances.some((instance) => instance.id === zentaoLink.instanceId));
+  /** 手动同步弹窗的打开状态。 */
+  const [zentaoSyncOpen, setZentaoSyncOpen] = useState(false);
+  /** 工时弹窗的打开状态。 */
+  const [zentaoEffortOpen, setZentaoEffortOpen] = useState(false);
+  useEffect(() => {
+    if (!zentaoAvailable) {
+      setZentaoSyncOpen(false);
+      setZentaoEffortOpen(false);
+    }
+  }, [zentaoAvailable]);
   const zh = props.language === 'zh-CN';
   const editCopy = taskEditCopies[props.language];
   const managementStatus = resolveTaskManagementStatus(props.task);
@@ -950,6 +974,8 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     };
     let additions: TaskAttachmentCandidate[] = [];
     let failedCount = 0;
+    /** 部分成功时仍显示失败项的读取或保存原因。 */
+    let failureMessage: string | undefined;
     let text = request.plainText;
     let nativeReadFailed = false;
 
@@ -977,6 +1003,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
         if (!pending.current()) return {};
         additions = result.resources;
         failedCount = result.failedCount;
+        failureMessage = result.failureMessage;
         text = clipboardTextAfterResources(text, additions);
       }
 
@@ -991,7 +1018,10 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       if (additions.length === 0) {
         if (failedCount > 0 || request.files.length > 0 || (nativeReadFailed && !text)) {
           attachmentPasteRetryRef.current = retryOperation;
-          setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage(failedCount || request.files.length) });
+          setAttachmentSaveState({
+            kind: 'error',
+            message: failureMessage || taskPasteErrorMessage(failedCount || request.files.length),
+          });
           return {};
         }
         attachmentPasteRetryRef.current = null;
@@ -1020,18 +1050,24 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       );
       if (failedCount > 0) {
         attachmentPasteRetryRef.current = retryOperation;
-        setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage(failedCount) });
+        setAttachmentSaveState({
+          kind: 'error',
+          message: [taskPasteErrorMessage(failedCount), failureMessage].filter(Boolean).join('\n'),
+        });
       } else {
         attachmentPasteRetryRef.current = null;
       }
       /** 有待重试的失败项时先不写回正文，重试成功后再插入，避免同一段文字进入两次。 */
       return { updatedAt: result.task.updatedAt, ...(failedCount === 0 && text ? { insertText: text } : {}) };
-    } catch {
+    } catch (error) {
       if (!pending.current()) return {};
       if (request.files.length === 0 && request.plainText.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD && additions.length === 0) {
         // 物化失败时保留原文，不让重试再重复插入同一段文字。
         attachmentPasteRetryRef.current = null;
-        setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage() });
+        setAttachmentSaveState({
+          kind: 'error',
+          message: taskEditErrorMessage(error, taskPasteErrorMessage(), zh ? 'zh-CN' : 'en'),
+        });
         return { insertText: request.plainText };
       }
       const resourceLikePaste = request.files.length > 0 || text.length >= PENDING_RESOURCE_LONG_TEXT_THRESHOLD;
@@ -1041,7 +1077,10 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
         return { insertText: request.plainText };
       }
       attachmentPasteRetryRef.current = retryOperation;
-      setAttachmentSaveState({ kind: 'error', message: taskPasteErrorMessage() });
+      setAttachmentSaveState({
+        kind: 'error',
+        message: taskEditErrorMessage(error, taskPasteErrorMessage(), zh ? 'zh-CN' : 'en'),
+      });
       return {};
     } finally {
       pending.finish();
@@ -1187,6 +1226,12 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
 
   return (
     <section className="product-drawer-pane task-detail-pane-content task-detail-pane-shell" aria-label={props.task.title}>
+      {zentaoAvailable && zentaoSyncOpen ? (
+        <ZentaoPushModal open instances={zentaoInstances} language={props.language} client={props.zentaoClient} task={props.task} onUpdated={(task) => props.onZentaoTaskUpdated?.(task)} onClose={() => setZentaoSyncOpen(false)} />
+      ) : null}
+      {zentaoAvailable && zentaoEffortOpen && props.zentaoClient && zentaoLink?.kind === 'task' ? (
+        <ZentaoEffortModal language={props.language} client={props.zentaoClient} task={props.task} onClose={() => setZentaoEffortOpen(false)} />
+      ) : null}
       <header className="task-detail-pane-header task-detail-summary-row">
         <span className="task-detail-pane-title">
           <InlineTaskTextField
@@ -1270,6 +1315,32 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
               >
                 <GitBranchIcon size={16} aria-hidden="true" />
                 {zh ? '代码交付…' : 'Code delivery…'}
+              </Button>
+            ) : null}
+            {zentaoAvailable ? (
+              <Button
+                variant="secondary"
+                size="regular"
+                onClick={() => {
+                  moreActionsRef.current?.hidePopover();
+                  setZentaoSyncOpen(true);
+                }}
+                disabled={props.busy}
+              >
+                {zh ? '同步到禅道…' : 'Sync to ZenTao…'}
+              </Button>
+            ) : null}
+            {zentaoAvailable && zentaoLink?.kind === 'task' ? (
+              <Button
+                variant="secondary"
+                size="regular"
+                onClick={() => {
+                  moreActionsRef.current?.hidePopover();
+                  setZentaoEffortOpen(true);
+                }}
+                disabled={props.busy}
+              >
+                {zh ? '禅道工时…' : 'ZenTao hours…'}
               </Button>
             ) : null}
             <Button

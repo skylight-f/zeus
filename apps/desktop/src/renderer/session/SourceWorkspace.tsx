@@ -8,26 +8,32 @@ import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
 import { OpenWithMenu } from './ConversationResources.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { Button } from '../ui/Button.js';
 import type { ConversationOpenTarget, ConversationResourceOpenTarget } from '@zeus/shared';
 import { listConversationResourceOpenTargetsInMain } from '../appShellBridge.js';
-import { FilePreview, FileReviewContent, PreviewImage } from '../code/FilePreview.js';
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FilePreview, FileReviewContent, FileSourceEditButton, PreviewImage } from '../code/FilePreview.js';
+import { Suspense, lazy, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowsInIcon as ArrowsIn } from '@phosphor-icons/react/dist/csr/ArrowsIn';
 import { ArrowsOutIcon as ArrowsOut } from '@phosphor-icons/react/dist/csr/ArrowsOut';
 import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
+import { fileStatusLabel } from '../code/fileStatus.js';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import type { ConversationResourcePreview } from './sessionTypes.js';
-import type { SessionUiLanguage } from './ThreadItemView.js';
+import { copyText, type SessionUiLanguage } from './ThreadItemView.js';
 import { ConversationMarkdown } from './ConversationMarkdown.js';
-import type { FilePreviewRequest, ConversationCodeComment, ConversationCodeCommentPosition } from '@zeus/shared';
-import { CodeCommentPanel } from './CodeCommentPanel.js';
-/** 与项目源码编辑器一样按需加载，避免会话首屏加载编辑器运行时。 */
-const SourceCodePreview = lazy(() => import('../code/SourceCodePreview.js').then((module) => ({ default: module.SourceCodePreview })));
+import type { FilePreviewRequest, ConversationCodeComment } from '@zeus/shared';
+/** 与项目源码编辑器一样按需加载，避免会话首屏加载编辑器和评论运行时。 */
+const CommentableSourceCodePreview = lazy(() => import('./CommentableSourceCodePreview.js').then((module) => ({ default: module.CommentableSourceCodePreview })));
 
 /** Markdown 可在排版预览与源码之间切换。 */
 export type SourceWorkspaceViewMode = 'preview' | 'source';
+
+/** 标签按已授权文件去重；资源记录仍独立用于后端读取与打开授权。 */
+function sourceWorkspaceTabId(preview: ConversationResourcePreview): string {
+  return JSON.stringify([preview.resource.projectId, preview.resource.conversationId, preview.fileIdentity ? 'file' : 'resource', preview.fileIdentity ?? preview.resource.id]);
+}
 
 /** Markdown 默认展示排版，其余文件直接展示源码。 */
 export function defaultSourceWorkspaceViewMode(preview: ConversationResourcePreview): SourceWorkspaceViewMode {
@@ -35,34 +41,60 @@ export function defaultSourceWorkspaceViewMode(preview: ConversationResourcePrev
   return supportsMarkdownPreview(preview) ? 'preview' : 'source';
 }
 
-/** 同一预览面板保留已打开文件，关闭当前标签后回到相邻文件。 */
-export function SourceWorkspace(props: Parameters<typeof SourceWorkspaceView>[0]) {
+/** 源码标签状态由会话持有，组件卸载后仍可恢复。 */
+export interface SourceWorkspaceState {
+  /** 已处理的打开请求，恢复面板时不重新选择旧请求。 */
+  requestedPreview: ConversationResourcePreview;
   /** 每个标签保留自己的预览模式和已授权资源。 */
-  const [tabs, setTabs] = useState([{ preview: props.preview, mode: props.viewMode }]);
-  /** 当前标签独立于最近收到的打开请求。 */
-  const [activeId, setActiveId] = useState(props.preview.resource.id);
+  tabs: { preview: ConversationResourcePreview; mode: SourceWorkspaceViewMode }[];
+  /** 当前文件标签标识独立于消息中的资源记录。 */
+  activeId: string;
+}
+
+/** 同一会话保留已打开文件，关闭当前标签后回到相邻文件。 */
+export function SourceWorkspace(
+  props: Parameters<typeof SourceWorkspaceView>[0] & {
+    /** 会话保存的源码标签状态。 */
+    state: SourceWorkspaceState | null;
+    /** 所有标签操作写回所属会话。 */
+    onStateChange: Dispatch<SetStateAction<SourceWorkspaceState | null>>;
+  },
+) {
+  /** 首次打开可直接展示，后续挂载读取会话保存的选择。 */
+  const { tabs, activeId } = props.state ?? { tabs: [{ preview: props.preview, mode: props.viewMode }], activeId: sourceWorkspaceTabId(props.preview) };
   useEffect(() => {
-    setTabs((current) => [...current.filter((tab) => tab.preview.resource.id !== props.preview.resource.id), { preview: props.preview, mode: props.viewMode }]);
-    setActiveId(props.preview.resource.id);
-  }, [props.preview]);
+    props.onStateChange((current) => {
+      if (current?.requestedPreview === props.preview) return current;
+      /** 重复打开只更新正文、授权与定位，保留原标签顺序。 */
+      const id = sourceWorkspaceTabId(props.preview);
+      /** 没有指定行号时保留用户选择的阅读模式。 */
+      const existing = current?.tabs.find((tab) => sourceWorkspaceTabId(tab.preview) === id);
+      /** 行号链接必须显示源码，普通重开沿用原模式。 */
+      const tab = { preview: props.preview, mode: props.preview.kind === 'source' && props.preview.location?.line ? ('source' as const) : (existing?.mode ?? props.viewMode) };
+      return {
+        requestedPreview: props.preview,
+        tabs: existing ? current!.tabs.map((entry) => (sourceWorkspaceTabId(entry.preview) === id ? tab : entry)) : [...(current?.tabs ?? []), tab],
+        activeId: id,
+      };
+    });
+  }, [props.onStateChange, props.preview, props.viewMode]);
   /** 外部预览到达但状态尚未同步时仍显示真实文件。 */
-  const active = tabs.find((tab) => tab.preview.resource.id === activeId) ?? tabs[0]!;
+  const active = tabs.find((tab) => sourceWorkspaceTabId(tab.preview) === activeId) ?? tabs[0]!;
   return (
     <SourceWorkspaceView
       {...props}
       preview={active.preview}
       viewMode={active.mode}
       tabs={tabs.map((tab) => tab.preview)}
-      onSelectTab={(preview) => setActiveId(preview.resource.id)}
-      onViewModeChange={(mode) => setTabs((current) => current.map((tab) => (tab.preview.resource.id === activeId ? { ...tab, mode } : tab)))}
+      onSelectTab={(preview) => props.onStateChange((current) => (current ? { ...current, activeId: sourceWorkspaceTabId(preview) } : current))}
+      onViewModeChange={(mode) => props.onStateChange((current) => (current ? { ...current, tabs: current.tabs.map((tab) => (sourceWorkspaceTabId(tab.preview) === current.activeId ? { ...tab, mode } : tab)) } : current))}
       onCloseTab={(preview) => {
-        const remaining = tabs.filter((tab) => tab.preview.resource.id !== preview.resource.id);
+        const remaining = tabs.filter((tab) => sourceWorkspaceTabId(tab.preview) !== sourceWorkspaceTabId(preview));
         if (!remaining.length) {
           props.onClose();
           return;
         }
-        setTabs(remaining);
-        if (preview.resource.id === activeId) setActiveId(remaining.at(-1)!.preview.resource.id);
+        props.onStateChange((current) => (current ? { ...current, tabs: remaining, activeId: sourceWorkspaceTabId(preview) === activeId ? sourceWorkspaceTabId(remaining.at(-1)!.preview) : activeId } : current));
       }}
     />
   );
@@ -73,7 +105,7 @@ function SourceWorkspaceView(props: {
   /** 文件标题与浏览器标签共用会话顶栏位置。 */
   toolbarHost?: HTMLElement | null;
   preview: ConversationResourcePreview;
-  /** 外部打开与复制沿用宿主的资源授权。 */
+  /** 外部打开沿用宿主的资源授权。 */
   onOpen?: (target: ConversationOpenTarget, resource?: ConversationResource) => void | Promise<void>;
   /** 多文件标签由外层持有，正文组件只负责当前文件。 */
   tabs?: ConversationResourcePreview[];
@@ -118,6 +150,8 @@ function SourceWorkspaceView(props: {
       active = false;
     };
   }, [props.preview.resource.projectId, props.preview.resource.conversationId, props.preview.resource.id]);
+  /** 文件标签与正文共用稳定身份，消息资源变化不重新挂载同一文件。 */
+  const tabId = sourceWorkspaceTabId(props.preview);
   /** 当前打开应用的真实图标与名称。 */
   const openApplication = openTargets.find((target) => target.id === openTarget);
   /** 展示宿主打开失败，不吞掉权限或应用错误。 */
@@ -133,13 +167,25 @@ function SourceWorkspaceView(props: {
   }, [copiedResourceId]);
   /** 工具栏只展示当前文件的复制结果。 */
   const copied = copiedResourceId === props.preview.resource.id;
-  /** 统一处理复制与外部应用打开。 */
+  /** 图标提示与无障碍反馈共用全文复制文案。 */
+  const copyLabel = copied ? (zh ? '已复制全文' : 'Full text copied') : zh ? '复制全文' : 'Copy full text';
+  /** 复制当前文件已完整加载的正文，不复制路径或当前选区。 */
+  async function copyFullText(): Promise<void> {
+    if (props.preview.kind !== 'source' || props.preview.truncated) return;
+    setOpenError(null);
+    setCopiedResourceId(null);
+    try {
+      if (!(await copyText(props.preview.content))) throw new Error(zh ? '复制全文失败，请重试。' : 'Could not copy the full text. Please try again.');
+      setCopiedResourceId(props.preview.resource.id);
+    } catch (error) {
+      setOpenError(error);
+    }
+  }
+  /** 外部应用和打开方式菜单共用原有授权入口。 */
   async function openResource(target: ConversationOpenTarget): Promise<void> {
     setOpenError(null);
     try {
-      if (target === 'copy_path') setCopiedResourceId(null);
       await props.onOpen?.(target, props.preview.resource);
-      if (target === 'copy_path' && props.onOpen) setCopiedResourceId(props.preview.resource.id);
     } catch (error) {
       setOpenError(error);
     }
@@ -177,67 +223,10 @@ function SourceWorkspaceView(props: {
   const markdownPreview = supportsMarkdownPreview(props.preview);
   /** 当前只挂载被选中的一种展示模式。 */
   const renderedMarkdown = Boolean(sourcePreview && markdownPreview && props.viewMode === 'preview');
-  /** 尚未保存的评论行范围。 */
-  const [draftPosition, setDraftPosition] = useState<ConversationCodeCommentPosition | null>(null);
-  /** 当前正在编辑的已保存评论。 */
-  const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
-  /** Shift 点击使用上次选中的行作为范围起点。 */
-  const rangeStartLine = useRef<number | null>(null);
-
   useEffect(() => {
     titleRef.current?.focus();
     titleRef.current?.parentElement?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  }, [props.preview.resource.id]);
-
-  useEffect(() => {
-    setDraftPosition(null);
-    setEditingCommentId(null);
-    rangeStartLine.current = null;
-  }, [props.preview.resource.id, displayPath]);
-
-  /** 只处理当前文件的评论，输入正文变化时复用分组结果。 */
-  const comments = useMemo(() => (props.comments ?? []).filter((comment) => comment.position.path === displayPath && comment.position.side === 'right'), [props.comments, displayPath]);
-  /** 容器按行复用，其他评论更新时也保留当前行的输入状态。 */
-  const widgetElements = useRef(new Map<number, HTMLElement>());
-  /** 只为实际存在评论或草稿的行建立容器，滚动隐藏时保留 React 状态。 */
-  const widgets = useMemo(() => {
-    // 评论数量决定门户数量，与文件总行数无关。
-    const lines = new Set(comments.map((comment) => comment.position.line));
-    if (draftPosition) lines.add(draftPosition.line);
-    /** 仅保留当前评论行，移除的评论不长期占用容器。 */
-    const next = [...lines].sort((left, right) => left - right).map((line) => ({ line, element: widgetElements.current.get(line) ?? document.createElement('div') }));
-    widgetElements.current = new Map(next.map((widget) => [widget.line, widget.element]));
-    return next;
-  }, [comments, draftPosition]);
-
-  /** 由编辑器在评论区块完成布局后聚焦，避免提前聚焦离屏节点。 */
-  const activeCommentLine = draftPosition?.line ?? comments.find((comment) => comment.id === editingCommentId)?.position.line;
-
-  /** 复用稳定回调，评论范围不依赖会话正文的更新。 */
-  const beginComment = useCallback(
-    (line: number, extendRange: boolean) => {
-      /** 归一化范围，持久化仍使用结束行与可选起始行。 */
-      const startLine = extendRange && rangeStartLine.current ? Math.min(rangeStartLine.current, line) : line;
-      /** 范围终点不小于起点。 */
-      const endLine = extendRange && rangeStartLine.current ? Math.max(rangeStartLine.current, line) : line;
-      rangeStartLine.current = line;
-      setEditingCommentId(null);
-      setDraftPosition({ path: displayPath, line: endLine, side: 'right', ...(startLine !== endLine ? { startLine, startSide: 'right' as const } : {}) });
-    },
-    [displayPath],
-  );
-  /** 评论入口保持当前界面语言。 */
-  const commentLabel = useCallback((line: number) => (zh ? `评论第 ${line} 行` : `Comment on line ${line}`), [zh]);
-
-  /** 保存到原有会话评论草稿，不修改文件内容。 */
-  function saveComment(position: ConversationCodeCommentPosition, body: string, existingId?: string): void {
-    if (!props.onCommentsChange) return;
-    /** 沿用原有会话草稿回调写入评论。 */
-    const next = existingId ? (props.comments ?? []).map((comment) => (comment.id === existingId ? { ...comment, body } : comment)) : [...(props.comments ?? []), { id: crypto.randomUUID(), body, position }];
-    props.onCommentsChange(next);
-    setDraftPosition(null);
-    setEditingCommentId(null);
-  }
+  }, [tabId, props.preview]);
 
   /** 顶栏展示文件名与预览操作，正文从文件信息行直接开始。 */
   const header = (
@@ -250,26 +239,27 @@ function SourceWorkspaceView(props: {
           if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || !(event.target instanceof HTMLElement) || event.target.getAttribute('role') !== 'tab') return;
           event.preventDefault();
           const tabs = props.tabs ?? [props.preview];
-          const index = tabs.findIndex((tab) => tab.resource.id === props.preview.resource.id);
+          const index = tabs.findIndex((tab) => sourceWorkspaceTabId(tab) === tabId);
           const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
           props.onSelectTab?.(tabs[next]!);
           event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
         }}
       >
         {(props.tabs ?? [props.preview]).map((preview) => (
-          <div className="zeus-workspace-tab-shell" data-active={preview.resource.id === props.preview.resource.id || undefined} key={preview.resource.id}>
+          <div className="zeus-workspace-tab-shell" data-active={sourceWorkspaceTabId(preview) === tabId || undefined} key={sourceWorkspaceTabId(preview)}>
             <button
               type="button"
-              ref={preview.resource.id === props.preview.resource.id ? titleRef : undefined}
+              ref={sourceWorkspaceTabId(preview) === tabId ? titleRef : undefined}
               role="tab"
               className="zeus-workspace-tab"
-              tabIndex={preview.resource.id === props.preview.resource.id ? 0 : -1}
-              aria-selected={preview.resource.id === props.preview.resource.id}
-              data-icon-tooltip={preview.resource.displayName}
+              tabIndex={sourceWorkspaceTabId(preview) === tabId ? 0 : -1}
+              aria-selected={sourceWorkspaceTabId(preview) === tabId}
+              data-icon-tooltip={preview.review?.status ? `${preview.resource.displayName} · ${fileStatusLabel(preview.review.status, zh)}` : preview.resource.displayName}
+              aria-label={preview.review?.status ? `${preview.resource.displayName} · ${fileStatusLabel(preview.review.status, zh)}` : preview.resource.displayName}
               onClick={() => props.onSelectTab?.(preview)}
             >
               {supportsMarkdownPreview(preview) ? <File aria-hidden="true" /> : <FileTypeIcon name={preview.resource.kind === 'file' ? preview.resource.projectRelativePath : preview.resource.displayName} />}
-              <span>{basename(preview.resource.kind === 'file' ? preview.resource.projectRelativePath : preview.resource.displayName)}</span>
+              <span data-file-status={preview.review?.status}>{basename(preview.resource.kind === 'file' ? preview.resource.projectRelativePath : preview.resource.displayName)}</span>
             </button>
             <button
               type="button"
@@ -331,8 +321,14 @@ function SourceWorkspaceView(props: {
         </p>
       ) : null}
       <FileReviewContent
+        onSaved={() => props.onOpenFile?.(props.preview.resource)}
+        previewRequest={
+          props.preview.resource.kind === 'file'
+            ? { kind: 'resource', projectId: props.preview.resource.projectId, conversationId: props.preview.resource.conversationId, resourceId: props.preview.resource.id, comparison: 'head' }
+            : undefined
+        }
         sourceRequest={searchRequest}
-        key={`${props.preview.resource.id}:${sourcePreview?.location?.line ?? ''}:${sourcePreview?.location?.endLine ?? ''}`}
+        key={`${tabId}:${sourcePreview?.location?.line ?? ''}:${sourcePreview?.location?.endLine ?? ''}`}
         review={sourcePreview ? { ...sourcePreview.review, location: sourcePreview.location } : undefined}
         zh={zh}
         toolbar={(reviewActions) => (
@@ -348,6 +344,9 @@ function SourceWorkspaceView(props: {
               </nav>
               <div className="session-source-actions">
                 {reviewActions}
+                {sourcePreview && props.preview.resource.kind === 'file' ? (
+                  <FileSourceEditButton zh={zh} request={{ kind: 'resource', projectId: props.preview.resource.projectId, conversationId: props.preview.resource.conversationId, resourceId: props.preview.resource.id }} />
+                ) : null}
                 <button
                   type="button"
                   aria-label={zh ? '在文件中搜索' : 'Find in file'}
@@ -361,21 +360,23 @@ function SourceWorkspaceView(props: {
                   <FileMagnifyingGlass aria-hidden="true" />
                 </button>
                 {markdownPreview ? (
-                  <button type="button" onClick={() => props.onViewModeChange(renderedMarkdown ? 'source' : 'preview')}>
+                  <Button size="compact" className="session-source-mode-toggle" onClick={() => props.onViewModeChange(renderedMarkdown ? 'source' : 'preview')}>
                     {renderedMarkdown ? (zh ? '查看源代码' : 'View source') : zh ? '查看预览' : 'View preview'}
-                  </button>
+                  </Button>
                 ) : null}
                 <button
                   type="button"
-                  aria-label={copied ? (zh ? '已复制路径' : 'Path copied') : zh ? '复制路径' : 'Copy path'}
-                  data-icon-tooltip={copied ? (zh ? '已复制路径' : 'Path copied') : zh ? '复制路径' : 'Copy path'}
-                  disabled={!props.onOpen}
-                  onClick={() => void openResource('copy_path')}
+                  aria-label={copyLabel}
+                  data-icon-tooltip={
+                    !sourcePreview ? (zh ? '当前文件没有可复制的文本' : 'This file has no text to copy') : sourcePreview.truncated ? (zh ? '预览不完整，无法复制全文' : 'The preview is incomplete; full text cannot be copied') : copyLabel
+                  }
+                  disabled={!sourcePreview || sourcePreview.truncated}
+                  onClick={() => void copyFullText()}
                 >
                   {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
                 </button>
                 <span role="status" className="session-source-copy-status">
-                  {copied ? (zh ? '已复制路径' : 'Path copied') : ''}
+                  {copied ? copyLabel : ''}
                 </span>
                 <div className="session-source-open-group">
                   <button type="button" disabled={!props.onOpen} data-icon-tooltip={openApplication?.label} onClick={() => void openResource(openTarget ?? 'system_default')}>
@@ -423,11 +424,12 @@ function SourceWorkspaceView(props: {
           {props.preview.kind === 'image' ? (
             <PreviewImage key={props.preview.dataUrl} url={props.preview.dataUrl} name={props.preview.resource.displayName} zh={zh} />
           ) : renderedMarkdown ? (
-            <ConversationMarkdown text={props.preview.content} streamId={`source-preview:${props.preview.resource.id}`} phase="final" language={props.language} />
+            <ConversationMarkdown text={props.preview.content} streamId={`source-preview:${tabId}`} phase="final" language={props.language} documentMode />
           ) : (
-            <Suspense fallback={<div role="status">{zh ? '正在打开源码…' : 'Opening source…'}</div>}>
-              <SourceCodePreview
-                key={props.preview.resource.id}
+            <Suspense fallback={null}>
+              <CommentableSourceCodePreview
+                key={tabId}
+                identity={tabId}
                 path={displayPath}
                 content={props.preview.content}
                 language={props.preview.language}
@@ -444,51 +446,9 @@ function SourceWorkspaceView(props: {
                 locale={props.language}
                 searchRequest={searchRequest}
                 location={props.preview.location}
-                widgets={widgets}
-                focusWidget={widgets.find((widget) => widget.line === activeCommentLine)?.element}
-                onComment={props.onCommentsChange ? beginComment : undefined}
-                commentLabel={commentLabel}
+                comments={props.comments}
+                onCommentsChange={props.onCommentsChange}
               />
-              {widgets.map((widget) =>
-                createPortal(
-                  <>
-                    {comments
-                      .filter((comment) => comment.position.line === widget.line)
-                      .map((comment) =>
-                        editingCommentId === comment.id ? (
-                          <CodeCommentPanel
-                            key={comment.id}
-                            language={props.language}
-                            position={comment.position}
-                            comment={comment}
-                            onCancel={() => setEditingCommentId(null)}
-                            onSave={(body) => saveComment(comment.position, body, comment.id)}
-                            onDelete={() => {
-                              props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id));
-                              setEditingCommentId(null);
-                            }}
-                          />
-                        ) : (
-                          <span key={comment.id} className="session-saved-code-comment">
-                            <strong>{zh ? '本地评论' : 'Local comment'}</strong>
-                            <span>{comment.body}</span>
-                            <span className="session-saved-code-comment-actions">
-                              <button type="button" onClick={() => setEditingCommentId(comment.id)}>
-                                {zh ? '编辑' : 'Edit'}
-                              </button>
-                              <button type="button" onClick={() => props.onCommentsChange?.((props.comments ?? []).filter((candidate) => candidate.id !== comment.id))}>
-                                {zh ? '删除' : 'Delete'}
-                              </button>
-                            </span>
-                          </span>
-                        ),
-                      )}
-                    {draftPosition?.line === widget.line ? <CodeCommentPanel language={props.language} position={draftPosition} onCancel={() => setDraftPosition(null)} onSave={(body) => saveComment(draftPosition, body)} /> : null}
-                  </>,
-                  widget.element,
-                  String(widget.line),
-                ),
-              )}
             </Suspense>
           )}
         </div>
@@ -521,10 +481,16 @@ export function FilePreviewWorkspace(props: {
   request: FilePreviewRequest;
   /** 本次点击的位置独立于资源首次登记的行号。 */
   location?: ConversationFileLocation;
+  /** 会话评论使用的项目相对路径或附件名称。 */
+  commentPath?: string;
   language: SessionUiLanguage;
   toolbarHost?: HTMLElement | null;
   fullWidth: boolean;
   canSplit: boolean;
+  /** 当前会话全部代码评论。 */
+  comments?: ConversationCodeComment[];
+  /** 缺省表示当前会话只读。 */
+  onCommentsChange?: (comments: ConversationCodeComment[]) => void;
   onFullWidthChange: (value: boolean) => void;
   onClose: () => void;
 }) {
@@ -561,7 +527,7 @@ export function FilePreviewWorkspace(props: {
   return (
     <section className="session-context-workspace session-source-workspace" aria-label={zh ? '文件审阅' : 'File review'}>
       {props.toolbarHost ? createPortal(header, props.toolbarHost) : header}
-      <FilePreview request={props.request} location={props.location} zh={zh} />
+      <FilePreview request={props.request} location={props.location} zh={zh} commentPath={props.commentPath} comments={props.comments} onCommentsChange={props.onCommentsChange} />
     </section>
   );
 }

@@ -1,6 +1,7 @@
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
 import { createAiRuntimeSessionManager, parseModelRef, type AiRuntimeSession } from '@zeus/ai-runtime';
 import {
+  withGitRepositoryOperation,
   buildGitPatchExport,
   buildTaskBranchName,
   buildTaskBranchPrefix,
@@ -14,6 +15,7 @@ import {
   fetchGitRemote,
   finalizeTaskBranchIntegration,
   getGitBranchHead,
+  getGitCommonDirectory,
   getGitRepositoryContext,
   getGitWorktreeClean,
   getProjectGitRepositorySnapshot,
@@ -275,8 +277,8 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
    * 弹窗读取能力时已经需要完整 Git 快照；真正创建工作区时还会再次刷新远端并冻结来源提交。
    * 提交阶段只复验模型和运行能力，避免在工作区准备前再做一次完整仓库扫描。
    */
-  async function resolveTaskPushExecutionCapabilities(project: ZeusProjectRecord, requestedModel?: string | null) {
-    return resolveConversationCapabilities(project, { requestedModel });
+  async function resolveTaskPushExecutionCapabilities(project: ZeusProjectRecord, selectedModelRef: string) {
+    return resolveConversationCapabilities(project, selectedModelRef);
   }
 
   async function resolveTaskPushEnvironment(
@@ -379,22 +381,32 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       prepared: Awaited<ReturnType<typeof prepareTaskWorktree>>;
       remoteName: string;
     }> = [];
+    /** 存量登记可能包含同仓库的多个工作树；任何目录或 Git 写入之前先核对真实身份。 */
+    const repositoryPathsByIdentity = new Map<string, string>();
+    const repositoryContexts = await mapTaskRepositoriesWithConcurrency(registeredRepositories, async (registeredRepository) => {
+      const projectRelativePath = relative(project.localPath, registeredRepository.localPath);
+      if (projectRelativePath === '..' || projectRelativePath.startsWith(`..${sep}`) || isAbsolute(projectRelativePath)) {
+        throw nativeApiError('ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', `Project repository path is outside the project directory: ${registeredRepository.relativePath}`);
+      }
+      const repository = await getGitRepositoryContext(registeredRepository.localPath);
+      if (!repository.isRepository || resolve(repository.topLevel) !== resolve(registeredRepository.localPath)) {
+        throw nativeApiError('ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', `Project repository is unavailable: ${registeredRepository.relativePath}`);
+      }
+      /** 公共目录由 Git 和文件系统解析，不把不同工作树路径当成不同仓库。 */
+      const commonDirectory = await getGitCommonDirectory(registeredRepository.localPath);
+      /** 提示两条重复登记路径，供刷新清单前核对。 */
+      const priorPath = repositoryPathsByIdentity.get(commonDirectory);
+      if (priorPath !== undefined) {
+        throw nativeApiError('ZEUS_PROJECT_REPOSITORY_DUPLICATED', `同一 Git 仓库被重复登记：${priorPath}、${registeredRepository.relativePath}。请刷新本地仓库后重新推送；已有分支和工作区保持不变。`);
+      }
+      repositoryPathsByIdentity.set(commonDirectory, registeredRepository.relativePath);
+      return repository;
+    });
     try {
       if (registeredRepositories.length > 0) {
         mkdirSync(environmentRoot, { recursive: true });
         mirrorTaskEnvironmentContainer(project, environmentRoot, registeredRepositories, projectSharedPaths.listByProject(project.id));
       }
-      const repositoryContexts = await mapTaskRepositoriesWithConcurrency(registeredRepositories, async (registeredRepository) => {
-        const projectRelativePath = relative(project.localPath, registeredRepository.localPath);
-        if (projectRelativePath === '..' || projectRelativePath.startsWith(`..${sep}`) || isAbsolute(projectRelativePath)) {
-          throw nativeApiError('ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', `Project repository path is outside the project directory: ${registeredRepository.relativePath}`);
-        }
-        const repository = await getGitRepositoryContext(registeredRepository.localPath);
-        if (!repository.isRepository || resolve(repository.topLevel) !== resolve(registeredRepository.localPath)) {
-          throw nativeApiError('ZEUS_PROJECT_REPOSITORY_UNAVAILABLE', `Project repository is unavailable: ${registeredRepository.relativePath}`);
-        }
-        return repository;
-      });
       const sequence = taskEnvironments.listByTask(task.id).length + 1;
       /** 同一提交批次冻结当前设置，所有仓库使用相同分支前缀。 */
       const taskBranchPrefix = readTaskBranchPrefix();
@@ -817,36 +829,54 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
 
   async function inspectTaskTerminalCleanup(taskId: string, fallbackRepositoryPath: string) {
     const workspacePlans = await Promise.all(
-      taskWorkspaces
-        .listByTask(taskId)
-        .filter((workspace) => workspace.kind !== 'conflict')
-        .map(async (workspace) => {
-          if (!workspace.worktreePath) return { workspace, repositoryPath: workspace.repositoryPath || fallbackRepositoryPath, headSha: workspace.headSha, force: false };
-          try {
-            const review = await readTaskWorkspaceReview(workspace);
-            return {
-              workspace,
-              repositoryPath: workspace.repositoryPath || fallbackRepositoryPath,
-              headSha: review.headSha,
-              force: !review.clean,
-            };
-          } catch {
-            // 无法读取的任务目录不能被当作干净目录；只有用户确认后才允许强制移除。
-            return { workspace, repositoryPath: workspace.repositoryPath || fallbackRepositoryPath, headSha: workspace.headSha, force: true };
-          }
-        }),
+      taskWorkspaces.listByTask(taskId).map(async (workspace) => {
+        if (!workspace.worktreePath) return { workspace, repositoryPath: workspace.repositoryPath || fallbackRepositoryPath, headSha: workspace.headSha, force: false };
+        try {
+          const review = await readTaskWorkspaceReview(workspace);
+          return {
+            workspace,
+            repositoryPath: workspace.repositoryPath || fallbackRepositoryPath,
+            headSha: review.headSha,
+            force: !review.clean,
+          };
+        } catch {
+          // 无法读取的任务目录不能被当作干净目录；只有用户确认后才允许强制移除。
+          return { workspace, repositoryPath: workspace.repositoryPath || fallbackRepositoryPath, headSha: workspace.headSha, force: true };
+        }
+      }),
     );
+    /** 合入主现场和每次冲突处理现场都属于任务资源，终态必须统一收口。 */
+    const integrationPlans = taskIntegrations.listByTask(taskId).map((integration) => {
+      const workspace = taskWorkspaces.getById(integration.workspaceId);
+      const project = projects.getById(integration.projectId);
+      return {
+        integration,
+        attempts: taskIntegrationAttempts.listByIntegration(integration.id),
+        repositoryPath: workspace?.repositoryPath || project?.localPath || fallbackRepositoryPath,
+      };
+    });
+    /** 冲突工作区与尝试记录可能指向同一目录，确认数量按物理路径去重。 */
+    const integrationWorktreePaths = new Set(
+      integrationPlans
+        .flatMap((plan) => [plan.integration.integrationPath, ...plan.attempts.map((attempt) => attempt.worktreePath)])
+        .filter((path): path is string => Boolean(path && existsSync(path)))
+        .map((path) => resolve(path)),
+    );
+    for (const plan of workspacePlans) {
+      if (plan.workspace.kind === 'conflict' && plan.workspace.worktreePath && existsSync(plan.workspace.worktreePath)) integrationWorktreePaths.add(resolve(plan.workspace.worktreePath));
+    }
     const taskConversations = conversations.listByTask(taskId);
     const activeConversationCount = taskConversations.filter((conversation) => taskConversationHasActiveWork(conversation)).length;
     const taskRuntimeSessions = runtimeSessions.list({ taskId, archived: false });
     const activeRuntimeSessionCount = taskRuntimeSessions.filter((session) => !runtimeSessionIsConfirmedTerminal(session)).length;
     return {
       workspaces: workspacePlans,
+      integrations: integrationPlans,
       conversations: taskConversations,
       runtimeSessions: taskRuntimeSessions,
       activeConversationCount,
       activeRuntimeSessionCount,
-      requiresConfirmation: workspacePlans.some((entry) => entry.force) || activeConversationCount > 0 || activeRuntimeSessionCount > 0,
+      requiresConfirmation: workspacePlans.some((entry) => entry.force) || integrationWorktreePaths.size > 0 || activeConversationCount > 0 || activeRuntimeSessionCount > 0,
     };
   }
 
@@ -856,8 +886,41 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     return hasPendingWrite || providerBusy;
   }
 
-  /** 自动完成进程停止和资源回收，让一次任务状态操作直接完成。 */
+  /** 停止任务执行并回收可确认的工作区；来源仓库不可用时保留目录和登记。 */
   async function closeTaskResourcesForTerminalStatus(taskId: string, cleanup: Awaited<ReturnType<typeof inspectTaskTerminalCleanup>>): Promise<void> {
+    /** 任务、冲突分支和历史合入现场可能指向同一物理目录。 */
+    const cleanupPaths = new Map<string, string>();
+    for (const plan of cleanup.workspaces) if (plan.workspace.worktreePath) cleanupPaths.set(resolve(plan.workspace.worktreePath), plan.repositoryPath);
+    for (const plan of cleanup.integrations) {
+      for (const path of [plan.integration.integrationPath, ...plan.attempts.map((attempt) => attempt.worktreePath)]) if (path) cleanupPaths.set(resolve(path), plan.repositoryPath);
+    }
+    /** 物理目录已不存在时只收口登记，不要求已删除的源仓库继续可用。 */
+    const missingPaths = new Set<string>();
+    /** 缺少来源仓库的目录可能是唯一代码副本，必须保留。 */
+    const orphanedPaths = new Set<string>();
+    /** 同一源仓库只读取一次 Git 状态，不为每条历史记录重复扫描。 */
+    const repositoryAvailability = new Map<string, boolean>();
+    for (const [path, repositoryPath] of cleanupPaths) {
+      /** 只把明确不存在视为已清理，权限和 I/O 错误不能伪装成目录丢失。 */
+      const present = await lstat(path).then(
+        () => true,
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        },
+      );
+      if (!repositoryAvailability.has(repositoryPath)) repositoryAvailability.set(repositoryPath, (await getGitRepositoryContext(repositoryPath)).isRepository);
+      if (!present) {
+        missingPaths.add(path);
+        continue;
+      }
+      if (!repositoryAvailability.get(repositoryPath)) orphanedPaths.add(path);
+    }
+    /** 同时保留相关父子目录，防止清理父工作区时连带删除已保留的代码。 */
+    // ponytail: 任务内路径逐项比较；资源规模增大时可改为目录树索引。
+    const retainedPaths = [...cleanupPaths.keys()].filter((path) => !missingPaths.has(path) && [...orphanedPaths].some((orphan) => path === orphan || isPathInsideRoot(path, orphan) || isPathInsideRoot(orphan, path)));
+    /** 路径和原因保留在现有资源记录与任务事件中，供后续独立清理。 */
+    const retainedReason = '来源仓库不可用，相关工作区目录已保留，需以后单独清理。';
     await Promise.all(
       cleanup.runtimeSessions.map(async (session) => {
         /** 检查准备清理之后的最新状态，已退出的进程无需再次停止。 */
@@ -900,16 +963,35 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     }
 
     let removedWorktrees = 0;
+    let removedIntegrationWorktrees = 0;
+    /** 同一冲突目录可同时被工作区、合入记录和尝试记录引用，只允许物理回收一次。 */
+    const removedPaths = new Set<string>();
     const environmentIds = new Set<string>();
     const workspacePlans = [...cleanup.workspaces].sort((left, right) => right.workspace.repositoryRelativePath.split('/').length - left.workspace.repositoryRelativePath.split('/').length);
     for (const plan of workspacePlans) {
       if (plan.workspace.worktreePath) {
-        const result = await removeTaskWorktreeForTerminalStatus({
-          repositoryPath: plan.repositoryPath,
-          worktreePath: plan.workspace.worktreePath,
-          force: plan.force || taskWorkspaceIgnoredPaths(plan.workspace).length > 0,
-        });
-        if (result.removed) removedWorktrees += 1;
+        const worktreePath = resolve(plan.workspace.worktreePath);
+        if (retainedPaths.includes(worktreePath)) {
+          taskWorkspaces.update(plan.workspace.id, { state: plan.workspace.state === 'ready' ? 'failed' : plan.workspace.state, lastError: retainedReason });
+          continue;
+        }
+        if (missingPaths.has(worktreePath) && !repositoryAvailability.get(plan.repositoryPath)) {
+          removedPaths.add(worktreePath);
+        } else if (plan.workspace.kind === 'conflict') {
+          if (!removedPaths.has(worktreePath)) {
+            const removed = await cleanupTaskIntegrationWorktree({ repositoryPath: plan.repositoryPath, integrationPath: worktreePath });
+            if (removed) removedIntegrationWorktrees += 1;
+            removedPaths.add(worktreePath);
+          }
+        } else {
+          const result = await removeTaskWorktreeForTerminalStatus({
+            repositoryPath: plan.repositoryPath,
+            worktreePath,
+            force: plan.force || taskWorkspaceIgnoredPaths(plan.workspace).length > 0,
+          });
+          if (result.removed) removedWorktrees += 1;
+          removedPaths.add(worktreePath);
+        }
       }
       const terminalState = plan.workspace.state === 'merged' || plan.workspace.state === 'discarded' ? plan.workspace.state : 'reclaimed';
       taskWorkspaces.update(plan.workspace.id, {
@@ -922,6 +1004,30 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     }
     for (const environmentId of environmentIds) reconcileTaskEnvironmentState(environmentId);
 
+    for (const plan of cleanup.integrations) {
+      const integrationPaths = [plan.integration.integrationPath, ...plan.attempts.map((attempt) => attempt.worktreePath)].filter((path): path is string => Boolean(path));
+      /** 合入已完成不代表历史冲突目录可以丢弃，保留路径需继续可追溯。 */
+      const hasRetainedPath = integrationPaths.some((path) => retainedPaths.includes(resolve(path)));
+      for (const integrationPath of integrationPaths) {
+        const normalizedPath = resolve(integrationPath);
+        if (removedPaths.has(normalizedPath) || (missingPaths.has(normalizedPath) && !repositoryAvailability.get(plan.repositoryPath)) || retainedPaths.includes(normalizedPath)) continue;
+        const removed = await cleanupTaskIntegrationWorktree({ repositoryPath: plan.repositoryPath, integrationPath: normalizedPath });
+        if (removed) removedIntegrationWorktrees += 1;
+        removedPaths.add(normalizedPath);
+      }
+      for (const attempt of plan.attempts) {
+        taskConflictAiOperations.delete(attempt.id);
+        if (attempt.state === 'preparing' || attempt.state === 'active')
+          taskIntegrationAttempts.update(attempt.id, { state: 'stale', lastError: retainedPaths.includes(resolve(attempt.worktreePath)) ? retainedReason : '任务已结束，冲突处理现场已回收。' });
+      }
+      taskIntegrations.update(plan.integration.id, {
+        integrationPath: plan.integration.integrationPath && retainedPaths.includes(resolve(plan.integration.integrationPath)) ? plan.integration.integrationPath : null,
+        state: plan.integration.state === 'merged' ? 'merged' : 'failed',
+        conflictFiles: hasRetainedPath ? plan.integration.conflictFiles : [],
+        lastError: hasRetainedPath ? retainedReason : plan.integration.state === 'merged' ? null : '任务已结束，合入现场已回收。',
+      });
+    }
+
     for (const conversation of cleanup.conversations) conversations.archive(conversation.id);
     for (const session of cleanup.runtimeSessions) {
       const latest = runtimeSessions.getById(session.id);
@@ -932,9 +1038,11 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     recordTaskEvent({
       taskId,
       eventType: 'task.terminal_resources.cleaned',
-      title: '任务终态资源已清理',
+      title: retainedPaths.length > 0 ? '任务会话已结束，部分工作区已保留' : '任务终态资源已清理',
       payload: {
         removedWorktrees,
+        removedIntegrationWorktrees,
+        retainedWorktrees: retainedPaths.map((path) => ({ path, reason: retainedReason })),
         archivedConversations: cleanup.conversations.length,
         archivedRuntimeSessions: cleanup.runtimeSessions.length,
         interrupted,
@@ -1064,9 +1172,31 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     return { destinationId: 'workspace-git-command-application', resourceId, externalOperationId, opaque };
   }
 
+  /** 单步入口和后台组合共用跨进程仓库锁。 */
   async function executeWorkspaceGitCommand(input: { commandType: WorkspaceGitCommandType; operationIdentity: string; prepared: PreparedWorkspaceGitCommand; value: Record<string, unknown> }): Promise<WorkspaceGitRouteExecution> {
+    /** 只从准备阶段核验后的身份取得目录。 */
+    const opaque = input.prepared.opaque as WorkspaceGitPreparedOpaque;
+    const integration = opaque.integrationId ? taskIntegrations.getById(opaque.integrationId) : undefined;
+    const workspace = opaque.workspaceId ? taskWorkspaces.getById(opaque.workspaceId) : integration ? taskWorkspaces.getById(integration.workspaceId) : undefined;
+    const paths = workspace
+      ? [workspace.repositoryPath || projects.getById(workspace.projectId)!.localPath]
+      : opaque.taskId && !opaque.repositoryId
+        ? taskWorkspaces.listByTask(opaque.taskId).map((item) => item.repositoryPath || projects.getById(item.projectId)!.localPath)
+        : [];
+    /** 固定顺序消除多仓批量操作之间的锁顺序差异。 */
+    const ordered = [...new Set(paths)].sort();
+    const executeLocked = (index: number): Promise<WorkspaceGitRouteExecution> => (index === ordered.length ? executeWorkspaceGitCommandUnlocked(input) : withGitRepositoryOperation(ordered[index]!, () => executeLocked(index + 1)));
+    return executeLocked(0).catch((error) => {
+      if ((error as { code?: string }).code === 'ZEUS_GIT_BUSY') workspaceGitReject(409, 'ZEUS_GIT_BUSY', (error as Error).message);
+      throw error;
+    });
+  }
+
+  async function executeWorkspaceGitCommandUnlocked(input: { commandType: WorkspaceGitCommandType; operationIdentity: string; prepared: PreparedWorkspaceGitCommand; value: Record<string, unknown> }): Promise<WorkspaceGitRouteExecution> {
     const opaque = input.prepared.opaque as WorkspaceGitPreparedOpaque;
     switch (input.commandType) {
+      case workspaceGitCommandTypes.deliveryRepositoryAction:
+        return workspaceGitReject(400, 'ZEUS_GIT_DELIVERY_SCOPE_REQUIRED', '组合交付必须通过已接纳的运行执行。');
       case workspaceGitCommandTypes.taskRepositoryAttach:
         return executeTaskRepositoryAttach(opaque, input.value);
       case workspaceGitCommandTypes.workbenchAction:
@@ -2155,9 +2285,17 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
   }
 
   async function finalizeTaskIntegrationAfterAi(operationId: string, conversationId: string): Promise<void> {
+    /** AI 的后台收尾也使用同一仓库写锁。 */
     const attempt = taskIntegrationAttempts.getById(operationId);
-    if (attempt) return finalizeTaskIntegrationAttemptAfterAi(attempt.id, conversationId);
-    return finalizeLegacyTaskIntegrationAfterAi(operationId, conversationId);
+    const integration = taskIntegrations.getById(attempt?.integrationId ?? operationId);
+    const workspace = integration ? taskWorkspaces.getById(integration.workspaceId) : undefined;
+    if (!integration || !workspace) return;
+    await withGitRepositoryOperation(workspace.repositoryPath || projects.getById(workspace.projectId)!.localPath, () =>
+      attempt ? finalizeTaskIntegrationAttemptAfterAi(attempt.id, conversationId) : finalizeLegacyTaskIntegrationAfterAi(operationId, conversationId),
+    ).catch((error) => {
+      // 占用时保持原现场；组合运行会在用户继续时再次核对，不能抢占原操作。
+      if ((error as { code?: string }).code !== 'ZEUS_GIT_BUSY') throw error;
+    });
   }
 
   async function finalizeTaskIntegrationAttemptAfterAi(attemptId: string, conversationId: string): Promise<void> {
@@ -2238,6 +2376,10 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         publishRealtimeEvent('task.git_delivery.changed', { taskId: task.id, integrationId: integration.id, conversationId });
         return;
       }
+      /** 隔离结果落地并回收后，同步命名冲突工作区的真实生命周期。 */
+      const conflictWorkspaceId = conversations.getRecordById(conversationId)?.workspaceId;
+      const conflictWorkspace = conflictWorkspaceId ? taskWorkspaces.getById(conflictWorkspaceId) : undefined;
+      if (conflictWorkspace?.kind === 'conflict' && conflictWorkspace.baseWorkspaceId === workspace.id) taskWorkspaces.update(conflictWorkspace.id, { worktreePath: null, headSha: finalized.resultHeadSha, state: 'merged', lastError: null });
       const taskWorktreeReclaimed = integration.targetBranch === workspace.sourceBranch ? await markTaskWorkspaceDelivered(workspace) : false;
       recordTaskEvent({
         taskId: task.id,

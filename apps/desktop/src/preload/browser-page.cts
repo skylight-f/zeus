@@ -1,5 +1,9 @@
+/// <reference types="vite/client" />
 import { ipcRenderer } from 'electron';
 import { installIconTooltips } from './iconTooltip.js';
+import { installMarkdownListInput } from './markdownListInput.js';
+import { selectionCommentIcons } from './selectionCommentIcons.js';
+import selectionCommentStyles from '../renderer/session/selectionComment.css?inline';
 
 function invokeBrowserPageCommand(commandType: string, body: unknown): Promise<unknown> {
   const commandId = globalThis.crypto.randomUUID();
@@ -103,9 +107,14 @@ function install(): void {
   shadow = rootHost.attachShadow({ mode: 'closed' });
   /** 评论浮层使用共享提示机制，监听只作用于自己的 ShadowRoot。 */
   const disposeIconTooltips = installIconTooltips(shadow);
+  /** 仅增强 Zeus 评论影子根，不修改所浏览网站自己的输入框。 */
+  const disposeListInput = installMarkdownListInput(shadow);
   window.addEventListener('pagehide', disposeIconTooltips, { once: true });
+  window.addEventListener('pagehide', disposeListInput, { once: true });
+  /** 将同一份评论样式放入封闭 ShadowRoot，不影响被审阅网页。 */
   const style = document.createElement('style');
   style.textContent = `
+    ${selectionCommentStyles}
     :host { all: initial; color-scheme: light dark; }
     * { box-sizing: border-box; }
     .outline { position: fixed; pointer-events: none; border: 2px solid #7638f5; border-radius: 4px; background: rgb(118 56 245 / 14%); display: none; }
@@ -142,7 +151,9 @@ function install(): void {
   editorPin = document.createElement('div');
   editorPin.className = 'editor-pin';
   editor = document.createElement('div');
-  editor.className = 'editor';
+  editor.className = 'editor session-response-annotation-editor';
+  // 批注控件目前使用中文，不继承网页或 ShadowRoot 重置后的字体语言规则。
+  editor.lang = 'zh-CN';
   editor.hidden = true;
   shadow.append(hoverOutline, regionOutline, markerLayer, editorPin, editor);
   (document.documentElement || document.body).append(rootHost);
@@ -283,23 +294,31 @@ function openEditor(
   state.editorTarget = target;
   editor.dataset.expanded = 'false';
   editor.innerHTML = `
-    <div class="editor-row">
-      <button type="button" data-action="cancel" aria-label="取消评论" data-icon-tooltip="取消评论">×</button>
-      <textarea rows="1" aria-label="评论内容" placeholder="添加评论…" maxlength="20000"></textarea>
-      <button type="button" data-action="voice" aria-label="语音输入" data-icon-tooltip="语音输入">
-        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6"></path>
-        </svg>
+    <div class="session-response-annotation-row">
+      <button type="button" data-action="options" aria-label="评论选项" aria-expanded="false" data-icon-tooltip="评论选项">
+        <svg aria-hidden="true" viewBox="${selectionCommentIcons.viewBox}" fill="currentColor"><path d="${selectionCommentIcons.options}"></path></svg>
       </button>
-      <button type="button" class="editor-save" data-action="save" aria-label="完成评论" data-icon-tooltip="完成评论并添加到输入框">
-        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="m6 12.5 4 4L18.5 8"></path>
-        </svg>
+      <textarea rows="1" aria-label="评论内容" placeholder="添加评论…" maxlength="20000"></textarea>
+      <button type="button" class="session-response-annotation-save" data-action="save" aria-label="完成评论" data-icon-tooltip="完成评论并添加到输入框">
+        <svg aria-hidden="true" viewBox="${selectionCommentIcons.viewBox}" fill="currentColor"><path d="${selectionCommentIcons.save}"></path></svg>
       </button>
     </div>
+    <div class="session-response-annotation-options" hidden>
+      <button type="button" data-action="voice" aria-label="语音输入">语音输入</button>
+      <button type="button" data-action="cancel">取消</button>
+    </div>
   `;
+  /** 网页专属操作放在共用的选项区，主输入行与会话、文件保持一致。 */
+  const optionsButton = editor.querySelector<HTMLButtonElement>('[data-action="options"]')!;
+  /** 展开状态由当前编辑器持有，关闭后随 DOM 一同清理。 */
+  const options = editor.querySelector<HTMLDivElement>('.session-response-annotation-options')!;
   const textarea = editor.querySelector<HTMLTextAreaElement>('textarea')!;
   textarea.value = existing?.body ?? '';
+  optionsButton.addEventListener('click', () => {
+    options.hidden = !options.hidden;
+    optionsButton.setAttribute('aria-expanded', String(!options.hidden));
+    syncEditorActions(textarea);
+  });
   editor.querySelector('[data-action="cancel"]')?.addEventListener('click', () => closeEditor());
   editor.querySelector('[data-action="save"]')?.addEventListener('click', () => void saveComment());
   const voiceButton = editor.querySelector<HTMLButtonElement>('[data-action="voice"]');
@@ -345,16 +364,15 @@ function positionEditor(anchor: PageAnchor): void {
   }
 }
 
+/** 输入框按内容增长，选项展开时保留统一圆角并重新定位。 */
 function syncEditorActions(textarea: HTMLTextAreaElement): void {
   if (!editor) return;
   textarea.style.height = 'auto';
   textarea.style.height = `${Math.min(112, Math.max(28, textarea.scrollHeight))}px`;
   const hasBody = Boolean(textarea.value.trim());
   const saveButton = editor.querySelector<HTMLButtonElement>('[data-action="save"]');
-  const voiceButton = editor.querySelector<HTMLButtonElement>('[data-action="voice"]');
   if (saveButton) saveButton.disabled = !hasBody;
-  editor.dataset.expanded = String(textarea.scrollHeight > 36);
-  if (voiceButton) voiceButton.hidden = hasBody;
+  editor.dataset.expanded = String(textarea.scrollHeight > 36 || editor.querySelector('[data-action="options"]')?.getAttribute('aria-expanded') === 'true');
   if (state.editorAnchor) positionEditor(state.editorAnchor);
 }
 
@@ -628,7 +646,7 @@ function renderMarkers(): void {
   markerLayer.replaceChildren();
   for (const comment of state.comments) {
     const marker = document.createElement('button');
-    marker.className = 'marker';
+    marker.className = 'marker session-response-annotation-marker';
     marker.type = 'button';
     marker.textContent = String(comment.number);
     marker.dataset.commentId = comment.id;

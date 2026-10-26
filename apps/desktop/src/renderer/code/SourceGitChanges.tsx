@@ -14,7 +14,8 @@ import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/Caret
 import { MagnifyingGlassIcon as Search } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
 import type { GitApiClient } from '../features/git/gitApiClient.js';
 import type { GitDiffSummary, GitFileStatusSummary, ProjectGitAction, ProjectGitRepositoryWorkbenchItem, ProjectGitWorkbenchSnapshot } from '../features/git/gitContracts.js';
-import { BranchSwitcher, CheckoutRevisionDialog, NewBranchDialog, PushDialog, StashDialog, UpdateProjectDialog } from '../git/GitRepositoryControls.js';
+import { PushDialog } from '../git/GitPushDialog.js';
+import { BranchSwitcher, CheckoutRevisionDialog, NewBranchDialog, StashDialog, UpdateProjectDialog } from '../git/GitRepositoryControls.js';
 import type { BusyState, ExecutionOutcome, OperationTone, PushSelection } from '../git/gitWorkbenchTypes.js';
 import { notifyProjectGitChanged, projectGitWorkbenchCacheEntry, readCachedProjectGitWorkbench, requestProjectGitWorkbench, subscribeProjectGitRefresh, visibleRepositoryFiles } from '../git/projectGitWorkbenchState.js';
 import { useGitCommitDrafts } from '../git/useGitCommitDrafts.js';
@@ -24,7 +25,7 @@ import { Button } from '../ui/Button.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import './sourceGitChanges.css';
 
-export type SourceGitClient = Pick<GitApiClient, 'loadProjectGitWorkbench' | 'executeProjectGitAction' | 'generateGitCommitMessage'> & GitCommitModelsClient;
+export type SourceGitClient = Pick<GitApiClient, 'loadProjectGitPushPreview' | 'loadProjectGitCommit' | 'loadProjectGitWorkbench' | 'executeProjectGitAction' | 'generateGitCommitMessage'> & GitCommitModelsClient;
 export interface SourceGitChangePreview {
   path: string;
   repositoryPath: string;
@@ -538,6 +539,9 @@ export function SourceGitChanges(props: {
         {dialog === 'stash' && repository ? <StashDialog repository={repository} zh={zh} busy={busy} onClose={() => setDialog(null)} onExecute={execute} /> : null}
         {dialog === 'push' ? (
           <PushDialog
+            projectId={props.projectId}
+            client={props.client!}
+            revision={snapshot?.refreshedAt ?? ''}
             open
             zh={zh}
             repositories={repositories}

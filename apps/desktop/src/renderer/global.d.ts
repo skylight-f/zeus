@@ -1,40 +1,43 @@
 import type { SourceLanguageRequest, SourceLanguageResult } from '@zeus/shared';
-import type { FilePreviewRequest, FilePreviewItem } from '@zeus/shared';
-import type { GitFileBlame } from '@zeus/git-core';
-import type { AutomaticUpdateIndicatorState } from './appShellBridge.js';
-import type { DashboardClientOptions, LocalBusinessDataSnapshot, LocalSettingsExportSnapshot } from './apiClient.js';
 import type {
-  NetworkProxySettings,
-  NetworkProxyCheckTarget,
-  NetworkProxyConnectionResult,
   ConversationFileLocation,
   ConversationOpenTarget,
   ConversationResourceOpenTarget,
   CreateProjectSourceEntryInput,
+  FilePreviewItem,
+  FilePreviewRequest,
   MoveProjectSourceEntryInput,
-  UsageModelCostBreakdown,
-  ProjectSourceDirectorySnapshot,
+  NetworkProxyCheckTarget,
+  NetworkProxyConnectionResult,
+  NetworkProxySettings,
+  ProjectSourceContentSearchOptions,
   ProjectSourceContentSearchResult,
   ProjectSourceTextSearchInput,
   ProjectSourceTextSearchResult,
+  ProjectSourceDirectorySnapshot,
   ProjectSourceDocument,
   ProjectSourceEntry,
   ProjectSourceEvent,
   ProjectSourceSearchResult,
   SaveProjectSourceFileInput,
-  TrashProjectSourceEntryInput,
   ThirdPartyTaskExtract,
+  TrashProjectSourceEntryInput,
+  UsageModelCostBreakdown,
+  UsageModelOutputRateBreakdown,
   ZeusBrowserApprovalDecision,
   ZeusBrowserCommand,
   ZeusBrowserConversationSnapshot,
   ZeusBrowserEvent,
   ZeusBrowserPreparedSubmission,
   ZeusBrowserSettings,
-  ZeusComputerSettings,
-  ZeusComputerPreview,
   ZeusComputerControlIdentity,
+  ZeusComputerPreview,
+  ZeusComputerSettings,
   ZeusRetiredNativeRuntimeState,
 } from '@zeus/shared';
+import type { GitFileBlame } from '@zeus/git-core';
+import type { AutomaticUpdateIndicatorState } from './appShellBridge.js';
+import type { DashboardClientOptions, LocalBusinessDataSnapshot, LocalSettingsExportSnapshot } from './apiClient.js';
 
 type ConversationInputResourceBridge = {
   name: string;
@@ -57,7 +60,18 @@ type TaskInputResourceBridge = {
   restorableText?: string;
 };
 
-/** 菜单栏主体与独立透明费用窗口之间共享的纯展示数据。 */
+/** 菜单栏主体与独立透明指标窗口之间共享的基础展示数据。 */
+type MenuBarUsageDetailBridgeBase = {
+  id: string;
+  label: string;
+  language: 'zh-CN' | 'en-US';
+  appearance: 'light' | 'dark' | 'system';
+  anchor: { x: number; y: number };
+  pinned: boolean;
+};
+
+/** 费用或模型速率明细使用可判别联合，Renderer 不猜测条目结构。 */
+type MenuBarUsageCostDetailBridgePayload = MenuBarUsageDetailBridgeBase & ({ kind: 'cost'; entries: UsageModelCostBreakdown[]; equivalentCost: boolean } | { kind: 'output-rate'; entries: UsageModelOutputRateBreakdown[] });
 
 declare global {
   interface Window {
@@ -118,16 +132,20 @@ declare global {
         checkedAt: string;
         restartScheduled: true;
       }>;
-      /** 任务与普通会话的代码交付按钮共用同一原生窗口入口。 */
+      /** 任务、普通会话与项目提交按钮共用同一原生窗口入口。 */
       openTaskGitDeliveryWindow: (
-        input: { taskId: string; workspaceId?: string | null; projectId?: never; conversationId?: never } | { taskId?: never; workspaceId?: never; projectId: string; conversationId: string },
+        input:
+          | { taskId: string; workspaceId?: string | null; projectId?: never; conversationId?: never; repositoryId?: never; pathPrefix?: never }
+          | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId?: never; pathPrefix?: never }
+          | { taskId?: never; workspaceId?: never; projectId: string; conversationId: string; repositoryId?: never; pathPrefix?: never }
+          | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId: string; pathPrefix?: string },
       ) => Promise<{ opened: true; reused: boolean; taskId?: string; projectId?: string; conversationId?: string }>;
-      /** 两种范围都关闭当前真实交付窗口。 */
+      /** 所有范围都关闭当前真实交付窗口。 */
       closeTaskGitDeliveryWindow: () => Promise<{ closed: true; taskId?: string; projectId?: string; conversationId?: string }>;
       getTaskGitDeliveryCurrentContext: () => Promise<{ taskId: string | null; workspaceId: string | null }>;
       notifyTaskGitDeliveryCurrentContext: (context: { taskId: string | null; workspaceId: string | null }) => void;
       notifyTaskGitDeliveryChanged: (taskId: string) => void;
-      openTaskGitDeliveryConversation: (input: { taskId: string; conversationId: string }) => Promise<{ opened: true }>;
+      openTaskGitDeliveryConversation: (input: { taskId: string; conversationId: string } | { projectId: string; conversationId: string }) => Promise<{ opened: true }>;
       /** 任务工作区文件在独立窗口中只读查看。 */
       openTaskGitDiffWindow: (input: Extract<import('@zeus/shared').FilePreviewRequest, { kind: 'task-git' }>) => Promise<{ opened: true }>;
       openProjectGitDiffWindow: (input: {
@@ -138,12 +156,18 @@ declare global {
         commitHash?: string;
         comparisonRef?: string;
         comparisonMode?: 'current' | 'working-tree';
+        /** 已加载的推送补丁；提供时新窗口只展示快照，不重读仓库。 */
+        diffText?: string;
       }) => Promise<{ opened: true }>;
+      /** 按调用窗口身份读取展示快照，不接受其他窗口或本机路径。 */
+      loadProjectGitDiffSnapshot: () => Promise<{ filePath: string; diff: import('./apiClient.js').GitDiffSummary }>;
       loadProjectGitWorkbench: (projectId: string) => Promise<import('./apiClient.js').ProjectGitWorkbenchSnapshot>;
       /** 只读获取当前项目的耐久 Git 操作历史页。 */
       loadProjectGitOperations: (input: { projectId: string; cursor?: string }) => Promise<import('./apiClient.js').ProjectGitOperationPage>;
       loadProjectGitHistory: (input: { projectId: string; repositoryId: string; offset: number; ref?: string }) => Promise<{ commits: import('./apiClient.js').ProjectGitRepositorySnapshot['recentCommits']; hasMore: boolean }>;
       loadProjectGitCommit: (input: { projectId: string; repositoryId: string; commitHash: string }) => Promise<import('./apiClient.js').ProjectGitCommitDetail>;
+      /** 按指定远端目标读取待推送范围。 */
+      loadProjectGitPushPreview: (input: { projectId: string; repositoryId: string; selection: import('./apiClient.js').ProjectGitPushPreviewInput }) => Promise<import('./apiClient.js').ProjectGitPushPreview>;
       loadProjectGitComparisonDiff: (input: { projectId: string; repositoryId: string; ref: string; mode: 'current' | 'working-tree' }) => Promise<import('./apiClient.js').GitDiffSummary>;
       cancelProjectGitAction: (repositoryId: string) => Promise<{ cancelled: boolean }>;
       executeProjectGitAction: (input: {
@@ -172,7 +196,7 @@ declare global {
       quitFromMenuBarUsage: () => Promise<{ quitting: true }>;
       listProjectSourceDirectory: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDirectorySnapshot>;
       searchProjectSourceEntries: (input: { projectId: string; query: string }) => Promise<ProjectSourceSearchResult>;
-      searchProjectSourceContent: (input: { projectId: string; query: string }) => Promise<ProjectSourceContentSearchResult>;
+      searchProjectSourceContent: (input: { projectId: string; query: string } & ProjectSourceContentSearchOptions) => Promise<ProjectSourceContentSearchResult>;
       searchProjectSourceText: (input: ProjectSourceTextSearchInput) => Promise<ProjectSourceTextSearchResult>;
       loadProjectSourceBlame: (input: { projectId: string; relativePath: string; ref?: string; expectedSha256?: string }) => Promise<GitFileBlame>;
       loadConversationSourceBlame: (input: { projectId: string; conversationId: string; resourceId: string; expectedSha256: string }) => Promise<GitFileBlame>;
@@ -182,7 +206,15 @@ declare global {
       /** 页面关闭和选择变化时撤销短期资源。 */
       releaseFilePreview: (ids: string[]) => Promise<void>;
       /** 用户主动请求系统查看或导出当前预览版本。 */
-      actOnFilePreview: (id: string, action: 'quick-look' | 'open' | 'reveal' | 'export') => Promise<void>;
+      actOnFilePreview: (id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit') => Promise<void>;
+      /** 只恢复两端预览中选中的行区块，并返回更新后的预览授权。 */
+      /** 将完整草稿保存到当前授权工作区文件。 */
+      saveFilePreview: (input: import('@zeus/shared').FilePreviewSaveInput) => Promise<import('@zeus/shared').FilePreviewItem[]>;
+      revertFilePreviewBlock: (input: import('@zeus/shared').FilePreviewRevertInput) => Promise<import('@zeus/shared').FilePreviewItem[]>;
+      /** 预览令牌绑定内容和窗口，不接受任意仓库路径。 */
+      loadFilePreviewBlame: (id: string) => Promise<GitFileBlame | null>;
+      /** 在原生源码页打开主进程校验后的目标，沿用草稿离开保护。 */
+      onFilePreviewSourceWorkspaceRequested: (listener: (workspace: import('@zeus/shared').FilePreviewSourceWorkspace) => void) => () => void;
       requestProjectSourceLanguage: (input: SourceLanguageRequest) => Promise<SourceLanguageResult>;
       releaseProjectSourceLanguage: (projectId: string) => Promise<void>;
       readProjectSourceFile: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDocument>;
@@ -213,6 +245,8 @@ declare global {
       ) => Promise<{
         resources: ConversationInputResourceBridge[];
         failedCount: number;
+        /** 部分成功时保留未完成项的具体原因。 */
+        failureMessage?: string;
       }>;
       materializeConversationResources: (
         resources: Array<{
@@ -227,7 +261,6 @@ declare global {
       readConversationClipboardResources: () => Promise<{ resources: ConversationInputResourceBridge[]; text: string }>;
       getConversationResourcePreview: (resource: { localPath?: string; uploadRef?: string }) => Promise<{ previewUrl: string; mimeType: string } | null>;
       openConversationInputResource: (resource: { localPath?: string; uploadRef?: string }) => Promise<{ opened: boolean; error?: string }>;
-      discardConversationResources: (resources: Array<{ localPath?: string; uploadRef?: string }>) => Promise<{ discardedCount: number }>;
       chooseTaskAttachments: () => Promise<TaskInputResourceBridge[]>;
       authorizeTaskFiles: (
         files: File[],
@@ -235,6 +268,8 @@ declare global {
       ) => Promise<{
         resources: TaskInputResourceBridge[];
         failedCount: number;
+        /** 部分成功时保留未完成项的具体原因。 */
+        failureMessage?: string;
       }>;
       materializeTaskResources: (
         resources: Array<{
@@ -321,8 +356,12 @@ declare global {
       notifySensitiveRequestDraft: (payload: { requestId: string; present: boolean }) => void;
       /** 终端焦点不覆盖右侧工作面的独立归属。 */
       notifyTerminalActivity: (active: boolean) => void;
-      notifySessionContextActivity: (payload: { active: boolean; kind: 'browser' | 'subagents' | 'plan' | 'source' | 'turn_diff' | 'none' }) => void;
+      notifySessionContextActivity: (payload: { active: boolean; kind: 'browser' | 'subagents' | 'plan' | 'source' | 'turn_diff' | 'question' | 'none'; ownerConversationId?: string }) => void;
       notifyAppCloseLayerActivity: (active: boolean) => void;
+      /** 管理由当前工作区创建的系统窗口。 */
+      updateSystemWindow: (name: string, action: 'show' | 'close') => Promise<void>;
+      /** 系统窗口关闭回调仍遵守表单的忙碌保护。 */
+      onSystemWindowCloseRequest: (listener: (name: string) => void) => () => void;
       resolveTaskTableLayoutCloseRequest: (proceed: boolean) => void;
       resolveUnsavedChangesCloseRequest: (proceed: boolean) => void;
       onTaskTableLayoutCloseRequested: (listener: () => void) => () => void;
@@ -340,7 +379,7 @@ declare global {
       onNativeNewConversation: (listener: () => void) => () => void;
       /** 原生关闭快捷键仅交给获得焦点的终端。 */
       onNativeCloseActiveTerminalTab: (listener: () => void) => () => void;
-      onNativeCloseActiveContextTab: (listener: () => void) => () => void;
+      onNativeCloseActiveContextTab: (listener: (ownerConversationId?: string) => void) => () => void;
       onNativeCloseFrontmostLayer: (listener: () => void) => () => void;
       /** 系统菜单保持原生网页可见，并返回选择或取消。 */
       /** 系统菜单绑定当前会话和标签，原生网页保持可见。 */

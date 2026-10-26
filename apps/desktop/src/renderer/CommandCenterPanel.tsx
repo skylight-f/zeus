@@ -17,7 +17,8 @@ import { StopIcon as Stop } from '@phosphor-icons/react/dist/csr/Stop';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
-import { commandNeedsHighRiskConfirmation, type CommandRiskFlags } from '@zeus/shared';
+import { commandNeedsHighRiskConfirmation, commandShells, type CommandShell, type CommandRiskFlags } from '@zeus/shared';
+import { ZeusSelect } from './ZeusSelect.js';
 import { projectTerminalOutput } from '@zeus/shared';
 import {
   isLikelyLocalServerConnectionError,
@@ -39,11 +40,14 @@ import { ModalPortal } from './ui/ModalPortal.js';
 import { MenuSurface } from './ui/MenuSurface.js';
 import { VisibleApplicationError } from './ui/ApplicationErrorDialog.js';
 import './commandCenter.css';
-import { ProjectTerminalPanel } from './features/runtime/ProjectTerminalPanel.js';
 
 export interface CommandCenterPanelProps {
   /** 项目弹窗的关闭入口；关闭显示层不终止后台运行。 */
   onClose?: () => void;
+  /** 通知指定原执行身份，允许直接打开不在最近列表中的记录。 */
+  initialRunId?: string;
+  /** 只有准确执行详情已渲染时回传；收起或关闭后清除可见身份。 */
+  onRunDetailVisible?: (run: CommandRun | null) => void;
   mode: 'global' | 'project';
   project?: ProjectRecord;
   client: DashboardClient;
@@ -56,6 +60,8 @@ interface CommandDraft {
   title: string;
   description: string;
   command: string;
+  /** 保存解释器和正文，避免迁移后静默改变脚本语义。 */
+  shell: CommandShell;
   timeoutSeconds: string;
   enabled: boolean;
   telegramEnabled: boolean;
@@ -75,6 +81,7 @@ const emptyDraft: CommandDraft = {
   title: '',
   description: '',
   command: '',
+  shell: typeof navigator !== 'undefined' && navigator.platform.startsWith('Win') ? 'powershell' : 'sh',
   timeoutSeconds: '300',
   enabled: true,
   telegramEnabled: false,
@@ -429,8 +436,6 @@ async function writeCommandRunClipboard(content: string): Promise<boolean> {
 
 export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const zh = props.language === 'zh-CN';
-  /** 与浏览器工作区一样，将终端停靠到滚动正文之外。 */
-  const [terminalHost, setTerminalHost] = useState<HTMLDivElement | null>(null);
   const [commands, setCommands] = useState<CommandDefinition[]>([]);
   const [runs, setRuns] = useState<CommandRun[]>([]);
   const [loading, setLoading] = useState(true);
@@ -485,7 +490,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   useEffect(() => {
     historyCommandIdRef.current = null;
     setHistoryCommand(null);
-    setSelectedRunId(null);
+    setSelectedRunId(props.initialRunId ?? null);
     if (props.mode !== 'project' || !props.project) {
       setRuns([]);
       return;
@@ -494,7 +499,12 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
     void props.client
       .loadCommandRuns(props.project.id)
       .then((items) => {
-        if (active) setRuns(items);
+        if (active)
+          setRuns((current) => {
+            /** 最近列表与详情可并行返回，不能覆盖通知加载的较早执行。 */
+            const requestedRun = current.find((run) => run.id === props.initialRunId);
+            return requestedRun && !items.some((run) => run.id === requestedRun.id) ? [requestedRun, ...items] : items;
+          });
       })
       .catch((loadError) => {
         if (active) setError(loadError);
@@ -502,7 +512,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
     return () => {
       active = false;
     };
-  }, [props.client, props.mode, props.project?.id]);
+  }, [props.client, props.mode, props.project?.id, props.initialRunId]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -569,6 +579,11 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         }
         runLogCursorRef.current = { runId: selectedRunId, nextSeq: detail.nextSeq };
         setRunDetail((current) => mergeCommandRunDetail(current, detail, skippedHistoricalLogs));
+        if (props.initialRunId === detail.run.id && historyCommandIdRef.current === null) {
+          // 已删除的命令也能通过执行时快照查看原结果。
+          historyCommandIdRef.current = detail.run.commandSnapshot.id;
+          setHistoryCommand(detail.run.commandSnapshot);
+        }
         setRuns((current) => {
           const index = current.findIndex((run) => run.id === detail.run.id);
           if (index < 0) return [detail.run, ...current];
@@ -613,7 +628,14 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       if (pollTimer) window.clearInterval(pollTimer);
       unsubscribe?.();
     };
-  }, [props.client, selectedRunId, selectedRunIsActive, selectedRuntimeSessionId]);
+  }, [props.client, props.initialRunId, selectedRunId, selectedRunIsActive, selectedRuntimeSessionId]);
+
+  // 详情完成渲染后才回传可见身份，关闭或切换时立即撤销回执。
+  useEffect(() => {
+    if (!historyCommand || !runDetail || runDetail.run.id !== selectedRunId) return;
+    props.onRunDetailVisible?.(runDetail.run);
+    return () => props.onRunDetailVisible?.(null);
+  }, [historyCommand?.id, runDetail?.run, selectedRunId, props.onRunDetailVisible]);
 
   async function reloadCommands(): Promise<void> {
     const items = props.mode === 'global' ? await props.client.loadGlobalCommands() : props.project ? await props.client.loadProjectCommands(props.project.id) : [];
@@ -675,6 +697,7 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       title: command.title,
       description: command.description,
       command: command.command,
+      shell: command.shell ?? 'sh',
       timeoutSeconds: String(command.timeoutSeconds),
       enabled: command.enabled,
       telegramEnabled: command.telegramEnabled,
@@ -833,7 +856,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
             {props.mode === 'global' ? <p>{zh ? '在项目中运行' : 'Run from a project'}</p> : null}
           </span>
           <div className="command-center-header-actions">
-            {props.mode === 'project' && props.project ? <ProjectTerminalPanel dockHost={terminalHost} key={props.project.id} project={props.project} client={props.client} language={props.language} /> : null}
             <Button variant="primary" onClick={openCreate} disabled={!canMaintain || busy}>
               <Plus aria-hidden="true" />
               {zh ? '新建命令' : 'New command'}
@@ -985,7 +1007,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
           ) : null}
         </MotionPresence>
       </section>
-      <div className="command-center-terminal-host" ref={setTerminalHost} />
     </div>
   );
 }
@@ -997,6 +1018,10 @@ function CommandDefinitionDetails(props: { command: CommandDefinition; zh: boole
       {props.command.description ? <p>{props.command.description}</p> : null}
       <code>{props.command.command}</code>
       <dl>
+        <div>
+          <dt>{props.zh ? '解释器' : 'Shell'}</dt>
+          <dd>{props.command.shell ?? 'sh'}</dd>
+        </div>
         <div>
           <dt>{props.zh ? '名称' : 'Name'}</dt>
           <dd>{props.command.name}</dd>
@@ -1179,7 +1204,7 @@ function CommandDefinitionModal(props: {
         <header className="command-modal-header">
           <span>
             <h3 id="command-definition-modal-title">{props.title}</h3>
-            <p>{zh ? '命令会在目标项目目录中执行，使用系统命令解释器（sh -lc）。' : 'Commands run in the target project folder using the system shell (sh -lc).'}</p>
+            <p>{zh ? '命令在目标项目目录中执行。解释器与脚本一起保存，切换解释器不会自动转换脚本。' : 'Commands run in the project folder. The shell is saved with the script; changing it does not convert the script.'}</p>
           </span>
           <button type="button" aria-label={zh ? '关闭' : 'Close'} onClick={props.onClose} disabled={props.busy}>
             ×
@@ -1205,8 +1230,20 @@ function CommandDefinitionModal(props: {
             </label>
             <label className="wide">
               {zh ? '命令' : 'Command'}
-              <textarea required maxLength={1024} rows={4} value={props.draft.command} onChange={(event) => update('command', event.currentTarget.value)} />
+              {/* 可执行命令保留原始缩进和内容。 */}
+              <textarea data-markdown-lists="off" required maxLength={1024} rows={4} value={props.draft.command} onChange={(event) => update('command', event.currentTarget.value)} />
             </label>
+            <div>
+              <span>{zh ? '命令解释器' : 'Command shell'}</span>
+              <ZeusSelect<CommandShell>
+                ariaLabel={zh ? '命令解释器' : 'Command shell'}
+                size="regular"
+                value={props.draft.shell}
+                options={commandShells.map((shell) => ({ value: shell, label: shell === 'powershell' ? 'Windows PowerShell' : shell }))}
+                onChange={(shell) => update('shell', shell)}
+                disabled={props.busy}
+              />
+            </div>
             <label>
               {zh ? '超时（秒）' : 'Timeout (seconds)'}
               <input required type="number" min={5} max={3600} value={props.draft.timeoutSeconds} onChange={(event) => update('timeoutSeconds', event.currentTarget.value)} />
@@ -1518,6 +1555,7 @@ function draftToInput(draft: CommandDraft): CommandDefinitionInput {
     title: draft.title.trim(),
     description: draft.description.trim(),
     command: draft.command.trim(),
+    shell: draft.shell,
     timeoutSeconds: Number(draft.timeoutSeconds),
     enabled: draft.enabled,
     telegramEnabled: draft.telegramEnabled,
