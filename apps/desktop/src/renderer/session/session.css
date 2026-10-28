@@ -11875,6 +11875,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   min-inline-size: 190px;
   overflow: hidden;
   padding: 5px;
+  /* 菜单使用会话行的视口坐标，脱离工作台网格后才能出现在行旁。 */
+  position: fixed;
   z-index: 100;
 }
 

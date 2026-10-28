@@ -2006,6 +2006,7 @@ export function SidebarNav(props: {
                             conversationStates={props.conversationStates}
                             onSelectConversation={props.onSelectConversation}
                             onArchiveConversation={props.onArchiveConversation}
+                            onRenameConversation={props.onRenameConversation}
                             language={props.appLanguage}
                             compactProjectLabel
                             showEmptyState={false}
