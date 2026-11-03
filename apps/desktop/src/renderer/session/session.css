@@ -56,30 +56,132 @@
 }
 
 .session-computer-preview-image {
+  background: transparent;
   border: 1px solid var(--session-line);
-  border-radius: 8px;
-  margin-block-start: 10px;
-  overflow: hidden;
+  border-radius: 10px;
+  box-shadow: 0 2px 8px -4px var(--session-shadow);
   position: relative;
+  isolation: isolate;
 }
-
-.session-computer-preview-image > img {
+/* 画面按钮与控制按钮分开，禁止嵌套交互控件。 */
+.session-computer-preview .session-computer-preview-open {
   display: block;
   inline-size: 100%;
+  border: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  background: transparent;
+  padding: 0;
+  cursor: zoom-in;
 }
-
+.session-computer-preview-open > img {
+  display: block;
+  inline-size: 100%;
+  max-block-size: 300px;
+  object-fit: contain;
+}
+/* 无图和加载失败时为操作保留空间，说明文字不与按钮重叠。 */
 .session-computer-preview-image > p {
-  padding: 20px 12px;
-  text-align: center;
+  background: light-dark(color-mix(in srgb, var(--session-text) 3%, var(--session-canvas)), var(--zeus-dark-surface));
+  border-radius: inherit;
+  min-block-size: 104px;
+  margin: 0;
+  padding: 52px 12px 16px;
+  box-sizing: border-box;
 }
-
-.session-computer-preview-cursor {
-  block-size: 16px;
-  color: #151515;
-  filter: drop-shadow(0 0 1px white);
-  inline-size: 16px;
-  pointer-events: none;
+/* 悬停和键盘聚焦显示同一组操作，无图时始终保留停止入口。 */
+.session-computer-preview-controls {
+  align-items: center;
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
   position: absolute;
+  inset: 6px 6px auto;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 3;
+  transition: opacity 160ms ease;
+}
+.session-computer-preview-image:is(:hover, :focus-within, :has(:popover-open), :not(:has(img))) .session-computer-preview-controls {
+  opacity: 1;
+}
+.session-computer-preview-controls > button {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  background: var(--session-canvas);
+  border: 1px solid var(--session-line);
+  border-radius: 6px;
+  color: var(--session-text-muted);
+  cursor: pointer;
+  box-sizing: border-box;
+  inline-size: 28px;
+  block-size: 28px;
+  flex: 0 0 auto;
+  padding: 0;
+  list-style: none;
+}
+/* 操作仍可点击，空白操作行不阻挡用户打开完整画面。 */
+.session-computer-preview-controls > button,
+.session-computer-preview-info {
+  pointer-events: auto;
+}
+.session-computer-preview-controls svg {
+  inline-size: 16px;
+  block-size: 16px;
+}
+.session-computer-preview-controls > button:hover {
+  background: var(--session-control-hover);
+}
+/* 焦点环和禁用反馈不能被悬浮遮罩隐藏。 */
+.session-computer-preview :is(button, summary):focus-visible {
+  outline: 2px solid var(--session-focus-outline);
+  outline-offset: 2px;
+}
+.session-computer-preview button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+/* 原生顶层详情不增加侧栏滚动范围，靠近窗口边缘时向可用方向展开。 */
+.session-computer-preview-info {
+  position: fixed;
+  inset: auto;
+  position-area: bottom span-left;
+  position-try-fallbacks:
+    flip-block,
+    flip-inline,
+    flip-block flip-inline;
+  margin: 8px 0;
+  inline-size: min(240px, calc(100vw - 32px));
+  max-block-size: min(200px, calc(100dvh - 32px));
+  overflow: auto;
+  overscroll-behavior: contain;
+  gap: 6px;
+  box-sizing: border-box;
+  padding: 12px;
+  background: var(--session-canvas);
+  color: var(--session-text);
+  border: 1px solid var(--session-line);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px var(--session-shadow);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+/* 仅在打开时布局，保留浏览器对关闭浮层的隐藏规则。 */
+.session-computer-preview-info:popover-open {
+  display: grid;
+}
+@media (hover: none) {
+  /* 触屏没有悬停，始终展示停止和详情操作。 */
+  .session-computer-preview-controls {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 减少动态效果时直接显示操作。 */
+  .session-computer-preview-controls {
+    transition: none;
+  }
 }
 
 .session-codex-parity-v1 .session-quick-actions-anchor {
@@ -1339,13 +1441,17 @@
 }
 
 .session-codex-parity-v1 .session-turn-failure-icon {
+  align-items: center;
   block-size: 20px;
+  display: flex;
   flex: 0 0 20px;
   inline-size: 20px;
+  justify-content: center;
 }
 
 .session-codex-parity-v1 .session-turn-failure-icon svg {
   block-size: 100%;
+  display: block;
   fill: none;
   inline-size: 100%;
   stroke: currentColor;
@@ -1896,7 +2002,7 @@
   padding: 0;
 }
 
-.session-codex-parity-v1 .session-context-draft-chip > button:hover:not(:disabled):not([aria-disabled='true']) {
+.session-codex-parity-v1 .session-context-draft-chip > button:hover:not(:disabled):not([aria-disabled='true']):not(.session-context-draft-preview-trigger) {
   background: var(--session-control-hover);
 }
 
@@ -4749,6 +4855,13 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 .sess
   display: flex;
   font-size: 14px;
   gap: 8px;
+}
+
+/* 执行位置也承载多行摘要；长单词在窄窗口内换行，保留模型原有换行。 */
+.session-codex-parity-v1 .session-current-status-text {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  white-space: break-spaces;
 }
 
 /* 消息间距由内部时间线保留；底部状态与最后一条过程只留紧凑行距。 */
@@ -10610,6 +10723,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   justify-self: start;
 }
 
+/* 已记住的 Skill 独立收缩，避免窄输入框中的操作按钮重叠。 */
+.session-new-conversation-skill {
+  inline-size: min(100%, 220px);
+  min-inline-size: 0;
+}
+
 .session-codex-parity-v1 .session-composer-trailing-actions {
   justify-content: flex-end;
   justify-self: end;
@@ -12304,7 +12423,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   padding-block-end: 0;
 }
 
-.session-codex-parity-v1 .session-context-toolbar-host > :is(.browser-tab-strip, .session-context-workspace-header) {
+.session-codex-parity-v1 .session-context-toolbar-host > :is(.browser-tab-strip, .session-context-workspace-header, .session-side-question-header) {
   background: transparent;
   border: 0;
   flex: 1 1 0;
@@ -13286,96 +13405,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 /* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
-.session-computer-preview .session-computer-preview-open {
-  display: block;
-  inline-size: 100%;
-  border: 0;
-  border-radius: inherit;
-  overflow: hidden;
-  background: transparent;
-  padding: 0;
-  cursor: zoom-in;
-}
-.session-computer-preview-open > img {
-  display: block;
-  inline-size: 100%;
-  max-block-size: 300px;
-  object-fit: contain;
-}
-.session-computer-preview-controls {
-  align-items: center;
-  display: flex;
-  justify-content: flex-end;
-  gap: 4px;
-  position: absolute;
-  inset: 6px 6px auto;
-  pointer-events: none;
-  opacity: 0;
-  z-index: 3;
-  transition: opacity 160ms ease;
-}
-.session-computer-preview-image:is(:hover, :focus-within, :has(details[open]), :not(:has(img))) .session-computer-preview-controls {
-  opacity: 1;
-}
-.session-computer-preview-controls > button,
-.session-computer-preview-info > summary {
-  align-items: center;
-  display: flex;
-  justify-content: center;
-  background: var(--session-canvas);
-  border: 1px solid var(--session-line);
-  border-radius: 6px;
-  color: var(--session-text-muted);
-  cursor: pointer;
-  box-sizing: border-box;
-  inline-size: 28px;
-  block-size: 28px;
-  flex: 0 0 auto;
-  padding: 0;
-  list-style: none;
-}
-.session-computer-preview-info > summary::-webkit-details-marker {
-  display: none;
-}
-.session-computer-preview-controls > button,
-.session-computer-preview-info {
-  pointer-events: auto;
-}
-.session-computer-preview-controls svg {
-  inline-size: 16px;
-  block-size: 16px;
-}
-.session-computer-preview-controls > button:hover,
-.session-computer-preview-info > summary:hover {
-  background: var(--session-control-hover);
-}
-.session-computer-preview-info > div {
-  position: absolute;
-  inset: 34px 0 auto auto;
-  inline-size: min(240px, 100%);
-  max-block-size: 200px;
-  overflow: auto;
-  display: grid;
-  gap: 6px;
-  box-sizing: border-box;
-  padding: 12px;
-  background: var(--session-canvas);
-  border: 1px solid var(--session-line);
-  border-radius: 12px;
-  box-shadow: 0 8px 24px var(--session-shadow);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-@media (hover: none) {
-  .session-computer-preview-controls {
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .session-computer-preview-controls {
-    transition: none;
-  }
-}
 .session-codex-parity-v1 .session-quick-actions-surface {
   inline-size: min(360px, calc(100vw - 32px));
   inset-block-start: calc(100% + 8px);
@@ -14121,16 +14150,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 :root:has(.session-workspace-root[data-session-transition]) {
   view-transition-name: none;
 }
-.session-workspace-root[data-session-transition] {
-  view-transition-name: session-workspace;
-}
 .session-workspace-root[data-session-transition] .session-thread-header {
   view-transition-name: session-header;
 }
 .session-workspace-root[data-session-transition] .session-quick-actions-surface[data-presentation='persistent'] {
   view-transition-name: session-environment;
 }
-::view-transition-group(session-workspace),
 ::view-transition-group(session-header),
 ::view-transition-group(session-environment) {
   animation-duration: 260ms;
@@ -14150,7 +14175,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   opacity: 0;
 }
 .session-codex-parity-v1 .session-transcript-shell[data-history-ready='true'] > .session-transcript {
-  animation: session-history-arrive 260ms var(--session-ease-out) both;
   opacity: 1;
 }
 .session-codex-parity-v1 .session-transcript-shell[data-local-submission='true'] > .session-transcript {
@@ -14159,14 +14183,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 .session-codex-parity-v1 .session-transcript-shell[data-native-arrival='true'] > .session-transcript,
 .session-workspace-root .session-thread-header[data-native-arrival='true'] .session-thread-title-copy[data-conversation-transition='true'] {
   animation: none;
-}
-@keyframes session-history-arrive {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
 }
 @starting-style {
   .session-codex-parity-v1 .session-transcript-loading[data-visible='true'] {
@@ -14215,15 +14231,14 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  ::view-transition-group(session-workspace),
-::view-transition-group(session-header),
-::view-transition-group(session-environment),
-::view-transition-old(session-workspace),
-::view-transition-new(session-workspace),
-::view-transition-old(session-header),
-::view-transition-new(session-header),
-::view-transition-old(session-environment),
-::view-transition-new(session-environment) {
+  ::view-transition-group(session-header),
+  ::view-transition-group(session-environment),
+  ::view-transition-old(session-workspace),
+  ::view-transition-new(session-workspace),
+  ::view-transition-old(session-header),
+  ::view-transition-new(session-header),
+  ::view-transition-old(session-environment),
+  ::view-transition-new(session-environment) {
     animation: none;
   }
 
@@ -14232,7 +14247,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   }
 
   .session-codex-parity-v1 .session-transcript-shell > .session-transcript,
-.session-codex-parity-v1 .session-transcript-loading {
+  .session-codex-parity-v1 .session-transcript-loading {
     transition: none;
   }
 }
@@ -14492,7 +14507,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
 }
 
 @media (max-width: 759px) {
-
   .session-codex-parity-v1 .session-thread-item-user.has-message-actions {
     min-inline-size: min(320px, 88%);
   }
@@ -14670,20 +14684,20 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   padding: 0 12px 0 16px;
 }
 
-.session-side-question > header > strong {
+.session-side-question-header > strong {
   font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.session-side-question > header > nav {
+.session-side-question-header > nav {
   display: flex;
   flex: 0 0 auto;
   gap: 7px;
 }
 
-.session-side-question > header > nav > button {
+.session-side-question-header > nav > button {
   align-items: center;
   background: transparent;
   border: 0;
@@ -14697,12 +14711,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   padding: 4px;
 }
 
-.session-side-question > header > nav > button:hover {
+.session-side-question-header > nav > button:hover {
   background: var(--session-control-hover);
   color: var(--session-text);
 }
 
-.session-side-question > header > nav > button:focus-visible {
+.session-side-question-header > nav > button:focus-visible {
   outline: 2px solid var(--zeus-brand-primary);
   outline-offset: 2px;
 }
@@ -14718,9 +14732,20 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .session-codex-parity-v1 {
   flex-direction: column;
   gap: 8px;
   overflow: auto;
-  padding: 12px;
 }
 
 .session-side-question-space {
   flex: 1 1 auto;
+}
+
+/* 前缀、摘要和详情图标共用居中行，避免行内基线与不同字号造成上下偏移。 */
+.session-codex-parity-v1 .session-turn-failure-message > span:not(.session-message-delivery-actions) {
+  align-items: center;
+  display: flex;
+  min-inline-size: 0;
+}
+
+.session-codex-parity-v1 .session-turn-failure-message .application-error-inline {
+  font-size: inherit;
+  line-height: inherit;
 }

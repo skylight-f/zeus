@@ -1,9 +1,12 @@
+import { copyText } from '../ui/clipboard.js';
+export { copyText } from '../ui/clipboard.js';
 import { BrowserCommentPreview } from './BrowserCommentPreview.js';
 import type { ConversationTurnUsage, ZeusBrowserComment } from '@zeus/shared';
 import { formatRuntimeCosts, formatTokenCount } from './tokenUsageFormat.js';
 import { AnimatedSize } from '../ui/AnimatedSize.js';
 import { describeUserFacingError } from '@zeus/shared';
 import { type FormEvent, type KeyboardEvent, memo, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useReadingState } from '../ui/readingState.js';
 import { ArrowBendUpRightIcon as ArrowBendUpRight } from '@phosphor-icons/react/dist/csr/ArrowBendUpRight';
 import { ClockIcon as Clock } from '@phosphor-icons/react/dist/csr/Clock';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
@@ -53,7 +56,6 @@ const copy = {
     request: '等待操作',
     error: '本轮错误',
     unknown: '未识别的处理记录',
-    thinking: '正在思考',
     expand: '展开全文',
     collapse: '收起',
     copy: '复制消息',
@@ -72,7 +74,6 @@ const copy = {
     attachments: '附件',
     details: '技术详情',
     queued: '排队中',
-    restoringConversation: '正在恢复会话',
     conflictPreparing: '正在准备冲突现场',
     conflictPreparationFailed: '冲突现场准备失败',
     deliveryPaused: '发送已暂停',
@@ -102,7 +103,6 @@ const copy = {
     request: 'Action pending',
     error: 'Turn error',
     unknown: 'Unrecognized activity',
-    thinking: 'Thinking',
     expand: 'Expand full text',
     collapse: 'Collapse',
     copy: 'Copy message',
@@ -121,7 +121,6 @@ const copy = {
     attachments: 'Attachments',
     details: 'Technical details',
     queued: 'Queued',
-    restoringConversation: 'Restoring conversation',
     conflictPreparing: 'Preparing conflict workspace',
     conflictPreparationFailed: 'Conflict workspace preparation failed',
     deliveryPaused: 'Sending paused',
@@ -163,16 +162,14 @@ export interface ThreadItemViewProps {
   onCallMcpAppTool?: (input: McpAppToolCall) => Promise<McpAppToolResult>;
   onVisibleContentChange?: () => void;
   responseAnnotations?: ConversationResponseAnnotation[];
-  /** 选区作为右侧会话的评论引用，不写入主会话草稿。 */
-  onAskInSidebar?: (anchor: ConversationResponseTextAnchor) => void;
+  /** 选区暂存或直接发送到右侧会话，不写入主会话草稿。 */
+  onAskInSidebar?: (anchor: ConversationResponseTextAnchor, sendImmediately?: boolean) => void;
   onAddResponseAnnotation?: (anchor: ConversationResponseTextAnchor) => string;
   onUpdateResponseAnnotation?: (id: string, note: string) => void;
   onRemoveResponseAnnotation?: (id: string) => void;
   queuedSubmissionId?: string;
   /** 排队提示与操作共用真实等待事实，避免正常发送交接时短暂出现。 */
   waitingInQueue?: boolean;
-  /** 来自服务端队列的真实恢复阶段，与页面历史加载分开。 */
-  conversationRestoring?: boolean;
   queuedSteerDisabledReason?: string | null;
   onSteerQueuedSubmission?: (submissionId: string) => void | Promise<void>;
   onDeleteQueuedSubmission?: (submissionId: string) => void | Promise<void>;
@@ -348,13 +345,12 @@ function TaskPushMessageContent(
   );
 }
 
-/** 按实际交付阶段显示提示；内部入队不等同于用户需要等待。 */
-function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof copy)[SessionUiLanguage], language: SessionUiLanguage, conversationRestoring = false, waitingInQueue = false): string | null {
+/** 按实际交付阶段显示提示；历史加载不显示状态，内部入队不等同于用户需要等待。 */
+function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof copy)[SessionUiLanguage], language: SessionUiLanguage, waitingInQueue = false): string | null {
   // 接纳或终态已由权威记录确认，不再展示发送途中的提示。
   if (item.providerItemId || item.status === 'active' || item.status === 'completed' || item.status === 'resolved') return null;
   const delivery = primitiveText(item.payload.delivery);
   const pausedReason = primitiveText(item.payload.pausedReason);
-  if (conversationRestoring && (item.status === 'queued' || item.status === 'paused')) return labels.restoringConversation;
   if (item.status === 'failed' || item.status === 'unconfirmed' || pausedReason === 'recovery_required' || pausedReason === 'recovered_unsent' || pausedReason === 'conflict_preparation_failed' || pausedReason === 'user_confirmation')
     return null;
   if (delivery === 'steer_now') {
@@ -373,7 +369,7 @@ function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof
     return labels.deliveryPaused;
   }
   if (item.status !== 'queued') return null;
-  return item.payload.queuedUntilHydrated === true ? labels.restoringConversation : waitingInQueue ? labels.queued : null;
+  return item.payload.queuedUntilHydrated === true ? null : waitingInQueue ? labels.queued : null;
 }
 
 function recoveredRequestAnswers(value: unknown): Record<string, string[]> {
@@ -462,8 +458,8 @@ const RecoveredRequestUserInputItem = memo(function RecoveredRequestUserInputIte
 
 export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemViewProps) {
   const labels = copy[props.language];
-  const [expanded, setExpanded] = useState(false);
-  const [messageExpanded, setMessageExpanded] = useState(false);
+  const [expanded, setExpanded] = useReadingState(`user-message:${props.item.key}`, false);
+  const [messageExpanded, setMessageExpanded] = useReadingState(`message-width:${props.item.key}`, false);
   const [feedback, setFeedback] = useState<'good' | 'bad' | null>(null);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState('');
@@ -550,7 +546,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
   const accessibleLabel = command ? (props.language === 'zh-CN' ? '命令执行' : 'Command execution') : label;
   const showVisibleRoleLabel = Boolean(subagentInput || expertActor) || (role !== 'user' && role !== 'assistant' && role !== 'commentary' && role !== 'error');
   // 任务首发消息已经是工作面的稳定内容，内部创建进度只在底部统一呈现。
-  const optimisticStatus = props.item.optimistic && !taskPushLayout ? optimisticDeliveryStatus(props.item, labels, props.language, props.conversationRestoring, props.waitingInQueue) : null;
+  const optimisticStatus = props.item.optimistic && !taskPushLayout ? optimisticDeliveryStatus(props.item, labels, props.language, props.waitingInQueue) : null;
   /** 排队操作沿用父级传入的权限，不从外观或本地状态推断可发送性。 */
   const showQueuedActions = Boolean(props.waitingInQueue && props.queuedSubmissionId && (props.onSteerQueuedSubmission || props.onDeleteQueuedSubmission));
   /** 状态与操作共同决定底栏；已确认未发送可只有操作，未知送达可只有状态。 */
@@ -772,8 +768,6 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
           onVisibleContentChange={props.onVisibleContentChange}
           onRenderSettled={handleMarkdownSettled}
         />
-      ) : role === 'assistant' && props.item.status !== 'completed' ? (
-        <SessionSweepText className="session-current-status-text" text={labels.thinking} active={Boolean(props.motionActive)} />
       ) : null}
       {!command && !mcpApp && !recoveredRequestUserInput ? <TypedItemFacts item={props.item} role={role} language={props.language} /> : null}
       {role !== 'error' && conversationContext ? <UserConversationContextSummary draft={conversationContext} language={props.language} /> : null}
@@ -1626,51 +1620,4 @@ function primitiveText(value: unknown): string | null {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-export async function copyText(
-  text: string,
-  services: {
-    writeNative?: (value: string) => Promise<{ written: boolean } | undefined>;
-    writeWeb?: (value: string) => Promise<void>;
-    writeLegacy?: (value: string) => boolean;
-  } = {},
-): Promise<boolean> {
-  const writeNative = services.writeNative ?? ((value: string) => globalThis.window?.zeus?.writeClipboardText?.(value));
-  try {
-    const result = await writeNative(text);
-    if (result?.written) return true;
-  } catch {
-    // 原生桥不可用时继续尝试浏览器与选区兜底。
-  }
-  const writeWeb = services.writeWeb ?? globalThis.navigator?.clipboard?.writeText?.bind(globalThis.navigator.clipboard);
-  try {
-    if (writeWeb) {
-      await writeWeb(text);
-      return true;
-    }
-  } catch {
-    // file:// 页面通常没有 Clipboard API 权限，继续使用同步选区兜底。
-  }
-  return (services.writeLegacy ?? copyTextWithSelection)(text);
-}
-
-function copyTextWithSelection(text: string): boolean {
-  if (typeof document === 'undefined' || !document.body || typeof document.execCommand !== 'function') return false;
-  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.readOnly = true;
-  textarea.style.inset = '0 auto auto -10000px';
-  textarea.style.opacity = '0';
-  textarea.style.position = 'fixed';
-  document.body.append(textarea);
-  textarea.select();
-  let copied = false;
-  try {
-    copied = document.execCommand('copy');
-  } finally {
-    textarea.remove();
-    activeElement?.focus();
-  }
-  return copied;
 }

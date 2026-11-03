@@ -489,7 +489,16 @@ export type ProjectGitAction =
   | { type: 'delete_branch'; branchName: string }
   | { type: 'revert'; revision: string }
   | { type: 'cherry_pick'; revision: string }
-  | { type: 'merge'; branchName: string }
+  | {
+      /** 将来源分支合并到已确认的目标快照。 */
+      type: 'merge';
+      /** 待合并的本地或远端跟踪分支。 */
+      branchName: string;
+      /** 用户确认时的目标本地分支，不能改用执行时的分支。 */
+      expectedBranch: string;
+      /** 用户确认时的目标完整提交 SHA。 */
+      expectedHeadSha: string;
+    }
   | { type: 'rebase'; branchName: string }
   | { type: 'stash'; message?: string; includeUntracked?: boolean; keepIndex?: boolean }
   | { type: 'apply_stash'; stashRef: string; pop?: boolean }
@@ -761,8 +770,9 @@ export function buildTaskEnvironmentRootPath(projectContainerPath: string, proje
   return join(root, safeProject, safePush, safeTask);
 }
 
-/** 从任务编码、名称和开发线序号生成可读分支；最终合法性仍由 git check-ref-format 判定。 */
-export function buildTaskBranchName(taskCode: string, taskTitle: string, sequence: number, branchPrefix = defaultTaskBranchPrefix): string {
+/** 从任务编码、名称和开发线序号生成可读分支；调用方可用只读占用查询跳过已有名称。 */
+export function buildTaskBranchName(taskCode: string, taskTitle: string, sequence: number, branchPrefix = defaultTaskBranchPrefix, isUnavailable?: (branchName: string) => boolean): string {
+  /** 非拉丁名称使用固定可读短名，任务编码和开发线序号继续区分分支。 */
   const slug =
     taskTitle
       .normalize('NFKD')
@@ -770,7 +780,14 @@ export function buildTaskBranchName(taskCode: string, taskTitle: string, sequenc
       .replace(/[^a-z0-9]+/gu, '-')
       .replace(/^-+|-+$/gu, '')
       .slice(0, 36) || 'task';
-  return `${buildTaskBranchPrefix(taskCode, branchPrefix)}${slug}-${String(Math.max(1, Math.trunc(sequence))).padStart(2, '0')}`;
+  /** 同一任务的候选名称只递增开发线序号，不改写任何已有分支。 */
+  const prefix = `${buildTaskBranchPrefix(taskCode, branchPrefix)}${slug}-`;
+  /** 从调用方建议的下一条开发线开始查找。 */
+  let candidateSequence = Math.max(1, Math.trunc(sequence));
+  /** 最终合法性和创建时占用仍由 Git 校验。 */
+  let branchName = `${prefix}${String(candidateSequence).padStart(2, '0')}`;
+  while (isUnavailable?.(branchName)) branchName = `${prefix}${String(++candidateSequence).padStart(2, '0')}`;
+  return branchName;
 }
 
 /** 用任务编码限定可接管的既有本地任务分支，避免把其他任务分支登记到当前任务。 */
@@ -1027,7 +1044,10 @@ export async function cleanupPreparedTaskWorktree(input: { repositoryPath: strin
 
 /** 汇总 IDEA 式提交窗口所需的 staged、unstaged、untracked 与冲突状态。 */
 export async function getTaskWorkspaceReview(cwd: string, ignoredPaths: string[] = [], repositoryContext?: GitRepositoryContext): Promise<TaskWorkspaceReview> {
-  const context = repositoryContext ?? (await getGitRepositoryContext(cwd));
+  /** 工作区摘要只需当前分支和 HEAD，不枚举所有分支、远端和工作树。 */
+  const context: Pick<GitRepositoryContext, 'isRepository' | 'branch' | 'headSha'> =
+    repositoryContext ??
+    (await Promise.all([requireGitStdout(cwd, ['branch', '--show-current']), readGitStdout(cwd, ['rev-parse', '--verify', 'HEAD'])]).then(([branch, headSha]) => ({ isRepository: true, branch: branch || 'detached', headSha })));
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'Task workspace is not a Git repository.');
   const ignored = ignoredPaths.map((path) => requireSafeWorkspacePath(path));
   const isIgnored = (path: string): boolean => ignored.some((ignoredPath) => path === ignoredPath || path.startsWith(`${ignoredPath}/`));
@@ -1341,13 +1361,11 @@ export async function commitTaskWorkspace(input: CommitTaskWorkspaceInput): Prom
       throw gitCoreError('ZEUS_TASK_MERGE_COMMIT_INCOMPLETE', `Merge commits must include every changed path: ${omitted.join(', ')}`);
     }
   }
-  /** 已暂存删除的路径不再属于 index，不能再次 git add；仍保留在提交范围中。 */
-  const stagePaths = paths.length > 0 ? splitNullRecords((await runGit(input.cwd, ['--literal-pathspecs', 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...paths])).stdout) : [];
   /** 只整理用户选择的现存文件，不格式化重命名来源处可能重新创建的文件。 */
   const formattedPaths = await formatTaskCommitPaths(input.cwd, selectedPaths);
   // 来源目录里的暂存改动可能先被带入 worktree；共享目录和子仓库必须从父仓 index 中明确退出。
   if (ignored.length > 0 && review.headSha) await runGit(input.cwd, ['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...ignored]);
-  if (stagePaths.length > 0) await runGit(input.cwd, ['--literal-pathspecs', 'add', '-A', '--', ...stagePaths]);
+  await stageRepositoryPaths(input.cwd, paths);
   /** 从暂存结果确定最终路径；关闭重命名折叠以保留两端，排除新增后又删除的空变化。 */
   const stagedNames = paths.length > 0 ? splitNullRecords((await runGit(input.cwd, ['--literal-pathspecs', 'diff', '--cached', '--name-only', '--no-renames', '-z', '--', ...paths])).stdout) : [];
   /** 仅在 Git 提交成功返回后标记完成。 */
@@ -1852,7 +1870,7 @@ export async function writeTaskIntegrationResolution(integrationPath: string, pa
   const absolutePath = resolve(integrationPath, safePath);
   if (!isPathInside(integrationPath, absolutePath)) throw gitCoreError('ZEUS_GIT_PATH_INVALID', `Conflict path escapes the integration worktree: ${safePath}`);
   await writeFile(absolutePath, content, 'utf8');
-  await runGit(integrationPath, ['add', '--', safePath]);
+  await stageRepositoryPaths(integrationPath, [safePath]);
   const remainingConflictFiles = await readTaskIntegrationConflictPaths(integrationPath);
   return { path: safePath, remainingConflictFiles };
 }
@@ -1881,12 +1899,19 @@ export async function completeTaskIntegrationCommit(input: { integrationPath: st
     if (resultHeadSha !== localChanges.resultHeadSha) throw gitCoreError('ZEUS_TARGET_HEAD_CHANGED', 'Integration result changed while local source changes were being resolved.');
     return { resultHeadSha };
   }
+  /** 已解决冲突之外的新修改必须先暂存，不能在完成合入和清理现场时被遗漏。 */
+  const review = await getTaskWorkspaceReview(input.integrationPath);
+  if (review.unstagedFiles.length > 0 || review.untrackedFiles.length > 0) {
+    throw gitCoreError('ZEUS_TASK_WORKSPACE_DIRTY', '合入现场仍有未暂存或未跟踪文件，请核对并暂存全部有效修改后继续；当前现场已保留。');
+  }
   const mergeHead = await readGitStdout(input.integrationPath, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
   const staged = splitLines(await readGitStdout(input.integrationPath, ['diff', '--cached', '--name-only']));
   if (mergeHead) {
     await runGit(input.integrationPath, ['commit', '--no-edit']);
   } else if (input.mode === 'squash' && staged.length > 0) {
     await runGit(input.integrationPath, ['commit', '-m', requireSafeGitText(input.commitMessage, 'commit message')]);
+  } else if (staged.length > 0) {
+    throw gitCoreError('ZEUS_TASK_WORKSPACE_DIRTY', '合入现场存在已暂存修改，但原合并状态已丢失；请核对现场后继续，不能忽略这些修改完成交付。');
   }
   return { resultHeadSha: await resolveCommit(input.integrationPath, 'HEAD') };
 }
@@ -2475,6 +2500,7 @@ async function createUnbornTaskWorktree(repositoryPath: string, worktreePath: st
   }
 }
 
+/** 两端共用 Git 进程边界，保留取消状态与脱敏的命令诊断。 */
 async function defaultGitCommandRunner(cwd: string, args: string[], input?: string): Promise<GitRunnerResult> {
   const execution = projectGitExecution.getStore();
   execution?.signal?.throwIfAborted();
@@ -2542,7 +2568,13 @@ async function defaultGitCommandRunner(cwd: string, args: string[], input?: stri
     child.once('close', (code) => {
       cleanup();
       if (stopped || code !== 0)
-        reject(Object.assign(gitCoreError('ZEUS_GIT_COMMAND_FAILED', stopped ?? (stderr || `Git 命令退出码：${code}`)), { interrupted: Boolean(stopped), stdout: redactGitOutput(stdout), stderr: redactGitOutput(stderr) }));
+        reject(
+          Object.assign(gitCoreError('ZEUS_GIT_COMMAND_FAILED', stopped ?? (stderr || `Git 命令退出码：${code}`), [formatGitCommand(args, input !== undefined), `退出码：${code}`, stdout, stderr].filter(Boolean).join('\n')), {
+            interrupted: Boolean(stopped),
+            stdout: redactGitOutput(stdout),
+            stderr: redactGitOutput(stderr),
+          }),
+        );
       else resolveResult({ stdout, stderr });
     });
   });
@@ -2559,13 +2591,40 @@ function formatGitCommand(args: string[], hasInput: boolean): string {
   return `git ${words.join(' ')}${hasInput ? ' # 通过标准输入传入内容' : ''}`;
 }
 
+/** 保留 Git 执行器的完整错误，启动失败也附带实际请求的命令。 */
 async function runGit(cwd: string, args: string[], input?: string): Promise<GitRunnerResult> {
   try {
     return await defaultGitCommandRunner(cwd, args, input);
   } catch (error) {
+    if ((error as { code?: string }).code === 'ZEUS_GIT_COMMAND_FAILED') throw error;
     const message = error instanceof Error ? error.message : 'Git command failed.';
-    throw gitCoreError('ZEUS_GIT_COMMAND_FAILED', message);
+    /** 详情保留实际失败命令与输出，摘要仍沿用统一错误解释。 */
+    const output = error as { stdout?: string; stderr?: string };
+    throw gitCoreError('ZEUS_GIT_COMMAND_FAILED', message, [formatGitCommand(args, input !== undefined), output.stdout, output.stderr || message].filter(Boolean).join('\n'));
   }
+}
+
+/** 已跟踪文件使用 update，避免被父目录忽略规则拦截；新文件仍遵守忽略规则。 */
+async function stageRepositoryPaths(cwd: string, paths: string[]): Promise<GitRunnerResult> {
+  if (!paths.length) return { stdout: '', stderr: '' };
+  /** Git 返回确切文件名，保留特殊字符及已暂存删除，不扩大用户选择。 */
+  const [trackedResult, untrackedResult, stagedResult] = await Promise.all([
+    runGit(cwd, ['--literal-pathspecs', 'ls-files', '--cached', '-z', '--', ...paths]),
+    runGit(cwd, ['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '-z', '--', ...paths]),
+    runGit(cwd, ['--literal-pathspecs', 'diff', '--cached', '--name-only', '--no-renames', '-z', '--', ...paths]),
+  ]);
+  /** 未解决冲突的多个 index stage 可能返回同一路径，暂存时只处理一次。 */
+  const tracked = [...new Set(splitNullRecords(trackedResult.stdout))];
+  /** 只有 Git 确认未被忽略的新文件可以纳入暂存。 */
+  const untracked = splitNullRecords(untrackedResult.stdout);
+  /** 已暂存删除无需再次 add，但仍是有效选择。 */
+  const known = [...tracked, ...untracked, ...splitNullRecords(stagedResult.stdout)];
+  if (paths.some((path) => !known.some((file) => file === path || file.startsWith(`${path}/`)))) throw gitCoreError('ZEUS_GIT_SELECTION_CHANGED', '所选文件已变化或被忽略，请刷新后重新选择。');
+  /** 合并两次 Git 输出，普通暂存入口仍可展示真实操作结果。 */
+  const results: GitRunnerResult[] = [];
+  if (tracked.length) results.push(await runGit(cwd, ['--literal-pathspecs', 'add', '-u', '--', ...tracked]));
+  if (untracked.length) results.push(await runGit(cwd, ['--literal-pathspecs', 'add', '-A', '--', ...untracked]));
+  return combineGitRunnerResults(...results);
 }
 
 async function gitCommitIsAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
@@ -2582,14 +2641,11 @@ async function gitCommitIsAncestor(cwd: string, ancestor: string, descendant: st
 /** 合并类命令遇到真实冲突时保留现场并返回输出；其他失败仍按错误处理。 */
 async function runGitPreservingConflict(cwd: string, args: string[]): Promise<GitRunnerResult> {
   try {
-    return await defaultGitCommandRunner(cwd, args);
+    return await runGit(cwd, args);
   } catch (error) {
     if (projectGitExecution.getStore()?.signal?.aborted || (error as { interrupted?: boolean }).interrupted) throw error;
     const status = await getGitStatus(cwd).catch(() => emptyGitStatus());
-    if (status.conflictFiles.length === 0) {
-      const message = error instanceof Error ? error.message : 'Git command failed.';
-      throw gitCoreError('ZEUS_GIT_COMMAND_FAILED', message);
-    }
+    if (status.conflictFiles.length === 0) throw error;
     const candidate = error as { stdout?: unknown; stderr?: unknown; message?: unknown };
     return {
       stdout: typeof candidate.stdout === 'string' ? candidate.stdout : '',
@@ -3111,10 +3167,12 @@ export function withGitOperationSignal<T>(signal: AbortSignal, operation: () => 
   return projectGitExecution.run({ ...projectGitExecution.getStore(), signal }, operation);
 }
 
+/** 所有工作台写操作在公共仓库锁内执行，并沿用调用方的取消与命令记录。 */
 export async function executeProjectGitAction(cwd: string, action: ProjectGitAction, signal?: AbortSignal, env?: NodeJS.ProcessEnv, onCommand?: (command: string) => Promise<void>): Promise<ProjectGitActionResult> {
   return withGitRepositoryOperation(cwd, () => projectGitExecution.run({ signal, env, onCommand }, () => executeProjectGitActionInternal(cwd, action)));
 }
 
+/** 在已持有的锁内读取实际仓库状态，校验动作目标后执行 Git。 */
 async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAction): Promise<ProjectGitActionResult> {
   const context = await getGitRepositoryContext(cwd);
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected directory is not a Git repository.');
@@ -3183,8 +3241,7 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
       break;
     }
     case 'stage':
-      args = ['--literal-pathspecs', 'add', '-A', '--', ...requireRepositoryPaths(repositoryPath, action.paths)];
-      break;
+      return finishProjectGitAction(repositoryPath, action.type, await stageRepositoryPaths(repositoryPath, requireRepositoryPaths(repositoryPath, action.paths)));
     case 'unstage':
       args = context.headSha
         ? ['--literal-pathspecs', 'restore', '--staged', '--', ...requireRepositoryPaths(repositoryPath, action.paths)]
@@ -3223,9 +3280,7 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
           if (entry) throw gitCoreError('ZEUS_GIT_SELECTION_CHANGED', '重命名来源又出现文件，请同时选择该文件或先处理其更改。');
           paths.push(file.originalPath);
         }
-        // 已暂存删除不再属于索引；通过 Git 展开可暂存路径，保留删除与重命名两端的提交范围。
-        const stagePaths = splitNullRecords((await runGit(repositoryPath, ['--literal-pathspecs', 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', ...paths])).stdout);
-        if (stagePaths.length) await runGit(repositoryPath, ['--literal-pathspecs', 'add', '-A', '--', ...stagePaths]);
+        await stageRepositoryPaths(repositoryPath, paths);
         args = ['--literal-pathspecs', 'commit', '--only', '-m', message, '--', ...paths];
       } else args = ['commit', '-m', message];
       break;
@@ -3290,6 +3345,12 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
       args = ['cherry-pick', await resolveCommit(repositoryPath, action.revision)];
       break;
     case 'merge':
+      if (typeof action.expectedBranch !== 'string' || !action.expectedBranch.trim() || typeof action.expectedHeadSha !== 'string' || !action.expectedHeadSha.trim()) {
+        throw gitCoreError('ZEUS_GIT_MERGE_CONTEXT_REQUIRED', '合并必须提供已确认的目标分支与提交，请刷新仓库后重新确认。');
+      }
+      if (context.detached || action.expectedBranch !== context.branch || action.expectedHeadSha !== context.headSha) {
+        throw gitCoreError('ZEUS_GIT_MERGE_CONTEXT_CHANGED', '目标分支或提交已变化，本次合并未执行。请刷新仓库后重新确认。');
+      }
       args = ['merge', '--no-edit', await assertGitBranchFormat(repositoryPath, action.branchName, 'merge branch')];
       break;
     case 'rebase':

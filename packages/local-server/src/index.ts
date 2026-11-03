@@ -4,7 +4,7 @@ export { readPricingDocument } from './modelPricingDocument.js';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
 import { assertContextCapacitySupported, asyncMessageQuestions } from '@zeus/shared';
 import type { ConversationWorktreeOptions } from '@zeus/shared';
-import { createDistributionContext, type DistributionConfig } from '@zeus/shared';
+import type { DistributionConfig } from '@zeus/shared';
 
 import type { TaskWorkToolPort } from './taskWorkDynamicTools.js';
 import { parseJsonObject } from './localServerPlatformSupport.js';
@@ -29,7 +29,7 @@ import {
   readCodexTurnItems,
 } from '@zeus/ai-runtime';
 import { type GitDiffSummary, type GitStatusSummary } from '@zeus/git-core';
-import { type AutoUpdatePolicy, type ReleaseReadiness } from './releaseCore.js';
+import { resolveReleaseUpdateManifestUrl, type AutoUpdatePolicy, type ReleaseReadiness } from './releaseCore.js';
 import { createPlatformSecretStore, type SecretPresenceLabel, type SecretStore } from './securityCore.js';
 import { normalizeNetworkProxySettings } from '@zeus/shared';
 import { applyNetworkProxyAtStartup } from './networkProxyRuntime.js';
@@ -144,6 +144,7 @@ import { ConversationDispatchCommandApplication } from './conversationDispatchCo
 import { createConversationExecutionContextOperations } from './conversationExecutionContextOperations.js';
 import { ConversationExecutionCoordinator, type ConversationExecutionRoute } from './conversationExecutionCoordinator.js';
 import { ManagedConversationToolResultStore } from './conversationPortableContext.js';
+import { ConversationSourceContextReader } from './conversationSourceContext.js';
 import { ConversationQueueCoreMutationApplication, selectAutomaticQueueDispatchCandidate } from './conversationQueueCoreMutationApplication.js';
 import { ConversationQueueDispatchScheduler, mustWaitForInProcessRuntimeTurn, shouldRequestConversationQueueDispatch } from './conversationQueueDispatchScheduler.js';
 import { isObjectLike } from './conversationResourcePreview.js';
@@ -669,16 +670,6 @@ export type TelegramDispatchPreviewBody = TelegramUpdate;
 const telegramNotificationSettingsKey = 'telegram.notificationSettings';
 const telegramSecuritySettingsKey = 'telegram.securitySettings';
 
-function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean, distribution?: DistributionConfig): string {
-  const { zeusReleaseManifestUrl, isZeusReleaseUrl } = createDistributionContext(distribution);
-  const fallback = process.platform === 'win32' ? zeusReleaseManifestUrl.replace('zeus-release-manifest.json', 'zeus-release-manifest-win32.json') : zeusReleaseManifestUrl;
-  const candidate = configured?.trim() || fallback;
-  const url = new URL(candidate);
-  if (isZeusReleaseUrl(candidate)) return url.toString();
-  if (allowUntrustedTest && url.protocol === 'http:' && url.hostname === '127.0.0.1' && Boolean(url.port)) return url.toString();
-  throw new Error('Zeus release update manifest URL is not trusted.');
-}
-
 const telegramRuntimeSummaryLogInterval = 5;
 const NON_CODEX_LEGACY_HISTORY_LIMIT = 12;
 
@@ -875,6 +866,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   let dispatchUnifiedConversationQueueHead: ((conversationId: string) => Promise<void>) | null = null;
   let dispatchQueuedExpertRound: ((submissionId: string) => Promise<void>) | null = null;
   const conversationToolResults = new ManagedConversationToolResultStore(dataLayout.conversationToolResults, conversationExecution, artifactStore);
+  /** 来源身份与原文读取共用产品持久记录，模型不接触本机日志路径。 */
+  const conversationSources = new ConversationSourceContextReader(conversations, conversationSubmissions, conversationProviderItems, conversationSnapshotV2);
   if (!readOnlyValidation) conversationExecution.setDispatchEnabled(false);
   if (!readOnlyValidation) await db.save();
   const executionHostAppVersion = (typeof options.currentAppVersion === 'function' ? options.currentAppVersion() : options.currentAppVersion)?.trim() || '0.0.0';
@@ -931,6 +924,8 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   const eventSubscribers = new Set<ConversationRealtimeSocket>();
   /** IM 复用现有提交后事件；未启用连接时监听回调只作常量时间判断。 */
   let imRealtimeObserver: ((event: ZeusRealtimeEvent) => void) | undefined;
+  /** 本机领域订阅者在同一提交后事件流内处理失效和交付唤醒。 */
+  const realtimeObservers = new Set<(event: ZeusRealtimeEvent) => void>();
   const nativeLocalEventGenerationId = `zeus-local-${randomUUID()}`;
   const conversationEventFlow = new ConversationEventFlowControl();
   const realtimeSubscriberHighWaterBytes = conversationEventFlowBudgets.websocket.maximumBufferedBytes;
@@ -1551,6 +1546,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
         redactSensitiveText,
         execution: conversationExecution,
         toolResults: conversationToolResults,
+        sourceContexts: conversationSources,
         plugins: zeusConversationPluginRuntime,
         configuredMcp: zeusConfiguredMcpRuntime,
         browserAutomation: options.browserAutomation,
@@ -2058,6 +2054,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
       execution: conversationExecution,
       commandDeliveries,
       toolResults: conversationToolResults,
+      sourceContexts: conversationSources,
       // 只读检查与后台同步都必须核对真正收到本次发送的候选线程。
       reconcileOutcomeUnknownSwitches: (conversationId) => recoverUnifiedOutcomeUnknownSwitches(conversationId),
       eventFlow: conversationEventFlow,
@@ -2696,6 +2693,14 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   /** 慢订阅者在有界高水位断开，随后通过耐久游标补拉，避免 Core 为单个窗口无界缓存。 */
   function broadcastRealtimeEvent(event: ZeusRealtimeEvent): void {
     imRealtimeObserver?.(event);
+    for (const observe of realtimeObservers) {
+      try {
+        observe(event);
+      } catch (error) {
+        // 摘要或交付唤醒失败不能阻断会话事实向其他订阅者传播。
+        console.error('本机领域事件订阅处理失败。', event.type, error);
+      }
+    }
     const encoded = JSON.stringify(event);
     for (const subscriber of eventSubscribers) {
       if (subscriber.readyState !== subscriber.OPEN) continue;
@@ -3235,6 +3240,7 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
   traceStartup('runtime_sessions_ready');
 
   conversationOperations = createConversationApplicationOperations({
+    conversationSources,
     settings,
     conversationGoals,
     aiRuntimeManager,
@@ -3753,6 +3759,12 @@ async function createLocalServerWithDatabase(options: CreateLocalServerOptions, 
     setImRealtimeObserver: (listener: ((event: ZeusRealtimeEvent) => void) | undefined) => {
       imRealtimeObserver = listener;
     },
+    /** 返回注销函数，宿主关闭后不再接收领域事件。 */
+    subscribeRealtimeEvents: (listener: (event: ZeusRealtimeEvent) => void) => {
+      realtimeObservers.add(listener);
+      return () => realtimeObservers.delete(listener);
+    },
+    taskWorkspaceIgnoredPaths: gitIntegrationOperations.taskWorkspaceIgnoredPaths,
     executeConversationDispatchMessage,
     executeConversationDispatchRequestResponse,
     executeProjectConversationIdempotent,

@@ -1,6 +1,5 @@
 import { resolveGitDeliveryConflictWorkspace } from './gitDeliveryExecution.js';
 import { piSdkBinaryVersion } from '@zeus/ai-runtime';
-import { projectConversationTurnFailure } from '@zeus/storage';
 import { resolveContextCapacityPolicy } from './contextCapacitySupport.js';
 import { assertContextCapacity, assertContextCapacitySupported, contextCapacityUnavailableReason } from '@zeus/shared';
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
@@ -15,6 +14,7 @@ import { mergeEmployeeWorkSettings, type EmployeeWorkSettings } from '@zeus/shar
 import { TaskWorkPlanningRepository } from '@zeus/storage';
 import { asyncMessageQuestions, formatAsyncQuestionAnswer, validateCanonicalRequestUserInputAnswers, type AsyncQuestionAnswer } from '@zeus/shared';
 import { userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
+import type { ConversationSourceContextReader } from './conversationSourceContext.js';
 import { type AiRuntimeSession, createAiRuntimeSessionManager, modelConnectionCredentialSlotId, modelRef, piRuntimeWorkerProtocolVersion, runWithCodexRpcRetryContext } from '@zeus/ai-runtime';
 import { getGitBranchHead, getGitRepositoryContext, readTaskIntegrationConflictPaths, type ProjectGitAction } from '@zeus/git-core';
 import {
@@ -77,14 +77,14 @@ import { type ConversationCapabilitiesSnapshot, ConversationCapabilityQueryAppli
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
 import { ConversationExecutionCoordinator, type ConversationExecutionRoute } from './conversationExecutionCoordinator.js';
 import type { NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { appendConversationResourceContext, connectionRetryPrompt, conversationTurnHasCompletedOutput, readNativeConversationSkillReferences, readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
+import { appendConversationResourceContext, failedTurnRetryPrompt, conversationTurnHasCompletedOutput, readNativeConversationSkillReferences, readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
 import type { CreateConversationMessageBody, NativeConversationAttachment, ProjectConversationAcceptanceReservation, StartProjectConversationBody, StartTaskConversationBody, TaskConversationAcceptanceReservation } from './index.js';
 import { createModelConnectionService } from './modelConnectionService.js';
 import { resolveWritableNonCodexLegacyConversation, type WritableNonCodexLegacyConversationContext } from './nonCodexLegacyRuntime.js';
 import { createPiNativeConversationCoordinator } from './piNativeConversationCoordinator.js';
 import { type RuntimeSettingsSnapshot } from './runtimeQueryApplication.js';
 import type { AppShellSettingsSnapshot } from './localServerSettingsNormalization.js';
-import { buildTaskConflictAiConversationTitle, buildTaskConflictAiPrompt } from './taskConflictAi.js';
+import { buildGitConflictIntentContext, buildTaskConflictAiConversationTitle, buildTaskConflictAiPrompt } from './taskConflictAi.js';
 import type { ZeusConversationPluginRuntime } from './zeusConversationPluginRuntime.js';
 import type { ZeusPluginService } from './zeusPluginService.js';
 import { readDigitalTeamTaskPushPolicy } from './digitalTeamWorkflowExecutionPolicy.js';
@@ -94,6 +94,8 @@ export { inspectReadOnlyValidationManifest, verifyReadOnlyValidationDescriptor, 
 // 拆分期间保留结构化工厂依赖，后续按领域端口继续收窄。
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ConversationApplicationOperationDependencies = Record<string, any> & {
+  /** 来源引用与模型读取共用服务端归属校验。 */
+  conversationSources: ConversationSourceContextReader;
   aiRuntimeManager: ReturnType<typeof createAiRuntimeSessionManager>;
   artifactStore: ArtifactStore;
   codexNativeCoordinator: ReturnType<typeof createCodexNativeConversationCoordinator>;
@@ -233,6 +235,8 @@ export function isNativeApiRecord(value: unknown): value is Record<string, unkno
 }
 
 export function createConversationApplicationOperations(dependencies: ConversationApplicationOperationDependencies) {
+  /** 初始来源及后续引用使用同一个核实和原文快照入口。 */
+  const conversationSources = dependencies.conversationSources;
   const {
     aiRuntimeManager,
     appendAuditLog,
@@ -1349,7 +1353,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         if (parseJsonObject(existing.inputJson).internalOperation !== true) throw nativeApiError('ZEUS_INVALID_CONVERSATION_RETRY', '该恢复身份已由其他请求使用。');
         return { statusCode: 202, body: toNativeDurableAcceptance(input.operationIdentity, idempotencyKey, conversation, existing) };
       }
-      /** 只允许续接最新的明确网络失败，拒绝活动轮次和未知送达。 */
+      /** 手动续接只要求最新轮次明确失败，错误分类不限制恢复；仍拒绝活动轮次和未知送达。 */
       const turn = conversationTurns
         .listByConversation(conversation.id)
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
@@ -1357,7 +1361,6 @@ export function createConversationApplicationOperations(dependencies: Conversati
       if (
         turn?.providerTurnId !== retryOfTurnId ||
         turn.status !== 'failed' ||
-        projectConversationTurnFailure(parseJsonObject(turn.errorJson ?? '{}')).category !== 'network' ||
         conversationTurns.getLatestActiveByConversation(conversation.id) ||
         conversationSubmissions.listQueueProjectionByConversation(conversation.id).some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status))
       ) {
@@ -1380,7 +1383,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       /** 新提交只携带服务端生成的续接意图，不复制原用户消息和附件。 */
       const restored = await acceptNativeConversationMessage(
         conversation,
-        connectionRetryPrompt,
+        failedTurnRetryPrompt,
         {
           clientUserMessageId: idempotencyKey,
           displayText: '已请求继续上次中断的操作',
@@ -1754,7 +1757,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
               throw nativeApiError('ZEUS_INVALID_CONVERSATION_MESSAGE', 'composerDraft must be a string no longer than 100000 characters.');
             })();
     const browserCommentContent = normalizeNativeBrowserCommentContent(body.browserCommentContent);
-    const conversationContext = normalizeNativeConversationContext(body.conversationContext);
+    const conversationContext = conversationSources.enrich(normalizeNativeConversationContext(body.conversationContext) ?? undefined, conversation);
     if (body.pluginReferences !== undefined) {
       if (!zeusPluginService) throw nativeApiError('ZEUS_PLUGINS_UNAVAILABLE', 'Zeus Plugin Host 当前不可用，不能接受结构化 Plugin/Skill 引用。');
       await zeusPluginService.validateExplicitReferences({ projectId: conversation.projectId, references: body.pluginReferences });
@@ -2282,6 +2285,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         typeof anchor.selectedText !== 'string' ||
         !anchor.selectedText.trim() ||
         anchor.selectedText.length > 20_000 ||
+        (anchor.sourceConversationId !== undefined && (typeof anchor.sourceConversationId !== 'string' || !anchor.sourceConversationId.trim() || anchor.sourceConversationId.length > 200)) ||
         (entry.note !== undefined && (typeof entry.note !== 'string' || entry.note.length > 20_000))
       ) {
         throw nativeApiError('ZEUS_INVALID_CONVERSATION_CONTEXT', `Response annotation ${index} is invalid.`);
@@ -2316,7 +2320,10 @@ export function createConversationApplicationOperations(dependencies: Conversati
     if (Buffer.byteLength(serialized, 'utf8') > 1_000_000) {
       throw nativeApiError('ZEUS_INVALID_CONVERSATION_CONTEXT', 'conversationContext must be no larger than 1 MB.');
     }
-    return JSON.parse(serialized) as Record<string, unknown>;
+    /** 来源身份和原文快照由服务端重建，不接受客户端伪造的授权依据。 */
+    const normalized = JSON.parse(serialized) as Record<string, unknown>;
+    delete normalized.sourceConversation;
+    return normalized;
   }
 
   function normalizeNativeClientUserMessageId(value: unknown, legacyFallback: string): string {
@@ -2547,7 +2554,11 @@ export function createConversationApplicationOperations(dependencies: Conversati
     /** 批注提示词经过与后续消息相同的校验。 */
     const browserCommentContent = normalizeNativeBrowserCommentContent(body.browserCommentContent);
     /** 首发评论使用后续消息相同的长度与结构校验。 */
-    const conversationContext = normalizeNativeConversationContext(body.conversationContext) ?? undefined;
+    const conversationContext = conversationSources.enrich(
+      normalizeNativeConversationContext(body.conversationContext) ?? undefined,
+      { id: reservation.conversationId, projectId: project.id, taskId: null },
+      !body.source && typeof body.inheritConversationId === 'string' ? body.inheritConversationId : undefined,
+    );
     const content = reviewWorkspace
       ? [
           '请审查当前会话工作树的代码变化。',
@@ -3621,6 +3632,9 @@ export function createConversationApplicationOperations(dependencies: Conversati
           conflictBranch: conflictWorkspace.branchName,
           mode: resolved.integration.mode,
           commitMessage: conflictCommitMessage,
+          sourceHeadSha: resolved.integration.targetHeadSha,
+          taskHeadSha: resolved.integration.taskHeadSha,
+          intentContext: buildGitConflictIntentContext({ conversations, projectId: project.id, scope: { taskId: task.id }, excludedConversationId: reservation.conversationId, task }),
         });
         const selectedAgentKind = modelConversation.agentKind;
         const serviceTierPlan = selectedAgentKind === 'codex' ? await resolveDefaultModelServiceTierPlan() : null;
@@ -3728,7 +3742,11 @@ export function createConversationApplicationOperations(dependencies: Conversati
         /** 校验提示词后再冻结派发计划。 */
         const browserCommentContent = normalizeNativeBrowserCommentContent(body.browserCommentContent);
         /** 首发评论使用后续消息相同的长度与结构校验。 */
-        const conversationContext = normalizeNativeConversationContext(body.conversationContext) ?? undefined;
+        const conversationContext = conversationSources.enrich(
+          normalizeNativeConversationContext(body.conversationContext) ?? undefined,
+          { id: reservation.conversationId, projectId: project.id, taskId: task.id },
+          typeof body.inheritConversationId === 'string' ? body.inheritConversationId.trim() : undefined,
+        );
         const explicitContent = typeof body.content === 'string' ? body.content.trim() : '';
         const canonicalAttachmentInput = body.attachments === undefined && !explicitContent && !browserComments.length ? normalizeTaskPushAttachments(task, project.localPath) : null;
         const attachments = canonicalAttachmentInput?.attachments ?? explicitAttachments;
@@ -4191,6 +4209,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       .send({ error: code, message, cause: userFacingErrorCause(error).cause, ...(code.includes('STALE') || code.includes('RECOVERY_REQUIRED') || code === 'ZEUS_CONVERSATION_ARCHIVE_STATE_UNCONFIRMED' ? { recoveryRequired: true } : {}) });
   }
 
+  /** 解析后台动作白名单，并保留与桌面相同的合并目标快照。 */
   function parseProjectGitAction(value: unknown): ProjectGitAction {
     if (!isNativeApiRecord(value) || typeof value.type !== 'string') throw nativeApiError('ZEUS_GIT_ACTION_INVALID', 'A supported Git action is required.');
     const stringValue = (key: string): string | undefined => (typeof value[key] === 'string' ? value[key].trim() || undefined : undefined);
@@ -4263,7 +4282,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       case 'cherry_pick':
         return { type: 'cherry_pick', revision: stringValue('revision') ?? '' };
       case 'merge':
-        return { type: 'merge', branchName: stringValue('branchName') ?? '' };
+        return { type: 'merge', branchName: stringValue('branchName') ?? '', expectedBranch: stringValue('expectedBranch') ?? '', expectedHeadSha: stringValue('expectedHeadSha') ?? '' };
       case 'rebase':
         return { type: 'rebase', branchName: stringValue('branchName') ?? '' };
       case 'stash':

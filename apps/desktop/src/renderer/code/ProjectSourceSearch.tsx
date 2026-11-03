@@ -232,7 +232,7 @@ export function ProjectSourceSearch(props: {
           {!pending && !error && !files.length ? <p className="project-source-empty">{zh ? '没有匹配的内容。' : 'No matching content.'}</p> : null}
           {files.map((file) => (
             <details key={file.relativePath} className="source-search-file" open>
-              <summary title={file.relativePath}>
+              <summary title={file.relativePath} data-file-path={file.relativePath}>
                 <File aria-hidden="true" />
                 <span>{file.relativePath}</span>
                 <small>{file.matches.length}</small>
@@ -260,6 +260,7 @@ export function ProjectSourceSearch(props: {
                     disabled={replacing}
                     aria-label={`${file.relativePath}:${match.line}:${match.column} ${match.preview}`}
                     title={`${file.relativePath}:${match.line}:${match.column}`}
+                    data-file-path={file.relativePath}
                     onClick={() => props.onOpen(file.relativePath, match.line, match.column)}
                   >
                     <small>{match.line}</small>

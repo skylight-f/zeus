@@ -37,7 +37,8 @@ const copy = {
     equivalentCostHint: '按 API 单价换算的等价费用，不代表订阅实际扣款。',
     remainingCredits: '剩余点数',
     allProviders: '全部供应源',
-    reorderHint: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
+    providers: '供应商',
+    reorderHelp: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
     reorder: '排序',
     loading: '正在读取用量',
     noProviders: '还没有可统计的用量',
@@ -104,7 +105,8 @@ const copy = {
     equivalentCostHint: 'Converted at API rates; this is not an actual subscription charge.',
     remainingCredits: 'Credits remaining',
     allProviders: 'All providers',
-    reorderHint: 'Drag to reorder, or focus a handle and press ↑ ↓',
+    providers: 'Provider',
+    reorderHelp: 'Drag to reorder, or focus a handle and press ↑ ↓',
     reorder: 'Reorder',
     loading: 'Loading usage',
     noProviders: 'No usage recorded yet',
@@ -428,7 +430,7 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
     <section className="menu-bar-usage-provider-list" aria-label={text.allProviders}>
       {props.providers.length > 1 ? (
         <small className="menu-bar-usage-reorder-hint" id="menu-bar-usage-reorder-hint">
-          {text.reorderHint}
+          {text.reorderHelp}
         </small>
       ) : null}
       <span className="menu-bar-usage-sr-only" role="status">
@@ -472,7 +474,7 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
                 draggable
                 aria-label={`${text.reorder} ${fullName}`}
                 aria-describedby="menu-bar-usage-reorder-hint"
-                title={text.reorderHint}
+                title={text.reorderHelp}
                 onDragStart={(event) => {
                   event.dataTransfer.effectAllowed = 'move';
                   event.dataTransfer.setData('text/plain', provider.providerId);

@@ -13,7 +13,6 @@ import { MotionPresence } from '../ui/MotionPresence.js';
 import { FileTypeIcon } from './FileTypeIcon.js';
 import { projectGitFileStatuses } from '../git/projectGitWorkbenchState.js';
 import type { ProjectGitWorkbenchSnapshot } from '../features/git/gitContracts.js';
-import { fileStatusLabel } from './fileStatus.js';
 import './projectCodeSearch.css';
 
 /** 内容分类与项目范围独立，全部分类保留各类结果的来源。 */
@@ -473,7 +472,7 @@ export function WorkspaceSearch(props: WorkspaceSearchProps) {
                     {fileStart && selection.kind === 'source' ? (
                       <div className="project-code-search-file" role="presentation">
                         <FileTypeIcon path={selection.match.relativePath} />
-                        <span data-file-status={fileStatus} data-icon-tooltip={fileStatus ? `${selection.match.relativePath} · ${fileStatusLabel(fileStatus, zh)}` : selection.match.relativePath}>
+                        <span tabIndex={0} data-file-root={selection.project.localPath} data-file-path={selection.match.relativePath} data-file-status={fileStatus} data-icon-tooltip={`${projectName} · ${selection.match.relativePath}`}>
                           {projectName} · {selection.match.relativePath}
                         </span>
                       </div>
@@ -481,6 +480,8 @@ export function WorkspaceSearch(props: WorkspaceSearchProps) {
                     <button
                       type="button"
                       id={`${id}-match-${index}`}
+                      data-file-root={selection.kind === 'source' ? selection.project.localPath : undefined}
+                      data-file-path={selection.kind === 'source' ? selection.match.relativePath : undefined}
                       className={`project-code-search-match${selection.kind !== 'source' ? ' workspace-search-item' : ''}`}
                       role="option"
                       aria-label={selection.kind === 'source' ? `${projectName} · ${selection.match.relativePath}:${selection.match.line}:${selection.match.column} ${selection.match.preview}` : undefined}
@@ -508,7 +509,7 @@ export function WorkspaceSearch(props: WorkspaceSearchProps) {
             <footer className="project-code-search-footer">
               {current?.incomplete ? <p role="status">{zh ? '部分内容达到搜索上限或暂不可用，请缩小范围后重试。' : 'Some content reached a search limit or is unavailable. Refine your search and retry.'}</p> : null}
               {visible.length < selections.length ? <p role="status">{zh ? `每类最多显示 ${searchResultLimit} 条，请选择项目或细化关键词。` : `Up to ${searchResultLimit} results per type. Select a project or refine the query.`}</p> : null}
-              {includeSource ? <span>{zh ? '全部搜索包含文件路径；代码分类查看完整正文命中。仅搜索已保存的 UTF-8 文件。' : 'All includes file paths; Code shows full content matches in saved UTF-8 files.'}</span> : null}
+              {includeSource ? <span>{zh ? '仅搜索已保存的 UTF-8 文件。' : 'Searches saved UTF-8 files only.'}</span> : null}
               <span>{zh ? '↑ ↓ 选择 · Enter 打开 · Esc 关闭' : '↑ ↓ Select · Enter Open · Esc Close'}</span>
             </footer>
           </section>

@@ -1,4 +1,7 @@
+import { copyText } from '../ui/clipboard.js';
+import { displayedFilePath } from '../ui/filePathActions.js';
 import { projectSourcePreviewKind } from '@zeus/shared';
+import { isMacOSPlatform } from '../platform.js';
 import { FilePreview } from './FilePreview.js';
 import type { FilePreviewRequest } from '@zeus/shared';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
@@ -6,7 +9,21 @@ import { createPortal } from 'react-dom';
 import { MenuSurface } from '../ui/MenuSurface.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { Collapsible } from '../ui/Collapsible.js';
-import { Suspense, forwardRef, lazy, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  Suspense,
+  forwardRef,
+  lazy,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import { sourceWorkspaces, sourceModels, sourceModelKey, retainSourceModels, releaseSourceWorkspace } from './sourceEditorState.js';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
@@ -556,6 +573,61 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
     if (activePathRef.current === path) setActivePath(next[Math.min(index, next.length - 1)]?.document.relativePath ?? null);
   }
 
+  /** 快捷键名称沿用当前平台，菜单与执行使用同一组组合键。 */
+  const macShortcuts = isMacOSPlatform();
+  /** 菜单显示名称保留平台常见符号，避免用户猜测组合键。 */
+  const fileShortcutLabels = {
+    createFile: macShortcuts ? '⌘N' : 'Ctrl+N',
+    createDirectory: macShortcuts ? '⌘⇧N' : 'Ctrl+Shift+N',
+    rename: 'F2',
+    move: macShortcuts ? '⌘⇧M' : 'Ctrl+Shift+M',
+    reveal: macShortcuts ? '⌘⇧R' : 'Ctrl+Shift+R',
+    delete: macShortcuts ? '⌘⌫' : 'Delete',
+  };
+  /** 文件树菜单复制真实名称或完整路径，失败保留在当前工作区。 */
+  async function copySourceEntry(entry: ProjectSourceEntry, path: boolean): Promise<void> {
+    setContextMenu(null);
+    if (!(await copyText(path ? displayedFilePath(entry.relativePath, props.project.localPath) : entry.name))) setError(zh ? '复制失败，请重试。' : 'Could not copy. Please try again.');
+  }
+
+  /** 文件树和菜单共用快捷键；编辑器与输入框不参与文件删除操作。 */
+  function handleFileShortcut(entry: ProjectSourceEntry, event: ReactKeyboardEvent<HTMLElement>): void {
+    if (event.defaultPrevented || event.repeat || event.altKey || busyPath || operation || !entry.accessible || (event.target as HTMLElement).closest('input, textarea, [contenteditable="true"]')) return;
+    const primary = macShortcuts ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+    const plain = !event.metaKey && !event.ctrlKey;
+    const key = event.key.toLowerCase();
+    let next: FileOperation = null;
+    if (plain && (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      setContextMenu({ entry, x: bounds.left + 20, y: bounds.bottom });
+    } else if (primary && key === 'c') {
+      void copySourceEntry(entry, event.shiftKey);
+    } else if (primary && key === 'n') {
+      next = { kind: event.shiftKey ? 'create-directory' : 'create-file', parentRelativePath: entry.kind === 'directory' ? entry.relativePath : parentPath(entry.relativePath) };
+    } else if (plain && !event.shiftKey && event.key === 'F2') {
+      next = { kind: 'rename', entry };
+    } else if (primary && event.shiftKey && key === 'm') {
+      next = { kind: 'move', entry };
+    } else if (primary && event.shiftKey && key === 'r') {
+      void bridge?.revealProjectSourceEntry({ projectId: props.project.id, relativePath: entry.relativePath });
+      setContextMenu(null);
+    } else if (!event.shiftKey && (macShortcuts ? primary && ['Backspace', 'Delete'].includes(event.key) : plain && event.key === 'Delete')) {
+      next = { kind: 'delete', entry };
+    } else {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (next) beginOperation(next);
+  }
+
+  /** 目录和搜索结果使用同一右键入口，键盘菜单使用焦点行的位置。 */
+  function openFileContextMenu(entry: ProjectSourceEntry, event: ReactMouseEvent<HTMLButtonElement>): void {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ entry, x: event.clientX, y: event.clientY });
+  }
+
   function beginOperation(next: FileOperation): void {
     setContextMenu(null);
     setOperation(next);
@@ -674,7 +746,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   const breadcrumbs = activePath?.split('/') ?? [];
 
   return (
-    <section className="project-source-workspace" style={{ '--zeus-source-tree-width': `${treeWidth}px` } as CSSProperties} data-tree-open={treeDrawerOpen ? 'true' : 'false'}>
+    <section data-file-root={props.project.localPath} className="project-source-workspace" style={{ '--zeus-source-tree-width': `${treeWidth}px` } as CSSProperties} data-tree-open={treeDrawerOpen ? 'true' : 'false'}>
       {notice || activeTab?.externalChange ? (
         <div className={`project-source-message ${activeTab?.externalChange ? 'failed' : 'success'}`} role="status">
           <span>{activeTab?.externalChange ? (zh ? '文件已在外部发生变化，请重新加载或另存为。' : 'The file changed externally. Reload it or save it as a new file.') : notice}</span>
@@ -776,11 +848,8 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                     busyPath={busyPath}
                     onToggle={(path) => void toggleDirectory(path)}
                     onOpen={(path) => void openFile(path)}
-                    onContextMenu={(entry, event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setContextMenu({ entry, x: event.clientX, y: event.clientY });
-                    }}
+                    onShortcut={handleFileShortcut}
+                    onContextMenu={openFileContextMenu}
                   />
                 )}
               </div>
@@ -1050,8 +1119,17 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                     </button>
                   </>
                 ) : null}
-                <button role="menuitem" type="button" onClick={() => beginOperation({ kind: 'rename', entry: contextMenu.entry })}>
-                  {zh ? '重命名' : 'Rename'}
+                <button role="menuitem" type="button" onClick={() => void copySourceEntry(contextMenu.entry, false)}>
+                  <span>{zh ? '复制文件名' : 'Copy file name'}</span>
+                  <kbd>{macShortcuts ? '⌘C' : 'Ctrl+C'}</kbd>
+                </button>
+                <button role="menuitem" type="button" onClick={() => void copySourceEntry(contextMenu.entry, true)}>
+                  <span>{zh ? '复制路径' : 'Copy path'}</span>
+                  <kbd>{macShortcuts ? '⌘⇧C' : 'Ctrl+Shift+C'}</kbd>
+                </button>
+                <button role="menuitem" type="button" aria-keyshortcuts="F2" onClick={() => beginOperation({ kind: 'rename', entry: contextMenu.entry })}>
+                  <span>{zh ? '重命名' : 'Rename'}</span>
+                  <kbd>{fileShortcutLabels.rename}</kbd>
                 </button>
                 <button role="menuitem" type="button" onClick={() => beginOperation({ kind: 'move', entry: contextMenu.entry })}>
                   {zh ? '移动…' : 'Move…'}
@@ -1209,6 +1287,7 @@ function TreeRows(props: {
   onToggle(path: string): void;
   onOpen(path: string): void;
   onContextMenu(entry: ProjectSourceEntry, event: ReactMouseEvent<HTMLButtonElement>): void;
+  onShortcut(entry: ProjectSourceEntry, event: ReactKeyboardEvent<HTMLElement>): void;
 }) {
   const directory = props.directories[props.directoryPath];
   if (!directory) return null;
@@ -1227,6 +1306,9 @@ function TreeRows(props: {
           disabled={!entry.accessible || props.busyPath === entry.relativePath}
           onClick={() => (directoryEntry ? props.onToggle(entry.relativePath) : props.onOpen(entry.relativePath))}
           onContextMenu={(event) => props.onContextMenu(entry, event)}
+          data-file-path={entry.relativePath}
+          data-icon-tooltip={entry.name}
+          onKeyDown={(event) => props.onShortcut(entry, event)}
         >
           <span className="project-source-disclosure" aria-hidden="true">
             {directoryEntry ? expanded ? <CaretDown size={12} /> : <CaretRight size={12} /> : null}

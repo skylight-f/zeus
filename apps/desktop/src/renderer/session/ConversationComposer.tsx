@@ -30,13 +30,15 @@ import { ServiceTierToggle } from './ServiceTierToggle.js';
 import { resolveModelCapability } from './modelSelection.js';
 import { useConversationInputResources } from './useConversationInputResources.js';
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
+import { browserProjectModelPreferenceStorage, readProjectModelPreferences } from './projectModelPreferences.js';
+import { contextCapacitySelectionAllowed } from './contextCapacitySelection.js';
 import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
-
-import { systemMessageScope, recordSystemMessage, recoverSystemMessage, useConversationSystemMessages } from './conversationSystemMessages.js';
+import { systemMessageScope, recordSystemMessage, recoverSystemMessage, useConversationSystemMessages, handledMessageDeliveryErrors } from './conversationSystemMessages.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import type { ComposerInputHandle } from './MarkdownComposerEditor.js';
 import { useInputSuggestion } from './useInputSuggestion.js';
 import { InputSuggestionButton } from './InputSuggestionControl.js';
+import { selectPendingExecutionMessage } from './sessionSelectors.js';
 
 export type ComposerKeyIntent = 'submit' | 'newline' | 'escape' | 'ignore';
 export interface ComposerRuntimeSettings {
@@ -68,6 +70,8 @@ export interface ConversationComposerProps {
   onRemoveBrowserSubmission?: () => void;
   onContextDraftChange?: (draft: ConversationContextDraft) => void;
   projectId?: string;
+  /** 普通会话切换模型时恢复所属项目的选择。 */
+  restoreProjectModelPreferences?: boolean;
   /** 讨论归属任务，用于读取成员实际继承配置。 */
   taskId?: string;
   onLoadExtensions?: (projectId?: string, forceReload?: boolean) => Promise<import('../features/codex/codexContracts.js').SkillCatalog>;
@@ -175,7 +179,12 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const selectedCapacity = props.runtimeSettings?.contextCapacityTokens !== undefined ? props.runtimeSettings.contextCapacityTokens : (props.state.snapshot?.contextCapacityTokens ?? null);
   const [selectedEffort, setSelectedEffort] = useState(initialEffort);
   const [selectedServiceTier, setSelectedServiceTier] = useState<NativeServiceTierSelection>(initialServiceTier);
-  const active = props.state.conversationState === 'active_prework' || props.state.conversationState === 'active_final_answer';
+  /** 本地发送立即切换主按钮；停止操作仍须取得真实轮次身份后才能启用。 */
+  const active =
+    props.state.conversationState === 'active_prework' ||
+    props.state.conversationState === 'active_final_answer' ||
+    props.state.conversationState === 'starting_turn' ||
+    (props.state.transportState !== 'failed' && Boolean(selectPendingExecutionMessage(props.state)));
   const busy = Boolean(props.state.busyOperation);
   const writable = props.readOnly !== true && props.state.conversationState !== 'legacy_readonly';
   const inputWritable = writable && props.inputBlocked !== true;
@@ -227,6 +236,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
   /** 自动预测要求空输入且无待处理交互；手动生成可以与主会话并行。 */
   const suggestion = useInputSuggestion({
     state: props.state,
+    conversationModelRef: effectiveModel,
     draft: editorValue,
     // 待处理问题由后台读取权威状态；这里仅报告即时输入限制，避免落后的会话投影漏掉完成事件。
     automaticEligible: inputWritable && !hasDraft && editorValue.length === 0 && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
@@ -286,7 +296,11 @@ export function ConversationComposer(props: ConversationComposerProps) {
     void Promise.resolve()
       .then(() => props.onSubmit(nextDelivery, settings))
       .then(() => recoverInputOperation('message_send'))
-      .catch((error: unknown) => recordSystemMessage(systemScope, error, 'message_send', '消息提交失败。'));
+      .catch((error: unknown) => {
+        // 发送中的连接恢复与失败已经显示在原消息下；前置拒绝仍由系统消息承载。
+        if (error && typeof error === 'object' && handledMessageDeliveryErrors.has(error)) return;
+        recordSystemMessage(systemScope, error, 'message_send', '消息提交失败。');
+      });
   }
 
   function enterGoalInput(initialObjective?: string): void {
@@ -612,20 +626,42 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 searchPlaceholder={copy.searchModel}
                 emptyLabel={copy.noModel}
                 onChange={(model) => {
+                  /** 模型能力包含供应商身份及当前允许的参数。 */
                   const capability = resolveModelCapability(props.capabilities?.models, model);
-                  const effort = capability?.defaultReasoningEffort ?? capability?.supportedReasoningEfforts[0] ?? '';
-                  const normalizedTier = normalizeServiceTierSelection({ type: 'standard' }, capability);
+                  /** 完整身份用于区分不同供应商的同名模型。 */
+                  const modelId = capability?.id ?? model;
+                  /** 审查等独立工作流不读取普通会话配置。 */
+                  const storage = props.restoreProjectModelPreferences ? browserProjectModelPreferenceStorage() : undefined;
+                  /** 历史推送模型名只在目录中唯一匹配时恢复。 */
+                  const last = props.projectId ? readProjectModelPreferences(storage, props.projectId) : null;
+                  /** 仅恢复所选项目和模型的选择。 */
+                  const remembered = props.projectId ? (readProjectModelPreferences(storage, props.projectId, modelId) ?? (resolveModelCapability(props.capabilities?.models, last?.model)?.id === modelId ? last : null)) : null;
+                  /** 无已用等级或当前模型不再支持时采用模型默认。 */
+                  const effort = remembered && capability?.supportedReasoningEfforts.includes(remembered.effort) ? remembered.effort : (capability?.defaultReasoningEffort ?? capability?.supportedReasoningEfforts[0] ?? '');
+                  /** 不支持的 Fast 由现有速度控件说明。 */
+                  const normalizedTier = normalizeServiceTierSelection(remembered?.serviceTier ?? { type: 'standard' }, capability);
+                  /** 已记住容量失效时使用默认容量，未有记忆时保留当前会话选择。 */
+                  const capacity = remembered ? (contextCapacitySelectionAllowed(remembered.contextCapacityTokens, capability?.contextCapacity) ? remembered.contextCapacityTokens : null) : selectedCapacity;
+                  if (remembered && remembered.contextCapacityTokens !== capacity) {
+                    recordSystemMessage(
+                      systemScope,
+                      props.language === 'zh-CN' ? '已记住的上下文容量不受当前模型支持，已改用默认容量。' : 'The remembered context capacity is unsupported by this model; the default capacity will be used.',
+                      'message_send',
+                      '模型配置恢复失败。',
+                    );
+                  }
                   setSelectedModel(model);
                   setSelectedEffort(effort);
                   setSelectedServiceTier(normalizedTier.selection);
                   props.onRuntimeSettingsChange?.({
-                    contextCapacityTokens: selectedCapacity,
-                    model,
+                    contextCapacityTokens: capacity,
+                    model: modelId,
                     agentKind: capability?.agentKind,
                     effort,
                     ...serviceTierWireOverride(normalizedTier.selection),
+                    // 切换模型只恢复模型配置，不能带入另一会话记住的权限。
                     permissionMode: props.permissionMode,
-                    collaborationMode: props.collaborationMode,
+                    collaborationMode: remembered?.workMode ?? props.collaborationMode,
                   });
                 }}
               />

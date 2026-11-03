@@ -54,6 +54,8 @@ import {
 import { adaptConversationSnapshotV2, mergeConversationHistoryV2, mergeConversationProcessV2, mergeConversationTurnHistoryV2, resumeCachedConversationSnapshot, updateConversationV2Paging } from './conversationSnapshotV2Adapter.js';
 import { markConversationNavigationRenderReady } from '../performanceTraceContext.js';
 import { selectHasConfirmedUserMessage } from './sessionSelectors.js';
+import { handledMessageDeliveryErrors } from './conversationSystemMessages.js';
+import { reportApplicationError } from '../ui/ApplicationErrorDialog.js';
 
 /** 会话事件流按指数退避重试五次，单次等待小于一分钟。 */
 export const reconnectBackoffMs = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
@@ -411,7 +413,18 @@ export interface SessionController {
   removeBrowserComments(commentIds: string[]): void;
   setContextDraft(contextDraft: ConversationContextDraft): void;
 
-  send(delivery: 'queue' | 'steer_now', expectedTurnId?: string, settings?: NativeTurnSettingsSelection): Promise<NativeOperationAcceptance | void>;
+  /** 普通发送消费输入框；独立选区输入保留输入框草稿并复用相同发送队列。 */
+  send(
+    delivery: 'queue' | 'steer_now',
+    expectedTurnId?: string,
+    settings?: NativeTurnSettingsSelection,
+    message?: {
+      /** 本次直接发送的正文。 */
+      content: string;
+      /** 本次直接发送的引用。 */
+      conversationContext: ConversationContextDraft;
+    },
+  ): Promise<NativeOperationAcceptance | void>;
   /** 回答绑定原问题，独立于 Composer 普通消息草稿。 */
   answerAsyncQuestion(item: NativeSessionItemBuffer, answers: AsyncQuestionAnswer['answers'], asNewMessage?: boolean, answerAttachments?: Record<string, NativeConversationAttachment[]>): Promise<NativeOperationAcceptance | void>;
   retryPendingSend(clientUserMessageId: string, intent: 'check' | 'continue'): Promise<NativeOperationAcceptance | void>;
@@ -1002,6 +1015,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       action.type === 'context_draft_changed' ||
       action.type === 'send_started' ||
       action.type === 'send_failed' ||
+      action.type === 'send_reconcile_progress' ||
       action.type === 'send_uncertain';
     /** 历史接管前补齐已加载用户输入的位置，不能先把它排到有位置的回复之后。 */
     const missingInputPlacement =
@@ -1059,38 +1073,43 @@ export function createSessionController(options: CreateSessionControllerOptions)
     else for (const listener of listeners) listener();
   }
 
+  /** 只有存活的控制器可以保存草稿，避免迟到回执覆盖重新打开后的输入与评论。 */
   function persistDraft(): void {
-    if (!storage) return;
-    const draft = state.draft;
-    const attachments = state.attachments;
-    const browserSubmission = state.browserSubmission;
-    const contextDraft = state.contextDraft;
-    if (
-      !draft &&
-      attachments.length === 0 &&
-      !browserSubmission &&
-      !hasConversationContext(contextDraft) &&
-      recoverableSends.length === 0 &&
-      deferredSends.length === 0 &&
-      acceptedDisplaySends.length === 0 &&
-      pendingBrowserCommentMarks.length === 0
-    ) {
-      storage.removeItem(storageKey);
-      return;
+    if (disposed || (!storage && typeof window === 'undefined')) return;
+    /** 正文、附件和评论作为同一份草稿写入，不能只保存其中一部分。 */
+    const { draft, attachments, browserSubmission, contextDraft } = state;
+    try {
+      if (!storage) throw new Error('本地草稿存储不可用。');
+      if (
+        !draft &&
+        attachments.length === 0 &&
+        !browserSubmission &&
+        !hasConversationContext(contextDraft) &&
+        recoverableSends.length === 0 &&
+        deferredSends.length === 0 &&
+        acceptedDisplaySends.length === 0 &&
+        pendingBrowserCommentMarks.length === 0
+      ) {
+        storage.removeItem(storageKey);
+        return;
+      }
+      storage.setItem(
+        storageKey,
+        JSON.stringify({
+          draft,
+          attachments,
+          ...(browserSubmission ? { browserSubmission } : {}),
+          ...(hasConversationContext(contextDraft) ? { contextDraft } : {}),
+          ...(recoverableSends.length > 0 ? { recoverableSends } : {}),
+          ...(deferredSends.length > 0 ? { deferredSends } : {}),
+          ...(acceptedDisplaySends.length > 0 ? { acceptedDisplaySends } : {}),
+          ...(pendingBrowserCommentMarks.length > 0 ? { pendingBrowserCommentMarks } : {}),
+        } satisfies PersistedDraft),
+      );
+    } catch (error) {
+      reportApplicationError(error, { title: '草稿保存失败', summary: '输入和评论仍保留在当前窗口，但未能保存到本地。请先保留内容再退出 Zeus。' });
+      throw error;
     }
-    storage.setItem(
-      storageKey,
-      JSON.stringify({
-        draft,
-        attachments,
-        ...(browserSubmission ? { browserSubmission } : {}),
-        ...(hasConversationContext(contextDraft) ? { contextDraft } : {}),
-        ...(recoverableSends.length > 0 ? { recoverableSends } : {}),
-        ...(deferredSends.length > 0 ? { deferredSends } : {}),
-        ...(acceptedDisplaySends.length > 0 ? { acceptedDisplaySends } : {}),
-        ...(pendingBrowserCommentMarks.length > 0 ? { pendingBrowserCommentMarks } : {}),
-      } satisfies PersistedDraft),
-    );
   }
 
   /** 持久正文或明确终态清理显示账本；替代提交按权威队列同步换代。 */
@@ -1847,6 +1866,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
         pendingSendReconcileQueue.delete(clientUserMessageId);
         let resolved = false;
         for (let attempt = 0; attempt < pendingSendReconcileAttempts; attempt += 1) {
+          // 每轮退避期间显示本次连接次数；已接纳消息继续静默核对。
+          if (recoverableSend(clientUserMessageId)?.deliveryState === 'uncertain') {
+            dispatch({ type: 'send_reconcile_progress', clientUserMessageId, attempt: attempt + 1, maxAttempts: pendingSendReconcileAttempts });
+          }
           await waitForPendingSendReconcile(attempt);
           /** 每轮都读取该消息最新状态，忽略排队时的旧引用。 */
           const current = recoverableSend(clientUserMessageId);
@@ -1866,6 +1889,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
             break;
           }
         }
+        // 核对结束仍未知时交回原错误组件；接纳和明确失败已由 reducer 排除。
+        dispatch({ type: 'send_reconcile_progress', clientUserMessageId, attempt: 0, maxAttempts: pendingSendReconcileAttempts });
         if (!resolved && recoverableSend(clientUserMessageId)) window.zeus?.reportRendererRuntimeError?.(`消息 ${clientUserMessageId} 连续 ${pendingSendReconcileAttempts} 次未取得权威状态，已保留原消息。`);
       }
     })().finally(() => {
@@ -2193,9 +2218,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
             await hooks.onReadable(
               adaptConversationSnapshotV2({
                 ...readable,
-                queue: emptyQueueWhileHydrating(),
-                requests: [],
-                planImplementationRequests: [],
+                queue: state.queue ?? emptyQueueWhileHydrating(),
+                requests: state.pendingRequests,
+                planImplementationRequests: state.planImplementationRequests,
                 goal: latestGoal ?? fallbackGoalForHydration(),
               }),
             );
@@ -2407,15 +2432,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
       // 已有权威快照时保持稳定的重连状态，不能在 reconnecting/hydrating 间反复切换并触发整页同步闪烁。
       if (!reconnecting || !state.snapshot) dispatch({ type: 'transport_changed', transportState: 'hydrating' });
       const progressiveHydration = loadConversationForProgressiveHydration({
-        ...(!state.snapshot
-          ? {
-              onReadable: async (readableSnapshot: NativeConversationSnapshot): Promise<void> => {
-                if (disposed || token !== connectionToken || state.snapshot) return;
-                markConversationNavigationRenderReady(options.projectId, options.conversationId);
-                await applyAuthoritativeSnapshot(readableSnapshot);
-              },
-            }
-          : {}),
+        // 命中旧缓存也立即接管最新正文与摘要，不等待队列、确认项和目标读取。
+        onReadable: async (readableSnapshot: NativeConversationSnapshot): Promise<void> => {
+          if (disposed || token !== connectionToken || (state.snapshot && state.snapshot.throughEventSeq > readableSnapshot.throughEventSeq)) return;
+          if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
+          await applyAuthoritativeSnapshot(readableSnapshot);
+        },
         onGoal: (response) => {
           if (disposed || token !== connectionToken) return;
           dispatch({ type: 'goal_hydrated', conversationId: options.conversationId, response });
@@ -2458,8 +2480,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
       }
       // Snapshot 已经权威且可独立阅读；实时连接只负责后续增量，不能继续遮住已取得的历史。
       if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
-      const snapshotAlreadyApplied = reconnecting && state.snapshot?.id === snapshot.id && state.snapshot.throughEventSeq === snapshot.throughEventSeq && state.snapshot.syncStreamGeneration === snapshot.syncStreamGeneration;
-      if (!snapshotAlreadyApplied) await applyAuthoritativeSnapshot(snapshot);
+      // 正文可能已在同一事件水位提前显示，完整快照仍须接管队列与交互状态。
+      await applyAuthoritativeSnapshot(snapshot);
       await reconcilePersistedAcceptance(snapshot);
       try {
         await withSessionTimeout(lifecycle.opened, conversationRealtimeOpenTimeoutMs, () => new ConversationRealtimeOpenTimeoutError());
@@ -2643,7 +2665,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
         if (explicitFailure) restoreFailedEnvelopeComposer(unresolvedEnvelope);
         persistDraft();
         // 结果不确定只影响本消息，后台只读核对不会阻止用户继续发送。
-        if (!explicitFailure) schedulePendingSendReconcile(unresolvedEnvelope);
+        if (!explicitFailure) {
+          dispatch({ type: 'send_reconcile_progress', clientUserMessageId: trackedEnvelope.clientUserMessageId, attempt: 1, maxAttempts: pendingSendReconcileAttempts });
+          schedulePendingSendReconcile(unresolvedEnvelope);
+        }
+        // 错误继续向调用方传播，但 Composer 不重复记录已由原消息接管的提示。
+        if (error && typeof error === 'object') handledMessageDeliveryErrors.add(error);
         throw error;
       }
     })().finally(() => {
@@ -3562,14 +3589,14 @@ export function createSessionController(options: CreateSessionControllerOptions)
       });
     },
     /** 接收一次发送意图；内部确认未完成时保存到已有队列并自动接续。 */
-    send(delivery, expectedTurnId, settings) {
+    send(delivery, expectedTurnId, settings, message) {
       const normalizedExpectedTurnId = expectedTurnId || undefined;
       const requestedCollaborationMode = settings?.collaborationMode ?? state.snapshot?.collaborationMode ?? 'default';
       if (activeOperation) return rejectSend(new Error(`Session operation already in progress: ${activeOperation.key}`));
-      const draft = state.draft;
-      const composerAttachments = [...state.attachments];
-      const browserSubmission = state.browserSubmission ? structuredClone(state.browserSubmission) : null;
-      const contextDraft = structuredClone(state.contextDraft);
+      const draft = message ? message.content : state.draft;
+      const composerAttachments = message ? [] : [...state.attachments];
+      const browserSubmission = !message && state.browserSubmission ? structuredClone(state.browserSubmission) : null;
+      const contextDraft = structuredClone(message ? message.conversationContext : state.contextDraft);
       if (!draft.trim() && composerAttachments.length === 0 && !browserSubmission && !hasConversationContext(contextDraft)) {
         return rejectSend(new Error('请输入消息，或添加附件、评论后再发送。'));
       }
@@ -3614,6 +3641,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
         browserSubmission,
         contextDraft,
         delivery,
+        // 直接发送的选区不属于输入框，接纳、重连和重试均保留原草稿。
+        ...(message ? { composerConsumed: true } : {}),
         ...(normalizedExpectedTurnId ? { expectedTurnId: normalizedExpectedTurnId } : {}),
         ...(appliedSettings?.model ? { model: appliedSettings.model } : {}),
         ...(appliedSettings?.agentKind ? { agentKind: appliedSettings.agentKind } : {}),
@@ -3710,7 +3739,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       await applyAuthoritativeSnapshot(await loadConversationForHydration());
       /** 只续跑最新的明确失败，不自动重放未知送达或已完成的请求。 */
       const turn = state.snapshot?.turns.toSorted((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)).at(-1);
-      if (turn?.providerTurnId !== providerTurnId || turn.status !== 'failed' || turn.error?.category !== 'network') throw new Error('该轮次已改变，请检查当前会话后重试。');
+      if (turn?.providerTurnId !== providerTurnId || turn.status !== 'failed') throw new Error('该轮次已改变，请检查当前会话后重试。');
       if (activeOperation || sendOperations.size > 0 || deferredSends.length || state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)))
         throw new Error('请先处理尚未确认的消息。');
       /** 同一失败轮次的重复点击和重启复用发送身份。 */
@@ -4051,7 +4080,8 @@ function browserStorage(): SessionDraftStorage | undefined {
 
 /** 输入框可显示安全空值，后台调用方同时接收读取失败，避免误启动模型。 */
 function readPersistedDraft(storage: SessionDraftStorage | undefined, key: string, onReadError?: () => void): PersistedDraft {
-  const empty: PersistedDraft = { draft: '', attachments: [], contextDraft: structuredClone(emptyConversationContextDraft) };
+  /** 没有磁盘记录时保留上下文缺省，让会话接管继续使用已有的创建期评论。 */
+  const empty: PersistedDraft = { draft: '', attachments: [] };
   if (!storage) return empty;
   try {
     const raw = storage.getItem(key);

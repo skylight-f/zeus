@@ -54,10 +54,14 @@ export interface BatchDeliveryResult {
   repositoryName: string;
   status: BatchDeliveryStatus;
   message: string;
+  /** 原始失败保留错误链，详情窗口可读取 Git 输出。 */
+  error?: unknown;
 }
 
 /** 交付视图只消费显示事实，不要求普通目录伪造任务工作区。 */
 export interface DeliveryRepositoryGroup {
+  /** 文件复制沿用实际工作目录；缺省仍提供原始相对路径。 */
+  localPath?: string;
   workspace: Pick<TaskWorkspaceIndexSnapshot, 'id' | 'branchName' | 'state' | 'repositoryName' | 'repositoryRelativePath'>;
   detail: Pick<TaskWorkspaceSnapshot, 'review'> | undefined;
   files: DeliveryFile[];
@@ -67,7 +71,7 @@ export interface DeliveryRepositoryGroup {
 }
 
 /** 本机读取失败保留重试，不能把未加载误报为没有变化。 */
-export function InitialLoadState(props: { zh: boolean; error?: string | null; onRetry?: () => void }) {
+export function InitialLoadState(props: { zh: boolean; error?: unknown; onRetry?: () => void }) {
   return (
     <section className="task-git-delivery-load-state" role={props.error ? 'alert' : 'status'}>
       {props.error ? <VisibleApplicationError error={props.error} language={props.zh ? 'zh-CN' : 'en'} /> : <strong>{props.zh ? '正在读取本机 Git 信息…' : 'Loading local Git information…'}</strong>}
@@ -196,7 +200,7 @@ export function DeliveryRepositoryFileTree(props: {
                 /** 本仓库选中路径供目录与文件共用。 */
                 const selectedPaths = new Set(props.selectedPathsByWorkspace[workspaceId] ?? []);
                 return (
-                  <details open key={workspaceId} className={`task-git-delivery-repository${props.focusedWorkspaceId === workspaceId ? ' is-focused' : ''}`}>
+                  <details open data-file-root={group.localPath} key={workspaceId} className={`task-git-delivery-repository${props.focusedWorkspaceId === workspaceId ? ' is-focused' : ''}`}>
                     <summary>
                       <label>
                         <input type="checkbox" checked={workspaceSelected} onChange={(event) => props.onToggleWorkspace(workspaceId, event.target.checked)} disabled={props.disabled || group.workspace.state === 'discarded'} />
@@ -340,7 +344,7 @@ function DeliveryDirectoryEntries(props: Parameters<typeof DeliveryDirectoryFile
           <li key={path}>
             {directory ? (
               <details open className="task-git-delivery-directory">
-                <summary data-icon-tooltip={path}>
+                <summary data-file-path={path} data-icon-tooltip={name.slice(0, -1)}>
                   {checkbox}
                   <DeliveryEntryIcon />
                   <span>{name.slice(0, -1)}</span>
@@ -353,7 +357,8 @@ function DeliveryDirectoryEntries(props: Parameters<typeof DeliveryDirectoryFile
                 {checkbox}
                 <button
                   type="button"
-                  data-icon-tooltip={`${path} · ${fileStatusLabel(files[0].status, props.zh)}`}
+                  data-file-path={path}
+                  data-icon-tooltip={name}
                   aria-label={`${path} · ${fileStatusLabel(files[0].status, props.zh)}`}
                   aria-pressed={props.selectedFile === path}
                   onClick={() => props.onSelect(path)}
@@ -494,7 +499,7 @@ function BatchDeliveryResults(props: { results: BatchDeliveryResult[]; zh: boole
           <li key={result.workspaceId} data-status={result.status}>
             <b>{props.zh ? { succeeded: '成功', skipped: '跳过', attention: '待处理', failed: '失败' }[result.status] : result.status}</b>
             <span>{result.repositoryName}</span>
-            <small>{result.message}</small>
+            <small>{result.error ? <VisibleApplicationError error={result.error} summary={result.message} title={result.repositoryName} language={props.zh ? 'zh-CN' : 'en'} /> : result.message}</small>
           </li>
         ))}
       </ol>
@@ -546,7 +551,7 @@ export function GitDeliveryWorkspace(props: {
         <GitPaneSeparator name="delivery-height" label={props.zh ? '调整文件区与差异区高度' : 'Resize files and diff'} axis="y" initial={42} min={25} max={65} />
         <main className="task-git-review-main task-git-delivery-diff-main">
           <header className="task-git-review-pane-title">
-            <strong data-icon-tooltip={props.selectedFile} data-file-status={props.fileStatus}>
+            <strong tabIndex={0} data-file-path={props.selectedFile || undefined} data-icon-tooltip={props.diffTitle} data-file-status={props.fileStatus}>
               {props.diffTitle}
             </strong>
           </header>
@@ -591,13 +596,15 @@ export function GitDeliveryActions(props: {
   commitFeedback?: ReactNode;
   /** 合入选择器标明来源或目标，避免额外常驻说明段落。 */
   mergeLabel?: string;
-  mergeTarget: string;
-  mergeOptions: ComponentProps<typeof ZeusSelect>['options'];
-  onMergeTargetChange: (value: string) => void;
+  mergeTarget?: string;
+  mergeOptions?: ComponentProps<typeof ZeusSelect>['options'];
+  onMergeTargetChange?: (value: string) => void;
   mergeDisabled: boolean;
   mode: 'merge' | 'squash';
   onModeChange?: (value: 'merge' | 'squash') => void;
   mergeCount: number;
+  /** 任务交付明确覆盖工作目录全部仓库，独立仓库操作仍使用所选范围。 */
+  mergeAll?: boolean;
   onMerge: () => void;
   mergeIssues?: ReactNode;
   mergeFeedback?: ReactNode;
@@ -651,24 +658,34 @@ export function GitDeliveryActions(props: {
           <strong>{props.zh ? '合入分支' : 'Merge branch'}</strong>
         </div>
         <div className="task-git-delivery-merge-row">
-          <ZeusSelect
-            size="compact"
-            ariaLabel={props.mergeLabel ?? (props.zh ? '合入目标分支' : 'Target branch')}
-            value={props.mergeTarget}
-            options={props.mergeOptions}
-            onChange={props.onMergeTargetChange}
-            disabled={busy || props.mergeDisabled}
-            searchPlaceholder={props.zh ? '搜索本地分支' : 'Search local branches'}
-          />
+          {props.onMergeTargetChange ? (
+            <ZeusSelect
+              size="compact"
+              ariaLabel={props.mergeLabel ?? (props.zh ? '合入目标分支' : 'Target branch')}
+              value={props.mergeTarget ?? ''}
+              options={props.mergeOptions ?? []}
+              onChange={props.onMergeTargetChange}
+              disabled={busy || props.mergeDisabled}
+              searchPlaceholder={props.zh ? '搜索本地分支' : 'Search local branches'}
+            />
+          ) : null}
           <Button
             variant="secondary"
             size="compact"
-            aria-label={props.zh ? `合入所选仓库（${props.mergeCount}）` : `Merge selected repositories (${props.mergeCount})`}
+            aria-label={
+              props.mergeAll
+                ? props.zh
+                  ? `全部合入各自来源分支（${props.mergeCount} 个仓库）`
+                  : `Merge all ${props.mergeCount} repositories into their source branches`
+                : props.zh
+                  ? `合入所选仓库（${props.mergeCount}）`
+                  : `Merge selected repositories (${props.mergeCount})`
+            }
             busy={props.busyAction === 'merge'}
             onClick={props.onMerge}
             disabled={busy || props.mergeCount === 0}
           >
-            {props.zh ? '合入' : 'Merge'}
+            {props.zh ? (props.mergeAll ? '全部合入来源分支' : '合入') : props.mergeAll ? 'Merge all into source branches' : 'Merge'}
             {props.mergeCount > 0 ? `（${props.mergeCount}）` : ''}
           </Button>
         </div>

@@ -44,7 +44,7 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
     taskTableLayoutDirty,
     zeusWindowForeground,
   } = state;
-  const { acknowledgeNativeConversationAttention, nativeConversationAttentionRetryRevision, openTaskConflictAiConversation, recordLocalError, refreshArchivedConversations } = domainActions;
+  const { acknowledgeNativeConversationAttention, nativeConversationAttentionRetryRevision, openTaskConflictAiConversation, openTaskGitDelivery, recordLocalError, refreshArchivedConversations } = domainActions;
   const { openProjectSection, refreshCodexConfigImport, requestWorkspaceLeave } = operations;
   useEffect(() => {
     if (activeNavTarget !== 'settings' || settingsCategory !== 'runtime' || codexConfigImportPreview || codexConfigImportLoading || !props.onInspectCodexConfigImport) return;
@@ -149,6 +149,7 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
       void client
         .startTaskIntegrationConflictAi(pending.taskId, pending.integrationId, pending.path, pending.content, pending.fingerprint, pending.permissionMode, pending.idempotencyKey, pending.skillId)
         .then(async (operation) => {
+          if (pending.deliveryInput) await client.startGitDeliveryRun(pending.projectId, pending.deliveryInput, `${pending.idempotencyKey}:delivery`);
           clearPendingConflictAiStart(pending.idempotencyKey);
           if (disposed) return;
           await openTaskConflictAiConversation(pending.taskId, operation.conversationId);
@@ -183,7 +184,21 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
     return () => window.cancelAnimationFrame(frame);
   }, [sessionDrawerReady, sessionDrawerTarget]);
   useEffect(() => {
-    /** 快捷键沿用本地的独立工作区入口。 */
+    /** macOS 的 Cmd+K 与 Windows 的 Ctrl+K 共用任务代码交付入口。 */
+    function onCodeDeliveryShortcut(event: globalThis.KeyboardEvent): void {
+      if (!(isMacOSPlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey || event.repeat || event.isComposing || event.defaultPrevented) return;
+      if (event.key.toLowerCase() !== 'k' || !selectedNativeConversation?.taskId || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
+      /** 文本输入保留编辑器自己的快捷键，交付操作只处理工作区按键。 */
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+      event.preventDefault();
+      openTaskGitDelivery(selectedNativeConversation.taskId, selectedNativeConversation.workspaceId);
+    }
+    window.addEventListener('keydown', onCodeDeliveryShortcut);
+    return () => window.removeEventListener('keydown', onCodeDeliveryShortcut);
+  }, [openTaskGitDelivery, selectedNativeConversation?.taskId, selectedNativeConversation?.workspaceId]);
+  useEffect(() => {
+    /** 保留原有快捷键，源码整页、Git 侧栏与命令弹窗共用鼠标入口语义。 */
     function onProjectWorkspaceShortcut(event: globalThis.KeyboardEvent): void {
       if (!(isMacOSPlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey || event.repeat || event.isComposing || event.defaultPrevented) return;
       // 已关闭但仍在退出动画中的弹层不继续屏蔽工作区快捷键。

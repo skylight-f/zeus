@@ -88,7 +88,7 @@ import {
   createConversationInputResourceBroker,
   readOrCreateConversationAttachmentGrantSecret,
 } from './conversationInputResources.js';
-import { cleanupStaleReleaseBackups, createReleaseUpdateService, type ReleaseUpdateService } from './releaseUpdateService.js';
+import { cleanupStaleReleaseBackups, createReleaseUpdateService, readDesktopReleaseUpdateStatus, type ReleaseUpdateService } from './releaseUpdateService.js';
 import { completeWindowsReleaseInstall } from './windowsReleaseInstaller.js';
 import { publishFile, windowsSecurityRequestAsync } from '@zeus/storage/platform-security';
 import { businessProcessEnvironment, runWindowsRuntimeHelper } from '@zeus/ai-runtime';
@@ -1170,10 +1170,9 @@ async function createWindow(): Promise<void> {
       minWidth: 640,
       minHeight: 560,
       title: desktopDisplayName(),
-      // macOS 保留交通灯与玻璃材质；Windows 采用系统标题栏，复用最大化、贴靠和辅助功能。
-      ...(process.platform === 'darwin'
-        ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 14, y: 16 }, transparent: true, vibrancy: 'under-window' as const, visualEffectState: 'active' as const, backgroundColor: '#00000000' }
-        : { titleBarStyle: 'default' as const, backgroundColor: nativeTheme.shouldUseDarkColors ? '#18181b' : '#f5f5f7' }),
+      // 透明窗口不支持可靠缩放；主工作区使用不透明底板，macOS 保留交通灯，Windows 保留系统标题栏。
+      backgroundColor: nativeTheme.shouldUseDarkColors ? '#18181b' : '#f5f5f7',
+      ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 14, y: 16 } } : { titleBarStyle: 'default' as const }),
       show: false,
       webPreferences: {
         preload: join(desktopRoot(), 'dist/preload/index.cjs'),
@@ -1331,6 +1330,7 @@ function closeFocusedWindowOrContextTab(): void {
     window.webContents.send('zeus:terminal-close-active-tab');
     return;
   }
+  if (browserHost?.closeActiveContextTab(window, contextActivity?.active && contextActivity.kind === 'browser' ? contextActivity.ownerConversationId : undefined)) return;
   if (browserHost?.isVisibleTabFocused(window) || contextActivity?.active) {
     window.webContents.send('zeus:session-context-close-active-tab', contextActivity?.ownerConversationId);
     return;
@@ -2480,6 +2480,26 @@ function setupIpc(): void {
     revealMainWindow(requestingWindow);
     return { activated: true };
   });
+  /** 设置页与原生更新窗口共用系统网络读取清单，不把地址或代理选择交给 Renderer。 */
+  ipcMain.handle('zeus:release:check-update', async (event) => {
+    /** 只有本应用窗口可以发起官方清单读取。 */
+    const requestingWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('Release update request came from an untrusted window.');
+    if (readOnlyValidationDescriptor) throw new Error('Release update checks are unavailable in read-only validation.');
+    await auxiliaryServicesReady;
+    /** 本机清单覆盖仅限测试发行且显式启用，正式发行不能改写官方地址。 */
+    const allowUntrustedReleaseUpdateTest = isTestDistribution() && process.env.ZEUS_ALLOW_UNTRUSTED_UPDATE_TEST === '1';
+    return readDesktopReleaseUpdateStatus({
+      currentAppVersion: app.getVersion(),
+      localServerConfig: () => {
+        if (!localServerRuntime) throw new Error('Zeus local server is not ready.');
+        return localServerRuntime.config;
+      },
+      testMode: isTestDistribution(),
+      allowUntrustedTestUpdate: allowUntrustedReleaseUpdateTest,
+      releaseUpdateManifestUrl: allowUntrustedReleaseUpdateTest ? process.env.ZEUS_RELEASE_UPDATE_MANIFEST_URL : undefined,
+    });
+  });
   ipcMain.handle('zeus:release:download-update', async (event, request: MainCommandRequest) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('Release update request came from an untrusted window.');
@@ -3236,22 +3256,38 @@ async function readSystemClipboardFileReferences(): Promise<string[]> {
     const { stdout } = await execFile(
       '/usr/bin/osascript',
       [
+        '-l',
+        'JavaScript',
         '-e',
-        `try
-  set fileReference to the clipboard as «class furl»
-  return POSIX path of fileReference
-on error
-  return ""
-end try`,
+        `ObjC.import('AppKit');
+// 只读取原生文件格式，不能把普通文本强制转换成文件 URL。
+const pasteboard = $.NSPasteboard.generalPasteboard;
+// Finder 多选文件分别保存在各个剪贴板条目中。
+const items = pasteboard.pasteboardItems;
+// URL 交给已有附件解析器解码和校验，不读取剪贴板正文。
+const references = [];
+if (!items.isNil()) {
+  for (let index = 0; index < items.count; index++) {
+    // 缺少文件格式的文本或图片条目不提供文件授权。
+    const fileUrl = items.objectAtIndex(index).stringForType('public.file-url');
+    if (!fileUrl.isNil()) references.push(ObjC.unwrap(fileUrl));
+  }
+}
+if (references.length === 0) {
+  // 旧文件列表仍是明确的文件格式，不从字符串或 HTML 推断路径。
+  const filenames = pasteboard.propertyListForType('NSFilenamesPboardType');
+  if (!filenames.isNil()) references.push(...ObjC.deepUnwrap(filenames));
+}
+JSON.stringify(references);`,
       ],
       { timeout: 1000, maxBuffer: 64 * 1024 },
     );
-    return stdout
-      .split(/\r?\n/gu)
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith('/'));
+    /** 系统进程只返回有界文件引用，具体路径沿用共享解析与授权检查。 */
+    const references: unknown = JSON.parse(stdout);
+    if (!Array.isArray(references) || references.length > 128 || references.some((reference) => typeof reference !== 'string')) throw new Error('macOS 文件剪贴板返回了无效引用。');
+    return references;
   } catch {
-    // Finder 复制文件时 Electron 可能只暴露文件图标；osascript 读不到 furl 时继续走 bitmap 回退。
+    // 原生文件格式不可读时继续已有图片回退，不从普通文本猜测文件路径。
     return [];
   }
 }
@@ -3787,6 +3823,7 @@ async function initializeApplication(): Promise<void> {
             isPackaged: true,
             testMode: isTestDistribution(),
             allowUntrustedTestUpdate: allowUntrustedReleaseUpdateTest,
+            releaseUpdateManifestUrl: allowUntrustedReleaseUpdateTest ? process.env.ZEUS_RELEASE_UPDATE_MANIFEST_URL : undefined,
             /** 保留 macOS 下载安全检查；打开磁盘映像交给系统，不执行自动替换。 */
             openDownloadedArtifact: async (path) => {
               if (process.platform === 'darwin') await execFile(nativeUpdateProgressHelperPath(), ['--quarantine-download', path], { timeout: 10_000 });

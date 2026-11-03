@@ -2,7 +2,8 @@ import type { FilePreviewSourceWorkspace } from '@zeus/shared';
 import { compareConversationWorkStartedDesc, cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig, matchesTaskDeadline, projectTerminalOutput, type TaskDeadlineFilter, temporaryWorkspaceId } from '@zeus/shared';
 import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
 import type { DigitalTeamEntrySelection } from '../digital-teams/DigitalTeamWorkspace.js';
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
+import { reuseConversationQueryValue } from '../conversations/conversationQueryReuse.js';
 import type { GlobalAgentSettingsHandle } from '../../settings/GlobalAgentSettingsPane.js';
 import { type AutomaticUpdateIndicatorState, loadAutomaticUpdateIndicatorFromMain } from '../../appShellBridge.js';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation, conversationTreeRuntimeStateFromSession, type ProjectConversationGroup } from '../../session/ProjectConversationTree.js';
@@ -10,6 +11,7 @@ import { createNativeConversationStartEnvelopeManager, createProjectConversation
 import { conversationStartClientCommandTypes, forgetConversationStartCommandRequest } from '../conversations/conversationStartCommandClient.js';
 import type { CodexConversationCapabilities, CodexTaskPushCapabilities, NativeConversationChoice, NativeSessionState, SessionConversationOwner, StartTaskModelPushRequest } from '../../session/sessionTypes.js';
 import { buildPersistedSessionViewCache, initialSessionHotCache, refreshSessionHotState, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
+import { useCompletedConversationPreload } from '../../session/useCompletedConversationPreload.js';
 import { type TaskModelPushForm, type TaskModelPushModalStatus } from '../../task/TaskModelPushModal.js';
 import { projectTaskModelPushConversationChoices } from '../../task/TaskModelPushPendingWorkspace.js';
 import { useConversationFeatureController } from '../conversations/useConversationFeatureController.js';
@@ -231,12 +233,20 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   useEffect(() => {
     nativeConversationChoicesByProjectRef.current = nativeConversationChoicesByProject;
   }, [nativeConversationChoicesByProject]);
-  const [nativeConversationChoiceTaskStates, setNativeConversationChoiceTaskStates] = useState<Record<string, NativeConversationChoiceTaskLoadState>>(() =>
+  const [nativeConversationChoiceTaskStates, updateNativeConversationChoiceTaskStates] = useState<Record<string, NativeConversationChoiceTaskLoadState>>(() =>
     Object.fromEntries((props.initialNativeConversationChoices ?? []).map((snapshot) => [snapshot.taskId, completeNativeConversationChoiceTaskLoad(undefined)])),
   );
-  const [nativeConversationChoiceProjectStates, setNativeConversationChoiceProjectStates] = useState<Record<string, NativeConversationChoiceTaskLoadState>>(() =>
+  const [nativeConversationChoiceProjectStates, updateNativeConversationChoiceProjectStates] = useState<Record<string, NativeConversationChoiceTaskLoadState>>(() =>
     Object.fromEntries((props.initialNativeProjectConversationChoices ?? []).map((snapshot) => [snapshot.projectId, completeNativeConversationChoiceTaskLoad(undefined)])),
   );
+  /** 所有目录入口共用相等判断，后台完成回执不重复发布相同加载状态。 */
+  const setNativeConversationChoiceTaskStates = useCallback((update: SetStateAction<Record<string, NativeConversationChoiceTaskLoadState>>) => {
+    updateNativeConversationChoiceTaskStates((current) => reuseConversationQueryValue(current, typeof update === 'function' ? update(current) : update));
+  }, []);
+  /** 项目目录和任务目录保持相同的状态发布规则。 */
+  const setNativeConversationChoiceProjectStates = useCallback((update: SetStateAction<Record<string, NativeConversationChoiceTaskLoadState>>) => {
+    updateNativeConversationChoiceProjectStates((current) => reuseConversationQueryValue(current, typeof update === 'function' ? update(current) : update));
+  }, []);
   const [selectedNativeConversationId, setSelectedNativeConversationId] = useState<string | null>(() => props.initialSelectedNativeConversationId ?? null);
   const selectedNativeConversationIdRef = useRef<string | null>(props.initialSelectedNativeConversationId ?? null);
   const [selectedNativeConversationPresentation, setSelectedNativeConversationPresentation] = useState<'history' | 'interactive'>(() => (props.initialSelectedNativeConversationId ? 'history' : 'interactive'));
@@ -1149,22 +1159,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const selectedTaskModelPushOperation = Object.values(taskModelPushPendingByTask).find((pending) => pending.navigationId === selectedNativeConversationId);
   const selectedTaskModelPushOptimisticState = selectedTaskModelPushOperation?.status === 'accepted' && selectedTaskModelPushOperation.choice.id === selectedNativeConversation?.id ? selectedTaskModelPushOperation.session : undefined;
   useEffect(() => {
-    function onCommitShortcut(event: globalThis.KeyboardEvent): void {
-      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'k') return;
-      const target = event.target;
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable)) return;
-      if (!selectedNativeConversation?.taskId || !selectedNativeConversation.workspaceId) return;
-      event.preventDefault();
-      setTaskGitReviewState({
-        taskId: selectedNativeConversation.taskId,
-        workspaceId: selectedNativeConversation.workspaceId,
-        mode: 'commit',
-      });
-    }
-    window.addEventListener('keydown', onCommitShortcut);
-    return () => window.removeEventListener('keydown', onCommitShortcut);
-  }, [selectedNativeConversation?.taskId, selectedNativeConversation?.workspaceId]);
-  useEffect(() => {
     selectedNativeConversationIdRef.current = selectedNativeConversationId;
   }, [selectedNativeConversationId]);
   const nativeConversationGroups = useMemo<ProjectConversationGroup[]>(
@@ -1208,12 +1202,12 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setNativeConversationRuntimeStates((current) => {
       const next = { ...current };
       for (const conversation of choices) next[conversation.id] = conversationTreeRuntimeStateFromConversation(conversation);
-      return next;
+      return reuseConversationQueryValue(current, next);
     });
     setNativeConversationTaskRunStatuses((current) => {
       const next = { ...current };
       for (const conversation of choices) next[conversation.id] = taskAgentRunStatusFromConversation(conversation);
-      return next;
+      return reuseConversationQueryValue(current, next);
     });
   }, []);
   /** 只落盘本次取得新权威状态的会话，避免每次序列化整份热缓存。 */
@@ -1237,6 +1231,21 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     if (sessionViewCachePersistTimerRef.current !== null) window.clearTimeout(sessionViewCachePersistTimerRef.current);
     sessionViewCachePersistTimerRef.current = window.setTimeout(persistNativeConversationViewCache, 2_500);
   }, [persistNativeConversationViewCache]);
+  /** 后台首屏与前台水合共用持久化队列，不额外序列化整份缓存。 */
+  const persistPreloadedConversation = useCallback(
+    (conversationId: string): void => {
+      dirtySessionViewCacheRef.current.add(conversationId);
+      scheduleNativeConversationViewCachePersistence();
+    },
+    [scheduleNativeConversationViewCachePersistence],
+  );
+  useCompletedConversationPreload({
+    client: props.nativeConversationClient,
+    groups: nativeConversationGroups,
+    cache: nativeConversationHotCacheRef.current,
+    selectedConversationId: selectedNativeConversation?.id,
+    onCached: persistPreloadedConversation,
+  });
   useEffect(() => {
     const flush = (): void => {
       if (sessionViewCachePersistTimerRef.current !== null) window.clearTimeout(sessionViewCachePersistTimerRef.current);

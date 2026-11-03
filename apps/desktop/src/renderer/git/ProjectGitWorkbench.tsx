@@ -6,6 +6,7 @@ import { GitMergeIcon as GitMerge } from '@phosphor-icons/react/dist/csr/GitMerg
 import { ArrowDownIcon as ArrowDown } from '@phosphor-icons/react/dist/csr/ArrowDown';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { projectGitWorkbenchCacheEntry, readCachedProjectGitWorkbench, requestProjectGitWorkbench, subscribeProjectGitRefresh, notifyProjectGitChanged, visibleRepositoryFiles } from './projectGitWorkbenchState.js';
+import { createProjectGitMergeAction } from './projectGitMergeAction.js';
 import { BranchSwitcher, MergeBranchDialog, UpdateProjectDialog, NewBranchDialog, RemoteBranchCheckoutDialog, CheckoutRevisionDialog, BranchDirectoryTree, BranchContextMenu, StashDialog, PullDialog } from './GitRepositoryControls.js';
 import type { ExecutionOutcome } from './gitWorkbenchTypes.js';
 import type { BranchKind } from './gitWorkbenchTypes.js';
@@ -541,7 +542,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       newBranch(target.ref);
       action(
         label(`将“${target.ref}”合并到“${repository.snapshot.branch}”…`, `Merge '${target.ref}' into '${repository.snapshot.branch}'…`),
-        { type: 'merge', branchName: target.ref },
+        createProjectGitMergeAction(repository, target.ref),
         label(
           `将来源分支“${target.ref}”合并到目标分支“${repository.snapshot.branch}”，可能产生合并提交或冲突。`,
           `Merge source branch '${target.ref}' into target branch '${repository.snapshot.branch}'. This may create a merge commit or conflicts.`,
@@ -1671,7 +1672,7 @@ function CommitFileTreeEntry(props: Parameters<typeof CommitFileDirectoryTree>[0
   if (!props.node.stats) {
     return (
       <details className="project-git-commit-file-folder" open>
-        <summary style={{ paddingLeft: `${props.depth * 12 + 5}px` }}>
+        <summary data-file-path={props.node.path} style={{ paddingLeft: `${props.depth * 12 + 5}px` }}>
           <CaretRight aria-hidden="true" />
           <Folder weight="regular" aria-hidden="true" />
           <span>{props.node.name}</span>
@@ -1685,13 +1686,14 @@ function CommitFileTreeEntry(props: Parameters<typeof CommitFileDirectoryTree>[0
   return (
     <button
       type="button"
+      data-file-path={props.node.path}
       className={props.node.path === props.selectedPath ? 'is-current' : ''}
       style={{ paddingLeft: `${props.depth * 12 + 7}px` }}
       onClick={() => props.onSelect(props.node.path)}
       onDoubleClick={() => props.onOpen(props.node.path)}
     >
       <FileTypeIcon name={props.node.path} />
-      <span data-icon-tooltip={props.node.path} data-file-status={props.node.stats.changeType}>
+      <span data-icon-tooltip={props.node.name} data-file-status={props.node.stats.changeType}>
         {props.node.name}
       </span>
       <em>+{props.node.stats.additions}</em>

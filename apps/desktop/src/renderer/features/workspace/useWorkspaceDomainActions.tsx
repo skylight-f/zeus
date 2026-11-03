@@ -1,4 +1,5 @@
 import { transitionConversation } from '../../session/conversationTransition.js';
+import { markSideQuestionConversationArchived } from '../../session/useSessionContextWorkspace.js';
 import { useBackgroundInputSuggestions } from '../../session/useBackgroundInputSuggestions.js';
 import { notifyProjectGitChanged } from '../../git/projectGitWorkbenchState.js';
 import { isZentaoDestinationComplete, type ZentaoTaskDestination } from '../../task/ZentaoSyncModal.js';
@@ -59,6 +60,7 @@ import {
   reconcileTaskPushRepositories,
   resolveTaskModelPushEntry,
   resolveTaskModelPushInitialForm,
+  selectTaskModelPushModel,
   selectedTaskPushCurrentConversationPaths,
   selectedTaskPushParentContexts,
   selectedTaskPushRelatedContexts,
@@ -671,13 +673,14 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           void refreshArchivedConversations();
         }
         if (event.type === 'project.git_delivery.changed' && typeof event.payload.projectId === 'string') {
-          // 后台组合不依赖交付窗口存活，任务与普通会话都从服务端事件刷新真实 Git 快照。
+          // 交付进度只更新运行投影，不能把等待和提交说明生成当作 Git 变化。
           if (typeof event.payload.taskId === 'string') taskGitDeliveryChangedRef.current(event.payload.taskId);
           else setTaskGitDeliveryRevision((current) => current + 1);
-          // 项目工作台沿用同一个失效通知，避免其他入口继续显示旧文件列表。
-          notifyProjectGitChanged(event.payload.projectId);
         } else if (event.type === 'task.git_delivery.changed' && typeof event.payload.taskId === 'string') {
           taskGitDeliveryChangedRef.current(event.payload.taskId);
+        } else if (event.type === 'project.git.changed' && typeof event.payload.projectId === 'string') {
+          // 已执行的仓库操作才使文件列表和详情快照失效。
+          notifyProjectGitChanged(event.payload.projectId);
         }
         if (event.type === 'task.board.updated' && typeof event.payload.projectId === 'string') {
           // 全局显示修改使所有缓存失效，当前看板沿用既有加载流程刷新。
@@ -1654,6 +1657,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
 
   /** HTTP 回执与实时通知共用已确认归档的移除逻辑，不依赖下一次列表读取成功。 */
   function removeConfirmedArchivedConversation(conversationId: string, projectId: string | null, taskId: string | null, navigationId = conversationId): void {
+    markSideQuestionConversationArchived(conversationId);
     if (taskId) nativeConversationChoiceLoadCoordinator.forget(taskId, conversationId);
     else if (projectId) nativeProjectConversationChoiceLoadCoordinator.forget(projectId, conversationId);
     setNativeConversationChoicesByProject((current) =>
@@ -2489,21 +2493,23 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     if (reference !== undefined && (!selected || selected.available === false)) throw new Error('ZEUS_MODEL_UNAVAILABLE');
     setTaskModelPushCapabilities(capabilities);
     setTaskModelPushForm((current) => {
+      /** 接入不同模型时恢复它自己的项目记忆；同模型刷新不覆盖正在编辑的表单。 */
+      const selectedForm = selected && !current.stageId && resolveModelCapability(capabilities.models, current.model)?.id !== selected.id ? selectTaskModelPushModel(current, capabilities.models, task.projectId, selected.id) : current;
       const normalized = resolveTaskModelPushInitialForm(
         capabilities,
         {
-          model: current.stageId ? current.model : (selected?.id ?? current.model),
-          effort: current.effort,
-          serviceTier: current.serviceTier,
-          workMode: current.workMode,
-          permissionMode: current.permissionMode,
-          ...(current.workspaceModeSelected ? { workspaceMode: current.workspaceMode } : {}),
+          model: selectedForm.stageId ? selectedForm.model : (selected?.id ?? selectedForm.model),
+          effort: selectedForm.effort,
+          serviceTier: selectedForm.serviceTier,
+          workMode: selectedForm.workMode,
+          permissionMode: selectedForm.permissionMode,
+          ...(selectedForm.workspaceModeSelected ? { workspaceMode: selectedForm.workspaceMode } : {}),
         },
-        current.skillId,
+        selectedForm.skillId,
       );
       return reconcileTaskPushRepositories(
         {
-          ...current,
+          ...selectedForm,
           model: normalized.model,
           effort: normalized.effort,
           serviceTier: normalized.serviceTier,

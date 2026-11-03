@@ -1,4 +1,4 @@
-import { classifyAssistantMessage, serializeConversationContext, type ConversationContextDraft } from '@zeus/shared';
+import { classifyAssistantMessage, emptyConversationContextDraft, serializeConversationContext, type ConversationContextDraft } from '@zeus/shared';
 import type { AsyncQuestionAnswer } from '@zeus/shared';
 import type { TaskPushMessageLayout } from '@zeus/shared';
 import type { ConversationPlanActionRepository, ConversationProviderItemRepository, ConversationTurnRepository, ZeusConversationSubmissionRecord } from '@zeus/storage';
@@ -7,8 +7,8 @@ import { isAbsolute } from 'node:path';
 import type { ConversationDispatchContext, NativeConversationAttachmentInput, NativeConversationSkillInput, NativeSubmissionRecoveryKind } from './codexNativeConversationContracts.js';
 import { coordinatorError, isRecord, parseJsonRecord } from './codexNativeConversationPolicy.js';
 
-/** 自动续接与用户请求重试共用模型指令，正常界面只展示恢复状态。 */
-export const connectionRetryPrompt = '请从上次连接失败的中断处继续完成我的请求。先检查已经完成的操作，避免重复执行。';
+/** 用户手动重试从原失败处继续，先核对已完成操作以免重复执行。 */
+export const failedTurnRetryPrompt = '请从上次失败的中断处继续完成我的请求。先检查已经完成的操作，避免重复执行。';
 
 /** 所有引导入口共用正式交付判断，后台收尾不能重新开放已经交付的轮次。 */
 export function conversationTurnHasCompletedOutput(
@@ -161,7 +161,12 @@ export function readNativeConversationSkillReferences(submissions: readonly Zeus
 /** 两条链路共用批注与引用正文，防止只保存界面元数据却没有交给模型。 */
 export function appendConversationResourceContext(prompt: string, browserCommentContent: string | undefined, browserComments: Record<string, unknown>[] | undefined, conversationContext: Record<string, unknown> | undefined): string {
   const browserContext = browserCommentContent?.trim() || (browserComments?.length ? JSON.stringify({ browserComments }) : '');
-  const readableContext = conversationContext ? serializeConversationContext(conversationContext as unknown as ConversationContextDraft).trim() : '';
+  /** 来源原文由服务端补充，独立去重以免把客户端已序列化的评论再发送一次。 */
+  const draft = conversationContext as unknown as ConversationContextDraft | undefined;
+  /** 引用自身沿用原有序列化，来源快照单独追加。 */
+  const readableContext = draft ? serializeConversationContext({ responseAnnotations: draft.responseAnnotations, codeComments: draft.codeComments }).trim() : '';
+  /** 只有服务端已核实的来源进入模型上下文。 */
+  const sourceContext = draft?.sourceConversation ? serializeConversationContext({ ...emptyConversationContextDraft, sourceConversation: draft.sourceConversation }) : '';
   const missingReadableContext = readableContext && !prompt.includes(readableContext) ? readableContext : '';
-  return [prompt, browserContext && !prompt.includes(browserContext) ? browserContext : '', missingReadableContext].filter((part) => part.trim()).join('\n\n');
+  return [prompt, browserContext && !prompt.includes(browserContext) ? browserContext : '', missingReadableContext, sourceContext && !prompt.includes(sourceContext) ? sourceContext : ''].filter((part) => part.trim()).join('\n\n');
 }

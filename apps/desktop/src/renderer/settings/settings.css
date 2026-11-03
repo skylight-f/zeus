@@ -726,6 +726,33 @@
     color: var(--zeus-product-muted);
     cursor: pointer;
   }
+  /* 价格输入与更新同行，窄窗口按控件宽度自然换行。 */
+  .model-connection-pricing,
+  .model-connection-pricing-field {
+    display: grid;
+    gap: 6px;
+    min-inline-size: 0;
+  }
+  .model-connection-pricing-input,
+  .model-connection-pricing-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    min-inline-size: 0;
+  }
+  .model-connection-pricing-input > input {
+    flex: 1 1 240px;
+    min-inline-size: 0;
+  }
+  .model-connection-pricing-status {
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .model-connection-pricing > p {
+    margin: 0;
+  }
   .model-connection-enabled {
     display: flex;
     align-items: center;
@@ -739,7 +766,7 @@
     padding-block-start: 18px;
     border-block-start: 0;
   }
-  /* 批量展开保持独立快捷入口，标题和说明共用左侧空间。 */
+  /* 模型分组标题与批量展开操作同行。 */
   .model-definition-section > header {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -858,6 +885,7 @@
     font-size: 13px;
   }
   .model-definition-identity small {
+    overflow-wrap: anywhere;
     font-size: 11px;
   }
   .model-definition-header .model-definition-remove {

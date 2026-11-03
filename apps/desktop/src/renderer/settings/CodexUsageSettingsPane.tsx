@@ -5,6 +5,7 @@ import { calculateUncachedInputTokens, type CodexLocalUsageDay, type CodexLocalU
 import { CalendarDotsIcon as CalendarDots } from '@phosphor-icons/react/dist/csr/CalendarDots';
 import { GaugeIcon as Gauge } from '@phosphor-icons/react/dist/csr/Gauge';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { compareModelNames } from '../modelOptionPresentation.js';
 import { SettingsPagination, settingsPage, settingsPageSize } from './SettingsPagination.js';
 
 type UsageClient = {
@@ -869,7 +870,9 @@ function UsageBreakdownTable(props: { title: string; rows: CodexLocalUsageGroup[
 }
 
 function usageFilterOptions(providers: UsageProviderAnalytics[], field: 'models' | 'projects'): Array<Pick<CodexLocalUsageGroup, 'id' | 'label'>> {
-  return [...new Map(providers.flatMap((entry) => entry.filters[field]).map((group) => [group.id, group])).values()].sort((left, right) => left.label.localeCompare(right.label));
+  return [...new Map(providers.flatMap((entry) => entry.filters[field]).map((group) => [group.id, group])).values()].sort((left, right) =>
+    field === 'models' ? compareModelNames(left.label, right.label) : left.label.localeCompare(right.label),
+  );
 }
 
 function formatTokens(value: number | null, language: Language): string {

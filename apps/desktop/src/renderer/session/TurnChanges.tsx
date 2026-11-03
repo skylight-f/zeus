@@ -1,4 +1,5 @@
 import { FilePreview } from '../code/FilePreview.js';
+import { useReadingState } from '../ui/readingState.js';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import { groupDirectoryFiles } from '../code/groupDirectoryFiles.js';
 import { AnimatedSize } from '../ui/AnimatedSize.js';
@@ -137,9 +138,15 @@ export function TurnChangeCard(props: {
           <ul className="session-turn-change-files">
             {visibleFiles.map((file) => (
               <li key={file.id}>
-                <button type="button" aria-label={`${displayPath(file)} · ${localizedChangeType(file, props.language)}`} onClick={() => props.onReview?.(changeSet, file.id)} disabled={!props.onReview}>
+                <button
+                  type="button"
+                  data-file-path={file.newPath ?? file.oldPath ?? undefined}
+                  aria-label={`${displayPath(file)} · ${localizedChangeType(file, props.language)}`}
+                  onClick={() => props.onReview?.(changeSet, file.id)}
+                  disabled={!props.onReview}
+                >
                   <FileTypeIcon name={file.newPath ?? file.oldPath ?? ''} />
-                  <span className="session-turn-change-path" data-icon-tooltip={`${displayPath(file)} · ${localizedChangeType(file, props.language)}`} data-file-status={file.changeType === 'binary' ? 'modified' : file.changeType}>
+                  <span className="session-turn-change-path" data-icon-tooltip={displayPath(file)} data-file-status={file.changeType === 'binary' ? 'modified' : file.changeType}>
                     {displayPath(file)}
                   </span>
                   <span className="session-turn-change-file-counts">
@@ -184,7 +191,9 @@ export function TurnDiffWorkspace(props: {
   const canComment = Boolean(props.onCommentsChange);
   const canOpen = Boolean(props.onOpenFile);
   const zh = props.language === 'zh-CN';
-  const [activeFileId, setActiveFileId] = useState(props.initialFileId ?? props.changeSet.files[0]?.id ?? null);
+  const [activeFileId, setActiveFileId] = useReadingState(`diff-file:${props.changeSet.id}`, props.initialFileId ?? props.changeSet.files[0]?.id ?? null);
+  /** 相同打开请求的重新挂载不覆盖用户在目录中的选择。 */
+  const initialOpenRequest = useRef({ changeSetId: props.changeSet.id, fileId: props.initialFileId });
   const titleRef = useRef<HTMLSpanElement | null>(null);
   const [busy, setBusy] = useState<ChangeAction | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -268,6 +277,8 @@ export function TurnDiffWorkspace(props: {
 
   useEffect(() => {
     // 外部打开意图只在目标改变时生效，不能覆盖用户随后在目录中的选择。
+    if (initialOpenRequest.current.changeSetId === props.changeSet.id && initialOpenRequest.current.fileId === props.initialFileId) return;
+    initialOpenRequest.current = { changeSetId: props.changeSet.id, fileId: props.initialFileId };
     setActiveFileId(props.initialFileId ?? callbacksRef.current.changeSet.files[0]?.id ?? null);
   }, [props.changeSet.id, props.initialFileId]);
 
@@ -488,7 +499,12 @@ export function TurnDiffWorkspace(props: {
           {activeFile ? (
             <>
               <header>
-                <strong data-icon-tooltip={`${displayPath(activeFile)} · ${localizedChangeType(activeFile, props.language)}`} data-file-status={activeFile.changeType === 'binary' ? 'modified' : activeFile.changeType}>
+                <strong
+                  tabIndex={0}
+                  data-file-path={activeFile.newPath ?? activeFile.oldPath ?? undefined}
+                  data-icon-tooltip={displayPath(activeFile)}
+                  data-file-status={activeFile.changeType === 'binary' ? 'modified' : activeFile.changeType}
+                >
                   {displayPath(activeFile)}
                 </strong>
                 <span>
@@ -571,7 +587,7 @@ function TurnDiffDirectory(props: { files: Array<{ path: string; file: TurnChang
         <li key={props.prefix + name}>
           {name.endsWith('/') ? (
             <details className="session-turn-diff-directory" open>
-              <summary data-icon-tooltip={props.prefix + name} style={{ paddingInlineStart: 7 + props.depth * 14 }}>
+              <summary data-file-path={props.prefix + name} data-icon-tooltip={name} style={{ paddingInlineStart: 7 + props.depth * 14 }}>
                 <CaretDown aria-hidden="true" />
                 <Folder aria-hidden="true" weight="regular" />
                 <span>{name.slice(0, -1)}</span>
@@ -584,8 +600,9 @@ function TurnDiffDirectory(props: { files: Array<{ path: string; file: TurnChang
               <button
                 type="button"
                 className="session-turn-diff-file"
+                data-file-path={file.newPath ?? file.oldPath ?? undefined}
                 key={file.id}
-                data-icon-tooltip={`${displayPath(file)} · ${localizedChangeType(file, props.language)}`}
+                data-icon-tooltip={name}
                 aria-label={`${displayPath(file)} · ${localizedChangeType(file, props.language)}`}
                 aria-current={file.id === props.activeFileId ? 'true' : undefined}
                 onClick={() => props.onSelect(file.id)}

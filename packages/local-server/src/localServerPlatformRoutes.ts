@@ -1,4 +1,5 @@
 import { GitDeliveryExecution } from './gitDeliveryExecution.js';
+import { GitEnvironmentSummaryService } from './gitEnvironmentSummary.js';
 import { registerTaskReminderService } from './taskReminderService.js';
 import { registerNotificationRoutes } from './notificationRoutes.js';
 import { repairTaskAttachmentReferences } from './taskAttachmentLifecycle.js';
@@ -31,6 +32,8 @@ import {
   isNonCodexAiCliAdapterId,
   listAiCliAdapters,
   type SelectableConnectionModel,
+  modelRef,
+  parseModelRef,
 } from '@zeus/ai-runtime';
 import {
   buildGitPatchExport,
@@ -652,6 +655,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     dispatchUnifiedConversationQueueHead,
     eventSubscribers,
     setImRealtimeObserver,
+    subscribeRealtimeEvents,
+    taskWorkspaceIgnoredPaths,
     executeConversationDispatchMessage,
     executeConversationDispatchRequestResponse,
     executeProjectConversationIdempotent,
@@ -832,7 +837,9 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     if (request.method === 'GET' && requestPath === '/api/events' && isAuthorizedRealtimeRequest(request)) return;
     if (!readOnlyValidation && authorizeReleaseNotesRequest(request)) return;
     const header = request.headers.authorization;
-    if (header !== `Bearer ${options.apiToken}`) {
+    /** 摘要订阅复用 WebSocket 令牌，但仍继续经过只读模式的外部读取限制。 */
+    const summarySocketAuthorized = request.method === 'GET' && /^\/api\/projects\/[^/]+\/git\/summary-events$/u.test(requestPath) && isAuthorizedRealtimeRequest(request);
+    if (header !== `Bearer ${options.apiToken}` && !summarySocketAuthorized) {
       await reply.code(401).send({
         error: 'ZEUS_UNAUTHORIZED',
         message: 'Missing or invalid Zeus local API token',
@@ -1475,6 +1482,22 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     repository: conversationSnapshotV2,
     projectExists: (projectId) => Boolean(projects.getById(projectId)),
     getConversation: (conversationId) => conversations.getRecordById(conversationId),
+    conversationModelRef: (conversationId) => {
+      /** 下一轮明确选择优先；无覆盖时沿用会话的真实模型和连接身份。 */
+      const conversation = conversations.getRecordById(conversationId);
+      if (!conversation) return null;
+      /** 受控快照负责解析持久设置，避免另外维护 JSON 解析规则。 */
+      const snapshot = conversationSnapshotV2.readSnapshot(conversationId, { closedTurnLimit: 1, includeSessionMetrics: false });
+      /** 连接身份必须来自该会话，不能用同名模型替代另一个供应商。 */
+      const sourceId = conversation.modelSourceId ?? (conversation.agentKind === 'codex' ? 'codex' : null);
+      /** 分列保存的模型 ID 可能含冒号，先与连接组合再作为完整身份使用。 */
+      const selected = snapshot.conversation.nextTurnSettings?.model ?? (conversation.modelId && sourceId ? modelRef(sourceId, conversation.modelId) : conversation.providerModel);
+      if (!selected) return null;
+      if (parseModelRef(selected)) return selected;
+      return sourceId ? modelRef(sourceId, selected) : null;
+    },
+    codexManager: codexAppServerManager,
+    nativeConversation: (conversationId) => conversations.getRecordById(conversationId),
     /** 只读取本会话队列，提交尚未建轮次时也不能使用上一轮回复。 */
     hasPendingSubmission: (conversationId) => conversationSubmissions.listQueueProjectionByConversation(conversationId).some((submission: ZeusConversationSubmissionRecord) => ['queued', 'dispatching', 'active'].includes(submission.status)),
     readSettings: () => (readOnlyValidation ? undefined : platformMutableState.appShellSettings.inputSuggestions),
@@ -3696,6 +3719,31 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     },
   });
   gitDelivery.register();
+  /** 卡片共享只读摘要，完整交付详情继续使用原查询入口。 */
+  const gitSummaries = new GitEnvironmentSummaryService({
+    server,
+    projects,
+    tasks,
+    environments: taskEnvironments,
+    workspaces: taskWorkspaces,
+    conversations,
+    submissions: conversationSubmissions,
+    ignoredPaths: taskWorkspaceIgnoredPaths,
+    authorized: isAuthorizedRealtimeRequest,
+  });
+  gitSummaries.register();
+  /** 接收提交后的领域事件，进度消息不再冒充 Git 文件变化。 */
+  const unsubscribeGitEvents = subscribeRealtimeEvents((event: import('./index.js').ZeusRealtimeEvent) => {
+    if (
+      ['conversation.thread.changed', 'conversation.turn.completed', 'conversation.request.created', 'conversation.request.changed', 'conversation.request.resolved', 'conversation.queue.changed'].includes(event.type) &&
+      typeof event.payload.conversationId === 'string'
+    )
+      gitDelivery.wakeWaiting(event.payload.conversationId);
+    if (['project.git.changed', 'task.git_delivery.changed', 'task.updated', 'task.management_status.changed', 'project.updated', 'project.deleted', 'project.repositories.changed'].includes(event.type)) {
+      const projectId = typeof event.payload.projectId === 'string' ? event.payload.projectId : typeof event.payload.taskId === 'string' ? tasks.getById(event.payload.taskId)?.projectId : undefined;
+      if (projectId) gitSummaries.invalidateProject(projectId, typeof event.payload.repositoryId === 'string' ? event.payload.repositoryId : typeof event.payload.workspaceId === 'string' ? event.payload.workspaceId : undefined);
+    }
+  });
   registerNotificationRoutes({ server, db, automations: automationNotifications, tasks: taskReminders, deliveries: gitDelivery.repository, readOnly: readOnlyValidation });
   /** 自动化存储统一接收 ISO 时间，避免 Date 被 SQLite 静默绑定为 NULL。 */
   const automationNow = (): string => now().toISOString();
@@ -4008,6 +4056,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         const authorizationRevision = automationTasks.getRevision(run.automationRevisionId);
         if (snapshot.permissionMode === 'full-access' && (!authorizationRevision || !automationTasks.hasFullAccessGrant(run.automationId, authorizationRevision.revision)))
           throw nativeApiError('ZEUS_AUTOMATION_PERMISSION_GRANT_REQUIRED', '原运行的完全访问授权已失效，请重新保存授权后运行。');
+        /** 创建任务可能让出控制权，实际接纳前再次读取整条自动化的当日用量。 */
+        automationRuns.assertDailyTokenBudget(run.automationId, automationNow());
         /** 项目任务复用项目流程；员工调研仍保留独立工作。 */
         const reference = await digitalEmployeeOrchestrator.queueAutomatedAssignment({
           projectId: project.id,
@@ -4584,6 +4634,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
       if (
         previousSettings.inputSuggestions?.enabled !== mutation.result.inputSuggestions?.enabled ||
         previousSettings.inputSuggestions?.modelRef !== mutation.result.inputSuggestions?.modelRef ||
+        previousSettings.inputSuggestions?.followConversationModel !== mutation.result.inputSuggestions?.followConversationModel ||
         previousSettings.inputSuggestions?.effort !== mutation.result.inputSuggestions?.effort ||
         previousSettings.inputSuggestions?.serviceTier !== mutation.result.inputSuggestions?.serviceTier
       )
@@ -4974,6 +5025,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
 
   // eslint-disable-next-line prefer-const
   closeLocalServerResources = async () => {
+    unsubscribeGitEvents();
+    gitSummaries.close();
     await gitDelivery.close();
     const cleanupErrors: unknown[] = [];
     await closeHeavyWorkerJobs();

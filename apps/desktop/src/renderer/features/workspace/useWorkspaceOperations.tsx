@@ -1849,9 +1849,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           }}
           onOpenTaskDetail={onOpenTaskDetail}
           onTaskManagementStatusChange={(taskId, status) => updateTaskManagementStatus(taskId, status)}
-          onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
           gitContext={props.commandClient && selectedProject ? { client: props.commandClient, project: selectedProject } : undefined}
-          taskGitDeliveryRevision={state.taskGitDeliveryRevision}
           onOpenTaskGitDelivery={(taskId, workspaceId) => openTaskGitDelivery(taskId, workspaceId)}
           onLatestContentVisibilityChange={setLatestConversationContentVisible}
         />
@@ -1914,9 +1912,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           }}
           onOpenTaskDetail={onOpenTaskDetail}
           onTaskManagementStatusChange={(taskId, status) => updateTaskManagementStatus(taskId, status)}
-          onLoadTaskWorkspaces={props.nativeConversationClient.loadTaskGitWorkspaces}
           gitContext={props.commandClient && selectedProject ? { client: props.commandClient, project: selectedProject } : undefined}
-          taskGitDeliveryRevision={state.taskGitDeliveryRevision}
           onOpenTaskGitDelivery={(taskId, workspaceId) => openTaskGitDelivery(taskId, workspaceId)}
           onLatestContentVisibilityChange={setLatestConversationContentVisible}
         />

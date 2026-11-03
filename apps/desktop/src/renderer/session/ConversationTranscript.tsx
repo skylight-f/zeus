@@ -32,7 +32,8 @@ import { isAssistantDeliverableItem } from './sessionTypes.js';
 import { type ConversationFileLocation, type ConversationOpenTarget, type ConversationResponseAnnotation, type ConversationResponseTextAnchor, parseCanonicalRequestUserInputQuestions } from '@zeus/shared';
 import { useThreadScrollController } from './useThreadScrollController.js';
 import { TurnChangeCard } from './TurnChanges.js';
-import { latestReasoningSummaryText, reasoningSummaryStatus, SessionReasoningSummary } from './SessionReasoningSummary.js';
+import { latestReasoningSummaryText } from './reasoningSummary.js';
+import { reasoningSummaryStatus, SessionReasoningSummary } from './SessionReasoningSummary.js';
 import { SessionSweepText } from './SessionSweepText.js';
 import { AnsweredRequestHistory, isAnsweredUserInputRequest, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
 import { newItemMotionDurationMs, useNewItemMotionIds } from '../ui/useNewItemMotion.js';
@@ -41,8 +42,10 @@ import { reportApplicationError, VisibleApplicationError } from '../ui/Applicati
 import { isImageResource } from './ConversationResources.js';
 import { ConversationImageResourcesContext, hasMissingMarkdownImages } from './ConversationMarkdown.js';
 import { isPendingQueueTranscriptMessage, composerQueuedSubmissions, orderTranscriptItemsWithQueue, visibleQueuedSubmissions } from './conversationQueuePresentation.js';
+import { selectPendingExecutionMessage } from './sessionSelectors.js';
 import type { McpAppToolCall, McpAppToolResult } from './McpAppFrame.js';
 import { ConversationNavigation, mergeNavigationEntries, navigationProviderIdentity, navigationRowKey, useConversationNavigation, type TranscriptNavigationEntry } from './ConversationNavigation.js';
+import { ReadingStateScope, useReadingSnapshot, useReadingState } from '../ui/readingState.js';
 
 export interface ConversationTranscriptProps {
   /** 系统消息保存只写会话历史，不触发模型请求。 */
@@ -74,8 +77,8 @@ export interface ConversationTranscriptProps {
   onLatestContentVisibilityChange?: (visible: boolean) => void;
   historyLoading?: boolean;
   creationStatus?: SessionCreationStatus;
-  /** 选区作为右侧会话的评论引用，不写入主会话草稿。 */
-  onAskInSidebar?: (anchor: ConversationResponseTextAnchor) => void;
+  /** 选区暂存或直接发送到右侧会话，不写入主会话草稿。 */
+  onAskInSidebar?: (anchor: ConversationResponseTextAnchor, sendImmediately?: boolean) => void;
   onAddResponseAnnotation?: (anchor: ConversationResponseTextAnchor) => string;
   onUpdateResponseAnnotation?: (id: string, note: string) => void;
   onRemoveResponseAnnotation?: (id: string) => void;
@@ -263,11 +266,31 @@ function useStableOptionalCallback<Arguments extends unknown[], Result>(callback
 
 /** 会话身份隔离滚动、展开和动效状态；主会话与子线程共用同一切换边界。 */
 export function ConversationTranscript(props: ConversationTranscriptProps) {
-  return <ConversationTranscriptContent key={systemMessageScope(props.state.projectId ?? '', props.navigationId ?? props.state.conversationId)} {...props} />;
+  return (
+    <ReadingStateScope id={systemMessageScope(props.state.projectId ?? '', props.navigationId ?? props.state.conversationId)}>
+      <ConversationTranscriptContent {...props} />
+    </ReadingStateScope>
+  );
+}
+
+/** 离开会话时只记录阅读锚点和最新条目标识，不复制消息正文。 */
+interface TranscriptReadingPosition {
+  /** 可见条目在容器内的像素偏移。 */
+  anchor: TranscriptViewportAnchor;
+  /** 离开时最新消息的稳定身份。 */
+  latestItem: string;
+  /** 深历史锚点所属轮次，空值表示没有可补读轮次。 */
+  turnId: string | null;
+  /** 是否仍由最新内容跟随器控制滚动。 */
+  following: boolean;
 }
 
 /** 渲染会话正文、渐进资源、完整目录和历史定位。 */
 function ConversationTranscriptContent(props: ConversationTranscriptProps) {
+  /** 导航身份在临时会话接管后仍保持稳定。 */
+  const savedReading = useReadingSnapshot<TranscriptReadingPosition>('viewport');
+  /** 首次恢复的目标不随本次阅读过程中的保存而变化。 */
+  const initialReading = useRef(savedReading.current).current;
   /** 产品会话隔离待确认消息，子线程只读投影不接管主会话写入。 */
   const systemScope = systemMessageScope(props.state.projectId ?? '', props.state.conversationId);
   /** 补写中的消息与权威回执共享身份。 */
@@ -316,12 +339,12 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const latestVisibilityCallbackRef = useRef(props.onLatestContentVisibilityChange);
   latestVisibilityCallbackRef.current = props.onLatestContentVisibilityChange;
   const historyPrependAnchorRef = useRef<(TranscriptViewportAnchor & { frozenCursor: string }) | null>(null);
-  const staticReadingAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
+  const staticReadingAnchorRef = useRef<TranscriptViewportAnchor | null>(initialReading?.following === false ? initialReading.anchor : null);
   /** 展开状态提交后立即补偿入口本身，避免首帧先跳动再由测量器纠正。 */
   const pendingProcessAnchorRef = useRef<{ trigger: HTMLButtonElement; top: number } | null>(null);
   const previousTurnIdRef = useRef<string | null>(null);
   const activeTurnTrackingInitializedRef = useRef(false);
-  const scrollController = useThreadScrollController();
+  const scrollController = useThreadScrollController(initialReading?.following === false ? 'static' : 'user_follow');
   const [returnToLatestVisible, setReturnToLatestVisible] = useState(false);
   const [historyPagingGate, setHistoryPagingGate] = useState<{ conversationId: string | null; positioned: boolean; userIntent: boolean }>({ conversationId: null, positioned: false, userIntent: false });
   const [historyPagingRequestedConversationId, setHistoryPagingRequestedConversationId] = useState<string | null>(null);
@@ -343,10 +366,10 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const userScrollPointerActiveRef = useRef(false);
   const userScrollIntentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const automaticResourceLoadAttemptRef = useRef<string | null>(null);
-  const [rowExpansionOverrides, setRowExpansionOverrides] = useState<ReadonlyMap<string, boolean>>(() => new Map());
+  const [rowExpansionOverrides, setRowExpansionOverrides] = useReadingState<ReadonlyMap<string, boolean>>('expanded-rows', () => new Map());
   const [focusedRowKey, setFocusedRowKey] = useState<string | null>(null);
   const [historyAnchorRowKey, setHistoryAnchorRowKey] = useState<string | null>(null);
-  const [staticReadingAnchorRowKey, setStaticReadingAnchorRowKey] = useState<string | null>(null);
+  const [staticReadingAnchorRowKey, setStaticReadingAnchorRowKey] = useState<string | null>(initialReading?.anchor.rowKey ?? null);
   const historyPagingArmed = historyPagingGate.conversationId === props.state.conversationId && historyPagingGate.positioned && historyPagingGate.userIntent;
   const historyPagingRequested = historyPagingRequestedConversationId === props.state.conversationId;
   const historySentinelIntersecting = historySentinelIntersection.conversationId === props.state.conversationId && historySentinelIntersection.intersecting;
@@ -492,6 +515,10 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
     [composerQueueClientUserMessageIds, composerQueueSubmissionIds, props.historyOnly, props.state.activeTurnId, props.state.itemOrder, props.state.items, props.state.planImplementationRequests],
   );
   const queuedSubmissionItems = useMemo(() => projectQueuedSubmissionItems(props.state, transcriptQueuedSubmissions, persistedItems), [persistedItems, props.state.conversationId, props.state.providerThreadId, transcriptQueuedSubmissions]);
+  /** 历史补页、正文补载和连接状态变化不算新消息。 */
+  const latestReadingItem = persistedItems.at(-1);
+  /** 只比较最新消息身份，避免有界快照的文本长度影响位置恢复。 */
+  const latestReadingSignature = latestReadingItem?.key ?? '';
   const projectedItems = useMemo(() => {
     if (contentProjection) return contentProjection.items;
     // 已确认消息沿用历史时间；仍在排队的补充留在记录末尾，避免切换后藏到旧回复上方。
@@ -545,9 +572,6 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const answeredRequests = useMemo(() => props.state.pendingRequests.filter(isAnsweredUserInputRequest), [props.state.pendingRequests]);
   // 当前状态始终读取完整会话事件，不受活动列表的展示筛选影响。
   const activeStatusKind = transcriptRunStatus(props.state);
-  /** 同轮、未失败且有可读文字的摘要才接管当前进展；空摘要继续显示运行提示。 */
-  const activeReasoningItem =
-    props.state.currentReasoningItem?.turnId === activeTurnId && props.state.currentReasoningItem.status !== 'failed' && latestReasoningSummaryText(props.state.currentReasoningItem).length > 0 ? props.state.currentReasoningItem : null;
   // 创建中的会话尚未建立真实轮次时，由连接提示承担当前进度。
   const creatingSession = props.creationStatus?.state === 'creating' || props.creationStatus?.state === 'retrying';
   // 创建失败时保留创建错误，不再显示独立运行状态。
@@ -556,16 +580,15 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const realTurnStarted = Boolean(activeTurnId && props.state.snapshot);
   // 创建期只保留一个主进度；失败原因已归属原消息时不再追加创建错误。
   const showCreationStatus = Boolean(props.creationStatus) && !(creatingSession && realTurnStarted) && !(creationFailed && items.some((item) => item.optimistic && item.payload.taskPushLayout && hasScopedDeliveryFailure(item)));
-  // 只有实际渲染的底部状态可以接管过程中的整理提示。
-  const canShowStandaloneActiveStatus = !props.historyOnly && Boolean(activeStatusKind) && !creationFailed && !(creatingSession && !realTurnStarted);
+  /** 占位、动效和正文操作共用实际显示的运行状态，不再单独推断思考阶段。 */
+  const showActiveStatus = !props.historyOnly && Boolean(activeStatusKind) && !creationFailed && !(creatingSession && !realTurnStarted);
   // 只筛选底部已承载的同轮进行中整理；完成、失败、历史及其他活动继续参与原有投影。
   const transcriptRows = useMemo(() => {
     if (contentProjection) return contentProjection.rows;
     // 此列表仅用于生成可见行，原始条目及身份不做删除或合并。
-    const visibleItems =
-      canShowStandaloneActiveStatus && activeStatusKind === 'compacting' ? items.filter((item) => item.turnId !== activeTurnId || normalizeItemType(item.type) !== 'contextcompaction' || item.status !== 'in_progress') : items;
+    const visibleItems = showActiveStatus && activeStatusKind === 'compacting' ? items.filter((item) => item.turnId !== activeTurnId || normalizeItemType(item.type) !== 'contextcompaction' || item.status !== 'in_progress') : items;
     return reuseTranscriptRows(previousProjection.current?.rows ?? [], projectTranscriptRows(visibleItems, answeredRequests, activeTurnId, props.historyOnly, props.state.terminalTurnIds));
-  }, [activeStatusKind, activeTurnId, answeredRequests, canShowStandaloneActiveStatus, items, props.historyOnly, props.state.terminalTurnIds]);
+  }, [activeStatusKind, activeTurnId, answeredRequests, items, props.historyOnly, props.state.terminalTurnIds, showActiveStatus]);
   const processAvailableTurnIds = useMemo(() => availableTurnProcessIds(props.state.snapshot), [props.state.snapshot?.snapshotV2]);
   const closedTurnChangeSetIds = useMemo(() => availableClosedTurnChangeSetIds(props.state.snapshot), [props.state.snapshot?.snapshotV2]);
   const baseTurnRows = useMemo(
@@ -576,7 +599,7 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   );
   /** 具体实时过程已经位于时间线末尾时，不再追加含义相同的“正在执行”。 */
   const hasLiveTurnWork = baseTurnRows.some((row) => row.kind === 'turn_work' && row.live);
-  const showStandaloneActiveStatus = shouldRenderStandaloneActiveStatus(canShowStandaloneActiveStatus, activeStatusKind, hasLiveTurnWork);
+  const showStandaloneActiveStatus = shouldRenderStandaloneActiveStatus(showActiveStatus, activeStatusKind, hasLiveTurnWork);
   previousProjection.current = contentProjection ?? createTranscriptProjection(props.state, projectionContext, items, transcriptRows, baseTurnRows);
 
   /** 真实投影提供已加载身份，目录只补齐缺失历史。 */
@@ -639,6 +662,48 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   }, [turnRows]);
   const turnRowsByKey = useMemo(() => new Map(turnRows.map((row) => [row.key, row])), [turnRows]);
   const activeTurnRowKeys = useMemo(() => new Set(turnRows.filter((row) => activeTurnId && activeTurnIdentities.has(transcriptTurnRowTurnId(row) ?? '')).map((row) => row.key)), [activeTurnId, activeTurnIdentities, turnRows]);
+  /** 深历史不一定在首屏快照中；按原轮次补回后才恢复锚点。 */
+  const [readingTurnLoaded, setReadingTurnLoaded] = useState(false);
+  /** 按需补读不随普通正文重绘重新发起。 */
+  const loadReadingTurn = useStableOptionalCallback(props.onLoadNavigationTurn);
+  /** 只在已水合且原锚点确实缺失时补读。 */
+  const readingTurnMissing = Boolean(
+    historyHydrated && initialReading?.turnId && initialReading.latestItem === latestReadingSignature && initialReading.anchor.rowKey && !turnRowsByKey.has(initialReading.anchor.rowKey) && !readingTurnLoaded,
+  );
+  // 原锚点补读完成前不展示错误的默认位置。
+  if (readingTurnMissing && loadReadingTurn && initialReading?.following === false) canRevealHistoryRef.current = false;
+  useEffect(() => {
+    if (!readingTurnMissing || !initialReading?.turnId || !loadReadingTurn) return;
+    /** 切走后不再把迟到回执写入已卸载视图。 */
+    let active = true;
+    void loadReadingTurn(initialReading.turnId)
+      .catch((error) => {
+        if (active) recordSystemMessage(systemScope, error, 'navigation', '阅读位置恢复失败。');
+      })
+      .finally(() => {
+        if (active) setReadingTurnLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [initialReading, loadReadingTurn, readingTurnMissing, systemScope]);
+  /** 卸载时读取最后一次已提交的正文与展开状态。 */
+  const readingCaptureRef = useRef({ historyPositioned, latestReadingSignature, turnRowsByKey });
+  useLayoutEffect(() => {
+    readingCaptureRef.current = { historyPositioned, latestReadingSignature, turnRowsByKey };
+  });
+  useLayoutEffect(() => {
+    /** 清理时 React 尚未移除正文，仍可读取可见条目的真实位置。 */
+    const container = containerRef.current;
+    return () => {
+      if (!container || !readingCaptureRef.current.historyPositioned) return;
+      /** 锚点同时记录内部条目和外层虚拟行。 */
+      const anchor = captureTranscriptViewportAnchor(container);
+      /** 轮次身份用于缓存失效后的按需补读。 */
+      const row = anchor.rowKey ? readingCaptureRef.current.turnRowsByKey.get(anchor.rowKey) : undefined;
+      savedReading.current = { anchor, latestItem: readingCaptureRef.current.latestReadingSignature, turnId: row ? transcriptTurnRowTurnId(row) : null, following: scrollController.getState().mode !== 'static' };
+    };
+  }, [savedReading, scrollController]);
   const pinnedRowKeys = useMemo(() => {
     const pinned = new Set([...activeTurnRowKeys, ...expandedRowKeys]);
     if (focusedRowKey) pinned.add(focusedRowKey);
@@ -702,7 +767,6 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
     }
     return anchors;
   }, [completionAnchorKeyByTurn, transcriptRows]);
-  const showActiveStatus = !props.historyOnly && shouldShowTranscriptThinking(props.state, items);
   const motionFocus = props.historyOnly ? null : resolveSessionMotionFocus(props.state, transcriptItems, showActiveStatus);
   const interactionAuthorityMissing = props.state.queue?.state.type === 'paused' && props.state.queue.state.reason === 'interaction_authority_missing' && Boolean(props.state.activeTurnId);
   const awaitingReplyMessageIdsKey = items
@@ -1074,17 +1138,45 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
     const container = containerRef.current;
     const conversationId = props.state.conversationId;
     if (!container || !historyHydrated || !conversationId || positionedConversationIdRef.current === conversationId) return;
+    /** 没有新消息时恢复阅读点；首次打开和新消息仍沿用最新内容入口。 */
+    const restore = initialReading && initialReading.latestItem === latestReadingSignature && !initialReading.following;
+    if (restore && initialReading.anchor.rowKey && !turnRowsByKey.has(initialReading.anchor.rowKey) && initialReading.turnId && props.onLoadNavigationTurn && !readingTurnLoaded) return;
     positionedConversationIdRef.current = conversationId;
     clearUserScrollIntent();
     clearStaticReadingAnchor();
-    const effect = scrollController.onExplicitLatestRequest();
-    if (effect.type === 'scroll_to_bottom') positionLatest(container);
+    if (restore) {
+      scrollController.onExplicitHistoryRequest();
+      container.scrollTop = initialReading.anchor.scrollTop;
+      compensateTranscriptViewportAnchor(container, initialReading.anchor);
+      rememberStaticReadingAnchor(container);
+      synchronizeTranscriptViewport(container);
+    } else {
+      const effect = scrollController.onExplicitLatestRequest();
+      if (effect.type === 'scroll_to_bottom') positionLatest(container);
+    }
+    // 首次显示沿用定位循环的完成条件，避免暴露行高测量期间的中间位置。
     maintainLatestPosition();
-    setReturnToLatestVisible(false);
+    setReturnToLatestVisible(Boolean(restore));
     setHistoryPagingGate({ conversationId, positioned: true, userIntent: false });
     setHistoryPagingRequestedConversationId(null);
     setHistorySentinelIntersection({ conversationId, intersecting: false });
-  }, [clearStaticReadingAnchor, clearUserScrollIntent, historyHydrated, maintainLatestPosition, positionLatest, props.state.conversationId, props.state.transcriptRevision, scrollController]);
+  }, [
+    clearStaticReadingAnchor,
+    clearUserScrollIntent,
+    historyHydrated,
+    initialReading,
+    latestReadingSignature,
+    maintainLatestPosition,
+    positionLatest,
+    props.onLoadNavigationTurn,
+    props.state.conversationId,
+    props.state.transcriptRevision,
+    readingTurnLoaded,
+    rememberStaticReadingAnchor,
+    scrollController,
+    synchronizeTranscriptViewport,
+    turnRowsByKey,
+  ]);
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -1270,10 +1362,9 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
         />
       );
     if (row.kind === 'turn_failure') {
-      /** 只对最新停止的网络失败提供续跑，历史轮次不重复提交。 */
+      /** 最新明确失败的轮次允许手动续跑；错误分类只解释原因，不隐藏恢复入口。 */
       const retryable =
         !props.historyOnly &&
-        row.failure.category === 'network' &&
         // 送达尚未核对的提交只开放原恢复入口，不能从旧失败卡发起另一条续接。
         !props.state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)) &&
         !props.state.activeTurnId &&
@@ -1622,16 +1713,13 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
           ) : null}
           {showCreationStatus && props.creationStatus ? <SessionCreationNotice status={props.creationStatus} language={props.language} /> : null}
           {showStandaloneActiveStatus && activeStatusKind ? (
-            activeStatusKind === 'executing' && activeReasoningItem ? (
-              <SessionReasoningSummary item={activeReasoningItem} language={props.language} status={reasoningSummaryStatus(activeReasoningItem, props.state)} motionActive onVisibleContentChange={maintainLatestPosition} />
-            ) : (
-              <TranscriptActiveStatus
-                language={props.language}
-                kind={activeStatusKind}
-                reconnectAttempt={props.state.providerReconnectAttempt || props.state.reconnectAttempt}
-                reconnectAttempts={props.state.providerReconnectAttempt > 0 ? props.state.providerReconnectAttempts : 5}
-              />
-            )
+            <TranscriptActiveStatus
+              language={props.language}
+              kind={activeStatusKind}
+              summaryText={props.state.currentReasoningItem?.turnId === activeTurnId ? latestReasoningSummaryText(props.state.currentReasoningItem) : undefined}
+              reconnectAttempt={props.state.providerReconnectAttempt || props.state.reconnectAttempt}
+              reconnectAttempts={props.state.providerReconnectAttempt > 0 ? props.state.providerReconnectAttempts : 5}
+            />
           ) : null}
           {!props.historyOnly && props.state.transportState === 'failed' && props.state.error?.code === 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED' ? (
             <ConversationNotice label={props.language === 'zh-CN' ? '连接失败' : 'Connection failed'}>
@@ -1788,6 +1876,7 @@ function SessionCreationNotice(props: { status: SessionCreationStatus; language:
       </section>
     );
   }
+  if (props.status.state === 'creating') return <TranscriptActiveStatus language={props.language} kind="executing" reconnectAttempt={0} reconnectAttempts={5} />;
   /** 重试计数沿用实际创建状态，普通连接文案由调用方提供。 */
   const retryingMessage = props.status.state === 'retrying' ? `${props.language === 'zh-CN' ? '正在连接...' : 'Connecting...'} (${props.status.retryAttempt ?? 1}/${props.status.maxRetries ?? 5})` : props.status.message;
   return (
@@ -1903,7 +1992,7 @@ function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: 
         ) : null}
         {props.onRetry ? (
           <button type="button" disabled={pending} onClick={() => void retry()}>
-            {pending ? (zh ? '正在连接...' : 'Connecting...') : zh ? '重试' : 'Retry'}
+            {pending ? (zh ? '正在重试…' : 'Retrying…') : zh ? '重试' : 'Retry'}
           </button>
         ) : null}
       </span>
@@ -2330,7 +2419,8 @@ function NavigationHistoryPlaceholder(props: { entry: TranscriptNavigationEntry;
 interface TranscriptRowRenderOptions {
   props: ConversationTranscriptProps;
   items: readonly NativeSessionItemBuffer[];
-  showThinking: boolean;
+  /** 正文操作和发送反馈服从同一处运行提示。 */
+  showActiveStatus: boolean;
   motionFocus: SessionMotionFocus;
   lastUserKey: string | undefined;
   activityPresentation: 'inline' | 'detail';
@@ -2339,10 +2429,11 @@ interface TranscriptRowRenderOptions {
   responseAnnotationsByItemId: ReadonlyMap<string, ConversationResponseAnnotation[]>;
 }
 
+/** 所有正文行共享当前运行提示与动效归属，避免重复占位。 */
 function transcriptRowRenderOptions(
   props: ConversationTranscriptProps,
   items: readonly NativeSessionItemBuffer[],
-  showThinking: boolean,
+  showActiveStatus: boolean,
   motionFocus: SessionMotionFocus,
   lastUserKey: string | undefined,
   activityPresentation: 'inline' | 'detail',
@@ -2350,7 +2441,7 @@ function transcriptRowRenderOptions(
   onVisibleContentChange: () => void,
   responseAnnotationsByItemId: ReadonlyMap<string, ConversationResponseAnnotation[]>,
 ): TranscriptRowRenderOptions {
-  return { props, items, showThinking, motionFocus, lastUserKey, activityPresentation, enteringItemIds, onVisibleContentChange, responseAnnotationsByItemId };
+  return { props, items, showActiveStatus, motionFocus, lastUserKey, activityPresentation, enteringItemIds, onVisibleContentChange, responseAnnotationsByItemId };
 }
 
 /** 按消息种类复用展示组件；阶段摘要保持原顺序，操作列表与命令详情分别按需展开。 */
@@ -2400,7 +2491,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
   }
   /** 任务首发的失败也使用原消息反馈，重试期间由连接状态接管。 */
   const taskCreation = row.item.payload.taskPushLayout ? options.props.creationStatus : undefined;
-  const showPendingDeliveryFeedback = row.item.optimistic && (!taskCreation || taskCreation.state === 'failed') && shouldShowPendingMessageDeliveryFeedback(row.item, options.showThinking);
+  const showPendingDeliveryFeedback = row.item.optimistic && (!taskCreation || taskCreation.state === 'failed') && shouldShowPendingMessageDeliveryFeedback(row.item, options.showActiveStatus);
   const queuedSubmission = queuedSubmissionForItem(row.item, options.props.state.queue);
   if (row.item.payload.internalOperation === true) {
     return (
@@ -2423,7 +2514,7 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
         questionAnswer={row.questionAnswer}
         language={options.props.language}
         assistantLabel={options.props.assistantLabel}
-        isLatest={options.activityPresentation === 'detail' && row.item.key === options.items[options.items.length - 1]?.key && !options.showThinking}
+        isLatest={options.activityPresentation === 'detail' && row.item.key === options.items[options.items.length - 1]?.key && !options.showActiveStatus}
         animateEntrance={options.enteringItemIds.has(row.item.key)}
         // 最终回复的底栏只按自身内容类型显示，新一轮运行状态不能隐藏历史回复的时间与用量。
         showAssistantActions={options.activityPresentation === 'detail' && isFinalAnswerItem(row.item)}
@@ -2514,11 +2605,17 @@ function isSamePlanItem(openItem: NativeSessionItemBuffer | null | undefined, it
   return openItem.itemId === item.itemId && openItem.turnId === item.turnId;
 }
 
-/** 运行状态只读取权威队列、轮次、请求、连接和过程事件，不从计时或正文猜测。 */
-export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'checking_plugin' | 'executing' | 'compacting' | 'waiting_input' | 'waiting_approval' | 'reconnecting' | null {
+/** 本地发送即时反馈，缓存摘要静态显示；权威运行、连接和失败状态到达后接管。 */
+export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'checking_plugin' | 'executing' | 'cached_summary' | 'compacting' | 'waiting_input' | 'waiting_approval' | 'reconnecting' | null {
+  // 原题缺少可操作的权威请求时等待交互恢复，不能继续显示执行动画。
+  if (hasUnclaimedRecoveredRequestUserInput(state)) return null;
   // 暂停或未知送达不代表模型继续运行，错误与核对入口由系统操作行承载。
   if (state.queue?.state.type === 'paused' || state.queue?.submissions.some((submission) => submission.internalOperation && submission.pausedReason === 'outcome_unknown')) return null;
   if (state.providerReconnectAttempt > 0 && state.providerReconnectTurnId && !state.terminalTurnIds[state.providerReconnectTurnId]) return 'reconnecting';
+  /** 初次连接尚未失败时显示执行；明确断线后才切换为连接提示。 */
+  const pendingMessage = selectPendingExecutionMessage(state);
+  if (state.transportState === 'failed') return null;
+  if (state.transportState === 'reconnecting' && pendingMessage && pendingMessage.status !== 'unconfirmed') return 'reconnecting';
   if (state.queue?.waitReason === 'plugin_hook') return 'checking_plugin';
   if (state.conversationState === 'starting_turn') return 'starting';
   /** 安全队首已经保存但尚未交给模型时，继续使用底部准备状态，不能因运行态暂为空闲而隐藏。 */
@@ -2532,10 +2629,22 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
     (!state.queue.waitReason || state.queue.waitReason === 'dispatch_pending' || state.queue.waitReason === 'execution_context_preparing' || state.queue.waitReason === 'conversation_restoring')
   )
     return 'starting';
-  if (!state.activeTurnId || state.terminalTurnIds[state.activeTurnId]) return null;
+  if (!state.activeTurnId || state.terminalTurnIds[state.activeTurnId]) {
+    // 发送结果核对进度在原消息下显示，同一请求不能同时显示执行与连接。
+    return pendingMessage && pendingMessage.status !== 'unconfirmed' ? 'executing' : null;
+  }
   // 切回会话需要重新订阅和读取权威状态，只有明确的重连状态才说明连接中断。
   if (state.transportState === 'reconnecting') return 'reconnecting';
-  if (state.transportState !== 'ready') return null;
+  if (state.transportState !== 'ready') {
+    // 切回时先展示同轮已缓存的摘要，不等待联网；静态文字不代表模型仍在运行。
+    return ['disconnected', 'connecting', 'hydrating'].includes(state.transportState) &&
+      state.snapshot?.id === state.conversationId &&
+      (state.conversationState === 'active_prework' || state.conversationState === 'active_final_answer') &&
+      state.currentReasoningItem?.turnId === state.activeTurnId &&
+      latestReasoningSummaryText(state.currentReasoningItem)
+      ? 'cached_summary'
+      : null;
+  }
   if (state.conversationState === 'waiting_user_input') return 'waiting_input';
   if (state.conversationState === 'waiting_approval') return 'waiting_approval';
   if (state.conversationState !== 'active_prework' && state.conversationState !== 'active_final_answer') return null;
@@ -2544,12 +2653,14 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
 }
 
 /** 任务耗时仍单独显示；此处不把时间增长当作模型继续推进的证据。 */
-function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonNullable<ReturnType<typeof transcriptRunStatus>>; reconnectAttempt: number; reconnectAttempts: number }): ReactNode {
+function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonNullable<ReturnType<typeof transcriptRunStatus>>; reconnectAttempt: number; reconnectAttempts: number; summaryText?: string }): ReactNode {
   // 整理状态与活动记录沿用同一套用户表述，由当前状态位置统一承载进度。
   const labels = {
-    starting: ['正在准备发送', 'Preparing to send'],
+    starting: ['正在执行', 'Executing'],
     checking_plugin: ['正在等待 Plugin Hook 检查', 'Waiting for Plugin Hook checks'],
     executing: ['正在执行', 'Executing'],
+    // 缓存态只展示已有摘要，缺少摘要时不会进入此状态。
+    cached_summary: ['', ''],
     compacting: ['正在整理较早对话以继续工作', 'Organizing earlier conversation to continue'],
     waiting_input: ['等待回答，请处理问题表单', 'Waiting for your answer'],
     waiting_approval: ['等待审批，请处理审批事项', 'Waiting for your approval'],
@@ -2565,7 +2676,7 @@ function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonN
   return (
     <p className="session-transcript-thinking" role="status" aria-live="polite">
       {props.kind === 'reconnecting' ? sessionConnectionSymbol : null}
-      <SessionSweepText className="session-current-status-text" text={retryLabel} active />
+      <SessionSweepText className="session-current-status-text" text={(props.kind === 'executing' || props.kind === 'cached_summary') && props.summaryText ? props.summaryText : retryLabel} active={props.kind !== 'cached_summary'} />
     </p>
   );
 }
@@ -2610,6 +2721,11 @@ export function MessageDeliveryOutcomeFeedback(props: {
   const [pendingAction, setPendingAction] = useState<'retry' | 'cancel' | null>(null);
   /** 保留本次重试或核对的错误，不覆盖原消息的持久送达记录。 */
   const [actionError, setActionError] = useState<unknown>(null);
+  /** 次数由发送控制器的真实只读核对循环提供，结束后恢复既有错误操作。 */
+  const deliveryReconnectAttempt = Number(props.item.payload.deliveryReconnectAttempt) || 0;
+  if (props.item.status === 'unconfirmed' && deliveryReconnectAttempt > 0) {
+    return <TranscriptActiveStatus language={props.language} kind="reconnecting" reconnectAttempt={deliveryReconnectAttempt} reconnectAttempts={Number(props.item.payload.deliveryReconnectAttempts) || 5} />;
+  }
   const pausedReason = props.item.payload.pausedReason;
   const interactionResponseRecovery = props.item.payload.recoveryKind === 'interaction_response';
   if (interactionResponseRecovery && props.item.status === 'queued') {
@@ -3183,6 +3299,17 @@ function isReasoningProcessText(item: NativeSessionItemBuffer): boolean {
 
 /** 隐藏状态和移入侧栏的协调事件既不渲染，也不打断可见操作的连续性。 */
 function isHiddenTranscriptProcessItem(item: NativeSessionItemBuffer): boolean {
+  // 空助手事件不再承担思考占位；待补正文、问题、附件和图片仍须保留加载入口。
+  if (
+    itemRole(item) === 'assistant' &&
+    item.status === 'in_progress' &&
+    classifyAssistantMessage(item.payload, item.phase) !== 'question' &&
+    !transcriptItemText(item).trim() &&
+    !item.payload.v2ContentHandle &&
+    item.resources.length === 0 &&
+    ![item.payload.attachments, item.payload.images].some((entries) => Array.isArray(entries) && entries.length > 0)
+  )
+    return true;
   return isSubagentCoordinationItem(item) || (normalizeItemType(item.type) === 'reasoning' && !isReasoningProcessText(item));
 }
 
@@ -3569,7 +3696,8 @@ export function projectQueuedSubmissionItems(state: NativeSessionState, submissi
   });
 }
 
-type SessionMotionFocusKind = 'thinking' | 'reasoning' | 'activity' | 'plan' | 'image' | 'streaming';
+/** 执行提示和真实内容动效使用同一焦点集合。 */
+type SessionMotionFocusKind = 'executing' | 'reasoning' | 'activity' | 'plan' | 'image' | 'streaming';
 
 interface ActiveSessionMotionFocus {
   kind: SessionMotionFocusKind;
@@ -3581,9 +3709,10 @@ type SessionMotionFocus = ActiveSessionMotionFocus | null;
 const nonRunningMotionStatuses = new Set(['completed', 'failed', 'interrupted', 'waiting', 'pending', 'queued', 'paused', 'unconfirmed']);
 const userBlockingConversationStates = new Set(['waiting_approval', 'waiting_user_input', 'interrupt_confirm']);
 
-function resolveSessionMotionFocus(state: NativeSessionState, items: readonly NativeSessionItemBuffer[], showThinking: boolean): SessionMotionFocus {
+/** 真实内容优先取得动效；没有内容时由统一执行提示承担。 */
+function resolveSessionMotionFocus(state: NativeSessionState, items: readonly NativeSessionItemBuffer[], showActiveStatus: boolean): SessionMotionFocus {
   const interactionAuthorityMissing = state.queue?.state.type === 'paused' && state.queue.state.reason === 'interaction_authority_missing';
-  if (!state.activeTurnId || interactionAuthorityMissing || userBlockingConversationStates.has(state.conversationState)) return showThinking ? { kind: 'thinking' } : null;
+  if (!state.activeTurnId || interactionAuthorityMissing || userBlockingConversationStates.has(state.conversationState)) return showActiveStatus ? { kind: 'executing' } : null;
   const activeItems = items.filter((item) => item.turnId === state.activeTurnId && !nonRunningMotionStatuses.has(item.status.toLocaleLowerCase()));
 
   // 最终回答已经开始时，它是离用户结果最近的活动，优先接管仍未终止的过程条目。
@@ -3595,10 +3724,11 @@ function resolveSessionMotionFocus(state: NativeSessionState, items: readonly Na
     const kind = sessionMotionKind(item);
     if (kind) return { kind, itemKey: item.key };
   }
-  return showThinking ? { kind: 'thinking' } : null;
+  return showActiveStatus ? { kind: 'executing' } : null;
 }
 
-function sessionMotionKind(item: NativeSessionItemBuffer): Exclude<SessionMotionFocusKind, 'thinking'> | null {
+/** 按已有消息种类选择内容动效，不生成额外运行提示。 */
+function sessionMotionKind(item: NativeSessionItemBuffer): Exclude<SessionMotionFocusKind, 'executing'> | null {
   const type = normalizeItemType(item.type);
   if (isOperationalActivityItem(item)) return 'activity';
   if (type === 'plan') return 'plan';
@@ -3607,25 +3737,6 @@ function sessionMotionKind(item: NativeSessionItemBuffer): Exclude<SessionMotion
   if (role === 'image') return 'image';
   if (role === 'assistant' || role === 'commentary') return 'streaming';
   return null;
-}
-
-/** 准备发送和当前轮次共用底部状态，已有模型摘要或回复时由它们接手。 */
-export function shouldShowTranscriptThinking(state: NativeSessionState, items: readonly NativeSessionItemBuffer[] = Object.values(state.items)): boolean {
-  if (hasUnclaimedRecoveredRequestUserInput(state)) return false;
-  // 已保存的安全队首与本地首次发送共用准备状态，不依赖活动轮次身份。
-  if (transcriptRunStatus(state) === 'starting') return true;
-  if (state.conversationState !== 'starting_turn' && state.conversationState !== 'active_prework' && state.conversationState !== 'active_final_answer') return false;
-  const effectiveActiveTurnId = state.activeTurnId && items.some((item) => item.turnId === state.activeTurnId) ? state.activeTurnId : latestLiveTurnId(items);
-  if (!effectiveActiveTurnId) return true;
-  return !items.some((item) => item.turnId === effectiveActiveTurnId && itemProvidesCurrentModelStatus(item, state));
-}
-
-function itemProvidesCurrentModelStatus(item: NativeSessionItemBuffer, state: NativeSessionState): boolean {
-  // 只有“模型当前在做什么”的思考摘要或已经开始的最终回答可以替代底部状态行；
-  // 命令、文件、网页和技能只是过程明细，不能让进行中状态消失。
-  if (normalizeItemType(item.type) === 'reasoning' && reasoningSummaryStatus(item, state) === 'active' && latestReasoningSummaryText(item).length > 0) return true;
-  if (item.status === 'completed' || item.status === 'failed' || item.status === 'interrupted') return false;
-  return isFinalAnswerItem(item);
 }
 
 export interface CompletedItemAnnouncementTracker {
