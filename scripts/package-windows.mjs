@@ -77,7 +77,7 @@ await run(
 );
 await generateReleaseManifest({ version: manifest.version, platform: 'win32', distDir: output, outputPath: join(output, `zeus-release-manifest-win32-${arch}.json`), signed: requireSignature });
 /** 在最终安装器签名和校验完成后保存对应定位文件。 */
-const symbols = await archivePackageSymbols({ asarPath, outputRoot: output, platform: 'win32', arch, variant: 'release', installerPaths: [join(output, installerName)] });
+const symbols = await archivePackageSymbols({ asarPath, outputRoot: output, platform: 'win32', arch, variant: 'release', expectedAppVersion: manifest.version, installerPaths: [join(output, installerName)] });
 console.log(`Zeus 定位文件已归档：${symbols}`);
 console.log(`Windows Zeus ${requireSignature ? '已签名' : '未签名'}正式安装包已生成：${join(output, installerName)}`);
 

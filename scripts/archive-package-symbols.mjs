@@ -15,7 +15,8 @@ function sha256(bytes) {
 }
 
 /** 核对实际打包内容后，在安装包旁保存独立定位目录；任一步失败都不宣布打包成功。 */
-export async function archivePackageSymbols({ asarPath, outputRoot, platform, arch, variant, installerPaths = [] }) {
+export async function archivePackageSymbols({ asarPath, outputRoot, platform, arch, variant, expectedAppVersion, installerPaths = [] }) {
+  if (typeof expectedAppVersion !== 'string' || !/^\d+\.\d+\.\d+$/u.test(expectedAppVersion)) throw new Error('定位文件归档必须明确指定本次打包的应用版本。');
   /** 报告中的 ASAR 指纹直接定位本次归档，重复构建也保留各自的安装器指纹。 */
   const asarSha256 = await sha256File(asarPath);
   /** 打包清单决定归档范围，不收集未进入安装包的残留构建文件。 */
@@ -26,10 +27,10 @@ export async function archivePackageSymbols({ asarPath, outputRoot, platform, ar
   /** 复用已随应用生成的完整源码包，保持 TypeScript 对照表指向的源码可用。 */
   const sourcePath = 'dist/licenses/zeus-source.tar.gz';
   const packed = readAsarFiles(asarPath, [...scriptPaths, sourcePath, 'package.json']);
-  /** 应用和 Electron 版本分别来自实际包与当前构建清单。 */
+  /** 应用版本与打包入口冻结的发行版本核对；上游源码版本和 Electron 版本仍来自根清单。 */
   const app = JSON.parse(packed.get('package.json').toString('utf8'));
   const workspace = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-  if (app.version !== workspace.version) throw new Error('定位文件归档的应用版本与构建输入不一致。');
+  if (app.version !== expectedAppVersion) throw new Error(`定位文件归档的应用版本与打包输入不一致：expected=${expectedAppVersion} actual=${app.version}。`);
   /** 每次构建使用独立目录，旧版本的定位文件不会被覆盖或清理。 */
   const symbolsRoot = join(outputRoot, 'symbols');
   await mkdir(symbolsRoot, { recursive: true });
@@ -38,6 +39,7 @@ export async function archivePackageSymbols({ asarPath, outputRoot, platform, ar
     /** 清单同时绑定源码、运行脚本、对照表、ASAR 和最终安装器。 */
     const manifest = {
       appVersion: app.version,
+      sourceVersion: workspace.version,
       electronVersion: workspace.devDependencies.electron,
       platform,
       arch,

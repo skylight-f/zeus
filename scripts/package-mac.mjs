@@ -210,9 +210,10 @@ export async function packageMac({ dmg = false } = {}) {
   const outputArgs = configuredOutputRoot ? [`--config.directories.output=${outputRoot}`] : [];
   const identity = distributionPackageIdentity(variant);
   const artifactPrefix = variant === 'test' ? 'Zeus-Test' : distributionArtifactPrefix;
+  const appVersion = assertDistributionVersions();
   const brandingArgs = [
     // 只在打包产物写入发行版本，不改写受版本控制的上游包清单。
-    `--config.extraMetadata.version=${assertDistributionVersions()}`,
+    `--config.extraMetadata.version=${appVersion}`,
     `--config.productName=${identity.name}`,
     `--config.mac.executableName=${identity.executable}`,
     `--config.artifactName=${artifactPrefix}-\${version}-\${arch}.\${ext}`,
@@ -230,14 +231,14 @@ export async function packageMac({ dmg = false } = {}) {
   verifyPackagedApp(appPath, { expectedElectronVersion: version });
   await verifyCodesignPackagedApp(appPath);
   /** 定位文件在签名完成后另存，不写入应用或磁盘映像。 */
-  const appVersion = JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8')).version;
   const symbols = await archivePackageSymbols({
     asarPath: join(appPath, 'Contents/Resources/app.asar'),
     outputRoot,
     platform: 'darwin',
     arch,
     variant,
-    installerPaths: dmg ? [join(outputRoot, `Zeus-${variant === 'test' ? 'Test-' : ''}${appVersion}-${arch}.dmg`)] : [],
+    expectedAppVersion: appVersion,
+    installerPaths: dmg ? [join(outputRoot, `${artifactPrefix}-${appVersion}-${arch}.dmg`)] : [],
   });
   console.log(`Zeus 定位文件已归档：${symbols}`);
   /** 只在打包和校验成功后回收同一身份、架构的旧安装包，失败时保留原有产物。 */
