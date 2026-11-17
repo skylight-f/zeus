@@ -1,3 +1,4 @@
+import { GitPaneSeparator } from './GitPaneSeparator.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { FilePreview, FilePreviewDataContext, PreviewIconButton, fileDiffEmptyMessage } from '../code/FilePreview.js';
 import type { FilePreviewRequest, FilePreviewItem } from '@zeus/shared';
@@ -6,25 +7,27 @@ import { fullFileDiff, refreshedFileDiff } from '../code/fullFileDiff.js';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import type { FileStatus } from '../code/fileStatus.js';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
-import { ColumnsIcon as Columns } from '@phosphor-icons/react/dist/csr/Columns';
-import { RowsIcon as Rows } from '@phosphor-icons/react/dist/csr/Rows';
 import type { DashboardClient, GitDiffHunk, GitDiffSummary, GitFileDiff } from '../apiClient.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { ResourceLoading } from '../ui/ResourceLoading.js';
+import type { PreparedFilePreview } from '../code/preparedFilePreview.js';
 /** 与会话和交付共用按可视区域渲染的差异视图。 */
 const CodeDiffView = lazy(() => import('../code/CodeDiffView.js').then((module) => ({ default: module.CodeDiffView })));
 
-import '../workspace.css';
+import '../styles.css';
+import '../ui/primitives.css';
+import '../agentdesk-theme.css';
+import { Button } from '../ui/Button.js';
 
 interface SideBySideDiffProps {
-  partitionHunks?: boolean;
-  onHunkDiscard?: (file: GitFileDiff, hunk: GitDiffHunk, index: number) => void;
-  hunkDiscardLabel?: string;
   /** 已知工作区状态优先于补丁类型，避免未跟踪文件被显示为已暂存新增。 */
   fileStatus?: FileStatus;
   /** 准确的仓库与比较范围。 */
   previewRequest?: FilePreviewRequest;
   /** 外部快照刷新时释放旧内容。 */
   revision?: string | number;
+  /** 文件树已准备好同一业务范围的授权全文。 */
+  preparedPreview?: PreparedFilePreview;
   /** 保存当前版本后刷新所属文件清单。 */
   onSaved?: () => void | Promise<void>;
   diff: GitDiffSummary | null;
@@ -101,21 +104,26 @@ export function ProjectGitDiffWindow(props: {
                 return detail.diff;
               })
             : source.comparisonRef
-              ? props.client.loadProjectGitComparisonDiff(source.projectId, source.repositoryId, source.comparisonRef, source.comparisonMode ?? 'current').then((summary) => {
+              ? props.client.loadProjectGitComparisonDiff(source.projectId, source.repositoryId, source.comparisonRef, source.comparisonMode ?? 'current', source.path).then((summary) => {
                   if (!cancelled) setTitle(`${source.comparisonRef} · ${zh ? '分支差异' : 'Branch diff'}`);
                   return summary;
                 })
-              : props.client.loadProjectGitWorkbench(source.projectId).then((workbench) => {
-                  /** 项目工作台只在项目来源下解析仓库。 */
-                  const repository = workbench.repositories.find((candidate) => candidate.id === source.repositoryId);
-                  if (!repository) throw new Error(zh ? '仓库已不在当前项目中。' : 'The repository is no longer part of this project.');
-                  if (!cancelled) {
-                    setTitle(repository.name);
-                    // 暂存范围由补丁决定；未跟踪与冲突不能从新增补丁推断。
-                    setFileStatuses(Object.fromEntries(repository.snapshot.fileStatuses.filter((file) => file.category === 'untracked' || file.category === 'conflict').map((file) => [file.path, file.category])));
-                  }
-                  return source.stage === 'staged' ? repository.snapshot.stagedDiff : source.stage === 'unstaged' ? repository.snapshot.unstagedDiff : repository.snapshot.diff;
-                });
+              : (() => {
+                  // 文件补丁与仓库状态独立回填，其他仓库扫描不延迟当前差异。
+                  void props.client
+                    .loadProjectGitWorkbench(source.projectId, false)
+                    .then((workbench) => {
+                      if (cancelled) return;
+                      const repository = workbench.repositories.find((candidate) => candidate.id === source.repositoryId);
+                      if (!repository) return;
+                      setTitle(repository.name);
+                      setFileStatuses(Object.fromEntries(repository.snapshot.fileStatuses.filter((file) => file.category === 'untracked' || file.category === 'conflict').map((file) => [file.path, file.category])));
+                    })
+                    .catch((cause: unknown) => {
+                      if (!cancelled) console.warn('Git file status refresh failed', cause);
+                    });
+                  return props.client.loadProjectGitComparisonDiff(source.projectId, source.repositoryId, 'HEAD', source.stage === 'staged' || source.stage === 'unstaged' ? source.stage : 'working-tree', source.path);
+                })();
     void request
       .then((next) => {
         if (cancelled) return;
@@ -162,26 +170,27 @@ export function ProjectGitDiffWindow(props: {
               </header>
               <div>
                 {props.source.path && !diff.fileDiffs.some((file) => file.newPath === props.source.path || file.oldPath === props.source.path) ? (
-                  <button type="button" data-file-path={props.source.path} className={props.source.path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(props.source.path)}>
+                  <Button unstyled type="button" data-file-path={props.source.path} className={props.source.path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(props.source.path)}>
                     <FileTypeIcon name={props.source.path} />
                     <span data-file-status={fileStatuses[props.source.path]}>{props.source.path}</span>
-                  </button>
+                  </Button>
                 ) : null}
                 {diff.fileDiffs.map((file) => {
                   const path = file.newPath || file.oldPath;
                   return (
-                    <button key={`${file.oldPath}:${file.newPath}`} type="button" data-file-path={path} className={path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(path)}>
-                      <FileTypeIcon name={path} />
+                    <Button unstyled key={`${file.oldPath}:${file.newPath}`} type="button" data-file-path={path} className={path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(path)}>
+                      <FileTypeIcon name={path} kind={file.isSubmodule ? 'submodule' : undefined} />
                       <span data-icon-tooltip={path} data-file-status={fileStatuses[path] ?? file.changeType}>
                         {path}
                       </span>
                       <em>+{file.addedLines}</em>
                       <i>-{file.deletedLines}</i>
-                    </button>
+                    </Button>
                   );
                 })}
               </div>
             </aside>
+            <GitPaneSeparator name="diff-files" label={zh ? '调整文件列表宽度' : 'Resize file list'} initial={24} min={15} max={50} />
             {viewer}
           </div>
         ) : (
@@ -198,11 +207,10 @@ export function ProjectGitDiffWindow(props: {
 function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操作由预览容器提供。 */ toolbar?: ReactNode; /** 已授权的前后两版完整正文。 */ items?: FilePreviewItem[] | null }) {
   /** 左右布局由共享工具栏控制。 */
   const preview = useContext(FilePreviewDataContext);
-  const [localUnified, setLocalUnified] = useState(false);
-  const unified = preview?.unified ?? localUnified;
+  const unified = preview?.unified ?? false;
   const original = props.diff?.fileDiffs[0] ?? null;
-  /** 本页恢复后的统计及暂存操作必须绑定新补丁，不能复用旧区块。 */
-  const file = useMemo(() => (original ? refreshedFileDiff(original, preview?.items ?? null, preview?.reverted) : null), [original, preview?.items, preview?.reverted]);
+  /** 子模块以本次读取的版本和脏状态为准；普通文件继续校验原始补丁。 */
+  const file = useMemo(() => (original ? refreshedFileDiff(original, preview?.items ?? null, preview?.reverted || preview?.items?.some((item) => Boolean(item.submodule))) : null), [original, preview?.items, preview?.reverted]);
   /** 片段操作仍使用原始补丁，连续正文不改变暂存范围。 */
   const [hunkIndex, setHunkIndex] = useState(0);
   /** 选择片段时只滚动到原始行，不创建第二个差异编辑器。 */
@@ -216,8 +224,6 @@ function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操�
       return { file: null, error: error instanceof Error ? error.message : '文件读取失败。' };
     }
   }, [file, props.items]);
-  /** 只有取得完整文本时，归属才绑定到同一对前后版本。 */
-  const blame = useMemo(() => (props.items ? { left: props.items[0]?.blame ?? [], right: props.items[1]?.blame ?? [] } : undefined), [props.items]);
   if (!file) return <p className="project-git-empty-copy">{props.zh ? '选择一个文件查看差异。' : 'Select a file to inspect its diff.'}</p>;
   const oldPath = file.changeType === 'added' ? (props.zh ? '变更前（空文件）' : 'Before (empty file)') : file.oldPath;
   const newPath = file.changeType === 'deleted' ? (props.zh ? '变更后（空文件）' : 'After (empty file)') : file.newPath;
@@ -243,25 +249,15 @@ function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操�
         ) : null}
         <span>+{file.addedLines}</span>
         <em>-{file.deletedLines}</em>
-        {!preview ? (
-          <span className="project-git-diff-mode" role="group" aria-label={props.zh ? '差异布局' : 'Diff layout'}>
-            <button type="button" aria-label={props.zh ? '左右两栏' : 'Side-by-side'} aria-pressed={!unified} className={!unified ? 'is-active' : ''} onClick={() => setLocalUnified(false)}>
-              <Columns aria-hidden="true" />
-            </button>
-            <button type="button" aria-label={props.zh ? '统一视图' : 'Unified'} aria-pressed={unified} className={unified ? 'is-active' : ''} onClick={() => setLocalUnified(true)}>
-              <Rows aria-hidden="true" />
-            </button>
-          </span>
-        ) : null}
       </header>
       <div className="project-git-diff-side-by-side">
         {!unified ? (
           <div className="project-git-diff-side-head">
             <span tabIndex={0} data-file-path={oldPath} data-icon-tooltip={oldPath}>
-              {oldPath}
+              {props.items?.some((item) => item.submodule) ? props.items[0]?.label : oldPath}
             </span>
             <span tabIndex={0} data-file-path={newPath} data-icon-tooltip={newPath}>
-              {newPath}
+              {props.items?.some((item) => item.submodule) ? props.items[1]?.label : newPath}
             </span>
           </div>
         ) : null}
@@ -273,12 +269,10 @@ function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操�
         ) : null}
         {continuous?.error ? (
           <p role="alert">{props.zh ? continuous.error : 'The complete file could not be matched to this diff. Refresh the file and try again.'}</p>
-        ) : props.previewRequest && !props.items ? (
-          <p role="status">{props.zh ? '正在读取完整文件…' : 'Loading complete file…'}</p>
         ) : (
           <>
             {!props.previewRequest ? <p role="status">{props.zh ? '此快照仅包含差异片段。' : 'This snapshot contains changed sections only.'}</p> : null}
-            {selectedHunk && (props.onHunkAction || props.onHunkDiscard) ? (
+            {selectedHunk && props.onHunkAction && !props.items?.some((item) => item.submodule) ? (
               <div className="project-git-diff-hunk-commands">
                 <ZeusSelect
                   ariaLabel={props.zh ? '选择改动片段' : 'Select changed section'}
@@ -296,27 +290,22 @@ function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操�
                     if (changed) setRevealLine(changed.newLineNumber !== null ? { line: changed.newLineNumber, side: 'right' } : { line: changed.oldLineNumber!, side: 'left' });
                   }}
                 />
-                {props.onHunkDiscard ? (
-                  <button type="button" className="is-danger" disabled={actionsDisabled} onClick={() => props.onHunkDiscard?.(file, selectedHunk, selectedIndex)}>
-                    {props.hunkDiscardLabel ?? (props.zh ? '放弃区块' : 'Discard hunk')}
-                  </button>
-                ) : null}
                 {props.onHunkAction ? (
-                  <button type="button" disabled={actionsDisabled} onClick={() => props.onHunkAction?.(file, selectedHunk, selectedIndex)}>
+                  <Button unstyled type="button" disabled={actionsDisabled} onClick={() => props.onHunkAction?.(file, selectedHunk, selectedIndex)}>
                     {props.hunkActionLabel}
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             ) : null}
             {visibleFile.hunks.length === 0 ? <p className="project-git-empty-copy">{fileDiffEmptyMessage(file, props.zh)}</p> : null}
-            <Suspense fallback={null}>
+            <Suspense fallback={<ResourceLoading label={props.zh ? '正在读取差异…' : 'Loading diff…'} />}>
               <CodeDiffView
                 file={file}
+                completeFile={continuous?.file ?? null}
                 unified={unified}
                 revertDisabled={props.hunkActionsDisabled || Boolean(props.previewRequest && !continuous?.file)}
                 resizable
                 omitHunkHeaders={Boolean(continuous?.file)}
-                blame={blame}
                 blameLocale={props.zh ? 'zh-CN' : 'en-US'}
                 revealLine={revealLine}
                 label={props.zh ? '文件差异' : 'File diff'}
@@ -342,13 +331,14 @@ function selectFileDiff(diff: GitDiffSummary, path: string): GitDiffSummary {
   return { ...diff, fileDiffs: diff.fileDiffs.filter((file) => file.newPath === path || file.oldPath === path) };
 }
 
-/** 仓库各入口共用媒体预览，文本保留原来的区块操作。 */
+/** 仓库各入口共用媒体预览；新补丁重读正文，文本保留原来的区块操作。 */
 export function SideBySideDiff(props: SideBySideDiffProps) {
-  const submodule = props.diff?.fileDiffs[0]?.isSubmodule === true;
-  return props.previewRequest && !submodule ? (
+  return props.previewRequest ? (
     <FilePreview
       request={props.previewRequest}
-      revision={props.revision}
+      revision={props.revision ?? props.diff?.diffText}
+      preparedPreview={props.preparedPreview}
+      waitForContent
       onSaved={props.onSaved}
       zh={props.zh}
       fileStatus={props.fileStatus ?? props.diff?.fileDiffs[0]?.changeType}

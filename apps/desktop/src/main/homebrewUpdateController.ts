@@ -1,6 +1,6 @@
 import { describeUserFacingError, redactUserFacingErrorDetails } from '@zeus/shared';
 import type { DesktopReleaseUpdateStatus, ReleaseUpdateService } from './releaseUpdateService.js';
-import { type HomebrewInstalledUpdate, type HomebrewPreparedUpdate, type HomebrewUpdateProgress, type HomebrewUpdateService, isTransientHomebrewDownloadError } from './homebrewUpdateService.js';
+import { type HomebrewInstalledUpdate, type HomebrewPreparedUpdate, type HomebrewUpdateProgress, type HomebrewUpdateService } from './homebrewUpdateService.js';
 import { createNativeUpdateProgressHost, type NativeUpdateProgressHost, type NativeUpdateProgressState } from './nativeUpdateProgress.js';
 
 /** 已下载待手动安装与可直接重启安装是两个不同状态。 */
@@ -19,7 +19,14 @@ export interface HomebrewUpdateIndicatorState {
 }
 
 export interface HomebrewUpdateController {
-  showOrCheck(): Promise<void>;
+  /** 提前启动隐藏的原生窗口，不检查版本，也不改变当前可见性。 */
+  warmup(): Promise<void>;
+  /** 只显示当前状态；首次打开先显示正在检查，不触发网络或安装操作。 */
+  show(): Promise<void>;
+  /** 已提前显示时不再次打开窗口，保留用户在等待期间的关闭选择。 */
+  showOrCheck(input?: { present?: boolean }): Promise<void>;
+  /** 检查开始前的记录失败结束等待状态，不覆盖已运行的下载或安装。 */
+  reportOpenFailure(error: unknown): Promise<void>;
   checkAutomatically(input?: { blockedPrepareVersion?: string | null }): Promise<boolean>;
   getIndicatorState(): HomebrewUpdateIndicatorState;
   restoreIndicatorState(state: HomebrewUpdateIndicatorState): void;
@@ -63,13 +70,12 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
   /** 并发进度回调共用一次启动，退出也必须等待正在创建的窗口。 */
   let hostCreation: Promise<NativeUpdateProgressHost> | null = null;
   let phase: ControllerPhase = 'idle';
-  let hidden = false;
+  /** 预热和恢复状态都保持隐藏，只有用户主动打开才显示。 */
+  let hidden = true;
   let closed = false;
   let currentUpdate: DesktopReleaseUpdateStatus | null = null;
   let prepared: PreparedUpdate | null = null;
   let installed: HomebrewInstalledUpdate | null = null;
-  /** 每次重新检查安装记录，不根据最初下载方式永久推断。 */
-  let updateMethod: 'homebrew' | 'direct' | null = null;
   let lastState: NativeUpdateProgressState | null = null;
   let lastFailureStep: UpdateFailureStep = 'check';
   let operation: Promise<void> | null = null;
@@ -101,15 +107,14 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       }
       hidden = false;
       if (action === 'download') void runExclusive(() => prepareUpdate(false));
-      else if (action === 'check') void runExclusive(() => checkForUpdate(true, true).then(() => undefined));
+      else if (action === 'check') void runExclusive(() => checkAndPrepareUpdate(true));
       else if (action === 'open_download_page') void runExclusive(openDownloadPage);
       else if (action === 'open_installer') void runExclusive(openDownloadedUpdate);
-      else if (action === 'reconnect' && updateMethod === 'homebrew') options.homebrew?.reconnectDownload();
       else if (action === 'restart') void runExclusive(installPreparedUpdate);
       else if (action === 'retry') {
         if (lastFailureStep === 'install' && prepared) void runExclusive(installPreparedUpdate);
         else if (lastFailureStep === 'prepare' || lastFailureStep === 'download') void runExclusive(() => prepareUpdate(false));
-        else void runExclusive(() => checkForUpdate(true, true).then(() => undefined));
+        else void runExclusive(() => checkAndPrepareUpdate(true));
       }
     });
     created.onExit(() => {
@@ -173,13 +178,13 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         await publishManualUpdate(update);
         return update;
       }
-      updateMethod = (await options.homebrew?.isManaged()) ? 'homebrew' : 'direct';
-      const manualReason = updateMethod === 'direct' ? await options.direct.manualInstallReason(update) : null;
-      if (manualReason) {
-        await publishManualUpdate(update);
-        return update;
-      }
-      if (prepared && prepared.method === updateMethod && samePreparedUpdate(prepared, update)) {
+      // 检查和下载不查询包管理器，安装方式只在用户发起安装后确定。
+      if (prepared && samePreparedUpdate(prepared, update)) {
+        // 安装条件只决定已下载更新的后续动作，不阻止下载本身。
+        if (prepared.method === 'direct' && (await options.direct.manualInstallReason(update))) {
+          await publishManualUpdate(update);
+          return update;
+        }
         phase = 'ready';
         if (updateIndicator) setIndicator(indicatorForReady(options.language(), update));
         if (!hidden) await publish(copyFor(options.language(), 'ready', options.currentVersion, update));
@@ -197,36 +202,38 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     }
   }
 
+  /** 用户检查到匹配的新版本后直接下载，避免本次检查将后台预取推迟到下个周期。 */
+  async function checkAndPrepareUpdate(present: boolean): Promise<void> {
+    const update = await checkForUpdate(present, true);
+    if (update?.status === 'available' && update.artifact && !prepared) await prepareUpdate(false);
+  }
+
+  /** 匹配的安装包可独立下载；下载完成后再决定自动安装或交给用户手动安装。 */
   async function prepareUpdate(automatic: boolean): Promise<void> {
-    if (!currentUpdate || !updateMethod || phase === 'failed' || currentUpdate.status !== 'available' || !currentUpdate.artifact) {
+    if (!currentUpdate || phase === 'failed' || currentUpdate.status !== 'available' || !currentUpdate.artifact) {
       const loaded = await checkForUpdate(!automatic, true);
       if (!loaded || loaded.status !== 'available' || !loaded.artifact) return;
     }
-    // 手动安装版本只在用户点击后下载；缺少匹配产物时仍保留发布页入口。
-    if (phase === 'manual' && (automatic || !currentUpdate?.artifact)) return;
     phase = 'preparing';
     lastFailureStep = 'prepare';
     const update = currentUpdate!;
     setIndicator(indicatorForPreparing(options.language(), update));
     for (let attempt = 0; ; attempt += 1) {
       try {
-        /** 两条下载路径只用真实进度驱动同一窗口。 */
+        /** 两个平台共用直接下载，包管理器不可用不能阻断下载。 */
         const onProgress = (progress: HomebrewUpdateProgress): void => {
           lastFailureStep = progress.phase === 'downloading' || progress.phase === 'reconnecting' ? 'download' : 'prepare';
           setIndicator(indicatorFromProgress(options.language(), progress, update));
-          void publish(progressCopy(options.language(), progress, update, updateMethod === 'direct'));
+          void publish(progressCopy(options.language(), progress, update, true));
         };
-        if (updateMethod === 'homebrew' && options.homebrew) {
-          prepared = { ...(await options.homebrew.prepare(update, onProgress)), method: 'homebrew' };
-        } else {
-          const result = await options.direct.download(onProgress);
-          if (!result.accepted) throw new Error(result.reason);
-          prepared = { method: 'direct', update: result.update };
-          currentUpdate = result.update;
-          if (await options.direct.manualInstallReason(result.update)) {
-            await publishManualUpdate(result.update);
-            return;
-          }
+        /** 下载结果与安装方式解耦，下载阶段不启动 Homebrew 或 Git。 */
+        const result = await options.direct.download(onProgress);
+        if (!result.accepted) throw new Error(result.reason);
+        prepared = { method: 'direct', update: result.update };
+        currentUpdate = result.update;
+        if (await options.direct.manualInstallReason(result.update)) {
+          await publishManualUpdate(result.update);
+          return;
         }
         phase = 'ready';
         setIndicator(indicatorForReady(options.language(), prepared.update));
@@ -258,6 +265,17 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     }
     lastFailureStep = 'install';
     try {
+      /** 用户明确发起安装后才读取管理记录；查询失败不能静默接管应用。 */
+      const homebrew = (await options.homebrew?.isManaged()) ? options.homebrew : undefined;
+      if (!homebrew && prepared.method === 'homebrew') throw new Error('Zeus 的安装管理方式已变化，请重新检查更新。');
+      if (homebrew && prepared.method === 'direct') {
+        options.canInstall();
+        phase = 'installing';
+        await publish(copyFor(options.language(), 'installing', options.currentVersion, prepared.update));
+        /** 已下载文件再次复验后交给 Homebrew，安装时不重复下载。 */
+        const artifactPath = await options.direct.downloadedArtifactPath(prepared.update);
+        prepared = { ...(await homebrew.prepare(prepared.update, artifactPath, (progress) => void publish(progressCopy(options.language(), progress, prepared!.update)))), method: 'homebrew' };
+      }
       if (prepared.method === 'direct' && (await options.direct.manualInstallReason(prepared.update))) {
         await publishManualUpdate(prepared.update);
         return;
@@ -265,7 +283,6 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
       options.canInstall();
       phase = 'installing';
       await publish(copyFor(options.language(), 'installing', options.currentVersion, prepared.update));
-      if (Boolean(await options.homebrew?.isManaged()) !== (prepared.method === 'homebrew')) throw new Error('Zeus 的安装管理方式已变化，请重新检查更新。');
       /** 用户取消退出时保留下载结果；直接安装由原安装器完成退出后的替换。 */
       let accepted: boolean;
       if (prepared.method === 'direct') {
@@ -312,15 +329,20 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     await publish(state);
   }
 
-  /** 打开安装包只响应用户点击；重新检查版本后由下载服务复验磁盘文件。 */
+  /** 用户打开安装包前恢复并复验磁盘缓存，重启后不依赖已丢失的内存下载记录。 */
   async function openDownloadedUpdate(): Promise<void> {
-    if (!(await checkForUpdate(false, true))) return;
+    await checkAndPrepareUpdate(false);
     try {
+      // 安装条件已恢复时，旧窗口的“打开安装包”动作也进入同一次安全重启安装。
+      if (process.platform === 'win32' && phase === 'ready' && prepared?.method === 'direct') {
+        await installPreparedUpdate();
+        return;
+      }
       if (phase !== 'downloaded' || prepared?.method !== 'direct') {
         await showCurrent();
         return;
       }
-      /** 打开操作不会触发重启、安装器或 Homebrew。 */
+      /** macOS 打开 DMG；Windows 无法原位升级时定位文件，避免退出后丢失安装入口。 */
       const result = await options.direct.openDownloaded();
       if (!result.accepted) {
         prepared = null;
@@ -359,8 +381,10 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
     }
   }
 
+  /** 先显示已有进度；首次点击使用检查状态，不等待操作记录或版本请求。 */
   async function showCurrent(): Promise<void> {
     hidden = false;
+    lastState ??= copyFor(options.language(), 'checking', options.currentVersion);
     const currentHost = await ensureHost();
     if (lastState) currentHost.update({ ...lastState, present: true });
     currentHost.show();
@@ -380,7 +404,8 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         setIndicator(idleIndicator(options.currentVersion));
         return;
       }
-      if (phase === 'manual' || phase === 'downloaded') return;
+      // 手动安装不阻止后台下载；无匹配安装包或本次已下载完成时不重复准备。
+      if (phase === 'downloaded' || update.status !== 'available' || !update.artifact) return;
       if (input?.blockedPrepareVersion === update.latestVersion && previousIndicator.failure?.step !== 'check' && previousIndicator.phase === 'failed' && previousIndicator.latestVersion === update.latestVersion) {
         phase = 'failed';
         setIndicator({ ...previousIndicator, updatedAt: new Date().toISOString() });
@@ -399,12 +424,22 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
   }
 
   return {
-    showOrCheck: () => {
+    warmup: async () => {
+      await ensureHost();
+    },
+    show: showCurrent,
+    showOrCheck: (input) => {
+      /** 提前显示后仅推进检查，不能重新弹出用户刚关闭的窗口。 */
+      const present = input?.present !== false;
       // 手动点击先显示正在执行的任务，不能只等待隐藏的自动检查结束。
-      if (operation) return showCurrent();
-      if (phase === 'preparing' || phase === 'installing' || (phase === 'available' && currentUpdate) || (phase === 'failed' && lastState?.state === 'failed')) return showCurrent();
-      hidden = false;
-      return runExclusive(() => checkForUpdate(true, true).then(() => undefined));
+      if (operation || phase === 'preparing' || phase === 'installing' || (phase === 'available' && currentUpdate) || (phase === 'failed' && lastState?.state === 'failed')) return present ? showCurrent() : Promise.resolve();
+      if (present) hidden = false;
+      return runExclusive(() => checkAndPrepareUpdate(present));
+    },
+    reportOpenFailure: async (error) => {
+      // 显示助手未就绪时沿用系统错误框，不自动重启；已有任务保留真实进度。
+      if (closed || !host || operation || lastState?.state !== 'checking') return;
+      await publishFailure(error, 'check');
     },
     checkAutomatically,
     getIndicatorState: () => ({ ...indicatorState }),
@@ -503,16 +538,22 @@ function indicatorForReady(language: 'zh-CN' | 'en-US', update: DesktopReleaseUp
   };
 }
 
-/** 下载和安装分开表达，未满足自动安装条件时不承诺重启后自动替换。 */
+/** 外部手动安装保留平台操作差异，不能把无法原位升级的位置标成可重启安装。 */
 function manualCopy(language: 'zh-CN' | 'en-US', update: DesktopReleaseUpdateStatus, downloaded: boolean): NativeUpdateProgressState {
   const zh = language === 'zh-CN';
+  /** Windows 使用安装器，不显示 macOS 的拖拽替换提示。 */
+  const windows = process.platform === 'win32';
   if (downloaded) {
     return {
       state: 'downloaded',
       title: zh ? '安装包已下载' : 'Installer Downloaded',
-      detail: zh
-        ? `Zeus ${update.latestVersion} 已下载并通过校验。打开安装包后，请结束工作并退出 Zeus，将新版拖入“应用程序”完成替换。`
-        : `Zeus ${update.latestVersion} is downloaded and verified. Open the installer, finish your work and quit Zeus, then drag the new app into Applications.`,
+      detail: windows
+        ? zh
+          ? `Zeus ${update.latestVersion} 已下载并通过校验。当前安装目录不可写，请点击“定位安装包”，再退出 Zeus，从文件管理器运行安装器。`
+          : `Zeus ${update.latestVersion} is downloaded and verified. The current install directory is not writable. Choose Show Installer in Folder, quit Zeus, then run the installer from File Explorer.`
+        : zh
+          ? `Zeus ${update.latestVersion} 已下载并通过校验。打开安装包后，请结束工作并退出 Zeus，将新版拖入“应用程序”完成替换。`
+          : `Zeus ${update.latestVersion} is downloaded and verified. Open the installer, finish your work and quit Zeus, then drag the new app into Applications.`,
     };
   }
   return {
@@ -520,11 +561,11 @@ function manualCopy(language: 'zh-CN' | 'en-US', update: DesktopReleaseUpdateSta
     title: zh ? '发现新版本' : 'A New Version Is Available',
     detail: update.artifact
       ? zh
-        ? `Zeus ${update.latestVersion} 可用。可在此下载并校验安装包，下载后需要手动替换应用。`
-        : `Zeus ${update.latestVersion} is available. Download and verify it here, then replace the app manually.`
+        ? `Zeus ${update.latestVersion} 可用。可在此下载并校验安装包，下载后需手动安装。`
+        : `Zeus ${update.latestVersion} is available. Download and verify it here, then install it manually.`
       : zh
-        ? `Zeus ${update.latestVersion} 可用，但暂无匹配此 Mac 的安装包。请前往下载页面查看。`
-        : `Zeus ${update.latestVersion} is available, but no installer matches this Mac. Visit the download page for details.`,
+        ? `Zeus ${update.latestVersion} 可用，但暂无匹配当前设备的安装包。请前往下载页面查看。`
+        : `Zeus ${update.latestVersion} is available, but no installer matches this device. Visit the download page for details.`,
   };
 }
 
@@ -747,5 +788,5 @@ function delay(milliseconds: number): Promise<void> {
 
 /** 仅网络下载中断可后台自动重试，校验及安装错误必须保留。 */
 function isTransientUpdateDownloadError(error: unknown): boolean {
-  return isTransientHomebrewDownloadError(error) || (error instanceof Error && typeof error.cause === 'object' && error.cause !== null && 'code' in error.cause && error.cause.code === 'ZEUS_UPDATE_DOWNLOAD_INTERRUPTED');
+  return error instanceof Error && typeof error.cause === 'object' && error.cause !== null && 'code' in error.cause && error.cause.code === 'ZEUS_UPDATE_DOWNLOAD_INTERRUPTED';
 }

@@ -25,6 +25,7 @@ import { isAssistantDeliverableItem, type NativeConversationToolResultPage, type
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { CodexApiClient } from '../features/codex/codexApiClient.js';
+import { Button } from '../ui/Button.js';
 
 /** 会话及其子线程共用当前连接的技能清单读取入口。 */
 export const ActivitySkillCatalogContext = createContext<CodexApiClient['loadSkills'] | undefined>(undefined);
@@ -263,9 +264,9 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
           <span>{target.prefix}</span>{' '}
         </>
       ) : null}
-      <button type="button" className="session-activity-resource-link" data-icon-tooltip={target.title} onClick={() => void props.onOpenResource?.(target.resource, defaultOpenTarget(target.resource))}>
+      <Button unstyled type="button" className="session-activity-resource-link" data-icon-tooltip={target.title} onClick={() => props.onOpenResource?.(target.resource, defaultOpenTarget(target.resource))}>
         {skillActivity ? title : target.label}
-      </button>
+      </Button>
     </span>
   ) : (
     <span className="session-activity-item-title">{title}</span>
@@ -422,7 +423,7 @@ function ActivityItemOutput(props: {
           const output = event.currentTarget;
           if (output.scrollHeight - output.clientHeight - output.scrollTop > 24) return;
           if (outputPreview.truncated) setVisibleCharacters((current) => current + MAX_ACTIVITY_OUTPUT_CHARACTERS);
-          else if (canLoadMore && !loadError) void loadNextPage();
+          else if (canLoadMore && !loadError) return loadNextPage();
         }}
       >
         {outputPreview.text}
@@ -597,14 +598,14 @@ export function SessionPlanProgress(props: { plan: NativeTurnPlanSnapshot; langu
     >
       {/* 外层保留居中布局和键盘处理；悬停仅覆盖可见进度条及其详情，左右留白不触发。 */}
       <div className="session-plan-progress" data-open={open || undefined} onPointerEnter={show} onPointerLeave={scheduleClose}>
-        <button ref={triggerRef} type="button" className="session-plan-trigger" aria-expanded={open} aria-controls={popoverId} onClick={show}>
+        <Button unstyled ref={triggerRef} type="button" className="session-plan-trigger" aria-expanded={open} aria-controls={popoverId} onClick={show}>
           <ListChecks aria-hidden="true" weight="regular" />
           <span role="status" aria-live="polite" aria-atomic="true">
             <strong>{summary}</strong>
             <small>{current?.step}</small>
           </span>
           <CaretDown className="session-plan-caret" aria-hidden="true" weight="bold" />
-        </button>
+        </Button>
         <div id={popoverId} className="session-plan-popover" data-motion-surface="popover" hidden={!open} inert={!open} aria-hidden={!open}>
           <div className="session-plan-body">
             {props.plan.explanation ? <p className="zeus-fidelity-text">{props.plan.explanation}</p> : null}
@@ -742,7 +743,8 @@ export function SessionTurnProcessDisclosure(props: {
   return (
     <section className="session-turn-process" data-label-kind={props.labelKind ?? 'process'} data-open={open || undefined} aria-busy={props.loading || undefined}>
       <div className="session-turn-process-control">
-        <button
+        <Button
+          unstyled
           type="button"
           aria-label={accessibleLabel}
           data-icon-tooltip={accessibleLabel}
@@ -751,12 +753,12 @@ export function SessionTurnProcessDisclosure(props: {
           onClick={(event) => {
             const nextOpen = !open;
             if (props.open === undefined) setInternalOpen(nextOpen);
-            props.onOpenChange?.(nextOpen, event.currentTarget);
+            return props.onOpenChange?.(nextOpen, event.currentTarget);
           }}
         >
           <span>{visibleCountLabel ?? (props.turn ? <SessionTurnDuration turn={props.turn} requests={props.requests ?? []} language={props.language} fallback={label} replyVisible={props.replyVisible} /> : label)}</span>
           <CaretDown className="session-turn-process-caret" aria-hidden="true" weight="bold" />
-        </button>
+        </Button>
       </div>
       <Collapsible id={bodyId} open={open} animateHeight>
         <div className="session-turn-process-body">

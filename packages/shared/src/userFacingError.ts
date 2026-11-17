@@ -767,7 +767,7 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
   ],
   [
     ['httpConnectionFailed', 'responseStreamConnectionFailed'],
-    ['与 AI 服务的连接未能建立，无法读取回复。请检查该服务的连接设置。', 'A connection to the AI service could not be established. Check the service’s connection settings.', 'settings'],
+    ['未能连接 AI 服务。请检查网络和连接设置后重试。', 'Could not connect to the AI service. Check the network and connection settings, then retry.', 'model_settings'],
   ],
   [['responseStreamDisconnected'], ['AI 服务在回复结束前断开了连接，因此没有收到完整回复。', 'The AI service disconnected before finishing its response, so the reply is incomplete.']],
   [['responseTooManyFailedAttempts'], ['AI 服务连续多次未能完成响应，当前请求已经停止。请稍后再继续。', 'The AI service failed to complete the response repeatedly, so this request has stopped. Try again later.']],
@@ -1038,6 +1038,10 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['所选模型的连接已更改或不可用。请检查模型设置并重新选择可用模型。', 'The selected model connection has changed or is unavailable. Check its settings and select an available model.', 'choose_model'],
   ],
   [['ZEUS_LOCAL_API_READ_TIMEOUT'], ['Zeus 的后台服务未能及时响应，当前信息暂时无法读取。', 'The Zeus background service did not respond in time. This information cannot be loaded yet.', 'retry']],
+  [
+    ['ZEUS_LOCAL_API_WRITE_OUTCOME_UNKNOWN'],
+    ['暂未取得操作结果，操作可能已执行。请先核对状态，再重试原操作。', 'The operation may have completed, but its result is not confirmed. Check its status before retrying the same operation.', 'check'],
+  ],
   [['ZEUS_CODEX_RPC_TIMEOUT'], ['Codex 未能在限定时间内响应，Zeus 暂时无法确认请求的处理情况。', 'Codex did not respond in time. Zeus cannot yet confirm the request’s progress.', 'check']],
   [['ZEUS_EXECUTION_HOST_DRAINING'], ['Zeus 正在重启后台服务，暂时无法处理新的操作。', 'Zeus is restarting its background service and cannot handle new actions yet.', 'retry']],
   [
@@ -1062,6 +1066,8 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
   [['ZEUS_TURN_CHANGE_SET_PATH_INVALID'], ['部分文件路径无效，本轮修改无法撤销或重新应用。', 'Some file paths are invalid. Changes from this turn cannot be undone or reapplied.']],
   [['ZEUS_TURN_CHANGE_SET_UNAVAILABLE'], ['本轮文件变更记录不完整，无法安全撤销或重新应用。', 'File change records for this turn are incomplete. Changes cannot be safely undone or reapplied.']],
   [['ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED'], ['这段会话已归档，需要先恢复会话才能继续。', 'This conversation is archived. Restore it before continuing.']],
+  // 派发状态变化不等于用户取消；旧记录也使用重新核对状态的统一恢复入口。
+  [['ZEUS_NATIVE_SUBMISSION_NOT_QUEUED'], ['消息状态已更新，请重新检查发送结果。', 'The message status has changed. Check its delivery status again.', 'check']],
   [
     ['ZEUS_NATIVE_SUBMISSION_NOT_EDITABLE', 'ZEUS_NATIVE_SUBMISSION_NOT_RETRYABLE'],
     ['这条消息的处理状态已变化，当前不能执行该操作。请查看最新消息状态。', 'The message’s processing state has changed, so this action is no longer available. Check its latest status.'],
@@ -1184,7 +1190,7 @@ export function userFacingErrorCause(error: unknown, depth = 0): UserFacingError
 }
 
 /** 原文进入详情前移除密钥、个人路径和堆栈；摘要不能成为敏感信息的旁路。 */
-export function redactUserFacingErrorDetails(value: string): string {
+export function redactUserFacingErrorDetails(value: string, options: { includeStack?: boolean; maxLength?: number } = {}): string {
   return value
     .replace(/(^|\n)\s*(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]*/giu, '$1$2: [REDACTED]')
     .replace(/\b([A-Za-z0-9_.-]*(?:api[ _-]?key|(?:access|refresh|session)[ _-]?token|token|password|passphrase|secret|authorization|cookie))["']?\s*[=:]\s*(["'])(?:\\.|(?!\2)[^\r\n])*?\2/giu, '$1=[REDACTED]')
@@ -1198,10 +1204,10 @@ export function redactUserFacingErrorDetails(value: string): string {
     .replace(/(?:file:\/\/)?\/(?:Users|home)\/[^\s,;"'<>]+/gu, '[LOCAL PATH]')
     .replace(/[A-Za-z]:\\[^\s,;"'<>]+/gu, '[LOCAL PATH]')
     .split(/\r?\n/u)
-    .filter((line) => !/^\s*at\s/u.test(line))
+    .filter((line) => options.includeStack || !/^\s*at\s/u.test(line))
     .join('\n')
     .trim()
-    .slice(0, 2000);
+    .slice(0, options.maxLength ?? 2000);
 }
 
 /** 这些文案只是旧版兜底，不应再次作为“具体原因”回显到新的错误弹窗。 */

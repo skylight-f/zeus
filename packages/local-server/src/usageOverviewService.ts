@@ -1,3 +1,4 @@
+import { codexPricingUrl } from './codexUsagePricing.js';
 import {
   calculateCacheHitRate,
   emptyTokenUsageBreakdown,
@@ -16,14 +17,17 @@ import {
   type UsageOverviewRangeSummary,
   type UsageProviderAnalytics,
   type UsageProviderSummary,
+  type KiloAccountUsage,
 } from '@zeus/shared';
 import { type CodexUsageLedgerRecord, CodexUsageLedgerRepository, type ConversationOutputRateMeasurement, type ConversationExecutionRepository, ConversationRepository, ProjectRepository } from '@zeus/storage';
 import type { CodexUsageService } from './codexUsageService.js';
 import type { ModelConnectionService } from './modelConnectionService.js';
+import type { CopilotRuntimeManager } from '@zeus/ai-runtime';
 
 interface CreateUsageOverviewServiceOptions {
   ledger: CodexUsageLedgerRepository;
   codexUsage: CodexUsageService;
+  copilotRuntimeManager: CopilotRuntimeManager;
   modelConnections: ModelConnectionService;
   projects: ProjectRepository;
   conversations: ConversationRepository;
@@ -57,12 +61,18 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
   /** 被动读取不刷新官方账户；汇总快捷时间范围与数据库返回的历史边界。 */
   async function read(): Promise<UsageOverviewSnapshot> {
     const official = options.codexUsage.readCachedOfficialUsage();
+    const pricingStatus = options.codexUsage.pricingStatus();
     const readAt = now();
     const connections = options.modelConnections.listMetadata();
+    /** 官方 Kilo 快照与本地账本一起参与缓存身份，余额变化无需等待新会话。 */
+    const kiloAccounts = new Map(connections.map((connection) => [connection.id, options.modelConnections.kiloUsage.read(connection)]));
     const revision = options.ledger.readRevision();
     /** 请求计时不属于费用账本修订，必须纳入缓存身份才能及时显示新速率。 */
     const outputMeasurements = options.execution.listOutputRateMeasurements();
-    const key = JSON.stringify([revision, localDate(readAt), readAt.getTimezoneOffset(), connections, official, outputMeasurements]);
+    const key =
+      JSON.stringify(connections.map((connection) => options.modelConnections.pricing.read(connection))) +
+      JSON.stringify(pricingStatus) +
+      JSON.stringify([revision, localDate(readAt), readAt.getTimezoneOffset(), connections, official, [...kiloAccounts], options.copilotRuntimeManager.readAccount(), outputMeasurements]);
     if (revision !== null && overviewCache?.key === key) return { ...overviewCache.snapshot, updatedAt: readAt.toISOString() };
     const outputRateByTurn = indexOutputRateMeasurements(outputMeasurements);
     const connectionNames = new Map(connections.map((connection) => [connection.id, connection.name]));
@@ -72,16 +82,29 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
     /** 每个供应源只分组一次，具体时间范围在汇总阶段裁剪。 */
     const groups = new Map(groupRows(allRows, (row) => canonicalUsageProviderId(row.providerId)));
     const history = options.ledger.listOverviewProviders();
-    const providerIds = new Set([...(official.state === 'available' && !history.some((entry) => entry.providerId === 'codex') ? ['codex'] : []), ...history.map((entry) => entry.providerId)]);
+    const providerIds = new Set([
+      ...(official.state === 'available' && !history.some((entry) => entry.providerId === 'codex') ? ['codex'] : []),
+      ...(options.copilotRuntimeManager.readAccount()?.authenticated ? ['copilot'] : []),
+      ...history.map((entry) => entry.providerId),
+      ...connections.filter((connection) => kiloAccounts.get(connection.id)).map((connection) => `api:${connection.id}`),
+    ]);
     const providers = [...providerIds]
       .map((providerId) => {
-        const provider = buildProviderSummary({ providerId, rows: groups.get(providerId) ?? [], outputRateByTurn, readAt, official, connectionNames, connectionsById });
+        const provider = buildProviderSummary({ providerId, rows: groups.get(providerId) ?? [], outputRateByTurn, readAt, official, connectionNames, connectionsById, kiloAccount: kiloAccounts.get(providerId.replace(/^api:/u, '')) });
         const bounds = history.find((entry) => entry.providerId === providerId);
         if (bounds) {
           provider.collectionStartedAt = bounds.firstAt;
           provider.cacheUsageAvailable ||= bounds.hasCache === 1;
-          provider.updatedAt = providerId === 'codex' && official.fetchedAt && official.fetchedAt > bounds.lastAt ? official.fetchedAt : bounds.lastAt;
+          if (bounds.lastAt > provider.updatedAt) provider.updatedAt = bounds.lastAt;
         }
+        const connection = connectionsById.get(providerId.replace(/^api:/u, ''));
+        const source = providerId === 'codex' ? codexPricingUrl : connection ? options.modelConnections.pricing.source(connection) : null;
+        const error = providerId === 'codex' ? pricingStatus.error : connection ? options.modelConnections.pricing.read(connection)?.error : null;
+        for (const range of Object.values(provider.overviewRanges))
+          for (const entry of range.costBreakdown) {
+            if (!entry.sourceUrls?.length && source) entry.sourceUrls = [source];
+            if (!entry.rate || !entry.estimatedCosts.length) entry.missingPriceReason = error ? 'sync_failed' : 'unconfirmed';
+          }
         return provider;
       })
       // 概览只展示当前供应商，移除连接不删除用于历史统计的账本。
@@ -96,6 +119,7 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
   async function readAnalytics(input: Parameters<UsageOverviewService['readAnalytics']>[0]): Promise<UsageAnalyticsSnapshot> {
     const readAt = now();
     const official = options.codexUsage.readCachedOfficialUsage();
+    const pricingStatus = options.codexUsage.pricingStatus();
     const connections = options.modelConnections.listMetadata();
     const connectionNames = new Map(connections.map((connection) => [connection.id, connection.name]));
     const connectionsById = new Map(connections.map((connection) => [connection.id, connection]));
@@ -112,6 +136,7 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
       if (!groups.has(`api:${connection.id}`)) groups.set(`api:${connection.id}`, []);
     }
     if (!groups.has('codex')) groups.set('codex', []);
+    if (options.copilotRuntimeManager.readAccount()?.authenticated && !groups.has('copilot')) groups.set('copilot', []);
 
     const since = rangeStart(input.range, readAt);
     const providers = [...groups.entries()]
@@ -121,10 +146,22 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
         const rangeRows = rows.filter((row) => !since || row.occurredAt >= since);
         /** 明细按项目和模型共同筛选。 */
         const filteredRows = rangeRows.filter((row) => (!input.projectId || row.projectId === input.projectId) && (!input.model || row.model === input.model));
-        const provider = buildProviderSummary({ providerId, rows, outputRateByTurn, readAt, official, connectionNames, connectionsById });
+        const connectionForAccount = connectionsById.get(providerId.replace(/^api:/u, ''));
+        const provider = buildProviderSummary({
+          providerId,
+          rows,
+          outputRateByTurn,
+          readAt,
+          official,
+          connectionNames,
+          connectionsById,
+          kiloAccount: connectionForAccount ? options.modelConnections.kiloUsage.read(connectionForAccount) : undefined,
+        });
         const pricingRows = filteredRows.length > 0 ? filteredRows : rows;
         const catalogDates = [...new Set(pricingRows.map((row) => row.estimate.rateSnapshot.catalogDate))].sort();
-        const sourceUrls = [...new Set(pricingRows.flatMap((row) => row.estimate.rateSnapshot.sourceUrls))];
+        const connection = connectionsById.get(providerId.replace(/^api:/u, ''));
+        const configuredSource = isCodex ? codexPricingUrl : connection ? options.modelConnections.pricing.source(connection) : null;
+        const sourceUrls = [...new Set([...(configuredSource ? [configuredSource] : []), ...pricingRows.flatMap((row) => row.estimate.rateSnapshot.sourceUrls)])];
         return {
           provider,
           range: input.range,
@@ -150,10 +187,13 @@ export function createUsageOverviewService(options: CreateUsageOverviewServiceOp
             collectionStartedAt: rows[0]?.occurredAt ?? null,
           },
           pricing: {
+            ...(isCodex ? { sync: pricingStatus } : {}),
             catalogDate: catalogDates.at(-1) ?? null,
             sourceUrls,
             note: isCodex
-              ? 'Credits 与 API 等价美元均为估算，不是实际账单；缺价会自动获取官方价格。' + (filteredRows.some((row) => row.estimate.rateSnapshot.backfilledAt) ? '历史缺价记录按补价时价格估算。' : '')
+              ? (pricingStatus.error ? `价格同步未完整完成：${pricingStatus.error}。` : '') +
+                'Credits 与 API 等价美元均为估算，不是实际账单；缺价会自动获取官方价格。' +
+                (filteredRows.some((row) => row.estimate.rateSnapshot.backfilledAt) ? '历史缺价记录按补价时价格估算。' : '')
               : '费用为供应商费率估算；未知模型或未返回费率的轮次不会计入估算。',
           },
         };
@@ -182,9 +222,13 @@ function buildProviderSummary(input: {
   official: Awaited<ReturnType<CodexUsageService['refreshOfficialUsage']>>;
   connectionNames: Map<string, string>;
   connectionsById: Map<string, ReturnType<ModelConnectionService['listMetadata']>[number]>;
+  /** Kilo 账户总余额和 Pass 周期额度，不用于改写本地请求费用。 */
+  kiloAccount?: KiloAccountUsage;
 }): UsageProviderSummary {
   const { providerId, rows, outputRateByTurn, readAt, official, connectionNames, connectionsById } = input;
   const isCodex = providerId === 'codex';
+  /** Copilot 订阅的 Token 来自本地 SDK 事件，当前尚无可核验的账户历史余额。 */
+  const isCopilot = providerId === 'copilot';
   const sourceId = isCodex ? 'codex' : providerId.startsWith('api:') ? providerId.slice(4) : providerId;
   const connectionName = connectionNames.get(sourceId);
   const connection = connectionsById.get(sourceId);
@@ -207,24 +251,25 @@ function buildProviderSummary(input: {
   return {
     providerId,
     sourceId,
-    name: isCodex ? 'Codex' : (connectionName ?? sourceId),
-    kind: isCodex ? 'subscription' : 'api',
-    deleted: !isCodex && !connectionName,
+    name: isCodex ? 'Codex' : isCopilot ? 'GitHub Copilot' : (connectionName ?? sourceId),
+    kind: isCodex || isCopilot || input.kiloAccount?.pass ? 'subscription' : 'api',
+    deleted: !isCodex && !isCopilot && !connectionName,
     cacheUsageAvailable: isCodex || connection?.templateId === 'deepseek' || rows.some((row) => row.usage.cachedInputTokens > 0 || row.usage.cacheWriteInputTokens > 0),
-    planType: isCodex ? official.planType : null,
-    officialState: isCodex ? official.state : null,
+    planType: isCodex ? official.planType : input.kiloAccount?.pass ? 'Kilo Pass' : null,
+    officialState: isCodex ? official.state : input.kiloAccount ? (input.kiloAccount.checkedAt && !input.kiloAccount.error ? 'available' : 'unavailable') : null,
     rateLimitWindows: isCodex ? official.rateLimitWindows : [],
     officialCreditBalance: isCodex ? official.creditBalance : null,
     officialCreditsUnlimited: isCodex ? official.creditsUnlimited : false,
+    ...(input.kiloAccount ? { kiloAccount: input.kiloAccount } : {}),
     accountTodayTokens: accountDays?.find((day) => day.date === today)?.totalTokens ?? null,
     accountSevenDayTokens: accountDays && accountDays.length > 0 ? accountDays.reduce((sum, day) => sum + day.totalTokens, 0) : null,
     dailyAccount: accountDays,
     overviewRanges,
     dailyLocal: groupRows(sevenDayRows, (row) => localDate(new Date(row.occurredAt))).map(([date, entries]) => ({ date, ...aggregateRows(entries, outputRateByTurn) })) satisfies CodexLocalUsageDay[],
     collectionStartedAt: rows[0]?.occurredAt ?? null,
-    updatedAt: isCodex && official.fetchedAt && official.fetchedAt > latestLocalAt ? official.fetchedAt : latestLocalAt,
-    stale: isCodex ? official.stale : false,
-    error: isCodex ? official.error : null,
+    updatedAt: [latestLocalAt, isCodex ? (official.fetchedAt ?? '') : (input.kiloAccount?.checkedAt ?? '')].sort().at(-1)!,
+    stale: isCodex ? official.stale : (input.kiloAccount?.stale ?? false),
+    error: isCodex ? official.error : (input.kiloAccount?.error ?? null),
   };
 }
 
@@ -331,6 +376,7 @@ function aggregateCostBreakdown(rows: readonly CodexUsageLedgerRecord[], pricePe
       /** 同档同价维持原有一行展示。 */
       const existing = groups.get(key);
       if (existing) {
+        existing.sourceUrls = [...new Set([...(existing.sourceUrls ?? []), ...snapshot.sourceUrls])];
         existing.usage = sumBreakdowns([existing.usage, request.usage]);
         existing.estimatedCosts = sumEstimatedCosts([{ costs: existing.estimatedCosts, apiEquivalentUsd: null }, request.estimate]);
         /** 合并行包含无法确定周期的条件时，不用其他条件的日期掩盖未知。 */
@@ -344,6 +390,7 @@ function aggregateCostBreakdown(rows: readonly CodexUsageLedgerRecord[], pricePe
           pricePeriod,
           usage: { ...request.usage },
           estimatedCosts: sumEstimatedCosts([request.estimate]),
+          sourceUrls: [...snapshot.sourceUrls],
         });
       }
     }

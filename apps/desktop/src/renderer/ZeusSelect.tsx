@@ -4,6 +4,7 @@ import { PushPinIcon } from '@phosphor-icons/react/dist/csr/PushPin';
 import { useMotionPresence } from './ui/useMotionPresence.js';
 
 import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject } from 'react';
+import { Button } from './ui/Button.js';
 
 export interface ZeusSelectOption<T extends string> {
   value: T;
@@ -54,6 +55,8 @@ export interface ZeusSelectProps<T extends string> {
   emptyLabel?: string;
   searchable?: boolean;
   popoverMinWidth?: number;
+  /** 浮层横向限制在触发器最近匹配的面板内，未匹配时沿用窗口边界。 */
+  popoverBoundarySelector?: string;
   /** 浮层箭头对齐触发器的起始、中部或末端交互区。 */
   popoverArrowAlignment?: 'start' | 'center' | 'end';
   /** 启用后使用包含选择与置顶按钮的对话框，避免在选项内嵌套按钮。 */
@@ -65,6 +68,10 @@ export interface ZeusSelectProps<T extends string> {
   /** 列表之外的独立操作区域，例如筛选结果的显示开关。 */
   footer?: ReactNode;
   size: 'compact' | 'regular' | 'roomy';
+  /** 临时入口挂载后直接展示选项。 */
+  defaultOpen?: boolean;
+  /** 通知临时入口浮层已关闭。 */
+  onOpenChange?: (open: boolean) => void;
 }
 
 interface ZeusSelectPopoverLayout {
@@ -240,13 +247,19 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
     const triggerRect = trigger.getBoundingClientRect();
     const viewportPadding = 8;
     const popoverGap = 6;
+    /** 所属面板的边界避免菜单越过分栏，触发相邻原生网页整体隐藏。 */
+    const boundaryRect = props.popoverBoundarySelector ? trigger.closest(props.popoverBoundarySelector)?.getBoundingClientRect() : undefined;
+    /** 左侧留白同时受窗口和所属面板约束，单位为 CSS 像素。 */
+    const minLeft = Math.max(0, boundaryRect?.left ?? 0) + viewportPadding;
+    /** 右侧留白同时受窗口和所属面板约束，单位为 CSS 像素。 */
+    const maxRight = Math.min(window.innerWidth, boundaryRect?.right ?? window.innerWidth) - viewportPadding;
     /** 模型长名称截断显示，避免单个长名称把菜单撑成横跨页面的大面板。 */
-    const maxWidth = Math.max(0, Math.min(window.innerWidth - viewportPadding * 2, props.pinning ? 360 : Number.POSITIVE_INFINITY));
+    const maxWidth = Math.max(0, Math.min(maxRight - minLeft, props.pinning ? 360 : Number.POSITIVE_INFINITY));
     if (popoverRef.current) {
       popoverContentWidthRef.current = Math.max(popoverContentWidthRef.current, measurePopoverContentWidth(popoverRef.current, maxWidth));
     }
     const width = Math.min(Math.max(triggerRect.width, props.popoverMinWidth ?? 0, popoverContentWidthRef.current), maxWidth);
-    const left = Math.min(Math.max(triggerRect.left, viewportPadding), Math.max(viewportPadding, window.innerWidth - width - viewportPadding));
+    const left = Math.min(Math.max(triggerRect.left, minLeft), Math.max(minLeft, maxRight - width));
     const triggerInset = Math.min(14, triggerRect.width / 2);
     const arrowAnchor = props.popoverArrowAlignment === 'start' ? triggerRect.left + triggerInset : props.popoverArrowAlignment === 'end' ? triggerRect.right - triggerInset : triggerRect.left + triggerRect.width / 2;
     /** 旋转方块以左上角定位，减去半边长后再限制在浮层圆角以内。 */
@@ -269,11 +282,12 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
       }
       return nextLayout;
     });
-  }, [props.popoverArrowAlignment, props.popoverMinWidth, props.pinning]);
+  }, [props.popoverArrowAlignment, props.popoverBoundarySelector, props.popoverMinWidth, props.pinning]);
 
   const closeListbox = (restoreFocus = true) => {
     setOpen(false);
     if (restoreFocus) focusElement(triggerRef.current ?? undefined);
+    props.onOpenChange?.(false);
   };
 
   const openListbox = (nextActiveValue = props.value) => {
@@ -287,9 +301,15 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
     popoverContentWidthRef.current = 0;
     setPopoverLayout(null);
     setOpen(true);
+    props.onOpenChange?.(true);
     // 长列表优先聚焦搜索；任务工具栏这类短列表直接聚焦选项，避免顶部搜索灰区抢占视觉。
     focusElement(searchable ? (searchRef.current ?? undefined) : (optionRefs.current.get(resolvedActiveValue) ?? undefined));
   };
+
+  /** 等触发器挂载后再打开，浮层直接进入所属应用容器。 */
+  useEffect(() => {
+    if (props.defaultOpen) openListbox();
+  }, []);
 
   const selectOption = (value: T) => {
     props.onChange(value);
@@ -454,6 +474,9 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
     const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(syncPopoverLayout);
     if (triggerRef.current) resizeObserver?.observe(triggerRef.current);
     if (popoverRef.current) resizeObserver?.observe(popoverRef.current);
+    /** 拖动分栏时触发器宽度可以不变，仍需随所属面板重新定位。 */
+    const boundary = props.popoverBoundarySelector ? triggerRef.current?.closest(props.popoverBoundarySelector) : null;
+    if (boundary) resizeObserver?.observe(boundary);
     window.addEventListener('resize', syncPopoverLayout);
     document.addEventListener('scroll', syncPopoverLayout, true);
     return () => {
@@ -461,7 +484,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
       window.removeEventListener('resize', syncPopoverLayout);
       document.removeEventListener('scroll', syncPopoverLayout, true);
     };
-  }, [open, searchPlaceholder, searchable, syncPopoverLayout, visibleOptions]);
+  }, [open, props.popoverBoundarySelector, searchPlaceholder, searchable, syncPopoverLayout, visibleOptions]);
 
   // 只在打开时自动聚焦；方向键移动后不能把焦点抢回搜索框。
   useEffect(() => {
@@ -548,7 +571,8 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
                     </span>
                   ) : null}
                   <span className={props.pinning ? 'zeus-select-option-row' : undefined} role={props.pinning ? 'listitem' : 'presentation'}>
-                    <button
+                    <Button
+                      unstyled
                       ref={(element) => {
                         if (element) optionRefs.current.set(option.value, element);
                         else optionRefs.current.delete(option.value);
@@ -582,9 +606,10 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
                       <span className="zeus-select-option-check" aria-hidden="true">
                         {selected ? '✓' : ''}
                       </span>
-                    </button>
+                    </Button>
                     {props.pinning && option.value && !option.disabled ? (
-                      <button
+                      <Button
+                        unstyled
                         type="button"
                         className="zeus-select-pin"
                         aria-label={`${pinned ? props.pinning.unpinLabel : props.pinning.pinLabel} ${optionLabel}`}
@@ -593,7 +618,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
                         onClick={(event) => togglePin(option, event.currentTarget)}
                       >
                         <PushPinIcon size={15} weight={pinned ? 'fill' : 'regular'} aria-hidden="true" />
-                      </button>
+                      </Button>
                     ) : null}
                   </span>
                 </Fragment>
@@ -623,7 +648,8 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
       ref={rootRef}
     >
       {/* 触发器只保留在业务布局中；popover 通过 portal 提升到应用壳层，禁止扩大表单滚动区域。 */}
-      <button
+      <Button
+        unstyled
         ref={triggerRef}
         type="button"
         className={props.triggerClassName ? `zeus-select-trigger ${props.triggerClassName}` : 'zeus-select-trigger'}
@@ -647,7 +673,7 @@ export function ZeusSelect<T extends string>(props: ZeusSelectProps<T>) {
         {selectedOption?.color ? <span className="zeus-select-value-color" style={{ backgroundColor: selectedOption.color }} aria-hidden="true" /> : null}
         {props.hideSelectedLabel ? null : <span className="zeus-select-value">{props.triggerLabel ?? selectedOption?.label ?? props.value}</span>}
         <span className="zeus-select-chevron" aria-hidden="true" />
-      </button>
+      </Button>
       {popover && portalHost ? createPortal(popover, portalHost) : popover}
     </span>
   );

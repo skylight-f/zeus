@@ -86,6 +86,8 @@ export interface ZeusBrowserTabSnapshot {
   canGoForward: boolean;
   crashed: boolean;
   annotationMode: boolean;
+  /** 译文只属于当前文档；刷新或导航后重新由用户开启。 */
+  translation?: { state: 'working' | 'ready' | 'error'; serviceLabel: string; message?: string };
   comments: ZeusBrowserComment[];
   createdAt: string;
   updatedAt: string;
@@ -110,8 +112,34 @@ export type ZeusBrowserScreenshotMode = 'always' | 'necessary';
 export type ZeusWebLinkOpenTarget = 'zeus_browser' | 'system_default';
 export type ZeusFileOpenTarget = 'zeus_source' | 'system_default' | 'editor:vscode' | 'editor:vscode-insiders' | 'editor:cursor' | 'editor:windsurf';
 
+/** 浏览器与桌面操作分别选择模型；空值沿用当前会话，不创建代理。 */
+export interface AutomationModelSettings {
+  /** 浏览器操作使用的完整模型目录身份。 */
+  browser: string | null;
+  /** 桌面操作使用的完整模型目录身份。 */
+  computer: string | null;
+}
+
+/** 缺省配置保留当前会话的执行方式；非法目录身份拒绝保存。 */
+export function normalizeAutomationModelSettings(value: unknown): AutomationModelSettings {
+  if (value === undefined) return { browser: null, computer: null };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('操作模型设置必须为对象。');
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((key) => key !== 'browser' && key !== 'computer')) throw new Error('操作模型设置包含未知字段。');
+  const result: AutomationModelSettings = { browser: null, computer: null };
+  for (const capability of ['browser', 'computer'] as const) {
+    const model = input[capability];
+    if (model === null || model === undefined) continue;
+    if (typeof model !== 'string' || !model.trim() || model.length > 512 || /\p{Cc}/u.test(model)) throw new Error('操作模型身份无效。');
+    result[capability] = model.trim();
+  }
+  return result;
+}
+
 export interface ZeusBrowserSettings {
   enabled: boolean;
+  /** 记住免费服务身份或模型目录身份；未设置时使用默认免费翻译。 */
+  translationServiceId?: string;
   downloadDirectory: string;
   askWhereToSave: boolean;
   screenshotMode: ZeusBrowserScreenshotMode;
@@ -122,6 +150,40 @@ export interface ZeusBrowserSettings {
   externalEdgeEnabled: boolean;
   externalConnectionState?: 'disabled' | 'waiting' | 'connected' | 'store_id_pending' | 'error';
   externalConnectionDetail?: string;
+}
+
+/** 密码管理界面只接收账号标识，不接收密码。 */
+export interface ZeusBrowserPasswordAccount {
+  id: string;
+  origin: string;
+  username: string;
+}
+
+/** 冲突只提供来源行号；row 为 0 表示保留已有记录或跳过。 */
+export interface ZeusBrowserPasswordConflict {
+  id: string;
+  origin: string;
+  username: string;
+  rows: number[];
+  hasExisting: boolean;
+}
+
+/** CSV 内容仅留在主进程，确认界面使用有期限的导入身份。 */
+export interface ZeusBrowserPasswordImportPreview {
+  token: string;
+  fileName: string;
+  added: number;
+  unchanged: number;
+  invalidRows: Array<{ row: number; reason: string }>;
+  conflicts: ZeusBrowserPasswordConflict[];
+}
+
+/** 导入回执不包含 CSV 内容或密码。 */
+export interface ZeusBrowserPasswordImportResult {
+  added: number;
+  updated: number;
+  skipped: number;
+  invalid: number;
 }
 
 /** 桌面控制设置与真实系统授权状态。 */
@@ -184,6 +246,8 @@ export interface ZeusBrowserConversationSnapshot {
   tabs: ZeusBrowserTabSnapshot[];
   activeTabId: string | null;
   pendingApprovals: ZeusBrowserApprovalRequest[];
+  /** 工具请求打开后保持为真，直到所属会话实际显示网页或关闭全部标签。 */
+  openRequested: boolean;
 }
 
 export interface ZeusBrowserPreparedSubmission {
@@ -211,6 +275,8 @@ export function mergeBrowserSubmissions(current: ZeusBrowserPreparedSubmission |
 }
 
 export type ZeusBrowserCommand =
+  /** 使用当前站点保存的账号填充登录表单，不自动提交。 */
+  | { action: 'autofill' }
   | { action: 'navigate'; url: string }
   | { action: 'back' }
   | { action: 'forward' }
@@ -219,6 +285,12 @@ export type ZeusBrowserCommand =
   /** 页面查找复用 Chromium，搜索内容限制在当前标签内。 */
   | { action: 'find'; text: string; forward?: boolean }
   | { action: 'stop_find' }
+  /** 双语阅读与模型选择共用现有手动命令入口。 */
+  | { action: 'translate' | 'restore_original' }
+  /** 仅内置的免账号服务可以通过快捷菜单直接选择。 */
+  | { action: 'translation_google' | 'translation_microsoft' }
+  /** 已选择的模型或内置翻译服务，主进程会重新核对目录。 */
+  | { action: 'translation_service'; serviceId: string }
   /** 手动菜单操作只作用于经过归属校验的网页。 */
   | { action: 'copy_url' | 'open_external' | 'zoom_in' | 'zoom_out' | 'zoom_reset' | 'devtools' }
   | { action: 'set_annotation_mode'; enabled: boolean }

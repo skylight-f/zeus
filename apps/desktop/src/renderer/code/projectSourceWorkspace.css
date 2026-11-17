@@ -112,19 +112,19 @@
   min-width: 0;
   min-height: 0;
   flex: 1;
-  grid-template-columns: var(--zeus-source-tree-width) 8px minmax(0, 1fr);
+  grid-template-columns: var(--zeus-source-tree-width) 4px minmax(0, 1fr);
 }
 
 .project-source-tree {
   box-sizing: border-box;
-  padding: 0;
   overflow: auto;
   display: flex;
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  border-right: 0;
-  background: transparent;
+  border: 0;
+  border-radius: 0;
+  background: var(--zeus-product-panel-muted);
 }
 .project-source-conflict-comparison {
   width: min(1200px, 94vw);
@@ -163,90 +163,34 @@
 .project-source-conflict-columns > section + section h3 {
   background: color-mix(in srgb, #408bd8 18%, transparent);
 }
-.project-source-change-preview {
+.project-source-module {
+  --source-module-header-height: 36px;
+  position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-}
-.project-source-change-preview > header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
   border-bottom: 0;
 }
-.project-source-change-preview > header > span {
-  overflow-wrap: anywhere;
-}
-.project-source-change-preview > .project-git-diff-preview {
-  flex: 1;
-  min-height: 0;
-}
-
-.project-source-module {
-  --source-module-header-height: 30px;
-  position: relative;
-  flex: 0 0 auto;
-  box-sizing: border-box;
-  overflow: hidden;
-  border: 1px solid var(--zeus-product-line);
-  border-radius: 10px;
-  background: var(--zeus-product-panel);
-}
-.macos-ai-app .project-source-tree .project-source-module > summary,
-.macos-ai-app .project-source-tree .project-source-changes-body summary {
+/* 目录常驻展开，分支和工作区入口共享固定顶行。 */
+.macos-ai-app .project-source-tree .project-source-module-header {
   box-sizing: border-box;
   width: 100%;
   inline-size: 100%;
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
-  justify-content: space-between;
-  list-style: none;
-  cursor: pointer;
-  padding: 10px 12px;
+  gap: 4px;
   font-weight: 600;
-}
-.macos-ai-app .project-source-tree .project-source-module > summary {
-  height: var(--source-module-header-height);
+  /* 工作目录错误按实际内容展开，不能被固定标题栏高度裁掉。 */
+  height: auto;
   min-height: var(--source-module-header-height);
   padding: 5px 12px;
   font-size: 12px;
   line-height: 20px;
 }
-.macos-ai-app .project-source-tree .project-source-changes-body summary {
-  padding: 3px 7px;
-  min-height: 26px;
-  font-size: 12px;
-  line-height: 20px;
-}
-.project-source-module > summary::-webkit-details-marker,
-.project-source-changes-body summary::-webkit-details-marker {
-  display: none;
-}
-.project-source-module > summary::after,
-.project-source-changes-body summary::after {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid currentColor;
-  border-bottom: 1.5px solid currentColor;
-  transform: rotate(-45deg);
-  margin-right: 3px;
-  margin-left: auto;
-  flex-shrink: 0;
-}
-.project-source-module[open] > summary::after,
-.project-source-changes-body details[open] > summary::after {
-  transform: rotate(45deg);
-}
-.project-source-module > summary::marker,
-.project-source-changes-body summary::marker {
-  content: '';
-}
-.project-source-module > summary > span:first-child {
+.project-source-module-header > .project-source-worktree-slot {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -280,346 +224,62 @@
   background: var(--zeus-interaction-hover);
 }
 .project-source-module-actions button:focus-visible {
-  outline: 2px solid var(--zeus-control-focus);
+  outline: 2px solid var(--zeus-control-accent);
   outline-offset: -1px;
 }
 .project-source-module-actions svg {
   width: 14px;
   height: 14px;
 }
-.project-source-module-actions button svg + svg {
-  width: 8px;
-  height: 8px;
-  margin-top: 8px;
-  margin-left: -5px;
-}
-.project-source-module > summary::after {
-  margin-left: 4px;
-}
-.project-source-changes-body summary > small {
-  margin-inline-end: 10px;
-}
 .project-source-tree:has(> .project-source-module) {
   overflow: hidden;
-}
-.project-source-tree > .project-source-module[open] {
-  height: 0;
-  min-height: 80px;
-  overflow: hidden;
-  flex: 1;
-}
-.project-source-tree:has(> .project-source-changes[open]) > .project-source-module:first-child[open] {
-  flex: 0 1 var(--source-module-share, 55%);
-}
-/* 分栏模块的高度由拖动布局决定，不使用通用 details 的自然高度动画。 */
-.macos-ai-app .project-source-tree > .project-source-module[open]::details-content {
-  position: absolute;
-  inset: var(--source-module-header-height) 0 0;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  block-size: auto;
-  transition: none;
-  overflow: hidden;
-}
-.project-source-module > .project-source-changes-body {
-  flex: 1;
-  overflow: auto;
-  min-height: 0;
-}
-.project-source-module-resizer {
-  flex: 0 0 8px;
-  border-radius: 4px;
-  cursor: row-resize;
-  touch-action: none;
-  background: transparent;
-}
-.project-source-module-resizer:hover,
-.project-source-module-resizer:focus-visible {
-  background: var(--zeus-control-accent);
-}
-.project-source-tree:has(> .project-source-module:not([open])) > .project-source-module-resizer {
-  display: none;
-}
-/* 任一卡片折叠后仍保留分区间距，只有同时展开时显示高度拖动区。 */
-.project-source-tree:has(> .project-source-module:not([open])) > .project-source-changes {
-  margin-top: 8px;
 }
 .project-source-module .project-source-tree-scroll {
   max-height: none;
   overflow: auto;
 }
 
-/* 内容搜索与替换固定在目录顶部，命中结果独立滚动。 */
-.project-source-content-search {
-  flex: 0 0 auto;
-  min-width: 0;
-  padding: 6px 8px;
-  font-size: 12px;
-}
+/* 搜索与新建入口并排，输入框使用剩余宽度，按钮不嵌入输入标签。 */
 .project-source-search-row {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-}
-.project-source-search-input,
-.source-search-replacement > input {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  flex: 1;
-  border: 1px solid var(--zeus-control-border);
-  border-radius: 6px;
-  background: var(--zeus-control-background, var(--zeus-product-panel));
-}
-.project-source-search-input:focus-within,
-.source-search-replacement > input:focus {
-  border-color: var(--zeus-control-accent);
-}
-.project-source-content-search .project-source-search-input > input,
-.project-source-content-search .source-search-replacement > input {
-  min-width: 0;
-  width: 0;
-  flex: 1;
-  padding: 6px;
-  min-height: 30px;
-  box-sizing: border-box;
-  font: inherit;
-  color: var(--zeus-control-text);
-  outline: none;
-}
-.project-source-content-search .project-source-search-input > input {
-  border: 0;
-  background: transparent;
-  box-shadow: none;
-}
-.project-source-search-input > button,
-.project-source-workspace .source-search-icon {
-  display: inline-flex;
-  flex: 0 0 24px;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  min-width: 24px;
-  height: 26px;
-  min-height: 26px;
-  padding: 0;
-  border: 0;
-  border-radius: 4px;
-  color: var(--zeus-control-muted-text);
-  background: transparent;
-  font-size: 12px;
-  cursor: pointer;
-}
-.project-source-search-input > button[aria-pressed='true'] {
-  color: var(--zeus-brand-text);
-  background: color-mix(in srgb, var(--zeus-control-accent) 16%, transparent);
-}
-.project-source-search-input > button:hover:not(:disabled),
-.project-source-workspace .source-search-icon:hover:not(:disabled),
-.source-search-location:hover:not(:disabled) {
-  background: var(--zeus-interaction-hover);
-}
-.project-source-search-input > button:focus-visible,
-.project-source-workspace .source-search-icon:focus-visible,
-.source-search-location:focus-visible {
-  outline: 2px solid var(--zeus-control-accent);
-  outline-offset: -2px;
-}
-.source-search-word {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-.source-search-icon svg {
-  width: 15px;
-  height: 15px;
-}
-.source-search-icon svg.expanded {
-  transform: rotate(90deg);
-}
-.source-search-replacement {
-  margin: 5px 0 0 28px;
-}
-.source-search-status {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  margin: 4px 0 0 28px;
-  color: var(--zeus-control-muted-text);
-}
-.source-search-status > span {
-  flex: 1;
-  min-width: 0;
-}
-.source-search-feedback {
-  margin: 6px 0;
-  color: var(--zeus-control-muted-text);
-  overflow-wrap: anywhere;
-  line-height: 1.5;
-}
-.project-source-content-results {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 0 6px 8px;
-  font-size: 12px;
-}
-.source-search-file > summary {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-height: 28px;
-  padding: 0 4px;
-  cursor: pointer;
-  list-style: none;
-}
-.source-search-file > summary::-webkit-details-marker {
-  display: none;
-}
-.source-search-file > summary::before {
-  content: '›';
-  color: var(--zeus-control-muted-text);
-}
-.source-search-file[open] > summary::before {
-  transform: rotate(90deg);
-}
-.source-search-file > summary > svg {
-  width: 14px;
-  height: 14px;
-  flex: none;
-}
-.source-search-file > summary > span {
-  flex: 1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
-}
-.source-search-file > summary > small {
-  color: var(--zeus-control-muted-text);
-  font-variant-numeric: tabular-nums;
-}
-.source-search-match {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  padding-inline-start: 12px;
-}
-.source-search-location {
-  display: flex;
-  align-items: baseline;
-  min-width: 0;
-  flex: 1;
-  gap: 7px;
-  padding: 5px 4px;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  text-align: start;
-  font: inherit;
-  cursor: pointer;
-}
-.source-search-location > small {
-  flex: 0 0 auto;
-  color: var(--zeus-control-muted-text);
-  font-variant-numeric: tabular-nums;
-}
-.source-search-location > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: pre;
-  font-family: var(--zeus-code-font-family, monospace);
-}
-.source-search-location mark {
-  background: color-mix(in srgb, var(--zeus-control-accent) 23%, transparent);
-  color: inherit;
-  border-radius: 2px;
-}
-.project-source-content-search button:disabled,
-.project-source-content-results button:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.project-source-changes-body {
-  padding: 2px 6px 12px;
-  color: var(--zeus-control-text);
-  font-size: 12px;
-  line-height: 20px;
-}
-.project-source-changes-body details > details,
-.project-source-changes-body details > button,
-.project-source-changes-body details > p {
-  margin-inline-start: 16px;
-}
-.project-source-changes-body summary {
-  padding: 3px 7px;
-  min-height: 26px;
-  box-sizing: border-box;
-  border-radius: 5px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-}
-.project-source-changes-body summary:hover {
-  background: var(--zeus-interaction-hover);
-}
-.project-source-changes-body summary strong {
-  font-weight: 600;
-}
-.project-source-changes-body p {
-  margin-block: 2px 6px;
-  padding-inline: 7px;
-  color: var(--zeus-product-muted);
-  font-size: 12px;
-}
-.project-source-changes-body small {
-  margin-inline-start: 8px;
-  color: var(--zeus-product-muted);
-}
-.project-source-changes-body button {
-  display: flex;
+  flex-shrink: 0;
+  min-height: 32px;
   align-items: center;
   gap: 6px;
-  width: calc(100% - 16px);
-  min-height: 26px;
-  padding: 2px 7px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--zeus-control-text);
-  background: transparent;
-  text-align: left;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
+  margin: 8px 10px;
 }
-.project-source-changes-body button:hover {
-  background: var(--zeus-interaction-hover);
+.project-source-search {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  margin: 0;
+  color: var(--zeus-control-muted-text);
 }
-.project-source-changes-body button:focus-visible {
-  outline: 2px solid var(--zeus-control-accent);
-  outline-offset: -2px;
-}
-.project-source-changes-body button > small {
-  margin-inline-start: auto;
-  flex-shrink: 0;
-}
-.project-source-changes-body > button {
-  width: auto;
-  margin: 0 0 4px auto;
-  color: var(--zeus-product-muted);
-}
-.project-source-changes-body button > svg {
+
+/* 放大镜放在输入框内，点击图标时仍由输入标签聚焦搜索框。 */
+.project-source-search svg {
+  position: absolute;
+  top: 50%;
+  left: 8px;
   width: 14px;
   height: 14px;
-  flex-shrink: 0;
+  transform: translateY(-50%);
+  pointer-events: none;
 }
-.project-source-changes-body button > span {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+.project-source-search input {
+  min-width: 0;
+  height: 28px;
+  flex: 1;
+  padding: 0 8px 0 28px;
+  border: 1px solid var(--zeus-control-border);
+  border-radius: 6px;
+  outline: none;
+  color: var(--zeus-control-text);
+  background: var(--zeus-control-bg);
+  font: inherit;
+  font-size: 12px;
 }
 
 .project-source-tree-scroll {
@@ -698,96 +358,53 @@
   line-height: 1.5;
 }
 
+/* 竖线属于拖拽手柄，目录区域不绘制外围边框；保留完整点击范围。 */
 .project-source-tree-resizer {
+  position: relative;
   cursor: col-resize;
   touch-action: none;
   background: transparent;
+  outline: none;
+}
+/* 拖拽面在工作台宿主中贯通顶部，网格轨道继续保留原有布局宽度。 */
+.project-source-tree-resizer.project-source-tree-resizer-overlay {
+  position: fixed;
+  z-index: 40;
+  -webkit-app-region: no-drag;
+}
+.project-source-tree-resizer::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 50%;
+  width: 1px;
+  background: var(--zeus-product-line);
   transition: background-color var(--zeus-button-motion);
 }
-.project-source-tree-resizer:hover:not(:disabled):not([aria-disabled='true']),
-.project-source-tree-resizer:focus-visible,
-.project-source-tree-resizer[data-dragging='true'] {
+.project-source-tree-resizer:hover:not(:disabled):not([aria-disabled='true'])::after,
+.project-source-tree-resizer:focus-visible::after,
+.project-source-tree-resizer[data-dragging='true']::after {
   background: var(--zeus-product-accent);
-  outline: none;
 }
 
 .project-source-editor-pane {
   display: grid;
-  overflow: hidden;
-  border: 1px solid var(--zeus-product-line);
-  border-radius: 10px;
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   background: var(--zeus-code-editor-bg);
 }
-.project-source-editor-track-placeholder {
-  min-width: 0;
-  min-height: 0;
-}
 
-.project-source-tabs {
+/* 标签和工具按钮共用一行，长文件列表单独滚动，入口始终可见。 */
+.project-source-editor-header {
   display: flex;
   min-width: 0;
-  min-height: 38px;
-  overflow-x: auto;
   align-items: stretch;
-  gap: 4px;
-  padding: 4px 8px 0;
-  border-bottom: 1px solid var(--zeus-control-border);
-  background: var(--zeus-code-editor-bg);
-
-  border-bottom: 0;
   background: var(--zeus-product-panel-muted);
 }
 
-.project-source-tab {
-  display: inline-flex;
-  min-width: 116px;
-  max-width: 220px;
-  min-height: 34px;
-  align-items: center;
-  box-sizing: border-box;
-  padding: 0 4px 0 0;
-  border: 1px solid transparent;
-  border-radius: 8px;
-
-  border-right: 0;
-  border-bottom: 2px solid transparent;
-  color: var(--zeus-control-muted-text);
-  background: transparent;
-}
-
-.project-source-tab > [role='tab'] {
-  display: inline-flex;
-  min-width: 0;
+.project-source-tabs {
   flex: 1;
-  align-items: center;
-  gap: 7px;
-  align-self: stretch;
-  padding: 0 0 0 9px;
-  border: 0;
-  color: inherit;
-  background: transparent;
-  font: inherit;
-  font-size: 12px;
-}
-.project-source-tab > [role='tab'] > span:first-child {
-  min-width: 0;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: left;
-}
-.project-source-tab.active {
-  color: var(--zeus-control-text);
-  border-color: var(--zeus-control-border);
-  background: color-mix(in srgb, var(--zeus-control-text) 8%, var(--zeus-code-editor-bg));
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--zeus-control-text) 10%, transparent);
-}
-.project-source-tab.active > [role='tab'] {
-  font-weight: 600;
+  padding: 4px 8px;
 }
 .project-source-tabs i {
   color: var(--zeus-brand-text);
@@ -799,24 +416,6 @@
   font-size: 12px;
   font-weight: 700;
 }
-.project-source-tab-close {
-  display: inline-grid;
-  width: 26px;
-  min-width: 26px;
-  height: 100%;
-  padding: 0;
-  place-items: center;
-  border: 0;
-  border-radius: 4px;
-  color: var(--zeus-control-muted-text);
-  background: transparent;
-  font: inherit;
-}
-.project-source-tab-close:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-interaction-hover);
-  color: var(--zeus-control-text);
-}
-
 .project-source-breadcrumbs {
   display: flex;
   min-height: 30px;
@@ -840,15 +439,6 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-}
-.project-source-code-editor-loading {
-  display: grid;
-  min-width: 0;
-  min-height: 0;
-  place-items: center;
-  background: var(--zeus-code-editor-bg);
-  color: var(--zeus-control-subtle-text);
-  font-size: 12px;
 }
 .project-source-code-editor .cm-editor {
   height: 100%;
@@ -920,16 +510,20 @@
   position: fixed;
   z-index: 1200;
   display: flex;
-  width: 184px;
+  width: min(260px, calc(100vw - 24px));
   flex-direction: column;
   gap: 2px;
   padding: 5px;
   border: 1px solid var(--zeus-control-border);
   border-radius: 8px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
-  background: var(--zeus-product-panel);
+  background: var(--zeus-solid-surface-bg, var(--zeus-product-panel));
 }
 .project-source-context-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   min-height: 28px;
   padding: 0 8px;
   border: 0;
@@ -966,7 +560,7 @@
   border: 1px solid var(--zeus-control-border);
   border-radius: 12px;
   box-shadow: 0 24px 70px rgb(0 0 0 / 26%);
-  background: var(--zeus-product-panel);
+  background: var(--zeus-solid-surface-bg, var(--zeus-product-panel));
 }
 .project-source-operation-modal > header,
 .project-source-operation-modal > footer {
@@ -1028,12 +622,11 @@
     grid-template-columns: minmax(0, 1fr);
     position: relative;
   }
-  .project-source-tree-resizer {
+  .project-source-tree-resizer,
+  .project-source-tree-resizer-track {
     display: none;
   }
   .project-source-tree {
-    padding: 8px;
-    background: var(--zeus-product-panel-muted);
     position: absolute;
     z-index: 5;
     inset: 0 auto 0 0;
@@ -1070,61 +663,37 @@
   }
 }
 
-/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
-.macos-ai-app .project-source-tree .project-source-module-header {
-  box-sizing: border-box;
-  width: 100%;
-  inline-size: 100%;
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-  font-weight: 600;
-  height: var(--source-module-header-height);
-  min-height: var(--source-module-header-height);
-  padding: 5px 12px;
-  font-size: 12px;
-  line-height: 20px;
-}
-.project-source-module-header > .project-source-branch-slot {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.macos-ai-app .project-source-module-header > .project-code-actions {
-  max-inline-size: none;
-  padding: 0;
-}
-.project-source-tree-resizer.project-source-tree-resizer-overlay {
-  position: fixed;
-  z-index: 40;
-  -webkit-app-region: no-drag;
-}
-.project-source-editor-header {
-  display: flex;
-  min-width: 0;
-  align-items: stretch;
-  background: var(--zeus-product-panel-muted);
-}
-
-@media (max-width: 900px) {
-  .project-source-tree-resizer-track {
-    display: none;
-  }
-}
-.project-source-branch-slot {
+/* 分支控件沿用原有逻辑，宽度跟随目录栏并保留工作区入口。 */
+.project-source-worktree-slot {
   display: flex;
   min-width: 0;
 }
-.macos-ai-app .project-source-branch-slot > .project-git-branch-trigger {
+.macos-ai-app .project-source-worktree-select .zeus-select-trigger {
   margin: 0;
   min-inline-size: 0;
   inline-size: 100%;
   min-block-size: 28px;
   padding: 3px 5px;
 }
+
+/* 快捷键与操作名称并排显示，保留清晰的文件操作范围。 */
+.project-source-context-menu kbd {
+  color: var(--zeus-control-muted-text);
+  font: inherit;
+  white-space: nowrap;
+}
+
+/* 高亮语言可手动兜底，状态栏选择不改变文件的编码或内容。 */
+.project-source-statusbar select {
+  min-width: 0;
+  max-width: 130px;
+  font: inherit;
+  color: inherit;
+  border: 0;
+  background: transparent;
+}
+
+/* 文件效果入口并入已有路径行，避免额外占用一排工具栏。 */
 .project-source-file-toolbar {
   display: flex;
   min-width: 0;
@@ -1167,6 +736,7 @@
   outline: 2px solid var(--zeus-control-accent);
   outline-offset: -2px;
 }
+/* 编辑器持续挂载，查看效果不会丢失草稿、滚动或撤销历史。 */
 .project-source-document-views {
   display: grid;
   min-width: 0;
@@ -1186,6 +756,7 @@
 .project-source-document-editor[hidden] {
   display: none;
 }
+/* HTML 使用独立页面，Markdown 使用现有主题渲染，不恢复外围卡片边框。 */
 .project-source-rendered-preview {
   position: relative;
   min-width: 0;
@@ -1224,9 +795,27 @@
   max-width: 100%;
   height: auto;
 }
+/* 较窄窗口上下分栏，保留两边完整滚动范围。 */
 @media (max-width: 1100px) {
   .project-source-document-views[data-view-mode='split'] {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   }
+}
+
+/* 工作树选择跟随文件树宽度，长分支和目录由统一选择器截断。 */
+.project-source-worktree-control {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  inline-size: 100%;
+}
+.project-source-worktree-select {
+  min-inline-size: 0;
+  inline-size: 100%;
+}
+.project-source-worktree-control > [role='alert'] {
+  white-space: normal;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }

@@ -1,10 +1,12 @@
-import { BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, type IpcMainEvent, type IpcMainInvokeEvent, type Rectangle, session, type Session, type WebContents, WebContentsView } from 'electron';
+import { browserCredentialPromptHtml } from './browserCredentialPrompt.js';
+import { BrowserWindow, clipboard, dialog, ipcMain, Menu, MenuItem, nativeImage, type IpcMainEvent, type IpcMainInvokeEvent, type Rectangle, session, type Session, type WebContents, WebContentsView } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { publishFile } from '@zeus/storage/platform-security';
 import { readFileSync } from 'node:fs';
 import { mkdir, open, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { serializeBrowserComments } from '@zeus/shared';
+import { defaultBrowserTranslationService, isFreeBrowserTranslationService, serializeBrowserComments, validBrowserTranslationSegments } from '@zeus/shared';
+import type { createBrowserTranslationClient } from './browserTranslationClient.js';
 import type {
   ZeusBrowserApprovalDecision,
   ZeusBrowserApprovalRequest,
@@ -32,6 +34,10 @@ import {
 import { googleWorkspaceExportRequest, sanitizeBrowserArtifactName } from './browserArtifactExport.js';
 import type { MainCommandLedger, MainCommandRequest } from './mainCommandLedger.js';
 import type { RetiredNativeRuntimeCleanup } from './retiredNativeRuntimeCleanup.js';
+import { BrowserPasswordStore, browserPasswordOrigin } from './browserPasswords.js';
+import { BrowserCuaHost } from './browserCuaHost.js';
+import type { BrowserCuaSurface } from './browserCuaBridge.js';
+import type { ComputerHost } from './computerHost.js';
 
 /** 仅保存长期设置与书签；标签、活动页和分组随本次应用运行结束。 */
 interface PersistedBrowserState {
@@ -42,11 +48,16 @@ interface PersistedBrowserState {
 }
 
 interface LiveBrowserTab {
+  /** 已填密码只用于清理工具返回和网页日志，关闭标签后释放。 */
+  passwordValues?: Set<string>;
   snapshot: ZeusBrowserTabSnapshot;
   view?: WebContentsView;
   ownerWindowId?: number;
-  refs: Map<string, string>;
   documentGeneration: number;
+  /** 当前文档的翻译身份与取消范围，关闭标签后不再请求外部服务。 */
+  translation?: { id: string; serviceId: string; controller: AbortController; busy: boolean };
+  /** 页面 preload 未启动时不能把未被接收的翻译指令显示为持续处理中。 */
+  pagePreloadFailed?: boolean;
   /** 区分本页首次查找与上一处／下一处，换页后重新开始。 */
   findText?: string;
   consoleLogs: Array<{ level: number; message: string; line: number; sourceId: string; createdAt: string }>;
@@ -97,6 +108,8 @@ interface BrowserDownload {
 }
 
 interface ActiveBrowserJsDialog {
+  /** 保存真实 CDP 参数，供后建立的 CUA 连接接续该对话框。 */
+  parameters?: Record<string, unknown>;
   kind: 'AlertDialog' | 'BeforeUnloadDialog' | 'ConfirmDialog' | 'PromptDialog';
   type: 'alert' | 'beforeunload' | 'confirm' | 'prompt';
   message: string;
@@ -133,6 +146,12 @@ interface ManagedBrowserAuditEntry {
 }
 
 interface CreateBrowserHostOptions {
+  /** 密码库由当前资料根与系统凭据身份共同隔离。 */
+  passwords: BrowserPasswordStore;
+  /** Main 内唯一的 CUA 宿主，模型不能指定 Driver 或传输地址。 */
+  computer?: () => ComputerHost;
+  /** 免费服务和已配置模型都通过本机 Core 请求，不把凭据交给网页。 */
+  translation?: ReturnType<typeof createBrowserTranslationClient>;
   /** 内置浏览器的授权和登录窗口跟随应用语言。 */
   language?: () => 'zh-CN' | 'en-US';
   statePath: string;
@@ -158,21 +177,6 @@ interface BrowserPageCommentInput {
   body?: unknown;
   anchor?: unknown;
   designChanges?: unknown;
-}
-
-interface BrowserToolElementInfo {
-  selector: string;
-  tagName: string;
-  type: string;
-  role: string;
-  name: string;
-  text: string;
-  href: string;
-  navigationUrl: string;
-  disabled: boolean;
-  editable: boolean;
-  fileInput: boolean;
-  submitter: boolean;
 }
 
 export const browserPartition = 'persist:zeus-browser';
@@ -214,6 +218,8 @@ function emptyTabSnapshot(input: { id: string; conversationId: string; url: stri
 }
 
 export class BrowserHost implements BrowserAutomationPort {
+  /** 页面自动化复用 CUA，Zeus 只保留标签与应用生命周期。 */
+  private readonly cua: BrowserCuaHost;
   readonly attachmentRoot: string;
   private readonly now: () => string;
   private readonly statePath: string;
@@ -222,6 +228,8 @@ export class BrowserHost implements BrowserAutomationPort {
   private readonly windows = new Map<number, BrowserWindow>();
   private readonly visibleTabByWindow = new Map<number, string>();
   private readonly activeTabByConversation = new Map<string, string>();
+  /** 页面暂停订阅时保留打开意图，普通后台标签不自动请求展开。 */
+  private readonly pendingOpenRequests = new Set<string>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly grantedWebPermissions = new Set<string>();
   private readonly downloads: BrowserDownload[] = [];
@@ -248,6 +256,11 @@ export class BrowserHost implements BrowserAutomationPort {
   }
 
   constructor(private readonly options: CreateBrowserHostOptions) {
+    this.cua = new BrowserCuaHost(() => {
+      const computer = options.computer?.();
+      if (!computer) throw new Error('CUA 浏览器宿主尚未就绪。');
+      return computer;
+    });
     this.now = options.now ?? (() => new Date().toISOString());
     this.statePath = resolve(options.statePath);
     this.attachmentRoot = resolve(options.attachmentRoot);
@@ -263,6 +276,10 @@ export class BrowserHost implements BrowserAutomationPort {
   }
 
   unregisterWindow(window: BrowserWindow): void {
+    this.options.passwords.cancel(window.id);
+    for (const tab of this.tabs.values()) {
+      if (tab.ownerWindowId === window.id) void this.cua.releaseTab(tab.snapshot.id).catch((error) => console.warn('CUA browser window cleanup failed', error));
+    }
     this.windows.delete(window.id);
     const visibleTabId = this.visibleTabByWindow.get(window.id);
     if (visibleTabId) this.detachTab(visibleTabId);
@@ -298,17 +315,48 @@ export class BrowserHost implements BrowserAutomationPort {
       return this.snapshotFor(requireNonEmptyString(conversationId, 'conversationId'));
     });
     // 系统菜单覆盖原生网页，选择结果仍交回现有操作入口执行。
-    ipcMain.handle('zeus:browser:show-menu', (event, input: unknown) => {
+    ipcMain.handle('zeus:browser:show-menu', async (event, input: unknown) => {
       /** 菜单只允许本应用渲染器打开，位置限制在所属窗口内。 */
       const window = this.requireRendererWindow(event);
       const value = asRecord(input);
-      const bounds = window.getContentBounds();
       const english = value.language === 'en-US';
       /** 菜单状态来自当前标签，不能由渲染器伪造网址或导航能力。 */
       const tab = this.requireConversationTab(requireNonEmptyString(value.conversationId, 'conversationId'), requireNonEmptyString(value.tabId, 'tabId'));
-      /** 使用真实页面缩放比例显示菜单状态。 */
-      const zoom = Math.round(this.ensureView(tab).webContents.getZoomFactor() * 100);
-      return new Promise<string | null>((resolveSelection) => {
+      /** 等待目录期间页面可能关闭或导航，菜单只能用于原来的页面。 */
+      const contents = this.ensureView(tab).webContents;
+      const generation = tab.documentGeneration;
+      /** 原生菜单弹出后不能追加模型项；两类目录并行读取并独立保留失败结果。 */
+      const sources = ['codex', 'custom'] as const;
+      const catalogs = await Promise.allSettled(sources.map((source) => this.loadTranslationServices(window, tab, source)));
+      if (window.isDestroyed() || contents.isDestroyed() || generation !== tab.documentGeneration || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id) return null;
+      /** 使用等待结束后的窗口尺寸和真实缩放比例。 */
+      const bounds = window.getContentBounds();
+      const zoom = Math.round(contents.getZoomFactor() * 100);
+      return new Promise<string | { action: 'translation_service'; serviceId: string } | null>((resolveSelection) => {
+        /** 原生子菜单覆盖网页，不创建触发网页隐藏的 Renderer 浮层。 */
+        const services = new Menu();
+        /** 选中标记只来自已保存身份，避免 radio 分组默认勾选其他服务。 */
+        const selectedId = this.settings.translationServiceId ?? defaultBrowserTranslationService;
+        /** 模型目录失败不影响免费服务的展示和选择。 */
+        for (const [id, label] of [
+          ['free:microsoft', english ? 'Microsoft · Free' : '微软翻译 · 免费'],
+          ['free:google', english ? 'Google · Free' : 'Google 翻译 · 免费'],
+        ]) {
+          services.append(new MenuItem({ label, type: 'checkbox', checked: selectedId === id, click: () => resolveSelection({ action: 'translation_service', serviceId: id! }) }));
+        }
+        /** 弹出前完整构建各类模型、登录入口和不可用提示。 */
+        for (const [index, result] of catalogs.entries()) {
+          services.append(new MenuItem({ type: 'separator' }));
+          if (result.status === 'rejected') {
+            services.append(new MenuItem({ label: sources[index] === 'codex' ? (english ? 'Codex models unavailable' : 'Codex 模型不可用') : english ? 'Provider models unavailable' : '供应商模型不可用', enabled: false }));
+            continue;
+          }
+          /** 目录身份与翻译命令共用完整 modelRef。 */
+          const catalog = result.value;
+          for (const model of catalog.items) services.append(new MenuItem({ label: model.label, type: 'checkbox', checked: selectedId === model.id, click: () => resolveSelection({ action: 'translation_service', serviceId: model.id }) }));
+          if (catalog.codexLoginRequired) services.append(new MenuItem({ label: english ? 'Sign in to Codex' : '登录 Codex', click: () => resolveSelection('translation_login') }));
+          if (!catalog.items.length && !catalog.codexLoginRequired) services.append(new MenuItem({ label: catalog.warning || (english ? 'No available models' : '暂无可用模型'), enabled: false }));
+        }
         /** 固定菜单项不接收网页提供的文案或可执行动作。 */
         const menu = Menu.buildFromTemplate([
           { label: english ? 'New tab' : '新建标签', click: () => resolveSelection('new_tab') },
@@ -321,6 +369,8 @@ export class BrowserHost implements BrowserAutomationPort {
           { label: english ? 'Stop loading' : '停止加载', enabled: tab.snapshot.loading, click: () => resolveSelection('stop') },
           { type: 'separator' },
           { label: english ? 'Find on page…' : '在页面中查找…', click: () => resolveSelection('find') },
+          { label: tab.snapshot.translation ? (english ? 'Restore original' : '恢复原文') : english ? 'Translate to Chinese' : '中英对照', click: () => resolveSelection(tab.snapshot.translation ? 'restore_original' : 'translate') },
+          { label: english ? 'Translation service' : '翻译服务', submenu: services },
           { label: english ? 'Copy page link' : '复制页面链接', enabled: tab.snapshot.url !== 'about:blank', click: () => resolveSelection('copy_url') },
           { label: english ? 'Open in default browser' : '在默认浏览器中打开', enabled: Boolean(normalizeExternalWebUrl(tab.snapshot.url)), click: () => resolveSelection('open_external') },
           {
@@ -337,7 +387,12 @@ export class BrowserHost implements BrowserAutomationPort {
           { label: english ? 'Reset split width' : '恢复默认分栏宽度', enabled: value.canSplit === true, click: () => resolveSelection('reset_size') },
           { label: english ? 'Close browser' : '关闭浏览器', click: () => resolveSelection('close') },
         ]);
-        menu.popup({ window, x: Math.min(bounds.width, Math.max(0, Math.round(finiteNumber(value.x, 0)))), y: Math.min(bounds.height, Math.max(0, Math.round(finiteNumber(value.y, 0)))), callback: () => resolveSelection(null) });
+        menu.popup({
+          window,
+          x: Math.min(bounds.width, Math.max(0, Math.round(finiteNumber(value.x, 0)))),
+          y: Math.min(bounds.height, Math.max(0, Math.round(finiteNumber(value.y, 0)))),
+          callback: () => resolveSelection(null),
+        });
       });
     });
     ipcMain.handle('zeus:browser:open-tab', async (event, input: unknown) => {
@@ -368,6 +423,7 @@ export class BrowserHost implements BrowserAutomationPort {
       /** 迁移保留原网页实例、标签顺序和当前选中项。 */
       const active = this.activeTabByConversation.get(source);
       for (const tab of tabs) {
+        void this.cua.releaseTab(tab.snapshot.id).catch((error) => console.warn('CUA browser draft cleanup failed', error));
         tab.snapshot = { ...tab.snapshot, conversationId: target, comments: tab.snapshot.comments.map((comment) => ({ ...comment, conversationId: target, status: sent.has(comment.id) ? 'sent' : comment.status })) };
         this.syncPageComments(tab);
       }
@@ -394,6 +450,7 @@ export class BrowserHost implements BrowserAutomationPort {
       /** 关闭范围只取经过校验的会话身份和主进程实时标签。 */
       const window = this.requireRendererWindow(event);
       const id = requireNonEmptyString(conversationId, 'conversationId');
+      this.pendingOpenRequests.delete(id);
       for (const tab of this.snapshotFor(id).tabs) this.closeTab(window, id, tab.id);
       return this.snapshotFor(id);
     });
@@ -416,7 +473,24 @@ export class BrowserHost implements BrowserAutomationPort {
       const tabId = requireNonEmptyString(value.tabId, 'tabId');
       const visible = value.visible === true;
       const bounds = normalizeBounds(value.bounds);
-      return { applied: await this.setLayout(window, conversationId, tabId, bounds, visible) };
+      /** 只捕获当前窗口正在展示的同一标签，不读取其他会话的页面。 */
+      const tab = this.tabs.get(tabId);
+      /** 截图与隐藏并行，不能让原生网页等待截图期间盖住弹窗。 */
+      const preview =
+        value.capturePreview === true && !visible && this.visibleTabByWindow.get(window.id) === tabId && tab?.snapshot.conversationId === conversationId && tab.view && !tab.view.webContents.isDestroyed()
+          ? tab.view.webContents
+              .capturePage(undefined, { stayHidden: true })
+              .then((image) => (image.isEmpty() ? undefined : image.toDataURL()))
+              .catch((error) => {
+                console.warn('Browser overlay preview capture failed', error);
+                return undefined;
+              })
+          : undefined;
+      /** 布局继续使用原有会话校验及网页实例；截图不写入文件或持久状态。 */
+      const applied = await this.setLayout(window, conversationId, tabId, bounds, visible);
+      /** 一次遮挡只返回当前可视区画面，恢复后由 Renderer 释放。 */
+      const previewImageUrl = await preview;
+      return { applied, ...(previewImageUrl ? { previewImageUrl } : {}) };
     });
     ipcMain.handle('zeus:browser:prepare-comments', async (event, input: unknown) => {
       this.requireRendererWindow(event);
@@ -459,6 +533,78 @@ export class BrowserHost implements BrowserAutomationPort {
       this.requireRendererWindow(event);
       return { ...this.settings };
     });
+    ipcMain.handle('zeus:browser:list-passwords', (event) => {
+      this.requireRendererWindow(event);
+      return this.options.passwords.list();
+    });
+    ipcMain.handle('zeus:browser:prepare-password-import', async (event) => {
+      const window = this.requireRendererWindow(event);
+      this.assertWritableBrowserCapability();
+      const picked = await dialog.showOpenDialog(window, { properties: ['openFile'], filters: [{ name: 'Chrome CSV', extensions: ['csv'] }] });
+      if (picked.canceled || !picked.filePaths[0] || window.isDestroyed()) return null;
+      const preview = await this.options.passwords.prepare(window.id, picked.filePaths[0]);
+      if (window.isDestroyed()) {
+        this.options.passwords.cancel(window.id);
+        return null;
+      }
+      return preview;
+    });
+    ipcMain.handle('zeus:browser:cancel-password-import', (event, token: unknown) => {
+      this.options.passwords.cancel(this.requireRendererWindow(event).id, requireNonEmptyString(token, 'token'));
+    });
+    ipcMain.handle('zeus:browser:commit-password-import', (event, request: MainCommandRequest) => {
+      const window = this.requireRendererWindow(event);
+      return this.options.mainCommandLedger().execute(request, 'desktop.browser.import_passwords', async (input, command) => {
+        this.assertWritableBrowserCapability();
+        const value = asRecord(input);
+        const choices = asRecord(value.choices);
+        if (Object.values(choices).some((row) => !Number.isSafeInteger(row) || Number(row) < 0)) throw new Error('密码导入选择无效。');
+        return this.options.passwords.commit(window.id, requireNonEmptyString(value.token, 'token'), choices as Record<string, number>, () => command.markWriteStarted());
+      });
+    });
+    ipcMain.handle('zeus:browser:delete-password', (event, request: MainCommandRequest) => {
+      this.requireRendererWindow(event);
+      return this.options.mainCommandLedger().execute(request, 'desktop.browser.delete_password', async (input, command) => {
+        this.assertWritableBrowserCapability();
+        await this.options.passwords.remove(requireNonEmptyString(asRecord(input).id, 'id'), () => command.markWriteStarted());
+        return { deleted: true };
+      });
+    });
+    /** 专属内容脚本使用单独的只读凭据接口，网页及模型工具没有此桥。 */
+    ipcMain.handle('zeus:browser-page:autofill-runtime', async (event, input: unknown) => {
+      const tab = this.requirePageTab(event);
+      this.assertWritableBrowserCapability();
+      if (!this.settings.enabled || event.senderFrame !== event.sender.mainFrame) throw new Error('自动填充请求不属于受信任的顶层文档。');
+      const origin = browserPasswordOrigin(event.sender.getURL());
+      const value = asRecord(input);
+      if (value.action === 'context') return { origin, generation: tab.documentGeneration, language: this.options.language?.() ?? 'zh-CN', tabId: event.sender.id };
+      const request = asRecord(value.request);
+      if (value.generation !== tab.documentGeneration || request.action !== 'credentials' || browserPasswordOrigin(requireNonEmptyString(request.url, 'url')) !== origin) throw new Error('自动填充请求的页面身份已变化。');
+      const generation = tab.documentGeneration;
+      const credentials = await this.options.passwords.credentials(origin);
+      if (event.sender.isDestroyed() || generation !== tab.documentGeneration || browserPasswordOrigin(event.sender.getURL()) !== origin) throw new Error('自动填充请求的页面身份已变化。');
+      return credentials.map((entry) => {
+        (tab.passwordValues ??= new Set()).add(entry.password);
+        return { uuid: entry.id, login: entry.username, password: entry.password, name: entry.username || entry.origin, group: '', stringFields: [], totp: '', expired: 'false', skipAutoSubmit: 'true' };
+      });
+    });
+    ipcMain.handle('zeus:browser-page:show-passwords', async (event, request: MainCommandRequest) => {
+      const tab = this.requirePageTab(event);
+      if (event.senderFrame !== event.sender.mainFrame) return;
+      const window = tab.ownerWindowId ? this.windows.get(tab.ownerWindowId) : undefined;
+      if (!window || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id || !this.settings.enabled) return;
+      if (asRecord(request?.body).generation !== tab.documentGeneration) return;
+      try {
+        if (!(await this.options.passwords.list(browserPasswordOrigin(event.sender.getURL()))).length) return;
+        await this.options.mainCommandLedger().execute(request, 'desktop.browser.autofill', async (_input, command) => {
+          if (asRecord(_input).generation !== tab.documentGeneration) return { completed: false };
+          await this.showPasswordMenu(window, tab, true, () => command.markWriteStarted());
+          return { completed: true };
+        });
+      } catch (error) {
+        this.emitError(tab, error);
+      }
+    });
     ipcMain.handle('zeus:browser:update-settings', async (event, request: MainCommandRequest) => {
       this.requireRendererWindow(event);
       return this.options.mainCommandLedger().execute(request, 'desktop.browser.update_settings', async (input, command) => {
@@ -497,6 +643,34 @@ export class BrowserHost implements BrowserAutomationPort {
         await command.markWriteStarted();
         return this.options.retiredNativeRuntimeCleanup.restoreLatest();
       });
+    });
+    ipcMain.handle('zeus:browser-page:translate', async (event, input: unknown) => {
+      /** 仅当前顶层文档的隔离预加载可以请求已开启的翻译。 */
+      const tab = this.requirePageTab(event);
+      const value = asRecord(input);
+      const run = tab.translation;
+      this.assertWritableBrowserCapability();
+      if (event.senderFrame !== event.sender.mainFrame || !run || value.runId !== run.id || run.controller.signal.aborted || run.busy || !this.options.translation || !validBrowserTranslationSegments(value.segments))
+        throw new Error('当前页面翻译请求已失效。');
+      run.busy = true;
+      try {
+        return { segments: await this.options.translation.translate(run.serviceId, value.segments, run.controller.signal) };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : this.text('翻译失败，请重试。', 'Translation failed. Retry.') };
+      } finally {
+        run.busy = false;
+      }
+    });
+    ipcMain.on('zeus:browser-page:translation-state', (event, input: unknown) => {
+      /** 迟到的文档状态不能影响新页面或另一标签。 */
+      const tab = this.tabFromWebContents(event.sender);
+      const value = asRecord(input);
+      if (!tab?.translation || event.senderFrame !== event.sender.mainFrame || value.runId !== tab.translation.id || !['working', 'ready', 'error'].includes(String(value.state)) || !tab.snapshot.translation) return;
+      tab.snapshot = {
+        ...tab.snapshot,
+        translation: { state: value.state as 'working' | 'ready' | 'error', serviceLabel: tab.snapshot.translation.serviceLabel, ...(typeof value.message === 'string' ? { message: value.message.slice(0, 500) } : {}) },
+      };
+      this.emitSnapshot(tab.snapshot.conversationId);
     });
     ipcMain.handle('zeus:browser-page:get-state', (event) => {
       const tab = this.requirePageTab(event);
@@ -552,12 +726,28 @@ export class BrowserHost implements BrowserAutomationPort {
       url: string;
     },
   ): Promise<ZeusBrowserConversationSnapshot> {
-    const snapshot = await this.openTab(window, input);
+    await this.openTab(window, input);
     this.emitOpenRequested(input.conversationId);
-    return snapshot;
+    return this.snapshotFor(input.conversationId);
   }
 
   async invoke(input: BrowserAutomationToolCall): Promise<{
+    contentItems: BrowserAutomationContentItem[];
+    success: boolean;
+  }> {
+    try {
+      const result = await this.invokeAutomation(input);
+      return { ...result, contentItems: result.contentItems.map((item) => (item.type === 'inputText' ? { ...item, text: this.redactPasswordText(item.text) } : item)) };
+    } catch (error) {
+      const message = this.redactPasswordText(error instanceof Error ? error.message : String(error), true);
+      if (error instanceof Error && message === error.message) throw error;
+      const detail = error as { code?: string; statusCode?: number; failClosed?: boolean } | null;
+      throw Object.assign(new Error(message), { code: detail?.code, statusCode: detail?.statusCode, failClosed: detail?.failClosed });
+    }
+  }
+
+  /** 所有自动化入口共用返回脱敏，不增加读取已保存密码的模型工具。 */
+  private async invokeAutomation(input: BrowserAutomationToolCall): Promise<{
     contentItems: BrowserAutomationContentItem[];
     success: boolean;
   }> {
@@ -565,8 +755,11 @@ export class BrowserHost implements BrowserAutomationPort {
     if (!this.settings.enabled) return toolText('The Zeus built-in browser is disabled in Settings.', false);
     const args = input.arguments;
     if (input.tool === 'catalog') return this.invokeAdvancedCatalog(args);
-    if (input.tool === 'release_handles') return this.releaseAdvancedHandles(input);
-    if (input.tool === 'invoke') return this.invokeAdvancedTool(input);
+    if (input.tool === 'release_handles') {
+      await this.cua.endTurn(input.conversationId, input.turnId);
+      return this.releaseAdvancedHandles(input);
+    }
+    if (input.tool === 'invoke' && !/^(?:get_browser_state|browser_)/u.test(String(args.path ?? ''))) return this.invokeAdvancedTool(input);
     if (input.tool === 'list_tabs') {
       return toolJson(
         this.snapshotFor(input.conversationId).tabs.map(({ id, title, url, loading }) => ({
@@ -581,8 +774,7 @@ export class BrowserHost implements BrowserAutomationPort {
       const url = normalizeBrowserUrl(requireNonEmptyString(args.url, 'url'));
       this.assertAgentUrlAllowed(url);
       const window = this.preferredWindow(input.conversationId);
-      const snapshot = await this.openTab(window, { conversationId: input.conversationId, url });
-      this.emitOpenRequested(input.conversationId);
+      const snapshot = await this.openConversationResource(window, { conversationId: input.conversationId, url });
       if (url !== 'about:blank' && snapshot.activeTabId) {
         await this.waitForTabReady(this.requireConversationTab(input.conversationId, snapshot.activeTabId), 30_000);
       }
@@ -618,6 +810,9 @@ export class BrowserHost implements BrowserAutomationPort {
 
     this.assertAgentUrlAllowed(tab.snapshot.url);
     this.emitOpenRequested(input.conversationId);
+    if (['snapshot', 'element', 'click', 'type', 'press', 'scroll', 'screenshot', 'invoke'].includes(input.tool)) {
+      return this.cua.invoke({ ...input, arguments: { ...input.arguments, tabId: tab.snapshot.id } }, this.cuaSurface(tab));
+    }
     switch (input.tool) {
       case 'history': {
         const action = requireNonEmptyString(args.action, 'action');
@@ -625,31 +820,9 @@ export class BrowserHost implements BrowserAutomationPort {
         if (action !== 'stop') await this.waitForTabReady(tab, 30_000);
         return result;
       }
-      case 'snapshot':
-        return toolJson(await this.pageSnapshot(tab, boundedInteger(args.maxElements, 160, 1, 400)));
-      case 'element':
-        return toolJson(await this.elementInfo(tab, this.resolveTarget(tab, requireNonEmptyString(args.target, 'target'))));
-      case 'click':
-        return this.invokeClickTool(input, tab);
-      case 'type':
-        return this.invokeTypeTool(input, tab);
-      case 'press':
-        return this.invokePressTool(tab, requireNonEmptyString(args.key, 'key'));
-      case 'scroll':
-        return this.invokeScrollTool(tab, args);
       case 'wait':
+        if (args.query !== undefined) return this.cua.wait({ ...input, arguments: { ...args, tabId: tab.snapshot.id } }, this.cuaSurface(tab));
         return this.invokeWaitTool(tab, args);
-      case 'screenshot': {
-        const image = await this.ensureView(tab).webContents.capturePage();
-        const artifactPath = await this.writeBrowserExport('screenshot.png', image.toPNG());
-        return {
-          contentItems: [
-            { type: 'inputText', text: JSON.stringify({ artifactPath, mimeType: 'image/png' }) },
-            { type: 'inputImage', imageUrl: image.toDataURL() },
-          ],
-          success: true,
-        };
-      }
       case 'developer':
         return this.invokeDeveloperTool(input, tab);
       default:
@@ -660,6 +833,8 @@ export class BrowserHost implements BrowserAutomationPort {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    await this.options.passwords.dispose();
+    await this.cua.close();
     if (this.persistenceTimer) clearTimeout(this.persistenceTimer);
     for (const pending of this.pendingApprovals.values()) {
       clearTimeout(pending.timer);
@@ -667,9 +842,46 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     this.pendingApprovals.clear();
     for (const tab of this.tabs.values()) {
+      this.stopTranslation(tab);
       if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     }
     if (!this.options.readOnlyValidation) await this.persist();
+  }
+
+  /** 私有传输先于 CUA worker 创建；只读验证模式不创建服务。 */
+  async initializeCua(): Promise<void> {
+    if (!this.options.readOnlyValidation) await this.cua.initialize();
+  }
+
+  /** 只供 Main 组装原生 worker 环境，不通过 IPC 或工具结果返回。 */
+  getCuaEndpoint(): string | undefined {
+    return this.cua.endpoint;
+  }
+
+  /** 轮次结束撤销控制，不关闭用户网页。 */
+  async endComputerUse(input: { conversationId: string; turnId: string }): Promise<void> {
+    await this.cua.endTurn(input.conversationId, input.turnId);
+  }
+
+  /** 实时读取宿主拥有的页面、窗口及布局，页面脚本不能提供这些身份。 */
+  private cuaSurface(tab: LiveBrowserTab): BrowserCuaSurface {
+    const contents = this.ensureView(tab).webContents;
+    const conversationId = tab.snapshot.conversationId;
+    const window = (): BrowserWindow => {
+      if (this.tabs.get(tab.snapshot.id) !== tab || contents.isDestroyed()) throw new Error('浏览器标签已经关闭。');
+      this.requireConversationTab(conversationId, tab.snapshot.id);
+      const owner = tab.ownerWindowId === undefined ? undefined : this.windows.get(tab.ownerWindowId);
+      if (!owner || owner.isDestroyed()) throw new Error('网页所属窗口已经失效，请重新打开该标签后观察。');
+      return owner;
+    };
+    return {
+      contents,
+      window,
+      bounds: () => tab.view!.getBounds(),
+      visible: () => this.visibleTabByWindow.get(window().id) === tab.snapshot.id && window().isVisible() && !window().isMinimized(),
+      pendingDialog: () => this.activeJsDialogs.get(tab.snapshot.id)?.parameters,
+      allowUrl: (url) => this.assertAgentUrlAllowed(normalizeBrowserUrl(url)),
+    };
   }
 
   /** 在 Main 资源就绪后恢复已持久化的外部浏览器连接；构造期间绝不写浏览器 manifest。 */
@@ -815,7 +1027,6 @@ export class BrowserHost implements BrowserAutomationPort {
         loading: url !== 'about:blank',
       },
       ownerWindowId: window.id,
-      refs: new Map(),
       documentGeneration: 1,
       consoleLogs: [],
     };
@@ -852,8 +1063,10 @@ export class BrowserHost implements BrowserAutomationPort {
   /** 同步释放标签，批量关闭期间不让新标签穿插进入清理范围。 */
   private closeTab(window: BrowserWindow, conversationId: string, tabId: string): void {
     const tab = this.requireConversationTab(conversationId, tabId);
+    void this.cua.releaseTab(tabId).catch((error) => console.warn('CUA browser cleanup failed', error));
     /** 只有被关闭网页持有焦点时才把焦点交给下一网页。 */
     const focusedBounds = this.visibleTabByWindow.get(window.id) === tabId && this.isVisibleTabFocused(window) ? tab.view!.getBounds() : null;
+    this.stopTranslation(tab);
     if (this.visibleTabByWindow.get(window.id) === tabId) this.detachTab(tabId);
     if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     this.tabs.delete(tabId);
@@ -864,7 +1077,10 @@ export class BrowserHost implements BrowserAutomationPort {
     const remaining = [...this.tabs.values()].filter((candidate) => candidate.snapshot.conversationId === conversationId);
     const next = remaining.at(-1)?.snapshot.id ?? null;
     if (next) this.activeTabByConversation.set(conversationId, next);
-    else this.activeTabByConversation.delete(conversationId);
+    else {
+      this.activeTabByConversation.delete(conversationId);
+      this.pendingOpenRequests.delete(conversationId);
+    }
     if (next && focusedBounds) {
       // 在本次原生命令内完成页面和焦点交接，下一次 Cmd/Ctrl+W 仍有标签目标。
       // setLayout 在返回 Promise 前完成挂载；失败仍沿用浏览器的可见错误通道。
@@ -891,6 +1107,10 @@ export class BrowserHost implements BrowserAutomationPort {
     if (previous && previous !== tabId) this.detachTab(previous);
     if (tab.ownerWindowId !== undefined && tab.ownerWindowId !== window.id) this.detachTab(tabId);
     const view = this.ensureView(tab);
+    const previousBounds = view.getBounds();
+    if (previousBounds.x !== bounds.x || previousBounds.y !== bounds.y || previousBounds.width !== bounds.width || previousBounds.height !== bounds.height) {
+      void this.cua.hideTabCursor(tabId).catch((error) => console.warn('CUA browser layout cleanup failed', error));
+    }
     tab.ownerWindowId = window.id;
     if (this.visibleTabByWindow.get(window.id) !== tabId) {
       window.contentView.addChildView(view);
@@ -898,10 +1118,12 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     view.setBounds(bounds);
     view.setVisible(true);
+    if (this.activeTabByConversation.get(conversationId) === tabId) this.pendingOpenRequests.delete(conversationId);
     return true;
   }
 
   private detachTab(tabId: string): void {
+    void this.cua.hideTabCursor(tabId).catch((error) => console.warn('CUA browser visibility cleanup failed', error));
     const tab = this.tabs.get(tabId);
     if (!tab?.view || tab.ownerWindowId === undefined) return;
     const window = this.windows.get(tab.ownerWindowId);
@@ -935,6 +1157,13 @@ export class BrowserHost implements BrowserAutomationPort {
         allowRunningInsecureContent: false,
       },
     });
+    /** 未挂载标签也有真实离屏 viewport；显示后仍由 renderer 提供实际浏览器布局。 */
+    const owner = tab.ownerWindowId === undefined ? undefined : this.windows.get(tab.ownerWindowId);
+    if (owner && !owner.isDestroyed()) {
+      const { width, height } = owner.getContentBounds();
+      view.setBounds({ x: 0, y: 0, width, height });
+    }
+    view.setVisible(false);
     tab.view = view;
     tab.findText = undefined;
     view.setBackgroundColor('#f8f9fb');
@@ -956,17 +1185,33 @@ export class BrowserHost implements BrowserAutomationPort {
     view.webContents.on('did-start-loading', update);
     view.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
       if (!isMainFrame || isInPlace) return;
+      void this.cua.hideTabCursor(tab.snapshot.id).catch((error) => console.warn('CUA browser navigation cursor cleanup failed', error));
+      this.stopTranslation(tab);
+      tab.pagePreloadFailed = false;
       tab.findText = undefined;
       tab.documentGeneration += 1;
-      tab.refs.clear();
       this.invalidateAdvancedHandlesForTab(tab.snapshot.id);
     });
     view.webContents.on('did-stop-loading', update);
     view.webContents.on('did-navigate', update);
-    view.webContents.on('did-navigate-in-page', update);
+    view.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+      // 路由变化停止翻译；同页锚点滚动保留已开启的阅读状态。
+      if (isMainFrame && url.split('#')[0] !== tab.snapshot.url.split('#')[0]) this.stopTranslation(tab);
+      update();
+    });
     view.webContents.on('page-title-updated', update);
+    view.webContents.on('preload-error', (_event, preloadPath, error) => {
+      tab.pagePreloadFailed = true;
+      tab.consoleLogs.push({ level: 3, message: String(error.message).slice(0, 20_000), line: 0, sourceId: preloadPath, createdAt: this.now() });
+      if (tab.consoleLogs.length > 500) tab.consoleLogs.splice(0, tab.consoleLogs.length - 500);
+      if (tab.translation && tab.snapshot.translation) {
+        tab.translation.controller.abort();
+        tab.snapshot = { ...tab.snapshot, translation: { ...tab.snapshot.translation, state: 'error', message: this.text('页面功能加载失败，请重新加载网页。', 'Page features failed to load. Reload the page.') } };
+        this.emitSnapshot(tab.snapshot.conversationId);
+      }
+    });
     view.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-      tab.consoleLogs.push({ level, message: String(message).slice(0, 20_000), line, sourceId: String(sourceId).slice(0, 4_000), createdAt: this.now() });
+      tab.consoleLogs.push({ level, message: this.redactPasswordText(String(message), true).slice(0, 20_000), line, sourceId: this.redactPasswordText(String(sourceId), true).slice(0, 4_000), createdAt: this.now() });
       if (tab.consoleLogs.length > 500) tab.consoleLogs.splice(0, tab.consoleLogs.length - 500);
     });
     view.webContents.on('page-favicon-updated', (_event, favicons) => {
@@ -982,6 +1227,8 @@ export class BrowserHost implements BrowserAutomationPort {
       update();
     });
     view.webContents.on('render-process-gone', () => {
+      void this.cua.releaseTab(tab.snapshot.id).catch((error) => console.warn('CUA browser cleanup failed', error));
+      this.stopTranslation(tab);
       this.activeJsDialogs.delete(tab.snapshot.id);
       tab.snapshot = { ...tab.snapshot, crashed: true, loading: false, updatedAt: this.now() };
       this.emitSnapshot(tab.snapshot.conversationId);
@@ -1007,6 +1254,73 @@ export class BrowserHost implements BrowserAutomationPort {
     return view;
   }
 
+  /** 原生账号菜单覆盖网页，列表及密码都不交给网页脚本。 */
+  private async showPasswordMenu(window: BrowserWindow, tab: LiveBrowserTab, quiet = false, beforeFill?: () => Promise<void>): Promise<void> {
+    this.assertWritableBrowserCapability();
+    const contents = this.ensureView(tab).webContents;
+    let origin: string;
+    try {
+      origin = browserPasswordOrigin(contents.getURL());
+    } catch {
+      if (quiet) return;
+      throw new Error(this.text('当前页面不支持密码填充。', 'Password filling is unavailable on this page.'));
+    }
+    const generation = tab.documentGeneration;
+    const accounts = await this.options.passwords.list(origin);
+    if (contents.isDestroyed() || tab.documentGeneration !== generation || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id) return;
+    if (!accounts.length && quiet) return;
+    if (accounts.length) {
+      const detected = await contents.executeJavaScriptInIsolatedWorld(1001, [{ code: `globalThis.zeusAutofill?.probe(${JSON.stringify(origin)}) ?? false` }]);
+      if (!detected) {
+        if (quiet) return;
+        throw new Error(this.text('自动填充尚未就绪，或页面没有可填充的登录框。', 'Autofill is not ready, or no supported sign-in field was found.'));
+      }
+      if (contents.isDestroyed() || tab.documentGeneration !== generation || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id) return;
+    }
+    const selected = await new Promise<string | null>((resolveSelection) => {
+      const menu = new Menu();
+      for (const account of accounts) menu.append(new MenuItem({ label: (account.username || this.text('无用户名', 'No username')).replace(/&/gu, '&&').slice(0, 240), click: () => resolveSelection(account.id) }));
+      if (!accounts.length) menu.append(new MenuItem({ label: this.text('此站点没有已保存的密码', 'No saved passwords for this site'), enabled: false }));
+      menu.popup({ window, callback: () => resolveSelection(null) });
+    });
+    if (!selected) return;
+    if (contents.isDestroyed() || tab.documentGeneration !== generation || browserPasswordOrigin(contents.getURL()) !== origin || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id) return;
+    await beforeFill?.();
+    if (contents.isDestroyed() || tab.documentGeneration !== generation || this.visibleTabByWindow.get(window.id) !== tab.snapshot.id) return;
+    let status: unknown;
+    try {
+      status = await contents.executeJavaScriptInIsolatedWorld(1001, [{ code: `globalThis.zeusAutofill?.fill(${JSON.stringify(origin)},${JSON.stringify(selected)}) ?? 'unavailable'` }], true);
+    } catch {
+      throw new Error(this.text('密码填充失败，请重新聚焦登录框后重试。', 'Password filling failed. Focus the sign-in field and try again.'));
+    }
+    if (status === 'filled') return;
+    if (status === 'unavailable') throw new Error(this.text('自动填充组件尚未就绪，请在页面加载后重试。', 'Autofill is not ready. Try again after the page loads.'));
+    if (status === 'page_changed') throw new Error(this.text('页面已变化，请重新选择账号。', 'The page changed. Select an account again.'));
+    if (status === 'account_missing') throw new Error(this.text('该账号已删除，请重新选择。', 'This account was deleted. Select an account again.'));
+    throw new Error(
+      status === 'multiple_forms' ? this.text('页面有多个登录表单，请先点击要填充的登录框。', 'Focus the sign-in field in the form you want to fill.') : this.text('未找到可填充的登录框。', 'No supported sign-in field was found.'),
+    );
+  }
+
+  /** 已填密码从所有浏览器工具文字结果及网页控制台中移除。 */
+  private redactPasswordText(text: string, includeShortFragments = false): string {
+    const values = [...new Set([...this.tabs.values()].flatMap((tab) => [...(tab.passwordValues ?? [])]))];
+    if (!values.length) return text;
+    /** 先解析 JSON 再替换字符串，避免破坏数字、布尔值或转义字符。 */
+    const scrub = (value: unknown): unknown => {
+      /** 短密码只替换完整工具值，避免把 e1 等定位引用改坏；日志可过滤短片段。 */
+      if (typeof value === 'string') return values.reduce((result, password) => (result === password || password.length >= 4 || includeShortFragments ? result.split(password).join('[redacted]') : result), value);
+      if (Array.isArray(value)) return value.map(scrub);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, scrub(nested)]));
+      return value;
+    };
+    try {
+      return JSON.stringify(scrub(JSON.parse(text)));
+    } catch {
+      return scrub(text) as string;
+    }
+  }
+
   private async runManualCommand(window: BrowserWindow, conversationId: string, tabId: string, command: ZeusBrowserCommand): Promise<void> {
     if (!this.settings.enabled) throw new Error('The built-in browser is disabled in Settings.');
     const tab = this.requireConversationTab(conversationId, tabId);
@@ -1015,6 +1329,9 @@ export class BrowserHost implements BrowserAutomationPort {
     const view = this.ensureView(tab);
     if (!command || typeof command !== 'object' || typeof command.action !== 'string') throw new TypeError('Browser command is invalid.');
     switch (command.action) {
+      case 'autofill':
+        await this.showPasswordMenu(window, tab);
+        break;
       case 'navigate':
         await loadUserFacingBrowserUrl(view.webContents, normalizeBrowserUrl(command.url));
         break;
@@ -1038,6 +1355,29 @@ export class BrowserHost implements BrowserAutomationPort {
       case 'stop_find':
         view.webContents.stopFindInPage('clearSelection');
         tab.findText = undefined;
+        break;
+      case 'translate':
+        await this.startTranslation(tab);
+        break;
+      case 'translation_google':
+      case 'translation_microsoft':
+        await this.selectTranslationService(tab, command.action === 'translation_google' ? 'free:google' : 'free:microsoft');
+        break;
+      case 'translation_service': {
+        if (typeof command.serviceId !== 'string' || !command.serviceId || command.serviceId.length > 2000) throw new TypeError('翻译服务身份无效。');
+        /** 重新核对模型目录，不接受已删除或未启用的模型身份。 */
+        if (!isFreeBrowserTranslationService(command.serviceId)) {
+          if (!this.options.translation) throw new Error(this.text('翻译服务不可用。', 'Translation is unavailable.'));
+          const generation = tab.documentGeneration;
+          const models = await this.options.translation.models(AbortSignal.timeout(30_000), command.serviceId);
+          if (generation !== tab.documentGeneration || !tab.view || tab.view.webContents.isDestroyed()) return;
+          if (!models.items.some((item) => item.id === command.serviceId)) throw new Error(this.text('翻译模型不可用，请重新选择。', 'The translation model is unavailable. Choose another model.'));
+        }
+        await this.selectTranslationService(tab, command.serviceId);
+        break;
+      }
+      case 'restore_original':
+        this.stopTranslation(tab);
         break;
       case 'copy_url':
         clipboard.writeText(tab.snapshot.url);
@@ -1100,6 +1440,83 @@ export class BrowserHost implements BrowserAutomationPort {
       default:
         throw new TypeError('不支持的浏览器操作。');
     }
+  }
+
+  /** 选择服务先保存设置；当前是已加载网页时立即用新服务重新翻译。 */
+  private async selectTranslationService(tab: LiveBrowserTab, serviceId: string): Promise<void> {
+    this.assertWritableBrowserCapability();
+    this.settings = { ...this.settings, translationServiceId: serviceId };
+    this.schedulePersist();
+    if (!tab.snapshot.loading && /^(https?:|file:)/u.test(tab.snapshot.url)) await this.startTranslation(tab);
+  }
+
+  /** 打开服务选择时读取当前目录，页面关闭或导航后取消读取。 */
+  private async loadTranslationServices(window: BrowserWindow, tab: LiveBrowserTab, source: 'codex' | 'custom') {
+    this.assertWritableBrowserCapability();
+    if (!this.options.translation || !tab.view) throw new Error(this.text('翻译服务不可用。', 'Translation is unavailable.'));
+    const contents = tab.view.webContents;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    contents.once('did-start-navigation', cancel);
+    contents.once('destroyed', cancel);
+    window.once('closed', cancel);
+    try {
+      const models = await this.options.translation.models(AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]), undefined, source);
+      controller.signal.throwIfAborted();
+      return { ...models, selectedId: this.settings.translationServiceId ?? defaultBrowserTranslationService };
+    } finally {
+      contents.off('did-start-navigation', cancel);
+      contents.off('destroyed', cancel);
+      window.off('closed', cancel);
+    }
+  }
+
+  /** 开启当前选择的服务；默认免费服务不读取模型目录或要求模型登录。 */
+  private async startTranslation(tab: LiveBrowserTab): Promise<void> {
+    this.assertWritableBrowserCapability();
+    if (!this.options.translation) throw new Error(this.text('翻译服务不可用。', 'Translation is unavailable.'));
+    if (tab.snapshot.loading || !/^(https?:|file:)/u.test(tab.snapshot.url)) throw new Error(this.text('请在网页加载完成后开启中英对照。', 'Open a webpage and wait for it to load.'));
+    if (tab.pagePreloadFailed) throw new Error(this.text('页面功能加载失败，请重新加载网页。', 'Page features failed to load. Reload the page.'));
+    this.stopTranslation(tab);
+    /** 未设置过服务的新用户直接使用免费翻译。 */
+    const serviceId = this.settings.translationServiceId ?? defaultBrowserTranslationService;
+    /** 换页或关闭立即取消服务准备和当前请求。 */
+    const run = { id: randomUUID(), serviceId, controller: new AbortController(), busy: false };
+    tab.translation = run;
+    tab.snapshot = { ...tab.snapshot, translation: { state: 'working', serviceLabel: '' } };
+    this.emitSnapshot(tab.snapshot.conversationId);
+    try {
+      /** 免费服务名称固定；AI 服务从当前目录获取显示名称。 */
+      let label: string;
+      if (isFreeBrowserTranslationService(serviceId)) {
+        label = serviceId === 'free:microsoft' ? this.text('微软翻译 · 免费', 'Microsoft · Free') : this.text('Google 翻译 · 免费', 'Google · Free');
+      } else {
+        /** 只核对已选模型，不初始化无关供应商。 */
+        const models = await this.options.translation.models(AbortSignal.any([run.controller.signal, AbortSignal.timeout(30_000)]), serviceId);
+        /** 用户删除或禁用的模型不能自动替换为其他模型。 */
+        const selected = models.items.find((entry) => entry.id === serviceId);
+        if (!selected) throw new Error(this.text('翻译模型不可用，请在翻译服务菜单中重新选择。', 'The translation model is unavailable. Choose another translation service.'));
+        label = selected.label;
+      }
+      if (run.controller.signal.aborted || tab.translation !== run) return;
+      tab.snapshot = { ...tab.snapshot, translation: { state: 'working', serviceLabel: label } };
+      tab.view!.webContents.send('zeus-browser-page:command', { type: 'start_translation', runId: run.id, serviceId });
+      this.emitSnapshot(tab.snapshot.conversationId);
+    } catch (error) {
+      if (tab.translation !== run) return;
+      this.stopTranslation(tab);
+      throw error;
+    }
+  }
+
+  /** 停止服务请求并清除译文；不改变原始 DOM 和已有批注。 */
+  private stopTranslation(tab: LiveBrowserTab): void {
+    if (!tab.translation && !tab.snapshot.translation) return;
+    tab.translation?.controller.abort();
+    tab.translation = undefined;
+    tab.snapshot = { ...tab.snapshot, translation: undefined };
+    if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.send('zeus-browser-page:command', { type: 'stop_translation' });
+    this.emitSnapshot(tab.snapshot.conversationId);
   }
 
   private async savePageComment(tab: LiveBrowserTab, input: BrowserPageCommentInput): Promise<ZeusBrowserComment> {
@@ -1265,6 +1682,7 @@ export class BrowserHost implements BrowserAutomationPort {
       tabs,
       activeTabId,
       pendingApprovals: [...this.pendingApprovals.values()].map(({ request }) => request).filter((request) => request.conversationId === conversationId),
+      openRequested: this.pendingOpenRequests.has(conversationId),
     };
   }
 
@@ -1273,6 +1691,7 @@ export class BrowserHost implements BrowserAutomationPort {
   }
 
   private emitOpenRequested(conversationId: string): void {
+    this.pendingOpenRequests.add(conversationId);
     this.emit({ type: 'open_requested', conversationId });
   }
 
@@ -1292,7 +1711,7 @@ export class BrowserHost implements BrowserAutomationPort {
       type: 'error',
       conversationId: tab.snapshot.conversationId,
       tabId: tab.snapshot.id,
-      message: error instanceof Error ? error.message : String(error),
+      message: this.redactPasswordText(error instanceof Error ? error.message : String(error), true),
     });
   }
 
@@ -1382,118 +1801,6 @@ export class BrowserHost implements BrowserAutomationPort {
     return toolJson({ action, url: webContents.getURL() });
   }
 
-  private async pageSnapshot(tab: LiveBrowserTab, maxElements: number): Promise<Record<string, unknown>> {
-    const result = (await this.ensureView(tab).webContents.executeJavaScript(`(${pageSnapshotScript})(${JSON.stringify(maxElements)})`, true)) as {
-      title: string;
-      url: string;
-      text: string;
-      elements: Array<{ ref: string; selector: string; [key: string]: unknown }>;
-    };
-    tab.refs.clear();
-    for (const element of result.elements ?? []) {
-      if (typeof element.ref === 'string' && typeof element.selector === 'string') tab.refs.set(element.ref, element.selector);
-    }
-    return result;
-  }
-
-  private resolveTarget(tab: LiveBrowserTab, target: string): string {
-    return tab.refs.get(target.replace(/^\[?ref=|\]$/gu, '')) ?? target;
-  }
-
-  private async elementInfo(tab: LiveBrowserTab, selector: string): Promise<BrowserToolElementInfo> {
-    return (await this.ensureView(tab).webContents.executeJavaScript(`(${elementInfoScript})(${JSON.stringify(selector)})`, true)) as BrowserToolElementInfo;
-  }
-
-  private async invokeClickTool(
-    input: BrowserAutomationToolCall,
-    tab: LiveBrowserTab,
-  ): Promise<{
-    contentItems: BrowserAutomationContentItem[];
-    success: boolean;
-  }> {
-    const selector = this.resolveTarget(tab, requireNonEmptyString(input.arguments.target, 'target'));
-    const info = await this.elementInfo(tab, selector);
-    if (info.fileInput) return toolText('Automated file uploads are not supported. Ask the user to choose the file manually.', false);
-    if (info.navigationUrl && safeOrigin(info.navigationUrl) !== safeOrigin(tab.snapshot.url)) {
-      const navigationUrl = normalizeBrowserUrl(info.navigationUrl);
-      this.assertAgentUrlAllowed(navigationUrl);
-    }
-    const result = await this.ensureView(tab).webContents.executeJavaScript(
-      `(${clickElementScript})(${JSON.stringify(selector)}, ${JSON.stringify(optionalString(input.arguments.mouse_button) ?? 'left')}, ${JSON.stringify(boundedInteger(input.arguments.click_count, 1, 1, 3))})`,
-      true,
-    );
-    return toolJson(result);
-  }
-
-  private async invokeTypeTool(
-    input: BrowserAutomationToolCall,
-    tab: LiveBrowserTab,
-  ): Promise<{
-    contentItems: BrowserAutomationContentItem[];
-    success: boolean;
-  }> {
-    const selector = this.resolveTarget(tab, requireNonEmptyString(input.arguments.target, 'target'));
-    const text = requireString(input.arguments.text, 'text').slice(0, 100_000);
-    const info = await this.elementInfo(tab, selector);
-    if (info.fileInput) return toolText('Automated file uploads are not supported. Ask the user to choose the file manually.', false);
-    // 用户已授权的登录信息沿用普通输入入口，私密凭据交接由用户自行选择。
-    const result = await this.ensureView(tab).webContents.executeJavaScript(`(${typeIntoElementScript})(${JSON.stringify(selector)}, ${JSON.stringify(text)}, ${input.arguments.replace !== false ? 'true' : 'false'})`, true);
-    return toolJson(result);
-  }
-
-  /** 按键直接执行，剪贴板仍走独立工具入口。 */
-  private async invokePressTool(
-    tab: LiveBrowserTab,
-    keyChord: string,
-  ): Promise<{
-    contentItems: BrowserAutomationContentItem[];
-    success: boolean;
-  }> {
-    const parts = keyChord
-      .split('+')
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const keyCode = parts.at(-1);
-    if (!keyCode) return toolText('A keyboard key is required.', false);
-    const modifiers: Array<'meta' | 'control' | 'alt' | 'shift'> = [];
-    for (const part of parts.slice(0, -1)) {
-      const normalized = part.toLowerCase();
-      if (normalized === 'cmd' || normalized === 'meta') modifiers.push('meta');
-      else if (normalized === 'ctrl' || normalized === 'control') modifiers.push('control');
-      else if (normalized === 'alt' || normalized === 'option') modifiers.push('alt');
-      else if (normalized === 'shift') modifiers.push('shift');
-      else return toolText(`Unsupported keyboard modifier: ${part}`, false);
-    }
-    const normalizedKey = keyCode.toLowerCase();
-    if ((modifiers.includes('meta') || modifiers.includes('control')) && (normalizedKey === 'c' || normalizedKey === 'v' || normalizedKey === 'x')) {
-      return toolText('Clipboard keyboard shortcuts are not supported. Use the clipboard tool for clipboard access.', false);
-    }
-    const webContents = this.ensureView(tab).webContents;
-    if (normalizedKey === 'enter' || normalizedKey === 'return') {
-      const navigationUrl = await webContents.executeJavaScript(`(${activeElementNavigationScript})()`, true);
-      if (typeof navigationUrl === 'string' && navigationUrl && safeOrigin(navigationUrl) !== safeOrigin(tab.snapshot.url)) {
-        this.assertAgentUrlAllowed(normalizeBrowserUrl(navigationUrl));
-      }
-    }
-    webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
-    webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
-    return toolJson({ pressed: keyChord });
-  }
-
-  private async invokeScrollTool(
-    tab: LiveBrowserTab,
-    args: Record<string, unknown>,
-  ): Promise<{
-    contentItems: BrowserAutomationContentItem[];
-    success: boolean;
-  }> {
-    const selector = optionalString(args.target);
-    const x = finiteNumber(args.x, 0);
-    const y = finiteNumber(args.y, 600);
-    const result = await this.ensureView(tab).webContents.executeJavaScript(`(${scrollScript})(${JSON.stringify(selector ? this.resolveTarget(tab, selector) : null)}, ${JSON.stringify(x)}, ${JSON.stringify(y)})`, true);
-    return toolJson(result);
-  }
-
   /** 等待可见、可用或消失等真实页面状态，不把仅存在于 DOM 中误判为完成。 */
   private async invokeWaitTool(
     tab: LiveBrowserTab,
@@ -1559,19 +1866,22 @@ export class BrowserHost implements BrowserAutomationPort {
     const method = requireNonEmptyString(input.arguments.method, 'method');
     const params = isPlainRecord(input.arguments.params) ? input.arguments.params : {};
     const debuggerApi = this.ensureView(tab).webContents.debugger;
+    const attachedHere = !debuggerApi.isAttached();
     try {
-      if (!debuggerApi.isAttached()) debuggerApi.attach('1.3');
+      if (attachedHere) debuggerApi.attach('1.3');
       const result = await debuggerApi.sendCommand(method, params);
       return toolJson(result);
     } finally {
-      if (debuggerApi.isAttached()) debuggerApi.detach();
+      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
   }
 
-  private invokeAdvancedCatalog(args: Record<string, unknown>): ReturnType<typeof toolJson> {
+  /** 页面能力读取 CUA 实际目录；导出、登录和窗口管理仍使用宿主能力。 */
+  private async invokeAdvancedCatalog(args: Record<string, unknown>): Promise<ReturnType<typeof toolJson>> {
     const group = optionalString(args.group)?.toLocaleLowerCase();
     const query = optionalString(args.query)?.toLocaleLowerCase();
     const entries = browserFrozenContractEntries
+      .filter((entry) => isHostBrowserMethod(entry.path))
       .filter((entry) => (!group || entry.group.toLocaleLowerCase() === group) && (!query || entry.path.toLocaleLowerCase().includes(query)))
       .map((entry) => ({
         path: entry.path,
@@ -1582,7 +1892,9 @@ export class BrowserHost implements BrowserAutomationPort {
         argumentSchema: browserFrozenArgumentSchema(entry.path),
         unsupportedOn: browserFrozenUnsupportedSurfaceKinds(entry.path),
       }));
-    return toolJson({ version: browserFrozenContractVersion, surface: 'built_in', count: entries.length, entries });
+    const native = !group || ['cua', 'cua-browser', 'browser'].includes(group) ? await this.cua.catalog(query) : toolJson({ engine: 'CUA', methods: [] });
+    const catalog = JSON.parse(native.contentItems[0].type === 'inputText' ? native.contentItems[0].text : '{}') as Record<string, unknown>;
+    return toolJson({ ...catalog, surface: 'built_in', hostMethods: entries });
   }
 
   private releaseAdvancedHandles(input: BrowserAutomationToolCall): ReturnType<typeof toolJson> {
@@ -1601,6 +1913,7 @@ export class BrowserHost implements BrowserAutomationPort {
     success: boolean;
   }> {
     const path = requireNonEmptyString(input.arguments.path, 'path');
+    if (!isHostBrowserMethod(path)) return toolText('内置浏览器的页面自动化已使用 CUA；请从 catalog 读取当前 CUA 方法，不调用旧的 Playwright/AX/DOM CUA 接口。', false);
     const contract = browserFrozenContractEntry(path);
     if (!contract) return toolText(`Method path is not in Browser ${browserFrozenContractVersion}: ${path}`, false);
     this.expireAdvancedHandlesOutsideTurn(input.conversationId, input.turnId);
@@ -1733,7 +2046,7 @@ export class BrowserHost implements BrowserAutomationPort {
       case 'Tabs.new': {
         const url = optionalString(args.url) ? normalizeBrowserUrl(requireNonEmptyString(args.url, 'url')) : 'about:blank';
         if (url !== 'about:blank') this.assertAgentUrlAllowed(url);
-        const snapshot = await this.openTab(this.preferredWindow(input.conversationId), { conversationId: input.conversationId, url });
+        const snapshot = await this.openConversationResource(this.preferredWindow(input.conversationId), { conversationId: input.conversationId, url });
         const tab = this.requireConversationTab(input.conversationId, snapshot.activeTabId!);
         if (url !== 'about:blank') await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
         return toolJson(this.createAdvancedHandle(input, 'Tab', tab));
@@ -1743,7 +2056,7 @@ export class BrowserHost implements BrowserAutomationPort {
       }
       case 'Documentation.get': {
         const requestedPath = optionalString(args.name);
-        const entries = requestedPath ? browserFrozenContractEntries.filter((entry) => entry.path === requestedPath) : browserFrozenContractEntries;
+        const entries = browserFrozenContractEntries.filter((entry) => isHostBrowserMethod(entry.path) && (!requestedPath || entry.path === requestedPath));
         return toolJson({
           version: browserFrozenContractVersion,
           entries: entries.map((entry) => ({ ...entry, argumentSchema: browserFrozenArgumentSchema(entry.path), unsupportedOn: browserFrozenUnsupportedSurfaceKinds(entry.path) })),
@@ -1766,13 +2079,9 @@ export class BrowserHost implements BrowserAutomationPort {
   ): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
     const path = contract.path;
     const apiProperties: Record<string, string> = {
-      'Tab.ax': 'AXAPI',
       'Tab.clipboard': 'TabClipboardAPI',
       'Tab.content': 'ContentAPI',
-      'Tab.cua': 'CUAAPI',
       'Tab.dev': 'TabDevAPI',
-      'Tab.dom_cua': 'DomCUAAPI',
-      'Tab.playwright': 'PlaywrightAPI',
     };
     if (apiProperties[path]) return toolJson(this.createAdvancedHandle(input, apiProperties[path]!, tab));
     if (path === 'Tab.capabilities') return toolJson(this.createAdvancedHandle(input, 'TabCapabilityCollection', tab));
@@ -1808,15 +2117,7 @@ export class BrowserHost implements BrowserAutomationPort {
       this.emitOpenRequested(input.conversationId);
       return toolJson({ tabId: tab.snapshot.id, state: path.split('.')[1], userVisible: true });
     }
-    if (path.startsWith('AXAPI.')) return this.invokeAdvancedAx(input, path.slice('AXAPI.'.length), tab, args);
-    if (path.startsWith('CUAAPI.')) return this.invokeAdvancedCua(input, path.slice('CUAAPI.'.length), tab, args);
-    if (path.startsWith('DomCUAAPI.')) return this.invokeAdvancedDomCua(input, path.slice('DomCUAAPI.'.length), tab, args);
     if (path.startsWith('ContentAPI.')) return this.invokeAdvancedContent(path.slice('ContentAPI.'.length), tab, args);
-    if (path.startsWith('PlaywrightAPI.')) return this.invokeAdvancedPlaywright(input, path.slice('PlaywrightAPI.'.length), tab, args);
-    if (path.startsWith('PlaywrightFrameLocator.')) return this.invokeAdvancedFrameLocator(input, path.slice('PlaywrightFrameLocator.'.length), handle, tab, args);
-    if (path.startsWith('PlaywrightLocator.')) return this.invokeAdvancedLocator(input, path.slice('PlaywrightLocator.'.length), handle, tab, args);
-    if (path.startsWith('PlaywrightDownload.')) return this.invokeAdvancedDownload(handle);
-    if (path.startsWith('PlaywrightFileChooser.')) return this.invokeAdvancedFileChooser(input, path.slice('PlaywrightFileChooser.'.length), handle, tab, args);
     if (path.startsWith('TabClipboardAPI.')) return this.invokeAdvancedTabClipboard(input, path.slice('TabClipboardAPI.'.length), args);
     if (path === 'TabDevAPI.logs') {
       const levels = Array.isArray(args.levels) ? new Set(args.levels.filter((value): value is string => typeof value === 'string').map((value) => (value === 'warning' ? 'warn' : value))) : null;
@@ -1836,150 +2137,6 @@ export class BrowserHost implements BrowserAutomationPort {
     if (path.startsWith('ViewportBrowserCapability.')) return this.invokeViewport(path.slice('ViewportBrowserCapability.'.length), tab, args);
     if (/^(AlertDialog|BeforeUnloadDialog|ConfirmDialog|PromptDialog)\./u.test(path)) return this.invokeAdvancedJsDialog(path, handle, tab, args);
     return toolText(`Frozen Browser method is registered but has no built-in adapter: ${path}`, false);
-  }
-
-  private async invokeAdvancedAx(input: BrowserAutomationToolCall, method: string, tab: LiveBrowserTab, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (method === 'get' || method === 'write') {
-      const mode = optionalString(args.mode) ?? 'state';
-      if (mode === 'screenshot') return this.captureAdvancedTabScreenshot(tab, {});
-      const state = await this.pageSnapshot(tab, boundedInteger(asRecord(args.options).maxElements, 400, 1, 1000));
-      if (mode === 'both') {
-        const screenshot = await this.captureAdvancedTabScreenshot(tab, {});
-        return { contentItems: [{ type: 'inputText', text: JSON.stringify(state, null, 2) }, ...screenshot.contentItems], success: screenshot.success };
-      }
-      return toolJson(state);
-    }
-    if (method === 'pressKey') return this.invokePressTool(tab, requireNonEmptyString(args.key, 'key'));
-    if (method === 'scroll') {
-      const direction = requireNonEmptyString(args.direction, 'direction').toLocaleLowerCase();
-      const amount = Math.max(0.1, Math.min(finiteNumber(args.pages, 1), 100)) * 600;
-      const deltaX = direction === 'left' || direction === 'l' ? -amount : direction === 'right' || direction === 'r' ? amount : 0;
-      const deltaY = direction === 'up' || direction === 'u' ? -amount : direction === 'down' || direction === 'd' ? amount : 0;
-      if (Array.isArray(args.target)) {
-        const point = requireViewportPoint(args.target, 'target');
-        this.ensureView(tab).webContents.sendInputEvent({ type: 'mouseWheel', x: Math.round(point.x), y: Math.round(point.y), deltaX, deltaY, canScroll: true });
-        return toolJson({ scrolled: true, target: point, deltaX, deltaY });
-      }
-      return this.invokeScrollTool(tab, { target: advancedTarget(args), x: deltaX, y: deltaY });
-    }
-    if (method === 'drag') {
-      const from = requireViewportPoint(args.from, 'from');
-      const to = requireViewportPoint(args.to, 'to');
-      return this.invokeAdvancedCua(input, 'drag', tab, { path: [from, to] });
-    }
-    if (method === 'typeText') {
-      const target = (await this.ensureView(tab).webContents.executeJavaScript(`(${activeElementSelectorScript})()`, true)) as string;
-      return this.invokeTypeTool({ ...input, arguments: { target, text: requireString(args.text, 'text'), replace: false } }, tab);
-    }
-    const target = advancedTarget(args);
-    if (method === 'click') {
-      return this.invokeClickTool(
-        {
-          ...input,
-          arguments: { target, mouse_button: optionalString(args.mouseButton) ?? 'left', click_count: boundedInteger(args.clickCount, 1, 1, 3) },
-        },
-        tab,
-      );
-    }
-    if (method === 'performSecondaryAction') {
-      const result = await this.ensureView(tab).webContents.executeJavaScript(
-        `(${performElementSecondaryActionScript})(${JSON.stringify(this.resolveTarget(tab, target))}, ${JSON.stringify(requireNonEmptyString(args.action, 'action'))})`,
-        true,
-      );
-      return toolJson(result);
-    }
-    if (method === 'setValue') return this.invokeTypeTool({ ...input, arguments: { target, text: requireString(args.value, 'value'), replace: true } }, tab);
-    if (method === 'selectText') {
-      const result = await this.ensureView(tab).webContents.executeJavaScript(
-        `(${selectElementTextScript})(${JSON.stringify(this.resolveTarget(tab, target))}, ${JSON.stringify(requireString(args.text, 'text'))}, ${JSON.stringify(optionalString(args.prefix) ?? '')}, ${JSON.stringify(optionalString(args.suffix) ?? '')}, ${JSON.stringify(optionalString(args.selectionType) ?? 'text')})`,
-        true,
-      );
-      return toolJson(result);
-    }
-    return toolText(`Unsupported AX operation: ${method}`, false);
-  }
-
-  private async invokeAdvancedCua(input: BrowserAutomationToolCall, method: string, tab: LiveBrowserTab, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    const webContents = this.ensureView(tab).webContents;
-    const modifiers = inputEventModifiers(args.keypress ?? args.keys);
-    if (method === 'keypress') return this.invokePressTool(tab, requireKeyCombination(args.keys ?? args.key));
-    if (method === 'scroll') {
-      webContents.sendInputEvent({
-        type: 'mouseWheel',
-        x: Math.round(finiteNumber(args.x, 0)),
-        y: Math.round(finiteNumber(args.y, 0)),
-        deltaX: finiteNumber(args.scrollX ?? args.deltaX, 0),
-        deltaY: finiteNumber(args.scrollY ?? args.deltaY, 0),
-        canScroll: true,
-        modifiers,
-      });
-      return toolJson({ scrolled: true, x: args.scrollX ?? args.deltaX ?? 0, y: args.scrollY ?? args.deltaY ?? 0 });
-    }
-    if (method === 'type') {
-      const target = optionalString(args.target) ?? (await webContents.executeJavaScript(`(${activeElementSelectorScript})()`, true));
-      return this.invokeTypeTool({ ...input, arguments: { target, text: requireString(args.text, 'text'), replace: false } }, tab);
-    }
-    if (method === 'downloadMedia') {
-      const url = (await webContents.executeJavaScript(`(${mediaUrlAtPointScript})(${JSON.stringify(finiteNumber(args.x, 0))}, ${JSON.stringify(finiteNumber(args.y, 0))})`, true)) as string;
-      webContents.downloadURL(normalizeBrowserUrl(url));
-      return toolJson({ started: true, url });
-    }
-    const path = Array.isArray(args.path) ? args.path.filter(isPlainRecord) : [];
-    const firstPoint = path[0] ?? {};
-    const lastPoint = path.at(-1) ?? {};
-    const startX = finiteNumber(args.x ?? args.startX ?? firstPoint.x, 0);
-    const startY = finiteNumber(args.y ?? args.startY ?? firstPoint.y, 0);
-    const endX = finiteNumber(args.endX ?? lastPoint.x, startX);
-    const endY = finiteNumber(args.endY ?? lastPoint.y, startY);
-    const button = Number(args.button) === 3 ? 'right' : Number(args.button) === 2 ? 'middle' : 'left';
-    if (method === 'move') {
-      webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(startX), y: Math.round(startY), movementX: 0, movementY: 0, modifiers });
-      return toolJson({ moved: true, x: startX, y: startY });
-    }
-    if (method === 'drag') {
-      webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(startX), y: Math.round(startY), button, clickCount: 1, modifiers });
-      const points = path.length >= 2 ? path.slice(1) : Array.from({ length: 12 }, (_value, index) => ({ x: startX + ((endX - startX) * (index + 1)) / 12, y: startY + ((endY - startY) * (index + 1)) / 12 }));
-      for (const point of points) {
-        const x = Math.round(finiteNumber(point.x, endX));
-        const y = Math.round(finiteNumber(point.y, endY));
-        webContents.sendInputEvent({ type: 'mouseMove', x, y, button, movementX: 0, movementY: 0, modifiers });
-      }
-      webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(endX), y: Math.round(endY), button, clickCount: 1, modifiers });
-      return toolJson({ dragged: true, start: { x: startX, y: startY }, end: { x: endX, y: endY } });
-    }
-    if (method === 'click' || method === 'double_click') {
-      // 只确认坐标处存在目标，不再按按钮类型或名称阻断操作。
-      const targetExists = await webContents.executeJavaScript(`Boolean(document.elementFromPoint(${JSON.stringify(startX)}, ${JSON.stringify(startY)}))`, true);
-      if (!targetExists) return toolText('ZEUS_BROWSER_COORDINATE_TARGET_MISSING: No element exists at the requested viewport coordinate.', false);
-      const clickCount = method === 'double_click' ? 2 : 1;
-      webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(startX), y: Math.round(startY), button, clickCount, modifiers });
-      webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(startX), y: Math.round(startY), button, clickCount, modifiers });
-      return toolJson({ clicked: true, x: startX, y: startY, clickCount });
-    }
-    return toolText(`Unsupported CUA operation: ${method}`, false);
-  }
-
-  private async invokeAdvancedDomCua(input: BrowserAutomationToolCall, method: string, tab: LiveBrowserTab, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (method === 'get_visible_dom') return toolJson(await this.pageSnapshot(tab, boundedInteger(args.maxElements, 400, 1, 1000)));
-    if (method === 'type') {
-      const target = (await this.ensureView(tab).webContents.executeJavaScript(`(${activeElementSelectorScript})()`, true)) as string;
-      return this.invokeTypeTool({ ...input, arguments: { target, text: requireString(args.text, 'text'), replace: false } }, tab);
-    }
-    if (method === 'keypress') return this.invokePressTool(tab, requireKeyCombination(args.keys ?? args.key));
-    if (method === 'scroll' && !optionalString(args.node_id)) return this.invokeScrollTool(tab, { x: args.x, y: args.y });
-    const target = advancedTarget({ ...args, target: args.node_id ?? args.target });
-    if (method === 'click') return this.invokeClickTool({ ...input, arguments: { target } }, tab);
-    if (method === 'double_click') {
-      await this.invokeClickTool({ ...input, arguments: { target } }, tab);
-      return this.invokeClickTool({ ...input, arguments: { target } }, tab);
-    }
-    if (method === 'scroll') return this.invokeScrollTool(tab, { target, x: args.x, y: args.y });
-    if (method === 'downloadMedia') {
-      const url = normalizeBrowserUrl((await this.ensureView(tab).webContents.executeJavaScript(`(${mediaUrlForTargetScript})(${JSON.stringify(this.resolveTarget(tab, target))})`, true)) as string);
-      this.ensureView(tab).webContents.downloadURL(url);
-      return toolJson({ started: true, url });
-    }
-    return toolText(`Unsupported DOM CUA operation: ${method}`, false);
   }
 
   private async invokeAdvancedContent(method: string, tab: LiveBrowserTab, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
@@ -2065,174 +2222,6 @@ export class BrowserHost implements BrowserAutomationPort {
     return path;
   }
 
-  private async invokeAdvancedPlaywright(input: BrowserAutomationToolCall, method: string, tab: LiveBrowserTab, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (method === 'domSnapshot') return toolJson(await this.pageSnapshot(tab, boundedInteger(args.maxElements, 400, 1, 1000)));
-    if (method === 'elementInfo') {
-      const info = await this.ensureView(tab).webContents.executeJavaScript(`(${elementsAtPointScript})(${JSON.stringify(finiteNumber(args.x, 0))}, ${JSON.stringify(finiteNumber(args.y, 0))})`, true);
-      return toolJson(info);
-    }
-    if (method === 'elementScreenshot') {
-      const matches = (await this.ensureView(tab).webContents.executeJavaScript(`(${elementsAtPointScript})(${JSON.stringify(finiteNumber(args.x, 0))}, ${JSON.stringify(finiteNumber(args.y, 0))})`, true)) as Array<{ rect?: Rectangle }>;
-      const rect = matches[0]?.rect;
-      if (!rect) return toolText('ZEUS_BROWSER_ELEMENT_NOT_FOUND: no visible element exists at the requested point.', false);
-      const image = await this.ensureView(tab).webContents.capturePage(rect);
-      const artifactPath = await this.writeBrowserExport('element-screenshot.png', image.toPNG());
-      return {
-        contentItems: [
-          { type: 'inputText', text: JSON.stringify({ artifactPath, mimeType: 'image/png', rect }) },
-          { type: 'inputImage', imageUrl: image.toDataURL() },
-        ],
-        success: true,
-      };
-    }
-    if (method === 'evaluate') {
-      const expression = advancedExpression(args.pageFunction ?? args.expression).slice(0, 200_000);
-      return toolJson(await this.ensureView(tab).webContents.executeJavaScript(`(${evaluatePageFunctionScript})(${JSON.stringify(expression)}, ${JSON.stringify(args.arg ?? null)})`, true));
-    }
-    if (method === 'waitForTimeout') return this.invokeWaitTool(tab, { timeoutMs: args.timeoutMs ?? args.timeout });
-    if (method === 'expectNavigation') {
-      const action = asRecord(args.action);
-      if (action.path === 'PlaywrightAPI.expectNavigation') return toolText('expectNavigation cannot recursively invoke itself.', false);
-      const result = await this.invokeAdvancedTool({
-        ...input,
-        arguments: {
-          surface: 'built_in',
-          path: requireNonEmptyString(action.path, 'action.path'),
-          ...(optionalString(action.handle) ? { handle: optionalString(action.handle) } : {}),
-          arguments: isPlainRecord(action.arguments) ? action.arguments : {},
-        },
-      });
-      if (!result.success) return result;
-      await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
-      return result;
-    }
-    if (method === 'waitForLoadState') {
-      await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
-      return toolJson({ loaded: true, url: tab.snapshot.url, documentGeneration: tab.documentGeneration });
-    }
-    if (method === 'waitForURL') {
-      const expected = requireNonEmptyString(args.url ?? args.pattern, 'url');
-      const timeoutMs = boundedInteger(args.timeoutMs, 30_000, 0, 30_000);
-      const startedAt = Date.now();
-      while (Date.now() - startedAt <= timeoutMs) {
-        if (urlMatches(tab.snapshot.url, expected)) return toolJson({ matched: true, url: tab.snapshot.url });
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-      }
-      return toolText(`Timed out waiting for URL: ${expected}`, false);
-    }
-    if (method === 'waitForEvent') {
-      const eventName = requireNonEmptyString(args.event, 'event');
-      const timeoutMs = boundedInteger(args.timeoutMs, 30_000, 0, 120_000);
-      if (eventName === 'download') {
-        const startedAt = Date.now();
-        while (Date.now() - startedAt <= timeoutMs) {
-          const download = [...this.downloads].reverse().find((candidate) => candidate.tabId === tab.snapshot.id && Date.parse(candidate.createdAt) >= startedAt);
-          if (download) return toolJson(this.createAdvancedHandle(input, 'PlaywrightDownload', tab, { download }));
-          await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-        }
-        return toolText('ZEUS_BROWSER_WAIT_TIMEOUT: Timed out waiting for a new download.', false);
-      }
-      if (eventName === 'filechooser') {
-        const debuggerApi = await this.ensureCdpMonitor(tab);
-        await debuggerApi.sendCommand('Page.enable');
-        await debuggerApi.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true });
-        const afterSequence = this.cdpSequence;
-        const event = await this.waitForCdpEvent(tab, 'Page.fileChooserOpened', afterSequence, timeoutMs);
-        if (!event) {
-          await debuggerApi.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => undefined);
-          return toolText('ZEUS_BROWSER_WAIT_TIMEOUT: Timed out waiting for a file chooser.', false);
-        }
-        return toolJson(
-          this.createAdvancedHandle(input, 'PlaywrightFileChooser', tab, {
-            backendNodeId: event.params?.backendNodeId,
-            frameId: event.params?.frameId,
-          }),
-        );
-      }
-      return toolText(`Unsupported Playwright event: ${eventName}`, false);
-    }
-    if (method === 'frameLocator') return toolJson(this.createAdvancedHandle(input, 'PlaywrightFrameLocator', tab, { query: locatorQuery('css', requireNonEmptyString(args.frameSelector ?? args.selector, 'frameSelector')) }));
-    if (['locator', 'getByLabel', 'getByPlaceholder', 'getByRole', 'getByTestId', 'getByText'].includes(method)) {
-      return toolJson(this.createAdvancedHandle(input, 'PlaywrightLocator', tab, { query: queryForLocatorMethod(method, args) }));
-    }
-    return toolText(`Unsupported Playwright operation: ${method}`, false);
-  }
-
-  private async invokeAdvancedFrameLocator(
-    input: BrowserAutomationToolCall,
-    method: string,
-    handle: AdvancedBrowserHandle | undefined,
-    tab: LiveBrowserTab,
-    args: Record<string, unknown>,
-  ): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (!handle || handle.kind !== 'PlaywrightFrameLocator') return toolText('PlaywrightFrameLocator requires a matching handle.', false);
-    const frame = asRecord(handle.payload?.query);
-    const query = queryForLocatorMethod(method === 'frameLocator' ? 'locator' : method, args);
-    return toolJson(this.createAdvancedHandle(input, method === 'frameLocator' ? 'PlaywrightFrameLocator' : 'PlaywrightLocator', tab, { query: { ...query, frame } }));
-  }
-
-  private async invokeAdvancedLocator(
-    input: BrowserAutomationToolCall,
-    method: string,
-    handle: AdvancedBrowserHandle | undefined,
-    tab: LiveBrowserTab,
-    args: Record<string, unknown>,
-  ): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (!handle || handle.kind !== 'PlaywrightLocator') return toolText('PlaywrightLocator requires a matching handle.', false);
-    const query = asRecord(handle.payload?.query);
-    if (['first', 'last', 'nth', 'filter', 'locator', 'getByLabel', 'getByPlaceholder', 'getByRole', 'getByTestId', 'getByText', 'and', 'or'].includes(method)) {
-      const next = evolveLocatorQuery(query, method, args, this.advancedHandles);
-      return toolJson(this.createAdvancedHandle(input, 'PlaywrightLocator', tab, { query: next }));
-    }
-    if (method === 'all') {
-      const count = Number(await this.runLocatorOperation(tab, query, 'count', {}));
-      return toolJson(Array.from({ length: count }, (_value, index) => this.createAdvancedHandle(input, 'PlaywrightLocator', tab, { query: { ...query, index } })));
-    }
-    if (method === 'downloadMedia') {
-      const url = await this.runLocatorOperation(tab, query, 'mediaUrl', {});
-      if (typeof url !== 'string' || !url) return toolText('The locator does not expose a downloadable URL.', false);
-      this.ensureView(tab).webContents.downloadURL(normalizeBrowserUrl(url));
-      return toolJson({ started: true, url });
-    }
-    if (method === 'evaluate' || method === 'evaluateAll') {
-      const expression = advancedExpression(args.pageFunction ?? args.expression).slice(0, 200_000);
-      return toolJson(await this.runLocatorOperation(tab, query, method, { expression, argument: args.arg ?? args.argument }));
-    }
-    const operationArgs = method === 'press' ? { ...args, key: args.value } : method === 'pressSequentially' || method === 'type' ? { ...args, text: args.value } : args;
-    const result = await this.runLocatorOperation(tab, query, method, operationArgs);
-    return toolJson(result);
-  }
-
-  private invokeAdvancedDownload(handle: AdvancedBrowserHandle | undefined): ReturnType<typeof toolJson> | ReturnType<typeof toolText> {
-    if (!handle || handle.kind !== 'PlaywrightDownload') return toolText('PlaywrightDownload requires a matching handle.', false);
-    const download = handle.payload?.download;
-    return toolJson(isPlainRecord(download) ? (download.path ?? null) : null);
-  }
-
-  private async invokeAdvancedFileChooser(
-    input: BrowserAutomationToolCall,
-    method: string,
-    handle: AdvancedBrowserHandle | undefined,
-    tab: LiveBrowserTab,
-    args: Record<string, unknown>,
-  ): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
-    if (!handle || handle.kind !== 'PlaywrightFileChooser') return toolText('PlaywrightFileChooser requires a matching handle.', false);
-    const backendNodeId = finiteNumber(handle.payload?.backendNodeId, 0);
-    if (!backendNodeId) return toolText('ZEUS_BROWSER_FILE_INPUT_STALE: The intercepted file input is no longer available.', false);
-    if (method === 'isMultiple') {
-      const debuggerApi = await this.ensureCdpMonitor(tab);
-      const description = (await debuggerApi.sendCommand('DOM.describeNode', { backendNodeId })) as { node?: { attributes?: string[] } };
-      const attributes = description.node?.attributes ?? [];
-      return toolJson(attributes.some((value, index) => index % 2 === 0 && value === 'multiple'));
-    }
-    const result = await dialog.showOpenDialog(this.preferredWindow(input.conversationId), { properties: ['openFile', 'multiSelections'] });
-    if (result.canceled || result.filePaths.length === 0) return toolText('The user did not select a file.', false);
-    const debuggerApi = await this.ensureCdpMonitor(tab);
-    await debuggerApi.sendCommand('DOM.setFileInputFiles', { backendNodeId, files: result.filePaths });
-    await debuggerApi.sendCommand('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => undefined);
-    return toolJson({ selected: result.filePaths.map((path) => basename(path)), count: result.filePaths.length, suppliedArguments: Array.isArray(args.files) ? args.files.length : 0 });
-  }
-
   private async invokeAdvancedTabClipboard(input: BrowserAutomationToolCall, method: string, args: Record<string, unknown>): Promise<{ contentItems: BrowserAutomationContentItem[]; success: boolean }> {
     if (method === 'readText') return toolJson(clipboard.readText());
     if (method === 'read') {
@@ -2315,6 +2304,7 @@ export class BrowserHost implements BrowserAutomationPort {
         if (eventMethod === 'Page.javascriptDialogOpening') {
           const type = normalizeJsDialogType(parameters.type);
           this.activeJsDialogs.set(tab.snapshot.id, {
+            parameters,
             type,
             kind: jsDialogHandleKind(type),
             message: optionalString(parameters.message) ?? '',
@@ -2508,6 +2498,10 @@ export class BrowserHost implements BrowserAutomationPort {
     if (secure.status !== 'submitted') return toolJson({ status: secure.status, ...(secure.selectedOption ? { selected_option: secure.selectedOption } : {}) });
     if (tab.documentGeneration !== generation || safeOrigin(tab.snapshot.url) !== requestedOrigin) return toolJson({ status: 'page_changed' });
     try {
+      for (const field of fields) {
+        const value = typeof field.id === 'string' ? secure.values[field.id] : undefined;
+        if (secureHtmlInputType(field.type) === 'password' && value) (tab.passwordValues ??= new Set()).add(value);
+      }
       if (secure.selectedOption) {
         const selected = options.find((option) => option.id === secure.selectedOption);
         const selector = this.browserAuthSelector(input, selected?.selector);
@@ -2537,7 +2531,10 @@ export class BrowserHost implements BrowserAutomationPort {
       const submit = isPlainRecord(args.submit) ? args.submit : {};
       const submitSelector = this.browserAuthSelector(input, submit.selector);
       if (submitSelector && submit.action === 'click') await this.ensureView(tab).webContents.executeJavaScript(`document.querySelector(${JSON.stringify(submitSelector)})?.click()`, true);
-      else if (submitSelector && submit.action === 'press_enter') await this.invokePressTool(tab, 'Enter');
+      else if (submitSelector && submit.action === 'press_enter') {
+        const submitted = await this.cua.invoke({ ...input, tool: 'press', arguments: { tabId: tab.snapshot.id, key: 'Enter' } }, this.cuaSurface(tab));
+        if (!submitted.success) return toolJson({ status: 'submission_unconfirmed', details: submitted.contentItems });
+      }
       return toolJson({ status: 'submitted', ...(secure.selectedOption ? { selected_option: secure.selectedOption } : {}) });
     } finally {
       for (const key of Object.keys(secure.values)) secure.values[key] = '';
@@ -2580,8 +2577,8 @@ export class BrowserHost implements BrowserAutomationPort {
     authWindow.webContents.on('will-navigate', (event) => event.preventDefault());
     const safeFields = fields.map((field) => ({ id: String(field.id ?? ''), label: String(field.label ?? field.id ?? 'Credential').slice(0, 100), type: secureHtmlInputType(field.type), required: field.required === true }));
     const safeOptions = options.map((option) => ({ id: String(option.id ?? ''), label: String(option.label ?? option.id ?? 'Option').slice(0, 100) }));
-    const configuration = JSON.stringify({ origin, fields: safeFields, options: safeOptions, channel, token }).replaceAll('<', '\\u003c');
-    const html = `<!doctype html><html lang="${this.options.language?.() ?? 'zh-CN'}"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><style>body{font:14px -apple-system,sans-serif;margin:0;background:#11151b;color:#f5f7f6}main{padding:24px}h1{font-size:20px;margin:0 0 6px}p{color:#aeb8b5;margin:0 0 18px;word-break:break-all}label{display:block;margin:12px 0 5px}input[type=text],input[type=email],input[type=tel],input[type=password]{box-sizing:border-box;width:100%;padding:10px;border:1px solid #39433f;border-radius:8px;background:#1b2229;color:#fff}.option{display:flex;gap:8px;align-items:center}.actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}button{padding:9px 15px;border-radius:8px;border:1px solid #44514d;background:#252e35;color:#fff}button.primary{background:#55bda1;color:#07120f;border-color:#55bda1}</style></head><body><main><h1>${this.text('通过 Zeus 登录', 'Sign in with Zeus')}</h1><p id="origin"></p><form id="form"><div id="options"></div><div id="fields"></div><div class="actions"><button type="button" id="cancel">${this.text('取消', 'Cancel')}</button><button class="primary" type="submit">${this.text('继续', 'Continue')}</button></div></form></main><script>const {ipcRenderer}=require('electron');const config=${configuration};document.getElementById('origin').textContent=config.origin;const options=document.getElementById('options');for(const option of config.options){const label=document.createElement('label');label.className='option';const input=document.createElement('input');input.type='radio';input.name='selectedOption';input.value=option.id;label.append(input,document.createTextNode(option.label));options.append(label)}const fields=document.getElementById('fields');for(const field of config.fields){const label=document.createElement('label');label.textContent=field.label;const input=document.createElement('input');input.type=field.type;input.name=field.id;input.required=field.required;input.autocomplete='off';label.append(input);fields.append(label)}const finish=(status)=>{const values={};for(const field of config.fields){const input=document.querySelector('[name="'+CSS.escape(field.id)+'"]');values[field.id]=input?.value||'';if(input)input.value=''}const selectedOption=document.querySelector('[name=selectedOption]:checked')?.value;ipcRenderer.send(config.channel,{token:config.token,status,values,selectedOption})};document.getElementById('cancel').onclick=()=>finish('cancelled');document.getElementById('form').onsubmit=(event)=>{event.preventDefault();finish('submitted')}</script></body></html>`;
+
+    const html = browserCredentialPromptHtml({ origin, fields: safeFields, options: safeOptions, channel, token }, this.options.language?.());
     return new Promise((resolveCredentials) => {
       let resolved = false;
       const finish = (value: { status: 'submitted' | 'cancelled'; values: Record<string, string>; selectedOption?: string }) => {
@@ -2603,10 +2600,6 @@ export class BrowserHost implements BrowserAutomationPort {
       authWindow.once('closed', () => finish({ status: 'cancelled', values: {} }));
       void authWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).then(() => authWindow.show());
     });
-  }
-
-  private async runLocatorOperation(tab: LiveBrowserTab, query: Record<string, unknown>, operation: string, args: Record<string, unknown>): Promise<unknown> {
-    return this.ensureView(tab).webContents.executeJavaScript(`(${advancedLocatorOperationScript})(${JSON.stringify(query)}, ${JSON.stringify(operation)}, ${JSON.stringify(args)})`, true);
   }
 
   private createAdvancedHandle(input: BrowserAutomationToolCall, kind: string, tab?: LiveBrowserTab, payload?: Record<string, unknown>): Record<string, unknown> {
@@ -2939,10 +2932,18 @@ export class BrowserHost implements BrowserAutomationPort {
         const snapshot = await this.openTab(window, { conversationId: input.conversationId, url });
         tab = this.requireConversationTab(input.conversationId, snapshot.activeTabId!);
         await this.waitForTabReady(tab, timeoutMs);
-        const content =
-          contentType === 'domSnapshot'
-            ? JSON.stringify(await this.pageSnapshot(tab, 400))
-            : ((await this.ensureView(tab).webContents.executeJavaScript(contentType === 'html' ? 'document.documentElement.outerHTML' : 'document.body?.innerText || ""', true)) as string);
+        /** 快照导出只保存 CUA 观察正文；失败结果不能伪装成页面内容。 */
+        let content: string;
+        if (contentType === 'domSnapshot') {
+          const observed = await this.cua.invoke({ ...input, tool: 'snapshot', arguments: { tabId: tab.snapshot.id, maxElements: 300 } }, this.cuaSurface(tab));
+          if (!observed.success) throw new Error('CUA 无法读取当前页面。');
+          content = observed.contentItems
+            .filter((item) => item.type === 'inputText')
+            .map((item) => item.text)
+            .join('\n');
+        } else {
+          content = (await this.ensureView(tab).webContents.executeJavaScript(contentType === 'html' ? 'document.documentElement.outerHTML' : 'document.body?.innerText || ""', true)) as string;
+        }
         results.push({ content: String(content).slice(0, 2_000_000), title: tab.snapshot.title || null, url: tab.snapshot.url || requestedUrl });
       } catch {
         results.push({ content: null, title: tab?.snapshot.title ?? null, url: tab?.snapshot.url ?? requestedUrl });
@@ -3151,6 +3152,7 @@ function normalizeSettings(value: unknown, fallback: ZeusBrowserSettings): ZeusB
   const downloadDirectory = typeof record.downloadDirectory === 'string' && isAbsolute(record.downloadDirectory.trim()) ? resolve(record.downloadDirectory.trim()) : fallback.downloadDirectory;
   return {
     enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
+    translationServiceId: typeof record.translationServiceId === 'string' && record.translationServiceId.length > 0 && record.translationServiceId.length <= 2000 ? record.translationServiceId : fallback.translationServiceId,
     downloadDirectory,
     askWhereToSave: typeof record.askWhereToSave === 'boolean' ? record.askWhereToSave : fallback.askWhereToSave,
     screenshotMode: record.screenshotMode === 'necessary' ? 'necessary' : record.screenshotMode === 'always' ? 'always' : fallback.screenshotMode,
@@ -3286,6 +3288,11 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** 只保留宿主产品能力；页面定位、输入和观察统一由 CUA 提供。 */
+function isHostBrowserMethod(path: string): boolean {
+  return !/^(?:AXAPI|CUAAPI|DomCUAAPI|PlaywrightAPI|PlaywrightFrameLocator|PlaywrightLocator|PlaywrightDownload|PlaywrightFileChooser)\./u.test(path) && !['Tab.ax', 'Tab.cua', 'Tab.dom_cua', 'Tab.playwright'].includes(path);
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -3299,11 +3306,6 @@ function requireNonEmptyString(value: unknown, field: string): string {
   const text = requireString(value, field).trim();
   if (!text) throw new TypeError(`${field} must not be empty.`);
   return text;
-}
-
-function requireKeyCombination(value: unknown): string {
-  if (Array.isArray(value) && value.every((entry) => typeof entry === 'string' && entry.trim())) return value.join('+');
-  return requireNonEmptyString(value, 'keys');
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -3345,21 +3347,6 @@ function toolJson(value: unknown): { contentItems: BrowserAutomationContentItem[
   };
 }
 
-function advancedTarget(args: Record<string, unknown>): string {
-  const explicit = optionalString(args.target) ?? optionalString(args.selector);
-  if (explicit) return explicit;
-  const index = args.elementIndex ?? args.element_index ?? (Number.isSafeInteger(args.target) ? args.target : undefined);
-  if (Number.isSafeInteger(index) && Number(index) >= 0) return `e${Number(index) + 1}`;
-  throw new TypeError('A semantic target, selector, or element index is required.');
-}
-
-function requireViewportPoint(value: unknown, field: string): { x: number; y: number } {
-  if (!Array.isArray(value) || value.length !== 2 || value.some((entry) => typeof entry !== 'number' || !Number.isFinite(entry))) {
-    throw new TypeError(`${field} must be a finite [x, y] viewport point.`);
-  }
-  return { x: value[0] as number, y: value[1] as number };
-}
-
 function browserConsoleLevel(level: number): 'debug' | 'info' | 'warn' | 'error' {
   if (level >= 3) return 'error';
   if (level === 2) return 'warn';
@@ -3367,146 +3354,10 @@ function browserConsoleLevel(level: number): 'debug' | 'info' | 'warn' | 'error'
   return 'debug';
 }
 
-function advancedExpression(value: unknown): string {
-  if (typeof value === 'string' && value.trim()) return value.trim();
-  if (isPlainRecord(value)) return requireNonEmptyString(value.expression ?? value.source, 'pageFunction.expression');
-  throw new TypeError('pageFunction must be a JavaScript source string or an approved expression descriptor.');
-}
-
 function normalizeAdvancedArguments(args: Record<string, unknown>): Record<string, unknown> {
   const options = isPlainRecord(args.options) ? args.options : {};
   return Object.keys(options).length > 0 ? { ...options, ...args } : args;
 }
-
-function urlMatches(actual: string, expected: string): boolean {
-  if (expected.startsWith('/') && expected.endsWith('/') && expected.length > 2) {
-    try {
-      return new RegExp(expected.slice(1, -1), 'u').test(actual);
-    } catch {
-      return false;
-    }
-  }
-  return actual === expected || actual.includes(expected);
-}
-
-function locatorQuery(strategy: string, value: unknown): Record<string, unknown> {
-  return { strategy, value };
-}
-
-function queryForLocatorMethod(method: string, args: Record<string, unknown>): Record<string, unknown> {
-  if (method === 'locator') return locatorQuery('css', requireNonEmptyString(args.selector, 'selector'));
-  if (method === 'getByLabel') return { ...locatorQuery('label', normalizeLocatorMatcher(args.text ?? args.label, 'label')), ...(typeof args.exact === 'boolean' ? { exact: args.exact } : {}) };
-  if (method === 'getByPlaceholder') return { ...locatorQuery('placeholder', normalizeLocatorMatcher(args.text ?? args.placeholder, 'placeholder')), ...(typeof args.exact === 'boolean' ? { exact: args.exact } : {}) };
-  if (method === 'getByRole')
-    return { ...locatorQuery('role', requireNonEmptyString(args.role, 'role')), ...(args.name !== undefined ? { name: normalizeLocatorMatcher(args.name, 'name') } : {}), ...(typeof args.exact === 'boolean' ? { exact: args.exact } : {}) };
-  if (method === 'getByTestId') return locatorQuery('testid', requireNonEmptyString(args.testId ?? args.value, 'testId'));
-  if (method === 'getByText') return { ...locatorQuery('text', normalizeLocatorMatcher(args.text, 'text')), ...(typeof args.exact === 'boolean' ? { exact: args.exact } : {}) };
-  return locatorQuery('css', requireNonEmptyString(args.selector, 'selector'));
-}
-
-function evolveLocatorQuery(query: Record<string, unknown>, method: string, args: Record<string, unknown>, handles: ReadonlyMap<string, AdvancedBrowserHandle>): Record<string, unknown> {
-  if (method === 'first') return { ...query, index: 0 };
-  if (method === 'last') return { ...query, index: -1 };
-  if (method === 'nth') return { ...query, index: boundedInteger(args.index, 0, 0, 100_000) };
-  if (method === 'filter') {
-    const options = isPlainRecord(args.options) ? args.options : args;
-    const has = locatorHandleQuery(options.has, handles, 'has');
-    const hasNot = locatorHandleQuery(options.hasNot, handles, 'hasNot');
-    return {
-      ...query,
-      filter: {
-        ...(options.hasText !== undefined ? { hasText: normalizeLocatorMatcher(options.hasText, 'hasText') } : {}),
-        ...(options.hasNotText !== undefined ? { hasNotText: normalizeLocatorMatcher(options.hasNotText, 'hasNotText') } : {}),
-        ...(has ? { has } : {}),
-        ...(hasNot ? { hasNot } : {}),
-        ...(typeof options.visible === 'boolean' ? { visible: options.visible } : {}),
-      },
-    };
-  }
-  if (method === 'and' || method === 'or') {
-    const otherId = requireNonEmptyString(args.locator ?? args.handle, 'locator');
-    const other = handles.get(otherId);
-    if (!other || other.kind !== 'PlaywrightLocator') throw new TypeError(`${method} requires another live PlaywrightLocator handle.`);
-    return { strategy: 'combine', operator: method, left: query, right: asRecord(other.payload?.query) };
-  }
-  return { ...queryForLocatorMethod(method, args), parent: query };
-}
-
-function locatorHandleQuery(value: unknown, handles: ReadonlyMap<string, AdvancedBrowserHandle>, name: string): Record<string, unknown> | undefined {
-  if (value === undefined) return undefined;
-  const id = requireNonEmptyString(value, name);
-  const handle = handles.get(id);
-  if (!handle || handle.kind !== 'PlaywrightLocator') throw new TypeError(`${name} requires a live PlaywrightLocator handle.`);
-  return asRecord(handle.payload?.query);
-}
-
-function normalizeLocatorMatcher(value: unknown, name: string): string | Record<string, unknown> {
-  if (typeof value === 'string' && value.length > 0) return value;
-  if (isPlainRecord(value) && typeof value.source === 'string' && value.source.length > 0) {
-    return { source: value.source, ...(typeof value.flags === 'string' ? { flags: value.flags } : {}) };
-  }
-  throw new TypeError(`${name} must be a non-empty string or a regular-expression descriptor.`);
-}
-
-function inputEventModifiers(value: unknown): Array<'meta' | 'control' | 'alt' | 'shift'> {
-  if (!Array.isArray(value)) return [];
-  const modifiers = new Set<'meta' | 'control' | 'alt' | 'shift'>();
-  for (const entry of value) {
-    const normalized = String(entry).trim().toLowerCase();
-    if (normalized === 'cmd' || normalized === 'command' || normalized === 'meta') modifiers.add('meta');
-    else if (normalized === 'ctrl' || normalized === 'control') modifiers.add('control');
-    else if (normalized === 'alt' || normalized === 'option') modifiers.add('alt');
-    else if (normalized === 'shift') modifiers.add('shift');
-    else throw new TypeError(`Unsupported input modifier: ${String(entry)}`);
-  }
-  return [...modifiers];
-}
-
-const activeElementSelectorScript = function activeElementSelector() {
-  const element = document.activeElement;
-  if (!(element instanceof Element)) throw new Error('The page has no active element.');
-  if (element.id) return `#${CSS.escape(element.id)}`;
-  const name = element.getAttribute('name');
-  if (name) return `${element.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
-  throw new Error('The active element does not have a stable selector.');
-}.toString();
-
-const selectElementTextScript = function selectElementText(selector: string, requested: string, prefix: string, suffix: string, selectionType: string) {
-  const element = document.querySelector(selector);
-  if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) throw new Error(`Text element not found: ${selector}`);
-  const matches: Array<{ start: number; end: number }> = [];
-  let offset = 0;
-  while (offset <= element.value.length - requested.length) {
-    const start = element.value.indexOf(requested, offset);
-    if (start < 0) break;
-    const end = start + requested.length;
-    if ((!prefix || element.value.slice(0, start).endsWith(prefix)) && (!suffix || element.value.slice(end).startsWith(suffix))) matches.push({ start, end });
-    offset = start + Math.max(1, requested.length);
-  }
-  if (matches.length !== 1) throw new Error(matches.length ? 'The requested text is ambiguous.' : 'The requested text was not found.');
-  const match = matches[0]!;
-  const boundedStart = selectionType === 'cursor_after' ? match.end : match.start;
-  const boundedEnd = selectionType === 'text' ? match.end : boundedStart;
-  element.focus();
-  element.setSelectionRange(boundedStart, boundedEnd);
-  return { selected: selector, start: boundedStart, end: boundedEnd, text: element.value.slice(boundedStart, boundedEnd) };
-}.toString();
-
-const performElementSecondaryActionScript = function performElementSecondaryAction(selector: string, requestedAction: string) {
-  const element = document.querySelector(selector) as HTMLElement | null;
-  if (!element) throw new Error(`Element not found: ${selector}`);
-  const action = requestedAction.toLocaleLowerCase();
-  if (action.includes('show') && action.includes('menu')) {
-    element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
-    return { action: requestedAction, performed: true };
-  }
-  if (action.includes('increment') && element instanceof HTMLInputElement) element.stepUp();
-  else if (action.includes('decrement') && element instanceof HTMLInputElement) element.stepDown();
-  else if (action.includes('press') || action.includes('pick') || action.includes('confirm')) element.click();
-  else throw new Error(`Unsupported accessibility action: ${requestedAction}`);
-  element.dispatchEvent(new Event('change', { bubbles: true }));
-  return { action: requestedAction, performed: true };
-}.toString();
 
 const exportPageContentScript = function exportPageContent(format: string) {
   const text = (document.body?.innerText || '').trim();
@@ -3531,335 +3382,4 @@ const exportYouTubeTranscriptScript = function exportYouTubeTranscript() {
     })
     .filter(Boolean);
   return { title: document.title, url: location.href, text: lines.join('\n') };
-}.toString();
-
-const elementsAtPointScript = function elementsAtPoint(x: number, y: number) {
-  return document
-    .elementsFromPoint(x, y)
-    .slice(0, 20)
-    .map((element) => {
-      const rect = element.getBoundingClientRect();
-      return {
-        tagName: element.tagName,
-        role: element.getAttribute('role') || '',
-        name: element.getAttribute('aria-label') || element.getAttribute('name') || '',
-        text: (element.textContent || '').trim().slice(0, 500),
-        rect: { x: Math.max(0, Math.floor(rect.x)), y: Math.max(0, Math.floor(rect.y)), width: Math.max(1, Math.ceil(rect.width)), height: Math.max(1, Math.ceil(rect.height)) },
-      };
-    });
-}.toString();
-
-const mediaUrlAtPointScript = function mediaUrlAtPoint(x: number, y: number) {
-  const element = document.elementFromPoint(x, y) as (HTMLElement & { currentSrc?: string; src?: string; href?: string }) | null;
-  const candidate = element?.currentSrc || element?.src || element?.href || element?.closest('a')?.href;
-  if (!candidate) throw new Error('The coordinate target does not expose downloadable media.');
-  return new URL(candidate, location.href).href;
-}.toString();
-
-const mediaUrlForTargetScript = function mediaUrlForTarget(selector: string) {
-  const element = document.querySelector(selector) as (HTMLElement & { currentSrc?: string; src?: string; href?: string }) | null;
-  const candidate = element?.currentSrc || element?.src || element?.href || element?.closest('a')?.href;
-  if (!candidate) throw new Error('The semantic target does not expose downloadable media.');
-  return new URL(candidate, location.href).href;
-}.toString();
-
-const evaluatePageFunctionScript = async function evaluatePageFunction(source: string, argument: unknown) {
-  const candidate = (0, eval)(`(${source})`);
-  return typeof candidate === 'function' ? await candidate(argument) : candidate;
-}.toString();
-
-const advancedLocatorOperationScript = async function advancedLocatorOperation(query: Record<string, unknown>, operation: string, args: Record<string, unknown>) {
-  const visible = (element: Element): boolean => {
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-  };
-  const rootFor = (candidate: Record<string, unknown>): ParentNode => {
-    const frame = candidate.frame as Record<string, unknown> | undefined;
-    if (!frame) return document;
-    const frameElement = resolve(frame)[0];
-    return frameElement instanceof HTMLIFrameElement && frameElement.contentDocument ? frameElement.contentDocument : document;
-  };
-  const matches = (actual: string, expected: unknown, exact = false): boolean => {
-    if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
-      const descriptor = expected as Record<string, unknown>;
-      if (typeof descriptor.source !== 'string') return false;
-      try {
-        return new RegExp(descriptor.source, typeof descriptor.flags === 'string' ? descriptor.flags.replace(/[^dgimsuvy]/gu, '') : 'u').test(actual);
-      } catch {
-        return false;
-      }
-    }
-    const value = String(expected ?? '');
-    return exact ? actual === value : actual.includes(value);
-  };
-  const resolve = (candidate: Record<string, unknown>): Element[] => {
-    if (candidate.strategy === 'combine') {
-      const left = resolve(candidate.left as Record<string, unknown>);
-      const right = resolve(candidate.right as Record<string, unknown>);
-      const rightSet = new Set(right);
-      return candidate.operator === 'and' ? left.filter((element) => rightSet.has(element)) : [...new Set([...left, ...right])];
-    }
-    const parent = candidate.parent as Record<string, unknown> | undefined;
-    const roots: ParentNode[] = parent ? resolve(parent) : [rootFor(candidate)];
-    const value = typeof candidate.value === 'string' ? candidate.value : '';
-    const found: Element[] = [];
-    for (const root of roots) {
-      if (candidate.strategy === 'css') found.push(...root.querySelectorAll(value));
-      else if (candidate.strategy === 'placeholder') found.push(...[...root.querySelectorAll('[placeholder]')].filter((element) => matches(element.getAttribute('placeholder') || '', candidate.value, candidate.exact === true)));
-      else if (candidate.strategy === 'testid') found.push(...root.querySelectorAll(`[data-testid="${CSS.escape(value)}"]`));
-      else if (candidate.strategy === 'text') found.push(...[...root.querySelectorAll('body *')].filter((element) => matches((element.textContent || '').trim(), candidate.value, candidate.exact === true)));
-      else if (candidate.strategy === 'role') {
-        found.push(
-          ...[...root.querySelectorAll(`[role="${CSS.escape(value)}"],${value}`)].filter((element) => {
-            return candidate.name === undefined || matches((element.getAttribute('aria-label') || element.textContent || '').trim(), candidate.name, candidate.exact === true);
-          }),
-        );
-      } else if (candidate.strategy === 'label') {
-        for (const label of root.querySelectorAll('label')) {
-          if (!matches((label.textContent || '').trim(), candidate.value, candidate.exact === true)) continue;
-          if ((label as HTMLLabelElement).control) found.push((label as HTMLLabelElement).control!);
-        }
-        found.push(...[...root.querySelectorAll('[aria-label]')].filter((element) => matches(element.getAttribute('aria-label') || '', candidate.value, candidate.exact === true)));
-      }
-    }
-    const filter = candidate.filter as Record<string, unknown> | undefined;
-    let result = [...new Set(found)].filter((element) => {
-      if (!filter) return true;
-      const text = (element.textContent || '').trim();
-      if (filter.hasText !== undefined && !matches(text, filter.hasText)) return false;
-      if (filter.hasNotText !== undefined && matches(text, filter.hasNotText)) return false;
-      if (filter.has && !resolve(filter.has as Record<string, unknown>).some((nested) => nested === element || element.contains(nested))) return false;
-      if (filter.hasNot && resolve(filter.hasNot as Record<string, unknown>).some((nested) => nested === element || element.contains(nested))) return false;
-      if (typeof filter.visible === 'boolean' && visible(element) !== filter.visible) return false;
-      return true;
-    });
-    if (typeof candidate.index === 'number') {
-      const index = candidate.index < 0 ? result.length - 1 : candidate.index;
-      result = result[index] ? [result[index]!] : [];
-    }
-    return result;
-  };
-  const elements = resolve(query);
-  const element = elements[0] as HTMLElement | undefined;
-  const requireElement = (): HTMLElement => {
-    if (!element) throw new Error('Locator did not match an element.');
-    return element;
-  };
-  if (operation === 'count') return elements.length;
-  if (operation === 'allTextContents') return elements.map((candidate) => candidate.textContent || '');
-  if (operation === 'innerText') return requireElement().innerText;
-  if (operation === 'textContent') return requireElement().textContent;
-  if (operation === 'getAttribute') return requireElement().getAttribute(String(args.name ?? ''));
-  if (operation === 'mediaUrl') {
-    const target = requireElement() as HTMLImageElement & HTMLAnchorElement & HTMLMediaElement;
-    const candidate = target.currentSrc || target.src || target.href || target.closest('a')?.href;
-    if (!candidate) throw new Error('The locator does not expose downloadable media.');
-    return new URL(candidate, location.href).href;
-  }
-  if (operation === 'isVisible') return Boolean(element && visible(element));
-  if (operation === 'isEnabled') return Boolean(element && !('disabled' in element && (element as HTMLButtonElement).disabled));
-  if (operation === 'info') {
-    const target = requireElement();
-    const input = target instanceof HTMLInputElement ? target : null;
-    const button = target instanceof HTMLButtonElement ? target : null;
-    const form = input?.form || button?.form || null;
-    return {
-      selector: String(query.value ?? ''),
-      tagName: target.tagName,
-      type: input?.type || target.getAttribute('type') || '',
-      role: target.getAttribute('role') || '',
-      name: target.getAttribute('aria-label') || target.getAttribute('name') || '',
-      text: (target.textContent || '').trim().slice(0, 500),
-      href: target instanceof HTMLAnchorElement ? target.href : '',
-      navigationUrl: target instanceof HTMLAnchorElement ? target.href : form ? input?.formAction || button?.formAction || form.action : '',
-      disabled: 'disabled' in target && Boolean((target as HTMLButtonElement).disabled),
-      editable: target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable,
-      fileInput: input?.type === 'file',
-      submitter: input?.type === 'submit' || input?.type === 'image' || button?.type === 'submit',
-    };
-  }
-  if (operation === 'waitFor') {
-    const timeout = Math.max(0, Math.min(30_000, Number(args.timeoutMs ?? args.timeout ?? 30_000)));
-    const desired = String(args.state ?? 'visible');
-    const startedAt = Date.now();
-    while (Date.now() - startedAt <= timeout) {
-      const matches = resolve(query);
-      if (desired === 'hidden' || desired === 'detached' ? matches.length === 0 || !visible(matches[0]!) : matches.length > 0 && (desired !== 'visible' || visible(matches[0]!))) return { state: desired };
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-    }
-    throw new Error(`Timed out waiting for locator state: ${desired}`);
-  }
-  if (operation === 'evaluate' || operation === 'evaluateAll') {
-    const expression = String(args.expression ?? '');
-    const callable = (0, eval)(`(${expression})`) as (subject: unknown, argument: unknown) => unknown;
-    return callable(operation === 'evaluateAll' ? elements : requireElement(), args.argument);
-  }
-  const target = requireElement();
-  target.scrollIntoView({ block: 'center', inline: 'center' });
-  target.focus({ preventScroll: true });
-  if (operation === 'click' || operation === 'dblclick') {
-    target.click();
-    if (operation === 'dblclick') target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, detail: 2 }));
-    return { clicked: true };
-  }
-  if (operation === 'fill' || operation === 'type' || operation === 'pressSequentially') {
-    const text = String(args.value ?? args.text ?? '');
-    // 登录框可直接填写；读取密码的遮蔽规则与输入能力分开。
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-      /** 调用原生赋值入口，让受框架控制的登录表单能收到后续输入事件。 */
-      const prototype = target instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-      /** 与普通输入工具使用同一赋值语义，避免框架误判为值未变化。 */
-      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-      setter?.call(target, operation === 'type' || operation === 'pressSequentially' ? `${target.value}${text}` : text);
-    } else if (target.isContentEditable) target.textContent = operation === 'type' || operation === 'pressSequentially' ? `${target.textContent || ''}${text}` : text;
-    else throw new Error('Locator is not editable.');
-    target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-    target.dispatchEvent(new Event('change', { bubbles: true }));
-    return { typed: text.length };
-  }
-  if (operation === 'press') {
-    const key = String(args.key ?? '');
-    target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-    target.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
-    return { pressed: key };
-  }
-  if (operation === 'selectOption') {
-    if (!(target instanceof HTMLSelectElement)) throw new Error('Locator is not a select element.');
-    const inputs = Array.isArray(args.value) ? args.value : Array.isArray(args.values) ? args.values : [args.value];
-    const values = inputs.map((entry) => (typeof entry === 'string' ? { value: entry } : entry && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : {}));
-    for (const [index, option] of [...target.options].entries()) option.selected = values.some((value) => value.value === option.value || value.label === option.label || value.index === index);
-    target.dispatchEvent(new Event('input', { bubbles: true }));
-    target.dispatchEvent(new Event('change', { bubbles: true }));
-    return target.selectedOptions.length;
-  }
-  if (operation === 'check' || operation === 'uncheck' || operation === 'setChecked') {
-    if (!(target instanceof HTMLInputElement) || !['checkbox', 'radio'].includes(target.type)) throw new Error('Locator is not checkable.');
-    target.checked = operation === 'check' || (operation === 'setChecked' && args.checked === true);
-    target.dispatchEvent(new Event('input', { bubbles: true }));
-    target.dispatchEvent(new Event('change', { bubbles: true }));
-    return { checked: target.checked };
-  }
-  throw new Error(`Unsupported locator operation: ${operation}`);
-}.toString();
-
-const pageSnapshotScript = function pageSnapshot(maxElements: number) {
-  const selectorFor = (element: Element): string => {
-    if (element.id) return `#${CSS.escape(element.id)}`;
-    for (const attribute of ['data-testid', 'data-test', 'name', 'aria-label']) {
-      const value = element.getAttribute(attribute);
-      if (value) return `${element.tagName.toLowerCase()}[${attribute}="${CSS.escape(value)}"]`;
-    }
-    const parts: string[] = [];
-    let current: Element | null = element;
-    while (current && current !== document.documentElement && parts.length < 8) {
-      let part = current.tagName.toLowerCase();
-      const siblings = current.parentElement ? [...current.parentElement.children].filter((candidate) => candidate.tagName === current!.tagName) : [];
-      if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(current) + 1})`;
-      parts.unshift(part);
-      current = current.parentElement;
-    }
-    return parts.join(' > ');
-  };
-  const candidates = [...document.querySelectorAll('a,button,input,textarea,select,summary,[role],[contenteditable="true"],[tabindex]')];
-  const elements: Array<Record<string, unknown>> = [];
-  for (const element of candidates) {
-    if (elements.length >= maxElements) break;
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
-    const elementRef: string = `e${elements.length + 1}`;
-    elements.push({
-      ref: elementRef,
-      selector: selectorFor(element),
-      tagName: element.tagName,
-      role: element.getAttribute('role') || '',
-      name: element.getAttribute('aria-label') || element.getAttribute('name') || '',
-      text: (element.textContent || '').trim().replace(/\s+/gu, ' ').slice(0, 300),
-      type: element.getAttribute('type') || '',
-      href: element instanceof HTMLAnchorElement ? element.href : '',
-      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-    });
-  }
-  return {
-    title: document.title,
-    url: location.href,
-    text: (document.body?.innerText || '').replace(/\s+/gu, ' ').trim().slice(0, 20_000),
-    elements,
-  };
-}.toString();
-
-const elementInfoScript = function elementInfo(selector: string) {
-  const element = document.querySelector(selector);
-  if (!element) throw new Error(`Element not found: ${selector}`);
-  const input = element instanceof HTMLInputElement ? element : null;
-  const button = element instanceof HTMLButtonElement ? element : null;
-  const form = input?.form || button?.form || null;
-  const navigationUrl = element instanceof HTMLAnchorElement ? element.href : form ? input?.formAction || button?.formAction || form.action : '';
-  const editable = Boolean(input || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement || (element as HTMLElement).isContentEditable);
-  return {
-    selector,
-    tagName: element.tagName,
-    type: input?.type || element.getAttribute('type') || '',
-    role: element.getAttribute('role') || '',
-    name: element.getAttribute('aria-label') || element.getAttribute('name') || '',
-    text: (element.textContent || '').trim().replace(/\s+/gu, ' ').slice(0, 500),
-    href: element instanceof HTMLAnchorElement ? element.href : '',
-    navigationUrl,
-    disabled: 'disabled' in element && Boolean((element as HTMLButtonElement).disabled),
-    editable,
-    fileInput: input?.type === 'file',
-    submitter: input?.type === 'submit' || input?.type === 'image' || button?.type === 'submit',
-  };
-}.toString();
-
-const clickElementScript = function clickElement(selector: string, mouseButton: string, clickCount: number) {
-  const element = document.querySelector(selector) as HTMLElement | null;
-  if (!element) throw new Error(`Element not found: ${selector}`);
-  element.scrollIntoView({ block: 'center', inline: 'center' });
-  element.focus({ preventScroll: true });
-  const button = mouseButton === 'right' || mouseButton === 'r' ? 2 : mouseButton === 'middle' || mouseButton === 'm' ? 1 : 0;
-  if (button === 2) element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button }));
-  else if (button === 1) element.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, cancelable: true, button }));
-  else {
-    element.click();
-    if (clickCount > 1) element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, button: 0, detail: 2 }));
-  }
-  return { clicked: selector, mouseButton, clickCount, url: location.href };
-}.toString();
-
-const typeIntoElementScript = function typeIntoElement(selector: string, text: string, replace: boolean) {
-  const element = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | HTMLElement | null;
-  if (!element) throw new Error(`Element not found: ${selector}`);
-  element.scrollIntoView({ block: 'center', inline: 'center' });
-  element.focus({ preventScroll: true });
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    if (element instanceof HTMLInputElement && element.type === 'file') throw new Error('Automated file uploads are not supported.');
-    const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-    setter?.call(element, replace ? text : `${element.value}${text}`);
-  } else if (element.isContentEditable) {
-    element.textContent = replace ? text : `${element.textContent || ''}${text}`;
-  } else {
-    throw new Error(`Element is not editable: ${selector}`);
-  }
-  element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-  element.dispatchEvent(new Event('change', { bubbles: true }));
-  return { typed: selector, length: text.length };
-}.toString();
-
-const activeElementNavigationScript = function activeElementNavigation() {
-  const element = document.activeElement;
-  const input = element instanceof HTMLInputElement ? element : null;
-  const button = element instanceof HTMLButtonElement ? element : null;
-  const form = input?.form || button?.form || null;
-  return form ? input?.formAction || button?.formAction || form.action : '';
-}.toString();
-
-const scrollScript = function scrollElement(selector: string | null, x: number, y: number) {
-  const target = selector ? document.querySelector(selector) : window;
-  if (!target) throw new Error(`Scroll target not found: ${selector}`);
-  if (target === window) window.scrollBy({ left: x, top: y, behavior: 'auto' });
-  else (target as HTMLElement).scrollBy({ left: x, top: y, behavior: 'auto' });
-  return { target: selector || 'window', x, y, scrollX: window.scrollX, scrollY: window.scrollY };
 }.toString();

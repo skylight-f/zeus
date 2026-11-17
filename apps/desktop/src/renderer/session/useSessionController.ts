@@ -5,7 +5,8 @@ import { attachV2ResourcesToSnapshot } from './conversationResourceProjection.js
 import { asyncMessageQuestions, formatAsyncQuestionAnswer, validateCanonicalRequestUserInputAnswers, type AsyncQuestionAnswer, type AsyncQuestionResponse } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
 import type { ConversationTranscriptEnvelope, ConversationTranscriptPlacementBatch, ConversationNavigationSnapshot } from '@zeus/shared';
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ConversationControllerRetentionContext } from './ConversationWorkspaceCache.js';
 import { mergeBrowserSubmissions, serializeBrowserComments, type ConversationContextDraft, emptyConversationContextDraft, hasConversationContext, serializeConversationContext, type ZeusBrowserPreparedSubmission } from '@zeus/shared';
 import { createInitialSessionState, durableUserMessageIdentity, sessionReducer, sessionTranscriptEntryId } from './sessionReducer.js';
 import {
@@ -52,13 +53,14 @@ import {
   type TurnChangeSetOperationResult,
 } from './sessionTypes.js';
 import { adaptConversationSnapshotV2, mergeConversationHistoryV2, mergeConversationProcessV2, mergeConversationTurnHistoryV2, resumeCachedConversationSnapshot, updateConversationV2Paging } from './conversationSnapshotV2Adapter.js';
-import { markConversationNavigationRenderReady } from '../performanceTraceContext.js';
 import { selectHasConfirmedUserMessage } from './sessionSelectors.js';
 import { handledMessageDeliveryErrors } from './conversationSystemMessages.js';
 import { reportApplicationError } from '../ui/ApplicationErrorDialog.js';
 
-/** 会话事件流按指数退避重试五次，单次等待小于一分钟。 */
+/** 会话前台恢复先退避五次，之后转入低频后台恢复。 */
 export const reconnectBackoffMs = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
+/** 前台恢复预算用尽后只做低频读取，不重放写入，单位毫秒。 */
+const backgroundReconnectDelayMs = 30_000;
 /** 常规只读核对次数；已接收消息阻挡待发队列时继续后台核对，不重放旧消息。 */
 export const pendingSendReconcileAttempts = 5 as const;
 /** 首次后台核对前的等待时间。 */
@@ -71,7 +73,21 @@ const CONVERSATION_SCHEMA_GENERATION = '2026-08-16-unified-conversation-segments
 const CONVERSATION_SYNC_STREAM_GENERATION = 'zeus-conversation-sync-v2' as const;
 export const conversationHydrationTimeoutMs = 20_000;
 export const conversationRealtimeOpenTimeoutMs = 5_000;
+/** 单条消息等待接纳的上限，单位毫秒；超时仅触发只读核对。 */
+export const conversationSendAcceptanceTimeoutMs = 20_000;
 export const conversationGoalHydrationTimeoutMs = 1_000;
+
+/** 接纳超时不能证明消息未执行，原消息继续保留供核对。 */
+class ConversationSendAcceptanceTimeoutError extends Error {
+  /** 送达组件按此错误保留结果未知，而非明确失败。 */
+  readonly code = 'ZEUS_CONVERSATION_SEND_ACCEPTANCE_TIMEOUT';
+
+  /** 提示用户当前等待的是接纳结果。 */
+  constructor() {
+    super('消息接纳未在 20 秒内确认，正在核对发送结果。');
+    this.name = 'ConversationSendAcceptanceTimeoutError';
+  }
+}
 
 class ConversationHydrationTimeoutError extends Error {
   readonly code = 'ZEUS_CONVERSATION_HYDRATION_TIMEOUT';
@@ -390,6 +406,8 @@ export interface CreateSessionControllerOptions {
   realtimePolicy?: 'auto' | 'lazy';
   initialCachedState?: NativeSessionState;
   initialOptimisticState?: NativeSessionState;
+  /** 已选中的持久会话只供首屏展示，交互仍等待最新服务端事实。 */
+  initialConversation?: NativeConversationChoice;
   storage?: SessionDraftStorage;
   createId?: () => string;
   reconnectDelay?: (delayMs: number) => Promise<void>;
@@ -504,7 +522,7 @@ interface PendingSendEnvelope {
   delivery: 'queue' | 'steer_now';
   expectedTurnId?: string;
   model?: string;
-  agentKind?: 'codex' | 'pi';
+  agentKind?: 'codex' | 'pi' | 'copilot';
   effort?: string;
   /** 本次发送冻结的窗口容量。 */
   contextCapacityTokens?: number | null;
@@ -766,6 +784,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let realtimeSubscribed = false;
   let realtimeConnectionPromise: Promise<void> | null = null;
   let connectionToken = 0;
+  /** 同一连接、同一正文水位的渐进快照只触发一次附属信息读取。 */
+  let metadataHydrationConnection = -1;
   /** 连接换代或销毁时取消所有正在读取的恢复上下文。 */
   const transcriptHydrations = new Set<TranscriptHydrationContext>();
   let sessionMetricsHydrationToken = 0;
@@ -776,7 +796,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let identityEpoch = 0;
   let disposed = false;
   let startPromise: Promise<void> | null = null;
+  /** 所有连接入口正在接管的快照与事件流，正文读取复用同一水合任务。 */
+  let hydrationPromise: Promise<void> | null = null;
   let reconnectLoopPromise: Promise<void> | null = null;
+  /** 磁盘显示缓存不能充当恢复事件订阅的权威基线。 */
+  let hasCompleteSnapshot = false;
   let reconnectLoopEpoch = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let resolveReconnectTimer: ((shouldContinue: boolean) => void) | null = null;
@@ -822,6 +846,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
   let renderDeltaTimer: ReturnType<typeof setTimeout> | null = null;
   /** 消息发送按客户端消息身份独立执行，不占用会话级操作锁。 */
   const sendOperations = new Map<string, Promise<NativeOperationAcceptance | void>>();
+  /** 权威事件可独立结束接纳等待，不必等待原 HTTP 连接关闭。 */
+  const sendAcceptanceResolvers = new Map<string, (acceptance: NativeOperationAcceptance | void) => void>();
   let activeOperation: { key: string; promise: Promise<unknown> } | null = null;
   let browserCommentMarkFlush: Promise<void> | null = null;
   let nextTurnSettingsWrite: Promise<NativeNextTurnSettings> | null = null;
@@ -1005,10 +1031,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
     }
   }
 
-  /** 本地输入同步显示，服务端历史与位置继续在同一次归约中接管。 */
+  /** 连接与本地输入同步更新，服务端历史与位置继续在同一次归约中接管。 */
   function dispatch(action: Parameters<typeof sessionReducer>[1]): void {
-    /** 这些动作不引入持久位置；缓冲它们会延迟气泡、读取旧草稿，甚至在恢复失败时丢失本地显示。 */
-    const localInputAction =
+    /** 连接就绪不能等待正文位置，否则续发会读到旧连接状态并失去唤醒；本地输入同样不依赖持久位置。 */
+    const immediateAction =
+      action.type === 'transport_changed' ||
       action.type === 'draft_changed' ||
       action.type === 'attachments_changed' ||
       action.type === 'browser_submission_changed' ||
@@ -1025,10 +1052,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const incomingMissingPlacement = (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged') && actionTranscripts(action).some((envelope) => envelope.placement.order === null);
     const incomingEpoch =
       action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed' ? action.event.payload.orderEpoch : Math.max(0, ...actionTranscripts(action).map((envelope) => envelope.placement.orderEpoch));
-    // 本地发送、取消、队列响应和表单状态立即归约，同时记入接管动作序列；
-    // 位置核对完成后先重放较旧的服务端动作，再重放这些本地动作，避免旧快照抹掉期间输入。
-    const placementSensitive = !localInputAction && actionRequiresPlacementRecovery(action);
+    const placementSensitive = !immediateAction && actionRequiresPlacementRecovery(action);
     const placementTakeoverRequired =
+      !immediateAction &&
       action.type !== 'transcript_placements_hydrated' &&
       (Boolean(placementRecovery) ||
         (placementSensitive &&
@@ -1257,12 +1283,14 @@ export function createSessionController(options: CreateSessionControllerOptions)
 
   /** 原子接管权威会话正文，并在首帧之后渐进补齐非正文信息。 */
   async function applyAuthoritativeSnapshot(snapshot: NativeConversationSnapshot): Promise<void> {
+    const token = connectionToken;
     if (snapshot.conversationSchemaGeneration !== CONVERSATION_SCHEMA_GENERATION || snapshot.syncStreamGeneration !== CONVERSATION_SYNC_STREAM_GENERATION || !Number.isSafeInteger(snapshot.throughEventSeq) || snapshot.throughEventSeq < 0) {
       throw new Error('Zeus Renderer 与本地服务的会话结构代次不匹配，已拒绝猜测旧新字段。');
     }
-    // 读取请求可能早于实时事件发出、晚于事件返回；旧读取不得回滚已经应用的回复或状态。
     if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) return;
-    lastAppliedSyncEventSequence = snapshot.throughEventSeq;
+    /** 首屏与完整快照共用正文水位，补齐队列不重复读取 Git 环境和统计。 */
+    const refreshMetadata = metadataHydrationConnection !== connectionToken || state.snapshot?.throughEventSeq !== snapshot.throughEventSeq;
+    lastAppliedSyncEventSequence = Math.max(lastAppliedSyncEventSequence, snapshot.throughEventSeq);
     for (const sequence of pendingSyncGapEvents.keys()) {
       if (sequence <= snapshot.throughEventSeq) deletePendingSyncGapEvent(sequence);
     }
@@ -1274,8 +1302,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const projectedSnapshot = withoutResolvedRequests(snapshotWithExecutionContext);
     dispatch({ type: 'snapshot_hydrated', snapshot: projectedSnapshot });
     if (placementRecovery) await placementRecovery;
-    if (!snapshot.executionContext) void hydrateExecutionContext();
-    void hydrateSessionMetrics(projectedSnapshot.id);
+    if (disposed || token !== connectionToken) return;
+    if (refreshMetadata) {
+      metadataHydrationConnection = connectionToken;
+      if (!snapshot.executionContext) void hydrateExecutionContext();
+      void hydrateSessionMetrics(projectedSnapshot.id);
+    }
   }
 
   async function hydrateSessionMetrics(conversationId: string): Promise<void> {
@@ -1526,6 +1558,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     }
     const suppressRequestAuthority = event.type === 'conversation.request.created' && requestId !== null && resolvedRequestIds.has(requestId);
     dispatch({ type: 'event_received', event, ...(suppressRequestAuthority ? { suppressRequestAuthority: true } : {}) });
+    if (state.snapshot && (event.type === 'conversation.queue.changed' || event.type === 'conversation.turn.started' || event.type === 'conversation.item.completed')) {
+      void reconcilePersistedAcceptance({ ...state.snapshot, submissions: state.queue?.submissions ?? state.snapshot.submissions }).catch(failConversationSync);
+    }
     if (event.type === 'conversation.turn.completed' || ((event.type === 'conversation.item.started' || event.type === 'conversation.item.completed') && event.payload.itemType === 'commandExecution')) void hydrateExecutionContext();
     if (event.type === 'conversation.turn.change_set.changed') hydrateFullTerminalChangeSet(event);
     if (event.type === 'conversation.request.created' && !suppressRequestAuthority && requestId) {
@@ -1618,12 +1653,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   function acceptedEnvelopeIsDurable(snapshot: NativeConversationSnapshot, envelope: PendingSendEnvelope): boolean {
-    if (envelopeHasProviderUserFact(snapshot, envelope)) return true;
+    if (selectHasConfirmedUserMessage(state, envelope.clientUserMessageId) || envelopeHasProviderUserFact(snapshot, envelope)) return true;
     return matchingEnvelopeSubmissions(snapshot, envelope).some(submissionIsDurableEnvelopeEvidence);
   }
 
   function envelopeWasTerminalWithoutProviderFact(snapshot: NativeConversationSnapshot, envelope: PendingSendEnvelope): boolean {
-    if (envelopeHasProviderUserFact(snapshot, envelope)) return false;
+    if (selectHasConfirmedUserMessage(state, envelope.clientUserMessageId) || envelopeHasProviderUserFact(snapshot, envelope)) return false;
     const matchingSubmissions = matchingEnvelopeSubmissions(snapshot, envelope);
     return matchingSubmissions.length > 0 && matchingSubmissions.every((submission) => submission.status === 'failed' || submission.status === 'deleted' || submission.status === 'cancelled' || isManualConfirmationSubmission(submission));
   }
@@ -1648,6 +1683,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
     dispatch({ type: 'send_terminal', clientUserMessageId: envelope.clientUserMessageId });
     persistDraft();
     options.client.forgetNativeMessageCommand?.(options.projectId, options.conversationId, envelope.idempotencyKey);
+    sendAcceptanceResolvers.get(envelope.clientUserMessageId)?.();
+    void flushDeferredSends();
   }
 
   function acceptedStatus(acceptance: NativeOperationAcceptance): string {
@@ -1667,6 +1704,20 @@ export function createSessionController(options: CreateSessionControllerOptions)
       ...(acceptance.submission?.id ? { submissionId: acceptance.submission.id } : {}),
       ...(typeof providerTurnIdValue === 'string' && providerTurnIdValue ? { providerTurnId: providerTurnIdValue } : {}),
     });
+    sendAcceptanceResolvers.get(clientUserMessageId)?.(acceptance);
+    reportSendState(clientUserMessageId, 'accepted');
+    void flushDeferredSends();
+  }
+
+  /** 同一身份的接纳事实只向前推进，迟到 HTTP 成功不能复活已销账的消息。 */
+  function recordSendAcceptance(envelope: PendingSendEnvelope, acceptance: NativeOperationAcceptance): void {
+    const current = recoverableSend(envelope.clientUserMessageId);
+    if (disposed || !current || current.deliveryState === 'accepted') return;
+    const acceptedEnvelope: PendingSendEnvelope = { ...current, deliveryState: 'accepted', acceptance };
+    retainRecoverableSend(acceptedEnvelope);
+    dispatchSendAccepted(envelope.clientUserMessageId, acceptance);
+    persistDraft();
+    schedulePendingSendReconcile(acceptedEnvelope);
   }
 
   function browserCommentMarkFromEnvelope(envelope: PendingSendEnvelope): PendingBrowserCommentMark | null {
@@ -1752,6 +1803,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
     recoverableSends = recoverableSends.filter((candidate) => candidate.clientUserMessageId !== envelope.clientUserMessageId);
     persistDraft();
     options.client.forgetNativeMessageCommand?.(options.projectId, options.conversationId, envelope.idempotencyKey);
+    sendAcceptanceResolvers.get(envelope.clientUserMessageId)?.(envelope.acceptance);
+    void flushDeferredSends();
     void flushPendingBrowserCommentMarks();
   }
 
@@ -1819,13 +1872,16 @@ export function createSessionController(options: CreateSessionControllerOptions)
   async function reconcileAcceptedSend(envelope: PendingSendEnvelope): Promise<boolean> {
     if (envelope.deliveryState !== 'accepted' || !envelope.acceptance || disposed || !recoverableSend(envelope.clientUserMessageId)) return true;
     const buffered = createRealtimeEventBuffer('targeted-hydration');
+    const token = connectionToken;
     targetedHydrationBuffer = buffered;
     try {
       if (await reconcileSubmissionReceipt(envelope)) return true;
       const snapshot = await withSessionTimeout(loadConversationForHydration(), conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
-      if (disposed || !recoverableSend(envelope.clientUserMessageId)) return true;
+      if (disposed || token !== connectionToken || !recoverableSend(envelope.clientUserMessageId)) return true;
       if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) throw new Error('会话快照早于已接收的实时事件，等待下一次权威核对。');
       await applyAuthoritativeSnapshot(snapshot);
+      if (disposed || token !== connectionToken) return false;
+      if (!recoverableSend(envelope.clientUserMessageId)) return true;
       if (envelopeWasTerminalWithoutProviderFact(snapshot, envelope)) {
         finalizeTerminalEnvelope(envelope);
         return true;
@@ -1846,7 +1902,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       return false;
     } finally {
       if (targetedHydrationBuffer === buffered) targetedHydrationBuffer = null;
-      if (!buffered.overflowed) {
+      if (!disposed && token === connectionToken && !buffered.overflowed) {
         for (const event of buffered.events) applyRealtimeEvent(event);
       }
       buffered.events.length = 0;
@@ -1974,18 +2030,23 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   async function reconcileFailedSend(envelope: PendingSendEnvelope): Promise<FailedSendReconciliation> {
+    const token = connectionToken;
     const buffered = createRealtimeEventBuffer('targeted-hydration');
     targetedHydrationBuffer = buffered;
     try {
       const snapshot = await withSessionTimeout(loadConversationForHydration(), conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
-      if (disposed || sendOperations.has(envelope.clientUserMessageId) || !recoverableSend(envelope.clientUserMessageId)) return { kind: 'unknown' };
+      if (disposed || token !== connectionToken || sendOperations.has(envelope.clientUserMessageId) || !recoverableSend(envelope.clientUserMessageId)) return { kind: 'unknown' };
       if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) return { kind: 'unknown' };
       await applyAuthoritativeSnapshot(snapshot);
+      if (disposed || token !== connectionToken) return { kind: 'unknown' };
+      // 位置恢复期间可能已收到成功回执或发起明确重试，旧读取不能重新写回账本。
+      if (recoverableSend(envelope.clientUserMessageId) !== envelope || sendOperations.has(envelope.clientUserMessageId)) return { kind: 'unknown' };
       if (envelopeWasTerminalWithoutProviderFact(snapshot, envelope)) {
         finalizeTerminalEnvelope(envelope);
         return { kind: 'terminal' };
       }
-      if (!acceptedEnvelopeIsDurable(snapshot, envelope)) return { kind: 'absent' };
+      // 快照没有消息不代表仍在途的提交不会稍后入账；未知请求不能据此改判失败。
+      if (!acceptedEnvelopeIsDurable(snapshot, envelope)) return { kind: envelope.deliveryState === 'uncertain' ? 'unknown' : 'absent' };
 
       const acceptance = acceptanceFromDurableSnapshot(snapshot, envelope);
       retainRecoverableSend({ ...envelope, deliveryState: 'accepted', acceptance });
@@ -1996,7 +2057,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       return { kind: 'unknown' };
     } finally {
       if (targetedHydrationBuffer === buffered) targetedHydrationBuffer = null;
-      if (!buffered.overflowed) {
+      if (!disposed && token === connectionToken && !buffered.overflowed) {
         for (const event of buffered.events) applyRealtimeEvent(event);
       }
       buffered.events.length = 0;
@@ -2105,8 +2166,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   function scheduleReconnect(token: number): void {
-    if (disposed || token !== connectionToken || reconnectLoopPromise || !stateNeedsRealtime()) {
-      if (!disposed && token === connectionToken && state.snapshot && !stateNeedsRealtime()) {
+    if (disposed || token !== connectionToken || reconnectLoopPromise || !needsConnectionRecovery()) {
+      if (!disposed && token === connectionToken && state.snapshot && !needsConnectionRecovery()) {
         dispatch({ type: 'transport_changed', transportState: 'ready', error: null });
       }
       return;
@@ -2114,25 +2175,18 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const epoch = ++reconnectLoopEpoch;
     const loop = (async () => {
       let attempt = 0;
-      while (!disposed && epoch === reconnectLoopEpoch && stateNeedsRealtime() && attempt < reconnectBackoffMs.length) {
-        dispatch({ type: 'transport_changed', transportState: 'reconnecting', reconnectAttempt: attempt + 1 });
-        const delayMs = reconnectDelayMs(attempt + 1);
+      while (!disposed && epoch === reconnectLoopEpoch && needsConnectionRecovery()) {
+        dispatch({ type: 'transport_changed', transportState: 'reconnecting', reconnectAttempt: attempt < reconnectBackoffMs.length ? attempt + 1 : 0, error: null });
+        const delayMs = (attempt < reconnectBackoffMs.length ? reconnectDelayMs(attempt + 1) : backgroundReconnectDelayMs) * (0.8 + Math.random() * 0.4);
         if (!(await waitForReconnectDelay(delayMs, epoch))) return;
         try {
-          await hydrate(true, 'required');
+          await hydrate(true, stateNeedsRealtime() ? 'required' : 'auto');
           if (!disposed && epoch === reconnectLoopEpoch && state.transportState === 'ready') return;
-        } catch {
-          // 只继续剩余预算；手动重连或销毁会话会取消当前恢复链。
+        } catch (error) {
+          const failure = toSessionError(error, true);
+          if (!failure.retryable || failure.recoveryRequired || (failure.status !== undefined && failure.status >= 400 && failure.status < 500 && ![408, 429].includes(failure.status))) return;
         }
         attempt += 1;
-      }
-      if (!disposed && epoch === reconnectLoopEpoch && attempt === reconnectBackoffMs.length) {
-        dispatch({
-          type: 'transport_changed',
-          transportState: 'failed',
-          reconnectAttempt: attempt,
-          error: { code: 'ZEUS_SESSION_CONNECTION_RETRIES_EXHAUSTED', message: '连接重试五次均失败。请检查网络后重试。', retryable: true, recoveryRequired: false },
-        });
       }
     })();
     reconnectLoopPromise = loop;
@@ -2182,6 +2236,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       isDisconnected: () => disconnected,
       markInactive() {
         active = false;
+        disconnected = true;
         eventTarget.removeEventListener?.('open', handleOpen);
         eventTarget.removeEventListener?.('close', handleDisconnect);
         eventTarget.removeEventListener?.('error', handleDisconnect);
@@ -2202,6 +2257,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     try {
       return await withHydrationAbort(
         (async () => {
+          /** 侧栏已确认的身份可先显示正文，最新目录事实与交互状态并行补齐。 */
+          const choicePromise = options.client.loadNativeConversationChoice(options.projectId, options.conversationId);
+          void choicePromise.catch(() => undefined);
           const interactionPromise = loadConversationInteractionForHydration();
           // 队列或确认项即使比正文更早失败，也由稍后的权威阶段统一处理，不能制造未处理 Promise。
           void interactionPromise.catch(() => undefined);
@@ -2212,7 +2270,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           });
           if (hooks?.onGoal) void goalPromise.then(hooks.onGoal).catch(() => undefined);
           const goalAtReadableDeadline = withSessionTimeout(goalPromise, conversationGoalHydrationTimeoutMs, () => new ConversationGoalHydrationTimeoutError()).catch(() => fallbackGoalForHydration());
-          const readable = await loadConversationReadableForHydration(context);
+          const readable = await loadConversationReadableForHydration(context, choicePromise);
           context.controller.signal.throwIfAborted();
           if (hooks?.onReadable) {
             await hooks.onReadable(
@@ -2225,10 +2283,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
               }),
             );
           }
-          const [interaction, goalAtDeadline] = await Promise.all([interactionPromise, goalAtReadableDeadline]);
+          const [interaction, goalAtDeadline, choice] = await Promise.all([interactionPromise, goalAtReadableDeadline, choicePromise]);
           context.controller.signal.throwIfAborted();
           return adaptConversationSnapshotV2({
             ...readable,
+            choice,
             queue: interaction.queue,
             requests: interaction.pending.requests,
             planImplementationRequests: interaction.pending.planImplementationRequests ?? [],
@@ -2247,10 +2306,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   /** 后台负责结构与消息的一致性；适配器继续校验身份和事件进度，后续更新沿用现有缓冲与补拉。 */
-  async function loadConversationReadableForHydration(context: TranscriptHydrationContext): Promise<NativeConversationReadableSnapshot & { choice: NativeConversationChoice }> {
+  async function loadConversationReadableForHydration(context: TranscriptHydrationContext, choicePromise: Promise<NativeConversationChoice>): Promise<NativeConversationReadableSnapshot & { choice: NativeConversationChoice }> {
     try {
-      // 选择信息只读一次，与可读快照并行；正常初始化仅重读可读快照。
-      const [readable, choice] = await Promise.all([loadReadableUntilInitialized(context), options.client.loadNativeConversationChoice(options.projectId, options.conversationId)]);
+      /** 列表身份必须同时匹配项目和会话；它不替代完整水合的权限与队列核验。 */
+      const initialChoice = options.initialConversation?.projectId === options.projectId && options.initialConversation.id === options.conversationId ? options.initialConversation : null;
+      const [readable, choice] = await Promise.all([loadReadableUntilInitialized(context), initialChoice ?? choicePromise]);
       return { ...readable, choice };
     } catch (error) {
       if (context.controller.signal.aborted) throw context.controller.signal.reason;
@@ -2258,7 +2318,14 @@ export function createSessionController(options: CreateSessionControllerOptions)
       const code = toSessionError(error, false).code;
       if (code === 'ZEUS_CONVERSATION_TRANSCRIPT_INITIALIZATION_PENDING') throw error;
       if (code === 'ZEUS_CONVERSATION_TRANSCRIPT_INITIALIZATION_FAILED') throw Object.assign(new Error(errorMessage(error)), { code, retryable: false, cause: userFacingErrorCause(error) });
-      throw Object.assign(new Error('会话内容暂时无法刷新'), { code: 'ZEUS_CONVERSATION_READ_FAILED', cause: userFacingErrorCause(error) });
+      const failure = toSessionError(error, true);
+      throw Object.assign(new Error('会话内容暂时无法刷新'), {
+        code: 'ZEUS_CONVERSATION_READ_FAILED',
+        cause: userFacingErrorCause(error),
+        retryable: failure.retryable,
+        recoveryRequired: failure.recoveryRequired,
+        ...(failure.status !== undefined ? { status: failure.status } : {}),
+      });
     }
   }
 
@@ -2363,6 +2430,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
     );
   }
 
+  /** 已选中的历史会话读取失败也需恢复，不能因没有运行轮次而放弃刷新。 */
+  function needsConnectionRecovery(): boolean {
+    return stateNeedsRealtime() || state.transportState === 'failed' || state.transportState === 'reconnecting';
+  }
+
   function releaseIdleRealtimeSubscription(): void {
     if (disposed || !realtimeSubscribed || stateNeedsRealtime()) return;
     cancelReconnectLoop();
@@ -2378,7 +2450,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   function ensureRealtimeConnection(): Promise<void> {
-    if (disposed || realtimeSubscribed) return Promise.resolve();
+    if (disposed || (realtimeSubscribed && state.transportState === 'ready' && state.snapshot?.id === options.conversationId)) return Promise.resolve();
     if (realtimeConnectionPromise) return realtimeConnectionPromise;
     cancelReconnectLoop();
     const attempt = hydrate(true, 'required');
@@ -2389,7 +2461,20 @@ export function createSessionController(options: CreateSessionControllerOptions)
     return tracked;
   }
 
-  async function hydrate(reconnecting: boolean, realtimeMode: 'auto' | 'required' = 'auto'): Promise<void> {
+  /** 统一登记自动重连、手动重连和请求答复后的水合，旧任务结束不清除新任务。 */
+  function hydrate(reconnecting: boolean, realtimeMode: 'auto' | 'required' = 'auto'): Promise<void> {
+    /** 快照和事件订阅共同完成本轮连接接管。 */
+    const attempt = hydrateSnapshotAndEvents(reconnecting, realtimeMode);
+    /** 后续连接可能先接管，只释放仍属于本轮的等待入口。 */
+    const tracked = attempt.finally(() => {
+      if (hydrationPromise === tracked) hydrationPromise = null;
+    });
+    hydrationPromise = tracked;
+    return tracked;
+  }
+
+  /** 读取权威快照并按会话活动状态接管实时事件订阅。 */
+  async function hydrateSnapshotAndEvents(reconnecting: boolean, realtimeMode: 'auto' | 'required'): Promise<void> {
     if (disposed) return;
     flushRenderDeltas();
     // 连接代次更换会取消旧分页请求，保留已显示内容并释放旧请求的读取标记。
@@ -2431,28 +2516,34 @@ export function createSessionController(options: CreateSessionControllerOptions)
       // 这样既不会遗漏快照读取期间发生的事件，也不会从 0 重放整段历史并反复撞上 WebSocket 高水位。
       // 已有权威快照时保持稳定的重连状态，不能在 reconnecting/hydrating 间反复切换并触发整页同步闪烁。
       if (!reconnecting || !state.snapshot) dispatch({ type: 'transport_changed', transportState: 'hydrating' });
-      const progressiveHydration = loadConversationForProgressiveHydration({
-        // 命中旧缓存也立即接管最新正文与摘要，不等待队列、确认项和目标读取。
-        onReadable: async (readableSnapshot: NativeConversationSnapshot): Promise<void> => {
-          if (disposed || token !== connectionToken || (state.snapshot && state.snapshot.throughEventSeq > readableSnapshot.throughEventSeq)) return;
-          if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
-          await applyAuthoritativeSnapshot(readableSnapshot);
-        },
-        onGoal: (response) => {
-          if (disposed || token !== connectionToken) return;
-          dispatch({ type: 'goal_hydrated', conversationId: options.conversationId, response });
-        },
-      });
+      /** 已核验过的会话优先按连续事件游标续接，缺失基线时由既有补读协议接管。 */
+      const resumeSnapshot = reconnecting && realtimeMode === 'required' && hasCompleteSnapshot && !syncProjectionSuspended ? state.snapshot : null;
+      const progressiveHydration = resumeSnapshot
+        ? Promise.resolve(resumeSnapshot)
+        : loadConversationForProgressiveHydration({
+            // 命中旧缓存也立即接管最新正文与摘要，不等待队列、确认项和目标读取。
+            onReadable: async (readableSnapshot: NativeConversationSnapshot): Promise<void> => {
+              if (disposed || token !== connectionToken || (state.snapshot && state.snapshot.throughEventSeq > readableSnapshot.throughEventSeq)) return;
+              await applyAuthoritativeSnapshot(readableSnapshot);
+              void flushDeferredSends();
+            },
+            onGoal: (response) => {
+              if (disposed || token !== connectionToken) return;
+              dispatch({ type: 'goal_hydrated', conversationId: options.conversationId, response });
+            },
+          });
       const snapshot = await withSessionTimeout(progressiveHydration, conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
       if (disposed || token !== connectionToken) return;
       const lazySnapshotHydration = options.realtimePolicy === 'lazy' && realtimeMode !== 'required';
       const subscribeRealtime =
         realtimeMode === 'required' || (!lazySnapshotHydration && (snapshotNeedsRealtime(snapshot) || stateNeedsRealtime() || recoverableSends.some((envelope) => envelope.deliveryState !== 'failed') || deferredSends.length > 0));
       if (!subscribeRealtime) {
-        if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
         await applyAuthoritativeSnapshot(snapshot);
+        hasCompleteSnapshot = true;
+        if (disposed || token !== connectionToken) return;
         // 浏览历史只能读取持久事实；首次发送进入 required 水合后才允许恢复发送账本和实时副作用。
         if (!lazySnapshotHydration) await reconcilePersistedAcceptance(snapshot);
+        if (disposed || token !== connectionToken) return;
         syncProjectionSuspended = false;
         hydrating = false;
         ready = true;
@@ -2462,7 +2553,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       }
       const eventOptions = {
         conversationId: options.conversationId,
-        afterSequence: snapshot.throughEventSeq,
+        afterSequence: resumeSnapshot ? Math.max(snapshot.throughEventSeq, lastAppliedSyncEventSequence) : snapshot.throughEventSeq,
         syncStreamGeneration: CONVERSATION_SYNC_STREAM_GENERATION,
         ...(reconnecting && state.lastEventId ? { afterEventId: state.lastEventId } : {}),
       };
@@ -2479,19 +2570,23 @@ export function createSessionController(options: CreateSessionControllerOptions)
         throw hydrationOverflowError;
       }
       // Snapshot 已经权威且可独立阅读；实时连接只负责后续增量，不能继续遮住已取得的历史。
-      if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
       // 正文可能已在同一事件水位提前显示，完整快照仍须接管队列与交互状态。
-      await applyAuthoritativeSnapshot(snapshot);
-      await reconcilePersistedAcceptance(snapshot);
+      if (!resumeSnapshot) await applyAuthoritativeSnapshot(snapshot);
+      hasCompleteSnapshot = true;
+      if (disposed || token !== connectionToken || socket !== nextSocket) return;
+      if (!resumeSnapshot) await reconcilePersistedAcceptance(snapshot);
+      if (disposed || token !== connectionToken || socket !== nextSocket) return;
       try {
         await withSessionTimeout(lifecycle.opened, conversationRealtimeOpenTimeoutMs, () => new ConversationRealtimeOpenTimeoutError());
       } catch (socketError) {
+        if (disposed || token !== connectionToken || socket !== nextSocket) return;
         lifecycle.markInactive();
         if (socket === nextSocket) socket = null;
         nextSocket.close();
         throw socketError;
       }
 
+      if (disposed || token !== connectionToken || socket !== nextSocket) return;
       if (lifecycle.isDisconnected()) throw new SocketDisconnectedDuringHydrationError();
       if (hydrationOverflowError) throw hydrationOverflowError;
       realtimeSubscribed = true;
@@ -2506,8 +2601,17 @@ export function createSessionController(options: CreateSessionControllerOptions)
       void flushDeferredSends();
     } catch (error) {
       hydrating = false;
+      if (disposed || token !== connectionToken) return;
+      const failure = toSessionError(error, true);
       const shouldScheduleReconnect =
-        !disposed && token === connectionToken && !(error instanceof ConversationRealtimeOpenTimeoutError) && (error instanceof SocketDisconnectedDuringHydrationError || socketLifecycle?.isDisconnected() === true);
+        failure.retryable &&
+        !failure.recoveryRequired &&
+        !(failure.status !== undefined && failure.status >= 400 && failure.status < 500 && ![408, 429].includes(failure.status)) &&
+        (error instanceof ConversationRealtimeOpenTimeoutError ||
+          error instanceof ConversationHydrationTimeoutError ||
+          error instanceof SocketDisconnectedDuringHydrationError ||
+          failure.code === 'ZEUS_CONVERSATION_READ_FAILED' ||
+          socketLifecycle?.isDisconnected() === true);
       if (!disposed && token === connectionToken) {
         socketLifecycle?.markInactive();
         socketLifecycle = null;
@@ -2515,8 +2619,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
         socket = null;
         realtimeSubscribed = false;
         failedSocket?.close();
-        if (!state.snapshot) markConversationNavigationRenderReady(options.projectId, options.conversationId);
-        dispatch({ type: 'transport_changed', transportState: 'failed', error: toSessionError(error, true) });
+        dispatch({ type: 'transport_changed', transportState: shouldScheduleReconnect && state.snapshot ? 'reconnecting' : 'failed', error: shouldScheduleReconnect && state.snapshot ? null : toSessionError(error, true) });
       }
       if (shouldScheduleReconnect) scheduleReconnect(token);
       throw error;
@@ -2543,6 +2646,11 @@ export function createSessionController(options: CreateSessionControllerOptions)
       })
       .finally(() => {
         if (activeOperation?.promise === promise) activeOperation = null;
+        // 操作占用可能挡住连接完成时的续发，释放后沿原消息身份继续排空。
+        for (const envelope of recoverableSends) {
+          if (!disposed && !activeOperation && (envelope.deliveryState === 'uncertain' || envelope.deliveryState === 'accepted')) schedulePendingSendReconcile(envelope);
+        }
+        void flushDeferredSends();
       });
     activeOperation = { key, promise };
     return promise;
@@ -2579,6 +2687,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
     retainRecoverableSend(trackedEnvelope);
     persistDraft();
     const previousConversationState = state.conversationState;
+    reportSendState(trackedEnvelope.clientUserMessageId, 'submitting');
+    /** 实时回执与 HTTP 返回竞争同一条消息的接纳结果。 */
+    const observedAcceptance = new Promise<NativeOperationAcceptance | void>((resolve) => sendAcceptanceResolvers.set(trackedEnvelope.clientUserMessageId, resolve));
     /** 请求 Promise 仅由该客户端消息身份持有。 */
     const operation = (async () => {
       dispatch({
@@ -2603,42 +2714,45 @@ export function createSessionController(options: CreateSessionControllerOptions)
       retainRecoverableSend(trackedEnvelope);
       persistDraft();
       try {
-        const acceptance = await options.client.sendNativeMessage(options.projectId, options.conversationId, {
-          content: trackedEnvelope.content,
-          ...(trackedEnvelope.displayText ? { displayText: trackedEnvelope.displayText } : {}),
-          composerDraft: trackedEnvelope.draft,
-          attachments: trackedEnvelope.attachments,
-          ...(trackedEnvelope.browserSubmission?.comments.length ? { browserComments: trackedEnvelope.browserSubmission.comments } : {}),
-          ...(trackedEnvelope.browserSubmission ? { browserCommentContent: trackedEnvelope.browserSubmission.content } : {}),
-          ...(hasConversationContext(trackedEnvelope.contextDraft) ? { conversationContext: trackedEnvelope.contextDraft } : {}),
-          delivery: trackedEnvelope.delivery,
-          ...(trackedEnvelope.questionAnswer ? { questionAnswer: trackedEnvelope.questionAnswer } : {}),
-          ...(trackedEnvelope.expectedTurnId ? { expectedTurnId: trackedEnvelope.expectedTurnId } : {}),
-          ...(trackedEnvelope.model ? { model: trackedEnvelope.model } : {}),
-          ...(trackedEnvelope.agentKind ? { agentKind: trackedEnvelope.agentKind } : {}),
-          ...(trackedEnvelope.effort ? { effort: trackedEnvelope.effort } : {}),
-          ...(trackedEnvelope.contextCapacityTokens !== undefined ? { contextCapacityTokens: trackedEnvelope.contextCapacityTokens } : {}),
-          ...(Object.prototype.hasOwnProperty.call(trackedEnvelope, 'serviceTier') ? { serviceTier: trackedEnvelope.serviceTier } : {}),
-          ...(trackedEnvelope.permissionMode ? { permissionMode: trackedEnvelope.permissionMode } : {}),
-          collaborationMode: trackedEnvelope.collaborationMode,
-          ...(trackedEnvelope.pluginReferences?.length ? { pluginReferences: trackedEnvelope.pluginReferences } : {}),
-          ...(trackedEnvelope.expertMentions?.length ? { expertMentions: trackedEnvelope.expertMentions } : {}),
-          ...(trackedEnvelope.skillReferences?.length ? { skillReferences: trackedEnvelope.skillReferences } : {}),
-          ...(trackedEnvelope.computerUseRequested ? { computerUseRequested: true } : {}),
-          idempotencyKey: trackedEnvelope.idempotencyKey,
-          clientUserMessageId: trackedEnvelope.clientUserMessageId,
-        });
-        /** HTTP 回执只更新当前消息，耐久状态交给后台只读核对。 */
-        const acceptedEnvelope: PendingSendEnvelope = { ...trackedEnvelope, deliveryState: 'accepted', acceptance };
-        retainRecoverableSend(acceptedEnvelope);
-        dispatchSendAccepted(trackedEnvelope.clientUserMessageId, acceptance);
-        persistDraft();
-        schedulePendingSendReconcile(acceptedEnvelope);
-        return acceptance;
+        const request = options.client
+          .sendNativeMessage(options.projectId, options.conversationId, {
+            content: trackedEnvelope.content,
+            ...(trackedEnvelope.displayText ? { displayText: trackedEnvelope.displayText } : {}),
+            composerDraft: trackedEnvelope.draft,
+            attachments: trackedEnvelope.attachments,
+            ...(trackedEnvelope.browserSubmission?.comments.length ? { browserComments: trackedEnvelope.browserSubmission.comments } : {}),
+            ...(trackedEnvelope.browserSubmission ? { browserCommentContent: trackedEnvelope.browserSubmission.content } : {}),
+            ...(hasConversationContext(trackedEnvelope.contextDraft) ? { conversationContext: trackedEnvelope.contextDraft } : {}),
+            delivery: trackedEnvelope.delivery,
+            ...(trackedEnvelope.questionAnswer ? { questionAnswer: trackedEnvelope.questionAnswer } : {}),
+            ...(trackedEnvelope.expectedTurnId ? { expectedTurnId: trackedEnvelope.expectedTurnId } : {}),
+            ...(trackedEnvelope.model ? { model: trackedEnvelope.model } : {}),
+            ...(trackedEnvelope.agentKind ? { agentKind: trackedEnvelope.agentKind } : {}),
+            ...(trackedEnvelope.effort ? { effort: trackedEnvelope.effort } : {}),
+            ...(trackedEnvelope.contextCapacityTokens !== undefined ? { contextCapacityTokens: trackedEnvelope.contextCapacityTokens } : {}),
+            ...(Object.prototype.hasOwnProperty.call(trackedEnvelope, 'serviceTier') ? { serviceTier: trackedEnvelope.serviceTier } : {}),
+            ...(trackedEnvelope.permissionMode ? { permissionMode: trackedEnvelope.permissionMode } : {}),
+            collaborationMode: trackedEnvelope.collaborationMode,
+            ...(trackedEnvelope.pluginReferences?.length ? { pluginReferences: trackedEnvelope.pluginReferences } : {}),
+            ...(trackedEnvelope.expertMentions?.length ? { expertMentions: trackedEnvelope.expertMentions } : {}),
+            ...(trackedEnvelope.skillReferences?.length ? { skillReferences: trackedEnvelope.skillReferences } : {}),
+            ...(trackedEnvelope.computerUseRequested ? { computerUseRequested: true } : {}),
+            idempotencyKey: trackedEnvelope.idempotencyKey,
+            clientUserMessageId: trackedEnvelope.clientUserMessageId,
+          })
+          .then((acceptance) => {
+            // 超时之后仍接收迟到的成功事实；失败只由本次有界等待处理。
+            recordSendAcceptance(trackedEnvelope, acceptance);
+            return acceptance;
+          });
+        return await withSessionTimeout(Promise.race([request, observedAcceptance]), conversationSendAcceptanceTimeoutMs, () => new ConversationSendAcceptanceTimeoutError());
       } catch (error) {
+        const current = recoverableSend(trackedEnvelope.clientUserMessageId);
+        // 快照或实时事件可能先于 HTTP 失败确认消息，禁止恢复旧的失败副本。
+        if (disposed || !current || current.deliveryState === 'accepted') return current?.acceptance;
         /** 统一错误结构只写入当前消息气泡。 */
         const failure = toSessionError(error, true);
-        /** 明确拒绝与结果未知分开显示，但两者都不阻止后续消息。 */
+        /** 明确拒绝可继续接纳后续消息，未知结果必须先核对顺序。 */
         const explicitFailure = sendFailureIsExplicit(failure) || failure.code === 'ZEUS_ASYNC_QUESTION_TURN_ENDED';
         /** 失败副本保留原附件、消息身份和幂等键。 */
         const unresolvedEnvelope: PendingSendEnvelope = {
@@ -2647,6 +2761,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           deliveryError: failure,
         };
         retainRecoverableSend(unresolvedEnvelope);
+        reportSendState(trackedEnvelope.clientUserMessageId, explicitFailure ? 'failed' : 'uncertain');
         dispatch(
           explicitFailure
             ? {
@@ -2664,7 +2779,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
         );
         if (explicitFailure) restoreFailedEnvelopeComposer(unresolvedEnvelope);
         persistDraft();
-        // 结果不确定只影响本消息，后台只读核对不会阻止用户继续发送。
+        // 结果未知保留原身份并只读核对；普通待发消息继续保持接纳顺序。
         if (!explicitFailure) {
           dispatch({ type: 'send_reconcile_progress', clientUserMessageId: trackedEnvelope.clientUserMessageId, attempt: 1, maxAttempts: pendingSendReconcileAttempts });
           schedulePendingSendReconcile(unresolvedEnvelope);
@@ -2674,17 +2789,50 @@ export function createSessionController(options: CreateSessionControllerOptions)
         throw error;
       }
     })().finally(() => {
-      if (sendOperations.get(trackedEnvelope.clientUserMessageId) === operation) sendOperations.delete(trackedEnvelope.clientUserMessageId);
+      if (sendOperations.get(trackedEnvelope.clientUserMessageId) === operation) {
+        sendOperations.delete(trackedEnvelope.clientUserMessageId);
+        sendAcceptanceResolvers.delete(trackedEnvelope.clientUserMessageId);
+      }
       void flushDeferredSends();
     });
     sendOperations.set(trackedEnvelope.clientUserMessageId, operation);
     return operation;
   }
 
+  /** 普通消息的未知接纳结果不能被后续普通消息越过；直接引导仍独立提交。 */
+  function hasUnresolvedAdmission(): boolean {
+    return sendOperations.size > 0 || recoverableSends.some((envelope) => envelope.delivery === 'queue' && (envelope.deliveryState === 'pending' || envelope.deliveryState === 'uncertain'));
+  }
+
+  /** 记录送达迁移及实际阻塞条件，不记录正文、附件或上下文内容。 */
+  function reportSendState(clientUserMessageId: string, phase: string): void {
+    if (typeof window === 'undefined') return;
+    window.zeus?.reportRendererRuntimeError?.(
+      JSON.stringify({
+        kind: 'conversation_delivery',
+        conversationId: options.conversationId,
+        clientUserMessageId,
+        phase,
+        at: new Date().toISOString(),
+        connectionToken,
+        transportState: state.transportState,
+        realtimeSubscribed,
+        snapshotMatches: state.snapshot?.id === options.conversationId,
+        activeOperation: activeOperation?.key.split(':')[0] ?? null,
+        inFlightCount: sendOperations.size,
+        unresolvedAdmission: hasUnresolvedAdmission(),
+        deferredCount: deferredSends.length,
+      }),
+    );
+  }
+
   /** 普通消息与问题回答共用待发队列；只冻结一次内容，内部等待结束后自动接续。 */
   function sendOrDeferEnvelope(envelope: PendingSendEnvelope): Promise<NativeOperationAcceptance | void> {
-    if (deferredSends.length > 0 || state.transportState !== 'ready' || state.snapshot?.id !== options.conversationId || !realtimeSubscribed) {
-      /** 连接未就绪时只保存本消息；队列顺序不代表消息状态存在依赖。 */
+    /** 普通连续发送按意图顺序接纳；直接引导不等待普通提交的回执。 */
+    const waitingForAcceptance = envelope.delivery === 'queue' && (deferredSends.length > 0 || hasUnresolvedAdmission());
+    /** 普通排队只依赖会话身份；直接引导仍须等实时状态完成核验。 */
+    const waitingForConnection = state.snapshot?.id !== options.conversationId || (envelope.delivery !== 'queue' && (state.transportState !== 'ready' || !realtimeSubscribed));
+    if (waitingForAcceptance || waitingForConnection) {
       /** 待发副本已交出 Composer，后续回执不能清空新草稿。 */
       const queuedEnvelope = { ...envelope, composerConsumed: true };
       deferredSends = [...deferredSends.filter((candidate) => candidate.clientUserMessageId !== envelope.clientUserMessageId), queuedEnvelope];
@@ -2703,30 +2851,38 @@ export function createSessionController(options: CreateSessionControllerOptions)
         ...(envelope.questionAnswer ? { questionAnswer: envelope.questionAnswer, preserveComposer: true } : {}),
         previousConversationState: state.conversationState,
         startedAt: envelope.startedAt ?? new Date().toISOString(),
-        queuedUntilHydrated: true,
+        queuedUntilHydrated: waitingForConnection,
       });
       persistDraft();
-      if (state.transportState !== 'ready' || !realtimeSubscribed) {
+      reportSendState(envelope.clientUserMessageId, 'deferred');
+      if (waitingForConnection) {
         void ensureRealtimeConnection().catch(() => undefined);
       } else {
         void flushDeferredSends();
       }
       return Promise.resolve();
     }
-    return submitEnvelope(envelope);
+    const submitted = submitEnvelope(envelope);
+    if (!realtimeSubscribed) void ensureRealtimeConnection().catch(() => undefined);
+    return submitted;
   }
 
-  /** 连接就绪后按保存顺序提交待发消息；单条失败不会终止后续消息。 */
+  /** 正文身份已知后按保存顺序接纳待发消息，不等待实时订阅。 */
   async function flushDeferredSends(): Promise<void> {
-    if (disposed || state.transportState !== 'ready' || !realtimeSubscribed || state.snapshot?.id !== options.conversationId || activeOperation) return;
-    while (!disposed && state.transportState === 'ready' && realtimeSubscribed && state.snapshot?.id === options.conversationId && deferredSends.length > 0 && !activeOperation) {
+    // 接纳完成会继续排空；重连、续发和回执回调不能并行取走后续消息。
+    if (disposed) return;
+    if (state.snapshot?.id !== options.conversationId || activeOperation || hasUnresolvedAdmission()) {
+      if (deferredSends[0]) reportSendState(deferredSends[0].clientUserMessageId, 'waiting');
+      return;
+    }
+    while (!disposed && state.snapshot?.id === options.conversationId && deferredSends.length > 0 && !activeOperation && !hasUnresolvedAdmission()) {
       const envelope = deferredSends[0]!;
+      if (envelope.delivery !== 'queue' && (state.transportState !== 'ready' || !realtimeSubscribed)) return;
       deferredSends = deferredSends.slice(1);
-      persistDraft();
       try {
         await submitEnvelope(envelope);
       } catch {
-        // 失败已经记录在该消息自己的账本中，继续提交下一条消息。
+        // 明确失败允许继续；结果未知由接纳门控保留顺序。
       }
     }
   }
@@ -2749,7 +2905,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
     delete retry.acceptance;
     delete retry.deliveryError;
     recoverableSends = recoverableSends.filter((candidate) => candidate.clientUserMessageId !== clientUserMessageId);
-    return sendOrDeferEnvelope(retry);
+    // 用户明确重试原消息时，它必须先于此前等待它的后续输入重新接纳。
+    if (state.transportState === 'ready' && realtimeSubscribed && state.snapshot?.id === options.conversationId) return submitEnvelope(retry);
+    deferredSends = [retry, ...deferredSends.filter((candidate) => candidate.clientUserMessageId !== clientUserMessageId)];
+    persistDraft();
+    void ensureRealtimeConnection().catch(() => undefined);
+    void flushDeferredSends();
   }
 
   async function cancelPendingSend(clientUserMessageId: string): Promise<void> {
@@ -2856,42 +3017,49 @@ export function createSessionController(options: CreateSessionControllerOptions)
   async function loadNavigationTurn(turnId: string): Promise<void> {
     /** 连接重建后旧请求不再复用。 */
     const generation = connectionToken;
-    /** 本地和 Provider 轮次别名共用同一份分页请求。 */
-    const turn = await loadTurnReadIdentity(turnId, generation);
-    /** 轮次身份与代次共同隔离按需读取。 */
-    const key = `${generation}:${turn.id}`;
-    /** 点击与进入视口可能同时请求同一轮。 */
-    const existing = navigationTurnLoads.get(key);
-    if (existing) return existing;
-    /** 页只合并展示投影，不推进实时同步进度。 */
-    const request = (async () => {
-      /** 沿用已有按轮次模型历史接口。 */
-      const load = options.client.loadNativeConversationTurnModelHistoryV2;
-      if (!load || !state.snapshot?.snapshotV2) throw new Error('会话正文尚未就绪，请重试。');
-      /** 冻结游标必须严格前进，失败不能无界重试。 */
-      const seenCursors = new Set<string>();
-      while (true) {
-        // 页面与游标可能仍在等待位置接管；只有实际归约完成后才能决定下一页。
-        await waitForTranscriptPlacementRecovery(generation);
-        /** 导航沿已有连续范围和读取方向补齐，不重新从第一页覆盖进度。 */
-        const paging = turnReadPaging(state.snapshot, turn, 'historyByTurn');
-        if (paging?.loaded && !paging.hasMore) return;
-        /** 空游标代表该轮第一页。 */
-        const cursor = paging?.nextCursor ?? '';
-        if (seenCursors.has(cursor)) throw new Error('历史正文分页没有推进。');
-        seenCursors.add(cursor);
-        /** 展开过程时已选择的方向继续使用，首个导航请求按正序开始。 */
-        const direction = paging?.direction ?? turnReadPaging(state.snapshot, turn, 'processByTurn')?.direction ?? 'forward';
-        await loadTurnHistoryPageV2(turn, direction);
-      }
-    })();
-    navigationTurnLoads.set(key, request);
-    /** 失败保留在调用方的局部状态，允许下一次明确重试。 */
-    const clear = () => {
-      if (navigationTurnLoads.get(key) === request) navigationTurnLoads.delete(key);
-    };
-    void request.then(clear, clear);
-    return request;
+    try {
+      /** 本地和 Provider 轮次别名共用同一份分页请求。 */
+      const turn = await loadTurnReadIdentity(turnId, generation);
+      /** 轮次身份与代次共同隔离按需读取。 */
+      const key = `${generation}:${turn.id}`;
+      /** 点击与进入视口可能同时请求同一轮。 */
+      const existing = navigationTurnLoads.get(key);
+      if (existing) return await existing;
+      /** 页只合并展示投影，不推进实时同步进度。 */
+      const request = (async () => {
+        /** 沿用已有按轮次模型历史接口。 */
+        const load = options.client.loadNativeConversationTurnModelHistoryV2;
+        if (!load || !state.snapshot?.snapshotV2) throw new Error('会话正文尚未就绪，请重试。');
+        /** 冻结游标必须严格前进，失败不能无界重试。 */
+        const seenCursors = new Set<string>();
+        while (true) {
+          // 页面与游标可能仍在等待位置接管；只有实际归约完成后才能决定下一页。
+          await waitForTranscriptPlacementRecovery(generation);
+          /** 导航沿已有连续范围和读取方向补齐，不重新从第一页覆盖进度。 */
+          const paging = turnReadPaging(state.snapshot, turn, 'historyByTurn');
+          if (paging?.loaded && !paging.hasMore) return;
+          /** 空游标代表该轮第一页。 */
+          const cursor = paging?.nextCursor ?? '';
+          if (seenCursors.has(cursor)) throw new Error('历史正文分页没有推进。');
+          seenCursors.add(cursor);
+          /** 展开过程时已选择的方向继续使用，首个导航请求按正序开始。 */
+          const direction = paging?.direction ?? turnReadPaging(state.snapshot, turn, 'processByTurn')?.direction ?? 'forward';
+          await loadTurnHistoryPageV2(turn, direction);
+        }
+      })();
+      navigationTurnLoads.set(key, request);
+      /** 失败保留在调用方的局部状态，允许下一次明确重试。 */
+      const clear = () => {
+        if (navigationTurnLoads.get(key) === request) navigationTurnLoads.delete(key);
+      };
+      void request.then(clear, clear);
+      return await request;
+    } catch (error) {
+      // 已关闭的控制器不再拥有阅读请求；连接换代沿当前分页继续，不向用户报告内部取消。
+      if (disposed) return;
+      if (generation !== connectionToken) return loadNavigationTurn(turnId);
+      throw error;
+    }
   }
 
   function dispatchV2Snapshot(snapshot: NativeConversationSnapshot): void {
@@ -2900,16 +3068,16 @@ export function createSessionController(options: CreateSessionControllerOptions)
     dispatch({ type: 'snapshot_v2_page_merged', snapshot });
   }
 
-  /** 分页等待消息位置实际接管，读取失败或连接换代不能被误认成游标未推进。 */
+  /** 分页等待位置核对及其触发的连接恢复，内部同步暂停不产生正文读取错误。 */
   async function waitForTranscriptPlacementRecovery(generation: number): Promise<void> {
-    while (placementRecovery) {
-      /** 等待当前真实核对；期间新到的位置代次仍由同一接管链处理。 */
-      const recovery = placementRecovery;
+    while (placementRecovery || syncProjectionSuspended) {
+      /** 位置核对失败会转入既有连接恢复，正文读取等待同一恢复任务继续。 */
+      const recovery = placementRecovery ?? hydrationPromise ?? reconnectLoopPromise;
+      if (!recovery) throw new Error(state.error?.message ?? '会话内容暂时无法刷新');
       await recovery;
       if (disposed || generation !== connectionToken) throw new Error('会话连接已变化，请重新定位。');
     }
     if (disposed || generation !== connectionToken || state.snapshot?.id !== options.conversationId) throw new Error('会话连接已变化，请重新定位。');
-    if (syncProjectionSuspended) throw new Error(state.error?.message ?? '会话位置尚未完成同步，请重试。');
   }
 
   /** 正文页和分页进度作为同一动作接管，调用方不会先于真实状态继续读取。 */
@@ -3152,7 +3320,12 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const loadProcess = options.client.loadNativeConversationProcessV2;
     const generation = connectionToken;
     /** 完整目录为深历史提供准确身份，导航与展开不能按别名各自读取。 */
-    const turn = await loadTurnReadIdentity(turnIdentity, generation);
+    const turn = await loadTurnReadIdentity(turnIdentity, generation).catch((error: unknown) => {
+      // 连接换代或关闭后由当前视图接管，旧身份请求不产生可见错误。
+      if (disposed || generation !== connectionToken) return null;
+      throw error;
+    });
+    if (!turn || disposed || generation !== connectionToken) return;
     const current = state.snapshot;
     if (!loadProcess || !current?.snapshotV2 || !current.v2Paging) return;
     // Snapshot V2 的固定首屏只携带最近闭合轮次；更早模型历史仍保留本地 turn id，
@@ -3245,7 +3418,13 @@ export function createSessionController(options: CreateSessionControllerOptions)
         },
       }));
     }
-    await commitV2Snapshot(canonicalizeTurnReadPaging(next, turn), generation);
+    try {
+      await commitV2Snapshot(canonicalizeTurnReadPaging(next, turn), generation);
+    } catch (error: unknown) {
+      // 等待位置接管期间的连接换代由当前视图接管，不报告旧过程请求的内部取消。
+      if (disposed || generation !== connectionToken) return;
+      throw error;
+    }
     if (processError) throw processError;
   }
 
@@ -3421,6 +3600,22 @@ export function createSessionController(options: CreateSessionControllerOptions)
     await loadTurnArtifactsV2('__conversation_resources__', true);
   }
 
+  /** 网络恢复或重新查看窗口时立即续接读取；不重发任何业务操作。 */
+  const restoreConnection = (): void => {
+    const failure = state.error;
+    if (
+      !disposed &&
+      needsConnectionRecovery() &&
+      state.transportState !== 'ready' &&
+      !failure?.recoveryRequired &&
+      failure?.retryable !== false &&
+      !(failure?.status !== undefined && failure.status >= 400 && failure.status < 500 && ![408, 429].includes(failure.status))
+    )
+      void ensureRealtimeConnection().catch(() => undefined);
+  };
+  globalThis.addEventListener?.('online', restoreConnection);
+  globalThis.addEventListener?.('focus', restoreConnection);
+
   const controller: SessionController = {
     start() {
       if (state.transportState === 'ready') return Promise.resolve();
@@ -3456,6 +3651,10 @@ export function createSessionController(options: CreateSessionControllerOptions)
     dispose() {
       if (disposed) return;
       disposed = true;
+      globalThis.removeEventListener?.('online', restoreConnection);
+      globalThis.removeEventListener?.('focus', restoreConnection);
+      for (const resolve of sendAcceptanceResolvers.values()) resolve();
+      sendAcceptanceResolvers.clear();
       for (const request of resourceRequests) request.abort();
       finishPendingSendReconcileWait?.();
       for (const context of transcriptHydrations) context.controller.abort(new DOMException('会话已关闭。', 'AbortError'));
@@ -3735,6 +3934,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
     retryPendingSend,
     /** 用户点击重试后，沿用已有耐久发送链路继续最新失败请求。 */
     async retryFailedTurn(providerTurnId) {
+      /** 历史浏览按需订阅实时事件，续接前先接入，保留后续回复与重连进度。 */
+      await ensureRealtimeConnection();
       /** 先取得权威终态；旧失败卡片不能在其他轮次运行时重新派发。 */
       await applyAuthoritativeSnapshot(await loadConversationForHydration());
       /** 只续跑最新的明确失败，不自动重放未知送达或已完成的请求。 */
@@ -3869,13 +4070,14 @@ export function createSessionController(options: CreateSessionControllerOptions)
         return Promise.reject(new Error(`Session operation already in progress: ${activeOperation.key}`));
       }
       const previousConversationState = state.conversationState;
+      const token = connectionToken;
       dispatch({ type: 'interrupt_started', turnId });
       return runOperation(
         operation,
         () => options.client.interruptNativeTurn(options.projectId, options.conversationId, turnId),
         () => undefined,
       ).catch((error) => {
-        dispatch({ type: 'interrupt_failed', previousConversationState, error: toSessionError(error, true) });
+        if (!disposed && token === connectionToken) dispatch({ type: 'interrupt_failed', turnId, previousConversationState, error: toSessionError(error, true) });
         throw error;
       });
     },
@@ -3998,16 +4200,76 @@ export interface UseSessionControllerResult {
  * 组件边界通过 useSessionControllerSelector 订阅所需 slice。
  */
 export function useSessionControllerInstance(options: CreateSessionControllerOptions): SessionController {
-  const controller = useMemo(
-    () => createSessionController(options),
-    [options.client, options.projectId, options.conversationId, options.enabled, options.realtimePolicy, options.initialCachedState, options.initialOptimisticState, options.storage, options.createId],
+  /** 只将主页面的真实会话交给页面缓存，子会话关闭时仍立即释放。 */
+  const retention = useContext(ConversationControllerRetentionContext);
+  /** 导航别名和子会话身份不能冒用主页面的控制器所有权。 */
+  const retainedOwner = retention?.conversationId === options.conversationId ? retention : null;
+  /** 页面恢复时使用最新显示缓存，普通更新只改变初始输入，不重建活动控制器。 */
+  const latest = useRef(options);
+  latest.current = options;
+  /** 身份决定控制器边界；初始数据与读取策略在创建或恢复时采样，不重建活动控制器。 */
+  const lifecycle = useMemo(
+    () => ({ controller: createSessionController(options), disposed: false, registered: false, shown: false }),
+    [options.client, options.projectId, options.conversationId, options.enabled, options.storage, options.createId, retainedOwner],
   );
-  useEffect(() => {
+  /** Activity 恢复后在绘制前交接新控制器，原有正文和输入 DOM 保持不变。 */
+  const [, refreshController] = useState(0);
+  useLayoutEffect(() => {
     // 尚未启动的控制器没有连接资源可释放；启用时会按新状态构造可工作的实例。
-    if (options.enabled === false) return;
+    if (options.enabled === false) {
+      for (const prior of retainedOwner?.controllers ?? []) prior.dispose();
+      retainedOwner?.controllers.clear();
+      return;
+    }
+    // StrictMode 的真正清理也会释放所有者；不能重新启动已被释放的实例。
+    if (retainedOwner && lifecycle.registered && !retainedOwner.controllers.has(lifecycle.controller)) lifecycle.disposed = true;
+    if (lifecycle.disposed) {
+      /** 隐藏前已加载的历史与本地显示身份不能丢失。 */
+      const retained = lifecycle.controller.getState();
+      /** 后台较新的事件水位优先，较旧缓存不能覆盖保留的正文。 */
+      const cached = latest.current.initialCachedState;
+      lifecycle.controller = createSessionController({
+        ...latest.current,
+        initialCachedState: cached?.snapshot && cached.snapshot.throughEventSeq >= (retained.snapshot?.throughEventSeq ?? 0) ? cached : retained,
+      });
+      lifecycle.disposed = false;
+      refreshController((revision) => revision + 1);
+    }
+    /** 清理始终释放本次实际启动的实例，不会误关恢复后的连接。 */
+    const controller = lifecycle.controller;
+    if (retainedOwner) {
+      for (const prior of retainedOwner.controllers)
+        if (prior !== controller) {
+          prior.dispose();
+          retainedOwner.controllers.delete(prior);
+        }
+      retainedOwner.controllers.add(controller);
+      lifecycle.registered = true;
+    }
     void controller.start().catch(() => undefined);
-    return () => controller.dispose();
-  }, [controller, options.enabled]);
+    return () => {
+      if (!retainedOwner) {
+        lifecycle.disposed = true;
+        controller.dispose();
+      }
+    };
+  }, [lifecycle, options.enabled, retainedOwner]);
+  /** 当前 render 使用已交接的控制器，选择器会重新订阅其持久状态。 */
+  const controller = lifecycle.controller;
+  useEffect(() => {
+    if (!retainedOwner || options.enabled === false) return;
+    if (!lifecycle.shown) {
+      lifecycle.shown = true;
+      return;
+    }
+    /** 先显示已保留界面，跨过一次绘制后再核对断线期间的权威状态。 */
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        void controller.reconnect().catch(() => undefined);
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [controller, lifecycle, retainedOwner, options.enabled]);
   useEffect(() => {
     if (options.enabled === false) return;
     // 浏览器订阅属于可选宿主能力；桥接对象存在时也可能没有此接口。
@@ -4054,20 +4316,6 @@ function errorMessage(error: unknown): string {
 /** 输入框与后台建议共用草稿身份，不能另建一份草稿键规则。 */
 function conversationDraftStorageKey(projectId: string, conversationId: string): string {
   return `zeus.native-session-draft:${projectId}:${conversationId}`;
-}
-
-/** 未打开的会话也按同一份草稿、附件和待发送记录判断是否允许自动建议。 */
-export function conversationDraftAllowsInputSuggestion(projectId: string, conversationId: string): boolean {
-  /** 无法读取草稿时不猜测为空，避免覆盖用户已有输入的意图。 */
-  const storage = browserStorage();
-  if (!storage) return false;
-  /** 后台自动生成不能把读取失败后的空草稿当作真实用户输入。 */
-  let readFailed = false;
-  /** 复用正式草稿读取与归一化逻辑，不复制存储格式。 */
-  const draft = readPersistedDraft(storage, conversationDraftStorageKey(projectId, conversationId), () => {
-    readFailed = true;
-  });
-  return !readFailed && !draft.draft.length && draft.attachments.length === 0 && !draft.browserSubmission && !hasConversationContext(draft.contextDraft ?? emptyConversationContextDraft);
 }
 
 function browserStorage(): SessionDraftStorage | undefined {

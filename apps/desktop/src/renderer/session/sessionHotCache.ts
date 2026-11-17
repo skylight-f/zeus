@@ -1,4 +1,4 @@
-import { emptyConversationContextDraft } from '@zeus/shared';
+import { emptyConversationContextDraft, sessionViewCacheSchemaGeneration } from '@zeus/shared';
 import type { NativeSessionState } from './sessionTypes.js';
 import { resumeCachedConversationSnapshot } from './conversationSnapshotV2Adapter.js';
 import { retainResourcesOwnedByItem } from './conversationResourceProjection.js';
@@ -11,8 +11,8 @@ export const sessionHotCacheByteLimit = 32 * 1024 * 1024;
 export const sessionHotCacheEntryByteLimit = 8 * 1024 * 1024;
 /** 磁盘显示缓存允许保留的最大会话数。 */
 export const sessionViewCacheMaximumEntries = 32;
-/** 磁盘显示缓存的结构代次。 */
-export const sessionViewCacheSchemaGeneration = 'zeus-session-display-cache';
+/** 仅恢复在截断前已经采用用户展示正文的缓存，旧执行正文缓存由权威快照重建。 */
+export { sessionViewCacheSchemaGeneration } from '@zeus/shared';
 /** 磁盘显示缓存的最长保留时间。 */
 export const sessionViewCacheMaximumAgeMs = 14 * 24 * 60 * 60 * 1000;
 
@@ -53,8 +53,11 @@ export function rememberSessionHotState(cache: SessionHotCache, conversationId: 
   if (!state.snapshot || state.conversationId !== conversationId || state.snapshot.id !== conversationId) return false;
   const estimatedBytes = estimateSessionHotStateBytes(state);
   const entryByteLimit = options.entryByteLimit ?? sessionHotCacheEntryByteLimit;
-  cache.delete(conversationId);
-  if (!Number.isFinite(estimatedBytes) || estimatedBytes > entryByteLimit) return false;
+  if (!Number.isFinite(estimatedBytes) || estimatedBytes > entryByteLimit) {
+    cache.delete(conversationId);
+    return false;
+  }
+  // 后台刷新和延迟持久化不改变访问顺序；前台访问由 refreshSessionHotState 更新最近使用身份。
   cache.set(conversationId, { state, estimatedBytes, cachedAt: options.cachedAt ?? Date.now() });
 
   const ordinaryLimit = options.ordinaryLimit ?? ordinarySessionHotCacheLimit;

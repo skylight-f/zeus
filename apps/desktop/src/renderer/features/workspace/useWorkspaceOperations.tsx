@@ -1,14 +1,15 @@
 import type { FilePreviewSourceWorkspace } from '@zeus/shared';
 import { formatVisibleApplicationError, modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
-import { useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { useCallback, useMemo, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { temporaryWorkspaceId, cloneTaskManagementStatusConfig, type TaskManagementStatusConfig } from '@zeus/shared';
 import { notifyMainAppShellSettingsChanged, recordManualUpdateCheckInMain } from '../../appShellBridge.js';
-import { ConnectedSessionWorkspace, SessionWorkspace, NewConversationComposer, type NewConversationDraftStore } from '../../session/SessionWorkspace.js';
+import { ConnectedSessionWorkspace, SessionWorkspace, readCachedCodexConversationCapabilities, refreshCodexConversationCapabilities, type NewConversationDraftStore } from '../../session/SessionWorkspace.js';
+import { ConversationWorkspaceCache } from '../../session/ConversationWorkspaceCache.js';
 import type { SessionTerminalClient } from '../../session/SessionTerminal.js';
 import { TaskDetailPaneContent } from '../../task/TaskDetailPaneContent.js';
 import { TaskDigitalTeamProgress } from '../digital-teams/TaskDigitalTeamProgress.js';
 import { taskModelPushHasRealChoice } from '../../task/TaskModelPushPendingWorkspace.js';
-import { normalizeTaskTableColumnPreferences, normalizeTaskTableEnumSortOrders, resolveTaskManagementStatus } from '../../task/taskWorkspaceModel.js';
+import { normalizeTaskTableColumnPreferences, resolveTaskManagementStatus } from '../../task/taskWorkspaceModel.js';
 import { createSessionOperationId } from '../../sessionOperationIdentity.js';
 import {
   type AiRuntimeSession,
@@ -36,14 +37,12 @@ import {
   mergeAppShellSettingsSaveResponse,
   normalizeProjectSidebarPreferredWidth,
   normalizeRendererAppShellSettings,
-  normalizeTaskStatusFilter,
   persistProjectSidebarPreferredWidth,
   PROJECT_SIDEBAR_DEFAULT_WIDTH,
   PROJECT_SIDEBAR_MAX_WIDTH,
   type ProjectCodeWorkspaceMode,
   type ProjectSidebarDragState,
   type ProjectWorkspaceSection,
-  resolveTaskManagementStatusConfig,
   resolveTaskTableColumns,
   taskTableColumnPreferencesEqual,
   toAppShellSettingsSavePayload,
@@ -96,7 +95,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     nativeSessionTask,
     nativeSessionTaskReadOnly,
     newConversationFocusRequest,
-    optimisticTerminalTaskStatuses,
     pendingSourceWorkspaceLeaveCancelRef,
     pendingSourceWorkspaceLeaveRef,
     pendingTaskTableLayoutLeaveCancelRef,
@@ -131,6 +129,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     selectedProject,
     selectedTaskModelPushOperation,
     selectedTaskModelPushOptimisticState,
+    nativeConversationStartState,
     sessionWorkspaceCopy,
     setActionState,
     setActiveNavTarget,
@@ -149,6 +148,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setGitOperationStatus,
     setLatestConversationContentVisible,
     setPatchExportStatus,
+    projectGitOpen,
+    setProjectGitOpen,
     setProjectCodeWorkspaceMode,
     setVisitedCodeWorkspaceModes,
     setProjectConfig,
@@ -203,9 +204,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setProjectCommandsProjectId,
     settingsWorkspaceCopy,
     snapshot,
-    taskModelPushEntry,
-    taskModelPushError,
-    taskModelPushTaskId,
     sourceWorkspaceDirty,
     sourceWorkspaceTarget,
     setSourceWorkspaceTarget,
@@ -222,7 +220,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     telegramAllowedUserIdsInput,
     telegramNotificationChatIdsInput,
     telegramNotificationSettings,
-    telegramSecuritySettings,
     telegramTokenInput,
     templateTaskIdentityRef,
     uiCopy,
@@ -232,6 +229,13 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   } = state;
   // 返回新会话只重新聚焦输入框；未发送草稿随工作区保留，由发送成功负责清理。
   const [newConversationDrafts] = useState<NewConversationDraftStore>(() => new Map());
+  /** 新建会话与项目预读共用目录请求，回调保持稳定以免输入时反复触发加载。 */
+  const loadNewConversationCapabilities = useCallback(
+    (projectId: string, force = false) => {
+      return props.nativeConversationClient ? refreshCodexConversationCapabilities(props.nativeConversationClient, projectId, force) : Promise.reject(new Error('模型选项读取不可用。'));
+    },
+    [props.nativeConversationClient],
+  );
   const sessionTerminalClient = useMemo<SessionTerminalClient | undefined>(() => {
     const {
       onConfirmRuntimeOperation,
@@ -309,16 +313,11 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   const {
     chooseNativeConversationAttachments,
     executeNewConversationProjectGit,
-    openTaskConversation,
-    openTaskConversationInline,
     openTaskCreateModal,
     openTaskCopyModal,
     openTaskGitDelivery,
-    openTaskModelPush,
-    retryTaskModelPushEntry,
     recordLocalError,
     recordTaskMutationVersion,
-    refreshNativeConversationChoices,
     refreshOpenTaskEvents,
     reopenTaskFromConversation,
     requestTaskTerminalCleanupConfirmation,
@@ -326,9 +325,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     selectNewConversationProject,
     startNativeConversation,
     startProjectConversation,
-    taskDetailPaneConversationState,
-    taskDetailPaneConversations,
-    taskDetailPaneModelPushView,
     taskDetailPaneTask,
     taskModelPushWorkspaceActions,
     updateTaskContent,
@@ -363,6 +359,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     return `${successCount} processed, ${skippedCount} skipped, ${failedCount} failed.`;
   }
 
+  /** 终态变更先确认整批清理，再逐项保存；取消时不修改任何任务。 */
   async function runBulkTaskStatusChange(targetStatus: TaskManagementStatus, taskIds: string[]): Promise<void> {
     const requestedTaskIdSet = new Set(taskIds);
     const requestedTasks = visibleTasks.filter((task) => requestedTaskIdSet.has(task.id));
@@ -374,12 +371,19 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       setTaskBulkActionStatus({ kind: 'done', message: formatTaskBulkActionResult(0, skippedCount, 0) });
       return;
     }
+    /** 清理授权只用于本次选中且需要变更的终态任务。 */
+    const confirmWorktreeCleanup = targetStatus === activeTaskManagementStatusConfig.roles.completedStatusId || targetStatus === activeTaskManagementStatusConfig.roles.cancelledStatusId;
+    if (confirmWorktreeCleanup) {
+      /** 使用配置中的状态名称，确认数量不包含已经处于目标状态的任务。 */
+      const statusLabel = formatConfiguredTaskManagementStatus(targetStatus, activeTaskManagementStatusConfig, appShellSettings.appLanguage);
+      if (!(await requestTaskTerminalCleanupConfirmation(statusLabel, eligibleTasks.length))) return;
+    }
     setActionState('updating-task');
     setTaskBulkActionStatus({ kind: 'running', message: formatTaskBulkActionResult(0, skippedCount, 0) });
     try {
       for (const task of eligibleTasks) {
         try {
-          const result = await updateTaskManagementStatus(task.id, targetStatus, { expectedUpdatedAt: task.updatedAt ?? '' });
+          const result = await updateTaskManagementStatus(task.id, targetStatus, { expectedUpdatedAt: task.updatedAt ?? '', confirmWorktreeCleanup });
           if (!result || result.kind !== 'updated') {
             skippedCount += 1;
             continue;
@@ -933,64 +937,43 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     }
   }
 
+  /** 仅在文件确实保存后更新最近导出状态，取消时结束本次操作。 */
   async function exportLocalSettings(): Promise<void> {
     if (!props.onExportLocalSettings) return;
     setActionState('loading-runtime');
     try {
       const exported = await props.onExportLocalSettings();
       const saved = props.onExportSettingsFile ? await props.onExportSettingsFile(exported) : { saved: false, filePath: null };
-      setDataPortabilityStatus({ kind: 'exported', target: saved.saved && saved.filePath ? saved.filePath : exported.exportedAt });
+      if (!saved.saved || !saved.filePath) {
+        setActionState('idle');
+        return;
+      }
+      setDataPortabilityStatus({ kind: 'exported', target: saved.filePath });
       setActionState('idle');
     } catch (error) {
       recordLocalError('renderer-action', error);
     }
   }
 
+  /** 只提交用户选中的设置快照，取消选择不能触发配置写入。 */
   async function importLocalSettings(): Promise<void> {
     if (!props.onImportLocalSettings) return;
     setActionState('loading-runtime');
     try {
       const selected = props.onImportSettingsFile ? await props.onImportSettingsFile() : { imported: false, filePath: null };
-      const result = await props.onImportLocalSettings(
-        selected.snapshot
-          ? {
-              schemaVersion: 1,
-              settings: {
-                appShell: toSafeAppShellImport(selected.snapshot.settings.appShell),
-                runtime: selected.snapshot.settings.runtime,
-                telegramNotification: selected.snapshot.settings.telegramNotification,
-                telegramSecurity: selected.snapshot.settings.telegramSecurity,
-              },
-            }
-          : {
-              schemaVersion: 1,
-              settings: {
-                appShell: {
-                  appLanguage: appShellSettings.appLanguage,
-                  appearance: appShellSettings.appearance,
-                  webviewDebugEnabled: appShellSettings.webviewDebugEnabled,
-                  developerModeEnabled: appShellSettings.developerModeEnabled,
-                  multiWindowEnabled: appShellSettings.multiWindowEnabled,
-                  backgroundModeEnabled: appShellSettings.backgroundModeEnabled,
-                  desktopNotificationsEnabled: appShellSettings.desktopNotificationsEnabled,
-                  openAtLoginEnabled: appShellSettings.openAtLoginEnabled,
-                  autoUpdateChannel: appShellSettings.autoUpdateChannel,
-                  defaultProjectId: appShellSettings.defaultProjectId,
-                  defaultModel: appShellSettings.defaultModel,
-                  defaultTaskTemplateId: appShellSettings.defaultTaskTemplateId,
-                  taskTableColumns: normalizeTaskTableColumnPreferences(appShellSettings.taskTableColumns),
-                  taskTableEnumSortOrders: normalizeTaskTableEnumSortOrders(appShellSettings.taskTableEnumSortOrders),
-                  taskManagementStatusTemplate: resolveTaskManagementStatusConfig(appShellSettings),
-                  taskStatusFilter: normalizeTaskStatusFilter(appShellSettings.taskStatusFilter),
-                  taskViewMode: appShellSettings.taskViewMode,
-                  taskPageView: appShellSettings.taskPageView,
-                },
-                runtime: runtimeSettings,
-                telegramNotification: telegramNotificationSettings,
-                telegramSecurity: telegramSecuritySettings,
-              },
-            },
-      );
+      if (!selected.imported || !selected.snapshot) {
+        setActionState('idle');
+        return;
+      }
+      const result = await props.onImportLocalSettings({
+        schemaVersion: 1,
+        settings: {
+          appShell: toSafeAppShellImport(selected.snapshot.settings.appShell),
+          runtime: selected.snapshot.settings.runtime,
+          telegramNotification: selected.snapshot.settings.telegramNotification,
+          telegramSecurity: selected.snapshot.settings.telegramSecurity,
+        },
+      });
       if (props.onLoadAppShellSettings) setAppShellSettings(normalizeRendererAppShellSettings(await props.onLoadAppShellSettings()));
       if (props.onLoadRuntimeSettings) setRuntimeSettings(normalizeRuntimeSettings(await props.onLoadRuntimeSettings()));
       if (props.onLoadTelegramNotificationSettings) {
@@ -1003,7 +986,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         setTelegramSecuritySettings(settings);
         setTelegramAllowedUserIdsInput(settings.allowedUserIds.join(', '));
       }
-      setDataPortabilityStatus({ kind: 'imported', target: selected.imported && selected.filePath ? selected.filePath : result.importedAt, changedSettings: result.importedSettings });
+      setDataPortabilityStatus({ kind: 'imported', target: selected.filePath ?? result.importedAt, changedSettings: result.importedSettings });
       setActionState('idle');
     } catch (error) {
       recordLocalError('renderer-action', error);
@@ -1482,14 +1465,39 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     requestWorkspaceLeave(navigate);
   }
 
+  /** Git 收起不改变底层页面或项目。 */
+  const closeProjectGit = useCallback(() => setProjectGitOpen(false), [setProjectGitOpen]);
+
+  /** 右侧图标与快捷键共用当前项目的 Git 开关。 */
+  function toggleProjectGit(): void {
+    if (!selectedProject || selectedProject.id === temporaryWorkspaceId) return;
+    setProjectGitOpen(!projectGitOpen);
+  }
+
   function openProjectSection(
     project: ProjectRecord,
     section: ProjectWorkspaceSection,
     codeMode: ProjectCodeWorkspaceMode = 'source',
-    onNavigated?: (() => void) | FilePreviewSourceWorkspace,
+    onNavigated?: (() => void) | FilePreviewSourceWorkspace | null,
     explicitSourceTarget: FilePreviewSourceWorkspace | null = null,
   ): void {
     const sourceTarget = typeof onNavigated === 'object' ? onNavigated : explicitSourceTarget;
+    if (section === 'git' || (section === 'code' && codeMode === 'git')) {
+      if (project.id === temporaryWorkspaceId) return;
+      const openGit = () => {
+        activeProjectIdRef.current = project.id;
+        setProjectDetail(project);
+        setProjectGitOpen(true);
+        if (typeof onNavigated === 'function') onNavigated();
+      };
+      if (project.id === activeProjectId) openGit();
+      else requestWorkspaceLeave(openGit);
+      return;
+    }
+    if (section === 'code' && codeMode === 'commands') {
+      setProjectCommandsProjectId(project.id);
+      return;
+    }
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
@@ -1497,6 +1505,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       setActiveNavTarget(section === 'sessions' ? 'conversations' : 'projects');
       setActiveProjectSection(section);
       if (section === 'code') {
+        setProjectGitOpen(false);
         setProjectCodeWorkspaceMode(codeMode);
         setVisitedCodeWorkspaceModes((current) => new Set(current).add(codeMode));
       }
@@ -1533,7 +1542,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       recordLocalError('project-commands-open', new Error('The conversation project is no longer available.'));
       return;
     }
-    openProjectSection(project, 'code', 'commands');
+    setProjectCommandsProjectId(project.id);
   }
 
   async function togglePinnedProject(projectId: string): Promise<void> {
@@ -1745,9 +1754,22 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
   function renderNativeConversationWorkspace(onOpenTaskDetail: (taskId: string) => void, embeddedInTask = false): ReactNode {
     /** 原会话阅读与输入保持同一控制器，不因后台团队状态重读重新创建。 */
     const workspace = renderNativeConversationWorkspaceContent(onOpenTaskDetail, embeddedInTask);
+    /** 保留正文与团队进展的共同外壳，跨项目切换不改变已有页面在树中的位置。 */
+    const retainWorkspace = (content: ReactNode): ReactNode => (
+      <ConversationWorkspaceCache
+        conversationId={selectedNativeConversation?.id}
+        conversationKey={
+          selectedNativeConversation?.transportKind === 'codex_native'
+            ? `${selectedNativeConversation.projectId}:${selectedTaskModelPushOperation?.navigationId ?? selectedNativeConversation.navigationId ?? selectedNativeConversation.id}`
+            : undefined
+        }
+      >
+        {content}
+      </ConversationWorkspaceCache>
+    );
     /** 完整页和任务内嵌页共用准确会话关联，不能由外层任务另取一份旧运行。 */
-    if (embeddedInTask || !nativeSessionTask || !selectedNativeConversation || !props.commandClient) return workspace;
-    return (
+    if (embeddedInTask || !nativeSessionTask || !selectedNativeConversation || !props.commandClient) return retainWorkspace(workspace);
+    return retainWorkspace(
       <div className="task-conversation-with-team-progress">
         <TaskDigitalTeamProgress
           key={`${nativeSessionTask.id}:${selectedNativeConversation.id}`}
@@ -1776,19 +1798,16 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           }}
         />
         {workspace}
-      </div>
+      </div>,
     );
   }
 
   /** 保留既有会话控制器与新建、重试、归档阅读的实际入口。 */
   function renderNativeConversationWorkspaceContent(onOpenTaskDetail: (taskId: string) => void, embeddedInTask = false): ReactNode {
     const taskReadOnlyGate =
-      nativeSessionTaskReadOnly && nativeSessionTask && selectedNativeConversation
+      (nativeSessionTaskReadOnly || selectedNativeConversation?.archived) && nativeSessionTask && selectedNativeConversation
         ? {
-            title: appShellSettings.appLanguage === 'zh-CN' ? '此任务已结束，会话当前为只读' : 'This task is closed and the conversation is read-only',
-            description:
-              appShellSettings.appLanguage === 'zh-CN' ? '你仍可查看完整归档记录。继续对话会重新打开任务，并只取消归档当前会话。' : 'You can still review the full archive. Continuing reopens the task and unarchives only this conversation.',
-            actionLabel: appShellSettings.appLanguage === 'zh-CN' ? '重新打开任务并继续' : 'Reopen task and continue',
+            actionLabel: nativeSessionTaskReadOnly ? (appShellSettings.appLanguage === 'zh-CN' ? '重新打开任务' : 'Reopen task') : appShellSettings.appLanguage === 'zh-CN' ? '恢复会话' : 'Restore conversation',
             busy: taskConversationReopenState?.conversationId === selectedNativeConversation.id && taskConversationReopenState.status === 'busy',
             error: taskConversationReopenState?.conversationId === selectedNativeConversation.id && taskConversationReopenState.status === 'error' ? taskConversationReopenState.error : null,
             onAction: () => reopenTaskFromConversation(nativeSessionTask.id, selectedNativeConversation.id),
@@ -1873,7 +1892,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           terminalClient={sessionTerminalClient}
           choices={nativeSessionChoices}
           initialCachedState={nativeConversationHotCacheRef.current.get(selectedNativeConversation.id)?.state}
-          initialOptimisticState={selectedTaskModelPushOptimisticState}
+          initialOptimisticState={selectedTaskModelPushOptimisticState ?? (nativeConversationStartState?.conversationId === selectedNativeConversation.id ? nativeConversationStartState : undefined)}
           initialCapabilities={selectedTaskModelPushOperation?.capabilities}
           stableConversationId={selectedTaskModelPushOperation?.navigationId}
           creationStatus={
@@ -1932,6 +1951,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         historyOnly={Boolean(selectedNativeConversation && selectedNativeConversationPresentation === 'history')}
         task={nativeSessionTask}
         owner={nativeSessionOwner}
+        capabilities={props.nativeConversationClient && nativeSessionOwner ? readCachedCodexConversationCapabilities(props.nativeConversationClient, nativeSessionOwner.projectId) : null}
         projects={snapshot.projects}
         tasks={currentProjectTasks.map((task) => createSessionWorkspaceTask(task, appShellSettings, appShellSettings.appLanguage))}
         choices={nativeSessionChoices}
@@ -1953,11 +1973,12 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         loadError={selectedNativeConversation && selectedNativeConversation.transportKind !== 'codex_native' ? nativeLegacyMessageError : nativeSessionChoiceTaskState?.error}
         onLatestContentVisibilityChange={setLatestConversationContentVisible}
         actions={{
+          onNewConversation: () => domainActions.prepareNewConversationDraft(),
           onStartConversation: startNativeConversation,
           onStartProjectConversation: startProjectConversation,
           onOpenTaskDetail,
           onTaskManagementStatusChange: (taskId, status) => updateTaskManagementStatus(taskId, status),
-          onLoadCapabilities: props.nativeConversationClient?.loadCodexConversationCapabilities,
+          onLoadCapabilities: props.nativeConversationClient?.loadCodexConversationCapabilities ? loadNewConversationCapabilities : undefined,
           onLoadSkills: props.nativeConversationClient?.loadSkills,
           onLoadDigitalEmployees: props.commandClient?.loadProjectDigitalEmployees,
           onOpenAiSettings: (section) => {
@@ -1968,7 +1989,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             handleMainNavigate('settings');
           },
           onSelectNewConversationProject: selectNewConversationProject,
-          onLoadNewConversationProjectGit: props.nativeConversationClient?.loadProjectGitWorkbench,
+          onLoadNewConversationProjectGit: props.nativeConversationClient ? (projectId) => props.nativeConversationClient!.loadProjectGitWorkbench(projectId, false) : undefined,
           onExecuteNewConversationProjectGit: props.nativeConversationClient ? executeNewConversationProjectGit : undefined,
           onChooseStartAttachments: props.onChooseConversationResources ? chooseNativeConversationAttachments : undefined,
           onSelectTask: (task) => {
@@ -2003,72 +2024,15 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         statusDefinitions={activeTaskManagementStatusConfig.statuses}
         priorityOptions={taskWorkspaceCopy.taskCreatePriorityOptions}
         busy={updatingTaskBusy}
-        terminalReadOnly={
-          Boolean(optimisticTerminalTaskStatuses[taskDetailPaneTask.id]) ||
-          resolveTaskManagementStatus(taskDetailPaneTask) === activeTaskManagementStatusConfig.roles.completedStatusId ||
-          resolveTaskManagementStatus(taskDetailPaneTask) === activeTaskManagementStatusConfig.roles.cancelledStatusId
-        }
-        onUseDigitalTeam={(selection) => {
-          setDigitalTeamTask(taskDetailPaneTask);
-          setDigitalTeamEntrySelection(selection);
-          closeTaskDetail();
-          setActiveNavTarget('digital-teams');
-        }}
-        digitalTeamClient={props.commandClient ?? null}
-        onSubscribeRealtimeEvents={props.onSubscribeRealtimeEvents}
-        digitalEmployeeClient={props.commandClient ?? null}
-        conversations={taskDetailPaneConversations}
-        conversationsLoading={taskDetailPaneConversationState?.status === 'loading' && !taskDetailPaneConversationState.choicesKnown}
-        conversationsError={taskDetailPaneConversationState?.status === 'error' ? taskDetailPaneConversationState.error : null}
-        modelPushOperation={taskDetailPaneModelPushView}
-        modelPushEntry={
-          taskModelPushTaskId === taskDetailPaneTask.id && (taskModelPushEntry === 'checking' || taskModelPushEntry === 'error')
-            ? { checking: taskModelPushEntry === 'checking', error: taskModelPushEntry === 'error' ? taskModelPushError : null, onRetry: retryTaskModelPushEntry }
-            : undefined
-        }
-        onOpenConversation={(taskId, conversationId) => void openTaskConversation(taskId, conversationId)}
-        onManageEmployees={() => {
-          /** 员工统一维护，任务指派自动建立项目参与关系。 */
-          closeTaskDetail();
-          handleMainNavigate('digital-employees');
-        }}
-        onSelectConversation={openTaskConversationInline}
-        activeConversationId={selectedNativeConversation?.taskId === taskDetailPaneTask.id ? selectedNativeConversation.id : null}
-        conversationWorkspace={selectedNativeConversation?.taskId === taskDetailPaneTask.id && !state.sessionDrawerTarget ? renderNativeConversationWorkspace((taskId) => setTaskDetailPaneTaskId(taskId), true) : null}
-        newConversationWorkspace={
-          props.nativeConversationClient ? (
-            <NewConversationComposer
-              key={`task-discussion-${taskDetailPaneTask.id}`}
-              inputSuggestionSettings={appShellSettings.inputSuggestions}
-              onGenerateInputSuggestion={props.nativeConversationClient.generateInputSuggestion}
-              docked
-              drafts={newConversationDrafts}
-              language={appShellSettings.appLanguage}
-              owner={{
-                kind: 'task',
-                projectId: taskDetailPaneTask.projectId,
-                projectName: snapshot.projects.find((project) => project.id === taskDetailPaneTask.projectId)?.name ?? '',
-                taskId: taskDetailPaneTask.id,
-                taskTitle: taskDetailPaneTask.title,
-              }}
-              task={createSessionWorkspaceTask(taskDetailPaneTask, appShellSettings, appShellSettings.appLanguage)}
-              onStartTask={startNativeConversation}
-              onLoadCapabilities={props.nativeConversationClient.loadCodexConversationCapabilities}
-              onLoadSkills={props.nativeConversationClient.loadSkills}
-              onLoadDigitalEmployees={props.commandClient?.loadProjectDigitalEmployees}
-              onChooseAttachments={props.onChooseConversationResources ? chooseNativeConversationAttachments : undefined}
-              onOpenComputerSettings={() => {
-                setSettingsCategory('browser');
-                handleMainNavigate('settings');
-              }}
-            />
-          ) : null
-        }
-        onPushNewConversation={(taskId) => void openTaskModelPush(taskId)}
-        onRetryModelPush={retryTaskModelPush}
+        pushState={state.taskModelPushTaskId === taskDetailPaneTask.id && (state.taskModelPushEntry === 'checking' || state.taskModelPushEntry === 'error') ? state.taskModelPushEntry : undefined}
+        pushDisabled={taskDetailPaneTask.managementStatus === activeTaskManagementStatusConfig.roles.completedStatusId || taskDetailPaneTask.managementStatus === activeTaskManagementStatusConfig.roles.cancelledStatusId}
+        onPushNewConversation={(taskId) => void domainActions.openTaskModelPush(taskId)}
+        conversations={state.nativeConversationChoicesByTask[taskDetailPaneTask.id]?.choices ?? []}
+        conversationsLoading={state.nativeConversationChoiceTaskStates[taskDetailPaneTask.id]?.status === 'loading'}
+        conversationsError={state.nativeConversationChoiceTaskStates[taskDetailPaneTask.id]?.error}
+        onOpenConversation={(taskId, conversationId) => void domainActions.openTaskConversation(taskId, conversationId)}
+        onReloadConversations={(taskId) => void domainActions.refreshNativeConversationChoices(taskId).catch((error: unknown) => recordLocalError('task-conversation-refresh', error))}
         onOpenCodeDelivery={(taskId) => openTaskGitDelivery(taskId)}
-        onCommitCode={(taskId) => setTaskGitReviewState({ taskId, mode: 'commit-only' })}
-        onPushCode={(taskId) => setTaskGitReviewState({ taskId, mode: 'push-only' })}
         onUpdateTaskContent={updateTaskContent}
         onUpdateRelationships={updateTaskRelationships}
         onCreateChild={(taskId) => openTaskCreateModal(taskId)}
@@ -2078,42 +2042,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         onAuthorizeFiles={props.onAuthorizeTaskFiles}
         onMaterializeResources={props.onMaterializeTaskResources}
         onReadClipboardResources={props.onReadTaskClipboardResources}
-        onReloadConversations={(taskId) => void refreshNativeConversationChoices(taskId)}
         onLoadAttachmentPreview={props.onLoadTaskAttachmentPreview}
         onOpenAttachment={props.onOpenTaskAttachment}
-        workflowClient={props.nativeConversationClient?.tasks}
-        onLoadWorkflowCapabilities={props.nativeConversationClient ? () => props.nativeConversationClient!.loadCodexTaskPushCapabilities(taskDetailPaneTask.projectId, taskDetailPaneTask.id) : undefined}
-        onStartTaskStage={
-          props.nativeConversationClient
-            ? async (stage) => {
-                if (stage.kind === 'plan' || stage.kind === 'implementation') {
-                  await openTaskModelPush(taskDetailPaneTask.id, stage);
-                  return;
-                }
-                if (stage.kind !== 'code_review') throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '当前版本尚不支持启动自定义阶段。' : 'Custom stages cannot be started in this version.');
-                const workflow = await props.nativeConversationClient!.tasks.loadTaskWorkflow(taskDetailPaneTask.id);
-                const implementation = workflow?.stages.filter((candidate) => candidate.sequence < stage.sequence && candidate.kind === 'implementation').sort((left, right) => right.sequence - left.sequence)[0];
-                const accepted = implementation?.deliverables.filter((deliverable) => deliverable.status === 'accepted').sort((left, right) => right.version - left.version)[0];
-                const sourceAttempt = accepted ? implementation?.attempts.find((attempt) => attempt.id === accepted.attemptId) : null;
-                if (!sourceAttempt?.conversationId) throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '找不到已验收交付物所属的对话。' : 'The conversation associated with the accepted deliverable could not be found.');
-                const result = await startNativeConversation({
-                  mode: 'create',
-                  source: 'code_review',
-                  stageId: stage.id,
-                  task: { id: taskDetailPaneTask.id, projectId: taskDetailPaneTask.projectId, title: taskDetailPaneTask.title },
-                  inheritConversationId: sourceAttempt.conversationId,
-                  content: stage.prompt || (appShellSettings.appLanguage === 'zh-CN' ? '执行当前任务的独立代码审查阶段。' : 'Run the independent code review stage for this task.'),
-                  permissionMode: 'read-only',
-                  collaborationMode: 'default',
-                  serviceTierSelection: stage.serviceTier ? { type: 'catalog', id: stage.serviceTier } : { type: 'standard' },
-                  model: stage.modelRef,
-                  ...(stage.effort ? { effort: stage.effort } : {}),
-                  agentKind: stage.agentKind,
-                });
-                if (typeof result === 'object' && result.state === 'failed') throw new Error(result.message);
-              }
-            : undefined
-        }
       />
     );
   }
@@ -2168,6 +2098,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     loadTaskTemplates,
     moveTaskBoardTask,
     openProjectSection,
+    toggleProjectGit,
+    closeProjectGit,
     openProjectCommands,
     projectDrawerVisualProps,
     projectSidebarMaximumWidth,

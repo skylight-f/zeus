@@ -13,9 +13,10 @@ import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { SkillSelector } from '../features/skills/SkillSelector.js';
 import { readSkillWorkflowDefault } from '../features/skills/skillWorkflowPreferences.js';
 import type { CodexApiClient } from '../features/codex/codexApiClient.js';
+import { Form } from '../ui/Form.js';
 
 export interface SessionCodeReviewSelection {
-  agentKind: 'codex' | 'pi';
+  agentKind: 'codex' | 'pi' | 'copilot';
   model: string;
   effort: string;
   serviceTierSelection: NativeServiceTierSelection;
@@ -165,7 +166,7 @@ export function SessionCodeReviewDialog(props: SessionCodeReviewDialogProps) {
     setError(null);
     try {
       const accepted = await props.onStart({
-        agentKind: selectedModel.agentKind === 'pi' ? 'pi' : 'codex',
+        agentKind: selectedModel.agentKind === 'copilot' ? 'copilot' : selectedModel.agentKind === 'pi' ? 'pi' : 'codex',
         model: selectedModel.id,
         effort: form.effort,
         serviceTierSelection: form.serviceTierSelection,
@@ -188,15 +189,15 @@ export function SessionCodeReviewDialog(props: SessionCodeReviewDialogProps) {
 
   return (
     <ModalPortal rootClassName="session-code-review-portal-root" dismissDisabled={busy} onDismiss={close} role="dialog" aria-labelledby="session-code-review-title">
-      <form className="session-code-review-modal zeus-solid-form-surface" onSubmit={(event) => void submit(event)} data-modal-surface="dialog">
+      <Form className="session-code-review-modal zeus-solid-form-surface" onSubmit={(event) => submit(event)} data-modal-surface="dialog">
         <header>
           <span>
             <strong id="session-code-review-title">{zh ? '开始代码审查' : 'Start code review'}</strong>
             <small>{zh ? '新建对话，审查当前工作目录中的代码' : 'Start a new conversation to review code in the current working folder'}</small>
           </span>
-          <button type="button" aria-label={zh ? '关闭' : 'Close'} onClick={close} disabled={busy}>
+          <Button unstyled type="button" aria-label={zh ? '关闭' : 'Close'} onClick={close} disabled={busy}>
             ×
-          </button>
+          </Button>
         </header>
 
         <div className="session-code-review-body">
@@ -318,7 +319,7 @@ export function SessionCodeReviewDialog(props: SessionCodeReviewDialogProps) {
             </Button>
           </span>
         </footer>
-      </form>
+      </Form>
     </ModalPortal>
   );
 }

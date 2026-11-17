@@ -1,4 +1,5 @@
 import { createModelPricingService } from './modelPricingService.js';
+import { createKiloAccountUsageService } from './kiloAccountUsage.js';
 import { userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
 import { randomUUID } from 'node:crypto';
 import {
@@ -72,6 +73,8 @@ export interface ModelConnectionDiagnostic {
 }
 
 export interface ModelConnectionService {
+  /** Kilo 官方账户余额和 Pass 周期额度，与本地费用账本分别维护。 */
+  kiloUsage: ReturnType<typeof createKiloAccountUsageService>;
   /** 公开价格服务，与密钥和模型配置隔离。 */
   pricing: ReturnType<typeof createModelPricingService>;
   /** 手工读取价格后返回连接展示状态。 */
@@ -95,7 +98,7 @@ export interface ModelConnectionService {
   probeModels(id: string): Promise<ModelCapabilityProbeSummary>;
   diagnose(id: string): Promise<ModelConnectionDiagnostic>;
   /** 生成入口只解析选中连接，设置入口省略参数时读取完整目录。 */
-  listSelectableModels(selectedModelRef?: string): Promise<SelectableConnectionModel[]>;
+  listSelectableModels(selectedModelRef?: string, purpose?: 'agent' | 'text'): Promise<SelectableConnectionModel[]>;
   /** 可选模型身份限制凭据读取，普通运行调用仍读取原有连接集合。 */
   loadRuntimeConnections(selectedModelRef?: string): Promise<Array<ModelConnectionRecord & { apiKey?: string }>>;
 }
@@ -120,6 +123,8 @@ export function createModelConnectionService(options: {
   now?: () => string;
   fetch?: typeof fetch;
   readPricingPage?: (input: { url: string }) => Promise<string>;
+  /** 共用目录刷新后的补价入口。 */
+  onPricingUpdated?: (connection: ModelConnectionRecord, catalog: import('@zeus/shared').ModelPricingCatalog) => Promise<void>;
 }): ModelConnectionService {
   const now = options.now ?? (() => new Date().toISOString());
   const fetcher = options.fetch ?? fetch;
@@ -133,11 +138,15 @@ export function createModelConnectionService(options: {
     return readStored().filter((connection) => !selectedModelRef || (connection.enabled && connection.models.some((model) => model.enabled && modelRef(connection.id, model.id) === selectedModelRef)));
   }
 
+  /** 账户查询只复用已保存的连接密钥，不通过前端的密钥查看接口。 */
+  const kiloUsage = createKiloAccountUsageService({ connections: readStored, readApiKey: (id) => options.secretStore.getSecret(modelConnectionSecretAccount(id)), now, fetch: fetcher });
+
   /** 使用现有连接的模型能力读取价格，页面内容不进入任何用户会话。 */
   const pricing = createModelPricingService({
     readPricingPage: options.readPricingPage,
     settings: options.settings,
     connections: readStored,
+    onCatalogUpdated: options.onPricingUpdated,
     save: options.save,
     now,
     async extract(connection, text, system, signal) {
@@ -148,12 +157,27 @@ export function createModelConnectionService(options: {
     },
   });
 
+  /** 仅缓存凭据是否存在；真实推理和密钥查看仍逐次读取 SecretStore。 */
+  const credentialStatus = new Map<string, { revision: string; expiresAt: number; value: Promise<boolean> }>();
+
+  /** 合并同一连接的钥匙串查询，展示状态最多复用一分钟。 */
+  function hasApiKey(record: ModelConnectionRecord): Promise<boolean> {
+    const cached = credentialStatus.get(record.id);
+    if (cached?.revision === record.updatedAt && cached.expiresAt > Date.now()) return cached.value;
+    const entry = { revision: record.updatedAt, expiresAt: Date.now() + 60_000, value: options.secretStore.getSecret(modelConnectionSecretAccount(record.id)).then(Boolean) };
+    credentialStatus.set(record.id, entry);
+    void entry.value.catch(() => {
+      if (credentialStatus.get(record.id) === entry) credentialStatus.delete(record.id);
+    });
+    return entry.value;
+  }
+
   async function hydrate(records = readStored()): Promise<ModelConnectionRecord[]> {
     return Promise.all(
       records.map(async (record) => ({
         ...record,
         pricingCatalog: pricing.read(record),
-        apiKeyConfigured: Boolean(await options.secretStore.getSecret(modelConnectionSecretAccount(record.id))),
+        apiKeyConfigured: await hasApiKey(record),
       })),
     );
   }
@@ -168,21 +192,29 @@ export function createModelConnectionService(options: {
   }
 
   async function requireConnection(id: string): Promise<ModelConnectionRecord> {
-    const connection = (await hydrate()).find((candidate) => candidate.id === id);
+    const connection = (await hydrate(readStored().filter((candidate) => candidate.id === id)))[0];
     if (!connection) throw serviceError('ZEUS_MODEL_CONNECTION_NOT_FOUND', '模型连接不存在。', 404);
     return connection;
+  }
+
+  /** 远端结果只能合并到发起时的配置，不能复活已删除连接或覆盖后续编辑。 */
+  function assertConnectionUnchanged(connection: ModelConnectionRecord): void {
+    if (readStored().find((item) => item.id === connection.id)?.updatedAt !== connection.updatedAt) throw serviceError('ZEUS_MODEL_CONNECTION_CHANGED', '模型连接已变化，请重新读取当前配置。', 409);
   }
 
   async function saveConnection(id: string, input: SaveModelConnectionRequest, existing?: ModelConnectionRecord): Promise<ModelConnectionRecord> {
     const timestamp = now();
     const apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : '';
     if (input.apiKey !== undefined && !apiKey) throw serviceError('ZEUS_MODEL_API_KEY_INVALID', 'API Key 不能为空。', 400);
-    const record = normalizeModelConnection(input, {
-      id,
-      apiKeyConfigured: Boolean(apiKey || existing?.apiKeyConfigured),
-      createdAt: existing?.createdAt ?? timestamp,
-      updatedAt: timestamp,
-    });
+    const record = normalizeModelConnection(
+      { ...input, pricingUrl: input.pricingUrl === undefined ? existing?.pricingUrl : input.pricingUrl },
+      {
+        id,
+        apiKeyConfigured: Boolean(apiKey || existing?.apiKeyConfigured),
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      },
+    );
     const requiresInsecureHttpConfirmation = record.baseUrl.startsWith('http://') && record.baseUrl !== existing?.baseUrl;
     if (requiresInsecureHttpConfirmation && input.allowInsecureHttp !== true) {
       throw serviceError('ZEUS_MODEL_CONNECTION_INSECURE_HTTP_CONFIRMATION_REQUIRED', 'HTTP 不会加密传输 API Key、请求内容或模型回复，请确认风险后再保存。', 409);
@@ -191,7 +223,10 @@ export function createModelConnectionService(options: {
     const index = records.findIndex((candidate) => candidate.id === id);
     if (index >= 0) records[index] = record;
     else records.push(record);
-    if (apiKey) await options.secretStore.setSecret(modelConnectionSecretAccount(id), apiKey);
+    if (apiKey) {
+      await options.secretStore.setSecret(modelConnectionSecretAccount(id), apiKey);
+      credentialStatus.delete(id);
+    }
     await write(records);
     return { ...record, apiKeyConfigured: Boolean(apiKey || existing?.apiKeyConfigured), pricingCatalog: pricing.read(record) };
   }
@@ -228,6 +263,7 @@ export function createModelConnectionService(options: {
   }
 
   return {
+    kiloUsage,
     pricing,
     async refreshPricing(id) {
       const connection = await requireConnection(id);
@@ -240,8 +276,9 @@ export function createModelConnectionService(options: {
     async list() {
       return hydrate();
     },
+    /** 单连接读取只核对该连接的凭据，不等待其他供应商的钥匙串。 */
     async get(id) {
-      return (await hydrate()).find((candidate) => candidate.id === id);
+      return (await hydrate(readStored().filter((candidate) => candidate.id === id)))[0];
     },
     async create(input) {
       const id = `model_connection_${randomUUID().replace(/-/gu, '')}`;
@@ -259,12 +296,16 @@ export function createModelConnectionService(options: {
     async remove(id) {
       await requireConnection(id);
       await options.secretStore.deleteSecret(modelConnectionSecretAccount(id));
+      credentialStatus.delete(id);
       await write(readStored().filter((candidate) => candidate.id !== id));
     },
     async clearApiKey(id) {
       const existing = await requireConnection(id);
       await options.secretStore.deleteSecret(modelConnectionSecretAccount(id));
-      return { ...existing, apiKeyConfigured: false, updatedAt: now() };
+      credentialStatus.delete(id);
+      const updated = { ...existing, apiKeyConfigured: false, updatedAt: now() };
+      await write(readStored().map((connection) => (connection.id === id ? updated : connection)));
+      return updated;
     },
     async saveModelReasoningOptions(id, modelId, input) {
       const connection = await requireConnection(id);
@@ -297,6 +338,7 @@ export function createModelConnectionService(options: {
     async refreshModels(id) {
       const connection = await requireConnection(id);
       const modelIds = await fetchModelIds(connection);
+      assertConnectionUnchanged(connection);
       const thinkingFormat = connection.templateId === 'custom' ? 'openai' : modelConnectionTemplates[connection.templateId].thinkingFormat;
       const sync = syncDiscoveredModels(connection.models, modelIds, thinkingFormat, { templateId: connection.templateId, baseUrl: connection.baseUrl });
       const updated = await saveConnection(connection.id, { ...connection, models: sync.models }, connection);
@@ -328,6 +370,7 @@ export function createModelConnectionService(options: {
         }
       };
       await Promise.all(Array.from({ length: Math.max(1, Math.min(probeConcurrency, targets.length)) }, runWorker));
+      assertConnectionUnchanged(connection);
       const probedById = new Map(results.map((result) => [result.modelId, result]));
       const models = connection.models.map((model) => {
         const result = probedById.get(model.id);
@@ -405,8 +448,8 @@ export function createModelConnectionService(options: {
         };
       }
     },
-    async listSelectableModels(selectedModelRef) {
-      return listSelectableConnectionModels(await hydrate(connectionsForModel(selectedModelRef)));
+    async listSelectableModels(selectedModelRef, purpose) {
+      return listSelectableConnectionModels(await hydrate(connectionsForModel(selectedModelRef)), purpose);
     },
     async loadRuntimeConnections(selectedModelRef) {
       /** 只为选中模型读取实际密钥，不访问其他连接的凭据。 */
@@ -423,7 +466,7 @@ export function createModelConnectionService(options: {
 }
 
 function withTemplateDefaults(input: SaveModelConnectionRequest): SaveModelConnectionRequest {
-  const templateId: ModelConnectionTemplateId = input.templateId === 'deepseek' || input.templateId === 'bailian' || input.templateId === 'kimi' || input.templateId === 'zai' ? input.templateId : 'custom';
+  const templateId: ModelConnectionTemplateId = input.templateId === 'deepseek' || input.templateId === 'bailian' || input.templateId === 'kimi' || input.templateId === 'zai' || input.templateId === 'kilo' ? input.templateId : 'custom';
   const template = templateId === 'custom' ? null : modelConnectionTemplates[templateId];
   return {
     ...input,

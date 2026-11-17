@@ -1,7 +1,7 @@
 import type { ConversationFeatureCatalog, ConversationFeatureAvailability } from '@zeus/shared';
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
-import { readPiBuiltinToolCatalog, buildAiRuntimePrompt, type CodexAccountSnapshot, type CodexCapabilitiesSnapshot, type CodexTransportState, type SelectableConnectionModel } from '@zeus/ai-runtime';
+import { readPiBuiltinToolCatalog, buildAiRuntimePrompt, modelRef, type CodexAccountSnapshot, type CodexCapabilitiesSnapshot, type CodexTransportState, type CopilotModelInfo, type SelectableConnectionModel } from '@zeus/ai-runtime';
 import { buildTaskBranchName, buildTaskBranchPrefix, type GitRepositoryContext } from '@zeus/git-core';
 import { readProjectRepositoryDiscovery } from './projectRepositoryDiscovery.js';
 import type {
@@ -59,7 +59,13 @@ interface ConversationCapabilityQueryPorts {
   modelCatalog: {
     /** 只读连接元数据，不重复读取钥匙串。 */
     hasConfiguredProvider(): boolean;
-    listSelectableModels(): Promise<SelectableConnectionModel[]>;
+    /** 指定模型时只读取对应连接凭据，目录页面省略参数读取全部。 */
+    listSelectableModels(selectedModelRef?: string): Promise<SelectableConnectionModel[]>;
+  };
+  /** Copilot GET 只读 SDK 已取回的账户与模型，不启动登录进程。 */
+  copilotCatalog: {
+    readAccount(): { authenticated: boolean } | null;
+    readModels(): CopilotModelInfo[];
   };
   git: TaskPushGitReadPort;
   taskContext: {
@@ -80,7 +86,7 @@ export interface ConversationCapabilityModel {
   id: string;
   model: string;
   displayName?: string;
-  agentKind: 'codex' | 'pi';
+  agentKind: 'codex' | 'pi' | 'copilot';
   sourceId: string;
   sourceName: string;
   available: boolean;
@@ -138,7 +144,7 @@ export class ConversationCapabilityQueryApplication {
   constructor(private readonly ports: ConversationCapabilityQueryPorts) {}
 
   /** 项目能力读取共用既有目录；内部模型预检可以跳过账号查询。 */
-  async readConversation(projectId: string, options: { readProviderAccount?: boolean } = {}): Promise<ConversationCapabilitiesSnapshot> {
+  async readConversation(projectId: string, options: { readProviderAccount?: boolean; selectedModelRef?: string } = {}): Promise<ConversationCapabilitiesSnapshot> {
     return this.readExisting(this.requireProject(projectId), options);
   }
 
@@ -146,7 +152,9 @@ export class ConversationCapabilityQueryApplication {
   async readDigitalEmployee(): Promise<DigitalEmployeeCapabilitiesSnapshot> {
     const transport = this.ports.provider.getState();
     const codexCapabilities = this.ports.codexNativeEnabled() && transport.type === 'ready' ? transport.capabilities : null;
-    const models = mapConversationCapabilityModels(codexCapabilities, await this.ports.modelCatalog.listSelectableModels()).map((model) => ({ ...model, contextCapacity: this.ports.readContextCapacitySupport?.(model) }));
+    const models = mapConversationCapabilityModels(codexCapabilities, await this.ports.modelCatalog.listSelectableModels(), this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : []).map(
+      (model) => ({ ...model, contextCapacity: this.ports.readContextCapacitySupport?.(model) }),
+    );
     const preferred = this.ports.readDefaultModel();
     const snapshot = {
       preferredModel: preferred ? (resolveModelCapability(models, preferred)?.id ?? preferred) : (models.find((model) => model.available !== false)?.id ?? null),
@@ -253,7 +261,10 @@ export class ConversationCapabilityQueryApplication {
   ): Promise<ConversationCapabilitiesSnapshot> {
     const connectionCatalog = preloadedConnectionCatalog ?? (await this.ports.modelCatalog.listSelectableModels());
     // 项目不再维护模型白名单；供应商中启用的模型全局可用，真实能力以运行探针结果为准。
-    const models = mapConversationCapabilityModels(codexCapabilities, connectionCatalog).map((model) => ({ ...model, contextCapacity: this.ports.readContextCapacitySupport?.(model) }));
+    const models = mapConversationCapabilityModels(codexCapabilities, connectionCatalog, this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : []).map((model) => ({
+      ...model,
+      contextCapacity: this.ports.readContextCapacitySupport?.(model),
+    }));
     if (models.length === 0) throw queryError('ZEUS_MODEL_UNAVAILABLE', '当前项目没有可用的 Codex 或 Pi 模型。');
     const defaultModel = this.ports.readDefaultModel();
     // 新项目沿用 Zeus 全局默认模型；会话/推送模型由各入口的“记住上次选择”覆盖。
@@ -270,7 +281,7 @@ export class ConversationCapabilityQueryApplication {
   }
 
   /** 目录查询只读本地账户缓存，单一供应商账号故障不能阻断其他来源。 */
-  private async readExisting(project: ZeusProjectRecord, options: { readProviderAccount?: boolean } = {}): Promise<ConversationCapabilitiesSnapshot> {
+  private async readExisting(project: ZeusProjectRecord, options: { readProviderAccount?: boolean; selectedModelRef?: string } = {}): Promise<ConversationCapabilitiesSnapshot> {
     const transport = this.ports.provider.getState();
     const codexCapabilities = this.ports.codexNativeEnabled() && transport.type === 'ready' ? transport.capabilities : null;
     /** 缓存缺失属于未知状态，只有其他读取异常才将 Codex 标记为不可用。 */
@@ -283,7 +294,7 @@ export class ConversationCapabilityQueryApplication {
             return this.unavailableCodexAccount();
           })
         : Promise.resolve(this.unavailableCodexAccount()),
-      this.ports.modelCatalog.listSelectableModels(),
+      this.ports.modelCatalog.listSelectableModels(options.selectedModelRef),
     ]);
     try {
       /** 账号故障只影响 Codex，独立供应商仍使用自己的目录与可用性证据。 */
@@ -423,7 +434,7 @@ export class ConversationCapabilityQueryApplication {
   }
 }
 
-function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSnapshot | null, connectionCatalog: SelectableConnectionModel[]): ConversationCapabilityModel[] {
+function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSnapshot | null, connectionCatalog: SelectableConnectionModel[], copilotCatalog: CopilotModelInfo[]): ConversationCapabilityModel[] {
   const codexModels: ConversationCapabilityModel[] = (codexCapabilities?.models ?? []).map((model) => ({
     id: model.id,
     model: model.model,
@@ -463,8 +474,29 @@ function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSna
     supports1MContext: model.supports1MContext,
     contextWindow: model.contextWindow,
   }));
+  /** GitHub 策略和上下文上限由当前登录账号的 SDK 目录提供。 */
+  const copilotModels: ConversationCapabilityModel[] = copilotCatalog.map((model) => ({
+    id: modelRef('copilot', model.id),
+    model: model.id,
+    displayName: model.name,
+    agentKind: 'copilot',
+    sourceId: 'copilot',
+    sourceName: 'GitHub Copilot',
+    available: model.policy?.state !== 'disabled' && model.policy?.state !== 'unconfigured',
+    availabilityReason: model.policy?.state === 'disabled' ? 'GitHub 策略禁用了该模型。' : model.policy?.state === 'unconfigured' ? 'GitHub 账号尚未配置该模型。' : 'Copilot SDK 已报告该模型。',
+    supportedReasoningEfforts: [...(model.supportedReasoningEfforts ?? [])],
+    defaultReasoningEffort: model.defaultReasoningEffort ?? null,
+    serviceTiers: [],
+    defaultServiceTier: null,
+    supports1MContext: model.capabilities.limits.max_context_window_tokens >= 1_000_000,
+    contextWindow: model.capabilities.limits.max_context_window_tokens,
+    imageInput: model.capabilities.supports.vision ? 'supported' : 'unsupported',
+    runtimeAdapter: 'copilot_sdk',
+    protocolFamily: 'copilot_sdk',
+    authenticationScheme: 'github_oauth',
+  }));
   const piTools = new Set(readPiBuiltinToolCatalog().map((tool) => tool.name));
-  return [...codexModels, ...connectionModels].map((model) => ({ ...model, features: conversationFeatureCatalog(model, piTools, codexCapabilities) }));
+  return [...codexModels, ...connectionModels, ...copilotModels].map((model) => ({ ...model, features: conversationFeatureCatalog(model, piTools, codexCapabilities) }));
 }
 
 /** 执行内核、模型接口和会话工具分别提供事实，不能把看图能力当成生图能力。 */
@@ -492,7 +524,7 @@ function conversationFeatureCatalog(model: ConversationCapabilityModel, piTools:
     steering: available('使用共用提交身份、队列和安全插话位置。'),
     goals: nativeKernel ? (native?.goals.supported && native.goals.enabled ? available('原生目标控制已启用。') : unavailable('当前 app-server 未启用原生目标控制。')) : tools('create_goal'),
     subagents: tools('spawn_agent'),
-    autoReview: nativeKernel ? unknown('原生接口支持请求独立审批审查；是否启用以实际调用回报为准，允许正常尝试。') : tools('bash'),
+    autoReview: model.agentKind === 'copilot' ? unavailable('Copilot 独立权限审查尚未接入；工具审批需人工处理。') : nativeKernel ? unknown('原生接口支持请求独立审批审查；是否启用以实际调用回报为准，允许正常尝试。') : tools('bash'),
     mcp: external,
     search: { ...external, reason: '搜索通过当前已启用 MCP 提供；未注册搜索服务时明确报告。' },
     browser: unknown('以本轮 Zeus 浏览器工具注册和浏览器状态为准。'),

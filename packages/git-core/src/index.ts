@@ -141,6 +141,11 @@ export interface GitRepositoryContext {
   worktrees: GitWorktreeEntry[];
 }
 
+/** 桌面发现目录与会话工作树准备共用仓库身份，绑定项目及仓库相对位置。 */
+export function projectGitRepositoryId(projectId: string, relativePath: string): string {
+  return `project_git_repository_${createHash('sha256').update(`${projectId}\0${relativePath}`).digest('hex').slice(0, 24)}`;
+}
+
 export interface DiscoveredGitRepository {
   name: string;
   relativePath: string;
@@ -287,6 +292,8 @@ export interface TaskWorkspaceFileDiff {
 }
 
 export interface TaskBranchFileChange {
+  /** 父仓库记录的子模块版本变更。 */
+  isSubmodule?: boolean;
   path: string;
   originalPath?: string;
   changeType: GitDiffFileChangeType;
@@ -389,6 +396,8 @@ const taskIntegrationLocalChangesStateName = 'zeus-local-changes.json';
 export type GitFileStatusCategory = 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked' | 'conflict' | 'other';
 
 export interface GitFileStatus {
+  /** Git 模式识别的子模块，包括新增与删除的引用。 */
+  isSubmodule?: boolean;
   path: string;
   originalPath?: string;
   indexStatus: string;
@@ -436,6 +445,8 @@ export interface ProjectGitRecentRef {
 }
 
 export interface ProjectGitRepositorySnapshot {
+  /** 当前分支创建时的固定提交；null 表示无法确定起点。 */
+  sourceHeadSha?: string | null;
   submodules?: { path: string; initialized: boolean }[];
   integrationState?: 'merge' | 'rebase' | null;
   branch: string;
@@ -450,8 +461,9 @@ export interface ProjectGitRepositorySnapshot {
   conflictFiles: string[];
   localBranches: string[];
   checkedOutBranches: string[];
-  /** 仅用于展示的脱敏远端地址与各本地分支的跟踪关系。 */
+  /** 仅用于展示的脱敏远端地址。 */
   remoteDetails?: Array<{ name: string; fetchUrl: string; pushUrl: string }>;
+  /** 各本地分支的真实跟踪关系，用于展示和解析该分支的推送目标。 */
   branchUpstreams?: Record<string, string>;
   /** 每个已设置上游的本地分支，相对其远端跟踪分支的提交差异。 */
   branchDivergences?: Record<string, { ahead: number; behind: number }>;
@@ -469,6 +481,8 @@ export interface ProjectGitRepositorySnapshot {
 
 export type ProjectGitAction =
   | { type: 'discard'; paths: string[] }
+  /** 回滚所选文件的暂存与未暂存修改；未跟踪文件不参与。 */
+  | { type: 'rollback'; paths: string[] }
   | { type: 'rename_branch'; branchName: string; newName: string }
   | { type: 'create_tag'; tagName: string; revision: string; message?: string }
   | { type: 'push_tag'; tagName: string; remote: string }
@@ -822,6 +836,53 @@ export async function assertValidGitBranchName(cwd: string, branchName: string, 
   }
 }
 
+/** 读取创建分支时记录的来源；缺项表示历史未记录，不以 upstream 或当前项目分支推测。 */
+export async function readGitBranchSource(cwd: string, branchName: string): Promise<string | null> {
+  /** 使用本地分支配置，避免用户全局配置混入工作树来源。 */
+  const branch = await assertGitBranchFormat(cwd, branchName, 'branch');
+  try {
+    /** Git 未找到配置时退出码为 1，其余错误继续交给调用方呈现。 */
+    const result = await execFileAsync('git', ['config', '--local', '--get', `branch.${branch}.zeus-source-branch`], { cwd, timeout: 15_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+    return result.stdout.trim() || null;
+  } catch (error) {
+    if ((error as { code?: number }).code === 1) return null;
+    throw error;
+  }
+}
+
+/** 新建独立会话分支时保存已核验的来源引用；分支重命名和删除沿用 Git 的配置生命周期。 */
+export async function recordGitBranchSource(cwd: string, branchName: string, sourceBranch: string, sourceHeadSha?: string): Promise<void> {
+  /** 来源可以是本地分支名或包含 remote 名称的远端跟踪分支名。 */
+  const branch = await assertGitBranchFormat(cwd, branchName, 'branch');
+  const source = await assertGitBranchFormat(cwd, sourceBranch, 'source branch');
+  await runGit(cwd, ['config', '--local', '--replace-all', `branch.${branch}.zeus-source-branch`, source]);
+  if (sourceHeadSha) await recordGitBranchSourceHead(cwd, branch, sourceHeadSha);
+}
+
+/** 读取固定分支起点；历史分支只采用明确的创建记录，不以移动的上游推测。 */
+async function readGitBranchSourceHead(cwd: string, branchName: string): Promise<string | null> {
+  /** 分支名先经 Git 校验，再用于配置键和完整引用。 */
+  const branch = await assertGitBranchFormat(cwd, branchName, 'branch');
+  try {
+    /** 本地配置随分支重命名和删除，不受全局 Git 配置影响。 */
+    const result = await execFileAsync('git', ['config', '--local', '--get', `branch.${branch}.zeus-source-head`], { cwd, timeout: 15_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+    return await resolveCommit(cwd, result.stdout.trim());
+  } catch (error) {
+    if ((error as { code?: number }).code !== 1) throw error;
+  }
+  /** reflog 中只有创建事件能证明原始起点；最旧的普通提交不能代替创建事件。 */
+  const reflog = await requireGitStdout(cwd, ['reflog', 'show', '--format=%H%x09%gs', localBranchRef(branch)]);
+  const creation = splitLines(reflog).find((line) => line.split('\t')[1]?.startsWith('branch: Created from '));
+  return creation ? resolveCommit(cwd, creation.split('\t')[0]!) : null;
+}
+
+/** 创建分支时保存固定提交，后续推送和合入不会移动成果比较起点。 */
+async function recordGitBranchSourceHead(cwd: string, branchName: string, sourceHeadSha: string): Promise<void> {
+  const branch = await assertGitBranchFormat(cwd, branchName, 'branch');
+  const head = await resolveCommit(cwd, sourceHeadSha);
+  await runGit(cwd, ['config', '--local', '--replace-all', `branch.${branch}.zeus-source-head`, head]);
+}
+
 /**
  * 创建或恢复任务 worktree。已注册的同名分支 worktree 会直接复用，
  * 从而保证一个任务开发分支同时只有一个物理写工作区。
@@ -1055,12 +1116,16 @@ export async function getTaskWorkspaceReview(cwd: string, ignoredPaths: string[]
   // Porcelain 的前两列包含有意义的空格，不能经过通用 splitLines 的 trim。
   const porcelainPromise = runGit(cwd, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '-uall', '--', ...diffPathspec]).then((result) => result.stdout);
   const upstreamPromise = readGitStdout(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).then((value) => value || null);
-  const unstagedStatPromise = runGit(cwd, ['diff', '--numstat', '-z', '--', ...diffPathspec]).then((result) => result.stdout);
-  const stagedStatPromise = runGit(cwd, ['diff', '--cached', '--numstat', '-z', '--', ...diffPathspec]).then((result) => result.stdout);
+  const unstagedStatPromise = runGit(cwd, ['diff', '--raw', '--numstat', '-z', '--', ...diffPathspec]).then((result) => result.stdout);
+  const stagedStatPromise = runGit(cwd, ['diff', '--cached', '--raw', '--numstat', '-z', '--', ...diffPathspec]).then((result) => result.stdout);
   /** 尚未结束的合并用于标识当前冲突现场，不能把已暂存等同于已合入。 */
   const mergeHeadPromise = readGitStdout(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
   const [porcelain, upstream, unstagedStat, stagedStat, mergeHeadSha] = await Promise.all([porcelainPromise, upstreamPromise, unstagedStatPromise, stagedStatPromise, mergeHeadPromise]);
-  const fileStatuses = parseGitPorcelainEntries(porcelain).filter((file) => !isIgnored(file.path) && (!file.originalPath || !isIgnored(file.originalPath)));
+  /** 原始模式与统计同次读取，删除后的子模块也保留类型。 */
+  const submodulePaths = new Set([...gitRawSubmodulePaths(stagedStat), ...gitRawSubmodulePaths(unstagedStat)]);
+  const fileStatuses = parseGitPorcelainEntries(porcelain)
+    .filter((file) => !isIgnored(file.path) && (!file.originalPath || !isIgnored(file.originalPath)))
+    .map((file) => ({ ...file, isSubmodule: submodulePaths.has(file.path) }));
   const counts = upstream ? parseAheadBehind(await readGitStdout(cwd, ['rev-list', '--left-right', '--count', `${upstream}...HEAD`])) : { ahead: 0, behind: 0 };
   const stagedFiles = fileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?');
   const unstagedFiles = fileStatuses.filter((file) => file.workingTreeStatus !== ' ' && file.workingTreeStatus !== '?');
@@ -1098,11 +1163,14 @@ export async function getTaskWorkspaceReview(cwd: string, ignoredPaths: string[]
 }
 
 /** 只读取工作区是否干净，避免为能力列表生成完整差异。 */
-export async function getGitWorktreeClean(cwd: string, ignoredPaths: string[] = []): Promise<boolean> {
+export async function getGitWorktreeClean(cwd: string, ignoredPaths: string[] = [], nestedPaths: string[] = []): Promise<boolean> {
   const ignored = ignoredPaths.map((path) => requireSafeWorkspacePath(path));
   const pathspec = ['.', ...ignored.flatMap((path) => [`:(exclude)${path}`, `:(exclude)${path}/**`])];
   // 能力读取和后台发现不得让 Git 顺便刷新索引文件。
-  return (await runGit(cwd, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '-uall', '--', ...pathspec])).stdout.length === 0;
+  const porcelain = (await runGit(cwd, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '-uall', '--', ...pathspec])).stdout;
+  if (!nestedPaths.length) return porcelain.length === 0;
+  // 嵌套仓库自身单独检查，只忽略父仓的未跟踪目录占位，保留父仓已跟踪文件。
+  return !parseGitPorcelainEntries(porcelain).some((file) => !(file.indexStatus === '?' && file.path.endsWith('/') && nestedPaths.includes(file.path.slice(0, -1))));
 }
 
 function gitDiffStatSummary(stdout: string, statuses: GitFileStatus[]): GitDiffSummary {
@@ -1115,6 +1183,7 @@ function gitDiffStatSummary(stdout: string, statuses: GitFileStatus[]): GitDiffS
       oldPath: changeType === 'added' ? '' : (originalPath ?? entry.path),
       newPath: changeType === 'deleted' ? '' : entry.path,
       changeType,
+      isSubmodule: entry.isSubmodule,
       addedLines: entry.additions,
       deletedLines: entry.deletions,
       hunks: [],
@@ -1123,12 +1192,38 @@ function gitDiffStatSummary(stdout: string, statuses: GitFileStatus[]): GitDiffS
   return { isRepository: true, files: fileDiffs.map((file) => file.newPath || file.oldPath), diffText: '', fileDiffs };
 }
 
-function parseGitNumStat(stdout: string): Array<{ path: string; originalPath?: string; additions: number; deletions: number }> {
+/** 原始模式记录使用零分隔路径，重命名保留两个路径，不从文件名猜测子模块。 */
+function gitRawSubmodulePaths(stdout: string): Set<string> {
+  /** 只记录这次比较实际出现的子模块路径。 */
+  const paths = new Set<string>();
+  /** 路径可以包含空格、制表符和换行，不能按行拆分。 */
   const records = stdout.split('\0');
-  const entries: Array<{ path: string; originalPath?: string; additions: number; deletions: number }> = [];
+  for (let index = 0; index < records.length; index += 1) {
+    /** 模式与状态来自 Git 原始记录头。 */
+    const match = records[index]?.match(/^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([A-Z])\d*$/u);
+    if (!match) break;
+    /** 非重命名记录只有一个路径，重命名与复制使用新路径。 */
+    const original = records[++index] ?? '';
+    /** 目标路径保持 Git 原始字节解码，不去除空白。 */
+    const path = match[3] === 'R' || match[3] === 'C' ? (records[++index] ?? original) : original;
+    if (match[1] === '160000' || match[2] === '160000') paths.add(path);
+  }
+  return paths;
+}
+
+/** 零分隔行数统计保留特殊路径，原始模式只用于补充子模块类型。 */
+function parseGitNumStat(stdout: string): Array<{ path: string; originalPath?: string; additions: number; deletions: number; isSubmodule?: boolean }> {
+  const records = stdout.split('\0');
+  const entries: Array<{ path: string; originalPath?: string; additions: number; deletions: number; isSubmodule?: boolean }> = [];
+  /** 与 numstat 一起返回的原始模式无需另读补丁正文。 */
+  const submodulePaths = gitRawSubmodulePaths(stdout);
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index] ?? '';
     if (!record) continue;
+    if (record.startsWith(':')) {
+      index += / [RC]\d+$/u.test(record) ? 2 : 1;
+      continue;
+    }
     const firstTab = record.indexOf('\t');
     const secondTab = firstTab >= 0 ? record.indexOf('\t', firstTab + 1) : -1;
     if (firstTab < 0 || secondTab < 0) continue;
@@ -1136,12 +1231,19 @@ function parseGitNumStat(stdout: string): Array<{ path: string; originalPath?: s
     const deletions = Number.parseInt(record.slice(firstTab + 1, secondTab), 10);
     const inlinePath = record.slice(secondTab + 1);
     if (inlinePath) {
-      entries.push({ path: inlinePath, additions: Number.isFinite(additions) ? additions : 0, deletions: Number.isFinite(deletions) ? deletions : 0 });
+      entries.push({ path: inlinePath, isSubmodule: submodulePaths.has(inlinePath), additions: Number.isFinite(additions) ? additions : 0, deletions: Number.isFinite(deletions) ? deletions : 0 });
       continue;
     }
     const originalPath = records[++index] ?? '';
     const path = records[++index] ?? originalPath;
-    if (path) entries.push({ path, ...(originalPath && originalPath !== path ? { originalPath } : {}), additions: Number.isFinite(additions) ? additions : 0, deletions: Number.isFinite(deletions) ? deletions : 0 });
+    if (path)
+      entries.push({
+        path,
+        ...(originalPath && originalPath !== path ? { originalPath } : {}),
+        isSubmodule: submodulePaths.has(path),
+        additions: Number.isFinite(additions) ? additions : 0,
+        deletions: Number.isFinite(deletions) ? deletions : 0,
+      });
   }
   return entries;
 }
@@ -1149,17 +1251,18 @@ function parseGitNumStat(stdout: string): Array<{ path: string; originalPath?: s
 /** 读取提交窗口当前文件的 HEAD 对比；未跟踪文件以 /dev/null 为旧版本。 */
 export async function getTaskWorkspaceFileDiff(cwd: string, path: string): Promise<TaskWorkspaceFileDiff> {
   const safePath = requireSafeWorkspacePath(path);
-  const review = await getTaskWorkspaceReview(cwd);
-  const untracked = review.untrackedFiles.some((file) => file.path === safePath);
-  /** orphan 分支首次提交前使用空提交比较，不能把不存在的 HEAD 当成错误。 */
-  const baseline = review.headSha || (await createEmptyRootCommit(cwd));
-  const diffText = untracked ? await readGitDiffAllowChanges(cwd, ['diff', '--no-index', '--binary', '--', '/dev/null', safePath]) : await readGitDiffAllowChanges(cwd, ['diff', baseline, '--binary', '--', safePath]);
-  return { path: safePath, diff: diffSummaryFromText(diffText) };
+  /** 任务和普通会话复用单文件读取，不为预览重算整个工作区审核。 */
+  return { path: safePath, diff: await getGitDiff(cwd, safePath) };
 }
 
-/** 读取任务分支相对来源分支共同起点产生的已提交代码成果。 */
-export async function getTaskBranchComparison(repositoryPath: string, sourceBranch: string, taskBranch: string, frozenSourceHeadSha?: string, repositoryContext?: GitRepositoryContext): Promise<TaskBranchComparison> {
-  const context = repositoryContext ?? (await getGitRepositoryContext(repositoryPath));
+/** 统计与单文件预览共用引用校验，不为读取比较端点枚举全部 worktree。 */
+async function resolveTaskBranchComparisonRefs(repositoryPath: string, sourceBranch: string, taskBranch: string, frozenSourceHeadSha?: string, repositoryContext?: GitRepositoryContext) {
+  const context = repositoryContext ?? {
+    isRepository: true,
+    topLevel: await requireGitStdout(repositoryPath, ['rev-parse', '--show-toplevel']).catch(() => {
+      throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected project is not a Git repository.');
+    }),
+  };
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected project is not a Git repository.');
   const [safeSourceBranch, safeTaskBranch] = await Promise.all([assertGitBranchFormat(context.topLevel, sourceBranch, 'source branch'), assertNamedBranchExists(context.topLevel, taskBranch, 'task branch')]);
   /** 显式空字符串表示任务从 unborn 来源开始；undefined 才表示读取当前来源分支。 */
@@ -1171,18 +1274,37 @@ export async function getTaskBranchComparison(repositoryPath: string, sourceBran
       : localBranchRef(await assertNamedBranchExists(context.topLevel, safeSourceBranch, 'source branch'));
   const taskBranchRef = localBranchRef(safeTaskBranch);
   const [resolvedSourceHeadSha, taskHeadSha] = await Promise.all([resolveCommit(context.topLevel, sourceBranchRef), resolveCommit(context.topLevel, taskBranchRef)]);
+  return { context, safeSourceBranch, safeTaskBranch, sourceUnborn, sourceBranchRef, taskBranchRef, resolvedSourceHeadSha, taskHeadSha };
+}
+
+/** 单文件补丁和全文预览只解析固定比较端点，不重新统计整个任务分支。 */
+export async function getTaskBranchDiffRange(repositoryPath: string, sourceBranch: string, taskBranch: string, frozenSourceHeadSha?: string): Promise<{ mergeBaseSha: string; taskHeadSha: string }> {
+  const refs = await resolveTaskBranchComparisonRefs(repositoryPath, sourceBranch, taskBranch, frozenSourceHeadSha);
+  const mergeBaseSha = refs.sourceUnborn ? refs.resolvedSourceHeadSha : await requireGitStdout(refs.context.topLevel, ['merge-base', refs.sourceBranchRef, refs.taskBranchRef]);
+  return { mergeBaseSha, taskHeadSha: refs.taskHeadSha };
+}
+
+/** 读取任务分支相对来源分支共同起点产生的已提交代码成果。 */
+export async function getTaskBranchComparison(repositoryPath: string, sourceBranch: string, taskBranch: string, frozenSourceHeadSha?: string, repositoryContext?: GitRepositoryContext): Promise<TaskBranchComparison> {
+  const { context, safeSourceBranch, safeTaskBranch, sourceUnborn, sourceBranchRef, taskBranchRef, resolvedSourceHeadSha, taskHeadSha } = await resolveTaskBranchComparisonRefs(
+    repositoryPath,
+    sourceBranch,
+    taskBranch,
+    frozenSourceHeadSha,
+    repositoryContext,
+  );
   /** 两个独立根提交没有 merge-base；空来源以确定性空提交直接比较任务历史。 */
   const [mergeBaseSha, rawCounts, numStat, nameStatus] = sourceUnborn
     ? await Promise.all([
         Promise.resolve(resolvedSourceHeadSha),
         requireGitStdout(context.topLevel, ['rev-list', '--count', taskBranchRef]).then((ahead) => `0 ${ahead}`),
-        runGit(context.topLevel, ['diff', '--numstat', '-z', sourceBranchRef, taskBranchRef, '--', '.']).then((result) => result.stdout),
+        runGit(context.topLevel, ['diff', '--raw', '--numstat', '-z', sourceBranchRef, taskBranchRef, '--', '.']).then((result) => result.stdout),
         runGit(context.topLevel, ['diff', '--name-status', '-z', sourceBranchRef, taskBranchRef, '--', '.']).then((result) => result.stdout),
       ])
     : await Promise.all([
         requireGitStdout(context.topLevel, ['merge-base', sourceBranchRef, taskBranchRef]),
         readGitStdout(context.topLevel, ['rev-list', '--left-right', '--count', `${sourceBranchRef}...${taskBranchRef}`]),
-        runGit(context.topLevel, ['diff', '--numstat', '-z', `${sourceBranchRef}...${taskBranchRef}`, '--', '.']).then((result) => result.stdout),
+        runGit(context.topLevel, ['diff', '--raw', '--numstat', '-z', `${sourceBranchRef}...${taskBranchRef}`, '--', '.']).then((result) => result.stdout),
         runGit(context.topLevel, ['diff', '--name-status', '-z', `${sourceBranchRef}...${taskBranchRef}`, '--', '.']).then((result) => result.stdout),
       ]);
   const counts = sourceUnborn ? { ahead: Number.parseInt(rawCounts.split(/\s+/u)[1] ?? '0', 10) || 0, behind: 0 } : parseAheadBehind(rawCounts);
@@ -1195,6 +1317,7 @@ export async function getTaskBranchComparison(repositoryPath: string, sourceBran
       changeType: entry.changeType,
       additions: stats?.additions ?? 0,
       deletions: stats?.deletions ?? 0,
+      isSubmodule: stats?.isSubmodule,
     };
   });
   return {
@@ -1232,8 +1355,13 @@ function parseGitNameStatus(stdout: string): Array<{ path: string; originalPath?
 /** 读取任务分支单个文件的已提交差异，不依赖任务 worktree 是否仍然存在。 */
 export async function getTaskBranchFileDiff(repositoryPath: string, sourceBranch: string, taskBranch: string, path: string, frozenSourceHeadSha?: string): Promise<TaskWorkspaceFileDiff> {
   const safePath = requireSafeWorkspacePath(path);
-  const comparison = await getTaskBranchComparison(repositoryPath, sourceBranch, taskBranch, frozenSourceHeadSha);
-  const diffText = await readGitDiffAllowChanges(repositoryPath, ['diff', '--binary', `${comparison.mergeBaseSha}..${comparison.taskHeadSha}`, '--', safePath]);
+  const comparison = await getTaskBranchDiffRange(repositoryPath, sourceBranch, taskBranch, frozenSourceHeadSha);
+  /** 名称映射保留重命名两端，补丁正文仍只读取所选文件。 */
+  const args = ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--find-renames', `${comparison.mergeBaseSha}..${comparison.taskHeadSha}`];
+  const names = (await runGit(repositoryPath, [...args, '--name-status', '-z', '--', '.'])).stdout;
+  const entry = parseGitNameStatus(names).find((file) => file.path === safePath || file.originalPath === safePath);
+  const paths = [...new Set([safePath, ...(entry?.originalPath ? [entry.originalPath, entry.path] : [])])].map((path) => `:(literal)${path}`);
+  const diffText = await readGitDiffAllowChanges(repositoryPath, [...args, '--binary', '--', ...paths]);
   return { path: safePath, diff: diffSummaryFromText(diffText) };
 }
 
@@ -2974,7 +3102,8 @@ function gitCoreError(code: string, message: string, details?: string): Error & 
 export async function getGitStatus(cwd: string): Promise<GitStatusSummary> {
   try {
     const branch = (await execFileAsync('git', ['branch', '--show-current'], { cwd })).stdout.trim() || 'detached';
-    const porcelain = (await execFileAsync('git', ['status', '--porcelain', '-z', '--untracked-files=all'], { cwd })).stdout;
+    // 后台读取不写回索引缓存，避免目录监听把读取误认为修改并再次刷新交付窗口。
+    const porcelain = (await execFileAsync('git', ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all'], { cwd })).stdout;
     const parsedStatus = parseGitPorcelainStatus(porcelain);
     const remoteBranches = splitLines(await readGitStdout(cwd, ['branch', '-r', '--format=%(refname:short)']));
     const recentCommits = parseRecentCommits(await readGitStdout(cwd, ['-c', 'core.quotePath=false', 'log', '-n', '5', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P']));
@@ -2990,15 +3119,18 @@ export async function getGitStatus(cwd: string): Promise<GitStatusSummary> {
   }
 }
 
-/** 为项目 Git 工作台读取单仓完整快照；所有字段都来自当前本机仓库。 */
-export async function getProjectGitRepositorySnapshot(cwd: string): Promise<ProjectGitRepositorySnapshot> {
-  const context = await getGitRepositoryContext(cwd);
+/** 读取本机仓库状态；交付列表可省略补丁，正文按选中文件另读。 */
+export async function getProjectGitRepositorySnapshot(cwd: string, includePatches = true, repositoryContext?: GitRepositoryContext): Promise<ProjectGitRepositorySnapshot> {
+  /** 同一次仓库发现已取得的身份可复用，避免重复枚举分支和 worktree。 */
+  const context = repositoryContext ?? (await getGitRepositoryContext(cwd));
   if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected directory is not a Git repository.');
-  const [status, diff, stagedDiffText, unstagedDiffText, upstreamText, tagsText, headTagsText, reflogText, stashText, recentText] = await Promise.all([
-    getGitStatus(context.topLevel),
-    getGitDiff(context.topLevel),
-    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--cached', '--submodule=short', '--', '.']),
-    readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', '.']),
+  const [sourceHeadSha, porcelain, diff, stagedDiffText, unstagedDiffText, upstreamText, tagsText, headTagsText, reflogText, stashText, recentText, remoteDetails, branchTracking, integrationState, submodules, rawModes] = await Promise.all([
+    context.detached || !context.headSha ? Promise.resolve(null) : readGitBranchSourceHead(context.topLevel, context.branch),
+    // porcelain 的首列空格是文件状态，不能 trim。
+    runGit(context.topLevel, ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all']).then((result) => result.stdout),
+    includePatches ? getGitDiff(context.topLevel) : Promise.resolve(null),
+    includePatches ? readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--cached', '--submodule=short', '--', '.']) : Promise.resolve(''),
+    includePatches ? readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', '.']) : Promise.resolve(''),
     readGitStdout(context.topLevel, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']),
     readGitStdout(context.topLevel, ['tag', '--sort=-creatordate']),
     readGitStdout(context.topLevel, ['tag', '--points-at', 'HEAD', '--sort=-creatordate']),
@@ -3018,15 +3150,6 @@ export async function getProjectGitRepositorySnapshot(cwd: string): Promise<Proj
       '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P',
       ...(context.headSha ? [context.headSha] : []),
     ]),
-  ]);
-  const upstream = upstreamText || null;
-  const divergence = upstream ? await readGitStdout(context.topLevel, ['rev-list', '--left-right', '--count', `${upstream}...HEAD`]) : '';
-  const [behindText = '0', aheadText = '0'] = divergence.split(/\s+/u);
-  const outgoingText = upstream
-    ? await readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'log', '--topo-order', '-n', '200', '--date=iso-strict', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P', `${upstream}..HEAD`])
-    : '';
-  const tags = splitLines(tagsText);
-  const [remoteDetails, branchTracking] = await Promise.all([
     Promise.all(
       context.remotes.map(async (name) => {
         const [fetchUrl, pushUrl] = await Promise.all([readGitStdout(context.topLevel, ['remote', 'get-url', name]), readGitStdout(context.topLevel, ['remote', 'get-url', '--push', name])]);
@@ -3034,21 +3157,38 @@ export async function getProjectGitRepositorySnapshot(cwd: string): Promise<Proj
       }),
     ),
     readGitStdout(context.topLevel, ['for-each-ref', '--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)', 'refs/heads/'], { ...process.env, LANG: 'C', LC_ALL: 'C' }),
+    readIntegrationState(context.topLevel),
+    readRegisteredSubmodules(context.topLevel),
+    // 清单模式只补读原始类型，不扫描所有文件的文本差异。
+    includePatches ? Promise.resolve('') : runGit(context.topLevel, ['diff', '--raw', '--no-ext-diff', ...(context.headSha ? ['HEAD'] : ['--cached']), '-z', '--', '.']).then((result) => result.stdout),
   ]);
+  /** 文件状态只解析一次，不重复读取状态接口的分支及最近提交。 */
+  const status = parseGitPorcelainStatus(porcelain);
+  const upstream = upstreamText || null;
+  const tags = splitLines(tagsText);
+  /** 上游统计与最近引用互不依赖，不串行增加首屏等待。 */
+  const [divergence, outgoingText, recentRefs] = await Promise.all([
+    upstream ? readGitStdout(context.topLevel, ['rev-list', '--left-right', '--count', `${upstream}...HEAD`]) : Promise.resolve(''),
+    upstream ? readGitStdout(context.topLevel, ['-c', 'core.quotePath=false', 'log', '--topo-order', '-n', '200', '--date=iso-strict', '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%aI%x1f%P', `${upstream}..HEAD`]) : Promise.resolve(''),
+    readProjectGitRecentRefs(context.topLevel, reflogText, context, tags),
+  ]);
+  const [behindText = '0', aheadText = '0'] = divergence.split(/\s+/u);
   const parsedBranchTracking = parseProjectGitBranchTracking(branchTracking);
-  const recentRefs = await readProjectGitRecentRefs(context.topLevel, reflogText, context, tags);
+  /** 类型索引只计算一次，清单模式沿用不读取补丁正文的路径。 */
+  const submodulePaths = includePatches ? new Set(diff?.fileDiffs.filter((file) => file.isSubmodule).flatMap((file) => [file.oldPath, file.newPath])) : gitRawSubmodulePaths(rawModes);
   return {
     branch: context.branch,
     detached: context.detached,
     headTags: splitLines(headTagsText),
     headSha: context.headSha,
+    sourceHeadSha,
     upstream,
-    integrationState: await readIntegrationState(context.topLevel),
-    submodules: await readRegisteredSubmodules(context.topLevel),
+    integrationState,
+    submodules,
     ahead: Number.parseInt(aheadText, 10) || 0,
     behind: Number.parseInt(behindText, 10) || 0,
     clean: status.clean,
-    fileStatuses: status.fileStatuses,
+    fileStatuses: status.fileStatuses.map((file) => ({ ...file, isSubmodule: submodulePaths.has(file.path) })),
     conflictFiles: status.conflictFiles,
     localBranches: context.localBranches,
     checkedOutBranches: context.worktrees.flatMap((worktree) => (worktree.branch ? [worktree.branch] : [])),
@@ -3062,7 +3202,8 @@ export async function getProjectGitRepositorySnapshot(cwd: string): Promise<Proj
     recentCommits: parseRecentCommits(recentText),
     outgoingCommits: parseRecentCommits(outgoingText),
     stashes: parseProjectGitStashes(stashText),
-    diff,
+    // 交付文件树只需要状态；正文由选中文件的读取请求提供。
+    diff: diff ?? { isRepository: true, files: status.fileStatuses.map((file) => file.path), diffText: '', fileDiffs: [] },
     stagedDiff: diffSummaryFromText(stagedDiffText),
     unstagedDiff: diffSummaryFromText(unstagedDiffText),
   };
@@ -3209,6 +3350,30 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
       args = ['fetch', '--prune', remote];
       break;
     }
+    case 'rollback': {
+      /** 实际状态决定重命名关联，调用方不能额外指定旧路径。 */
+      const selected = requireRepositoryPaths(repositoryPath, action.paths);
+      const status = await getGitStatus(repositoryPath);
+      const entries = selected.map((path) => status.fileStatuses.find((file) => file.path === path));
+      if (status.conflictFiles.length || entries.some((file) => !file || file.indexStatus === '?')) throw gitCoreError('ZEUS_GIT_ROLLBACK_INVALID', '文件状态已变化或存在冲突，请刷新后回滚已跟踪文件。');
+      /** 恢复重命名的旧路径之前，不覆盖该位置重新出现的文件。 */
+      for (const file of entries) {
+        if (file?.originalPath && file.indexStatus === 'R') {
+          const present = await lstat(resolve(repositoryPath, file.originalPath)).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (present) throw gitCoreError('ZEUS_GIT_ROLLBACK_INVALID', `重命名来源位置已有文件：${file.originalPath}`);
+        }
+      }
+      const paths = requireRepositoryPaths(
+        repositoryPath,
+        entries.flatMap((file) => (file!.originalPath && file!.indexStatus === 'R' ? [file!.originalPath, file!.path] : [file!.path])),
+      );
+      // 首次提交前只移除索引记录；--cached 保留工作区，包括暂存后继续编辑的内容。
+      args = context.headSha ? ['--literal-pathspecs', 'restore', '--source=HEAD', '--staged', '--worktree', '--', ...paths] : ['--literal-pathspecs', 'rm', '--cached', '--force', '--', ...paths];
+      break;
+    }
     case 'discard': {
       const paths = requireRepositoryPaths(repositoryPath, action.paths);
       const status = await getGitStatus(repositoryPath);
@@ -3322,17 +3487,18 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
     case 'update':
       return finishProjectGitAction(repositoryPath, action.type, await executeProjectGitUpdate(repositoryPath, action.strategy, action.smart === true));
     case 'checkout':
-      args = ['switch', await assertGitBranchFormat(repositoryPath, action.branchName, 'branch')];
+      // 子模块跟随父仓库记录的提交，Git 拒绝覆盖其本地修改。
+      args = ['switch', '--recurse-submodules', await assertGitBranchFormat(repositoryPath, action.branchName, 'branch')];
       break;
     case 'checkout_revision':
-      args = ['switch', '--detach', await resolveCommit(repositoryPath, action.revision)];
+      args = ['switch', '--recurse-submodules', '--detach', await resolveCommit(repositoryPath, action.revision)];
       break;
     case 'create_branch': {
       const branchName = await assertGitBranchFormat(repositoryPath, action.branchName, 'branch');
       const requestedBase = action.baseRef?.trim() || '';
       const baseRef = requestedBase ? (action.trackRemote ? await assertGitBranchFormat(repositoryPath, requestedBase, 'base branch') : await resolveCommit(repositoryPath, requestedBase)) : null;
       if (action.trackRemote && baseRef) await resolveCommit(repositoryPath, baseRef);
-      args = ['switch', '-c', branchName, ...(action.trackRemote ? ['--track'] : []), ...(baseRef ? [baseRef] : [])];
+      args = ['switch', '--recurse-submodules', '-c', branchName, ...(action.trackRemote ? ['--track'] : []), ...(baseRef ? [baseRef] : [])];
       break;
     }
     case 'delete_branch':
@@ -3388,6 +3554,7 @@ async function executeProjectGitActionInternal(cwd: string, action: ProjectGitAc
   // 切换始终使用 Git 的保护性检查，不自动贮藏、恢复或强制覆盖用户修改。
   try {
     const output = await operation();
+    if (action.type === 'create_branch' && context.headSha) await recordGitBranchSourceHead(repositoryPath, action.branchName, await resolveCommit(repositoryPath, 'HEAD'));
     return finishProjectGitAction(repositoryPath, action.type, output);
   } catch (error) {
     if (switchingAction) throw classifyGitSwitchFailure(switchingAction, args, error);
@@ -3579,13 +3746,45 @@ export async function getProjectGitCommitDetail(cwd: string, commitHash: string)
 }
 
 /** 读取所选分支与当前分支或工作区的差异；只解析受 Git 校验的 ref。 */
-export async function getProjectGitComparisonDiff(cwd: string, branchName: string, mode: 'current' | 'working-tree'): Promise<GitDiffSummary> {
-  const context = await getGitRepositoryContext(cwd);
-  if (!context.isRepository) throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected directory is not a Git repository.');
-  const revision = await resolveCommit(context.topLevel, branchName);
-  const args =
-    mode === 'working-tree' ? ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--find-renames', revision, '--', '.'] : ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--find-renames', `${revision}..HEAD`, '--', '.'];
-  return diffSummaryFromText(await readGitStdout(context.topLevel, args));
+export async function getProjectGitComparisonDiff(cwd: string, branchName: string, mode: 'current' | 'working-tree' | 'staged' | 'unstaged', path?: string, summaryOnly = false): Promise<GitDiffSummary> {
+  /** 单文件范围使用字面量路径，不能由文件名注入 Git pathspec。 */
+  const paths = path === undefined ? ['.'] : [`:(literal)${requireSafeWorkspacePath(path)}`];
+  if (path !== undefined && mode === 'working-tree' && branchName === 'HEAD') return getGitDiff(cwd, path);
+  /** 比较只依赖 Git 根和固定引用，不重复枚举分支、远端和 worktree。 */
+  const topLevel = await requireGitStdout(cwd, ['rev-parse', '--show-toplevel']).catch(() => {
+    throw gitCoreError('ZEUS_GIT_REPOSITORY_REQUIRED', 'The selected directory is not a Git repository.');
+  });
+  const revision = mode === 'current' || mode === 'working-tree' ? await resolveCommit(topLevel, branchName) : null;
+  /** 文件清单保留真实增删统计和重命名，不生成全部文件的补丁。 */
+  const comparison = mode === 'staged' ? ['--cached'] : mode === 'unstaged' ? [] : [mode === 'working-tree' ? revision! : `${revision}..HEAD`];
+  const args = ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--find-renames', ...comparison];
+  if (!summaryOnly) {
+    if (path !== undefined) {
+      /** 重命名检测先读取名称，补丁仍限定为选中文件的两个路径。 */
+      const names = (await runGit(topLevel, [...args, '--name-status', '-z', '--', '.'])).stdout;
+      const entry = parseGitNameStatus(names).find((entry) => entry.path === path || entry.originalPath === path);
+      if (entry?.originalPath) paths.push(`:(literal)${entry.originalPath}`, `:(literal)${entry.path}`);
+    }
+    return diffSummaryFromText((await runGit(topLevel, [...args, '--', ...paths])).stdout);
+  }
+  /** 两项统计独立读取，不传输补丁正文。 */
+  const [names, stats] = await Promise.all([
+    runGit(topLevel, [...args, '--name-status', '-z', '--', ...paths]).then((result) => result.stdout),
+    runGit(topLevel, [...args, '--raw', '--numstat', '-z', '--', ...paths]).then((result) => result.stdout),
+  ]);
+  /** 行数按新路径与名称状态对齐，保留重命名身份。 */
+  const statsByPath = new Map(parseGitNumStat(stats).map((entry) => [entry.path, entry]));
+  /** 空 hunks 仅表示本次只读统计，预览仍独立读取真实补丁。 */
+  const fileDiffs = parseGitNameStatus(names).map((entry): GitFileDiff => ({
+    oldPath: entry.changeType === 'added' ? '' : (entry.originalPath ?? entry.path),
+    newPath: entry.changeType === 'deleted' ? '' : entry.path,
+    changeType: entry.changeType,
+    isSubmodule: statsByPath.get(entry.path)?.isSubmodule,
+    addedLines: statsByPath.get(entry.path)?.additions ?? 0,
+    deletedLines: statsByPath.get(entry.path)?.deletions ?? 0,
+    hunks: [],
+  }));
+  return { isRepository: true, files: fileDiffs.map((file) => file.newPath || file.oldPath), diffText: '', fileDiffs };
 }
 
 /** 读取文件当前版本的逐行归属；只读命令不修改工作区、索引或引用。 */
@@ -3893,39 +4092,51 @@ function emptyGitStatus(): GitStatusSummary {
 }
 
 /** 只读获取当前工作区 diff；不执行 add、commit、checkout、stash 等写操作。 */
-export async function getGitDiff(cwd: string): Promise<GitDiffSummary> {
+export async function getGitDiff(cwd: string, path?: string): Promise<GitDiffSummary> {
+  /** 交付预览只读取当前文件；其他调用继续读取完整仓库。 */
+  const paths = path === undefined ? ['.'] : [`:(literal)${requireSafeWorkspacePath(path)}`];
   try {
-    await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd });
-    const names = (await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only'], { cwd })).stdout.trim();
-    const stagedNames = (await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only'], { cwd })).stdout.trim();
-    const porcelain = (await execFileAsync('git', ['status', '--porcelain', '-z', '--untracked-files=all'], { cwd })).stdout;
-    const untrackedPaths = parseGitPorcelainStatus(porcelain)
-      .fileStatuses.filter((file) => file.indexStatus === '?')
-      .map((file) => file.path);
-    const diffText = (
-      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', '.'], {
+    /** 单文件名称直接取补丁；状态与基准互不依赖，避免逐条等待 Git 子进程。 */
+    const [names, stagedNames, porcelain, headSha] = await Promise.all([
+      path === undefined ? execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '-z', '--', ...paths], { cwd }).then((result) => result.stdout) : Promise.resolve(''),
+      path === undefined ? execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only', '-z', '--', ...paths], { cwd }).then((result) => result.stdout) : Promise.resolve(''),
+      // 禁止只读状态查询写回索引，避免触发重复目录刷新。
+      execFileAsync('git', ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all', '--', ...paths], { cwd }).then((result) => result.stdout),
+      path === undefined ? Promise.resolve('') : readGitStdout(cwd, ['rev-parse', '--verify', 'HEAD']),
+    ]);
+    /** 同一份状态同时确定未跟踪文件和重命名来源。 */
+    const status = parseGitPorcelainStatus(porcelain);
+    const untrackedPaths = status.fileStatuses.filter((file) => file.indexStatus === '?').map((file) => file.path);
+    /** 单文件预览与正文使用相同的 HEAD → 工作区范围；空仓库使用只计算、不写入的空树。 */
+    const baseline = path === undefined ? null : headSha || (await runGit(cwd, ['hash-object', '-t', 'tree', '--stdin'], '')).stdout.trim();
+    /** 重命名的两端共同参与路径限定，避免新路径被误报为新增。 */
+    const originalPath = path === undefined ? undefined : status.fileStatuses.find((file) => file.path === path)?.originalPath;
+    if (originalPath) paths.push(`:(literal)${originalPath}`);
+    /** 补丁、暂存补丁和未跟踪文件互不依赖，共同完成后只解析一次。 */
+    const [diffText, stagedDiffText, untrackedDiffs] = await Promise.all([
+      execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--submodule=short', ...(baseline ? [baseline] : []), '--', ...paths], {
         cwd,
         maxBuffer: 10 * 1024 * 1024,
-      })
-    ).stdout;
-    const stagedDiffText = (
-      await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--cached', '--submodule=short', '--', '.'], {
-        cwd,
-        maxBuffer: 10 * 1024 * 1024,
-      })
-    ).stdout;
-    const untrackedDiffs: string[] = [];
-    for (const path of untrackedPaths.slice(0, 200)) {
-      untrackedDiffs.push(await readGitDiffAllowChanges(cwd, ['-c', 'core.quotePath=false', 'diff', '--no-index', '--', '/dev/null', path]));
-    }
+      }).then((result) => result.stdout),
+      path !== undefined
+        ? Promise.resolve('')
+        : execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--submodule=short', '--cached', '--', ...paths], {
+            cwd,
+            maxBuffer: 10 * 1024 * 1024,
+          }).then((result) => result.stdout),
+      mapWithConcurrency(untrackedPaths.slice(0, 200), 4, (path) => readGitDiffAllowChanges(cwd, ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--submodule=short', '--no-index', '--', '/dev/null', path])),
+    ]);
     const combinedDiffText = [diffText, stagedDiffText, ...untrackedDiffs].filter(Boolean).join('\n');
+    /** HEAD 到工作区的单文件补丁同时包含暂存和未暂存变化。 */
+    const fileDiffs = parseGitUnifiedDiff(combinedDiffText);
     return {
       isRepository: true,
-      files: Array.from(new Set([...splitLines(names), ...splitLines(stagedNames), ...untrackedPaths])),
+      files: path === undefined ? Array.from(new Set([...splitNullRecords(names), ...splitNullRecords(stagedNames), ...untrackedPaths])) : Array.from(new Set([...fileDiffs.map((file) => file.newPath || file.oldPath), ...untrackedPaths])),
       diffText: combinedDiffText,
-      fileDiffs: parseGitUnifiedDiff(combinedDiffText),
+      fileDiffs,
     };
-  } catch {
+  } catch (error) {
+    if (path !== undefined) throw error;
     return { isRepository: false, files: [], diffText: '', fileDiffs: [] };
   }
 }
@@ -3946,6 +4157,9 @@ export function parseGitUnifiedDiff(diffText: string): GitFileDiff[] {
       continue;
     }
     if (!currentFile) continue;
+
+    // 只从补丁头的真实模式识别子模块，不从源码中的相似文字猜测类型。
+    if (!currentHunk && /^(?:index .+ |(?:new file|deleted file|old|new) mode )160000$/u.test(line)) currentFile.isSubmodule = true;
 
     if (line.startsWith('rename from ')) {
       currentFile.oldPath = stripDiffPathPrefix(line.slice('rename from '.length));
@@ -4214,20 +4428,55 @@ export async function getGitFilePreviewSources(
       }
     }
   }
-  /** 使用 Git 树记录获取对象，拒绝符号链接和子模块作为普通文件解码。 */
+  /** 使用 Git 模式区分普通文件与子模块，符号链接和冲突索引不作为正文解码。 */
   async function side(revision: string | null, name: string, prefix: string, fallback?: string | null): Promise<FilePreviewSource> {
     const label = `${prefix} · ${revision === 'worktree' ? '工作区' : revision === 'index' ? '暂存区' : (revision?.slice(0, 12) ?? '不存在')}`;
     /** 所有历史侧编辑都指向当前工作区的新路径，不打开历史副本。 */
     const edit = { root: cwd, path: resolve(cwd, requireSafeWorkspacePath(newPath)) };
     if (!revision) return { name, label, edit, missing: true, reason: '此版本中不存在该文件。' };
-    if (revision === 'worktree') return { name, label, edit, root: cwd, path: resolve(cwd, requireSafeWorkspacePath(name)), git: { root: cwd, path: blamePath, baseRef: head } };
-    const output = revision === 'index' ? (await runGit(cwd, ['ls-files', '--stage', '-z', '--', `:(literal)${name}`])).stdout : (await runGit(cwd, ['ls-tree', '-z', revision, '--', `:(literal)${name}`])).stdout;
+    const output = revision === 'index' || revision === 'worktree' ? (await runGit(cwd, ['ls-files', '--stage', '-z', '--', `:(literal)${name}`])).stdout : (await runGit(cwd, ['ls-tree', '-z', revision, '--', `:(literal)${name}`])).stdout;
     const entry = output.split('\0').find((item) => item.slice(item.indexOf('\t') + 1) === name);
+    /** 提交树和索引都只接受确定的子模块版本，冲突索引仍保留原错误。 */
+    const gitlink = entry?.match(/^160000 (?:commit )?([a-f0-9]{40,64})(?: 0)?\t/u);
+    if (gitlink) {
+      /** 历史版本来自父仓库记录，工作区版本另从已初始化子模块读取。 */
+      const submodule: NonNullable<FilePreviewSource['submodule']> = { commit: gitlink[1]! };
+      /** 目录路径只用于核实子仓库身份和展示，不授予普通文件操作。 */
+      const directory = resolve(cwd, requireSafeWorkspacePath(name));
+      if (revision === 'worktree') {
+        /** 先核对真实路径边界，再读取目录内的仓库标记；缺失目录保留未初始化状态。 */
+        const actualDirectory = await realpath(directory).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+          return null;
+        });
+        if (actualDirectory && !isPathInside(await realpath(cwd), actualDirectory)) throw new Error('子模块超出授权目录。');
+        /** 未初始化的子模块不向上回退到父仓库的 HEAD。 */
+        const marker =
+          actualDirectory &&
+          (await lstat(join(actualDirectory, '.git')).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+            return null;
+          }));
+        submodule.initialized = Boolean(marker);
+        if (marker && actualDirectory) {
+          if (canonicalFilesystemPath(await requireGitStdout(actualDirectory, ['rev-parse', '--show-toplevel'])) !== canonicalFilesystemPath(actualDirectory)) throw new Error('子模块目录与仓库身份不一致。');
+          submodule.commit = await resolveCommit(actualDirectory, 'HEAD');
+          submodule.dirty = Boolean(await requireGitStdout(actualDirectory, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none']));
+        }
+      }
+      return { name, label, root: cwd, path: directory, submodule };
+    }
+    if (entry?.startsWith('160000 ')) return { name, label, reason: '子模块存在未解决的版本冲突，请先处理冲突。' };
+    if (revision === 'worktree') {
+      /** 已从索引删除的子模块即使还留有目录，也不作为当前父仓库的文件读取。 */
+      if (!entry && head && /^160000 /u.test(await requireGitStdout(cwd, ['ls-tree', head, '--', `:(literal)${name}`]))) return { name, label, missing: true, reason: '此版本中不存在该子模块。' };
+      return { name, label, edit, root: cwd, path: resolve(cwd, requireSafeWorkspacePath(name)), git: { root: cwd, path: blamePath, baseRef: head } };
+    }
     const match = entry?.match(/^(100[0-7]{3}) (?:blob )?([a-f0-9]{40,64})(?: 0)?\t/u);
     if (!match && !entry && fallback) return side(fallback, name, prefix);
     return match
       ? { name, label, edit, root: cwd, blob: match[2], git: { root: cwd, path: revision === 'index' ? blamePath : name, ...(revision === 'index' ? { baseRef: head } : { ref: revision }) } }
-      : { name, label, edit, missing: !entry, reason: entry ? '符号链接、冲突索引或子模块不能作为普通文件预览。' : '此版本中不存在该文件。' };
+      : { name, label, edit, missing: !entry, reason: entry ? '符号链接或未解决的冲突索引不能作为普通文件预览。' : '此版本中不存在该文件。' };
   }
   return Promise.all([side(before, oldPath, '变更前'), side(after, newPath, '变更后', untrackedTree)]);
 }

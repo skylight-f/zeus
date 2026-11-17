@@ -32,6 +32,7 @@ import { type ArtifactRef, type ArtifactStore, artifactStoreGeneration } from '.
 import { conversationSchemaGeneration, type ConversationSessionMetricsSnapshot, readConversationSessionMetrics } from './conversationExecutionStore.js';
 import { ConversationTranscriptRepository, providerFacet } from './conversationTranscriptStore.js';
 import { createHash } from 'node:crypto';
+import { inputSuggestionUserTurnSql } from './inputSuggestionStore.js';
 import { ConversationSystemMessageRepository } from './conversationSystemMessageStore.js';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,8 +97,14 @@ function conversationNavigationPlacement(row: ConversationNavigationPlacementRow
 // 继续保留原 JSON 预览供结构分类，Renderer 会按 toolPairId/type 将其从消息流排除。
 // 旧任务历史只保存纯文字时，按同会话的发送身份补回展示快照；不读取或暴露执行配置。
 // 首屏、历史分页和完整正文共用此投影，保证预览长度与内容句柄一致。
+// 展示短文案必须先替换 text，再截断 JSON；否则首屏会读到执行原文，全文到达后才切换摘要。
 const modelHistoryVisibleContentSql = `COALESCE(
   (SELECT json_patch(conversation_model_history.content_json, json_object(
+     'text', COALESCE(
+       NULLIF(json_extract(conversation_model_history.content_json, '$.displayText'), ''),
+       NULLIF(json_extract(submission.input_json, '$.displayText'), ''),
+       NULLIF(json_extract(submission.input_json, '$.taskPushLayout.displayText'), ''),
+       json_extract(conversation_model_history.content_json, '$.text')),
      'taskPushLayout', json_extract(submission.input_json, '$.taskPushLayout'),
      'attachments', COALESCE(json_extract(conversation_model_history.content_json, '$.attachments'), json_extract(submission.input_json, '$.attachments'), json('[]'))
    ))
@@ -111,6 +118,10 @@ const modelHistoryVisibleContentSql = `COALESCE(
      AND json_valid(submission.input_json)
      AND json_type(submission.input_json, '$.taskPushLayout') = 'object'),
   CASE
+  WHEN conversation_model_history.role = 'user'
+   AND json_valid(content_json)
+   AND COALESCE(NULLIF(json_extract(content_json, '$.displayText'), ''), NULLIF(json_extract(content_json, '$.taskPushLayout.displayText'), '')) IS NOT NULL
+    THEN json_set(content_json, '$.text', COALESCE(NULLIF(json_extract(content_json, '$.displayText'), ''), NULLIF(json_extract(content_json, '$.taskPushLayout.displayText'), '')))
   WHEN conversation_model_history.role = 'user'
    AND json_valid(content_json)
    AND (
@@ -1070,16 +1081,16 @@ export class ConversationSnapshotV2Repository {
       afterOrder: row.placement.order!,
       beforeOrder: boundaries[index + 1]?.placement.order ?? null,
     }));
-    /** 使用持久顺序索引聚合；临时思考摘要不生成入口，真实操作与持久思考正文仍可按需展开。 */
+    /** 固定区间、位置、别名的扫描顺序，使每个区间使用轮次位置索引，避免别名反复遍历全部区间。 */
     const counts = this.db.select<{ id: string; item_count: number }>(
       `SELECT json_extract(boundary.value, '$.id') AS id,
               COUNT(DISTINCT CASE WHEN alias.facet = 'tool_activity' THEN entry.id END) AS item_count
          FROM json_each(?) AS boundary
-         JOIN conversation_transcript_entries AS entry
+         CROSS JOIN conversation_transcript_entries AS entry
            ON entry.conversation_id = ? AND entry.turn_id = json_extract(boundary.value, '$.turnId')
           AND entry.display_order > json_extract(boundary.value, '$.afterOrder')
           AND (json_extract(boundary.value, '$.beforeOrder') IS NULL OR entry.display_order < json_extract(boundary.value, '$.beforeOrder'))
-         JOIN conversation_transcript_aliases AS alias
+         CROSS JOIN conversation_transcript_aliases AS alias
            ON alias.conversation_id = entry.conversation_id AND alias.entry_id = entry.id
          LEFT JOIN conversation_process_items
            ON alias.source_domain = 'process' AND conversation_process_items.conversation_id = alias.conversation_id
@@ -1103,6 +1114,19 @@ export class ConversationSnapshotV2Repository {
     /** 所有正文及内容句柄仍绑定调用方指定的同一会话。 */
     const conversationId = requiredIdentity(conversationIdValue, 'conversationId');
     return this.latestTurnsByStatus(conversationId, ['completed', 'interrupted', 'failed'], 3).map((turn) => this.toTurnSummary(conversationId, turn));
+  }
+
+  /** 自动预测只把真实用户轮次视为新回复，内部压缩不替换完成锚点。 */
+  readInputSuggestionSnapshot(conversationIdValue: string): ConversationSnapshotV2 {
+    const snapshot = this.readSnapshot(conversationIdValue, { closedTurnLimit: 1, includeSessionMetrics: false });
+    const turn = this.db.get<TurnRow>(
+      `${turnSummarySelectSql()} FROM conversation_turns
+      WHERE conversation_id=? AND status IN ('completed','interrupted','failed') AND ${inputSuggestionUserTurnSql}
+      ORDER BY created_at DESC,id DESC LIMIT 1`,
+      [snapshot.conversation.id],
+    );
+    const activeTurn = snapshot.activeTurn;
+    return { ...snapshot, activeTurn: activeTurn && (activeTurn.submissionId || activeTurn.openingUserMessage) ? activeTurn : null, recentClosedTurns: turn ? [this.toTurnSummary(snapshot.conversation.id, turn)] : [] };
   }
 
   readSnapshot(conversationIdValue: string, options: { closedTurnLimit?: number; byteLimit?: number; includeSessionMetrics?: boolean; executionContext?: ConversationSnapshotV2ExecutionContext } = {}): ConversationSnapshotV2 {
@@ -1446,12 +1470,14 @@ export class ConversationSnapshotV2Repository {
     byteLimit?: number;
     /** 仅取已保存的用户与助手对话，避免工具结果或思考摘要占满建议材料。 */
     dialogueOnly?: boolean;
+    /** 标题可复用已输出的思考摘要，仍排除工具记录。 */
+    includeReasoningSummaries?: boolean;
   }): ConversationSnapshotV2Page<ConversationModelHistoryPageItem> {
     const conversationId = requiredIdentity(input.conversationId, 'conversationId');
     const turnId = this.requireTurn(conversationId, input.turnId);
     /** 查询和游标高水位使用相同过滤条件，不扫描工具正文后再丢弃。 */
-    const dialogueWhere = input.dialogueOnly ? ` AND ${modelHistoryDialogueSql}` : '';
-    const context = this.sequencePageContext({ ...input, conversationId }, 'model_history', `turn:${turnId}${input.dialogueOnly ? ':dialogue' : ''}`, {
+    const dialogueWhere = input.dialogueOnly ? ` AND ${input.includeReasoningSummaries ? "role IN ('user', 'assistant') AND tool_pair_id IS NULL" : modelHistoryDialogueSql}` : '';
+    const context = this.sequencePageContext({ ...input, conversationId }, 'model_history', `turn:${turnId}${input.dialogueOnly ? (input.includeReasoningSummaries ? ':dialogue-with-summary' : ':dialogue') : ''}`, {
       table: 'conversation_model_history',
       column: 'sequence',
       extraWhere: ` AND turn_id = ?${dialogueWhere}`,

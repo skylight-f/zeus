@@ -1,4 +1,5 @@
 import type { FilePreviewSourceWorkspace } from '@zeus/shared';
+import { mergeTaskProjection } from '../tasks/taskQueryStore.js';
 import { compareConversationWorkStartedDesc, cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig, matchesTaskDeadline, projectTerminalOutput, type TaskDeadlineFilter, temporaryWorkspaceId } from '@zeus/shared';
 import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
 import type { DigitalTeamEntrySelection } from '../digital-teams/DigitalTeamWorkspace.js';
@@ -11,7 +12,7 @@ import { createNativeConversationStartEnvelopeManager, createProjectConversation
 import { conversationStartClientCommandTypes, forgetConversationStartCommandRequest } from '../conversations/conversationStartCommandClient.js';
 import type { CodexConversationCapabilities, CodexTaskPushCapabilities, NativeConversationChoice, NativeSessionState, SessionConversationOwner, StartTaskModelPushRequest } from '../../session/sessionTypes.js';
 import { buildPersistedSessionViewCache, initialSessionHotCache, refreshSessionHotState, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
-import { useCompletedConversationPreload } from '../../session/useCompletedConversationPreload.js';
+import { useConversationPreload } from '../../session/useConversationPreload.js';
 import { type TaskModelPushForm, type TaskModelPushModalStatus } from '../../task/TaskModelPushModal.js';
 import { projectTaskModelPushConversationChoices } from '../../task/TaskModelPushPendingWorkspace.js';
 import { useConversationFeatureController } from '../conversations/useConversationFeatureController.js';
@@ -138,6 +139,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const setActiveNavTarget = props.shellNavigation?.onNavigate ?? setLocalActiveNavTarget;
   const [activeProjectSection, setActiveProjectSection] = useState<ProjectWorkspaceSection>(() => inferInitialProjectSection(props));
   /** 旧 Git 链接与源码内的新地址统一打开完整 Git 工作台。 */
+  const [projectGitOpen, setProjectGitOpen] = useState(() => props.initialMainNavTarget === 'git-diff' || (typeof window !== 'undefined' && ['#project-git', '#project-code-git'].includes(window.location.hash)));
   const [projectCodeWorkspaceMode, setProjectCodeWorkspaceMode] = useState<ProjectCodeWorkspaceMode>(() => (typeof window !== 'undefined' && window.location.hash === '#project-commands' ? 'commands' : 'source'));
   const [visitedCodeWorkspaceModes, setVisitedCodeWorkspaceModes] = useState<Set<ProjectCodeWorkspaceMode>>(() => new Set(typeof window !== 'undefined' && window.location.hash === '#project-commands' ? ['source', 'commands'] : ['source']));
   /** 弹窗绑定准确项目，后台命令生命周期不依赖弹窗挂载。 */
@@ -250,8 +252,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [selectedNativeConversationId, setSelectedNativeConversationId] = useState<string | null>(() => props.initialSelectedNativeConversationId ?? null);
   const selectedNativeConversationIdRef = useRef<string | null>(props.initialSelectedNativeConversationId ?? null);
   const [selectedNativeConversationPresentation, setSelectedNativeConversationPresentation] = useState<'history' | 'interactive'>(() => (props.initialSelectedNativeConversationId ? 'history' : 'interactive'));
-  /** 可见回执绑定真实会话，切换时不复用上一条会话的布尔状态。 */
-  const [latestConversationContentVisibility, setLatestConversationContentVisibility] = useState<{ identity: string | null; visible: boolean }>({ identity: null, visible: false });
+  /** 同一工作面的主栏和侧栏各自记录阅读事实，切换后不继承旧工作面的状态。 */
+  const [latestConversationContentVisibility, setLatestConversationContentVisibility] = useState<{ ownerIdentity: string | null; identities: string[] }>({ ownerIdentity: null, identities: [] });
   const [zeusWindowForeground, setZeusWindowForeground] = useState(false);
   const [focusedArchivedConversation, setFocusedArchivedConversation] = useState<NativeConversationChoice | null>(null);
   const [optimisticTerminalTaskStatuses, setOptimisticTerminalTaskStatuses] = useState<Record<string, TaskManagementStatus>>({});
@@ -259,6 +261,10 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [pendingTaskStatuses, setPendingTaskStatuses] = useState<Record<string, { status: TaskManagementStatus }>>({});
   const [taskTerminalCleanupConfirmation, setTaskTerminalCleanupConfirmation] = useState<{
     statusLabel: string;
+    /** 批量清理中需要变更状态的任务数；单任务操作不提供。 */
+    taskCount?: number;
+    /** 会话归档复用清理确认框，但不表示任务进入终态。 */
+    archiveConversation?: boolean;
     resolve: (confirmed: boolean) => void;
   } | null>(null);
   const archivedConversations = conversationQuery.archived;
@@ -272,6 +278,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [nativeConversationStatusSyncState, setNativeConversationStatusSyncState] = useState<ZeusRealtimeConnectionState | 'syncing' | 'stale'>(() => (props.onSubscribeRealtimeEvents ? 'connecting' : 'connected'));
   const [initialNativeConversationHotCache] = useState<SessionHotCache>(initialSessionHotCache);
   const nativeConversationHotCacheRef = useRef<SessionHotCache>(initialNativeConversationHotCache);
+  /** 仅保留最近一次持久接纳的首发显示，完整快照到达后释放。 */
+  const [nativeConversationStartState, setNativeConversationStartState] = useState<NativeSessionState | null>(null);
   const sessionViewCachePersistTimerRef = useRef<number | null>(null);
   const [projectSidebarViewportWidth, setProjectSidebarViewportWidth] = useState(() => (typeof window === 'undefined' ? 1440 : window.innerWidth));
   const [projectSidebarPreferredWidth, setProjectSidebarPreferredWidth] = useState(() => readProjectSidebarPreferredWidth(browserProjectSidebarWidthStorage()));
@@ -331,8 +339,18 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     const restoredProjectId = resolveProjectWorkspaceTabs(projects, projects[0]?.id).activeProjectId;
     return projects.find((project) => project.id === restoredProjectId) ?? projects[0];
   });
-  const [taskDetail, setTaskDetail] = useState<TaskRecord | undefined>(() => props.snapshot?.tasks[0]);
+  const [taskDetail, updateTaskDetail] = useState<TaskRecord | undefined>(() => props.snapshot?.tasks[0]);
+  /** 详情、实时事件与写回执统一比较修订，旧读取不能覆盖同一任务的新内容。 */
+  const setTaskDetail = useCallback((value: SetStateAction<TaskRecord | undefined>): void => {
+    updateTaskDetail((current) => {
+      const next = typeof value === 'function' ? value(current) : value;
+      return next && current?.id === next.id ? mergeTaskProjection(current, next) : next;
+    });
+  }, []);
   const [taskDetailPaneTaskId, setTaskDetailPaneTaskId] = useState<string | undefined>();
+  /** 详情与事件的异步回执使用同一个即时导航身份。 */
+  const taskDetailPaneTaskIdRef = useRef(taskDetailPaneTaskId);
+  taskDetailPaneTaskIdRef.current = taskDetailPaneTaskId;
   const [taskDetailPresentation, setTaskDetailPresentation] = useState<TaskBoardOpenMode>('side_peek');
   const [taskBoardSnapshots, setTaskBoardSnapshots] = useState<Record<string, TaskBoardViewSnapshot>>({});
   const [taskBoardLoadState, setTaskBoardLoadState] = useState<Record<string, { loading: boolean; error: string | null }>>({});
@@ -404,19 +422,23 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   }
 
   useEffect(() => {
-    if (!props.snapshot) return;
+    /** 汇总响应也遵循任务修订顺序，后台查询不能回退刚保存的详情。 */
+    const incoming = props.snapshot;
+    if (!incoming) return;
     // 同步 Electron hydration 后传入的真实 snapshot，避免首屏 connecting 空状态锁死后续真实项目与任务。
-    setSnapshot(props.snapshot);
-    const restoredProjectId = resolveProjectWorkspaceTabs(props.snapshot.projects, props.snapshot.projects[0]?.id).activeProjectId;
-    const restoredProject = props.snapshot.projects.find((project) => project.id === restoredProjectId);
+    setSnapshot((current) => {
+      if (current === incoming) return current;
+      const knownTasks = new Map(current.tasks.map((task) => [task.id, task]));
+      return { ...incoming, tasks: incoming.tasks.map((task) => mergeTaskProjection(knownTasks.get(task.id), task)) };
+    });
+    const restoredProjectId = resolveProjectWorkspaceTabs(incoming.projects, incoming.projects[0]?.id).activeProjectId;
+    const restoredProject = incoming.projects.find((project) => project.id === restoredProjectId);
     /** 无项目工作的技术归属可能不进入公开目录，保留已经明确加载的身份。 */
-    const nextProject =
-      projectDetail?.id === temporaryWorkspaceId ? (props.snapshot.projects.find((item) => item.id === projectDetail.id) ?? projectDetail) : syncRecordFromSnapshot(projectDetail ?? restoredProject, props.snapshot.projects);
+    const nextProject = projectDetail?.id === temporaryWorkspaceId ? (incoming.projects.find((item) => item.id === projectDetail.id) ?? projectDetail) : syncRecordFromSnapshot(projectDetail ?? restoredProject, incoming.projects);
     /** 正在查看的临时工作成果不能被下一次目录水合替换为其他任务。 */
-    const nextTask =
-      taskDetail?.projectId === temporaryWorkspaceId && taskDetail.id === taskDetailPaneTaskId ? (props.snapshot.tasks.find((item) => item.id === taskDetail.id) ?? taskDetail) : syncRecordFromSnapshot(taskDetail, props.snapshot.tasks);
+    const nextTask = taskDetail?.projectId === temporaryWorkspaceId && taskDetail.id === taskDetailPaneTaskId ? (incoming.tasks.find((item) => item.id === taskDetail.id) ?? taskDetail) : syncRecordFromSnapshot(taskDetail, incoming.tasks);
     setProjectDetail(nextProject);
-    setTaskDetail(nextTask);
+    setTaskDetail((current) => (current?.id === nextTask?.id && nextTask ? mergeTaskProjection(current, nextTask) : nextTask));
     setProjectEditForm({
       name: nextProject?.name ?? '',
       localPath: nextProject?.localPath ?? '',
@@ -1115,16 +1137,37 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   );
   /** 项目和真实会话共同决定正文回执归属。 */
   const visibleConversationIdentity = selectedNativeConversation ? JSON.stringify([selectedNativeConversation.projectId, selectedNativeConversation.id]) : null;
+  // 切换工作面即丢弃旧阅读事实，返回同一会话也必须等待正文重新报告。
+  if (latestConversationContentVisibility.ownerIdentity !== visibleConversationIdentity) {
+    setLatestConversationContentVisibility({ ownerIdentity: visibleConversationIdentity, identities: [] });
+  }
   /** 拒绝已经卸载会话的迟到可见回调。 */
   const currentVisibleConversationIdentity = useRef(visibleConversationIdentity);
   currentVisibleConversationIdentity.current = visibleConversationIdentity;
-  /** 已加载会话的回执只有在其仍被选中时才有效。 */
-  const latestConversationContentVisible = Boolean(visibleConversationIdentity && latestConversationContentVisibility.identity === visibleConversationIdentity && latestConversationContentVisibility.visible);
-  /** 旧组件卸载时的回调仍绑定旧身份，不会误确认新会话。 */
+  /** 主栏可见性仍单独供当前会话的通知展示使用。 */
+  const latestConversationContentVisible = Boolean(
+    visibleConversationIdentity && latestConversationContentVisibility.ownerIdentity === visibleConversationIdentity && latestConversationContentVisibility.identities.includes(visibleConversationIdentity),
+  );
+  /** 提醒修订始终读取实时目录，不使用侧栏创建时保存的会话快照。 */
+  const latestContentVisibleConversations = useMemo(
+    () =>
+      latestConversationContentVisibility.ownerIdentity === visibleConversationIdentity
+        ? nativeConversationChoices.filter((conversation) => latestConversationContentVisibility.identities.includes(JSON.stringify([conversation.projectId, conversation.id])))
+        : [],
+    [latestConversationContentVisibility, nativeConversationChoices, visibleConversationIdentity],
+  );
+  /** 旧组件仍绑定旧工作面；同一工作面中的两个正文按各自身份更新。 */
   const setLatestConversationContentVisible = useCallback(
-    (visible: boolean) => {
+    (projectId: string, conversationId: string, visible: boolean) => {
       if (currentVisibleConversationIdentity.current !== visibleConversationIdentity) return;
-      setLatestConversationContentVisibility((current) => (current.identity === visibleConversationIdentity && current.visible === visible ? current : { identity: visibleConversationIdentity, visible }));
+      /** 项目和真实会话共同决定阅读事实，避免主子会话相互覆盖。 */
+      const identity = JSON.stringify([projectId, conversationId]);
+      setLatestConversationContentVisibility((current) => {
+        /** 工作面切换后只保留新工作面实际报告的身份。 */
+        const identities = current.ownerIdentity === visibleConversationIdentity ? current.identities : [];
+        if (identities.includes(identity) === visible) return current;
+        return { ownerIdentity: visibleConversationIdentity, identities: visible ? [...identities, identity] : identities.filter((entry) => entry !== identity) };
+      });
     },
     [visibleConversationIdentity],
   );
@@ -1239,7 +1282,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     },
     [scheduleNativeConversationViewCachePersistence],
   );
-  useCompletedConversationPreload({
+  /** 显示缓存由工作区持有，首屏写入和全局事件均可直接唤醒后台预取。 */
+  const observeConversationPreload = useConversationPreload({
     client: props.nativeConversationClient,
     groups: nativeConversationGroups,
     cache: nativeConversationHotCacheRef.current,
@@ -1262,7 +1306,11 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       // 冷切换的 controller 只有视图加载态，不能覆盖服务端已经给出的会话运行态；
       // 否则用户快速切走后该临时状态无人收尾，会在侧栏永久留下假转圈。
       if (!state.snapshot && (state.transportState === 'connecting' || state.transportState === 'hydrating' || state.transportState === 'reconnecting' || state.transportState === 'disconnected')) return;
+      /** 首屏缓存从缺失变为可用时直接唤醒后台，不依赖父组件恰好重绘。 */
+      const hadCachedSnapshot = Boolean(nativeConversationHotCacheRef.current.get(conversationId)?.state.snapshot);
       const remembered = refreshSessionHotState(nativeConversationHotCacheRef.current, conversationId, state);
+      if (remembered && !hadCachedSnapshot) observeConversationPreload();
+      if (state.snapshot) setNativeConversationStartState((current) => (current?.conversationId === conversationId ? null : current));
       // 只有本次进程已经完成权威水合，才把显示缓存推进到磁盘；旧缓存刷新失败不能续期。
       if (remembered && state.transportState === 'ready') {
         dirtySessionViewCacheRef.current.add(conversationId);
@@ -1280,7 +1328,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
             },
       );
     },
-    [scheduleNativeConversationViewCachePersistence],
+    [observeConversationPreload, scheduleNativeConversationViewCachePersistence],
   );
 
   useEffect(() => {
@@ -1468,9 +1516,9 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const mergeTaskRecord = useCallback((task: TaskRecord): void => {
     setSnapshot((current) => ({
       ...current,
-      tasks: current.tasks.some((candidate) => candidate.id === task.id) ? current.tasks.map((candidate) => (candidate.id === task.id ? task : candidate)) : [...current.tasks, task],
+      tasks: current.tasks.some((candidate) => candidate.id === task.id) ? current.tasks.map((candidate) => (candidate.id === task.id ? mergeTaskProjection(candidate, task) : candidate)) : [...current.tasks, task],
     }));
-    setTaskDetail((current) => (current?.id === task.id ? task : current));
+    setTaskDetail((current) => (current?.id === task.id ? mergeTaskProjection(current, task) : current));
   }, []);
   return {
     taskQuery,
@@ -1534,6 +1582,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     gitSwitchBranchName,
     gitTargetRef,
     latestConversationContentVisible,
+    latestContentVisibleConversations,
     loadTaskBoard,
     loadingDiffBusy,
     loadingRuntimeBusy,
@@ -1548,6 +1597,9 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     nativeConversationChoicesByTaskRef,
     nativeConversationGroups,
     nativeConversationHotCacheRef,
+    observeConversationPreload,
+    nativeConversationStartState,
+    setNativeConversationStartState,
     nativeConversationRuntimeStates,
     nativeConversationStartEnvelopeManager,
     nativeConversationStatusSyncState,
@@ -1707,6 +1759,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setPendingTaskStatuses,
     setPatchExportStatus,
     setPendingProjectDeleteId,
+    projectGitOpen,
+    setProjectGitOpen,
     setProjectCodeWorkspaceMode,
     setVisitedCodeWorkspaceModes,
     setProjectConfig,
@@ -1829,6 +1883,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     taskDeleteDialogTaskId,
     taskDetail,
     taskDetailPaneTaskId,
+    taskDetailPaneTaskIdRef,
     taskDetailPresentation,
     taskEvents,
     taskGitDeliveryChangedRef,

@@ -1,7 +1,7 @@
 import { MotionPresence } from '../toolPageHost.js';
 import { formatVisibleApplicationError } from '../toolPageHost.js';
 import { temporaryWorkspaceId } from '../toolPageHost.js';
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { formatAutomationOnceInput, parseAutomationOnceInput } from '../toolPageHost.js';
 import { ArrowClockwiseIcon as Refresh } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { ClockCountdownIcon as Clock } from '@phosphor-icons/react/dist/csr/ClockCountdown';
@@ -41,6 +41,13 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 读取失败只影响列表新鲜度，不能覆盖已确认的写入结果。 */
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  /** 较早的刷新或已卸载页面不能覆盖当前目录。 */
+  const refreshRevision = useRef(0);
+  /** 旧客户端的迟到回执只确认原操作，不能改写当前页面。 */
+  const viewOwner = useRef(props.client);
+  viewOwner.current = props.client;
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(props.projects));
   /** 一次性输入按规则时区解析，未改动的已保存时间保留原精度。 */
@@ -52,21 +59,29 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
   const [pendingDelete, setPendingDelete] = useState<AutomationTaskRecord | null>(null);
   async function refresh(): Promise<void> {
     if (!props.client) return;
+    const revision = ++refreshRevision.current;
     setLoading(true);
-    setError(null);
+    setRefreshError(null);
     try {
-      const [nextTasks, nextEmployees] = await Promise.all([props.client.loadAutomations(), props.client.loadGlobalDigitalEmployees()]);
-      setTasks(nextTasks);
-      setEmployees(nextEmployees);
-    } catch (cause) {
-      setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
+      const [nextTasks, nextEmployees] = await Promise.allSettled([props.client.loadAutomations(), props.client.loadGlobalDigitalEmployees()]);
+      if (revision !== refreshRevision.current) return;
+      if (nextTasks.status === 'fulfilled') setTasks(nextTasks.value);
+      if (nextEmployees.status === 'fulfilled') setEmployees(nextEmployees.value);
+      const failure = nextTasks.status === 'rejected' ? nextTasks : nextEmployees.status === 'rejected' ? nextEmployees : null;
+      if (failure) setRefreshError(`${zh ? '目录暂未更新：' : 'Directory could not be refreshed: '}${formatVisibleApplicationError(failure.reason, zh ? 'zh-CN' : 'en')}`);
     } finally {
-      setLoading(false);
+      if (revision === refreshRevision.current) setLoading(false);
     }
   }
 
   useEffect(() => {
+    viewOwner.current = props.client;
+    setBusyId(null);
     void refresh();
+    return () => {
+      refreshRevision.current += 1;
+      if (viewOwner.current === props.client) viewOwner.current = null;
+    };
     // 首次进入并行读取规则和员工；后续由用户显式刷新，避免打断编辑。
   }, [props.client]);
 
@@ -185,16 +200,24 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
     if (!props.client || !editingId || busyId || !actionValid || !triggerValid) return;
     setBusyId(editingId);
     setError(null);
+    const owner = props.client;
     try {
       const input = normalizeDraft(draft, onceAt);
       const saved = editingId === 'new' ? await props.client.createAutomation(input) : await props.client.updateAutomation(editingId, tasks.find((task) => task.id === editingId)!.revision, input);
+      if (viewOwner.current !== owner) return;
+      /** 授权保存属于后续写入；其失败不能让重试再次创建已经保存的规则。 */
+      setTasks((current) => (current.some((task) => task.id === saved.id) ? current.map((task) => (task.id === saved.id ? saved : task)) : [saved, ...current]));
+      setEditingId(saved.id);
+      refreshRevision.current += 1;
+      setLoading(false);
       if (saved.permissionMode === 'full-access' && fullAccessAcknowledged) await props.client.setAutomationFullAccessGrant(saved.id, saved.revision, true);
+      if (viewOwner.current !== owner) return;
       setEditingId(null);
       await refresh();
     } catch (cause) {
-      setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
+      if (viewOwner.current === owner) setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
     } finally {
-      setBusyId(null);
+      if (viewOwner.current === owner) setBusyId(null);
     }
   }
 
@@ -203,15 +226,17 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
     if (busyId) return false;
     setBusyId(id);
     setError(null);
+    const owner = props.client;
     try {
       await operation();
+      if (viewOwner.current !== owner) return false;
       await refresh();
-      return true;
+      return viewOwner.current === owner;
     } catch (cause) {
-      setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
+      if (viewOwner.current === owner) setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
       return false;
     } finally {
-      setBusyId(null);
+      if (viewOwner.current === owner) setBusyId(null);
     }
   }
 
@@ -231,7 +256,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
           <p>{zh ? '管理自动化规则，在通知中心查看运行结果。' : 'Manage automation rules and view results in notifications.'}</p>
         </div>
         <div className="automations-header-actions">
-          <Button aria-label={zh ? '刷新自动化' : 'Refresh automations'} onClick={() => void refresh()} busy={loading} disabled={loading || Boolean(busyId)}>
+          <Button aria-label={zh ? '刷新自动化' : 'Refresh automations'} onClick={() => refresh()} busy={loading} disabled={loading || Boolean(busyId)}>
             <Refresh aria-hidden="true" />
             {zh ? '刷新' : 'Refresh'}
           </Button>
@@ -242,9 +267,9 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
         </div>
       </header>
 
-      {error && !editingId && !pendingDelete ? (
+      {(error || refreshError) && !editingId && !pendingDelete ? (
         <p className="automations-error" role="alert">
-          {error}
+          {error ?? refreshError}
         </p>
       ) : null}
       <div className="automations-layout">
@@ -256,7 +281,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
           ) : tasks.length ? (
             tasks.map((task) => (
               <article className="automation-row" key={task.id} data-status={task.status}>
-                <button type="button" className="automation-row-main" disabled={Boolean(busyId)} onClick={() => startEdit(task)}>
+                <Button unstyled type="button" className="automation-row-main" disabled={Boolean(busyId)} onClick={() => startEdit(task)}>
                   <span className="automation-status-dot" aria-hidden="true" />
                   <span>
                     <strong>{task.name}</strong>
@@ -266,7 +291,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
                     {task.migrationIssue ? <small className="automation-warning">{task.migrationIssue}</small> : null}
                   </span>
                   <span className="automation-row-schedule">{scheduleLabel(task, zh)}</span>
-                </button>
+                </Button>
                 <div className="automation-row-actions">
                   {task.status === 'active' ? (
                     <Button
@@ -275,7 +300,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
                       aria-label={`${zh ? '立即运行' : 'Run'} ${task.name}`}
                       busy={busyId === `run:${task.id}`}
                       disabled={Boolean(busyId)}
-                      onClick={() => void mutate(`run:${task.id}`, () => props.client!.runAutomation(task.id))}
+                      onClick={() => mutate(`run:${task.id}`, () => props.client!.runAutomation(task.id))}
                     >
                       <Play aria-hidden="true" />
                     </Button>
@@ -286,7 +311,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
                     aria-label={`${task.status === 'active' ? (zh ? '暂停' : 'Pause') : zh ? '继续' : 'Resume'} ${task.name}`}
                     busy={busyId === `status:${task.id}`}
                     disabled={Boolean(busyId)}
-                    onClick={() => void mutate(`status:${task.id}`, () => props.client!.setAutomationStatus(task.id, task.status === 'active' ? 'paused' : 'active'))}
+                    onClick={() => mutate(`status:${task.id}`, () => props.client!.setAutomationStatus(task.id, task.status === 'active' ? 'paused' : 'active'))}
                   >
                     {task.status === 'active' ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                   </Button>
@@ -318,7 +343,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
             submitLabel={editingId === 'new' ? (zh ? '创建并启用' : 'Create and enable') : zh ? '保存更改' : 'Save changes'}
             submitDisabled={!draft.name.trim() || !draft.prompt.trim() || !actionValid || !triggerValid || (draft.permissionMode === 'full-access' && !fullAccessAcknowledged)}
             onClose={() => setEditingId(null)}
-            onSubmit={(event) => void submit(event)}
+            onSubmit={(event) => submit(event)}
           >
             {error ? (
               <p className="automations-error" role="alert">
@@ -564,7 +589,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
             onClose={() => setPendingDelete(null)}
             onSubmit={(event) => {
               event.preventDefault();
-              void mutate(`delete:${pendingDelete.id}`, () => props.client!.deleteAutomation(pendingDelete.id)).then((deleted) => {
+              return mutate(`delete:${pendingDelete.id}`, () => props.client!.deleteAutomation(pendingDelete.id)).then((deleted) => {
                 if (deleted) setPendingDelete(null);
               });
             }}

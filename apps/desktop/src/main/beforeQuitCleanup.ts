@@ -1,4 +1,5 @@
-export type DesktopLocalServerCloseMode = 'continue_in_background' | 'upgrade_handoff' | 'upgrade_shutdown' | 'final_quit' | 'force_quit';
+/** 明确退出会关闭后台宿主；升级交接由专用模式处理。 */
+export type DesktopLocalServerCloseMode = 'upgrade_handoff' | 'upgrade_shutdown' | 'final_quit' | 'force_quit';
 
 export interface BeforeQuitCleanupEvent {
   preventDefault: () => void;
@@ -9,11 +10,11 @@ export type BeforeQuitCleanupFailureAction = 'retry' | 'keep_open' | 'force_quit
 export interface BeforeQuitCleanupResources {
   closeSystemNotifications?: () => void;
   resolveQuitMode?: () => Promise<DesktopLocalServerCloseMode | 'cancel'>;
-  /** 用户选择继续后台运行时隐藏窗口，但保留 Main、Core 和通知资源。 */
-  continueInBackground?: () => void | Promise<void>;
   closeLocalServer?: (mode: DesktopLocalServerCloseMode) => Promise<void>;
   shouldDeferQuit?: () => boolean;
   requestQuitConfirmation?: () => void;
+  /** 确认退出后暂停界面连接；保留窗口时恢复连接。 */
+  onQuitStateChanged?: (quitting: boolean) => void;
   onCleanupError?: (error: unknown, quitMode: DesktopLocalServerCloseMode | null) => BeforeQuitCleanupFailureAction | Promise<BeforeQuitCleanupFailureAction>;
   exitApp: (code: number) => void;
 }
@@ -39,14 +40,11 @@ export function createBeforeQuitCleanupHandler(resources: BeforeQuitCleanupResou
           const resolvedQuitMode = (await resources.resolveQuitMode?.()) ?? 'final_quit';
           if (resolvedQuitMode === 'cancel') {
             cleanupStarted = false;
+            resources.onQuitStateChanged?.(false);
             return;
           }
           quitMode = resolvedQuitMode;
-          if (quitMode === 'continue_in_background') {
-            await resources.continueInBackground?.();
-            cleanupStarted = false;
-            return;
-          }
+          resources.onQuitStateChanged?.(true);
           const cleanupErrors: unknown[] = [];
           try {
             resources.closeSystemNotifications?.();
@@ -75,6 +73,7 @@ export function createBeforeQuitCleanupHandler(resources: BeforeQuitCleanupResou
             return;
           }
           cleanupStarted = false;
+          resources.onQuitStateChanged?.(false);
           return;
         }
       }

@@ -1,4 +1,5 @@
 import { buildTaskEnvironmentRootPath, cleanupPreparedTaskWorktree, prepareTaskWorktree } from '@zeus/git-core';
+import { restoreConversationWorktrees } from './conversationWorktreeLifecycle.js';
 import {
   ConversationExpertRepository,
   ConversationRepository,
@@ -84,6 +85,18 @@ export function createConversationExecutionContextOperations(dependencies: Conve
     const config = resolveTaskManagementStatusConfigForProject(task.projectId);
     return task.managementStatus === config.roles.completedStatusId || task.managementStatus === config.roles.cancelledStatusId;
   }
+
+  /** 从新对话建立的任务保留会话自有目录；已有任务工作区仍走任务恢复链路。 */
+  function usesProjectConversationWorkspace(conversation: ZeusConversationRecord): boolean {
+    if (!conversation.taskId) return true;
+    if (conversation.workspaceId || conversation.environmentId) return false;
+    /** 任务来源绑定最初会话，专家子通道共用同一目录归属。 */
+    const task = tasks.getById(conversation.taskId);
+    if (task?.createdFrom !== 'conversation') return false;
+    const source = parseJsonObject(task.sourceContextJson);
+    const root = typeof source.conversationId === 'string' ? conversations.getRecordById(source.conversationId) : undefined;
+    return root?.taskId === task.id && root.projectId === conversation.projectId;
+  }
   function taskConflictExecutionForConversation(conversation: ZeusConversationRecord): { operationId: string; integration: ZeusTaskIntegrationRecord; worktreePath: string } | null {
     const persistedAttempt = taskIntegrationAttempts.getByConversationId(conversation.id);
     if (persistedAttempt) {
@@ -135,6 +148,7 @@ export function createConversationExecutionContextOperations(dependencies: Conve
       for (const submission of conversationSubmissions.listByConversation(parent.id)) {
         const input = parseJsonObject(submission.inputJson);
         const context = isNativeApiRecord(input.context) ? input.context : null;
+        if (input.expertRound === true && context?.executionWorkspaceMode === 'worktree' && usesProjectConversationWorkspace(parent)) return 'worktree';
         if (input.expertRound === true && context?.executionWorkspaceMode === 'direct' && typeof context.projectLocalPath === 'string' && resolve(context.projectLocalPath) === resolve(project.localPath)) return 'direct';
       }
     }
@@ -150,18 +164,25 @@ export function createConversationExecutionContextOperations(dependencies: Conve
     return null;
   }
 
-  function resolveNativeConversationExecutionRoot(conversation: ZeusConversationRecord): string | null {
+  /** 明确恢复时可定位已回收的原环境；普通只读操作仍要求原仓库可读。 */
+  function resolveNativeConversationExecutionRoot(conversation: ZeusConversationRecord, restoreWorkspace = false): string | null {
     const contextualSubmission = conversationSubmissions.listByConversation(conversation.id).find((submission) => {
       const context = parseJsonObject(submission.inputJson).context;
       return isNativeApiRecord(context) && typeof context.projectLocalPath === 'string' && Boolean(context.projectLocalPath.trim());
     });
     const persistedContext = contextualSubmission ? parseJsonObject(contextualSubmission.inputJson).context : undefined;
+    /** 专家通道首发前还没有自己的提交，目录来自已登记的父会话。 */
+    if (!persistedContext && usesProjectConversationWorkspace(conversation)) {
+      const participant = conversationExperts.getParticipantByChildConversation(conversation.id);
+      const parent = participant ? conversations.getRecordById(participant.conversationId) : undefined;
+      if (parent && parent.id !== conversation.id && parent.projectId === conversation.projectId && parent.taskId === conversation.taskId) return resolveNativeConversationExecutionRoot(parent);
+    }
     const workspace = conversation.workspaceId ? taskWorkspaces.getById(conversation.workspaceId) : undefined;
     /** 旧会话可能仅由工作区关联环境；路径查询与实际恢复必须读取同一身份。 */
     const environmentId = conversation.environmentId ?? workspace?.environmentId;
     const environment = environmentId ? taskEnvironments.getById(environmentId) : undefined;
     const project = projects.getById(conversation.projectId);
-    if (conversation.taskId) {
+    if (conversation.taskId && !usesProjectConversationWorkspace(conversation)) {
       const conflictExecution = taskConflictExecutionForConversation(conversation);
       if (conflictExecution) return existsSync(conflictExecution.worktreePath) ? resolve(conflictExecution.worktreePath) : null;
       const executionMode = taskConversationExecutionWorkspaceMode(conversation, project);
@@ -170,9 +191,9 @@ export function createConversationExecutionContextOperations(dependencies: Conve
         return projectPath && existsSync(projectPath) && statSync(projectPath).isDirectory() ? projectPath : null;
       }
       /** 目录暂时不存在仍保留隔离身份，不能把排队快照冻结到项目主目录。 */
-      const task = tasks.getById(conversation.taskId);
+      const task = conversation.taskId ? tasks.getById(conversation.taskId) : undefined;
       if (!project || !task || !workspace || executionMode !== 'worktree') return null;
-      if (conversation.permissionMode === 'read-only') return resolveTaskReadOnlyWorkspacePath(project, task.id, workspace, environment);
+      if (conversation.permissionMode === 'read-only' && !restoreWorkspace) return resolveTaskReadOnlyWorkspacePath(project, task.id, workspace, environment);
       /** 和实际恢复采用同一原路径或确定性重建路径。 */
       const executionRoot = resolve(environment?.rootPath || (!environment ? workspace.worktreePath : null) || buildTaskEnvironmentRootPath(project.localPath, project.slug, task.taskCode, environment?.id ?? workspace.id));
       return executionRoot !== resolve(project.localPath) && isPathInsideRoot(executionRoot, join(dirname(resolve(project.localPath)), '.zeus-worktrees')) ? executionRoot : null;
@@ -222,37 +243,55 @@ export function createConversationExecutionContextOperations(dependencies: Conve
         throw nativeApiError('ZEUS_TASK_REOPEN_REQUIRED', '请先重新打开任务并恢复这条已归档会话。');
       }
     }
-    // 只读核验先于开发环境恢复锁，不能借用其他会话的可写目录或改变交付状态。
-    if (lockConversation.permissionMode === 'read-only' && lockConversation.taskId && lockConversation.workspaceId && !taskConflictExecutionForConversation(lockConversation)) {
+    /** 只读任务仅在明确恢复时允许重建原环境，普通审查仍只读取原仓库。 */
+    const readOnlyTask =
+      lockConversation.permissionMode === 'read-only' && lockConversation.taskId && lockConversation.workspaceId && !taskConflictExecutionForConversation(lockConversation)
+        ? { taskId: lockConversation.taskId, workspaceId: lockConversation.workspaceId }
+        : null;
+    if (readOnlyTask) {
       /** 根据会话持久身份复验原仓库，不借用同任务的其他工作区。 */
       const project = projects.getById(lockConversation.projectId);
       /** 当前会话绑定的仓库记录。 */
-      const workspace = taskWorkspaces.getById(lockConversation.workspaceId);
+      const workspace = taskWorkspaces.getById(readOnlyTask.workspaceId);
       /** 旧会话可以从仓库记录补全环境身份。 */
       const environmentId = lockConversation.environmentId ?? workspace?.environmentId;
       /** 当前会话绑定的执行环境。 */
       const environment = environmentId ? taskEnvironments.getById(environmentId) : undefined;
-      /** 可读目录必须存在，审查不执行开发环境恢复。 */
-      const cwd = project ? resolveTaskReadOnlyWorkspacePath(project, lockConversation.taskId, workspace, environment) : null;
-      if (!cwd) throw nativeApiError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '原任务工作目录已回收或不可用，无法进行只读审查。');
-      return { projectLocalPath: cwd, writableRoots: [], executionWorkspaceMode: 'worktree' };
+      /** 已有目录直接读取；明确恢复才可进入原环境的统一重建流程。 */
+      const cwd = project ? resolveTaskReadOnlyWorkspacePath(project, readOnlyTask.taskId, workspace, environment) : null;
+      if (cwd) return { projectLocalPath: cwd, writableRoots: [], executionWorkspaceMode: 'worktree' };
+      /** 缺少物理目录不免除项目、任务、仓库和环境的归属校验。 */
+      const restorable =
+        project &&
+        workspace &&
+        workspace.projectId === project.id &&
+        workspace.taskId === readOnlyTask.taskId &&
+        ['ready', 'merged', 'reclaimed'].includes(workspace.state) &&
+        (!environment || environment.id === workspace.environmentId) &&
+        (!workspace.environmentId || (environment && environment.projectId === project.id && environment.taskId === readOnlyTask.taskId && ['ready', 'reclaimed'].includes(environment.state)));
+      if (input.mode !== 'restore' || !restorable) throw nativeApiError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '原任务工作目录已回收或不可用，无法进行只读审查。');
     }
     const lockKey = `${lockConversation?.projectId ?? 'conversation'}:${lockConversation?.environmentId ?? lockConversation?.workspaceId ?? input.conversationId}`;
     const existing = taskConversationExecutionContextPromises.get(lockKey);
-    if (existing) return existing;
     const promise = (async () => {
+      if (existing) return existing;
       const conversation = conversations.getById(input.conversationId);
       if (!conversation) return null;
       // 归档是产品会话的继续边界；Provider 内部归档和任务状态不代替这个判断。
       if (conversation.archived && input.mode !== 'restore') throw nativeApiError('ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED', '会话已归档，请先恢复会话再继续。');
-      if (!conversation.taskId) {
+      if (usesProjectConversationWorkspace(conversation)) {
+        await restoreConversationWorktrees({ db, projects, conversations, conversationSubmissions }, conversation);
         /** 项目会话同样使用所属项目或已记录的路径，Pi 重启后不能退回宿主启动目录。 */
         const executionRoot = resolveNativeConversationExecutionRoot(conversation);
         if (!executionRoot || !existsSync(executionRoot) || !statSync(executionRoot).isDirectory()) throw nativeApiError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '会话工作目录不存在或不可用。');
-        return { projectLocalPath: resolve(executionRoot), writableRoots: resolveProjectConversationWritableRoots(conversation, executionRoot) };
+        return {
+          projectLocalPath: resolve(executionRoot),
+          writableRoots: resolveProjectConversationWritableRoots(conversation, executionRoot),
+          executionWorkspaceMode: taskConversationExecutionWorkspaceMode(conversation, projects.getById(conversation.projectId)) ?? undefined,
+        };
       }
       const project = projects.getById(conversation.projectId);
-      const task = tasks.getById(conversation.taskId);
+      const task = conversation.taskId ? tasks.getById(conversation.taskId) : undefined;
       const workspace = conversation.workspaceId ? taskWorkspaces.getById(conversation.workspaceId) : undefined;
       const environmentId = conversation.environmentId ?? workspace?.environmentId ?? null;
       const environment = environmentId ? taskEnvironments.getById(environmentId) : undefined;
@@ -314,7 +353,7 @@ export function createConversationExecutionContextOperations(dependencies: Conve
       const projectRoot = resolve(project.localPath);
       const worktreeContainerRoot = resolve(join(dirname(projectRoot), '.zeus-worktrees'));
       /** 与入队时冻结的路径一致，旧式单仓会话也优先沿用登记的工作区。 */
-      const environmentRoot = resolveNativeConversationExecutionRoot(conversation);
+      const environmentRoot = resolveNativeConversationExecutionRoot(conversation, input.mode === 'restore');
       if (!environmentRoot || environmentRoot === projectRoot || !isPathInsideRoot(environmentRoot, worktreeContainerRoot)) {
         throw nativeApiError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', 'The recorded task workspace path is unsafe; Zeus will not use the project root as a fallback.');
       }
@@ -385,7 +424,10 @@ export function createConversationExecutionContextOperations(dependencies: Conve
 
       const updatedWorkspaces = db.transaction(() => {
         if (environment) taskEnvironments.update(environment.id, { rootPath: environmentRoot, state: 'ready', lastError: null });
-        return prepared.map(({ workspace, prepared: restored }) => taskWorkspaces.update(workspace.id, { worktreePath: restored.worktreePath, headSha: restored.headSha, state: 'ready', lastError: null }));
+        /** 恢复审查目录不撤销仓库已有的合入结果。 */
+        return prepared.map(({ workspace, prepared: restored }) =>
+          taskWorkspaces.update(workspace.id, { worktreePath: restored.worktreePath, headSha: restored.headSha, state: readOnlyTask && workspace.state === 'merged' ? 'merged' : 'ready', lastError: null }),
+        );
       });
       await db.save();
       recordTaskEvent({
@@ -407,7 +449,17 @@ export function createConversationExecutionContextOperations(dependencies: Conve
     })();
     taskConversationExecutionContextPromises.set(lockKey, promise);
     try {
-      return await promise;
+      const context = await promise;
+      if (readOnlyTask) {
+        /** 共享环境准备完成后，按当前会话的精确仓库重新投影只读范围。 */
+        const project = projects.getById(lockConversation.projectId);
+        const workspace = taskWorkspaces.getById(readOnlyTask.workspaceId);
+        const environment = workspace?.environmentId ? taskEnvironments.getById(workspace.environmentId) : undefined;
+        const cwd = project ? resolveTaskReadOnlyWorkspacePath(project, readOnlyTask.taskId, workspace, environment) : null;
+        if (!cwd) throw nativeApiError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '原任务工作目录无法恢复，无法进行只读审查。');
+        return { projectLocalPath: cwd, writableRoots: [], executionWorkspaceMode: 'worktree' as const };
+      }
+      return context;
     } finally {
       if (taskConversationExecutionContextPromises.get(lockKey) === promise) taskConversationExecutionContextPromises.delete(lockKey);
     }
@@ -417,53 +469,6 @@ export function createConversationExecutionContextOperations(dependencies: Conve
     const repositoryRoots = workspaces.flatMap((workspace) => (workspace.worktreePath ? [workspace.worktreePath] : []));
     const sharedRoots = projectSharedPaths.listByProject(project.id).map((entry) => entry.localPath);
     return Array.from(new Set(workspaces.length === 0 ? [project.localPath, ...sharedRoots] : [...repositoryRoots, ...sharedRoots]));
-  }
-
-  /**
-   * 在任务环境中保留项目容器的相对布局：仓库位置留给 Git worktree，
-   * 共享可写目录和其他非 Git 内容使用符号链接保持单一真实来源。
-   */
-  function mirrorTaskEnvironmentContainer(project: ZeusProjectRecord, environmentRoot: string, repositories: ZeusProjectRepositoryRecord[], sharedPaths: ZeusProjectSharedPathRecord[]): void {
-    const repositoryPaths = new Set(repositories.map((entry) => entry.relativePath));
-    const sharedByPath = new Map(sharedPaths.map((entry) => [entry.relativePath, entry]));
-    const memberPaths = [...repositoryPaths, ...sharedByPath.keys()];
-
-    const visit = (sourcePath: string, targetPath: string, relativePath: string): void => {
-      const normalizedRelativePath = relativePath.split(sep).join('/') || '.';
-      if (repositoryPaths.has(normalizedRelativePath)) return;
-      const shared = sharedByPath.get(normalizedRelativePath);
-      if (shared) {
-        mkdirSync(dirname(targetPath), { recursive: true });
-        symlinkSync(shared.localPath, targetPath, 'dir');
-        return;
-      }
-      const prefix = normalizedRelativePath === '.' ? '' : `${normalizedRelativePath}/`;
-      const containsMember = memberPaths.some((memberPath) => prefix === '' || memberPath.startsWith(prefix));
-      if (normalizedRelativePath !== '.' && !containsMember) {
-        mkdirSync(dirname(targetPath), { recursive: true });
-        const entry = lstatSync(sourcePath);
-        symlinkSync(sourcePath, targetPath, entry.isDirectory() ? 'dir' : 'file');
-        return;
-      }
-      mkdirSync(targetPath, { recursive: true });
-      for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
-        if (entry.name === '.git' || entry.name === '.zeus-worktrees') continue;
-        const childRelativePath = normalizedRelativePath === '.' ? entry.name : `${normalizedRelativePath}/${entry.name}`;
-        visit(join(sourcePath, entry.name), join(targetPath, entry.name), childRelativePath);
-      }
-    };
-
-    visit(project.localPath, environmentRoot, '.');
-  }
-
-  /** 共享目录覆盖任务 worktree 中的同名路径，始终指向项目里的持久真实目录。 */
-  function overlayTaskEnvironmentSharedPaths(environmentRoot: string, sharedPaths: ZeusProjectSharedPathRecord[]): void {
-    for (const sharedPath of sharedPaths) {
-      const targetPath = join(environmentRoot, sharedPath.relativePath);
-      rmSync(targetPath, { recursive: true, force: true });
-      mkdirSync(dirname(targetPath), { recursive: true });
-      symlinkSync(sharedPath.localPath, targetPath, 'dir');
-    }
   }
 
   return {
@@ -476,4 +481,51 @@ export function createConversationExecutionContextOperations(dependencies: Conve
     resolveNativeConversationExecutionRoot,
     ensureNativeConversationExecutionContext,
   };
+}
+
+/**
+ * 在任务环境中保留项目容器的相对布局：仓库位置留给 Git worktree，
+ * 共享可写目录和其他非 Git 内容使用符号链接保持单一真实来源。
+ */
+export function mirrorTaskEnvironmentContainer(project: ZeusProjectRecord, environmentRoot: string, repositories: ReadonlyArray<Pick<ZeusProjectRepositoryRecord, 'relativePath'>>, sharedPaths: ZeusProjectSharedPathRecord[]): void {
+  const repositoryPaths = new Set(repositories.map((entry) => entry.relativePath));
+  const sharedByPath = new Map(sharedPaths.map((entry) => [entry.relativePath, entry]));
+  const memberPaths = [...repositoryPaths, ...sharedByPath.keys()];
+
+  const visit = (sourcePath: string, targetPath: string, relativePath: string): void => {
+    const normalizedRelativePath = relativePath.split(sep).join('/') || '.';
+    if (repositoryPaths.has(normalizedRelativePath)) return;
+    const shared = sharedByPath.get(normalizedRelativePath);
+    if (shared) {
+      mkdirSync(dirname(targetPath), { recursive: true });
+      symlinkSync(shared.localPath, targetPath, 'dir');
+      return;
+    }
+    const prefix = normalizedRelativePath === '.' ? '' : `${normalizedRelativePath}/`;
+    const containsMember = memberPaths.some((memberPath) => prefix === '' || memberPath.startsWith(prefix));
+    if (normalizedRelativePath !== '.' && !containsMember) {
+      mkdirSync(dirname(targetPath), { recursive: true });
+      const entry = lstatSync(sourcePath);
+      symlinkSync(sourcePath, targetPath, entry.isDirectory() ? 'dir' : 'file');
+      return;
+    }
+    mkdirSync(targetPath, { recursive: true });
+    for (const entry of readdirSync(sourcePath, { withFileTypes: true })) {
+      if (entry.name === '.git' || entry.name === '.zeus-worktrees') continue;
+      const childRelativePath = normalizedRelativePath === '.' ? entry.name : `${normalizedRelativePath}/${entry.name}`;
+      visit(join(sourcePath, entry.name), join(targetPath, entry.name), childRelativePath);
+    }
+  };
+
+  visit(project.localPath, environmentRoot, '.');
+}
+
+/** 共享目录覆盖任务 worktree 中的同名路径，始终指向项目里的持久真实目录。 */
+export function overlayTaskEnvironmentSharedPaths(environmentRoot: string, sharedPaths: ZeusProjectSharedPathRecord[]): void {
+  for (const sharedPath of sharedPaths) {
+    const targetPath = join(environmentRoot, sharedPath.relativePath);
+    rmSync(targetPath, { recursive: true, force: true });
+    mkdirSync(dirname(targetPath), { recursive: true });
+    symlinkSync(sharedPath.localPath, targetPath, 'dir');
+  }
 }

@@ -1,17 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
-import { GearSixIcon } from '@phosphor-icons/react/dist/csr/GearSix';
-import { defaultGitDeliverySettings, defaultTaskManagementStatusLabels, type GitDeliveryInput, type GitDeliveryRun, type GitDeliverySettings, type GitDeliveryStep, type TaskManagementStatusDefinition } from '@zeus/shared';
+import { useContext, useEffect, useRef, useState } from 'react';
+import { GitDeliveryCombinationContext } from './gitDeliverySettings.js';
+import { defaultTaskManagementStatusLabels, type CommandDefinition, type GitDeliveryInput, type GitDeliveryRun, type GitDeliverySettings, type GitDeliveryStep, type TaskManagementStatusDefinition } from '@zeus/shared';
 import type { DashboardClient } from '../apiClient.js';
 import { Button } from '../ui/Button.js';
 import { FormDialog } from '../ui/FormDialog.js';
 import { loadGitCommitModelOptions } from './gitCommitModels.js';
-import { GitCommitGenerationSettingsButton } from './GitCommitGenerationSettings.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { SkillSelector } from '../features/skills/SkillSelector.js';
 import { ConflictAiPermissions, TaskGitConflictWorkspace } from '../task/TaskGitConflictWorkspace.js';
 import { createConflictDocument, serializeConflictForGit, countUnresolvedConflictBlocks, type ConflictDocument } from '../task/taskConflictModel.js';
 import type { TaskIntegrationConflictFile } from '../session/sessionTypes.js';
+import { GitDeliveryProgress, gitDeliveryActionLabel as actionLabel } from './GitDeliveryProgress.js';
+import { GitDeliveryRunActions, GitDeliveryCleanupConfirmation } from './GitDeliveryRunActions.js';
+import { useGitDeliveryRuns } from './useGitDeliveryRuns.js';
+import { GitDeliveryCommandSelect } from './GitDeliveryCommandSelect.js';
 
 /** 两个入口使用同一后台交付客户端。 */
 export type GitDeliveryClient = Pick<
@@ -21,6 +24,7 @@ export type GitDeliveryClient = Pick<
   | 'startGitDeliveryRun'
   | 'loadGitCommitModels'
   | 'resumeGitDeliveryRun'
+  | 'stopGitDeliveryRun'
   | 'acknowledgeGitDelivery'
   | 'loadGitDeliveryConflict'
   | 'saveGitDeliveryConflict'
@@ -29,29 +33,7 @@ export type GitDeliveryClient = Pick<
   | 'subscribeEvents'
 >;
 
-/** 本机项目偏好只保存操作选择，不保存文件或分支。 */
-export function readGitDeliverySettings(projectId: string): GitDeliverySettings {
-  try {
-    const value = JSON.parse(localStorage.getItem(`zeus.git-delivery.settings:${projectId}`) ?? 'null') as Partial<GitDeliverySettings> | null;
-    if (
-      !value ||
-      ['commit', 'merge', 'push', 'resolveConflicts'].some((key) => typeof value[key as 'commit'] !== 'boolean') ||
-      (value.generateCommitMessage !== undefined && typeof value.generateCommitMessage !== 'boolean') ||
-      !['auto', 'full-access'].includes(value.permissionMode ?? '') ||
-      (value.skillId !== null && typeof value.skillId !== 'string') ||
-      (value.finalTaskStatus !== null && typeof value.finalTaskStatus !== 'string')
-    )
-      return { ...defaultGitDeliverySettings };
-    return { ...defaultGitDeliverySettings, ...value };
-  } catch {
-    return { ...defaultGitDeliverySettings };
-  }
-}
-
-/** 固定步骤的用户文案同时用于摘要和运行进度。 */
-function actionLabel(action: GitDeliveryStep['action'], zh: boolean): string {
-  return { commit: zh ? '提交' : 'Commit', merge: zh ? '合入' : 'Merge', push: zh ? '推送' : 'Push', task_status: zh ? '任务状态' : 'Task status' }[action];
-}
+export { readGitDeliverySettings } from './gitDeliverySettings.js';
 
 /** 运行控件不持有执行循环，只接纳固定输入并显示后台事实。 */
 export function GitDeliveryRunControl(props: {
@@ -59,23 +41,31 @@ export function GitDeliveryRunControl(props: {
   client: GitDeliveryClient;
   /** 当前真实项目。 */
   projectId: string;
+  /** 会话仓库交付仍使用会话范围，收尾选项按其真实任务归属展示。 */
+  taskId?: string | null;
   /** 当前输入；点击时再次固定副本。 */
   input: Omit<GitDeliveryInput, 'settings'>;
   /** 原页正在处理单步操作。 */
   disabled: boolean;
   /** 当前语言。 */
   zh: boolean;
-  /** 只有服务端持久接纳后才关闭原窗口。 */
+  /** 服务端持久接纳后销毁已隐藏的原窗口。 */
   onAccepted(): void;
 }) {
-  /** 已保存设置与表单草稿分离。 */
-  const [settings, setSettings] = useState(() => readGitDeliverySettings(props.projectId));
+  /** 功能区与底部按钮读取同一份组合，避免勾选和执行不一致。 */
+  const combination = useContext(GitDeliveryCombinationContext);
+  if (!combination) throw new Error('代码交付运行按钮必须位于交付操作栏。');
+  const { settings, setSettings, settingsOpen, setSettingsOpen, setRunning } = combination;
+  /** 任务工作区与关联任务的普通会话共享任务收尾。 */
+  const taskId = props.input.scope.kind === 'task' ? props.input.scope.taskId : props.taskId;
   /** 设置弹窗草稿。 */
   const [draft, setDraft] = useState<GitDeliverySettings | null>(null);
   /** 项目当前真实状态定义。 */
   const [statuses, setStatuses] = useState<TaskManagementStatusDefinition[]>([]);
-  /** 后台结果不从文件列表推算。 */
-  const [runs, setRuns] = useState<GitDeliveryRun[]>([]);
+  /** 命令目录沿用项目与全局合并结果，不在交付页复制脚本配置。 */
+  const [commands, setCommands] = useState<CommandDefinition[]>([]);
+  /** 未读取成功前禁止携带上次选择运行，避免旧命令被静默省略。 */
+  const [commandsLoaded, setCommandsLoaded] = useState(false);
   /** 加载、接纳或继续时阻止重复操作。 */
   const [busy, setBusy] = useState(false);
   /** 保留失败原因与手动重读入口。 */
@@ -88,6 +78,8 @@ export function GitDeliveryRunControl(props: {
   const pending = useRef(false);
   /** 后台查询只属于当前入口。 */
   const scopeId = props.input.scope.kind === 'task' ? props.input.scope.taskId : props.input.scope.conversationId;
+  /** 与环境卡片共用后台进度，关闭交付窗口不影响执行。 */
+  const { runs, error: runsError, refresh, acceptRun } = useGitDeliveryRuns(props.client, props.projectId, scopeId);
   /** 冲突页复用原三栏编辑器。 */
   const [conflict, setConflict] = useState<{ run: GitDeliveryRun; step: GitDeliveryStep; files: string[]; sourceBranch: string; targetBranch: string; file: TaskIntegrationConflictFile | null } | null>(null);
   /** 用户编辑内容只在保存或 AI 接管时发送。 */
@@ -95,37 +87,36 @@ export function GitDeliveryRunControl(props: {
   /** 当前是否有已接纳运行。 */
   const running = runs.some((run) => run.state === 'queued' || run.state === 'running');
 
-  /** 操作栏只保留进行中或待处理运行，成功历史不再占用交付空间。 */
-  const visibleRuns = runs.filter((run) => run.state !== 'succeeded').slice(0, 5);
+  /** 只显示最后一次交付，较早的失败不能重新成为可继续流程。 */
+  const visibleRuns = runs.slice(0, 1).filter((run) => run.state !== 'succeeded');
 
-  /** 重开窗口或实时变化都重新查询服务端进度。 */
-  async function refresh(): Promise<void> {
-    const result = await props.client.loadGitDeliveryRuns(props.projectId, scopeId);
-    setRuns(result.items);
-  }
-
+  /** 两个交付入口读取同一命令目录，聚焦或定义变化时重新核对可用项。 */
   useEffect(() => {
     let disposed = false;
-    /** 合并同一批逐仓事件，避免完成通知产生请求风暴。 */
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    setCommandsLoaded(false);
+    setCommands([]);
+    /** 加载失败保留明确错误，不能把失败当成项目没有命令。 */
     const reload = () => {
-      if (disposed) return;
       void props.client
-        .loadGitDeliveryRuns(props.projectId, scopeId)
+        .loadGitDeliveryOptions(props.projectId)
         .then((result) => {
-          if (!disposed) setRuns(result.items);
+          if (!disposed) {
+            setCommands(result.commands);
+            setStatuses(result.statuses);
+            setCommandsLoaded(true);
+          }
         })
         .catch((reason) => {
-          if (!disposed) setError(reason);
+          if (!disposed) {
+            setCommandsLoaded(false);
+            setError(reason);
+          }
         });
     };
     reload();
     const unsubscribe = props.client.subscribeEvents(
       (event) => {
-        if (event.type === 'project.git_delivery.changed') {
-          clearTimeout(timer);
-          timer = setTimeout(reload, 80);
-        }
+        if (event.type.startsWith('command.definition.')) reload();
       },
       (state) => {
         if (state === 'connected') reload();
@@ -134,35 +125,67 @@ export function GitDeliveryRunControl(props: {
     window.addEventListener('focus', reload);
     return () => {
       disposed = true;
-      clearTimeout(timer);
       unsubscribe();
       window.removeEventListener('focus', reload);
     };
-  }, [props.client, props.projectId, scopeId, props.zh]);
+  }, [props.client, props.projectId]);
 
-  /** 设置打开时读取项目状态，不用全局默认代替真实定义。 */
-  async function openSettings(): Promise<void> {
+  /** 功能区的设置按钮只在打开时读取当前项目状态。 */
+  useEffect(() => {
+    if (!settingsOpen) {
+      setDraft(null);
+      return;
+    }
+    let active = true;
     setError(null);
     setDraft({ ...settings });
-    try {
-      setStatuses((await props.client.loadGitDeliveryOptions(props.projectId)).statuses);
-    } catch (reason) {
-      setError(reason);
-    }
-  }
+    void props.client
+      .loadGitDeliveryOptions(props.projectId)
+      .then((result) => {
+        if (active) setStatuses(result.statuses);
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(reason);
+      });
+    return () => {
+      active = false;
+    };
+  }, [settingsOpen, props.client, props.projectId]);
 
-  /** 将固定快照交给后台；成功后不等待任何 Git 或 AI 步骤。 */
+  /** 接纳与后台运行期间，功能旁的复选框不能改变正在执行的组合。 */
+  useEffect(() => {
+    setRunning(busy || running);
+    return () => setRunning(false);
+  }, [busy, running, setRunning]);
+
+  /** 立即隐藏窗口，将固定快照交给后台；接纳失败时恢复原窗口。 */
   async function start(): Promise<void> {
     if (pending.current) return;
     pending.current = true;
     setBusy(true);
     setError(null);
+    /** 接纳或偏好保存失败时仍需恢复窗口展示原因。 */
+    let dismissed = false;
     try {
       /** 读取模型前固定文件和设置，接纳重试继续使用同一快照。 */
-      const sourceJson = JSON.stringify({ ...props.input, settings: { ...settings, finalTaskStatus: props.input.scope.kind === 'task' ? settings.finalTaskStatus : null } });
+      const sourceJson = JSON.stringify({
+        ...props.input,
+        postPushCommands: settings.push ? (settings.postPushCommandIds ?? []).map((commandId) => ({ commandId, expectedRevision: commands.find((command) => command.id === commandId)?.revision ?? 0 })) : [],
+        settings: { ...settings, finalTaskStatus: taskId ? settings.finalTaskStatus : null, archiveConversation: !taskId && settings.archiveConversation === true },
+      });
+      await window.zeus?.setTaskGitDeliverySubmissionState?.('pending');
       if (request.current?.sourceJson !== sourceJson) {
         /** 模型参数随运行冻结，之后修改项目偏好不影响已接纳步骤。 */
         const input = JSON.parse(sourceJson) as GitDeliveryInput;
+        if (input.settings.push && input.settings.postPushCommandIds?.length) {
+          if (!commandsLoaded) throw new Error(props.zh ? '命令列表尚未读取成功。' : 'The command list has not loaded.');
+          input.postPushCommands = input.settings.postPushCommandIds.map((commandId) => {
+            /** 冻结用户当前看到的定义版本，后台执行前再次核对。 */
+            const command = commands.find((entry) => entry.id === commandId);
+            if (!command) throw new Error(props.zh ? '所选命令已停用或删除，请重新选择。' : 'A selected command is disabled or deleted. Select it again.');
+            return { commandId, expectedRevision: command.revision };
+          });
+        }
         if (input.settings.commit && input.settings.generateCommitMessage && input.repositories.some((repository) => repository.paths.length > 0)) {
           /** 与原 AI 生成按钮共用模型、推理深度和速率偏好。 */
           const models = await loadGitCommitModelOptions(props.client, props.projectId);
@@ -171,14 +194,27 @@ export function GitDeliveryRunControl(props: {
         }
         request.current = { json: JSON.stringify(input), sourceJson, key: crypto.randomUUID() };
       }
-      await props.client.startGitDeliveryRun(props.projectId, JSON.parse(request.current.json) as GitDeliveryInput, request.current.key);
+      /** 接纳结果立即进入本地运行列表，偏好写入失败也不会允许重复启动。 */
+      const acceptedRun = await props.client.startGitDeliveryRun(props.projectId, JSON.parse(request.current.json) as GitDeliveryInput, request.current.key);
+      acceptRun(acceptedRun);
+      /** 只记录后台实际接纳的固定组合，失败请求和临时勾选不覆盖上次运行。 */
+      const acceptedSettings = (JSON.parse(request.current.json) as GitDeliveryInput).settings;
       request.current = null;
+      try {
+        localStorage.setItem(`zeus.git-delivery.settings:${props.projectId}`, JSON.stringify(acceptedSettings));
+      } catch {
+        setError(props.zh ? '组合已开始运行，但项目偏好保存失败。' : 'The combination started, but its project preference could not be saved.');
+        return;
+      }
+      await window.zeus?.setTaskGitDeliverySubmissionState?.('accepted');
       props.onAccepted();
+      dismissed = true;
     } catch (reason) {
       setError(reason);
     } finally {
       pending.current = false;
       setBusy(false);
+      if (!dismissed) await window.zeus?.setTaskGitDeliverySubmissionState?.('failed').catch((reason: unknown) => setError(reason));
     }
   }
 
@@ -250,235 +286,216 @@ export function GitDeliveryRunControl(props: {
   const summary = (['commit', 'merge', 'push'] as const)
     .filter((action) => settings[action])
     .map((action) => actionLabel(action, props.zh))
+    .concat(settings.push && settings.postPushCommandIds?.length ? [props.zh ? `命令（${settings.postPushCommandIds.length}）` : `Commands (${settings.postPushCommandIds.length})`] : [])
     .join(' → ');
   return (
-    <section className="task-git-delivery-action-step git-delivery-combination" aria-label={props.zh ? '组合交付' : 'Combined delivery'}>
-      <div className="git-delivery-combination-buttons">
-        <Button
-          variant="primary"
-          size="compact"
-          busy={busy}
-          disabled={props.disabled || busy || running || !props.input.repositories.length || !summary}
-          data-icon-tooltip={settings.finalTaskStatus && props.input.scope.kind === 'task' ? (props.zh ? `完成后状态：${finalStatusLabel}` : `Final status: ${finalStatusLabel}`) : undefined}
-          onClick={() => void start()}
-        >
-          {props.zh ? '全部仓库：' : 'All repositories: '}
-          {summary || (props.zh ? '执行交付' : 'Run delivery')}
-        </Button>
-        <Button variant="secondary" size="compact" disabled={busy} aria-label={props.zh ? '组合操作设置' : 'Combination settings'} data-icon-tooltip={props.zh ? '组合操作设置' : 'Combination settings'} onClick={() => void openSettings()}>
-          <GearSixIcon aria-hidden="true" />
-        </Button>
-      </div>
-      {error ? (
-        <div role="alert">
-          <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />
+    <>
+      <section className="git-delivery-command-selection" data-enabled={settings.push} aria-label={props.zh ? '推送后命令' : 'Commands after push'}>
+        <div className="task-git-delivery-field-row">
+          <span>{props.zh ? '推送后命令' : 'After push'}</span>
+          <GitDeliveryCommandSelect
+            commands={commands}
+            selectedIds={settings.postPushCommandIds ?? []}
+            disabled={props.disabled || busy || running || !settings.push || !commandsLoaded}
+            zh={props.zh}
+            onChange={(ids) => setSettings((current) => ({ ...current, postPushCommandIds: ids }))}
+          />
+        </div>
+      </section>
+      <section className="git-delivery-completion">
+        {taskId ? (
+          <div className="task-git-delivery-field-row">
+            <span>{props.zh ? '交付后状态' : 'Final status'}</span>
+            <ZeusSelect
+              size="compact"
+              disabled={props.disabled || busy || running}
+              value={settings.finalTaskStatus ?? ''}
+              options={[
+                { value: '', label: props.zh ? '不变更' : 'Do not change' },
+                ...statuses.map((status) => ({ value: status.id, label: status.label ?? defaultTaskManagementStatusLabels[props.zh ? 'zh-CN' : 'en-US'][status.id] ?? status.id })),
+              ]}
+              onChange={(value) => setSettings((current) => ({ ...current, finalTaskStatus: value || null }))}
+              ariaLabel={props.zh ? '交付成功后修改任务状态' : 'Task status after delivery succeeds'}
+            />
+          </div>
+        ) : (
+          <label className="git-delivery-checkbox">
+            <input type="checkbox" disabled={props.disabled || busy || running} checked={settings.archiveConversation === true} onChange={(event) => setSettings((current) => ({ ...current, archiveConversation: event.target.checked }))} />
+            {props.zh ? '交付成功后自动归档会话' : 'Archive conversation after delivery succeeds'}
+          </label>
+        )}
+      </section>
+      <section className="git-delivery-combination" aria-label={props.zh ? '执行交付' : 'Run delivery'}>
+        {error || runsError ? (
+          <div role="alert">
+            <VisibleApplicationError error={error || runsError} language={props.zh ? 'zh-CN' : 'en'} />
+            <Button
+              size="compact"
+              onClick={() => {
+                setError(null);
+                return refresh().catch((reason) => setError(reason));
+              }}
+            >
+              {props.zh ? '重新读取' : 'Reload'}
+            </Button>
+          </div>
+        ) : null}
+        {visibleRuns.map((run) => {
+          /** 进度摘要已显示当前动作，只为异常、冲突和附加原因保留详情行。 */
+          const detailedSteps = run.steps.filter(
+            (step) =>
+              step.state !== 'succeeded' && step.state !== 'pending' && (step.state === 'attention' || step.state === 'unknown' || step.message || step.error || step.conversationId || (step.action === 'merge' && step.state === 'waiting')),
+          );
+          return (
+            <section key={run.id} className="git-delivery-run" aria-label={props.zh ? '交付进度' : 'Delivery progress'}>
+              <GitDeliveryProgress run={run} zh={props.zh} />
+              {detailedSteps.length > 0 ? (
+                <ul>
+                  {detailedSteps.map((step) => (
+                    <li key={step.id}>
+                      <div className="git-delivery-run-step-heading">
+                        <strong>{step.action === 'task_status' || step.action === 'conversation_archive' ? actionLabel(step.action, props.zh) : `${step.repositoryName} · ${actionLabel(step.action, props.zh)}`}</strong>
+                        <span data-state={step.state}>
+                          {
+                            {
+                              pending: props.zh ? '等待前序步骤' : 'Pending',
+                              running: props.zh ? '执行中' : 'Running',
+                              waiting: step.action === 'command' ? (props.zh ? '命令运行中' : 'Command running') : props.zh ? 'AI 处理中' : 'AI running',
+                              attention: props.zh ? '需要处理' : 'Needs attention',
+                              unknown: props.zh ? '结果待核对' : 'Outcome unknown',
+                              succeeded: props.zh ? '已完成' : 'Completed',
+                            }[step.state]
+                          }
+                        </span>
+                      </div>
+                      {step.message || step.error ? (
+                        <small>
+                          <VisibleApplicationError error={step.error ?? step.message} summary={step.message ?? undefined} title={`${step.repositoryName} · ${actionLabel(step.action, props.zh)}`} language={props.zh ? 'zh-CN' : 'en'} />
+                        </small>
+                      ) : null}
+                      {step.conversationId ? (
+                        <Button size="compact" onClick={() => openConversation(run, step.conversationId!)}>
+                          {props.zh ? '打开冲突会话' : 'Open conflict conversation'}
+                        </Button>
+                      ) : null}
+                      {step.action === 'merge' && ['attention', 'waiting'].includes(step.state) ? (
+                        <Button size="compact" disabled={busy} onClick={() => openConflict(run, step)}>
+                          {props.zh ? '处理冲突' : 'Resolve conflicts'}
+                        </Button>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <GitDeliveryRunActions client={props.client} run={run} zh={props.zh} disabled={busy} onResume={resume} onUpdated={() => refresh()} />
+            </section>
+          );
+        })}
+        <div className="git-delivery-combination-buttons">
           <Button
+            variant="primary"
             size="compact"
-            onClick={() => {
-              setError(null);
-              void refresh().catch((reason) => setError(reason));
-            }}
+            busy={busy}
+            disabled={props.disabled || busy || running || !props.input.repositories.length || !summary || (settings.push && Boolean(settings.postPushCommandIds?.length) && !commandsLoaded)}
+            data-icon-tooltip={
+              settings.finalTaskStatus && taskId
+                ? props.zh
+                  ? `完成后状态：${finalStatusLabel}`
+                  : `Final status: ${finalStatusLabel}`
+                : !taskId && settings.archiveConversation
+                  ? props.zh
+                    ? '交付成功后归档会话'
+                    : 'Archive conversation after delivery succeeds'
+                  : undefined
+            }
+            onClick={() => start()}
           >
-            {props.zh ? '重新读取' : 'Reload'}
+            {summary || (props.zh ? '执行交付' : 'Run delivery')}
           </Button>
         </div>
-      ) : null}
-      {visibleRuns.map((run) => (
-        <section key={run.id} className="git-delivery-run" aria-label={props.zh ? '交付进度' : 'Delivery progress'}>
-          <strong>
-            {run.state === 'attention' ? (props.zh ? '交付需要处理' : 'Delivery needs attention') : props.zh ? '后台交付中' : 'Delivering in background'} · {run.steps.filter((step) => step.state === 'succeeded').length}/{run.steps.length}
-          </strong>
-          <ul>
-            {run.steps
-              .filter((step) => step.state !== 'succeeded' && step.state !== 'pending')
-              .map((step) => (
-                <li key={step.id}>
-                  <strong>{step.action === 'task_status' ? actionLabel(step.action, props.zh) : `${step.repositoryName} · ${actionLabel(step.action, props.zh)}`}</strong>
-                  <span>
-                    {
-                      {
-                        pending: props.zh ? '等待前序步骤' : 'Pending',
-                        running: props.zh ? '执行中' : 'Running',
-                        waiting: props.zh ? 'AI 处理中' : 'AI running',
-                        attention: props.zh ? '需要处理' : 'Needs attention',
-                        unknown: props.zh ? '结果待核对' : 'Outcome unknown',
-                        succeeded: props.zh ? '已完成' : 'Completed',
-                      }[step.state]
-                    }
-                  </span>
-                  {step.message || step.error ? (
-                    <small>
-                      <VisibleApplicationError error={step.error ?? step.message} summary={step.message ?? undefined} title={`${step.repositoryName} · ${actionLabel(step.action, props.zh)}`} language={props.zh ? 'zh-CN' : 'en'} />
-                    </small>
-                  ) : null}
-                  {step.conversationId ? (
-                    <Button size="compact" onClick={() => void openConversation(run, step.conversationId!)}>
-                      {props.zh ? '打开冲突会话' : 'Open conflict conversation'}
-                    </Button>
-                  ) : null}
-                  {step.action === 'merge' && ['attention', 'waiting'].includes(step.state) ? (
-                    <Button size="compact" disabled={busy} onClick={() => void openConflict(run, step)}>
-                      {props.zh ? '处理冲突' : 'Resolve conflicts'}
-                    </Button>
-                  ) : null}
-                </li>
-              ))}
-          </ul>
-          {run.state === 'attention' ? (
-            <Button size="compact" disabled={busy} onClick={() => void resume(run)}>
-              {props.zh ? '继续未完成步骤' : 'Continue remaining steps'}
-            </Button>
-          ) : null}
-        </section>
-      ))}
-      {cleanupRun ? (
-        <FormDialog
-          danger
-          title={props.zh ? '确认任务结束清理' : 'Confirm task cleanup'}
-          description={
-            props.zh ? '该状态变更需要停止并归档任务会话，并永久移除任务工作树。未提交的修改会被删除。' : 'This status change stops and archives task sessions and permanently removes task worktrees, including uncommitted changes.'
-          }
-          zh={props.zh}
-          busy={busy}
-          submitLabel={props.zh ? '确认清理并继续' : 'Confirm cleanup and continue'}
-          onClose={() => setCleanupRun(null)}
-          onSubmit={(event) => {
-            event.preventDefault();
-            void resume(cleanupRun, true);
-          }}
-        >
-          {cleanupRun.steps
-            .filter((step) => step.cleanupConfirmation)
-            .map((step) => (
-              <p key={step.id}>
-                {props.zh
-                  ? `有修改的工作区：${step.cleanupConfirmation!.dirtyWorkspaceCount}；活动会话：${step.cleanupConfirmation!.activeConversationCount}；活动运行：${step.cleanupConfirmation!.activeRuntimeSessionCount}`
-                  : `${step.cleanupConfirmation!.dirtyWorkspaceCount} modified worktrees; ${step.cleanupConfirmation!.activeConversationCount} active conversations; ${step.cleanupConfirmation!.activeRuntimeSessionCount} active runtimes`}
-              </p>
-            ))}
-          {error ? <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} /> : null}
-        </FormDialog>
-      ) : null}
-      {draft ? (
-        <FormDialog
-          title={props.zh ? '组合操作设置' : 'Combination settings'}
-          description={props.zh ? '按项目保存。各仓库独立执行，只有全部成功才更新任务状态。' : 'Saved for this project. Repositories run independently; task status changes only after all succeed.'}
-          zh={props.zh}
-          busy={busy}
-          submitLabel={props.zh ? '保存' : 'Save'}
-          submitDisabled={!draft.commit && !draft.merge && !draft.push}
-          onClose={() => setDraft(null)}
-          onSubmit={(event) => {
-            event.preventDefault();
-            try {
-              localStorage.setItem(`zeus.git-delivery.settings:${props.projectId}`, JSON.stringify(draft));
+        {cleanupRun ? <GitDeliveryCleanupConfirmation run={cleanupRun} zh={props.zh} busy={busy} error={error} onClose={() => setCleanupRun(null)} onConfirm={() => resume(cleanupRun, true)} /> : null}
+        {draft ? (
+          <FormDialog
+            title={props.zh ? '组合操作设置' : 'Combination settings'}
+            zh={props.zh}
+            busy={busy}
+            submitLabel={props.zh ? '保存' : 'Save'}
+            onClose={() => {
+              setDraft(null);
+              setSettingsOpen(false);
+            }}
+            onSubmit={(event) => {
+              event.preventDefault();
               setSettings(draft);
               setDraft(null);
-            } catch {
-              setError(props.zh ? '设置保存失败，请重试。' : 'Could not save settings.');
-            }
-          }}
-        >
-          {error ? <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} /> : null}
-          {(['commit', 'merge', 'push'] as const).map((action, index) => (
-            <div key={action} className="git-delivery-operation-row">
-              <label className="git-delivery-checkbox">
-                <input type="checkbox" checked={draft[action]} onChange={(event) => setDraft({ ...draft, [action]: event.target.checked })} />
-                {index + 1}. {actionLabel(action, props.zh)}
-              </label>
-              {action === 'commit' ? (
-                <>
-                  <label className="git-delivery-checkbox" aria-disabled={!draft.commit}>
-                    <input type="checkbox" checked={draft.generateCommitMessage} disabled={!draft.commit || busy} onChange={(event) => setDraft({ ...draft, generateCommitMessage: event.target.checked })} />
-                    {props.zh ? 'AI 生成提交信息' : 'Generate commit messages with AI'}
-                  </label>
-                  <GitCommitGenerationSettingsButton client={props.client} projectId={props.projectId} zh={props.zh} disabled={busy} />
-                </>
-              ) : null}
-            </div>
-          ))}
-          <label className="git-delivery-checkbox">
-            <input type="checkbox" checked={draft.resolveConflicts} onChange={(event) => setDraft({ ...draft, resolveConflicts: event.target.checked })} />
-            {props.zh ? '出现合入冲突时自动交给 AI，成功后继续' : 'Automatically resolve merge conflicts with AI and continue'}
-          </label>
-          {draft.resolveConflicts ? (
-            <>
-              <ConflictAiPermissions zh={props.zh} value={draft.permissionMode} disabled={busy} onChange={(value) => setDraft({ ...draft, permissionMode: value })} />
-              <SkillSelector client={props.client} projectId={props.projectId} value={draft.skillId ?? ''} onChange={(value) => setDraft({ ...draft, skillId: value || null })} language={props.zh ? 'zh-CN' : 'en-US'} />
-            </>
-          ) : null}
-          {props.input.scope.kind === 'task' ? (
-            <label>
-              <span>{props.zh ? '最后变更任务状态' : 'Final task status'}</span>
-              <ZeusSelect
-                size="compact"
-                value={draft.finalTaskStatus ?? ''}
-                options={[
-                  { value: '', label: props.zh ? '不变更' : 'Do not change' },
-                  ...statuses.map((status) => ({ value: status.id, label: status.label ?? defaultTaskManagementStatusLabels[props.zh ? 'zh-CN' : 'en-US'][status.id] ?? status.id })),
-                ]}
-                onChange={(value) => setDraft({ ...draft, finalTaskStatus: value || null })}
-                ariaLabel={props.zh ? '最后变更任务状态' : 'Final task status'}
-              />
-            </label>
-          ) : null}
-        </FormDialog>
-      ) : null}
-      {conflict ? (
-        <FormDialog
-          title={props.zh ? '处理交付冲突' : 'Resolve delivery conflicts'}
-          className="git-delivery-conflict-dialog"
-          zh={props.zh}
-          busy={busy}
-          submitLabel={props.zh ? '保存解决结果' : 'Save resolution'}
-          submitDisabled={!document || countUnresolvedConflictBlocks(document) > 0}
-          onClose={() => {
-            setConflict(null);
-            setDocument(null);
-          }}
-          onSubmit={(event) => {
-            event.preventDefault();
-            void saveConflict();
-          }}
-        >
-          {error ? <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} /> : null}
-          {conflict.files.length ? (
-            <TaskGitConflictWorkspace
-              allRepositories
-              zh={props.zh}
-              busy={busy}
-              aiBusy={busy}
-              integration={{ conflictFiles: conflict.files, targetBranch: conflict.targetBranch }}
-              taskBranch={conflict.sourceBranch}
-              conflictPath={conflict.file?.path ?? ''}
-              conflict={document}
-              onSelectPath={(path) => void openConflict(conflict.run, conflict.step, path)}
-              onDocumentChange={setDocument}
-              skillClient={props.client}
-              projectId={props.projectId}
-              onAskAi={async (content, fingerprint, permissionMode, skillId) => {
-                if (permissionMode !== 'auto' && permissionMode !== 'full-access') throw new Error('请选择自动审批或完全访问。');
-                await props.client.startGitDeliveryConflictAi(props.projectId, conflict.run.id, conflict.step.id, { path: conflict.file!.path, content, fingerprint, permissionMode, skillId });
-                setConflict(null);
-                await refresh();
-              }}
-            />
-          ) : (
-            <>
-              <p>{props.zh ? '冲突已解决，可以继续合入。' : 'Conflicts resolved. Continue the merge.'}</p>
-              <Button
-                onClick={() => {
-                  const run = conflict.run;
+              setSettingsOpen(false);
+            }}
+          >
+            {error ? <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} /> : null}
+            {draft.resolveConflicts ? (
+              <>
+                <ConflictAiPermissions zh={props.zh} value={draft.permissionMode} disabled={busy} onChange={(value) => setDraft({ ...draft, permissionMode: value })} />
+                <SkillSelector client={props.client} projectId={props.projectId} value={draft.skillId ?? ''} onChange={(value) => setDraft({ ...draft, skillId: value || null })} language={props.zh ? 'zh-CN' : 'en-US'} />
+              </>
+            ) : null}
+          </FormDialog>
+        ) : null}
+        {conflict ? (
+          <FormDialog
+            title={props.zh ? '处理交付冲突' : 'Resolve delivery conflicts'}
+            className="git-delivery-conflict-dialog"
+            zh={props.zh}
+            busy={busy}
+            submitLabel={props.zh ? '保存解决结果' : 'Save resolution'}
+            submitDisabled={!document || countUnresolvedConflictBlocks(document) > 0}
+            onClose={() => {
+              setConflict(null);
+              setDocument(null);
+            }}
+            onSubmit={(event) => {
+              event.preventDefault();
+              return saveConflict();
+            }}
+          >
+            {error ? <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} /> : null}
+            {conflict.files.length ? (
+              <TaskGitConflictWorkspace
+                allRepositories
+                zh={props.zh}
+                busy={busy}
+                aiBusy={busy}
+                integration={{ conflictFiles: conflict.files, targetBranch: conflict.targetBranch }}
+                taskBranch={conflict.sourceBranch}
+                conflictPath={conflict.file?.path ?? ''}
+                conflict={document}
+                onSelectPath={(path) => openConflict(conflict.run, conflict.step, path)}
+                onDocumentChange={setDocument}
+                skillClient={props.client}
+                projectId={props.projectId}
+                onAskAi={async (content, fingerprint, permissionMode, skillId) => {
+                  if (permissionMode !== 'auto' && permissionMode !== 'full-access') throw new Error('请选择自动审批或完全访问。');
+                  await props.client.startGitDeliveryConflictAi(props.projectId, conflict.run.id, conflict.step.id, { path: conflict.file!.path, content, fingerprint, permissionMode, skillId });
                   setConflict(null);
-                  void resume(run);
+                  await refresh();
                 }}
-              >
-                {props.zh ? '继续交付' : 'Continue delivery'}
-              </Button>
-            </>
-          )}
-        </FormDialog>
-      ) : null}
-    </section>
+              />
+            ) : (
+              <>
+                <p>{props.zh ? '冲突已解决，可以继续合入。' : 'Conflicts resolved. Continue the merge.'}</p>
+                <Button
+                  onClick={() => {
+                    const run = conflict.run;
+                    setConflict(null);
+                    return resume(run);
+                  }}
+                >
+                  {props.zh ? '继续交付' : 'Continue delivery'}
+                </Button>
+              </>
+            )}
+          </FormDialog>
+        ) : null}
+      </section>
+    </>
   );
 }

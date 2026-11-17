@@ -1,5 +1,6 @@
 import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
 import { redactUserFacingErrorDetails } from '@zeus/shared';
+import { markConversationNavigationRenderReady } from '../performanceTraceContext.js';
 import type { ConversationSystemMessage, ConversationSystemMessageInput, ConversationTranscriptEnvelope } from '@zeus/shared';
 import { systemMessageScope, useConversationSystemMessages, recordSystemMessage, recoverSystemMessage, setSystemMessageAnchor } from './conversationSystemMessages.js';
 import type { ConversationProcessGroup } from '@zeus/shared';
@@ -42,12 +43,15 @@ import { reportApplicationError, VisibleApplicationError } from '../ui/Applicati
 import { isImageResource } from './ConversationResources.js';
 import { ConversationImageResourcesContext, hasMissingMarkdownImages } from './ConversationMarkdown.js';
 import { isPendingQueueTranscriptMessage, composerQueuedSubmissions, orderTranscriptItemsWithQueue, visibleQueuedSubmissions } from './conversationQueuePresentation.js';
-import { selectPendingExecutionMessage } from './sessionSelectors.js';
+import { selectHasActiveProviderTurn, selectPendingExecutionMessage } from './sessionSelectors.js';
 import type { McpAppToolCall, McpAppToolResult } from './McpAppFrame.js';
 import { ConversationNavigation, mergeNavigationEntries, navigationProviderIdentity, navigationRowKey, useConversationNavigation, type TranscriptNavigationEntry } from './ConversationNavigation.js';
 import { ReadingStateScope, useReadingSnapshot, useReadingState } from '../ui/readingState.js';
+import { Button } from '../ui/Button.js';
 
 export interface ConversationTranscriptProps {
+  /** 创建前使用原草稿身份读取系统消息，不借用尚未生成的会话或任务身份。 */
+  draftSystemMessageScope?: string;
   /** 系统消息保存只写会话历史，不触发模型请求。 */
   onSaveSystemMessage?: (message: ConversationSystemMessageInput) => Promise<ConversationSystemMessage>;
   /** 主会话读取完整目录，独立子线程不传此入口。 */
@@ -267,7 +271,7 @@ function useStableOptionalCallback<Arguments extends unknown[], Result>(callback
 /** 会话身份隔离滚动、展开和动效状态；主会话与子线程共用同一切换边界。 */
 export function ConversationTranscript(props: ConversationTranscriptProps) {
   return (
-    <ReadingStateScope id={systemMessageScope(props.state.projectId ?? '', props.navigationId ?? props.state.conversationId)}>
+    <ReadingStateScope id={props.draftSystemMessageScope ?? systemMessageScope(props.state.projectId ?? '', props.navigationId ?? props.state.conversationId)}>
       <ConversationTranscriptContent {...props} />
     </ReadingStateScope>
   );
@@ -292,7 +296,7 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   /** 首次恢复的目标不随本次阅读过程中的保存而变化。 */
   const initialReading = useRef(savedReading.current).current;
   /** 产品会话隔离待确认消息，子线程只读投影不接管主会话写入。 */
-  const systemScope = systemMessageScope(props.state.projectId ?? '', props.state.conversationId);
+  const systemScope = props.draftSystemMessageScope ?? systemMessageScope(props.state.projectId ?? '', props.state.conversationId);
   /** 补写中的消息与权威回执共享身份。 */
   const pendingSystemMessages = useConversationSystemMessages(systemScope, props.onSaveSystemMessage, props.state.systemMessages);
   /** 恢复中的待确认记录覆盖同身份旧状态，但不复制一条消息。 */
@@ -352,7 +356,7 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const [completedAnnouncement, setCompletedAnnouncement] = useState<{ key: string; text: string } | null>(null);
   const completedAnnouncementTrackerRef = useRef<CompletedItemAnnouncementTracker>({ hydrated: false, lastCompletedKey: null });
   const positionedConversationIdRef = useRef<string | null>(null);
-  /** 首次虚拟行测量和贴底收敛后才展示正文，后续更新不重复隐藏已读内容。 */
+  /** 首次布局恢复阅读位置后即显示正文，后续行高变化沿用有界贴底校准。 */
   const [historyPositioned, setHistoryPositioned] = useState(false);
   /** 本地首发一旦已显示，后续历史接管也不能重新播放整段淡入。 */
   const initialLocalSubmissionRef = useRef(false);
@@ -435,6 +439,10 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   if (!historyPositioned && hasLocalSubmission) initialLocalSubmissionRef.current = true;
   /** 本地首帧直接可见；定位完成后保持可见，不随服务端身份接管重新隐藏。 */
   const historyReady = historyPositioned || hasLocalSubmission;
+  /** 首帧计时以真实正文就绪为准，保留界面恢复时也记录，不等待后台快照请求。 */
+  useLayoutEffect(() => {
+    if (historyReady && historyHydrated && props.state.projectId && props.state.conversationId) markConversationNavigationRenderReady(props.state.projectId, props.state.conversationId);
+  }, [historyReady, historyHydrated, props.state.projectId, props.state.conversationId]);
   /** 最新轮次取实时状态，不能等待旧首屏快照刷新后才开放重试。 */
   const latestTurn = useMemo(
     () =>
@@ -444,10 +452,10 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
     [props.state.turnsByProviderId],
   );
   const queuedSubmissions = useMemo(() => visibleQueuedSubmissions(props.state.queue), [props.state.queue]);
-  /** 输入框卡片接管的提交不能同时出现在会话时间线。 */
+  /** 正文与排队卡片使用同一轮次状态；接管的提交不能同时出现在会话时间线。 */
   const composerQueue = useMemo(
     () => (props.composerQueueVisible === false ? [] : composerQueuedSubmissions(props.state)),
-    [props.composerQueueVisible, props.state.itemOrder, props.state.items, props.state.queue, props.state.snapshot?.providerState],
+    [props.composerQueueVisible, props.state.activeTurnId, props.state.itemOrder, props.state.items, props.state.queue, props.state.snapshot?.providerState, props.state.terminalTurnIds],
   );
   /** 稳定提交身份覆盖冷开时由持久 submission 重建的本地消息。 */
   const composerQueueSubmissionIds = useMemo(() => new Set(composerQueue.map((submission) => submission.id)), [composerQueue]);
@@ -467,12 +475,12 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   /** 完整目录覆盖深历史，但不能与首屏正文争抢 Core 的同步读取。 */
   const navigation = useConversationNavigation({ scopeKey: props.state.conversationId, refreshKey: navigationRefreshKey, load: historyHydrated ? props.onLoadNavigation : undefined });
   useEffect(() => {
-    if (!props.onSaveSystemMessage) return;
-    /** 同一后台故障已被接纳时不因自动刷新再创建记录。 */
-    if (navigation.error && !systemMessages.some((message) => message.operation === 'navigation' && !message.recoveredAt && message.detail === redactUserFacingErrorDetails(navigation.error!)))
-      recordSystemMessage(systemScope, navigation.error, 'navigation', '会话目录读取失败。');
-    if (!navigation.error && !navigation.loading && navigation.snapshot) for (const message of systemMessages) if (message.operation === 'navigation' && !message.recoveredAt) recoverSystemMessage(systemScope, message);
-  }, [navigation.error, navigation.loading, navigation.snapshot, props.onSaveSystemMessage, systemScope, systemMessages]);
+    if (!navigation.error) return;
+    /** 后台目录失败只写诊断，不能打断已加载正文的阅读。 */
+    const diagnostic = `会话目录后台读取失败。\n会话：${props.state.conversationId}\n${redactUserFacingErrorDetails(navigation.error)}`;
+    console.warn('[Zeus runtime]', diagnostic);
+    window.zeus?.reportRendererRuntimeError?.(diagnostic);
+  }, [navigation.error, props.state.conversationId]);
   /** 内容批次复用已建立的输入、阶段和父组索引。 */
   const previousProjection = useRef<TranscriptProjection | null>(null);
   const projectionContext = [
@@ -666,19 +674,26 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
   const [readingTurnLoaded, setReadingTurnLoaded] = useState(false);
   /** 按需补读不随普通正文重绘重新发起。 */
   const loadReadingTurn = useStableOptionalCallback(props.onLoadNavigationTurn);
-  /** 只在已水合且原锚点确实缺失时补读。 */
+  /** 只为静态历史阅读补回缺失锚点；跟随最新消息时无需恢复旧位置。 */
   const readingTurnMissing = Boolean(
-    historyHydrated && initialReading?.turnId && initialReading.latestItem === latestReadingSignature && initialReading.anchor.rowKey && !turnRowsByKey.has(initialReading.anchor.rowKey) && !readingTurnLoaded,
+    historyHydrated &&
+    initialReading?.following === false &&
+    initialReading.turnId &&
+    initialReading.latestItem === latestReadingSignature &&
+    initialReading.anchor.rowKey &&
+    !turnRowsByKey.has(initialReading.anchor.rowKey) &&
+    !readingTurnLoaded,
   );
   // 原锚点补读完成前不展示错误的默认位置。
-  if (readingTurnMissing && loadReadingTurn && initialReading?.following === false) canRevealHistoryRef.current = false;
+  if (readingTurnMissing && loadReadingTurn) canRevealHistoryRef.current = false;
   useEffect(() => {
     if (!readingTurnMissing || !initialReading?.turnId || !loadReadingTurn) return;
     /** 切走后不再把迟到回执写入已卸载视图。 */
     let active = true;
     void loadReadingTurn(initialReading.turnId)
       .catch((error) => {
-        if (active) recordSystemMessage(systemScope, error, 'navigation', '阅读位置恢复失败。');
+        // 正文恢复失败归属原轮次，目录刷新成功不能将其误标为已恢复。
+        if (active) recordSystemMessage(systemScope, error, 'navigation_body', '阅读位置恢复失败。', { turnId: initialReading.turnId });
       })
       .finally(() => {
         if (active) setReadingTurnLoaded(true);
@@ -1154,7 +1169,8 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
       const effect = scrollController.onExplicitLatestRequest();
       if (effect.type === 'scroll_to_bottom') positionLatest(container);
     }
-    // 首次显示沿用定位循环的完成条件，避免暴露行高测量期间的中间位置。
+    // 已恢复缓存的锚点或完成首次贴底，直接接管首帧，不再隐藏正文等待后续定位帧。
+    setHistoryPositioned(true);
     maintainLatestPosition();
     setReturnToLatestVisible(Boolean(restore));
     setHistoryPagingGate({ conversationId, positioned: true, userIntent: false });
@@ -1348,36 +1364,24 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
         <SystemMessageNotice
           message={row.message}
           language={props.language}
-          busy={row.message.operation === 'navigation' && navigation.loading}
           onRetry={
-            row.message.operation === 'navigation'
-              ? () => navigation.retry()
-              : row.message.operation === 'navigation_body' && row.message.targetTurnId && props.onLoadNavigationTurn
-                ? async () => {
-                    await props.onLoadNavigationTurn!(row.message.targetTurnId!);
-                    recoverSystemMessage(systemScope, row.message);
-                  }
-                : undefined
+            row.message.operation === 'navigation_body' && row.message.targetTurnId && props.onLoadNavigationTurn
+              ? async () => {
+                  await props.onLoadNavigationTurn!(row.message.targetTurnId!);
+                  recoverSystemMessage(systemScope, row.message);
+                }
+              : undefined
           }
         />
       );
     if (row.kind === 'turn_failure') {
       /** 最新明确失败的轮次允许手动续跑；错误分类只解释原因，不隐藏恢复入口。 */
       const retryable =
-        !props.historyOnly &&
         // 送达尚未核对的提交只开放原恢复入口，不能从旧失败卡发起另一条续接。
-        !props.state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)) &&
-        !props.state.activeTurnId &&
-        latestTurn?.providerTurnId === row.turnId;
-      return (
-        <TurnFailureCard
-          failure={row.failure}
-          language={props.language}
-          retainedAnswer={turnHasRetainedAssistantAnswer(items, row.turnId)}
-          onRetry={retryable && props.onRetryFailedTurn ? () => props.onRetryFailedTurn?.(row.turnId) : undefined}
-        />
-      );
+        !props.state.queue?.submissions.some((submission) => ['queued', 'paused', 'dispatching', 'active'].includes(submission.status)) && !props.state.activeTurnId && latestTurn?.providerTurnId === row.turnId;
+      return <TurnFailureCard failure={row.failure} language={props.language} onRetry={retryable && props.onRetryFailedTurn ? () => props.onRetryFailedTurn?.(row.turnId) : undefined} />;
     }
+    /** 邻近视口的预读失败留在原位；只有显式跳转失败才生成系统消息。 */
     if (row.kind === 'navigation_placeholder')
       return (
         <NavigationHistoryPlaceholder
@@ -1386,8 +1390,13 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
           }}
           entry={row.entry}
           language={props.language}
+          readError={props.state.snapshot?.v2Paging?.historyByTurn?.[row.entry.providerTurnId ?? row.entry.turnId]?.error ?? props.state.snapshot?.v2Paging?.historyByTurn?.[row.entry.turnId]?.error}
           onLoad={historyHydrated ? props.onLoadNavigationTurn : undefined}
-          onReadError={props.onSaveSystemMessage ? (error) => recordSystemMessage(systemScope, error, 'navigation_body', '会话正文读取失败。', { entryId: row.entry.placement?.entryId ?? null, turnId: row.entry.turnId }) : undefined}
+          onReadError={
+            props.onSaveSystemMessage && navigationTargetKey === row.entry.rowKey
+              ? (error) => recordSystemMessage(systemScope, error, 'navigation_body', '会话正文读取失败。', { entryId: row.entry.placement?.entryId ?? null, turnId: row.entry.turnId })
+              : undefined
+          }
         />
       );
     if (row.kind === 'answered_request') return <AnsweredRequestHistory request={row.request} language={props.language} />;
@@ -1591,15 +1600,16 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
       {resourcePaging?.error ? (
         <div role="alert" className="session-resource-load-error">
           <span>{props.language === 'zh-CN' ? '链接与附件信息读取失败。' : 'Unable to load links and attachments.'}</span>
-          <button
+          <Button
+            unstyled
             type="button"
             disabled={resourcePaging.loading}
             onClick={() => {
-              void Promise.resolve(renderProps.onLoadConversationResources?.()).catch(() => undefined);
+              return Promise.resolve(renderProps.onLoadConversationResources?.()).catch(() => undefined);
             }}
           >
             {props.language === 'zh-CN' ? '重试' : 'Retry'}
-          </button>
+          </Button>
         </div>
       ) : null}
       <div
@@ -1711,9 +1721,10 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
                   : 'Send a message to start a conversation.'}
             </p>
           ) : null}
-          {showCreationStatus && props.creationStatus ? <SessionCreationNotice status={props.creationStatus} language={props.language} /> : null}
+          {showCreationStatus && props.creationStatus ? <SessionCreationNotice key={props.state.conversationId} status={props.creationStatus} language={props.language} /> : null}
           {showStandaloneActiveStatus && activeStatusKind ? (
             <TranscriptActiveStatus
+              key={props.state.providerReconnectTurnId ?? activeTurnId ?? props.state.conversationId}
               language={props.language}
               kind={activeStatusKind}
               summaryText={props.state.currentReasoningItem?.turnId === activeTurnId ? latestReasoningSummaryText(props.state.currentReasoningItem) : undefined}
@@ -1725,9 +1736,9 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
             <ConversationNotice label={props.language === 'zh-CN' ? '连接失败' : 'Connection failed'}>
               <span>{props.language === 'zh-CN' ? '连接已断开。' : 'Connection lost.'}</span>
               {props.onReconnect ? (
-                <button type="button" onClick={() => void props.onReconnect?.()}>
+                <Button unstyled type="button" onClick={() => props.onReconnect?.()}>
                   {props.language === 'zh-CN' ? '重试' : 'Retry'}
-                </button>
+                </Button>
               ) : null}
             </ConversationNotice>
           ) : null}
@@ -1736,7 +1747,8 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
         </section>
         {showNavigation ? <ConversationNavigation key={props.state.conversationId} entries={navigationEntries} activeRowKey={activeNavigationKey} language={props.language} shellRef={shellRef} onNavigate={navigateToEntry} /> : null}
         <V2HistoryPageStatus state={props.state} language={props.language} enabled={historyPagingArmed && historyPagingRequested} intersecting={historySentinelIntersecting} />
-        <button
+        <Button
+          unstyled
           type="button"
           className="session-return-latest"
           data-visible={returnToLatestVisible || undefined}
@@ -1755,7 +1767,7 @@ function ConversationTranscriptContent(props: ConversationTranscriptProps) {
           }}
         >
           {props.language === 'zh-CN' ? '返回最新消息' : 'Return to latest'}
-        </button>
+        </Button>
         <TranscriptHistoryLoading
           visible={!historyReady && (Boolean(props.historyLoading) || (!props.creationStatus && props.state.transportState !== 'failed'))}
           initializing={Boolean(props.state?.transcriptInitializing)}
@@ -1869,22 +1881,14 @@ function SessionCreationNotice(props: { status: SessionCreationStatus; language:
           <VisibleApplicationError error={props.status.errorCause ?? props.status.error ?? props.status.message} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
         </div>
         {props.status.onRetry ? (
-          <button type="button" onClick={() => void props.status.onRetry?.()}>
+          <Button unstyled type="button" onClick={() => props.status.onRetry?.()}>
             {props.status.retryLabel ?? (props.language === 'zh-CN' ? '重试' : 'Retry')}
-          </button>
+          </Button>
         ) : null}
       </section>
     );
   }
-  if (props.status.state === 'creating') return <TranscriptActiveStatus language={props.language} kind="executing" reconnectAttempt={0} reconnectAttempts={5} />;
-  /** 重试计数沿用实际创建状态，普通连接文案由调用方提供。 */
-  const retryingMessage = props.status.state === 'retrying' ? `${props.language === 'zh-CN' ? '正在连接...' : 'Connecting...'} (${props.status.retryAttempt ?? 1}/${props.status.maxRetries ?? 5})` : props.status.message;
-  return (
-    <section className={`session-creation-status is-${props.status.state}`} role="status" aria-live="polite">
-      {sessionConnectionSymbol}
-      <SessionSweepText className="session-current-status-text" text={retryingMessage} active />
-    </section>
-  );
+  return <TranscriptActiveStatus language={props.language} kind={props.status.state === 'retrying' ? 'reconnecting' : 'executing'} reconnectAttempt={props.status.retryAttempt ?? 1} reconnectAttempts={props.status.maxRetries ?? 5} />;
 }
 
 /** 普通状态沿用底部进度样式，只有真正的错误使用警告图标和边框。 */
@@ -1930,9 +1934,9 @@ export function SystemMessageNotice(props: { message: ConversationSystemMessageI
         <VisibleApplicationError error={props.message.detail} summary={props.message.summary} title={props.language === 'zh-CN' ? 'Zeus 系统消息' : 'Zeus system message'} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
       </span>
       {!props.message.recoveredAt && props.onRetry ? (
-        <button type="button" disabled={pending || props.busy} onClick={() => void retry()}>
+        <Button unstyled type="button" disabled={pending || props.busy} onClick={() => retry()}>
           {pending || props.busy ? (props.language === 'zh-CN' ? '正在重试…' : 'Retrying…') : props.language === 'zh-CN' ? '重试' : 'Retry'}
-        </button>
+        </Button>
       ) : null}
       {retryFailed ? <span role="status">{props.language === 'zh-CN' ? '重试未成功。' : 'Retry failed.'}</span> : null}
     </ConversationNotice>
@@ -1940,7 +1944,7 @@ export function SystemMessageNotice(props: { message: ConversationSystemMessageI
 }
 
 /** 失败卡保留官方原因，显式续跑只针对调用方确认可重试的轮次。 */
-function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: SessionUiLanguage; retainedAnswer: boolean; onRetry?: () => void | Promise<void> }) {
+function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: SessionUiLanguage; onRetry?: () => void | Promise<void> }) {
   /** 请求提交期间禁用重复点击，失败原因保留在原提示中。 */
   const [pending, setPending] = useState(false);
   /** 手动续跑失败不能覆盖原轮次的官方错误。 */
@@ -1960,49 +1964,23 @@ function TurnFailureCard(props: { failure: NativeTurnFailureSnapshot; language: 
   }
   /** 错误名称和详情入口使用同一语言。 */
   const zh = props.language === 'zh-CN';
-  /** 连接失败复用现有错误详情窗口，原始原因和手动重试同时可用。 */
-  const connectionFailure = props.failure.category === 'network';
-  /** 重试结果接管同一条状态文案，原始错误仍由详情入口说明。 */
-  const connectionMessage = pending ? (zh ? '正在重新连接…' : 'Reconnecting…') : retryError ? (zh ? '重试失败，请查看原因。' : 'Retry failed. View details.') : zh ? '连接失败，已停止。' : 'Connection failed. Stopped.';
-  /** 已保留回答的断流不能再误报为“没有收到完整回复”。 */
-  const retainedStreamFailure = props.retainedAnswer && props.failure.cause?.code === 'responseStreamDisconnected';
-  if (retainedStreamFailure && !props.onRetry && !connectionFailure) {
-    return (
-      <ConversationNotice role="status" label={zh ? '回答已保留' : 'Response retained'}>
-        <span data-zeus-selectable="text">{zh ? '回答已保留，但 AI 服务未确认完整结束。你可以继续对话。' : 'The response was retained, but the AI service did not confirm a clean finish. You can continue the conversation.'}</span>
-        <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(props.failure, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
-          {zh ? '错误详情' : 'Error details'}
-        </button>
-      </ConversationNotice>
-    );
-  }
   return (
-    <ConversationNotice label={connectionFailure ? (zh ? '连接失败' : 'Connection failed') : zh ? '模型返回错误' : 'Model error'}>
-      {connectionFailure ? <span>{connectionMessage}</span> : <VisibleApplicationError error={props.failure} language={zh ? 'zh-CN' : 'en'} />}
+    <ConversationNotice label={zh ? '模型返回错误' : 'Model error'}>
+      <VisibleApplicationError error={props.failure} language={zh ? 'zh-CN' : 'en'} />
       <span className="session-message-delivery-actions">
-        {connectionFailure ? (
-          <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(props.failure, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
-            {zh ? '查看原因' : 'View details'}
-          </button>
-        ) : null}
         {retryError ? (
-          <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(retryError, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
+          <Button unstyled type="button" className="application-error-details-link" onClick={() => reportApplicationError(retryError, { language: zh ? 'zh-CN' : 'en', showDetails: true })}>
             {zh ? '重试失败原因' : 'Retry failure details'}
-          </button>
+          </Button>
         ) : null}
         {props.onRetry ? (
-          <button type="button" disabled={pending} onClick={() => void retry()}>
+          <Button unstyled type="button" disabled={pending} onClick={() => retry()}>
             {pending ? (zh ? '正在重试…' : 'Retrying…') : zh ? '重试' : 'Retry'}
-          </button>
+          </Button>
         ) : null}
       </span>
     </ConversationNotice>
   );
-}
-
-/** 判断失败轮次是否已经留下可读回答；只认非空最终回答，不把过程说明当作交付。 */
-function turnHasRetainedAssistantAnswer(items: readonly NativeSessionItemBuffer[], turnId: string): boolean {
-  return items.some((item) => item.turnId === turnId && isFinalAnswerItem(item) && item.text.trim().length > 0);
 }
 
 export type TranscriptRow =
@@ -2114,6 +2092,8 @@ export function projectSystemMessageRows(rows: readonly TranscriptViewportRow[],
   /** 保持原正文顺序，只插入系统消息。 */
   const result = [...rows];
   for (const message of [...messages].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id))) {
+    /** 旧的后台目录错误保留诊断记录，不再占用聊天正文。 */
+    if (message.operation === 'navigation') continue;
     /** 权威位置优先，尚未落库时使用首次记录的消息锚点。 */
     const order = message.transcript?.placement.order;
     /** 折叠的过程也不能吞掉消息边界；后续工具流式追加留在提示之后。 */
@@ -2163,9 +2143,9 @@ export function projectTranscriptFailureRows(rows: readonly TranscriptViewportRo
   const knownTurns = [...new Map(Object.values(turns).map((turn) => [turn.id, turn])).values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
   /** 已由后续轮次接管的旧续接错误不进入虚拟列表，避免空行留下估算高度。 */
   const latestTurn = knownTurns.at(-1);
-  /** 最新失败必须保留，不能因残留重连标记而隐藏终态。 */
+  /** 网络失败不生成正文胶囊或虚拟占位，原始失败仍保留在轮次记录中。 */
   const failures: Extract<TranscriptViewportRow, { kind: 'turn_failure' }>[] = knownTurns
-    .filter((turn) => turn.status === 'failed' && turn.error && (turn.error.code !== 'ZEUS_MODEL_RESPONSE_RETRYING' || turn === latestTurn))
+    .filter((turn) => turn.status === 'failed' && turn.error && turn.error.category !== 'network' && (turn.error.code !== 'ZEUS_MODEL_RESPONSE_RETRYING' || turn === latestTurn))
     .map<Extract<TranscriptViewportRow, { kind: 'turn_failure' }>>((turn) => ({
       kind: 'turn_failure',
       key: `turn-failure:${turn.id}`,
@@ -2361,7 +2341,15 @@ function projectNavigationRows(rows: readonly TranscriptTurnRow[], entries: read
 }
 
 /** 只在占位真正靠近视口时读取对应轮次；失败保留在原位，等待用户重试。 */
-function NavigationHistoryPlaceholder(props: { entry: TranscriptNavigationEntry; language: SessionUiLanguage; onLoad?: (turnId: string) => Promise<void>; onReadError?: (error: unknown) => void; onReadSuccess?: () => void }) {
+function NavigationHistoryPlaceholder(props: {
+  entry: TranscriptNavigationEntry;
+  language: SessionUiLanguage;
+  /** 已有分页错误随会话保存，虚拟行重建不能自动重试同一次失败。 */
+  readError?: string | null;
+  onLoad?: (turnId: string) => Promise<void>;
+  onReadError?: (error: unknown) => void;
+  onReadSuccess?: () => void;
+}) {
   /** 观察真实占位，虚拟列表远处保留的节点不能触发无关读取。 */
   const ref = useRef<HTMLElement | null>(null);
   /** 回调变化不触发再次读取；失败仍归属本次目标。 */
@@ -2372,9 +2360,17 @@ function NavigationHistoryPlaceholder(props: { entry: TranscriptNavigationEntry;
   onReadSuccess.current = props.onReadSuccess;
   /** 同一占位失败后不因重复相交自动重放。 */
   const [attempt, setAttempt] = useState(0);
+  /** 错误回填不重新启动观察器，避免一次重试失败后再次自动读取。 */
+  const readError = useRef(props.readError);
+  readError.current = props.readError;
   /** 状态只影响此处占位，不覆盖整个会话。 */
-  const [status, setStatus] = useState<{ loading: boolean; error: string | null }>({ loading: true, error: null });
+  const [status, setStatus] = useState<{ loading: boolean; error: string | null }>({ loading: !props.readError, error: props.readError ? redactUserFacingErrorDetails(props.readError) : null });
   useEffect(() => {
+    // 沿用真实分页失败；只有用户点击原位重试才再次进入读取流程。
+    if (readError.current && attempt === 0) {
+      setStatus({ loading: false, error: redactUserFacingErrorDetails(readError.current) });
+      return;
+    }
     if (!ref.current || !props.onLoad) return;
     /** 卸载或切换目标后不处理旧结果。 */
     let cancelled = false;
@@ -2388,11 +2384,19 @@ function NavigationHistoryPlaceholder(props: { entry: TranscriptNavigationEntry;
         /** 固定本次读取归属，切换会话后不借用新回调。 */
         const succeeded = onReadSuccess.current;
         void props.onLoad!(props.entry.turnId)
-          .then(() => succeeded?.())
+          .then(() => {
+            if (!cancelled) succeeded?.();
+          })
           .catch((error: unknown) => {
             if (!cancelled) {
-              setStatus({ loading: false, error: error instanceof Error ? error.message : '正文读取失败。' });
-              onReadError.current?.(error);
+              setStatus({ loading: false, error: redactUserFacingErrorDetails(error instanceof Error ? error.message : '正文读取失败。') });
+              if (onReadError.current) onReadError.current(error);
+              else {
+                /** 预读失败保留脱敏诊断，用户滚动到占位时可原位重试。 */
+                const diagnostic = `会话正文预读失败。\n轮次：${props.entry.turnId}\n${redactUserFacingErrorDetails(error instanceof Error ? error.message : String(error))}`;
+                console.warn('[Zeus runtime]', diagnostic);
+                window.zeus?.reportRendererRuntimeError?.(diagnostic);
+              }
             }
           });
       },
@@ -2408,9 +2412,9 @@ function NavigationHistoryPlaceholder(props: { entry: TranscriptNavigationEntry;
     <section ref={ref} className="session-navigation-placeholder" aria-busy={status.loading}>
       {status.error && !props.onReadError ? <span role="alert">{status.error}</span> : null}
       {status.error && !props.onReadError ? (
-        <button type="button" onClick={() => setAttempt((current) => current + 1)}>
+        <Button unstyled type="button" onClick={() => setAttempt((current) => current + 1)}>
           {props.language === 'zh-CN' ? '重试' : 'Retry'}
-        </button>
+        </Button>
       ) : null}
     </section>
   );
@@ -2612,7 +2616,7 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
   // 暂停或未知送达不代表模型继续运行，错误与核对入口由系统操作行承载。
   if (state.queue?.state.type === 'paused' || state.queue?.submissions.some((submission) => submission.internalOperation && submission.pausedReason === 'outcome_unknown')) return null;
   if (state.providerReconnectAttempt > 0 && state.providerReconnectTurnId && !state.terminalTurnIds[state.providerReconnectTurnId]) return 'reconnecting';
-  /** 初次连接尚未失败时显示执行；明确断线后才切换为连接提示。 */
+  /** 本地消息仅提供连接反馈，执行状态需要已经开始的 Provider 轮次。 */
   const pendingMessage = selectPendingExecutionMessage(state);
   if (state.transportState === 'failed') return null;
   if (state.transportState === 'reconnecting' && pendingMessage && pendingMessage.status !== 'unconfirmed') return 'reconnecting';
@@ -2629,10 +2633,7 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
     (!state.queue.waitReason || state.queue.waitReason === 'dispatch_pending' || state.queue.waitReason === 'execution_context_preparing' || state.queue.waitReason === 'conversation_restoring')
   )
     return 'starting';
-  if (!state.activeTurnId || state.terminalTurnIds[state.activeTurnId]) {
-    // 发送结果核对进度在原消息下显示，同一请求不能同时显示执行与连接。
-    return pendingMessage && pendingMessage.status !== 'unconfirmed' ? 'executing' : null;
-  }
+  if (!selectHasActiveProviderTurn(state)) return null;
   // 切回会话需要重新订阅和读取权威状态，只有明确的重连状态才说明连接中断。
   if (state.transportState === 'reconnecting') return 'reconnecting';
   if (state.transportState !== 'ready') {
@@ -2654,9 +2655,21 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
 
 /** 任务耗时仍单独显示；此处不把时间增长当作模型继续推进的证据。 */
 function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonNullable<ReturnType<typeof transcriptRunStatus>>; reconnectAttempt: number; reconnectAttempts: number; summaryText?: string }): ReactNode {
+  /** 只有连续恢复超过 10 秒才显示连接提示，短暂抖动不占用正文。 */
+  const [reconnectStatusVisible, setReconnectStatusVisible] = useState(false);
+  useEffect(() => {
+    if (props.kind !== 'reconnecting') {
+      setReconnectStatusVisible(false);
+      return;
+    }
+    /** 重试次数变化不重新计时；恢复或离开当前状态时取消提示。 */
+    const timer = window.setTimeout(() => setReconnectStatusVisible(true), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [props.kind]);
+  if (props.kind === 'reconnecting' && !reconnectStatusVisible) return null;
   // 整理状态与活动记录沿用同一套用户表述，由当前状态位置统一承载进度。
   const labels = {
-    starting: ['正在执行', 'Executing'],
+    starting: ['正在准备', 'Preparing'],
     checking_plugin: ['正在等待 Plugin Hook 检查', 'Waiting for Plugin Hook checks'],
     executing: ['正在执行', 'Executing'],
     // 缓存态只展示已有摘要，缺少摘要时不会进入此状态。
@@ -2686,18 +2699,22 @@ function InteractionAuthorityMissingNotice(props: { language: SessionUiLanguage;
   /** 等待停止完成期间禁用重复操作。 */
   const [stopping, setStopping] = useState(false);
   /** 沿用当前轮次的停止操作，不改变回答或队列状态。 */
-  const stop = () => {
+  const stop = async () => {
     if (!props.onInterrupt || stopping) return;
     setStopping(true);
-    void Promise.resolve(props.onInterrupt(props.turnId)).finally(() => setStopping(false));
+    try {
+      await props.onInterrupt(props.turnId);
+    } finally {
+      setStopping(false);
+    }
   };
   return (
     <ConversationNotice deliveryState="unconfirmed" label={props.language === 'zh-CN' ? '问题暂不可用' : 'Question unavailable'}>
       <span>{props.language === 'zh-CN' ? 'AI 正在等待你的回答，但 Zeus 暂时无法显示可回答的问题。' : 'The AI is waiting for your answer, but Zeus cannot currently display a question you can respond to.'}</span>
       <div className="session-message-delivery-actions">
-        <button type="button" disabled={!props.onInterrupt || stopping} onClick={stop}>
+        <Button unstyled type="button" disabled={!props.onInterrupt || stopping} onClick={stop}>
           {stopping ? (props.language === 'zh-CN' ? '正在停止…' : 'Stopping…') : props.language === 'zh-CN' ? '停止当前任务' : 'Stop current turn'}
-        </button>
+        </Button>
       </div>
     </ConversationNotice>
   );
@@ -2809,19 +2826,19 @@ export function MessageDeliveryOutcomeFeedback(props: {
       {canRetry || canCancelLocalSend || feedbackError ? (
         <div className="session-message-delivery-actions">
           {feedbackError ? (
-            <button type="button" className="application-error-details-link" onClick={() => reportApplicationError(feedbackError, { language: zh ? 'zh-CN' : 'en', summary: message, showDetails: true })}>
+            <Button unstyled type="button" className="application-error-details-link" onClick={() => reportApplicationError(feedbackError, { language: zh ? 'zh-CN' : 'en', summary: message, showDetails: true })}>
               {zh ? '查看原因' : 'View details'}
-            </button>
+            </Button>
           ) : null}
           {canRetry ? (
-            <button type="button" disabled={pendingAction !== null} onClick={() => void retryDelivery()}>
+            <Button unstyled type="button" disabled={pendingAction !== null} onClick={() => retryDelivery()}>
               {pendingAction === 'retry' ? (zh ? '正在重试…' : 'Retrying…') : zh ? '重试' : 'Retry'}
-            </button>
+            </Button>
           ) : null}
           {canCancelLocalSend ? (
-            <button type="button" disabled={pendingAction !== null} onClick={() => void cancelDelivery()}>
+            <Button unstyled type="button" disabled={pendingAction !== null} onClick={() => cancelDelivery()}>
               {pendingAction === 'cancel' ? (zh ? '正在取消…' : 'Cancelling…') : zh ? '取消发送' : 'Cancel send'}
-            </button>
+            </Button>
           ) : null}
         </div>
       ) : null}
@@ -2900,14 +2917,14 @@ export function projectTranscriptTurnRows(
   const loadedProcessTurnIds = new Set<string>();
   /** 每个轮次只检索自己的沟通区间，长会话不扫描其他轮次。 */
   const groupsByTurn = Map.groupBy(processGroups, (group) => group.turnId);
-  /** 起点身份直接定位空摘要。 */
-  const groupByBoundary = new Map(processGroups.map((group) => [group.afterEntryId, group]));
+  /** 已显示的新边界会使跨越它的目录区间失效，不能再复用该区间的身份和补读范围。 */
+  const supersededProcessGroupIds = new Set<string>();
   /** 原始沟通行与已加载详情共用持久边界，按有序区间二分查找。 */
   const groupForRow = (row: TranscriptRow): ConversationProcessGroup | undefined => {
     /** 操作行中的成员按持久顺序排列。 */
     const item = row.kind === 'item' ? row.item : row.kind === 'activity' ? row.items[0] : undefined;
-    /** 本地轮次身份与服务端目录一致。 */
-    const placement = item?.transcript?.placement;
+    /** 普通发言、已答询问与操作使用同一持久位置校验目录区间。 */
+    const placement = row.kind === 'answered_request' ? row.request.transcript?.placement : item?.transcript?.placement;
     if (placement?.order == null || !placement.turnId) return undefined;
     /** 目录按顺序返回，查找起点小于条目位置的最后一组。 */
     const groups = groupsByTurn.get(placement.turnId) ?? [];
@@ -2923,8 +2940,17 @@ export function projectTranscriptTurnRows(
     }
     /** 结束边界排除下一段沟通后的详情。 */
     const group = groups[low - 1];
-    return group && (group.beforeOrder === null || placement.order < group.beforeOrder) ? group : undefined;
+    return group && !supersededProcessGroupIds.has(group.id) && (group.beforeOrder === null || placement.order < group.beforeOrder) ? group : undefined;
   };
+  /** 目录异步刷新期间，先按当前可见边界分组，避免旧范围让多个过程块共享身份。 */
+  for (const row of orderedRows) {
+    if (isTurnProcessRow(row)) continue;
+    /** 区间内出现非过程行，说明它已不能代表一段连续的可见操作。 */
+    const group = groupForRow(row);
+    if (group) supersededProcessGroupIds.add(group.id);
+  }
+  /** 失效区间也不能以空摘要重新插入正文。 */
+  const groupByBoundary = new Map(processGroups.filter((group) => !supersededProcessGroupIds.has(group.id)).map((group) => [group.afterEntryId, group]));
   /** Provider 事件早于开场消息落库时，持久输入身份仍负责把过程放回用户消息之后。 */
   const userAnchorByOpeningInputId = new Map<string, { index: number; rowKey: string; turnId: string }>();
   /** 缺少持久输入身份的旧记录只兼容同轮第一条普通用户消息。 */

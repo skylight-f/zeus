@@ -1,8 +1,9 @@
+import { useWindowDocument } from '../ui/windowDocument.js';
+import { branchSwitchRepositories, executeRepositoryBatch, intersectRepositoryValues, repositoryLocalBranches } from './repositoryBranchGroups.js';
 import './gitWorkspace.css';
 import { createProjectGitMergeAction } from './projectGitMergeAction.js';
 import { repositoryColor } from './repositoryColor.js';
-import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { MenuSurface, type MenuSubmenuAnchor } from '../ui/MenuSurface.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
@@ -17,6 +18,7 @@ import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/Caret
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
+import { Form } from '../ui/Form.js';
 
 interface BranchTreeNode {
   name: string;
@@ -24,22 +26,39 @@ interface BranchTreeNode {
   children: Map<string, BranchTreeNode>;
 }
 
+/** Git 工作区与会话入口共用仓库、分支和动作的级联菜单。 */
 export function BranchSwitcher(props: {
   zh: boolean;
   /** 按仓库、分支、操作逐级展开，供源码与 Git 工作区共用。 */
   cascadeRepositories?: boolean;
+  /** 会话只提供签出或来源选择，不显示工作区的提交、合并等动作。 */
+  referenceSelection?: {
+    mode: 'checkout' | 'source';
+    onSelect: (repositories: ProjectGitRepositoryWorkbenchItem[], ref: string, kind: BranchKind) => Promise<boolean>;
+  };
+  /** 工作树配置保留在同一菜单内。 */
+  footer?: ReactNode;
+  /** 会话加载、发送或 Git 操作期间禁用入口及选择。 */
+  disabled?: boolean;
+  /** 会话可显示多仓状态或尚未创建的工作树来源。 */
+  triggerLabel?: string;
+  /** 新建分支弹窗关闭后恢复入口焦点。 */
+  triggerRef?: RefObject<HTMLButtonElement | null>;
   repositories: ProjectGitRepositoryWorkbenchItem[];
   selectedRepository: ProjectGitRepositoryWorkbenchItem | null;
   busy: BusyState;
   onSelectRepository: (repositoryId: string) => void;
   onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
-  onOpenDiff: (repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }) => void;
-  onOpenUpdate: () => void;
-  onOpenCommit: () => void;
-  onOpenPush: () => void;
-  onOpenNewBranch: (baseRef?: string) => void;
-  onOpenRevision: () => void;
+  onOpenDiff?: (repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }) => void;
+  onOpenUpdate?: () => void;
+  onOpenCommit?: () => void;
+  onOpenPush?: () => void;
+  onOpenNewBranch?: (baseRef?: string, repositoryId?: string) => void;
+  onOpenRevision?: () => void;
 }) {
+  /** 分支菜单跟随所在窗口的尺寸、焦点和键盘事件。 */
+  const document = useWindowDocument();
+  const window = document.defaultView!;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [position, setPosition] = useState({ left: 0, top: 0 });
@@ -55,18 +74,29 @@ export function BranchSwitcher(props: {
   const menuTreeRef = useRef<HTMLDivElement>(null);
   const submenuId = useId();
   const [commonBranch, setCommonBranch] = useState('');
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  /** 内部引用用于普通 Git 入口，外部引用用于会话弹窗的焦点恢复。 */
+  const localTriggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = props.triggerRef ?? localTriggerRef;
   /** 下拉视觉退出后释放内容，业务开关仍立即生效。 */
   const { ref: popoverRef, present: popoverPresent } = useMotionPresence<HTMLDivElement>(open);
   const searchRef = useRef<HTMLInputElement>(null);
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const triggerLabel = props.selectedRepository ? currentRepositoryRefLabel(props.selectedRepository, props.zh) : props.zh ? '选择分支' : 'Select branch';
+  const triggerLabel = props.triggerLabel ?? (props.selectedRepository ? currentRepositoryRefLabel(props.selectedRepository, props.zh) : props.zh ? '选择分支' : 'Select branch');
   const visibleRepositories = normalizedQuery
     ? props.repositories.filter((repository) => `${repository.name}/${repository.relativePath}`.toLocaleLowerCase().includes(normalizedQuery) || repositoryHasMatchingReference(repository, normalizedQuery))
     : props.selectedRepository
       ? [props.selectedRepository]
       : props.repositories.slice(0, 1);
-  const commonLocalBranches = useMemo(() => intersectRepositoryValues(props.repositories, (repository) => repository.snapshot.localBranches), [props.repositories]);
+  /** 批量签出按父子关系收敛范围；工作树来源仍保留逐仓选择。 */
+  const branchRepositories = useMemo(() => (props.referenceSelection?.mode === 'source' ? props.repositories : branchSwitchRepositories(props.repositories)), [props.repositories, props.referenceSelection?.mode]);
+  const commonLocalBranches = useMemo(() => intersectRepositoryValues(branchRepositories, repositoryLocalBranches), [branchRepositories]);
+  /** 工作树可批量选择共同远程来源；普通签出仍只使用共同本地分支。 */
+  const commonBranches = [
+    ...commonLocalBranches.map((ref) => ({ ref, kind: 'local' as const })),
+    ...(props.referenceSelection?.mode === 'source'
+      ? intersectRepositoryValues(props.repositories, (repository) => repository.snapshot.remoteBranches.filter((ref) => ref.includes('/') && !ref.endsWith('/HEAD'))).map((ref) => ({ ref, kind: 'remote' as const }))
+      : []),
+  ];
 
   const closeMenus = () => {
     setReferenceMenu(null);
@@ -131,9 +161,9 @@ export function BranchSwitcher(props: {
     { id: 'update', label: props.zh ? '更新项目…' : 'Update Project…', run: props.onOpenUpdate },
     { id: 'commit', label: props.zh ? '提交…' : 'Commit…', run: props.onOpenCommit },
     { id: 'push', label: props.zh ? '推送…' : 'Push…', run: props.onOpenPush },
-    { id: 'new-branch', label: props.zh ? '新建分支…' : 'New Branch…', run: () => props.onOpenNewBranch() },
+    { id: 'new-branch', label: props.zh ? '新建分支…' : 'New Branch…', run: props.onOpenNewBranch },
     { id: 'revision', label: props.zh ? '切换到标签或提交…' : 'Switch to a tag or commit…', run: props.onOpenRevision },
-  ].filter((action) => matches(action.label));
+  ].filter((action) => action.run && matches(action.label));
 
   const popover = popoverPresent ? (
     <div ref={menuTreeRef} className="git-branch-menu-tree">
@@ -159,61 +189,82 @@ export function BranchSwitcher(props: {
               setRepositoryMenu(null);
               setQuery(event.currentTarget.value);
             }}
-            aria-label={props.zh ? '搜索分支、操作和仓库' : 'Search branches, actions and repositories'}
-            placeholder={props.zh ? '搜索分支、操作和仓库' : 'Search branches, actions and repositories'}
+            aria-label={props.referenceSelection ? (props.zh ? '搜索分支和仓库' : 'Search branches and repositories') : props.zh ? '搜索分支、操作和仓库' : 'Search branches, actions and repositories'}
+            placeholder={props.referenceSelection ? (props.zh ? '搜索分支和仓库' : 'Search branches and repositories') : props.zh ? '搜索分支、操作和仓库' : 'Search branches, actions and repositories'}
           />
         </label>
         <div className="project-git-branch-popover-scroll">
           {quickActions.length > 0 ? (
             <section className="project-git-branch-actions" aria-label={props.zh ? 'Git 操作' : 'Git actions'}>
               {quickActions.map((action) => (
-                <button key={action.id} type="button" onClick={runAction(action.run)} disabled={props.busy !== null}>
+                <Button unstyled key={action.id} type="button" onClick={runAction(() => action.run?.())} disabled={props.disabled || props.busy !== null}>
                   {action.label}
-                </button>
+                </Button>
               ))}
             </section>
           ) : null}
-          {!props.cascadeRepositories && normalizedQuery && props.repositories.length > 1 && commonLocalBranches.some(matches) ? (
+          {props.repositories.length > 1 && commonBranches.some((branch) => matches(branch.ref)) ? (
             <section className="project-git-branch-group">
-              <strong>{props.zh ? '共同本地分支' : 'Common local branches'}</strong>
-              {commonLocalBranches.filter(matches).map((branch) => (
-                <div key={branch} className="project-git-common-branch">
-                  <button type="button" className={branch === commonBranch ? 'is-current' : ''} onClick={() => setCommonBranch((current) => (current === branch ? '' : branch))}>
-                    <GitBranch aria-hidden="true" />
-                    <span>{branch}</span>
-                    <CaretRight aria-hidden="true" />
-                  </button>
-                  {commonBranch === branch ? (
-                    <span className="project-git-common-branch-actions">
-                      <button
-                        type="button"
-                        disabled={props.busy !== null || props.repositories.some((repository) => repository.snapshot.detached)}
-                        onClick={async () => {
-                          for (const repository of props.repositories) {
-                            if (repository.snapshot.branch === branch && !repository.snapshot.detached) continue;
-                            if ((await props.onExecute(repository, { type: 'checkout', branchName: branch }, props.zh ? `在全部仓库签出“${branch}”` : `Checkout '${branch}' in all repositories`)) !== 'completed') break;
+              <strong>{props.referenceSelection?.mode === 'source' ? (props.zh ? '共同来源分支' : 'Common source branches') : props.zh ? '共同本地分支' : 'Common local branches'}</strong>
+              {commonBranches
+                .filter((branch) => matches(branch.ref))
+                .map(({ ref: branch, kind }) => (
+                  <div key={`${kind}:${branch}`} className="project-git-common-branch">
+                    <Button unstyled type="button" className={branch === commonBranch ? 'is-current' : ''} onClick={() => setCommonBranch((current) => (current === `${kind}:${branch}` ? '' : `${kind}:${branch}`))}>
+                      <GitBranch aria-hidden="true" />
+                      <span>{branch}</span>
+                      <CaretRight aria-hidden="true" />
+                    </Button>
+                    {commonBranch === `${kind}:${branch}` ? (
+                      <span className="project-git-common-branch-actions">
+                        <Button
+                          unstyled
+                          type="button"
+                          disabled={
+                            props.disabled ||
+                            props.busy !== null ||
+                            (props.referenceSelection?.mode !== 'source' &&
+                              branchRepositories.some((repository) => (repository.snapshot.detached || repository.snapshot.branch !== branch) && repository.snapshot.checkedOutBranches?.includes(branch)))
                           }
-                          setOpen(false);
-                        }}
-                      >
-                        {props.zh ? `在全部 ${props.repositories.length} 个仓库签出` : `Checkout in all ${props.repositories.length} repositories`}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={props.busy !== null}
-                        onClick={async () => {
-                          for (const repository of props.repositories.filter((candidate) => candidate.snapshot.branch !== branch)) {
-                            if ((await props.onExecute(repository, createProjectGitMergeAction(repository, branch), props.zh ? `将“${branch}”合入当前分支` : `Merge '${branch}' into current branch`)) !== 'completed') break;
-                          }
-                          setOpen(false);
-                        }}
-                      >
-                        {props.zh ? '合入各仓当前分支' : 'Merge into each current branch'}
-                      </button>
-                    </span>
-                  ) : null}
-                </div>
-              ))}
+                          onClick={async () => {
+                            if (props.referenceSelection) {
+                              if (await props.referenceSelection.onSelect(props.repositories, branch, kind)) closeMenus();
+                              return;
+                            }
+                            await executeRepositoryBatch(branchRepositories, (repository) =>
+                              props.onExecute(repository, { type: 'checkout', branchName: branch }, props.zh ? `在全部仓库签出“${branch}”` : `Checkout '${branch}' in all repositories`),
+                            );
+                            setOpen(false);
+                          }}
+                        >
+                          {props.referenceSelection?.mode === 'source'
+                            ? props.zh
+                              ? `用作全部 ${props.repositories.length} 个仓库的来源`
+                              : `Use as source for all ${props.repositories.length} repositories`
+                            : props.zh
+                              ? `在全部 ${props.repositories.length} 个仓库签出`
+                              : `Checkout in all ${props.repositories.length} repositories`}
+                        </Button>
+                        {!props.referenceSelection ? (
+                          <Button
+                            unstyled
+                            type="button"
+                            disabled={props.disabled || props.busy !== null}
+                            onClick={async () => {
+                              await executeRepositoryBatch(
+                                props.repositories.filter((repository) => repository.snapshot.branch !== branch),
+                                (repository) => props.onExecute(repository, createProjectGitMergeAction(repository, branch), props.zh ? `将“${branch}”合入当前分支` : `Merge '${branch}' into current branch`),
+                              );
+                              setOpen(false);
+                            }}
+                          >
+                            {props.zh ? '合入各仓当前分支' : 'Merge into each current branch'}
+                          </Button>
+                        ) : null}
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
             </section>
           ) : null}
           {props.cascadeRepositories || props.repositories.length > 1 ? (
@@ -221,7 +272,8 @@ export function BranchSwitcher(props: {
               {props.repositories
                 .filter((repository) => !normalizedQuery || `${repository.name}/${repository.relativePath}`.toLocaleLowerCase().includes(normalizedQuery) || repositoryHasMatchingReference(repository, normalizedQuery))
                 .map((repository) => (
-                  <button
+                  <Button
+                    unstyled
                     type="button"
                     key={repository.id}
                     id={`${repositoryRowId}-${repository.id}`}
@@ -238,6 +290,7 @@ export function BranchSwitcher(props: {
                       setReferenceMenu(null);
                       if (props.cascadeRepositories) {
                         setRepositoryMenu({ anchor: event.currentTarget, repository });
+                        if (props.referenceSelection) return props.onSelectRepository(repository.id);
                       } else {
                         props.onSelectRepository(repository.id);
                         setQuery('');
@@ -249,7 +302,7 @@ export function BranchSwitcher(props: {
                     <span>{repository.name}</span>
                     <small>{currentRepositoryRefLabel(repository, props.zh)}</small>
                     <CaretRight />
-                  </button>
+                  </Button>
                 ))}
             </section>
           ) : null}
@@ -258,6 +311,7 @@ export function BranchSwitcher(props: {
               key={`${repository.id}:${normalizedQuery}`}
               zh={props.zh}
               repository={repository}
+              selectionMode={props.referenceSelection?.mode}
               collapsible={props.cascadeRepositories}
               query={`${repository.name}/${repository.relativePath}`.toLocaleLowerCase().includes(normalizedQuery) ? '' : normalizedQuery}
               onOpenReferenceMenu={openReferenceMenu}
@@ -266,8 +320,17 @@ export function BranchSwitcher(props: {
             />
           ))}
           {quickActions.length === 0 && !props.repositories.some((repository) => repositoryHasMatchingReference(repository, normalizedQuery)) ? (
-            <p className="project-git-branch-empty">{props.zh ? '没有匹配的分支、标签或操作。可使用“签出标签或 Revision”解析完整引用。' : 'No matching branch, tag, or action. Use Checkout Tag or Revision to resolve an exact ref.'}</p>
+            <p className="project-git-branch-empty">
+              {props.referenceSelection
+                ? props.zh
+                  ? '没有匹配的分支或仓库。'
+                  : 'No matching branches or repositories.'
+                : props.zh
+                  ? '没有匹配的分支、标签或操作。可使用“签出标签或 Revision”解析完整引用。'
+                  : 'No matching branch, tag, or action. Use Checkout Tag or Revision to resolve an exact ref.'}
+            </p>
           ) : null}
+          {props.footer}
         </div>
       </div>
       <MotionPresence>
@@ -286,32 +349,39 @@ export function BranchSwitcher(props: {
           >
             <div className="project-git-branch-popover-scroll">
               <section className="project-git-branch-actions">
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={props.busy !== null}
-                  onClick={runAction(() => {
-                    props.onSelectRepository(repositoryMenu.repository.id);
-                    props.onOpenNewBranch();
-                  })}
-                >
-                  {props.zh ? '新建分支…' : 'New Branch…'}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={props.busy !== null}
-                  onClick={runAction(() => {
-                    props.onSelectRepository(repositoryMenu.repository.id);
-                    props.onOpenRevision();
-                  })}
-                >
-                  {props.zh ? '切换到标签或提交…' : 'Switch to a tag or commit…'}
-                </button>
+                {props.onOpenNewBranch ? (
+                  <Button
+                    unstyled
+                    type="button"
+                    role="menuitem"
+                    disabled={props.disabled || props.busy !== null}
+                    onClick={runAction(() => {
+                      props.onSelectRepository(repositoryMenu.repository.id);
+                      props.onOpenNewBranch?.(undefined, repositoryMenu.repository.id);
+                    })}
+                  >
+                    {props.zh ? '新建分支…' : 'New Branch…'}
+                  </Button>
+                ) : null}
+                {props.onOpenRevision ? (
+                  <Button
+                    unstyled
+                    type="button"
+                    role="menuitem"
+                    disabled={props.disabled || props.busy !== null}
+                    onClick={runAction(() => {
+                      props.onSelectRepository(repositoryMenu.repository.id);
+                      props.onOpenRevision?.();
+                    })}
+                  >
+                    {props.zh ? '切换到标签或提交…' : 'Switch to a tag or commit…'}
+                  </Button>
+                ) : null}
               </section>
               <RepositoryBranchGroups
                 zh={props.zh}
                 repository={repositoryMenu.repository}
+                selectionMode={props.referenceSelection?.mode}
                 collapsible
                 query={`${repositoryMenu.repository.name}/${repositoryMenu.repository.relativePath}`.toLocaleLowerCase().includes(normalizedQuery) ? '' : normalizedQuery}
                 onOpenReferenceMenu={openReferenceMenu}
@@ -324,23 +394,55 @@ export function BranchSwitcher(props: {
       </MotionPresence>
       <MotionPresence>
         {open && referenceMenu && popoverRef.current ? (
-          referenceMenu.kind === 'local' || referenceMenu.kind === 'remote' ? (
-            <BranchContextMenu
-              key={referenceMenu.anchor.id}
+          props.referenceSelection && (referenceMenu.kind === 'local' || referenceMenu.kind === 'remote') ? (
+            <MenuSurface
               id={submenuId}
-              x={0}
-              y={0}
+              className="project-git-branch-context-menu"
               submenuAnchor={{ row: referenceMenu.anchor, parent: referenceMenu.parent }}
-              repository={referenceMenu.repository}
-              branch={referenceMenu.reference}
-              kind={referenceMenu.kind}
-              zh={props.zh}
-              busy={props.busy}
               onClose={() => setReferenceMenu(null)}
-              onAction={closeMenus}
-              onExecute={props.onExecute}
-              onOpenDiff={props.onOpenDiff}
-            />
+              aria-label={props.zh ? `分支操作：${referenceMenu.reference}` : `Branch actions: ${referenceMenu.reference}`}
+            >
+              <div className="git-reference-menu-heading">
+                <GitBranch aria-hidden="true" />
+                <strong>{referenceMenu.reference}</strong>
+              </div>
+              <Button
+                unstyled
+                type="button"
+                role="menuitem"
+                disabled={
+                  props.disabled ||
+                  props.busy !== null ||
+                  (props.referenceSelection.mode === 'checkout' &&
+                    (referenceMenu.repository.snapshot.detached || referenceMenu.repository.snapshot.branch !== referenceMenu.reference) &&
+                    referenceMenu.repository.snapshot.checkedOutBranches?.includes(referenceMenu.reference))
+                }
+                onClick={async () => {
+                  if (await props.referenceSelection!.onSelect([referenceMenu.repository], referenceMenu.reference, referenceMenu.kind as BranchKind)) closeMenus();
+                }}
+              >
+                {props.referenceSelection.mode === 'source' ? (props.zh ? '用作来源分支' : 'Use as source branch') : props.zh ? '签出' : 'Checkout'}
+              </Button>
+            </MenuSurface>
+          ) : referenceMenu.kind === 'local' || referenceMenu.kind === 'remote' ? (
+            props.onOpenDiff ? (
+              <BranchContextMenu
+                key={referenceMenu.anchor.id}
+                id={submenuId}
+                x={0}
+                y={0}
+                submenuAnchor={{ row: referenceMenu.anchor, parent: referenceMenu.parent }}
+                repository={referenceMenu.repository}
+                branch={referenceMenu.reference}
+                kind={referenceMenu.kind}
+                zh={props.zh}
+                busy={props.busy}
+                onClose={() => setReferenceMenu(null)}
+                onAction={closeMenus}
+                onExecute={props.onExecute}
+                onOpenDiff={props.onOpenDiff}
+              />
+            ) : null
           ) : (
             <RevisionContextMenu
               key={referenceMenu.anchor.id}
@@ -358,7 +460,7 @@ export function BranchSwitcher(props: {
               onNewBranch={(baseRef) => {
                 closeMenus();
                 props.onSelectRepository(referenceMenu.repository.id);
-                props.onOpenNewBranch(baseRef);
+                return props.onOpenNewBranch?.(baseRef);
               }}
             />
           )
@@ -369,13 +471,14 @@ export function BranchSwitcher(props: {
 
   return (
     <>
-      <button
+      <Button
+        unstyled
         ref={triggerRef}
         type="button"
         className={`project-git-branch-trigger${open ? ' is-open' : ''}`}
         aria-haspopup="dialog"
         aria-expanded={open}
-        disabled={!props.repositories.length}
+        disabled={props.disabled || !props.repositories.length}
         onClick={() => {
           setQuery('');
           setReferenceMenu(null);
@@ -386,7 +489,7 @@ export function BranchSwitcher(props: {
         <GitBranch aria-hidden="true" />
         <span data-icon-tooltip={`${props.selectedRepository?.name ?? ''} · ${triggerLabel}`}>{triggerLabel}</span>
         <CaretDown aria-hidden="true" />
-      </button>
+      </Button>
       {typeof document !== 'undefined' && document.body && popover ? createPortal(popover, triggerRef.current?.closest('.macos-ai-app') ?? document.body) : popover}
     </>
   );
@@ -395,6 +498,8 @@ export function BranchSwitcher(props: {
 export function RepositoryBranchGroups(props: {
   zh: boolean;
   collapsible?: boolean;
+  /** 会话签出仅列本地分支，来源选择还允许远程分支。 */
+  selectionMode?: 'checkout' | 'source';
   repository: ProjectGitRepositoryWorkbenchItem;
   query: string;
   activeAnchorId?: string;
@@ -404,10 +509,21 @@ export function RepositoryBranchGroups(props: {
   const matches = (value: string): boolean => !props.query || value.toLocaleLowerCase().includes(props.query);
   const groups = [
     { id: 'recent', label: props.zh ? '最近' : 'Recent', values: props.repository.snapshot.recentRefs.filter((item) => matches(item.ref)) },
-    { id: 'local', label: props.zh ? '本地' : 'Local', values: props.repository.snapshot.localBranches.filter(matches).map((ref) => ({ ref, kind: 'local' as const })) },
+    {
+      id: 'local',
+      label: props.zh ? '本地' : 'Local',
+      values: repositoryLocalBranches(props.repository)
+        .filter(matches)
+        .map((ref) => ({ ref, kind: 'local' as const })),
+    },
     { id: 'remote', label: props.zh ? '远程' : 'Remote', values: props.repository.snapshot.remoteBranches.filter(matches).map((ref) => ({ ref, kind: 'remote' as const })) },
     { id: 'tags', label: props.zh ? '标签' : 'Tags', values: props.repository.snapshot.tags.filter(matches).map((ref) => ({ ref, kind: 'tag' as const })) },
-  ].filter((group) => group.values.length > 0);
+  ]
+    .map((group) => ({
+      ...group,
+      values: group.values.filter((item) => !props.selectionMode || item.kind === 'local' || (props.selectionMode === 'source' && item.kind === 'remote' && item.ref.includes('/') && !item.ref.endsWith('/HEAD'))),
+    }))
+    .filter((group) => group.values.length > 0);
   if (groups.length === 0) return null;
   return (
     <section className="project-git-branch-repository">
@@ -473,7 +589,8 @@ function ReferenceTree(props: {
         </details>
       ))}
       {leaves.map((item, index) => (
-        <button
+        <Button
+          unstyled
           key={`${item.kind}:${item.ref}`}
           type="button"
           className={props.activeAnchorId === `${treeId}-${index}` ? 'is-active' : item.kind === 'local' && item.ref === props.repository.snapshot.branch ? 'is-current' : ''}
@@ -493,7 +610,7 @@ function ReferenceTree(props: {
           <span>{item.ref.slice(prefix.length)}</span>
           {item.kind === 'local' && item.ref === props.repository.snapshot.branch ? <small>{props.zh ? '当前' : 'Current'}</small> : null}
           <CaretRight />
-        </button>
+        </Button>
       ))}
     </div>
   );
@@ -531,129 +648,80 @@ export function RevisionContextMenu(props: {
         <GitBranch aria-hidden="true" />
         <strong>{props.revision}</strong>
       </div>
-      <button
+      <Button
+        unstyled
         type="button"
         role="menuitem"
         disabled={props.busy !== null}
         onClick={() => {
           closeMenus();
-          void props.onExecute(props.repository, { type: 'checkout_revision', revision: props.revision }, props.zh ? `签出“${props.revision}”` : `Checkout '${props.revision}'`);
+          return props.onExecute(props.repository, { type: 'checkout_revision', revision: props.revision }, props.zh ? `签出“${props.revision}”` : `Checkout '${props.revision}'`);
         }}
       >
         {props.zh ? '签出（进入游离提交状态）' : 'Checkout (detached HEAD)'}
-      </button>
-      <button type="button" role="menuitem" disabled={props.busy !== null} onClick={() => props.onNewBranch(props.revision)}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" disabled={props.busy !== null} onClick={() => props.onNewBranch(props.revision)}>
         {props.zh ? `从“${props.revision}”新建分支…` : `New Branch from '${props.revision}'…`}
-      </button>
+      </Button>
     </MenuSurface>
   );
 }
 
-export function UpdateProjectDialog(props: {
-  open: boolean;
-  projectId: string;
-  zh: boolean;
-  repositories: ProjectGitRepositoryWorkbenchItem[];
-  busy: BusyState;
-  errorsByRepository: Readonly<Record<string, string>>;
-  onClose: () => void;
-  onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
-}) {
-  const [strategy, setStrategy] = useState<ProjectGitUpdateStrategy>('merge');
-  const [resetConfirmed, setResetConfirmed] = useState(false);
-  const [results, setResults] = useState<Array<{ id: string; outcome: ExecutionOutcome }>>([]);
-  useEffect(() => {
-    if (!props.open) return;
-    setStrategy(readUpdateStrategy(props.projectId));
-    setResetConfirmed(false);
-    setResults([]);
-  }, [props.open, props.projectId]);
-  if (!props.open) return null;
-  const localCommitCount = props.repositories.reduce((total, repository) => total + repository.snapshot.outgoingCommits.length, 0);
-  const resetNeedsConfirmation = strategy === 'reset' && localCommitCount > 0;
+/** 更新项目只选择整合策略；执行进度与冲突由共享工作台显示。 */
+export function UpdateProjectDialog(props: { projectId: string; zh: boolean; busy: BusyState; onClose: () => void; onUpdate: (strategy: ProjectGitUpdateStrategy) => void }) {
+  /** 更新方式按项目保存，取消不写入。 */
+  const [strategy, setStrategy] = useState(() => readUpdateStrategy(props.projectId));
+  /** 勾选后，后续快捷键直接使用已保存的更新方式。 */
+  const [skipDialog, setSkipDialog] = useState(() => readSkipUpdateDialog(props.projectId));
   return (
-    <ModalPortal rootClassName="project-git-modal-root" backdropClassName="project-git-modal-backdrop" onDismiss={props.onClose} dismissDisabled={props.busy !== null} role="dialog" aria-label={props.zh ? '更新项目' : 'Update project'}>
-      <section className="project-git-update-dialog" data-modal-surface="dialog">
+    <ModalPortal rootClassName="project-git-modal-root" backdropClassName="project-git-modal-backdrop" onDismiss={props.onClose} dismissDisabled={props.busy !== null} role="dialog" aria-label={props.zh ? '更新项目' : 'Update Project'}>
+      <Form
+        className="project-git-update-dialog"
+        data-modal-surface="dialog"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (props.busy !== null) return;
+          window.localStorage.setItem(`zeus.project-git-update-strategy:${props.projectId}`, strategy);
+          window.localStorage.setItem(`zeus.project-git-update-skip-dialog:${props.projectId}`, String(skipDialog));
+          return props.onUpdate(strategy);
+        }}
+      >
         <header>
           <strong>{props.zh ? '更新项目' : 'Update Project'}</strong>
-          <small>
-            {props.zh
-              ? '获取所有仓库的远端变化，并按所选方式更新当前分支。未提交的文件会先备份，更新后再恢复。'
-              : 'Fetch remote changes for all repositories and update their current branches using the selected method. Uncommitted files are backed up first and restored afterward.'}
-          </small>
         </header>
         <main>
-          <fieldset className="project-git-update-strategies">
-            <legend>{props.zh ? '更新方式' : 'Update method'}</legend>
-            {(
-              [
-                ['merge', props.zh ? '合并远端变化' : 'Merge incoming changes', props.zh ? '保留本地提交历史，可能产生合并提交。' : 'Keep local commit history; may create a merge commit.'],
-                ['rebase', props.zh ? '将当前分支变基到远端之上' : 'Rebase current branch onto incoming changes', props.zh ? '把本地提交重放到最新上游之后。' : 'Replay local commits on top of the updated upstream.'],
-                ['reset', props.zh ? '重置到远端分支' : 'Reset to the remote branch', props.zh ? '丢弃本地分支尚未包含在远端中的提交。' : 'Drop local commits that are not present in the tracked remote branch.'],
-              ] as const
-            ).map(([value, title, description]) => (
-              <label key={value} className={strategy === value ? 'is-current' : ''}>
-                <input type="radio" name="project-git-update-strategy" value={value} checked={strategy === value} onChange={() => setStrategy(value)} />
-                <span>
-                  <strong>{title}</strong>
-                  <small>{description}</small>
-                </span>
-              </label>
-            ))}
-          </fieldset>
-          <section className="project-git-update-repositories">
-            <strong>{props.zh ? `仓库 (${props.repositories.length})` : `Repositories (${props.repositories.length})`}</strong>
-            {props.repositories.map((repository) => {
-              const result = results.find((item) => item.id === repository.id)?.outcome;
-              return (
-                <span key={repository.id}>
-                  <GitBranch aria-hidden="true" />
-                  <b>{repository.name}</b>
-                  <small>{repository.snapshot.detached ? (props.zh ? '游离提交状态，无法更新' : 'Detached HEAD; cannot update') : (repository.snapshot.upstream ?? (props.zh ? '没有跟踪远端' : 'No tracked remote'))}</small>
-                  {repository.snapshot.fileStatuses.length > 0 ? <em>{props.zh ? `Smart Stash · ${repository.snapshot.fileStatuses.length} 个变化` : `Smart Stash · ${repository.snapshot.fileStatuses.length} changes`}</em> : null}
-                  {result ? <i className={`is-${result}`}>{result === 'completed' ? (props.zh ? '已完成' : 'Completed') : props.zh ? '存在冲突' : 'Conflicts'}</i> : null}
-                  {result === null && results.some((item) => item.id === repository.id) ? (
-                    <i className="is-error">
-                      <VisibleApplicationError error={props.errorsByRepository[repository.id]} language={props.zh ? 'zh-CN' : 'en'} />
-                    </i>
-                  ) : null}
-                </span>
-              );
-            })}
-          </section>
-          {resetNeedsConfirmation ? (
-            <label className="project-git-update-reset-confirm">
-              <input type="checkbox" checked={resetConfirmed} onChange={(event) => setResetConfirmed(event.currentTarget.checked)} />
-              <span>
-                {props.zh
-                  ? `我确认丢弃全部仓库中共 ${localCommitCount} 个尚未进入跟踪远端的本地提交。未提交文件会通过 Smart Stash 恢复。`
-                  : `I confirm dropping ${localCommitCount} local commits not present in tracked remotes. Uncommitted files will be restored through Smart Stash.`}
-              </span>
+          <fieldset className="project-git-update-strategies" aria-label={props.zh ? '更新方式' : 'Update method'} disabled={props.busy !== null}>
+            <label>
+              <input type="radio" name="project-git-update-strategy" value="merge" checked={strategy === 'merge'} onChange={() => setStrategy('merge')} />
+              <span>{props.zh ? '将传入的更改合并到当前分支' : 'Merge incoming changes into the current branch'}</span>
             </label>
-          ) : null}
+            <label>
+              <input type="radio" name="project-git-update-strategy" value="rebase" checked={strategy === 'rebase'} onChange={() => setStrategy('rebase')} />
+              <span>{props.zh ? '将当前分支变基到传入的更改之上' : 'Rebase the current branch on top of incoming changes'}</span>
+            </label>
+          </fieldset>
         </main>
         <footer>
+          <label className="project-git-update-remember">
+            <input type="checkbox" checked={skipDialog} disabled={props.busy !== null} onChange={(event) => setSkipDialog(event.currentTarget.checked)} />
+            <span>{props.zh ? '不再显示' : "Don't show again"}</span>
+          </label>
           <Button variant="secondary" onClick={props.onClose} disabled={props.busy !== null}>
-            {props.zh ? '关闭' : 'Close'}
+            {props.zh ? '取消' : 'Cancel'}
           </Button>
+          {/* 共享焦点管理器读取原生 autofocus 属性，并在关闭后恢复原焦点。 */}
           <Button
-            variant={strategy === 'reset' ? 'danger' : 'primary'}
-            busy={props.busy?.action === 'update'}
-            disabled={props.busy !== null || (resetNeedsConfirmation && !resetConfirmed)}
-            onClick={async () => {
-              window.localStorage.setItem(`zeus.project-git-update-strategy:${props.projectId}`, strategy);
-              const nextResults: Array<{ id: string; outcome: ExecutionOutcome }> = [];
-              for (const repository of props.repositories) {
-                const outcome = await props.onExecute(repository, { type: 'update', strategy, smart: true }, props.zh ? '更新项目' : 'Update project');
-                nextResults.push({ id: repository.id, outcome });
-                setResults([...nextResults]);
-              }
+            type="submit"
+            variant="primary"
+            ref={(button) => {
+              button?.setAttribute('autofocus', '');
             }}
+            disabled={props.busy !== null}
           >
-            {strategy === 'reset' ? (props.zh ? '重置全部仓库' : 'Reset all repositories') : props.zh ? '更新全部仓库' : 'Update all repositories'}
+            {props.zh ? '确定' : 'OK'}
           </Button>
         </footer>
-      </section>
+      </Form>
     </ModalPortal>
   );
 }
@@ -712,7 +780,7 @@ export function NewBranchDialog(props: {
             onClick={async () => {
               if (!repository) return;
               const outcome = await props.onExecute(repository, { type: 'create_branch', branchName: branchName.trim(), baseRef }, props.zh ? '新建并签出分支' : 'Create and checkout branch');
-              if (outcome) props.onClose();
+              if (outcome) return props.onClose();
             }}
           >
             {props.zh ? '创建并签出' : 'Create and Checkout'}
@@ -757,14 +825,14 @@ export function RemoteBranchCheckoutDialog(props: {
         <header>
           <strong>{props.zh ? '检出远程分支' : 'Checkout Remote Branch'}</strong>
           <span className="project-git-remote-checkout-modes" role="tablist" aria-label={props.zh ? '检出方式' : 'Checkout mode'}>
-            <button type="button" role="tab" aria-selected={mode === 'existing'} disabled={existingCandidates.length === 0 || props.busy !== null} onClick={() => setMode('existing')}>
+            <Button unstyled type="button" role="tab" aria-selected={mode === 'existing'} disabled={existingCandidates.length === 0 || props.busy !== null} onClick={() => setMode('existing')}>
               <ArrowRight aria-hidden="true" />
               <span>{props.zh ? '检出现有' : 'Checkout Existing'}</span>
-            </button>
-            <button type="button" role="tab" aria-selected={mode === 'new'} disabled={props.busy !== null} onClick={() => setMode('new')}>
+            </Button>
+            <Button unstyled type="button" role="tab" aria-selected={mode === 'new'} disabled={props.busy !== null} onClick={() => setMode('new')}>
               <GitBranch aria-hidden="true" />
               <span>{props.zh ? '检出新分支' : 'Checkout New Branch'}</span>
-            </button>
+            </Button>
           </span>
         </header>
         <main>
@@ -903,7 +971,7 @@ export function CheckoutRevisionDialog(props: {
             onClick={async () => {
               if (!repository) return;
               const outcome = await props.onExecute(repository, { type: 'checkout_revision', revision: revision.trim() }, props.zh ? '切换到所选提交' : 'Switch to the selected commit');
-              if (outcome) props.onClose();
+              if (outcome) return props.onClose();
             }}
           >
             {props.zh ? '签出' : 'Checkout'}
@@ -923,20 +991,21 @@ export function shortRef(ref: string): string {
   return /^[0-9a-f]{40}$/iu.test(ref) ? ref.slice(0, 8) : ref;
 }
 
-export function intersectRepositoryValues(repositories: ProjectGitRepositoryWorkbenchItem[], read: (repository: ProjectGitRepositoryWorkbenchItem) => string[]): string[] {
-  if (repositories.length === 0) return [];
-  const [first, ...rest] = repositories;
-  return [...new Set(read(first!))].filter((value) => rest.every((repository) => read(repository).includes(value))).sort((left, right) => left.localeCompare(right));
-}
-
 export function repositoryHasMatchingReference(repository: ProjectGitRepositoryWorkbenchItem, query: string): boolean {
   if (!query) return true;
   return [...repository.snapshot.localBranches, ...repository.snapshot.remoteBranches, ...repository.snapshot.tags, ...repository.snapshot.recentRefs.map((item) => item.ref)].some((value) => value.toLocaleLowerCase().includes(query));
 }
 
+/** 旧的重置偏好不用于快捷键更新，默认保留当前分支历史。 */
 export function readUpdateStrategy(projectId: string): ProjectGitUpdateStrategy {
+  /** 仅变基需要显式保留，其余值使用合并。 */
   const value = typeof window === 'undefined' ? null : window.localStorage.getItem(`zeus.project-git-update-strategy:${projectId}`);
-  return value === 'merge' || value === 'rebase' || value === 'reset' ? value : 'merge';
+  return value === 'rebase' ? 'rebase' : 'merge';
+}
+
+/** 仅快捷键使用免提示偏好；分支菜单始终允许重新选择。 */
+export function readSkipUpdateDialog(projectId: string): boolean {
+  return typeof window !== 'undefined' && window.localStorage.getItem(`zeus.project-git-update-skip-dialog:${projectId}`) === 'true';
 }
 
 export function BranchDirectoryTree(props: {
@@ -973,7 +1042,8 @@ export function BranchTreeEntry(props: Parameters<typeof BranchDirectoryTree>[0]
         .join(props.zh ? '，' : ', ')
     : '';
   return (
-    <button
+    <Button
+      unstyled
       type="button"
       className={props.node.branch === (props.selected ?? props.current) ? 'is-current' : ''}
       data-checked-out={props.node.branch === props.current || undefined}
@@ -997,7 +1067,7 @@ export function BranchTreeEntry(props: Parameters<typeof BranchDirectoryTree>[0]
           {divergenceText}
         </span>
       ) : null}
-    </button>
+    </Button>
   );
 }
 
@@ -1059,7 +1129,7 @@ export function BranchContextMenu(props: {
 
   const run = (action: ProjectGitAction, label: string) => () => {
     closeMenus();
-    void props.onExecute(props.repository, action, label);
+    return props.onExecute(props.repository, action, label);
   };
   const compare = (mode: 'current' | 'working-tree') => () => {
     closeMenus();
@@ -1111,7 +1181,7 @@ export function BranchContextMenu(props: {
               busy={props.busy?.action === 'delete_branch'}
               disabled={props.busy !== null}
               onClick={() => {
-                void props.onExecute(props.repository, { type: 'delete_branch', branchName: props.branch }, props.zh ? '删除分支' : 'Delete branch').then((outcome) => {
+                return props.onExecute(props.repository, { type: 'delete_branch', branchName: props.branch }, props.zh ? '删除分支' : 'Delete branch').then((outcome) => {
                   if (outcome === 'completed') closeMenus();
                 });
               }}
@@ -1139,7 +1209,8 @@ export function BranchContextMenu(props: {
         <strong>{props.branch}</strong>
       </div>
       {props.branch !== current ? (
-        <button
+        <Button
+          unstyled
           type="button"
           role="menuitem"
           disabled={props.busy !== null}
@@ -1149,19 +1220,20 @@ export function BranchContextMenu(props: {
               return;
             }
             closeMenus();
-            void props.onExecute(props.repository, { type: 'checkout', branchName: props.branch }, props.zh ? '签出分支' : 'Checkout branch');
+            return props.onExecute(props.repository, { type: 'checkout', branchName: props.branch }, props.zh ? '签出分支' : 'Checkout branch');
           }}
         >
           {props.zh ? '签出' : 'Checkout'}
-        </button>
+        </Button>
       ) : null}
       {props.kind === 'remote' && !props.repository.snapshot.detached ? (
-        <button type="button" role="menuitem" disabled={props.busy !== null} onClick={() => setRemoteCheckout('checkout')}>
+        <Button unstyled type="button" role="menuitem" disabled={props.busy !== null} onClick={() => setRemoteCheckout('checkout')}>
           {props.zh ? `从“${props.branch}”新建分支…` : `New Branch from '${props.branch}'…`}
-        </button>
+        </Button>
       ) : null}
       {props.branch !== current && !props.repository.snapshot.detached ? (
-        <button
+        <Button
+          unstyled
           type="button"
           role="menuitem"
           disabled={props.busy !== null}
@@ -1171,52 +1243,65 @@ export function BranchContextMenu(props: {
               return;
             }
             closeMenus();
-            void checkoutAndRebase();
+            return checkoutAndRebase();
           }}
         >
           {props.zh ? `签出并变基到“${currentLabel}”` : `Checkout and Rebase onto '${currentLabel}'`}
-        </button>
+        </Button>
       ) : null}
       <hr />
-      <button type="button" role="menuitem" onClick={compare('current')}>
+      <Button unstyled type="button" role="menuitem" onClick={compare('current')}>
         {props.zh ? `与“${currentLabel}”比较` : `Compare with '${currentLabel}'`}
-      </button>
-      <button type="button" role="menuitem" onClick={compare('working-tree')}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={compare('working-tree')}>
         {props.zh ? '显示与工作区的差异' : 'Show Diff with Working Tree'}
-      </button>
+      </Button>
       {props.branch !== current && !props.repository.snapshot.detached ? (
         <>
           <hr />
-          <button type="button" role="menuitem" disabled={props.busy !== null} onClick={run({ type: 'rebase', branchName: props.branch }, props.zh ? '变基当前分支' : 'Rebase current branch')}>
+          <Button unstyled type="button" role="menuitem" disabled={props.busy !== null} onClick={run({ type: 'rebase', branchName: props.branch }, props.zh ? '变基当前分支' : 'Rebase current branch')}>
             {props.zh ? `将“${current}”变基到“${props.branch}”` : `Rebase '${current}' onto '${props.branch}'`}
-          </button>
-          <button
+          </Button>
+          <Button
+            unstyled
             type="button"
             role="menuitem"
             disabled={props.busy !== null}
             onClick={run(createProjectGitMergeAction(props.repository, props.branch), props.zh ? `将“${props.branch}”合并到“${current}”` : `Merge '${props.branch}' into '${current}'`)}
           >
             {props.zh ? `将“${props.branch}”合入“${current}”` : `Merge '${props.branch}' into '${current}'`}
-          </button>
+          </Button>
         </>
       ) : null}
       {props.kind === 'remote' && !props.repository.snapshot.detached ? (
         <>
           <hr />
-          <button type="button" role="menuitem" disabled={props.busy !== null} onClick={run({ type: 'pull', remote: props.branch.split('/')[0], targetBranch: remoteLeaf, strategy: 'rebase' }, props.zh ? '拉取并变基' : 'Pull with rebase')}>
+          <Button
+            unstyled
+            type="button"
+            role="menuitem"
+            disabled={props.busy !== null}
+            onClick={run({ type: 'pull', remote: props.branch.split('/')[0], targetBranch: remoteLeaf, strategy: 'rebase' }, props.zh ? '拉取并变基' : 'Pull with rebase')}
+          >
             {props.zh ? `拉取到“${current}”（变基）` : `Pull into '${current}' Using Rebase`}
-          </button>
-          <button type="button" role="menuitem" disabled={props.busy !== null} onClick={run({ type: 'pull', remote: props.branch.split('/')[0], targetBranch: remoteLeaf, strategy: 'merge' }, props.zh ? '拉取并合并' : 'Pull with merge')}>
+          </Button>
+          <Button
+            unstyled
+            type="button"
+            role="menuitem"
+            disabled={props.busy !== null}
+            onClick={run({ type: 'pull', remote: props.branch.split('/')[0], targetBranch: remoteLeaf, strategy: 'merge' }, props.zh ? '拉取并合并' : 'Pull with merge')}
+          >
             {props.zh ? `拉取到“${current}”（合并）` : `Pull into '${current}' Using Merge`}
-          </button>
+          </Button>
         </>
       ) : null}
       {props.kind === 'local' && props.branch !== current ? (
         <>
           <hr />
-          <button type="button" role="menuitem" disabled={props.busy !== null} onClick={() => setConfirmDelete(true)}>
+          <Button unstyled type="button" role="menuitem" disabled={props.busy !== null} onClick={() => setConfirmDelete(true)}>
             {props.zh ? '删除…' : 'Delete…'}
-          </button>
+          </Button>
         </>
       ) : null}
     </MenuSurface>
@@ -1471,7 +1556,7 @@ export function MergeBranchDialog(props: {
             onClick={async () => {
               /** 目标身份取自当前弹窗展示的仓库快照，后台不替换为更新后的分支。 */
               const result = await props.onExecute(props.repository, createProjectGitMergeAction(props.repository, branch), props.zh ? '合并分支' : 'Merge branch');
-              if (result) props.onClose();
+              if (result) return props.onClose();
             }}
           >
             {props.zh ? '合并' : 'Merge'}

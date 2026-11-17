@@ -1,5 +1,8 @@
 /* 所有差异入口共用可视区域布局，长行横向滚动以保持两侧行号对齐。 */
 .code-diff-view {
+  position: relative;
+  /* 与恢复轨道共享正文起始留白，避免箭头高于实际色块。 */
+  --diff-content-inset: 8px;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   min-height: 0;
@@ -11,7 +14,12 @@
 .code-diff-view.is-resizable {
   grid-template-columns: minmax(0, var(--git-diff, 50%)) 6px minmax(0, 1fr);
 }
-.code-diff-view.is-unified {
+/* 分栏拖动区只在悬停或聚焦时显示手柄，常态不截断连接色带。 */
+.code-diff-view > .git-pane-separator {
+  background: transparent;
+}
+.code-diff-view.is-unified,
+.code-diff-view.is-single-side {
   grid-template-columns: minmax(0, 1fr);
 }
 .code-diff-view > .project-source-code-editor {
@@ -25,68 +33,56 @@
   display: none !important;
 }
 .code-diff-view .cm-content {
-  padding-block: 0 32px;
+  padding-block: var(--diff-content-inset) 24px;
+}
+/* 选区覆盖不透明差异底色；覆盖 CodeMirror 的行内负层级，沿用半透明选区颜色。 */
+.code-diff-view .cm-selectionLayer {
+  z-index: 1 !important;
+  /* 选区只负责绘制，拖选、滚动与行内操作仍由原有节点接收。 */
+  pointer-events: none;
+}
+/* 行号区与正文分层；细轨道避免长文档出现醒目的滚动边框。 */
+.code-diff-view .cm-gutters {
+  border-inline-end: 1px solid var(--zeus-control-border);
+}
+.code-diff-view .cm-scroller::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
 .code-diff-view .cm-gutterElement {
   line-height: 20px;
 }
 .code-diff-line-number {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  min-width: 54px;
+  min-width: 4ch;
   min-height: 20px;
-  padding-inline: 4px;
+  padding-inline: 8px;
   white-space: nowrap;
 }
 .code-diff-view.is-unified .code-diff-line-number > span {
-  min-width: 42px;
+  min-width: 3ch;
   text-align: right;
 }
-.code-diff-line.is-addition,
-.code-diff-view > :last-of-type .code-diff-line.is-replacement {
-  background: color-mix(in srgb, var(--zeus-code-addition-text) 14%, transparent);
+/* 同一行的评论与源码定位各有点击范围；只在可评论时留出图标位置。 */
+.session-codex-parity-v1 .code-diff-line-number:has(> .session-code-comment-add) {
+  min-width: 3ch;
+  padding-inline-start: 22px;
 }
-.code-diff-line.is-deletion,
-.code-diff-view > :first-of-type .code-diff-line.is-replacement {
-  background: color-mix(in srgb, #d14b4b 14%, transparent);
+.session-codex-parity-v1 .code-diff-line-number > .session-code-comment-add {
+  inline-size: 20px;
+  min-inline-size: 20px;
 }
-.code-diff-line.is-header,
-.code-diff-line.is-metadata,
-.code-diff-line.is-empty {
-  background: var(--zeus-product-panel-muted);
-  color: var(--zeus-product-muted);
-}
-.code-diff-annotation {
-  overflow: hidden;
-  white-space: normal;
-}
-.code-diff-annotation > div {
-  display: flow-root;
-}
-/* 差异表本身填满父级剩余空间，不让全部文档高度撑开会话布局。 */
-.code-diff-host {
-  min-height: 0;
-  height: 100%;
-  overflow: hidden !important;
-}
-.session-codex-parity-v1 .code-diff-line-number:hover:not(:disabled):not([aria-disabled='true']) .session-code-comment-add {
-  background: var(--zeus-product-accent);
-  color: #fff;
-}
-
-/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
-
-.code-diff-view.is-single-side {
-  grid-template-columns: minmax(0, 1fr);
-}
-.code-diff-view > .git-pane-separator {
-  background: transparent;
-}
-.code-diff-view .cm-selectionLayer {
-  z-index: 1 !important;
-  /* 选区只负责绘制，拖选、滚动与行内操作仍由原有节点接收。 */
-  pointer-events: none;
+/* 色板独立于状态文字颜色：新增浅绿、删除中性灰、修改浅蓝，深色主题保持同一语义。 */
+.code-diff-view {
+  --diff-addition: light-dark(#c7e9c4, #294333);
+  --diff-deletion: light-dark(#dedede, #383a3d);
+  --diff-replacement: light-dark(#e6effb, #273b54);
+  --diff-word-addition: light-dark(#b4dcae, #3b6145);
+  --diff-word-deletion: light-dark(#c9c9c9, #575a60);
+  --diff-fold-line: light-dark(#c5c8cc, #62666c);
 }
 .code-diff-view :is(.code-diff-line, .code-diff-tone, .code-diff-alignment).is-addition {
   background: var(--diff-addition);
@@ -97,12 +93,14 @@
 .code-diff-view :is(.code-diff-line, .code-diff-tone, .code-diff-alignment).is-replacement {
   background: var(--diff-replacement);
 }
+/* 字词高亮只用于配对修改，整块新增或删除不再叠加文字背景。 */
 .code-diff-view .code-diff-word.is-addition {
   background: var(--diff-word-addition);
 }
 .code-diff-view .code-diff-word.is-deletion {
   background: var(--diff-word-deletion);
 }
+/* 恢复轨道位于右侧编辑器最左边，与原始行号一同滚动和软换行对齐。 */
 .code-diff-revert-slot {
   display: flex;
   width: 24px;
@@ -135,6 +133,7 @@
   outline: 2px solid var(--zeus-control-accent);
   outline-offset: -2px;
 }
+/* 细线双箭头表示把左侧区块恢复到右侧，图形始终在首行内居中。 */
 .code-diff-revert-icon {
   display: block;
   flex: none;
@@ -170,6 +169,32 @@
   background: var(--zeus-product-panel-muted);
   cursor: pointer;
 }
+.code-diff-line.is-header,
+.code-diff-line.is-metadata,
+.code-diff-line.is-empty {
+  background: var(--zeus-product-panel-muted);
+  color: var(--zeus-product-muted);
+}
+/* 区块范围是辅助信息，正文继续保持固定行高与完整补丁文本。 */
+.code-diff-line.is-header {
+  font-size: 11px;
+  font-weight: 500;
+}
+.code-diff-annotation {
+  overflow: hidden;
+  white-space: normal;
+}
+.code-diff-annotation > div {
+  display: flow-root;
+}
+/* 差异表本身填满父级剩余空间，不让全部文档高度撑开会话布局。 */
+.code-diff-host {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden !important;
+}
+
+/* 片段操作保留在同一滚动视图上方，不再为每个片段建立编辑器。 */
 .project-git-diff-side-by-side > .project-git-diff-hunk-commands {
   display: flex;
   align-items: center;
@@ -186,6 +211,8 @@
   color: inherit;
   background: var(--zeus-product-panel);
 }
+
+/* 共享控件进入现有标题行，快照入口保留自身的一行操作。 */
 .code-diff-container {
   display: flex;
   flex-direction: column;
@@ -283,6 +310,7 @@
   content: '✓';
   float: right;
 }
+/* 折叠边界只占 8 像素，完整行数留在悬停提示和辅助阅读名称中。 */
 .code-diff-view .code-diff-fold,
 .code-diff-editable .cm-editor .cm-collapsedLines {
   display: block;
@@ -309,6 +337,7 @@
 .code-diff-editable .cm-editor .cm-collapsedLines:hover {
   color: var(--zeus-product-muted);
 }
+/* 两种编辑器共用连续波浪，不再绘制居中文字及两端装饰字符。 */
 .code-diff-view .code-diff-fold::before,
 .code-diff-editable .cm-editor .cm-collapsedLines::before {
   content: '';
@@ -327,6 +356,7 @@
   outline: 2px solid var(--zeus-control-accent);
   outline-offset: 0;
 }
+/* 连接层只绘制两栏间隙，鼠标拖选、恢复和分隔条继续接收原有事件。 */
 .code-diff-connectors {
   position: absolute;
   inset: 0;

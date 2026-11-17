@@ -82,13 +82,15 @@ import {
   ZeusApiError,
   type ZeusRealtimeEvent,
 } from '../../apiClient.js';
+import { Form } from '../../ui/Form.js';
+import { ResourceLoading } from '../../ui/ResourceLoading.js';
 
 /** 全局数字员工与数字团队均从首页独立进入。 */
 /** 全局数字员工与数字团队均从首页独立进入。 */
 export type MainNavTarget = 'projects' | 'conversations' | 'automations' | 'skills' | 'digital-employees' | 'digital-teams' | 'settings';
 export type LegacyMainNavTarget = MainNavTarget | 'dashboard' | 'tasks' | 'runtime' | 'git-diff' | 'telegram' | 'settings-data';
 export type ProjectWorkspaceSection = 'tasks' | 'git' | 'code' | 'sessions';
-export type ProjectCodeWorkspaceMode = 'source' | 'commands';
+export type ProjectCodeWorkspaceMode = 'source' | 'git' | 'commands';
 export type ProjectWorkspaceEntryId = 'tasks' | 'git' | 'source' | 'commands';
 export type ProjectWorkspaceEntry = Readonly<{
   id: ProjectWorkspaceEntryId;
@@ -221,6 +223,9 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
   Pick<
     DashboardClient,
     | 'loadHomeAttention'
+    | 'loadAutomaticInputSuggestion'
+    | 'ensureAutomaticInputSuggestion'
+    | 'dismissAutomaticInputSuggestion'
     | 'loadHomeRuntime'
     | 'loadConversationGitHistory'
     | 'loadProjectGitComparisonDiff'
@@ -247,6 +252,13 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
     | 'loadDigitalEmployeeCapabilities'
     | 'refreshTaskPushRepositoryRemote'
     | 'loadCodexAccount'
+    | 'loadCopilotAccount'
+    | 'refreshCopilotAccount'
+    | 'startCopilotLogin'
+    | 'loadCopilotLoginStep'
+    | 'advanceCopilotLogin'
+    | 'cancelCopilotLogin'
+    | 'logoutCopilotAccount'
     | 'diagnoseCodexConnection'
     | 'loadCodexUsageSummary'
     | 'loadUsageOverview'
@@ -614,6 +626,7 @@ export function applyRuntimeEndedEventToConversation(conversation: ConversationH
 }
 
 export const nativeConversationListLifecycleEventTypes = new Set([
+  'conversation.title.changed',
   'conversation.transport.changed',
   'conversation.thread.changed',
   'conversation.turn.started',
@@ -812,10 +825,10 @@ export function executionHostSupportsConversationSource(transition: ExecutionHos
 
 export function SessionMobileSourceTrigger(props: { language: AppLanguage; open: boolean; onOpen: () => void; triggerRef?: RefObject<HTMLButtonElement | null> }) {
   return (
-    <button ref={props.triggerRef} type="button" className="session-mobile-source-trigger" aria-expanded={props.open} aria-controls="session-project-conversation-list" onClick={props.onOpen}>
+    <Button unstyled ref={props.triggerRef} type="button" className="session-mobile-source-trigger" aria-expanded={props.open} aria-controls="session-project-conversation-list" onClick={props.onOpen}>
       <span aria-hidden="true">☰</span>
       {props.language === 'zh-CN' ? '会话列表' : 'Conversations'}
-    </button>
+    </Button>
   );
 }
 
@@ -1568,6 +1581,8 @@ export function TaskCreateModal(props: {
   form: TaskCreateFormState;
   error?: string;
   busy: boolean;
+  /** 源任务正文尚未校准时保留关闭入口，禁止编辑与提交不完整副本。 */
+  sourceLoading?: boolean;
   titleInputRef: RefObject<HTMLInputElement | null>;
   parentTasks: TaskRecord[];
   onFormChange: (field: TaskCreateTextField, value: string) => void;
@@ -1577,7 +1592,7 @@ export function TaskCreateModal(props: {
   onAuthorizeFiles: (files: File[], source: 'paste' | 'drop') => Promise<TaskResourceAuthorizationResult>;
   onMaterializeResources: (resources: TaskResourcePayload[]) => Promise<TaskCreateAttachmentCandidate[]>;
   onReadClipboardResources: () => Promise<{ resources: TaskCreateAttachmentCandidate[]; text: string }>;
-  onParseThirdPartyLink: (url: string) => Promise<ThirdPartyTaskExtract>;
+  onParseThirdPartyLink: (url: string, onMetadata?: (result: ThirdPartyTaskExtract) => void) => Promise<ThirdPartyTaskExtract>;
   onApplyThirdPartyTaskInfo: (info: ThirdPartyTaskExtract) => void;
   onOpenThirdPartyLink: (url: string) => Promise<boolean>;
   onAddAttachments: (attachments: TaskCreateAttachment[]) => void;
@@ -1609,6 +1624,8 @@ export function TaskCreateModal(props: {
   const [thirdPartyLinkInput, setThirdPartyLinkInput] = useState('');
   /** 读取期间锁定草稿，避免提交或编辑与异步回填竞争。 */
   const [thirdPartyParsing, setThirdPartyParsing] = useState(false);
+  /** 文本已回填后继续允许编辑，提交仍等待附件接纳完成。 */
+  const [thirdPartyMetadataReady, setThirdPartyMetadataReady] = useState(false);
   /** 读取结果和可恢复的登录入口。 */
   const [thirdPartyHint, setThirdPartyHint] = useState<{ tone: 'ok' | 'error'; text: string; openUrl?: string } | null>(null);
   /** 仅当前弹窗的请求可回填；关闭、重开和卸载都会使旧请求失效。 */
@@ -1621,6 +1638,7 @@ export function TaskCreateModal(props: {
       setThirdPartyOpen(false);
       setThirdPartyLinkInput('');
       setThirdPartyParsing(false);
+      setThirdPartyMetadataReady(false);
       setThirdPartyHint(null);
     }
     return () => {
@@ -1636,15 +1654,15 @@ export function TaskCreateModal(props: {
   }, [settingsOpen]);
   /** 从导入步骤返回后，键盘可直接核对或继续填写任务标题。 */
   useEffect(() => {
-    if (interactionOpen && !thirdPartyOpen) props.titleInputRef.current?.focus();
-  }, [interactionOpen, thirdPartyOpen, props.titleInputRef]);
+    if (interactionOpen && !thirdPartyOpen && !props.sourceLoading) props.titleInputRef.current?.focus();
+  }, [interactionOpen, thirdPartyOpen, props.sourceLoading, props.titleInputRef]);
   if (!props.open) return null;
   /** 当前资源错误优先显示，保留上层字段校验结果。 */
   const visibleError = resourceError ?? props.error;
   const describedBy = thirdPartyOpen ? 'task-create-third-party-help' : visibleError ? 'task-create-error' : undefined;
   const resourcesBusy = previews.processing;
   /** 附件处理只阻止提交和切换任务结构，不禁用正在输入的文字框。 */
-  const textInputDisabled = props.busy || thirdPartyParsing;
+  const textInputDisabled = props.busy || props.sourceLoading || (thirdPartyParsing && !thirdPartyMetadataReady);
   const interactionBusy = textInputDisabled || resourcesBusy;
 
   /** 标题接收的附件放入当前正文；可恢复长文本回到正文末尾。 */
@@ -1720,13 +1738,22 @@ export function TaskCreateModal(props: {
     thirdPartyRequestRef.current = request;
     setThirdPartyOpen(true);
     setThirdPartyParsing(true);
+    setThirdPartyMetadataReady(false);
     setThirdPartyHint(null);
     try {
       /** 来源详情通过主进程校验后才允许进入草稿。 */
-      const result = await props.onParseThirdPartyLink(url);
+      let metadataApplied = false;
+      const result = await props.onParseThirdPartyLink(url, (metadata) => {
+        if (thirdPartyRequestRef.current !== request || metadata.kind !== 'ok') return;
+        metadataApplied = true;
+        props.onApplyThirdPartyTaskInfo(metadata);
+        setThirdPartyMetadataReady(true);
+        setThirdPartyOpen(false);
+      });
       if (thirdPartyRequestRef.current !== request) return;
       if (result.kind === 'ok') {
-        props.onApplyThirdPartyTaskInfo(result);
+        if (metadataApplied) props.onAddAttachments(result.attachments);
+        else props.onApplyThirdPartyTaskInfo(result);
         setThirdPartyHint({ tone: 'ok', text: props.copy.taskCreateThirdPartyApplied(result.title || result.objectId, result.provider, result.attachments.length, result.attachmentFailedCount) });
         setThirdPartyOpen(false);
       } else if (result.kind === 'login_required') {
@@ -1756,6 +1783,13 @@ export function TaskCreateModal(props: {
     setThirdPartyParsing(false);
     setThirdPartyHint(null);
     setThirdPartyOpen(false);
+  }
+
+  /** 关闭意图立即撤销导入回填资格，不等待退出动画或卸载。 */
+  function closeTaskCreateModal(): void {
+    thirdPartyRequestRef.current = null;
+    pasteShortcutFallbackTokenRef.current += 1;
+    props.onClose();
   }
 
   /** 打开失败要留在当前草稿明确提示，不能让登录按钮静默失效。 */
@@ -1886,14 +1920,15 @@ export function TaskCreateModal(props: {
     <ModalPortal
       rootClassName="task-create-modal-portal-root"
       backdropClassName="task-create-modal-backdrop"
-      dismissDisabled={interactionBusy}
-      onDismiss={props.onClose}
+      dismissDisabled={props.busy || resourcesBusy}
+      onDismiss={closeTaskCreateModal}
       role="dialog"
       aria-labelledby="task-create-modal-title"
       aria-describedby={describedBy}
     >
-      <form
+      <Form
         className="task-create-modal zeus-solid-form-surface"
+        aria-busy={props.sourceLoading || props.busy || undefined}
         onPaste={handleTaskCreateClipboardPaste}
         onDragOver={(event) => {
           if (event.dataTransfer.types.includes('Files')) event.preventDefault();
@@ -1902,16 +1937,15 @@ export function TaskCreateModal(props: {
         onSubmit={(event) => {
           if (thirdPartyOpen) {
             event.preventDefault();
-            void handleThirdPartyLinkParse(thirdPartyLinkInput);
-            return;
+            return handleThirdPartyLinkParse(thirdPartyLinkInput);
           }
-          if (interactionBusy) {
+          if (interactionBusy || thirdPartyParsing) {
             event.preventDefault();
             return;
           }
           /** 回车只创建，只有明确点击推送按钮才携带推送意图。 */
           const submitter = (event.nativeEvent as SubmitEvent).submitter;
-          props.onSubmit(event, submitter instanceof HTMLButtonElement && submitter.value === 'create-and-push');
+          return props.onSubmit(event, submitter instanceof HTMLButtonElement && submitter.value === 'create-and-push');
         }}
         onKeyDown={handleTaskCreateModalKeyDown}
         data-modal-surface="dialog"
@@ -1929,17 +1963,19 @@ export function TaskCreateModal(props: {
                   setThirdPartyHint(null);
                   setThirdPartyOpen(true);
                 }}
+                busy={thirdPartyParsing}
                 disabled={interactionBusy}
               >
                 {props.copy.taskCreateThirdPartyLinkLabel}
               </Button>
             ) : null}
-            <button type="button" className="task-create-modal-close" aria-label={props.copy.taskCreateClose} onClick={props.onClose} disabled={interactionBusy}>
+            <Button unstyled type="button" className="task-create-modal-close" aria-label={props.copy.taskCreateClose} onClick={closeTaskCreateModal} disabled={props.busy || resourcesBusy}>
               ×
-            </button>
+            </Button>
           </div>
         </header>
         <div className="task-create-modal-body">
+          {props.sourceLoading ? <ResourceLoading label={props.copy.taskCountPrefix === 'Tasks' ? 'Loading task…' : '正在读取任务…'} /> : null}
           {thirdPartyOpen ? (
             <div id="task-create-third-party-panel" className="task-create-field task-create-third-party-field">
               <span id="task-create-third-party-label">{props.copy.taskCreateThirdPartyUrlLabel}</span>
@@ -1966,7 +2002,7 @@ export function TaskCreateModal(props: {
                   event.preventDefault();
                   event.stopPropagation();
                   setThirdPartyLinkInput(pastedLink);
-                  void handleThirdPartyLinkParse(pastedLink);
+                  return handleThirdPartyLinkParse(pastedLink);
                 }}
                 disabled={interactionBusy}
               />
@@ -1976,9 +2012,9 @@ export function TaskCreateModal(props: {
                   ? [
                       thirdPartyHint.text,
                       thirdPartyHint.openUrl ? (
-                        <button key="open" type="button" className="task-create-third-party-open-button" onClick={() => void handleThirdPartyLogin(thirdPartyHint.openUrl as string)} disabled={interactionBusy}>
+                        <Button unstyled key="open" type="button" className="task-create-third-party-open-button" onClick={() => handleThirdPartyLogin(thirdPartyHint.openUrl as string)} disabled={interactionBusy}>
                           {props.copy.taskCreateThirdPartyOpenLink}
-                        </button>
+                        </Button>
                       ) : null,
                     ]
                   : thirdPartyParsing
@@ -2276,13 +2312,20 @@ export function TaskCreateModal(props: {
             </>
           ) : (
             <>
-              <Button variant="secondary" size="regular" className="task-create-cancel-button" onClick={props.onClose} disabled={interactionBusy}>
+              <Button variant="secondary" size="regular" className="task-create-cancel-button" onClick={closeTaskCreateModal} disabled={props.busy || resourcesBusy}>
                 {props.copy.taskCreateCancel}
               </Button>
               <Button variant="secondary" size="regular" className="task-create-settings-toggle" aria-expanded={settingsOpen} aria-controls="task-create-options" onClick={() => setSettingsOpen((open) => !open)} disabled={interactionBusy}>
                 {props.copy.taskCreateMoreSettings}
               </Button>
-              <Button type="submit" variant="secondary" size="regular" className="task-create-submit-button" busy={props.busy} disabled={interactionBusy || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}>
+              <Button
+                type="submit"
+                variant="secondary"
+                size="regular"
+                className="task-create-submit-button"
+                busy={props.busy}
+                disabled={interactionBusy || thirdPartyParsing || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}
+              >
                 {props.busy ? props.copy.taskCreateSubmitting : props.copy.taskCreateSubmit}
               </Button>
               <Button
@@ -2292,14 +2335,14 @@ export function TaskCreateModal(props: {
                 variant="primary"
                 size="regular"
                 className="task-create-push-button"
-                disabled={interactionBusy || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}
+                disabled={interactionBusy || thirdPartyParsing || Boolean(props.form.zentao && !isZentaoDestinationComplete(props.form.zentao))}
               >
                 {props.copy.taskCreateSubmitAndPush}
               </Button>
             </>
           )}
         </footer>
-      </form>
+      </Form>
     </ModalPortal>
   );
 
@@ -2343,10 +2386,31 @@ export function TaskTableLayoutDecisionDialog(props: { open: boolean; title: str
   return surface;
 }
 
-export function TaskTerminalCleanupDialog(props: { confirmation: { statusLabel: string } | null; language: AppLanguage; onCancel: () => void; onConfirm: () => void }) {
+/** 单任务、整批任务和会话归档共用清理风险说明，并明确本次操作范围。 */
+export function TaskTerminalCleanupDialog(props: {
+  confirmation: { statusLabel: string; /** 本批需要变更的任务数，单任务和会话归档不提供。 */ taskCount?: number; archiveConversation?: boolean } | null;
+  language: AppLanguage;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
   if (!props.confirmation) return null;
   const zh = props.language === 'zh-CN';
-  const title = zh ? `清理工作现场并标记为“${props.confirmation.statusLabel}”？` : `Clean up the workspace and mark it “${props.confirmation.statusLabel}”?`;
+  /** 单会话归档不改变整个任务的状态或其他会话。 */
+  const archiving = props.confirmation.archiveConversation === true;
+  /** 批量确认先于任何任务修改，数量仅包含实际需要变更的任务。 */
+  const taskCount = props.confirmation.taskCount;
+  /** 标题区分会话归档、批量状态变更和单任务状态变更。 */
+  const title = archiving
+    ? zh
+      ? '清理工作树并归档会话？'
+      : 'Clean up worktrees and archive this conversation?'
+    : taskCount !== undefined
+      ? zh
+        ? `将 ${taskCount} 个任务标记为“${props.confirmation.statusLabel}”？`
+        : `Mark ${taskCount} tasks “${props.confirmation.statusLabel}”?`
+      : zh
+        ? `清理工作现场并标记为“${props.confirmation.statusLabel}”？`
+        : `Clean up the workspace and mark it “${props.confirmation.statusLabel}”?`;
   return (
     <ModalPortal
       rootClassName="task-terminal-cleanup-dialog-portal"
@@ -2363,22 +2427,42 @@ export function TaskTerminalCleanupDialog(props: { confirmation: { statusLabel: 
           </span>
           <span>
             <strong id="task-terminal-cleanup-dialog-title">{title}</strong>
-            <p id="task-terminal-cleanup-dialog-description">{zh ? '这个任务还有未提交内容或活动会话。继续后，Zeus 会：' : 'This task still has local changes or active sessions. If you continue, Zeus will:'}</p>
+            <p id="task-terminal-cleanup-dialog-description">
+              {archiving
+                ? zh
+                  ? '会话工作树包含未提交内容、合入现场或活动进程。继续后，Zeus 会：'
+                  : 'The conversation worktrees contain local changes, integration work or active processes. If you continue, Zeus will:'
+                : taskCount !== undefined
+                  ? zh
+                    ? `继续后，Zeus 会对这 ${taskCount} 个任务执行以下操作：`
+                    : `If you continue, Zeus will do the following for these ${taskCount} tasks:`
+                  : zh
+                    ? '这个任务还有未提交内容或活动会话。继续后，Zeus 会：'
+                    : 'This task still has local changes or active sessions. If you continue, Zeus will:'}
+            </p>
           </span>
         </header>
         <ul id="task-terminal-cleanup-dialog-effects">
-          <li>{zh ? '停止并归档关联会话；消息记录仍可查看。' : 'Stop and archive related sessions; their message history remains available.'}</li>
-          <li>{zh ? '永久删除任务工作目录中的未提交和未跟踪文件。' : 'Permanently delete uncommitted and untracked files from the task workspace.'}</li>
+          <li>
+            {archiving
+              ? zh
+                ? '停止工作树内的进程并归档当前会话；消息记录仍可查看。'
+                : 'Stop processes in these worktrees and archive this conversation; its message history remains available.'
+              : zh
+                ? '停止并归档关联会话；消息记录仍可查看。'
+                : 'Stop and archive related sessions; their message history remains available.'}
+          </li>
+          <li>{zh ? '永久删除待清理工作树中的未提交和未跟踪文件。' : 'Permanently delete uncommitted and untracked files from the worktrees being cleaned up.'}</li>
         </ul>
         <p className="task-terminal-cleanup-dialog-preserved" id="task-terminal-cleanup-dialog-preserved">
-          {zh ? '已提交的代码、任务分支和代码交付记录不会删除。' : 'Committed code, task branches, and delivery records will not be deleted.'}
+          {zh ? '已提交的代码、Git 分支和代码交付记录不会删除。' : 'Committed code, Git branches, and delivery records will not be deleted.'}
         </p>
         <footer>
           <Button variant="secondary" onClick={props.onCancel}>
-            {zh ? '先保留现场' : 'Keep workspace'}
+            {taskCount !== undefined ? (zh ? '取消整批操作' : 'Cancel batch') : zh ? '先保留现场' : 'Keep workspace'}
           </Button>
           <Button variant="danger" onClick={props.onConfirm}>
-            {zh ? `清理并标记为“${props.confirmation.statusLabel}”` : `Clean up and mark “${props.confirmation.statusLabel}”`}
+            {archiving ? (zh ? '清理并归档' : 'Clean up and archive') : zh ? `清理并标记为“${props.confirmation.statusLabel}”` : `Clean up and mark “${props.confirmation.statusLabel}”`}
           </Button>
         </footer>
       </section>
@@ -2508,7 +2592,8 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
               setDraggedValue(null);
             }}
           >
-            <button
+            <Button
+              unstyled
               type="button"
               className="task-enum-order-drag-handle"
               draggable
@@ -2522,11 +2607,12 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
               onDragEnd={() => setDraggedValue(null)}
             >
               <span aria-hidden="true">⋮⋮</span>
-            </button>
+            </Button>
             <span className="task-enum-order-rank">{index + 1}</span>
             <span className="task-enum-order-label">{item.label}</span>
             <span className="task-enum-order-actions">
-              <button
+              <Button
+                unstyled
                 data-icon-tooltip={props.language === 'zh-CN' ? `上移 ${item.label}` : `Move ${item.label} up`}
                 type="button"
                 aria-label={props.language === 'zh-CN' ? `上移 ${item.label}` : `Move ${item.label} up`}
@@ -2534,8 +2620,9 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
                 onClick={() => moveItem(item.value, index - 1)}
               >
                 ↑
-              </button>
-              <button
+              </Button>
+              <Button
+                unstyled
                 data-icon-tooltip={props.language === 'zh-CN' ? `下移 ${item.label}` : `Move ${item.label} down`}
                 type="button"
                 aria-label={props.language === 'zh-CN' ? `下移 ${item.label}` : `Move ${item.label} down`}
@@ -2543,7 +2630,7 @@ export function TaskEnumOrderEditor<T extends string>(props: { title: string; de
                 onClick={() => moveItem(item.value, index + 1)}
               >
                 ↓
-              </button>
+              </Button>
             </span>
           </li>
         ))}
@@ -2656,9 +2743,9 @@ export function ProjectArchiveWorkbench(props: {
           <strong>{props.copy.title}</strong>
           <small>{props.copy.count(props.projects.length)}</small>
         </span>
-        <button type="button" onClick={() => void props.onRefresh()} disabled={props.refreshDisabled}>
+        <Button unstyled type="button" onClick={() => props.onRefresh()} disabled={props.refreshDisabled}>
           {props.copy.refresh}
-        </button>
+        </Button>
       </div>
       {props.projects.length === 0 ? (
         <div className="project-archive-empty-row" aria-label={props.copy.emptyAria}>
@@ -2676,9 +2763,9 @@ export function ProjectArchiveWorkbench(props: {
                 <small>{project.localPath}</small>
               </span>
               <span className="project-archive-command-rail">
-                <button type="button" onClick={() => void props.onRestore(project.id)}>
+                <Button unstyled type="button" onClick={() => props.onRestore(project.id)}>
                   {props.copy.restore}
-                </button>
+                </Button>
               </span>
             </article>
           ))}

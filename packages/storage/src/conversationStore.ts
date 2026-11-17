@@ -5,6 +5,7 @@ import type { SQLInputValue } from 'node:sqlite';
 import { randomId } from './randomId.js';
 import { type CodexUsageEstimate, type ConversationResourceKind, type ConversationResourcePresentation, type TokenUsageBreakdown } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
+import { captureCompletedInputSuggestion } from './inputSuggestionStore.js';
 import type { ConversationAgentKind } from './conversationItemTypes.js';
 import { ConversationTranscriptRepository, hashConversationTranscriptContent } from './conversationTranscriptStore.js';
 import { pruneArchivedConversationSyncEvents } from './conversationSyncEventStore.js';
@@ -38,6 +39,8 @@ export interface ZeusConversationRecord {
   environmentId: string | null;
   sessionId: string | null;
   title: string;
+  /** 标题初始、待自动命名、自动完成或用户命名的持久状态。 */
+  titleSource: ConversationTitleSource;
   summary: string | null;
   status: string;
   stage: ConversationStage;
@@ -79,6 +82,8 @@ export interface ZeusConversationRecord {
 }
 
 export type ConversationTransportKind = 'legacy_cli' | 'codex_native';
+/** 初始标题只有普通新会话接纳后才进入待命名状态。 */
+export type ConversationTitleSource = 'initial' | 'pending' | 'automatic' | 'manual';
 export type ConversationStage = 'created' | 'connecting' | 'queued' | 'running' | 'waiting_user' | 'waiting_approval' | 'completed' | 'failed' | 'paused' | 'ready' | 'archived';
 export type ConversationAgentTransport = 'app_server' | 'rpc' | 'sdk';
 export type ConversationProviderState = 'unbound' | 'binding' | 'ready' | 'active' | 'waiting' | 'paused' | 'archived' | 'closed' | 'failed';
@@ -261,6 +266,11 @@ export interface BindConversationProviderInput {
 export interface BindPiConversationProviderInput extends BindConversationProviderInput {
   modelSourceId: string | null;
   modelId: string;
+}
+
+/** SDK 会话绑定必须记录真实 Provider 身份和传输类型。 */
+export interface BindManagedConversationProviderInput extends BindPiConversationProviderInput {
+  agentKind: 'pi' | 'copilot';
 }
 
 export interface ProviderSequenceSnapshot {
@@ -591,7 +601,7 @@ export class ProviderEventReceiptRepository {
 
 /** 设置仓储保存本机偏好与通知策略，不存储 token、密码等敏感明文。 */
 
-const selectConversationFields = `id, project_id, task_id, session_id, title, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
+const selectConversationFields = `id, project_id, task_id, session_id, title, title_source, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
   transport_kind, provider_id, provider_thread_id, provider_thread_path, provider_model, provider_state,
   provider_protocol_version, provider_binary_version, legacy_source_conversation_id, provider_settings_json, provider_token_usage_json, permission_mode, collaboration_mode, next_turn_settings_json, completion_unread, attention_kind, attention_revision, attention_turn_id, attention_updated_at, workspace_id, environment_id,
   agent_kind, agent_transport, model_source_id, model_id, native_session_id, native_session_path, capability_snapshot_id,
@@ -733,7 +743,7 @@ export class AgentCapabilitySnapshotRepository {
   create(input: CreateAgentCapabilitySnapshotInput): ZeusAgentCapabilitySnapshotRecord {
     const record: ZeusAgentCapabilitySnapshotRecord = {
       id: input.id ?? `agent_capability_${randomId(12)}`,
-      agentKind: assertEnum(input.agentKind, ['codex', 'pi', 'claude'] as const, 'agent capability kind'),
+      agentKind: assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'agent capability kind'),
       transportKind: assertEnum(input.transportKind, ['app_server', 'rpc', 'sdk'] as const, 'agent capability transport'),
       supportStatus: assertEnum(input.supportStatus, ['unavailable', 'framework_only', 'experimental', 'verified'] as const, 'agent capability support status'),
       adapterVersion: input.adapterVersion ?? null,
@@ -758,7 +768,7 @@ export class AgentCapabilitySnapshotRepository {
   }
 
   listByAgent(agentKind: ConversationAgentKind, limit = 20): ZeusAgentCapabilitySnapshotRecord[] {
-    const normalizedAgentKind = assertEnum(agentKind, ['codex', 'pi', 'claude'] as const, 'agent capability kind');
+    const normalizedAgentKind = assertEnum(agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'agent capability kind');
     const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 200));
     return this.db.select<DbAgentCapabilitySnapshotRow>(`SELECT * FROM agent_capability_snapshots WHERE agent_kind = ? ORDER BY checked_at DESC, id DESC LIMIT ?`, [normalizedAgentKind, safeLimit]).map(mapAgentCapabilitySnapshotRow);
   }
@@ -809,7 +819,7 @@ export class ConversationRepository {
     const providerState = assertEnum(input.providerState ?? 'unbound', ['unbound', 'binding', 'ready', 'active', 'waiting', 'paused', 'archived', 'closed', 'failed'] as const, 'conversation provider state');
     const permissionMode = assertEnum(input.permissionMode ?? 'read-only', ['read-only', 'auto', 'auto-review', 'full-access'] as const, 'conversation permission mode');
     const collaborationMode = assertEnum(input.collaborationMode ?? 'default', ['default', 'plan'] as const, 'conversation collaboration mode');
-    const agentKind = input.agentKind ? assertEnum(input.agentKind, ['codex', 'pi', 'claude'] as const, 'conversation agent kind') : transportKind === 'codex_native' ? 'codex' : null;
+    const agentKind = input.agentKind ? assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'conversation agent kind') : transportKind === 'codex_native' ? 'codex' : null;
     const agentTransport = input.agentTransport ? assertEnum(input.agentTransport, ['app_server', 'rpc', 'sdk'] as const, 'conversation agent transport') : transportKind === 'codex_native' ? 'app_server' : null;
     const timestamp = nowIso();
     const record: ZeusConversationRecord = {
@@ -820,6 +830,7 @@ export class ConversationRepository {
       environmentId: input.environmentId ?? null,
       sessionId: input.sessionId ?? null,
       title: input.title,
+      titleSource: 'initial',
       summary: input.summary ?? null,
       status: input.status ?? 'open',
       stage: 'created',
@@ -859,12 +870,12 @@ export class ConversationRepository {
       automationRunId: input.automationRunId ?? null,
     };
     this.db.execute(
-      `INSERT INTO conversations (id, project_id, task_id, workspace_id, environment_id, session_id, title, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
+      `INSERT INTO conversations (id, project_id, task_id, workspace_id, environment_id, session_id, title, title_source, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
         transport_kind, provider_id, provider_thread_id, provider_thread_path, provider_model, provider_state,
         provider_protocol_version, provider_binary_version, legacy_source_conversation_id, provider_settings_json, provider_token_usage_json, permission_mode, collaboration_mode, next_turn_settings_json, completion_unread,
         agent_kind, agent_transport, model_source_id, model_id, native_session_id, native_session_path, capability_snapshot_id,
         origin_kind, listing_scope, automation_run_id, context_capacity_tokens)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.id,
         record.projectId,
@@ -873,6 +884,7 @@ export class ConversationRepository {
         record.environmentId,
         record.sessionId,
         record.title,
+        record.titleSource,
         record.summary,
         record.status,
         record.stage,
@@ -1148,14 +1160,14 @@ export class ConversationRepository {
     return updated;
   }
 
-  /** Pi Worker 准备完成后绑定原生会话，同时保留此前已经展示给用户的 Zeus 会话身份。 */
-  bindPiProvider(conversationId: string, input: BindPiConversationProviderInput): ZeusConversationWithMessagesRecord {
+  /** 原生 SDK 会话绑定到既有 Zeus 会话，保留用户已见的会话身份。 */
+  bindManagedProvider(conversationId: string, input: BindManagedConversationProviderInput): ZeusConversationWithMessagesRecord {
     assertEnum(input.providerState, ['unbound', 'binding', 'ready', 'active', 'waiting', 'paused', 'archived', 'closed', 'failed'] as const, 'conversation provider state');
     const timestamp = nowIso();
     this.db.execute(
       `UPDATE conversations SET transport_kind = 'codex_native', provider_id = ?, provider_thread_id = ?, provider_thread_path = COALESCE(?, provider_thread_path),
        provider_model = ?, provider_state = ?, provider_protocol_version = COALESCE(?, provider_protocol_version), provider_binary_version = COALESCE(?, provider_binary_version),
-       agent_kind = 'pi', agent_transport = 'rpc', model_source_id = ?, model_id = ?, native_session_id = ?, native_session_path = COALESCE(?, native_session_path), updated_at = ? WHERE id = ?`,
+       agent_kind = ?, agent_transport = ?, model_source_id = ?, model_id = ?, native_session_id = ?, native_session_path = COALESCE(?, native_session_path), updated_at = ? WHERE id = ?`,
       [
         input.providerId,
         input.providerThreadId,
@@ -1164,6 +1176,8 @@ export class ConversationRepository {
         input.providerState,
         input.providerProtocolVersion ?? null,
         input.providerBinaryVersion ?? null,
+        input.agentKind,
+        input.agentKind === 'copilot' ? 'sdk' : 'rpc',
         input.modelSourceId,
         input.modelId,
         input.providerThreadId,
@@ -1176,6 +1190,11 @@ export class ConversationRepository {
     const updated = this.getById(conversationId);
     if (!updated) throw new Error(`Zeus conversation not found: ${conversationId}`);
     return updated;
+  }
+
+  /** Pi 旧调用沿用相同原子绑定，不改变既有会话身份。 */
+  bindPiProvider(conversationId: string, input: BindPiConversationProviderInput): ZeusConversationWithMessagesRecord {
+    return this.bindManagedProvider(conversationId, { ...input, agentKind: 'pi' });
   }
 
   updateProviderThreadPath(conversationId: string, input: { providerThreadId: string; providerThreadPath: string }): ZeusConversationWithMessagesRecord {
@@ -1372,6 +1391,29 @@ export class ConversationRepository {
        ORDER BY message.created_at DESC, message.id DESC LIMIT 13`,
       [projectId, 'taskId' in scope ? scope.taskId : scope.conversationId, excludedConversationId ?? ''],
     );
+  }
+
+  /** 冲突会话的来源由持久交付步骤确定，不能从标题或客户端路径推断。 */
+  getDeliveryConflictOrigin(conversationId: string): { conversationId: string; taskId: string | null; repositoryId: string; repositoryPath: string | null; integrationPath: string } | undefined {
+    return this.db.get(
+      `SELECT origin.id AS conversationId, task.id AS taskId, step.repository_id AS repositoryId, repository.local_path AS repositoryPath,
+              json_extract(step.result_json, '$.merge.integrationPath') AS integrationPath
+       FROM git_delivery_steps step JOIN git_delivery_runs run ON run.id = step.run_id
+       JOIN conversations conflict ON conflict.id = step.conversation_id AND conflict.project_id = run.project_id
+       JOIN conversations origin ON origin.id = run.scope_id AND origin.project_id = run.project_id
+       LEFT JOIN tasks task ON task.id = origin.task_id AND task.project_id = run.project_id
+       LEFT JOIN project_repositories repository ON repository.id = step.repository_id AND repository.project_id = run.project_id
+       WHERE conflict.id = ? AND run.scope_kind = 'conversation' AND step.action = 'merge'
+         AND origin.id <> conflict.id AND json_type(step.result_json, '$.merge.integrationPath') = 'text'
+       ORDER BY run.created_at DESC LIMIT 1`,
+      [conversationId],
+    );
+  }
+
+  /** 创建结果接管与宿主恢复共用任务关联，不覆盖已有任务，也不改变会话活动时间。 */
+  attachDeliveryConflictTask(conversationId: string): void {
+    const origin = this.getDeliveryConflictOrigin(conversationId);
+    if (origin?.taskId) this.db.execute('UPDATE conversations SET task_id = ? WHERE id = ? AND task_id IS NULL', [origin.taskId, conversationId]);
   }
 
   getRecordById(conversationId: string): ZeusConversationRecord | undefined {
@@ -1618,13 +1660,36 @@ export class ConversationRepository {
     return restored;
   }
 
-  updateTitle(conversationId: string, title: string): ZeusConversationWithMessagesRecord {
+  /** 按主键向后恢复自动创建任务的未完成命名，每页最多 25 条，不重复扫描页首。 */
+  listPendingAutomaticTitleIds(afterId: string): string[] {
+    return this.db
+      .select<{ id: string }>(
+        `SELECT conversation.id FROM conversations AS conversation
+       JOIN tasks AS task ON task.id = conversation.task_id AND task.project_id = conversation.project_id
+       WHERE conversation.id > ? AND conversation.title_source IN ('initial', 'pending')
+         AND conversation.archived = 0 AND conversation.origin_kind = 'ordinary' AND conversation.listing_scope = 'ordinary'
+         AND task.created_from = 'conversation' AND task.archived = 0 AND task.deleted_at IS NULL
+         AND CASE WHEN json_valid(task.source_context_json) THEN json_extract(task.source_context_json, '$.conversationId') END = conversation.id
+         AND EXISTS (SELECT 1 FROM conversation_submissions WHERE conversation_id = conversation.id)
+       ORDER BY conversation.id LIMIT 25`,
+        [afterId],
+      )
+      .map((row) => row.id);
+  }
+
+  /** 首发及启动恢复可以启用初始标题，手动或已完成命名不会被重新启用。 */
+  enableAutomaticTitle(conversationId: string): void {
+    this.db.execute(`UPDATE conversations SET title_source = 'pending' WHERE id = ? AND title_source = 'initial'`, [conversationId]);
+  }
+
+  /** 名称与来源一起保存，手动命名立即阻止后台覆盖。 */
+  updateTitle(conversationId: string, title: string, titleSource: ConversationTitleSource = 'manual'): ZeusConversationWithMessagesRecord {
     const existing = this.getById(conversationId);
     if (!existing) {
       throw new Error(`Zeus conversation not found: ${conversationId}`);
     }
     const timestamp = nowIso();
-    this.db.execute(`UPDATE conversations SET title = ?, updated_at = ? WHERE id = ${toSqlStringLiteral(conversationId)}`, [title, timestamp]);
+    this.db.execute(`UPDATE conversations SET title = ?, title_source = ?, updated_at = ? WHERE id = ?`, [title, titleSource, timestamp, conversationId]);
     const updated = this.getById(conversationId);
     if (!updated) {
       throw new Error(`Zeus conversation not found: ${conversationId}`);
@@ -1934,6 +1999,7 @@ export class ConversationTurnRepository {
     );
   }
 
+  /** 轮次完成与自动建议待办同事务保存，完成事件丢失后仍可恢复生成。 */
   upsert(
     input: Omit<ZeusConversationTurnRecord, 'id' | 'errorJson' | 'planJson' | 'agentKind' | 'nativeRunId'> & {
       id?: string;
@@ -1942,42 +2008,46 @@ export class ConversationTurnRepository {
       nativeRunId?: string | null;
     },
   ): ZeusConversationTurnRecord {
-    const status = assertEnum(input.status, ['queued', 'dispatching', 'running', 'waiting', 'paused', 'completed', 'interrupted', 'failed'] as const, 'conversation turn status');
-    const existing = input.providerTurnId ? this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE provider_thread_id = ? AND provider_turn_id = ?`, [input.providerThreadId, input.providerTurnId]) : undefined;
-    if (existing?.status === 'completed') {
-      if (!existing.client_submission_id && input.clientSubmissionId) {
-        this.db.execute(`UPDATE conversation_turns SET client_submission_id = ?, updated_at = ? WHERE id = ?`, [input.clientSubmissionId, input.updatedAt, existing.id]);
-        return mapConversationTurnRow(this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE id = ?`, [existing.id])!);
+    return this.db.transaction(() => {
+      const status = assertEnum(input.status, ['queued', 'dispatching', 'running', 'waiting', 'paused', 'completed', 'interrupted', 'failed'] as const, 'conversation turn status');
+      const existing = input.providerTurnId ? this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE provider_thread_id = ? AND provider_turn_id = ?`, [input.providerThreadId, input.providerTurnId]) : undefined;
+      if (existing?.status === 'completed') {
+        if (!existing.client_submission_id && input.clientSubmissionId) {
+          this.db.execute(`UPDATE conversation_turns SET client_submission_id = ?, updated_at = ? WHERE id = ?`, [input.clientSubmissionId, input.updatedAt, existing.id]);
+          captureCompletedInputSuggestion(this.db, existing.id, input.updatedAt);
+          return mapConversationTurnRow(this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE id = ?`, [existing.id])!);
+        }
+        return mapConversationTurnRow(existing);
       }
-      return mapConversationTurnRow(existing);
-    }
-    const id = existing?.id ?? input.id ?? `conversation_turn_${randomId(12)}`;
-    const errorJson = input.error === undefined ? null : JSON.stringify(input.error);
-    this.db.execute(
-      `INSERT INTO conversation_turns (id, conversation_id, provider_thread_id, provider_turn_id, client_submission_id, status, error_json, started_at, completed_at, created_at, updated_at, agent_kind, native_run_id)
+      const id = existing?.id ?? input.id ?? `conversation_turn_${randomId(12)}`;
+      const errorJson = input.error === undefined ? null : JSON.stringify(input.error);
+      this.db.execute(
+        `INSERT INTO conversation_turns (id, conversation_id, provider_thread_id, provider_turn_id, client_submission_id, status, error_json, started_at, completed_at, created_at, updated_at, agent_kind, native_run_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET provider_thread_id = excluded.provider_thread_id, provider_turn_id = excluded.provider_turn_id,
        client_submission_id = COALESCE(excluded.client_submission_id, conversation_turns.client_submission_id),
        status = excluded.status, error_json = excluded.error_json, started_at = COALESCE(excluded.started_at, conversation_turns.started_at),
        completed_at = excluded.completed_at, updated_at = excluded.updated_at, agent_kind = excluded.agent_kind, native_run_id = COALESCE(excluded.native_run_id, conversation_turns.native_run_id)`,
-      [
-        id,
-        input.conversationId,
-        input.providerThreadId,
-        input.providerTurnId,
-        input.clientSubmissionId,
-        status,
-        errorJson,
-        input.startedAt,
-        input.completedAt,
-        input.createdAt,
-        input.updatedAt,
-        input.agentKind ?? 'codex',
-        input.nativeRunId ?? input.providerTurnId,
-      ],
-    );
-    syncConversationStage(this.db, input.conversationId, input.updatedAt);
-    return mapConversationTurnRow(this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE id = ?`, [id])!);
+        [
+          id,
+          input.conversationId,
+          input.providerThreadId,
+          input.providerTurnId,
+          input.clientSubmissionId,
+          status,
+          errorJson,
+          input.startedAt,
+          input.completedAt,
+          input.createdAt,
+          input.updatedAt,
+          input.agentKind ?? 'codex',
+          input.nativeRunId ?? input.providerTurnId,
+        ],
+      );
+      if (status === 'completed') captureCompletedInputSuggestion(this.db, id, input.updatedAt);
+      syncConversationStage(this.db, input.conversationId, input.updatedAt);
+      return mapConversationTurnRow(this.db.get<DbConversationTurnRow>(`SELECT * FROM conversation_turns WHERE id = ?`, [id])!);
+    });
   }
 
   getById(id: string): ZeusConversationTurnRecord | undefined {
@@ -2415,6 +2485,21 @@ export class ConversationSubmissionRepository {
       [conversationId],
     );
     return row ? mapConversationSubmissionRow(row) : undefined;
+  }
+
+  /** 目录只投影经同项目、同任务核验的来源身份，不加载引用正文。 */
+  getSourceConversationId(conversationId: string): string | null {
+    return (
+      this.db.get<{ source_id: string }>(
+        `SELECT source.id AS source_id FROM conversation_submissions submission
+       JOIN conversations owner ON owner.id = submission.conversation_id
+       JOIN conversations source ON source.id = json_extract(submission.input_json, '$.conversationContext.sourceConversation.id')
+       WHERE submission.conversation_id = ? AND source.id <> owner.id
+         AND source.project_id = owner.project_id AND source.task_id IS owner.task_id
+       ORDER BY submission.created_at, submission.id LIMIT 1`,
+        [conversationId],
+      )?.source_id ?? null
+    );
   }
 
   /** 只读取最早提交的创建操作身份，避免会话列表加载提示词和附件正文。 */
@@ -3373,6 +3458,8 @@ interface DbConversationRow {
   environment_id: string | null;
   session_id: string | null;
   title: string;
+  /** 与标题同时保存的命名状态。 */
+  title_source: ConversationTitleSource;
   summary: string | null;
   status: string;
   stage: ConversationStage;
@@ -3606,6 +3693,7 @@ function mapConversationRow(row: DbConversationRow): ZeusConversationRecord {
     environmentId: row.environment_id,
     sessionId: row.session_id,
     title: row.title,
+    titleSource: row.title_source,
     summary: row.summary,
     status: row.status,
     stage: assertEnum(row.stage, ['created', 'connecting', 'queued', 'running', 'waiting_user', 'waiting_approval', 'completed', 'failed', 'paused', 'ready', 'archived'] as const, 'conversation stage'),

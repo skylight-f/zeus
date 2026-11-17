@@ -212,7 +212,9 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     setRunState: (conversationId, state) => runStates.set(conversationId, state),
   });
   const zeusToolBroker =
-    options.browserAutomation || options.workTools || options.sourceContexts ? createZeusToolBroker(options.browserAutomation, { audit: options.auditNativeTool, work: options.workTools, sources: options.sourceContexts }) : undefined;
+    options.browserAutomation || options.workTools || options.sourceContexts || options.automationAgents
+      ? createZeusToolBroker(options.browserAutomation, { audit: options.auditNativeTool, work: options.workTools, sources: options.sourceContexts, automationAgents: options.automationAgents })
+      : undefined;
   /** 来源读取启用时，旧线程恢复也使用新建线程的完整工具目录。 */
   const resumeDynamicTools = options.sourceContexts ? codexConversationDynamicTools(zeusToolBroker, options.plugins ? codexPluginDynamicTools : []) : undefined;
   const handleDynamicToolRequest = createCodexDynamicToolApplication({
@@ -238,7 +240,19 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
   let scheduledPersistDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduledPersistDirty = false;
   let persistenceChain = Promise.resolve();
-  const modelRequestTiming = createCodexModelRequestTimingTracker();
+  const modelRequestTiming = createCodexModelRequestTimingTracker((conversationId, turnId, timestamp) => {
+    if (!options.recordDispatchPerformance) return;
+    const turn = options.turns.getById(turnId);
+    if (!turn?.clientSubmissionId) return;
+    options.recordDispatchPerformance({
+      conversationId,
+      submissionId: turn.clientSubmissionId,
+      phase: 'first_text',
+      startedAt: turn.createdAt,
+      completedAt: timestamp,
+      durationMs: Date.parse(timestamp) - Date.parse(turn.createdAt),
+    });
+  });
   const providerEvents = createCodexProviderEventFlow({
     manager: options.manager,
     flowControl: options.eventFlow,
@@ -276,9 +290,13 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     if (current && options.conversations.getRecordById(current.conversationId)?.archived) {
       throw coordinatorError('ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED', '会话已归档，请先恢复会话再继续。');
     }
-
+    if (current?.status === 'paused') {
+      /** 恢复核对可能已暂停本次提交，派发检查必须保留真实原因和恢复属性。 */
+      const failure = submissionErrorSnapshot(current.errorJson);
+      if (failure) throw Object.assign(new Error(failure.message), failure);
+    }
     if (!current || current.providerTurnId || (current.status !== 'queued' && current.status !== 'dispatching')) {
-      throw coordinatorError('ZEUS_NATIVE_SUBMISSION_NOT_QUEUED', '这条消息已取消、替换或离开待发送状态，不会再次发送。');
+      throw coordinatorError('ZEUS_NATIVE_SUBMISSION_NOT_QUEUED', '消息状态已更新，请重新检查发送结果。');
     }
   }
   async function persist(): Promise<void> {
@@ -903,7 +921,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       contextCapacityTokens: existingConversation ? existingConversation.contextCapacityTokens : (input.contextCapacityTokens ?? null),
       projectId: input.projectId,
       projectLocalPath: resolve(input.projectLocalPath),
-      taskId: null,
+      taskId: input.taskId ?? null,
       ...(input.executionWorkspaceMode ? { executionWorkspaceMode: input.executionWorkspaceMode } : {}),
       model: input.model,
       modelSourceId: input.modelSourceId ?? null,
@@ -917,15 +935,16 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       ...(input.writableRoots?.length ? { writableRoots: input.writableRoots.map((root) => resolve(root)) } : {}),
       workMode: input.collaborationMode ?? existingConversation?.collaborationMode ?? 'default',
     };
-    if (existingConversation && (existingConversation.projectId !== input.projectId || existingConversation.taskId !== null || existingConversation.transportKind !== 'codex_native')) {
+    if (existingConversation && (existingConversation.projectId !== input.projectId || existingConversation.taskId !== (input.taskId ?? null) || existingConversation.transportKind !== 'codex_native')) {
       throw coordinatorError('ZEUS_NATIVE_RESERVED_RESOURCE_CONFLICT', 'Reserved project conversation id is already owned by another resource.');
     }
     const conversation =
       existingConversation ??
-      options.conversations.create({
+      (input.createRecord ?? options.conversations.create.bind(options.conversations))({
         contextCapacityTokens: context.contextCapacityTokens,
         ...(input.conversationId ? { id: input.conversationId } : {}),
         projectId: input.projectId,
+        ...(input.taskId ? { taskId: input.taskId } : {}),
         title,
         summary: [...(input.displayText ?? input.prompt)].slice(0, 240).join('') || input.attachments?.[0]?.name || '',
         status: 'starting',
@@ -1189,6 +1208,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     return dispatchSubmission(refreshed, submission, input.providerWriteLifecycle, false, input.segmentLifecycle);
   }
 
+  /** 队首沿用原提交身份，并在写出前仅核对本会话的旧线程与停止结果。 */
   async function dispatchQueuedMessage(input: { conversationId: string; submissionId: string; segmentLifecycle: ConversationSegmentLifecycle }): Promise<NativeAcceptedOperation> {
     assertOpen();
     let conversation = input.segmentLifecycle.requiresNewSegment ? requireProductConversation(input.conversationId) : requireConversation(input.conversationId);
@@ -1198,6 +1218,15 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     }
     if (!submission.executionSnapshotId) {
       throw coordinatorError('ZEUS_CONVERSATION_EXECUTION_SNAPSHOT_REQUIRED', 'Queued submission does not have a frozen execution snapshot.');
+    }
+
+    if (!input.segmentLifecycle.requiresNewSegment) {
+      if (providerStopRecovery.hasPendingEvidence(conversation.id)) {
+        const recovery = await providerStopRecovery.recoverForNewSubmission(conversation.id);
+        if (recovery === 'pending' || recovery === 'recovery_required') return accepted(options.submissions.getById(submission.id) ?? submission, recovery === 'pending' ? 'queued' : 'recovery_required', conversation.providerThreadId, null);
+      }
+      await ensureGenerationReconciled([conversation.id]);
+      conversation = requireConversation(conversation.id);
     }
 
     // 统一队列排空必须沿用首次接受时的提交和请求哈希。再次调用 submitMessage 会重建 payload，
@@ -1840,8 +1869,8 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     const stateTurnId =
       state.type === 'active' || state.type === 'waiting' ? state.turnId : options.turns.listByConversation(conversation.id).find((turn) => turn.providerTurnId === input.providerTurnId && turn.status === 'waiting')?.providerTurnId;
     if (stateTurnId !== input.providerTurnId) throw coordinatorError('ZEUS_NATIVE_TURN_MISMATCH', 'Interrupt target is not the current active provider turn.');
-    // 同时撤销桌面控制与中断 Provider；桌面桥断线不能阻止用户停止模型。
-    const computerStop = options.browserAutomation?.endComputerUse?.({ conversationId: conversation.id, turnId: input.providerTurnId }).then(
+    // 子任务或桌面桥失败不能阻止主模型收到中断；各自结果仍如实报告。
+    const controlStop = Promise.all([options.stopSubagents?.(conversation.id), options.browserAutomation?.endComputerUse?.({ conversationId: conversation.id, turnId: input.providerTurnId })]).then(
       () => null,
       (error: unknown) => ({ error }),
     );
@@ -1873,8 +1902,8 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       throw coordinatorError('ZEUS_NATIVE_INTERRUPT_OUTCOME_UNKNOWN', 'Codex did not confirm a terminal outcome for the interrupted turn.');
     }
     // 模型停止后仍如实报告桌面撤销失败，不将两者混同为全部停止。
-    const computerStopFailure = await computerStop;
-    if (computerStopFailure) throw computerStopFailure.error;
+    const controlStopFailure = await controlStop;
+    if (controlStopFailure) throw controlStopFailure.error;
     const submission = options.submissions.listByConversation(conversation.id).find((entry) => entry.providerTurnId === input.providerTurnId);
     return {
       operationId: operationId(),
@@ -2697,12 +2726,9 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     throw coordinatorError(serialized.code ?? 'ZEUS_CODEX_PERMISSION_SCHEMA_UNSUPPORTED', serialized.message);
   }
 
+  /** 本地线程归属和回执恢复完成后，并行核对各旧会话的 Provider 状态。 */
   async function recover(): Promise<void> {
     assertOpen();
-    // 先恢复冻结的线程归属，再核对旧停止目标；不得用新线程查询旧轮次。
-    options.turns.restoreAcceptedThreadBindings();
-    await persist();
-    await reconcilePersistedTerminalSubmissions();
     await providerStopRecovery.recoverPersisted();
     const automaticRecoveryConversationIds = new Set(
       options.conversations
@@ -2819,6 +2845,12 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       let conversation = options.conversations.getById(conversationId);
       if (!conversation || conversation.archived || conversation.providerState === 'archived' || conversation.providerState === 'closed') return;
       if (hasPendingPlanImplementationRequest(conversation.id)) return;
+      if (providerStopRecovery.hasPendingEvidence(conversation.id)) {
+        const recovery = await providerStopRecovery.recoverForNewSubmission(conversation.id);
+        if (recovery === 'pending' || recovery === 'recovery_required') return;
+      }
+      await ensureGenerationReconciled([conversation.id]);
+      conversation = requireConversation(conversation.id);
       let state = runStates.get(conversation.id) ?? inferRunState(conversation);
       if (state.type === 'paused' && state.reason === 'recovery_required') {
         conversation = await recoverPausedConversation(conversation.id, 'dispatch');

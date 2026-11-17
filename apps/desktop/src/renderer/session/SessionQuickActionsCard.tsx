@@ -1,10 +1,14 @@
 import { RuntimeCopyButton } from './RuntimeDetails.js';
+import { IconTooltip } from '../ui/IconTooltip.js';
 import { Collapsible } from '../ui/Collapsible.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
-import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowSquareOutIcon as ArrowSquareOut } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
+import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
+import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
+import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { DesktopIcon as Desktop } from '@phosphor-icons/react/dist/csr/Desktop';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
@@ -14,10 +18,13 @@ import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { GithubLogoIcon as GithubLogo } from '@phosphor-icons/react/dist/csr/GithubLogo';
 import { GlobeSimpleIcon as GlobeSimple } from '@phosphor-icons/react/dist/csr/GlobeSimple';
+import { MinusCircleIcon as MinusCircle } from '@phosphor-icons/react/dist/csr/MinusCircle';
+import { PencilSimpleLineIcon as PencilSimpleLine } from '@phosphor-icons/react/dist/csr/PencilSimpleLine';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { ShareNetworkIcon as ShareNetwork } from '@phosphor-icons/react/dist/csr/ShareNetwork';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { UsersThreeIcon as UsersThree } from '@phosphor-icons/react/dist/csr/UsersThree';
+import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import { conversationAttachmentIdentity } from './ConversationComposerAttachments.js';
 import { isImageResource, isPendingImageAttachment, ResourceIcon } from './ConversationResources.js';
 import { SessionCodeReviewDialog, type SessionCodeReviewSelection } from './SessionCodeReviewDialog.js';
@@ -26,8 +33,13 @@ import type { CodexConversationCapabilities, ConversationResource, ConversationR
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { VisibleApplicationError, reportApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { DashboardClient, ProjectRecord } from '../apiClient.js';
-import type { GitEnvironmentSummary, GitEnvironmentWorkspace } from '@zeus/shared';
+import type { GitEnvironmentStatus, GitEnvironmentWorkspace } from '@zeus/shared';
 import { platformShortcutLabel } from '../platform.js';
+import { conversationGitDeliveryTarget } from '../git/conversationGitDeliveryTarget.js';
+import { GitDeliveryProgress } from '../git/GitDeliveryProgress.js';
+import { GitDeliveryRunActions } from '../git/GitDeliveryRunActions.js';
+import { useGitDeliveryRuns } from '../git/useGitDeliveryRuns.js';
+import { Button } from '../ui/Button.js';
 
 interface SessionQuickActionsCardProps {
   gitContext?: { client: DashboardClient; project: ProjectRecord };
@@ -45,17 +57,23 @@ interface SessionQuickActionsCardProps {
   capabilities?: CodexConversationCapabilities | null;
   onLoadCapabilities?: (projectId: string) => Promise<CodexConversationCapabilities>;
   onLoadSkills?: (projectId?: string, forceReload?: boolean) => Promise<import('../features/codex/codexContracts.js').SkillCatalog>;
-  onOpenGitDelivery?: (taskId: string, workspaceId: string | null) => void;
+  onOpenGitDelivery?: (taskId: string, workspaceId: string | null) => void | Promise<void>;
   /** 内置浏览器的显示状态由当前会话工作面维护。 */
   browserOpen: boolean;
   /** 入口只切换显示，浏览器标签与关闭流程仍由会话管理。 */
   onToggleBrowser: (trigger: HTMLButtonElement) => void;
+  /** 当前主会话的侧栏是否正在显示。 */
+  sideQuestionOpen?: boolean;
+  /** 可提问的主会话提供同一打开、恢复和收起入口。 */
+  onToggleSideQuestion?: (trigger: HTMLButtonElement) => void;
   /** 会话终端继续使用原有会话身份和显示状态。 */
   terminalOpen: boolean;
   /** 缺少终端能力时不显示入口，不创建项目级替代终端。 */
   onToggleTerminal?: (trigger: HTMLButtonElement) => void;
   subagentCount?: number;
   onOpenSubagents?: (trigger: HTMLButtonElement) => void;
+  /** 屏幕控制停止时同步结束该会话的操作模型。 */
+  onStopOperationAgent?: () => Promise<void>;
   onStartCodeReview?: (
     selection: SessionCodeReviewSelection,
   ) => void | boolean | { state: 'preparing'; cancel: () => void } | { state: 'failed'; message: string } | Promise<void | boolean | { state: 'preparing'; cancel: () => void } | { state: 'failed'; message: string }>;
@@ -75,6 +93,8 @@ interface SourceRow {
 /** 正文列扣掉常驻卡 332px 后，仍能容纳 768px 正文和两侧留白。 */
 const PERSISTENT_CARD_MIN_COLUMN_WIDTH = 1200;
 const DEFAULT_VISIBLE_SOURCE_COUNT = 3;
+/** 只保留最近 32 个范围的显示结果，打开时仍重新读取真实 Git 状态。 */
+const environmentStatusCache = new WeakMap<DashboardClient, Map<string, GitEnvironmentStatus>>();
 
 export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const zh = props.language === 'zh-CN';
@@ -84,38 +104,68 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const [showAllSources, setShowAllSources] = useState(false);
   const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
   /** 只接收当前范围的共享摘要，后台刷新保留上次显示结果。 */
-  const [summary, setSummary] = useState<GitEnvironmentSummary | null>(null);
+  const [summary, setSummary] = useState<GitEnvironmentStatus | null>(null);
   const [workspaceState, setWorkspaceState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [workspaceError, setWorkspaceError] = useState<unknown>(null);
+  /** 打开中的窗口按发起会话归属，迟到回执不能清除另一次打开状态。 */
+  const [openingDelivery, setOpeningDelivery] = useState<{ conversationId: string } | null>(null);
+  /** 异步窗口回执只关闭发起会话自己的面板。 */
+  const currentConversationId = useRef(props.conversation.id);
+  currentConversationId.current = props.conversation.id;
   const taskId = props.task?.id ?? props.conversation.taskId;
   const gitClient = props.gitContext?.client;
   /** 普通目录读取项目仓库，独立工作树继续使用服务端绑定的会话范围。 */
   const directWorkspace = props.conversation.workspaceMode === 'direct';
   /** 关联任务不等于使用任务工作树，普通目录任务仍读取项目全部仓库。 */
-  const useTaskWorkspaces = Boolean(taskId && !directWorkspace);
+  const useTaskWorkspaces = Boolean(taskId && !directWorkspace && (props.conversation.workspaceId || props.conversation.workspaceMode !== 'worktree'));
+  /** 持久范围身份决定何时重新读取，普通目录与独立工作树保持各自边界。 */
+  const summaryKey = JSON.stringify([
+    props.conversation.projectId,
+    props.gitContext?.project.localPath,
+    useTaskWorkspaces
+      ? ['task', taskId, props.conversation.workspaceId, props.conversation.environmentId]
+      : directWorkspace
+        ? ['project']
+        : ['conversation', props.conversation.id, props.conversation.workspaceId, props.conversation.environmentId],
+  ]);
   /** 交付入口沿用原目录模式，摘要订阅不扩大写入范围。 */
   const conversationGitClient = !useTaskWorkspaces ? gitClient : null;
   /** 审查入口核对原工作区身份，不借用其他仓库。 */
-  const workspace = summary?.workspace ?? null;
+  const workspace = summary?.workspace ?? props.conversation.workspace ?? null;
   const exactReviewWorkspace = workspace && workspace.id === props.conversation.workspaceId && workspace.environmentId === props.conversation.environmentId ? workspace : null;
   /** 首次摘要到达前显示会话根目录；单次命令进入子仓库不改变工作区身份。 */
   const executionContext = props.state.snapshot?.executionContext;
   /** 执行上下文保留只读审查、冲突处理等精确范围；Git 聚合摘要只补充尚未加载的目录。 */
-  const cwd = executionContext?.cwd ?? summary?.cwd ?? null;
-  /** 普通目录有多个仓库时不把首仓分支冒充整个项目分支。 */
-  const branch = directWorkspace && (summary?.repositoryCount ?? 0) > 1 ? (zh ? '多个仓库' : 'Multiple repositories') : (summary?.branch ?? executionContext?.branch ?? null);
-  /** 摘要覆盖同一交付范围的全部活动仓库。 */
-  const changes = summary ?? { files: 0, additions: 0, deletions: 0 };
-  const conversationReady = !taskId && workspaceState === 'ready' && Boolean(summary?.repositoryCount);
+  const cwd = executionContext?.cwd ?? summary?.cwd ?? props.conversation.executionPath ?? (directWorkspace ? props.gitContext?.project.localPath : null) ?? null;
+  /** 任一目录模式有多个仓库时，不把首仓分支冒充整个工作区分支。 */
+  const branch = (summary?.repositoryCount ?? 0) > 1 ? (zh ? '多个仓库' : 'Multiple repositories') : (summary?.branch ?? executionContext?.branch ?? props.conversation.workspace?.branchName ?? null);
+  /** 来源分支保持一行，完整仓库与分支仍可悬停读取，补载不移动操作按钮。 */
+  const sourceBranches = summary?.sourceBranches?.map((source) => `${source.repositoryRelativePath}: ${source.branch ?? (zh ? '未记录' : 'Not recorded')}`).join(' · ') || summary?.sourceBranch;
+  const conversationReady = !useTaskWorkspaces && (Boolean(summary?.repositoryCount) || executionContext?.isGitRepository === true);
   const sources = useMemo(() => collectSources(props.state), [props.state.attachments, props.state.items]);
   const visibleSources = showAllSources ? sources : sources.slice(0, DEFAULT_VISIBLE_SOURCE_COUNT);
-  /** 待提交提示与展示文件数使用同一范围，不受父仓占位的 dirty 状态影响。 */
-  const dirty = changes.files > 0;
+  /** 只区分是否有未提交更改，不读取或显示文件数及差异行数。 */
+  const dirty = summary?.dirty ?? false;
+  /** 交付行用图形和语义色区分 Git 状态，完整含义供悬停和读屏读取。 */
+  const deliveryStatus =
+    openingDelivery?.conversationId === props.conversation.id
+      ? { icon: CircleNotch, state: 'loading', label: zh ? '正在打开代码交付…' : 'Opening code delivery…' }
+      : !summary && (workspaceState === 'idle' || workspaceState === 'loading')
+        ? { icon: CircleNotch, state: 'loading', label: zh ? '正在读取 Git 状态…' : 'Loading Git status…' }
+        : workspaceState === 'error'
+          ? { icon: WarningCircle, state: 'error', label: zh ? 'Git 状态读取失败' : 'Failed to load Git status' }
+          : dirty
+            ? { icon: PencilSimpleLine, state: 'dirty', label: zh ? '有未提交更改' : 'Uncommitted changes' }
+            : summary?.repositoryCount
+              ? { icon: CheckCircle, state: 'clean', label: zh ? '工作区干净' : 'Working tree clean' }
+              : { icon: MinusCircle, state: 'unavailable', label: zh ? '非 Git 目录' : 'Not a Git repository' };
+  /** 保持状态图标的组件身份，加载时复用会话已有的旋转及减弱动画规则。 */
+  const DeliveryStatusIcon = deliveryStatus.icon;
   /** 进入页面不依赖预读成功；加载和目录错误由交付页呈现并提供重试。 */
   const canOpenDelivery = Boolean(conversationGitClient || (useTaskWorkspaces && props.onOpenGitDelivery));
   const codeReviewUnavailableReason = resolveCodeReviewUnavailableReason({
     zh,
-    taskId,
+    taskId: useTaskWorkspaces ? taskId : null,
     conversation: props.conversation,
     workspace: exactReviewWorkspace,
     workspaceState,
@@ -129,6 +179,31 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const persistent = hasPersistentSpace && !props.forceCollapsed;
   const cardVisible = !props.suppressed && (persistent || open);
   const cardMounted = cardVisible || Boolean(props.suppressed && persistent);
+  /** 进度沿用点击交付时的真实范围，冲突会话继续指向来源交付。 */
+  const deliveryTarget = conversationGitDeliveryTarget({ ...props.conversation, taskId }, props.conversation.workspaceId ?? workspace?.id ?? null);
+  /** 稳定身份避免流式消息更新重复预热同一交付窗口。 */
+  const deliveryTargetKey = JSON.stringify(deliveryTarget);
+  /** 返回主窗口或靠近入口时补齐预热；失败仍由真实打开报告。 */
+  const preloadDelivery = useCallback(() => {
+    if (props.suppressed || !canOpenDelivery) return;
+    void window.zeus?.openTaskGitDeliveryWindow({ ...JSON.parse(deliveryTargetKey), preload: true }).catch(() => undefined);
+  }, [props.suppressed, canOpenDelivery, deliveryTargetKey]);
+  useEffect(() => {
+    if (props.suppressed || !canOpenDelivery || !window.zeus?.openTaskGitDeliveryWindow) return;
+    /** 首屏渲染后只准备当前会话，真实点击仍负责显示和报告失败。 */
+    const idle = window.requestIdleCallback(preloadDelivery, { timeout: 500 });
+    window.addEventListener('focus', preloadDelivery);
+    return () => {
+      window.cancelIdleCallback(idle);
+      window.removeEventListener('focus', preloadDelivery);
+    };
+  }, [props.suppressed, canOpenDelivery, preloadDelivery]);
+  /** 项目级单步交付没有组合运行，不读取其他会话的组合进度。 */
+  const deliveryScopeId = deliveryTarget.taskId ?? deliveryTarget.conversationId ?? null;
+  /** 只在卡片可见时订阅交付事件，不增加 Git 文件变化订阅。 */
+  const { runs: deliveryRuns, error: deliveryProgressError, refresh: refreshDelivery } = useGitDeliveryRuns(gitClient, props.conversation.projectId, deliveryScopeId, cardVisible);
+  /** 最后一次成功后不回显旧失败，环境卡片和交付窗口使用同一条记录。 */
+  const deliveryRun = deliveryRuns[0]?.state === 'succeeded' ? undefined : deliveryRuns[0];
   /** 浮动快捷面板退场不延长数据订阅；常驻模式继续保持原组件身份。 */
   const { ref: cardRef, present: cardPresent } = useMotionPresence<HTMLDivElement>(cardMounted);
   const popoverOpen = cardVisible && !persistent;
@@ -158,74 +233,62 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
     setReviewDialogOpen(false);
   }, [props.conversation.id]);
 
-  /** 可见卡片订阅真实 Git 摘要；隐藏或切换身份后释放服务端文件监听。 */
-  useEffect(() => {
-    setSummary(null);
-    setWorkspaceState('idle');
+  /** 切换范围先清除旧状态，不把上个工作区的更改状态带入当前会话。 */
+  useLayoutEffect(() => {
+    /** 缓存按客户端与持久范围隔离，绝不借用上个会话的目录或状态。 */
+    const cached = gitClient ? environmentStatusCache.get(gitClient)?.get(summaryKey) : undefined;
+    setSummary(cached ?? null);
+    setWorkspaceState(cached ? 'ready' : 'idle');
     setWorkspaceError(null);
-  }, [props.conversation.id, props.conversation.projectId, props.conversation.workspaceId, props.conversation.environmentId, directWorkspace, taskId]);
+  }, [gitClient, summaryKey]);
 
+  /** 打开卡片、轮次切换、交付完成和窗口恢复焦点时按需读取，关闭后取消请求。 */
   useEffect(() => {
     if (!cardVisible || !gitClient) return;
-    /** 当前订阅代次阻止关闭后的网络回调覆盖新范围。 */
-    let generation = 0;
-    let unsubscribe: (() => void) | undefined;
-    let focusTimer: ReturnType<typeof setTimeout> | undefined;
-    /** 身份参数由服务端再次核验，客户端不提供磁盘路径。 */
-    const query = new URLSearchParams();
-    if (useTaskWorkspaces && taskId) {
-      query.set('taskId', taskId);
-      if (props.conversation.workspaceId) query.set('workspaceId', props.conversation.workspaceId);
-    } else if (!directWorkspace) query.set('conversationId', props.conversation.id);
-    /** 复用统一认证和重连，连接恢复后服务端补发当前快照。 */
-    const connect = (): void => {
-      unsubscribe?.();
-      unsubscribe = undefined;
-      const current = ++generation;
+    /** 后续读取取消旧请求，旧范围和旧结果不能覆盖当前状态。 */
+    let controller: AbortController | undefined;
+    /** 目录由服务端按持久身份解析，不传本地路径。 */
+    const scope = useTaskWorkspaces && taskId ? { taskId, workspaceId: props.conversation.workspaceId ?? undefined } : directWorkspace ? {} : { conversationId: props.conversation.id };
+    /** 复用轻量状态接口，不订阅文件变化或读取差异统计。 */
+    const refreshStatus = (): void => {
       if (document.visibilityState === 'hidden') return;
-      setWorkspaceState((state) => (state === 'idle' ? 'loading' : state));
-      unsubscribe = gitClient.subscribeEvents(
-        (event) => {
-          if (current !== generation) return;
-          if (event.type === 'git.summary.updated') {
-            const next = event.payload.summary as GitEnvironmentSummary;
-            if (next.projectId !== props.conversation.projectId) return;
-            setSummary(next);
-            setWorkspaceState('ready');
-            setWorkspaceError(null);
-          } else if (event.type === 'git.summary.error') {
-            setWorkspaceState('error');
-            setWorkspaceError(new Error(String(event.payload.message ?? 'Git 状态读取失败。')));
-          }
-        },
-        (state) => {
-          if (current !== generation || state !== 'reconnecting') return;
+      controller?.abort();
+      controller = new AbortController();
+      /** 每次读取保留自身取消信号，迟到结果不得覆盖后续读取。 */
+      const { signal } = controller;
+      setWorkspaceState('loading');
+      setWorkspaceError(null);
+      void gitClient
+        .loadGitEnvironmentStatus(props.conversation.projectId, scope, signal)
+        .then((next) => {
+          if (signal.aborted) return;
+          /** 有界显示缓存不参与交付和权限判断，服务端继续核验真实范围。 */
+          const cache = environmentStatusCache.get(gitClient) ?? new Map<string, GitEnvironmentStatus>();
+          cache.delete(summaryKey);
+          cache.set(summaryKey, next);
+          if (cache.size > 32) cache.delete(cache.keys().next().value!);
+          environmentStatusCache.set(gitClient, cache);
+          setSummary(next);
+          setWorkspaceState('ready');
+        })
+        .catch((error: unknown) => {
+          if (signal.aborted) return;
           setWorkspaceState('error');
-          setWorkspaceError(new Error(zh ? 'Git 状态连接已断开，正在重新连接。' : 'Git status disconnected. Reconnecting.'));
-        },
-        { path: `/api/projects/${encodeURIComponent(props.conversation.projectId)}/git/summary-events?${query}` },
-      );
+          setWorkspaceError(error);
+        });
     };
-    /** 聚合窗口返回与页面可见事件，避免同时重建两次订阅。 */
-    const visibilityChanged = (): void => {
-      clearTimeout(focusTimer);
-      if (document.visibilityState === 'hidden') {
-        generation += 1;
-        unsubscribe?.();
-        unsubscribe = undefined;
-      } else focusTimer = setTimeout(connect, 250);
-    };
-    connect();
-    window.addEventListener('focus', visibilityChanged);
-    document.addEventListener('visibilitychange', visibilityChanged);
+    /** 只接收当前任务的交付结果，不借用其他任务的状态。 */
+    const unsubscribeDelivery = window.zeus?.onTaskGitDeliveryChanged?.((changedTaskId) => {
+      if (changedTaskId === taskId) refreshStatus();
+    });
+    refreshStatus();
+    window.addEventListener('focus', refreshStatus);
     return () => {
-      generation += 1;
-      clearTimeout(focusTimer);
-      unsubscribe?.();
-      window.removeEventListener('focus', visibilityChanged);
-      document.removeEventListener('visibilitychange', visibilityChanged);
+      controller?.abort();
+      unsubscribeDelivery?.();
+      window.removeEventListener('focus', refreshStatus);
     };
-  }, [cardVisible, gitClient, props.conversation.id, props.conversation.projectId, props.conversation.workspaceId, props.conversation.environmentId, useTaskWorkspaces, directWorkspace, taskId, zh]);
+  }, [cardVisible, gitClient, summaryKey, props.conversation.id, props.conversation.projectId, props.conversation.workspaceId, props.state.activeTurnId, useTaskWorkspaces, directWorkspace, taskId]);
 
   useEffect(() => {
     if (!open) return;
@@ -304,19 +367,25 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
 
   /** 同一个按钮统一打开原生交付窗口，任务范围保留现有工作区定位。 */
   async function openDelivery(): Promise<void> {
-    if (conversationGitClient) {
-      setOpen(false);
-      try {
+    if (openingDelivery?.conversationId === props.conversation.id) return;
+    /** 与快捷键共用目录模式，摘要只补充尚未带回的任务工作区身份。 */
+    const target = conversationGitDeliveryTarget({ ...props.conversation, taskId }, props.conversation.workspaceId ?? workspace?.id ?? null);
+    /** 按钮立即反馈并防止重复提交，窗口可用后再关闭浮动面板。 */
+    const opening = { conversationId: props.conversation.id };
+    setOpeningDelivery(opening);
+    try {
+      if (conversationGitClient) {
         if (!window.zeus?.openTaskGitDeliveryWindow) throw new Error(zh ? '当前环境无法打开代码交付窗口。' : 'The code delivery window is unavailable in this environment.');
-        await window.zeus.openTaskGitDeliveryWindow(directWorkspace && taskId ? { projectId: props.conversation.projectId } : { projectId: props.conversation.projectId, conversationId: props.conversation.id });
-      } catch (error) {
-        reportApplicationError(error, { language: zh ? 'zh-CN' : 'en' });
+        await window.zeus.openTaskGitDeliveryWindow(target);
+      } else if (target.taskId && props.onOpenGitDelivery) {
+        await props.onOpenGitDelivery(target.taskId, target.workspaceId ?? null);
       }
-      return;
+      if (currentConversationId.current === opening.conversationId) setOpen(false);
+    } catch (error) {
+      reportApplicationError(error, { language: zh ? 'zh-CN' : 'en' });
+    } finally {
+      setOpeningDelivery((current) => (current === opening ? null : current));
     }
-    if (!taskId || !props.onOpenGitDelivery) return;
-    setOpen(false);
-    props.onOpenGitDelivery(taskId, props.conversation.workspaceId ?? workspace?.id ?? null);
   }
 
   /** 浮层关闭后使用环境入口恢复焦点，避免引用已经卸载的工具行。 */
@@ -347,7 +416,8 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
         </span>
       ) : null}
       {persistent || props.suppressed ? null : (
-        <button
+        <Button
+          unstyled
           ref={triggerRef}
           type="button"
           className={`session-quick-actions-trigger ${open ? 'selected' : ''}`}
@@ -358,7 +428,7 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
           onClick={() => setOpen((current) => !current)}
         >
           <Desktop aria-hidden="true" weight="regular" />
-        </button>
+        </Button>
       )}
 
       {cardPresent ? (
@@ -387,20 +457,42 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                 </header>
 
                 <div className="session-quick-actions-list">
-                  <div className="session-quick-actions-row is-static" data-icon-tooltip={cwd ?? undefined}>
+                  <div className="session-quick-actions-row is-static session-quick-actions-metadata" data-icon-tooltip={cwd ?? undefined}>
                     <Folder aria-hidden="true" weight="regular" />
                     <span className="session-quick-actions-copy">
                       <strong>{zh ? '工作目录' : 'Working directory'}</strong>
-                      <small>{cwd ?? (zh ? '执行目录不可用' : 'Execution directory unavailable')}</small>
+                      <small>{cwd ?? (workspaceState === 'idle' || workspaceState === 'loading' ? (zh ? '正在读取…' : 'Loading…') : zh ? '执行目录不可用' : 'Execution directory unavailable')}</small>
                     </span>
                     {cwd ? <RuntimeCopyButton text={cwd} label={zh ? '复制工作目录' : 'Copy working directory'} copiedLabel={zh ? '工作目录已复制' : 'Working directory copied'} /> : null}
                   </div>
 
-                  <div className="session-quick-actions-row is-static" data-icon-tooltip={branch ?? undefined}>
+                  <div className="session-quick-actions-row is-static session-quick-actions-metadata" data-icon-tooltip={branch ?? undefined}>
                     <GitBranch aria-hidden="true" weight="regular" />
                     <span className="session-quick-actions-copy">
-                      <strong>{branch ?? (cwd ? (zh ? '非 Git 目录' : 'Not a Git repository') : zh ? '分支不可用' : 'Branch unavailable')}</strong>
-                      {summary?.sourceBranch ? <small>{zh ? `来源分支 ${summary.sourceBranch}` : `Source branch ${summary.sourceBranch}`}</small> : null}
+                      <strong>
+                        {workspaceState === 'error'
+                          ? zh
+                            ? 'Git 状态读取失败'
+                            : 'Failed to read Git status'
+                          : (branch ??
+                            (workspaceState === 'idle' || workspaceState === 'loading'
+                              ? zh
+                                ? '正在读取分支…'
+                                : 'Loading branch…'
+                              : summary?.repositoryCount === 0
+                                ? zh
+                                  ? '非 Git 目录'
+                                  : 'Not a Git repository'
+                                : zh
+                                  ? '分支不可用'
+                                  : 'Branch unavailable'))}
+                      </strong>
+                      {sourceBranches ? (
+                        <small title={sourceBranches}>
+                          {zh ? '来源分支 ' : 'Source branch '}
+                          {sourceBranches}
+                        </small>
+                      ) : null}
                     </span>
                     {branch && !(directWorkspace && (summary?.repositoryCount ?? 0) > 1) ? (
                       <RuntimeCopyButton text={branch} label={zh ? '复制工作分支' : 'Copy working branch'} copiedLabel={zh ? '工作分支已复制' : 'Working branch copied'} />
@@ -408,113 +500,120 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                   </div>
 
                   {subagentCount > 0 && props.onOpenSubagents ? (
-                    <button type="button" className="session-quick-actions-row" onClick={(event) => openSubagents(event.currentTarget)}>
+                    <Button unstyled type="button" className="session-quick-actions-row" onClick={(event) => openSubagents(event.currentTarget)}>
                       <UsersThree aria-hidden="true" weight="regular" />
                       <span className="session-quick-actions-copy">
                         <strong>{zh ? '智能体' : 'Agents'}</strong>
                         <small>{zh ? `${subagentCount} 个线程` : `${subagentCount} ${subagentCount === 1 ? 'thread' : 'threads'}`}</small>
                       </span>
                       <ArrowSquareOut aria-hidden="true" weight="regular" />
-                    </button>
+                    </Button>
                   ) : null}
 
-                  <button
+                  {props.onToggleSideQuestion ? (
+                    <Button
+                      unstyled
+                      type="button"
+                      className="session-quick-actions-row"
+                      aria-label={zh ? '侧边栏会话' : 'Sidebar conversation'}
+                      aria-pressed={props.sideQuestionOpen ?? false}
+                      onClick={(event) => toggleTool(event.currentTarget, props.onToggleSideQuestion)}
+                    >
+                      <ChatCircle aria-hidden="true" weight="regular" />
+                      <span className="session-quick-actions-copy">
+                        <strong>{zh ? '侧边栏会话' : 'Sidebar conversation'}</strong>
+                      </span>
+                    </Button>
+                  ) : null}
+
+                  <Button
+                    unstyled
                     type="button"
                     className="session-quick-actions-row"
                     aria-label={zh ? '浏览器' : 'Browser'}
                     aria-pressed={props.browserOpen}
                     aria-keyshortcuts="Meta+Shift+B Control+Shift+B"
+                    data-icon-tooltip={platformShortcutLabel('⌘⇧B')}
                     onClick={(event) => toggleTool(event.currentTarget, props.onToggleBrowser)}
                   >
                     <GlobeSimple aria-hidden="true" weight="regular" />
                     <span className="session-quick-actions-copy">
                       <strong>{zh ? '浏览器' : 'Browser'}</strong>
                     </span>
-                    <span className="session-quick-actions-shortcut">{platformShortcutLabel('⌘⇧B')}</span>
-                  </button>
+                  </Button>
 
                   {props.onToggleTerminal ? (
-                    <button
+                    <Button
+                      unstyled
                       type="button"
                       className="session-quick-actions-row"
                       aria-label={zh ? '会话终端' : 'Conversation terminal'}
                       aria-pressed={props.terminalOpen}
                       aria-keyshortcuts="Control+`"
+                      data-icon-tooltip="Ctrl+`"
                       onClick={(event) => toggleTool(event.currentTarget, props.onToggleTerminal)}
                     >
                       <TerminalWindow aria-hidden="true" weight="regular" />
                       <span className="session-quick-actions-copy">
                         <strong>{zh ? '会话终端' : 'Conversation terminal'}</strong>
                       </span>
-                      <span className="session-quick-actions-shortcut">Ctrl+`</span>
-                    </button>
+                    </Button>
                   ) : null}
 
-                  <button type="button" className="session-quick-actions-row" disabled={!canStartCodeReview} data-icon-tooltip={codeReviewUnavailableReason ?? undefined} onClick={openCodeReview}>
+                  <Button unstyled type="button" className="session-quick-actions-row" disabled={!canStartCodeReview} data-icon-tooltip={codeReviewUnavailableReason ?? undefined} onClick={openCodeReview}>
                     <FileCode aria-hidden="true" weight="regular" />
                     <span className="session-quick-actions-copy">
                       <strong>{zh ? '代码审查' : 'Code review'}</strong>
-                      <small>{codeReviewUnavailableReason ?? (zh ? '新建 AI 会话审查当前完整变化' : 'Review all current changes in a new AI conversation')}</small>
                     </span>
                     <ArrowSquareOut aria-hidden="true" weight="regular" />
-                  </button>
+                  </Button>
 
-                  <button
-                    type="button"
-                    className="session-quick-actions-row"
-                    disabled={!canOpenDelivery}
-                    data-icon-tooltip={!canOpenDelivery ? (zh ? '当前会话没有可用的项目 Git 入口' : 'Project Git is unavailable for this conversation') : undefined}
-                    onClick={openDelivery}
-                  >
-                    <GithubLogo aria-hidden="true" weight="regular" />
-                    <span className="session-quick-actions-copy">
-                      <strong>{zh ? '代码交付' : 'Code delivery'}</strong>
-                      <small>
-                        {workspaceState === 'loading'
-                          ? zh
-                            ? '正在读取 Git 状态…'
-                            : 'Loading Git status…'
-                          : workspaceState === 'error'
-                            ? zh
-                              ? 'Git 状态读取失败'
-                              : 'Failed to load Git status'
-                            : dirty
-                              ? zh
-                                ? `${changes.files} 个文件待提交`
-                                : `${changes.files} files to commit`
-                              : summary?.sourceBranch
-                                ? `${summary.branch} → ${summary.sourceBranch}`
-                                : zh
-                                  ? '查看、提交、合入与推送'
-                                  : 'Review, commit, merge, and push'}
-                      </small>
-                    </span>
-                    {/* 增删统计与代码交付共用一行，沿用原有颜色、占位和读屏说明。 */}
-                    <span
-                      className="session-quick-actions-diff"
-                      aria-label={
-                        workspaceState !== 'ready'
-                          ? zh
-                            ? '变更统计尚不可用'
-                            : 'Change counts unavailable'
-                          : zh
-                            ? `新增 ${changes.additions} 行，删除 ${changes.deletions} 行`
-                            : `${changes.additions} additions, ${changes.deletions} deletions`
-                      }
+                  <div className="session-quick-actions-delivery">
+                    <Button
+                      unstyled
+                      type="button"
+                      className="session-quick-actions-row"
+                      disabled={!canOpenDelivery || openingDelivery?.conversationId === props.conversation.id}
+                      aria-busy={openingDelivery?.conversationId === props.conversation.id || undefined}
+                      data-icon-tooltip={!canOpenDelivery ? (zh ? '当前会话没有可用的项目 Git 入口' : 'Project Git is unavailable for this conversation') : undefined}
+                      onClick={openDelivery}
+                      onPointerEnter={preloadDelivery}
+                      onFocus={preloadDelivery}
                     >
-                      <b>{workspaceState === 'ready' ? `+${changes.additions}` : '—'}</b>
-                      <i>{workspaceState === 'ready' ? `−${changes.deletions}` : '—'}</i>
-                    </span>
-                  </button>
+                      <GithubLogo aria-hidden="true" weight="regular" />
+                      <span className="session-quick-actions-copy">
+                        <strong>{zh ? '代码交付' : 'Code delivery'}</strong>
+                        {deliveryProgressError ? <small role="status">{zh ? '交付进度读取失败' : 'Delivery progress unavailable'}</small> : null}
+                      </span>
+                      {deliveryRun ? null : (
+                        <IconTooltip label={deliveryStatus.label}>
+                          <DeliveryStatusIcon
+                            role="img"
+                            aria-label={deliveryStatus.label}
+                            className={`session-quick-actions-delivery-status${deliveryStatus.state === 'loading' ? ' session-conversation-state-spinner' : ''}`}
+                            data-state={deliveryStatus.state}
+                            size={17}
+                            weight="regular"
+                          />
+                        </IconTooltip>
+                      )}
+                    </Button>
+                    {deliveryRun ? (
+                      <div className="session-quick-actions-delivery-progress">
+                        <GitDeliveryProgress run={deliveryRun} zh={zh} />
+                        {gitClient ? <GitDeliveryRunActions client={gitClient} run={deliveryRun} zh={zh} onUpdated={() => refreshDelivery()} /> : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
 
                 <section className="session-quick-actions-sources" aria-label={zh ? '来源' : 'Sources'}>
                   <header>
                     <strong>{zh ? '来源' : 'Sources'}</strong>
                     {props.onAddSources ? (
-                      <button type="button" aria-label={zh ? '添加来源' : 'Add source'} data-icon-tooltip={zh ? '添加到当前输入' : 'Add to current input'} onClick={() => void props.onAddSources?.()}>
+                      <Button unstyled type="button" aria-label={zh ? '添加来源' : 'Add source'} data-icon-tooltip={zh ? '添加到当前输入' : 'Add to current input'} onClick={() => props.onAddSources?.()}>
                         <Plus aria-hidden="true" weight="regular" />
-                      </button>
+                      </Button>
                     ) : null}
                   </header>
                   {visibleSources.length > 0 ? (
@@ -522,10 +621,10 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                       {visibleSources.map((source) => (
                         <li key={source.id}>
                           {source.resource && props.onOpenSource ? (
-                            <button type="button" data-icon-tooltip={source.label} onClick={() => void props.onOpenSource?.(source.resource as ConversationResource)}>
+                            <Button unstyled type="button" data-icon-tooltip={source.label} onClick={() => props.onOpenSource?.(source.resource as ConversationResource)}>
                               <SessionQuickActionSourceVisual source={source} onLoadResourcePreview={props.onLoadResourcePreview} />
                               <span className="session-quick-actions-source-label">{source.label}</span>
-                            </button>
+                            </Button>
                           ) : (
                             <span data-icon-tooltip={source.label}>
                               <SessionQuickActionSourceVisual source={source} onLoadResourcePreview={props.onLoadResourcePreview} />
@@ -539,17 +638,17 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                     <p>{zh ? '当前会话还没有来源。' : 'No sources in this conversation yet.'}</p>
                   )}
                   {sources.length > DEFAULT_VISIBLE_SOURCE_COUNT ? (
-                    <button type="button" className="session-quick-actions-view-all" aria-expanded={showAllSources} onClick={() => setShowAllSources((current) => !current)}>
+                    <Button unstyled type="button" className="session-quick-actions-view-all" aria-expanded={showAllSources} onClick={() => setShowAllSources((current) => !current)}>
                       <ShareNetwork aria-hidden="true" weight="regular" />
                       <span>{showAllSources ? (zh ? '收起' : 'Show less') : zh ? '查看全部' : 'View all'}</span>
-                    </button>
+                    </Button>
                   ) : null}
                 </section>
 
                 {workspaceState === 'error' ? <p role="status">{zh ? '显示最近一次读取的目录与分支。' : 'Shows the most recently loaded folder and branch.'}</p> : null}
               </Collapsible>
             </section>
-            <SessionComputerPreview key={props.conversation.id} conversationId={props.conversation.id} language={props.language} active={cardVisible} />
+            <SessionComputerPreview key={props.conversation.id} conversationId={props.conversation.id} language={props.language} active={cardVisible} onStopOperationAgent={props.onStopOperationAgent} />
           </div>
         </SessionQuickActionsCardMount>
       ) : null}
@@ -683,7 +782,7 @@ function resolveCodeReviewUnavailableReason(input: {
   if (!input.conversation.workspaceId || !input.conversation.environmentId) {
     return input.zh ? '此对话没有任务开始时的代码记录。请从拥有独立工作目录的任务对话启动审查' : 'This conversation has no record of the code when the task started. Start the review from a task conversation with its own working folder';
   }
-  if (input.workspaceState === 'idle' || input.workspaceState === 'loading') return input.zh ? '正在检查代码审查的工作目录…' : 'Checking the working folder for the code review…';
+  if (!input.workspace && (input.workspaceState === 'idle' || input.workspaceState === 'loading')) return input.zh ? '正在检查代码审查的工作目录…' : 'Checking the working folder for the code review…';
   if (input.workspaceState === 'error') return input.zh ? '读取工作目录失败，请重新打开面板重试' : 'Failed to load the working folder. Reopen this panel to retry';
   if (!input.workspace || !['ready', 'merged'].includes(input.workspace.state) || !input.workspace.worktreePath) return input.zh ? '此任务的工作目录已回收或不可用' : 'This task’s working folder has been reclaimed or is unavailable';
   return null;

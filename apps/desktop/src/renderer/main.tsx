@@ -158,7 +158,7 @@ async function renderWithClient(
             onAuthorizeTaskFiles={(files, source) => window.zeus?.authorizeTaskFiles?.(files, source) ?? Promise.resolve({ resources: [], failedCount: files.length })}
             onMaterializeTaskResources={(resources) => window.zeus?.materializeTaskResources?.(resources) ?? Promise.resolve([])}
             onReadTaskClipboardResources={() => window.zeus?.readTaskClipboardResources?.() ?? Promise.resolve({ resources: [], text: '' })}
-            onParseThirdPartyTaskLink={(url) => window.zeus?.parseThirdPartyTaskLink?.(url) ?? Promise.resolve({ kind: 'unsupported', sourceUrl: url })}
+            onParseThirdPartyTaskLink={(url, onMetadata) => window.zeus?.parseThirdPartyTaskLink?.(url, onMetadata) ?? Promise.resolve({ kind: 'unsupported', sourceUrl: url })}
             onLoadTaskAttachmentPreview={(path) => window.zeus?.getTaskAttachmentPreview?.(path) ?? Promise.resolve(null)}
             onOpenTaskAttachment={(path) => window.zeus?.openTaskAttachment?.(path) ?? Promise.resolve({ opened: false, error: 'open_attachment_unavailable' })}
             onCreateTaskFromTemplate={async (templateId, projectId, idempotencyKey) => {
@@ -380,22 +380,26 @@ async function renderTaskGitDeliveryWithClient(client: DashboardClient, paramete
   /** 子树筛选来自原生窗口校验后的相对路径。 */
   const pathPrefix = parameters.get('pathPrefix') ?? undefined;
   if (taskId ? projectId || conversationId || repositoryId || pathPrefix : !projectId || (conversationId && repositoryId) || (pathPrefix && !repositoryId)) throw new Error('代码交付窗口范围无效。');
-  /** 元数据与设置并行读取，完整交付页只创建一次。 */
-  const [{ TaskGitDeliveryWindow }, task, conversation, snapshot, appShellSettings, currentContext] = await Promise.all([
+  /** 任务身份只读取一次，项目元数据不依赖全量工作台。 */
+  const taskRecord = taskId ? client.tasks.loadTask(taskId) : Promise.resolve(null);
+  /** 当前交付对象与设置并行读取，避免全量项目和任务阻塞首屏。 */
+  const [{ TaskGitDeliveryWindow }, task, conversation, project, appShellSettings, currentContext] = await Promise.all([
     import('./task/TaskGitDeliveryWindow.js'),
-    taskId ? client.tasks.loadTask(taskId) : Promise.resolve(null),
+    taskRecord,
     projectId && conversationId ? client.loadNativeConversationChoice(projectId, conversationId) : Promise.resolve(null),
-    client.loadDashboard(),
-    client.settings.loadAppShellSettings(),
+    projectId ? client.projects.loadProject(projectId) : taskRecord.then((record) => (record ? client.projects.loadProject(record.projectId) : null)),
+    window.zeus?.getStartupSettings?.().then((settings) => settings ?? client.settings.loadAppShellSettings()) ?? client.settings.loadAppShellSettings(),
     window.zeus?.getTaskGitDeliveryCurrentContext?.() ?? Promise.resolve({ taskId: null, workspaceId: null }),
   ]);
   /** 所有窗口使用同一 React 根及启动错误边界。 */
   const root = document.getElementById('root');
   if (!root) throw new Error('Zeus renderer root element is missing');
   /** 不接受从其他项目借用的会话或缺失记录。 */
-  const project = snapshot.projects.find((item) => item.id === (task?.projectId ?? projectId));
+  if (project && project.id !== (task?.projectId ?? projectId)) throw new Error('代码交付项目归属无效，请从当前项目重新打开。');
   if (!task && !project) throw new Error('代码交付项目不存在，请从当前项目重新打开。');
-  if (conversationId && (!conversation || conversation.projectId !== project?.id || conversation.id !== conversationId || conversation.taskId)) throw new Error('代码交付会话归属无效，请从当前会话重新打开。');
+  // 自动创建任务的会话仍使用自有目录；已绑定任务工作区或环境的会话须走任务交付入口。
+  if (conversationId && (!conversation || conversation.projectId !== project?.id || conversation.id !== conversationId || conversation.workspaceId || conversation.environmentId))
+    throw new Error('代码交付会话归属无效，请从当前会话重新打开。');
   /** 控制器能力由真实记录选择，原生窗口壳与交付视图保持一致。 */
   const scope: import('./task/TaskGitDeliveryWindow.js').GitDeliveryWindowScope = task
     ? { kind: 'task', task, projectName: project?.name }
@@ -429,6 +433,9 @@ async function renderProjectGitDiffWithClient(client: DashboardClient, parameter
   const projectId = parameters.get('projectId')?.trim();
   const repositoryId = parameters.get('repositoryId')?.trim();
   const filePath = snapshot?.filePath ?? parameters.get('filePath') ?? '';
+  /** 独立窗口复用交付页的会话客户端，历史、比较和刷新都读取原工作树。 */
+  const conversationId = parameters.get('conversationId');
+  const diffClient = conversationId ? { ...client, ...client.forConversationGit(conversationId) } : client;
   /** 任务来源必须同时指定工作区和比较范围。 */
   const taskId = parameters.get('taskId');
   /** 任务工作区与项目仓库使用不同的身份。 */
@@ -446,7 +453,7 @@ async function renderProjectGitDiffWithClient(client: DashboardClient, parameter
     <>
       <RendererErrorBoundary appLanguage={appShellSettings.appLanguage} onFatalError={(error) => reportSurfaceFatalError(error, errorLanguage, 'ProjectGitDiffWindow')}>
         <ProjectGitDiffWindow
-          client={client}
+          client={diffClient}
           source={
             snapshot
               ? { kind: 'snapshot', path: snapshot.filePath, diff: snapshot.diff }
@@ -548,7 +555,7 @@ async function hydrateRenderer(): Promise<void> {
             loadCommit: (projectId, repositoryId, commitHash) => window.zeus!.loadProjectGitCommit({ projectId, repositoryId, commitHash }),
             /** 推送预览与实际操作使用同一桌面仓库解析器。 */
             loadPushPreview: (projectId, repositoryId, selection) => window.zeus!.loadProjectGitPushPreview({ projectId, repositoryId, selection }),
-            loadComparison: (projectId, repositoryId, ref, mode) => window.zeus!.loadProjectGitComparisonDiff({ projectId, repositoryId, ref, mode }),
+            loadComparison: (projectId, repositoryId, ref, mode, path, summaryOnly) => window.zeus!.loadProjectGitComparisonDiff({ projectId, repositoryId, ref, mode, path, summaryOnly }),
             execute: async (projectId, repositoryId, action) => unwrapProjectGitActionIpcResult(await window.zeus!.executeProjectGitAction({ projectId, repositoryId, action })),
           },
         }
@@ -617,25 +624,39 @@ function renderStartupFailure(error: unknown): void {
   const actions = document.createElement('div');
   actions.className = 'startup-failure-actions';
   const restart = startupFailureButton(zh ? '重新启动' : 'Restart', true);
+  /** 预加载缺失时，按钮不能接纳一个永远不会执行的操作。 */
+  const restartAction = window.zeus?.restartAfterStartupFailure;
+  restart.disabled = !restartAction;
   restart.onclick = async () => {
+    if (!restartAction) return;
     restart.disabled = true;
+    restart.setAttribute('aria-busy', 'true');
     restart.textContent = zh ? '正在重启…' : 'Restarting…';
     try {
-      await window.zeus?.restartAfterStartupFailure?.();
+      await restartAction();
     } catch (restartError) {
+      description.textContent = describeUserFacingError(restartError, startupLanguage).message;
       reportApplicationError(restartError, { language: zh ? 'zh-CN' : 'en' });
       restart.disabled = false;
+      restart.removeAttribute('aria-busy');
       restart.textContent = zh ? '重新启动' : 'Restart';
     }
   };
   const exit = startupFailureButton(zh ? `退出 ${distributionAppName}` : `Quit ${distributionAppName}`, false);
+  /** 网页降级面板没有原生退出能力时保持明确的不可用状态。 */
+  const exitAction = window.zeus?.exitAfterStartupFailure;
+  exit.disabled = !exitAction;
   exit.onclick = async () => {
+    if (!exitAction) return;
     exit.disabled = true;
+    exit.setAttribute('aria-busy', 'true');
     try {
-      await window.zeus?.exitAfterStartupFailure?.();
+      await exitAction();
     } catch (exitError) {
+      description.textContent = describeUserFacingError(exitError, startupLanguage).message;
       reportApplicationError(exitError, { language: zh ? 'zh-CN' : 'en' });
       exit.disabled = false;
+      exit.removeAttribute('aria-busy');
     }
   };
   actions.append(exit, restart);

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { conversationCommandTypes } from './conversationCommandApplication.js';
 import { isAbsolute, relative, sep } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -6,7 +7,11 @@ import { realpath } from 'node:fs/promises';
 import type { FastifyInstance } from 'fastify';
 import {
   commandEnvelopeSchemaGeneration,
+  conversationDispatchWireCommandTypes,
   canonicalCommandInputJson,
+  normalizeCommandRunParameters,
+  type CommandDefinition,
+  type CommandRun,
   deliveryWorkspacesForConversationBranch,
   resolveGitDeliveryRootWorkspace,
   gitConflictPreservationInstructions,
@@ -17,6 +22,8 @@ import {
 } from '@zeus/shared';
 import {
   GitDeliveryRepository,
+  CommandDefinitionRepository,
+  CommandRunRepository,
   TaskEnvironmentRepository,
   type GitDeliveryRunRecord,
   type GitDeliveryStepRecord,
@@ -30,12 +37,14 @@ import {
   type TaskIntegrationAttemptRepository,
   type ConversationRepository,
   type ConversationSubmissionRepository,
+  type ConversationTurnRepository,
 } from '@zeus/storage';
 import {
   discoverGitRepositories,
   executeProjectGitAction,
   getProjectGitRepositorySnapshot,
   getGitBranchHead,
+  getGitRepositoryContext,
   getGitCommonDirectory,
   startTaskBranchIntegration,
   completeTaskIntegrationCommit,
@@ -48,6 +57,7 @@ import {
   withGitOperationSignal,
   type ProjectGitAction,
 } from '@zeus/git-core';
+import { commandCenterCommandTypes } from './commandCenterCommandApplication.js';
 import { AutomationMutationApplication } from './automationMutationApplication.js';
 import { resolveConversationGitWorkspace } from './conversationGitWorkspace.js';
 import { readCommitFingerprint } from './gitCommitContext.js';
@@ -83,8 +93,14 @@ interface DeliveryExecutionDependencies {
   conversations: ConversationRepository;
   /** 会话归属和执行目录来源。 */
   conversationSubmissions: ConversationSubmissionRepository;
+  /** 冲突 AI 的停止复用原轮次入口；旧宿主适配器未提供时不能假报停止成功。 */
+  conversationTurns?: Pick<ConversationTurnRepository, 'getLatestActiveByConversation'>;
+  /** 命令停止回执之后仍等待原进程退出，超时不释放项目队首。 */
+  waitForCommandExit?: (runtimeSessionId: string) => Promise<boolean>;
   /** Git 写操作复用现有命令回执。 */
   commands: WorkspaceGitCommandApplication;
+  /** 命令预检沿用项目命令权限，执行时仍由命令中心再次校验。 */
+  commandSecurity(projectId: string): { allowShell: boolean; allowGitWrite: boolean };
   /** 当前项目可选管理状态。 */
   statusOptions(projectId: string): import('@zeus/shared').TaskManagementStatusDefinition[];
   /** 组合已授权合入时，复用原任务冲突结果落地流程。 */
@@ -113,6 +129,11 @@ function deliveryError(message: string, code = 'ZEUS_GIT_DELIVERY_INVALID', stat
 /** 稳定身份不含目录、正文或密钥。 */
 function deliveryIdentity(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 32);
+}
+
+/** 每个交付步骤的每次尝试对应唯一命令运行，身份可安全用于命令日志路径。 */
+function postPushCommandRunId(step: GitDeliveryStepRecord): string {
+  return `command_run_${deliveryIdentity(`${step.id}:${step.attempt}:confirmation`)}`;
 }
 
 /** 内部调用和 Renderer 使用同一命令信封协议。 */
@@ -144,6 +165,19 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
   if (typeof scopeId !== 'string' || !scopeId || scopeId.length > 256) throw deliveryError('缺少有效交付对象。', undefined, 400);
   if (!input.settings || ['commit', 'merge', 'push', 'resolveConflicts'].some((key) => typeof input.settings[key as 'commit'] !== 'boolean')) throw deliveryError('组合操作必须明确勾选。', undefined, 400);
   if (input.settings.generateCommitMessage !== undefined && typeof input.settings.generateCommitMessage !== 'boolean') throw deliveryError('AI 提交信息选项无效。', undefined, 400);
+  /** 项目偏好只记住命令身份和顺序；本次版本快照必须与实际启用的选择完全一致。 */
+  const commandIds = input.settings.postPushCommandIds ?? [];
+  if (!Array.isArray(commandIds) || commandIds.length > 50 || commandIds.some((id) => typeof id !== 'string' || !id || id.length > 256) || new Set(commandIds).size !== commandIds.length)
+    throw deliveryError('推送后命令选择无效或重复。', undefined, 400);
+  /** 未启用推送时保留偏好，不接纳任何命令步骤。 */
+  const commandSelections = input.postPushCommands ?? [];
+  const activeCommandIds = input.settings.push ? commandIds : [];
+  if (
+    !Array.isArray(commandSelections) ||
+    commandSelections.length !== activeCommandIds.length ||
+    commandSelections.some((command, index) => !command || command.commandId !== activeCommandIds[index] || !Number.isSafeInteger(command.expectedRevision) || command.expectedRevision < 1)
+  )
+    throw deliveryError('推送后命令已变化，请重新读取并选择。', undefined, 400);
   /** 已保存的旧运行未启用 AI；新运行必须明确携带可核验的模型快照。 */
   const generation = input.commitMessageGeneration;
   if (
@@ -165,7 +199,8 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
     (input.settings.finalTaskStatus !== null && (typeof input.settings.finalTaskStatus !== 'string' || !input.settings.finalTaskStatus || input.settings.finalTaskStatus.length > 128))
   )
     throw deliveryError('Skill 或任务状态无效。', undefined, 400);
-  if (input.scope.kind === 'conversation' && input.settings.finalTaskStatus !== null) throw deliveryError('普通会话不能变更任务状态。', undefined, 400);
+  if (input.settings.archiveConversation !== undefined && typeof input.settings.archiveConversation !== 'boolean') throw deliveryError('会话归档设置无效。', undefined, 400);
+  if (input.settings.archiveConversation && (input.scope.kind !== 'conversation' || input.settings.finalTaskStatus)) throw deliveryError('归档会话与任务状态变更不能同时执行。', undefined, 400);
   if (typeof input.message !== 'string' || input.message.length > 100_000 || !['merge', 'squash'].includes(input.mode)) throw deliveryError('提交说明或合入方式无效。', undefined, 400);
   if (!Array.isArray(input.repositories) || input.repositories.length === 0 || input.repositories.length > 200) throw deliveryError('请选择交付仓库。', undefined, 400);
   /** 重复仓库不能造成相同步骤运行两次。 */
@@ -182,6 +217,7 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
     )
       throw deliveryError('仓库分支快照无效。', undefined, 400);
     if (input.settings.merge && !repository.mergeBranch) throw deliveryError('请选择要合入的分支。', undefined, 400);
+    if (input.settings.merge && repository.mergeBranch === repository.expectedBranch) throw deliveryError('当前分支与目标分支相同，没有可执行的合入。', undefined, 400);
     if (
       !Array.isArray(repository.paths) ||
       repository.paths.length > 100_000 ||
@@ -201,11 +237,14 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
       generateCommitMessage: input.settings.generateCommitMessage ?? false,
       merge: input.settings.merge,
       push: input.settings.push,
+      ...(input.settings.postPushCommandIds !== undefined ? { postPushCommandIds: [...commandIds] } : {}),
       resolveConflicts: input.settings.resolveConflicts,
       permissionMode: input.settings.permissionMode,
       skillId: input.settings.skillId,
       finalTaskStatus: input.settings.finalTaskStatus,
+      ...(input.settings.archiveConversation !== undefined ? { archiveConversation: input.settings.archiveConversation } : {}),
     },
+    ...(input.postPushCommands !== undefined ? { postPushCommands: commandSelections.map(({ commandId, expectedRevision }) => ({ commandId, expectedRevision })) } : {}),
     message: input.message,
     ...(generation ? { commitMessageGeneration: { language: generation.language, modelRef: generation.modelRef, effort: generation.effort, serviceTier: generation.serviceTier } } : {}),
     mode: input.mode,
@@ -220,7 +259,11 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
 }
 
 /** 项目冲突会话只能使用已接纳步骤拥有的隔离目录。 */
-export function resolveGitDeliveryConflictWorkspace(db: ZeusDatabase, projectId: string, stepId: unknown): { localPath: string; workspaceMode: 'worktree'; permissionMode: 'auto' | 'full-access'; skillId: string | null } {
+export function resolveGitDeliveryConflictWorkspace(
+  db: ZeusDatabase,
+  projectId: string,
+  stepId: unknown,
+): { localPath: string; workspaceMode: 'worktree'; permissionMode: 'auto' | 'full-access'; skillId: string | null; taskId: string | null } {
   if (typeof stepId !== 'string') throw deliveryError('缺少冲突步骤身份。');
   /** 数据库身份来自先前经过范围校验的接纳记录。 */
   const row = db.get<{ runId: string }>('SELECT run_id AS runId FROM git_delivery_steps WHERE id = ?', [stepId]);
@@ -231,7 +274,12 @@ export function resolveGitDeliveryConflictWorkspace(db: ZeusDatabase, projectId:
     throw deliveryError('冲突步骤已失效或不属于当前项目。');
   /** 复用本次已接纳的权限和 Skill 选择，不允许另一个首发请求扩大权限。 */
   const settings = (step.result?.aiAuthorization ?? run.input.settings) as { permissionMode: 'auto' | 'full-access'; skillId?: string | null };
-  return { localPath: merge.integrationPath, workspaceMode: 'worktree', permissionMode: settings.permissionMode, skillId: settings.skillId ?? null };
+  /** 任务只能沿同项目来源会话取得，客户端不能指定关联任务。 */
+  const origin = db.get<{ taskId: string }>('SELECT task.id AS taskId FROM conversations origin JOIN tasks task ON task.id = origin.task_id AND task.project_id = origin.project_id WHERE origin.id = ? AND origin.project_id = ?', [
+    run.scope.conversationId,
+    projectId,
+  ]);
+  return { localPath: merge.integrationPath, workspaceMode: 'worktree', permissionMode: settings.permissionMode, skillId: settings.skillId ?? null, taskId: origin?.taskId ?? null };
 }
 
 /** 执行器只编排现有交付能力，窗口关闭后仍由宿主持有运行。 */
@@ -246,12 +294,16 @@ export class GitDeliveryExecution {
   private stopped = false;
   /** 退出时终止当前 Git 进程组，未确认写入由重启恢复核对。 */
   private readonly shutdown = new AbortController();
-  /** 仅唤醒等待 AI 的运行，进度仍由真实状态决定。 */
+  /** 仅唤醒等待 AI 或命令的运行，进度仍由真实状态决定。 */
   private timer: ReturnType<typeof setInterval> | undefined;
   /** 已发布的进度投影，无业务变化时不重复广播。 */
   private readonly publishedProgress = new Map<string, string>();
   /** 活跃推进期间到达的终态事件，等待本轮结束后再核对。 */
   private readonly pendingWakeups = new Set<string>();
+  /** 一次交付包含 AI 和命令等待，期间始终占用项目队首。 */
+  private readonly projectOwners = new Map<string, string>();
+  /** 终止结果核实前仍保留项目所有权，不让下一项抢占现场。 */
+  private readonly stopping = new Map<string, Promise<void>>();
 
   /** 注入现有命令与查询能力，不启动额外服务。 */
   constructor(private readonly options: DeliveryExecutionDependencies) {
@@ -264,9 +316,14 @@ export class GitDeliveryExecution {
     /** 复用现有 HTTP 幂等事务实现接纳和手动继续。 */
     const mutations = new AutomationMutationApplication(db);
     /** 所有入口都保持真实项目归属。 */
-    const requireRun = (projectId: string, id: string) => {
+    const requireRun = (projectId: string, id: string, forWrite = false) => {
       const run = this.repository.get(id);
       if (!run || run.projectId !== projectId) throw deliveryError('交付记录不存在。', 'ZEUS_GIT_DELIVERY_NOT_FOUND', 404);
+      if (forWrite) {
+        if (this.stopping.has(id)) throw deliveryError('正在终止，请等待当前操作确认结束。');
+        if (this.repository.latest(projectId, run.scope)?.id !== id) throw deliveryError('这不是最后一次交付，请处理当前最新记录。', 'ZEUS_GIT_DELIVERY_SUPERSEDED');
+        this.assertMergeDirection(run);
+      }
       return run;
     };
     /** 共享错误映射，不把接纳失败显示为后台运行。 */
@@ -274,12 +331,12 @@ export class GitDeliveryExecution {
       reply.code((error as { statusCode?: number }).statusCode ?? 500).send({ error: (error as { code?: string }).code ?? 'ZEUS_GIT_DELIVERY_FAILED', message: error instanceof Error ? error.message : '交付失败。' });
     server.get<{ Params: { projectId: string } }>('/api/projects/:projectId/git-delivery-options', async (request, reply) => {
       if (!this.options.projects.getById(request.params.projectId)) return reply.code(404).send({ message: '项目不存在。' });
-      return { statuses: this.options.statusOptions(request.params.projectId) };
+      return { statuses: this.options.statusOptions(request.params.projectId), commands: new CommandDefinitionRepository(db).listMerged(request.params.projectId, true) };
     });
     server.get<{ Params: { projectId: string }; Querystring: { scopeId?: string } }>('/api/projects/:projectId/git-delivery-runs', async (request, reply) => {
       try {
         if (!this.options.projects.getById(request.params.projectId)) throw deliveryError('项目不存在。', undefined, 404);
-        return { items: this.repository.list(request.params.projectId, request.query.scopeId).map((run) => this.repository.view(run)) };
+        return { items: this.repository.list(request.params.projectId, request.query.scopeId).map((run) => this.view(run)) };
       } catch (error) {
         return fail(reply, error);
       }
@@ -294,21 +351,35 @@ export class GitDeliveryExecution {
         const previous = this.repository.get(stableId);
         if (previous) {
           if (canonicalCommandInputJson(previous.input) !== canonicalCommandInputJson(input)) throw deliveryError('同一次运行身份不能用于不同输入。');
-          return reply.code(202).send(this.repository.view(previous));
+          return reply.code(202).send(this.view(previous));
         }
         const names: Record<string, string> = {};
-        for (const selection of input.repositories) names[selection.repositoryId] = (await this.resolve(request.params.projectId, input, selection)).name;
+        for (const selection of input.repositories) {
+          /** 接纳前校验目标属于该仓库，避免提交完成后才发现目标选错。 */
+          const context = await this.resolve(request.params.projectId, input, selection);
+          names[selection.repositoryId] = context.name;
+          if (input.settings.merge) {
+            const repository = await getGitRepositoryContext(context.repositoryPath ?? context.path);
+            const unborn = !repository.detached && !repository.headSha && repository.branch === selection.mergeBranch;
+            if (!repository.localBranches.includes(selection.mergeBranch) && !unborn) throw deliveryError('所选目标分支在本地不存在，请刷新后重新选择。');
+          }
+        }
         await this.assertDirectoryCoverage(input);
-        const task = input.scope.kind === 'task' ? this.options.tasks.getById(input.scope.taskId) : null;
+        for (const selection of input.postPushCommands ?? []) names[selection.commandId] = this.requirePostPushCommand(request.params.projectId, selection).title;
+        const taskId = input.scope.kind === 'task' ? input.scope.taskId : this.options.conversations.getRecordById(input.scope.conversationId)?.taskId;
+        const task = taskId ? this.options.tasks.getById(taskId) : null;
+        if (input.settings.finalTaskStatus && (!task || task.projectId !== request.params.projectId)) throw deliveryError('当前会话未关联本项目任务，不能变更任务状态。', undefined, 400);
+        if (input.settings.archiveConversation && taskId) throw deliveryError('关联任务的会话应使用任务状态收尾。', undefined, 400);
         if (input.settings.finalTaskStatus && !this.options.statusOptions(request.params.projectId).some((status) => status.id === input.settings.finalTaskStatus)) throw deliveryError('所选任务状态已不存在，请重新设置。');
         const result = mutations.execute({ method: 'POST', url: request.url, body: input, key }, () => ({
           statusCode: 202,
-          body: this.repository.view(this.repository.create(stableId, request.params.projectId, input, names, task?.managementStatus ?? null)),
+          body: this.repository.view(this.repository.create(stableId, request.params.projectId, input, names, task?.managementStatus ?? null, taskId)),
         }));
         const run = result.body as GitDeliveryRun;
         this.authorized.add(run.id);
         setImmediate(() => this.kick(run.id));
-        return reply.code(result.statusCode).send(this.repository.view(requireRun(request.params.projectId, run.id)));
+        this.changed(run.id);
+        return reply.code(result.statusCode).send(this.view(requireRun(request.params.projectId, run.id)));
       } catch (error) {
         return fail(reply, error);
       }
@@ -316,10 +387,17 @@ export class GitDeliveryExecution {
     server.post<{ Params: { projectId: string; runId: string }; Body: { confirmWorktreeCleanup?: boolean } }>('/api/projects/:projectId/git-delivery-runs/:runId/resume', async (request, reply) => {
       try {
         this.assertWritable();
-        const run = requireRun(request.params.projectId, request.params.runId);
-        if (this.active.has(run.id)) return reply.code(202).send(this.repository.view(run));
+        const run = requireRun(request.params.projectId, request.params.runId, true);
+        if (this.active.has(run.id) || this.authorized.has(run.id) || run.state === 'succeeded') return reply.code(202).send(this.view(run));
+        let accepted = false;
         const result = mutations.execute({ method: 'POST', url: request.url, body: request.body, key: request.headers['idempotency-key'] }, () => {
+          accepted = true;
           for (const step of run.steps) {
+            if (step.result?.deliveryStopped) {
+              step.result = { ...step.result, deliveryStopped: false };
+              step.message = null;
+              this.repository.updateStep(step, {});
+            }
             if (step.state === 'attention') {
               /** 只有明确未完成的同步阶段可以重做，其余成功回执保持不变。 */
               const phases = { ...((step.result?.phases as Record<string, Record<string, unknown>>) ?? {}) };
@@ -327,20 +405,45 @@ export class GitDeliveryExecution {
               const aiFinal = phases.ai_finalize;
               if (aiFinal && (aiFinal.integration as { state?: string } | undefined)?.state !== 'merged') delete phases.ai_finalize;
               if (final && final.localSyncStatus !== 'synced' && (final.integration as { state?: string } | undefined)?.state !== 'merged') delete phases.finalize;
+              // 命令只有明确失败后才接受再次运行；成功 Git 步骤及旧命令运行记录保持不变。
+              if (step.action === 'command') {
+                this.repository.updateStep(step, { state: 'pending', attempt: step.attempt + 1, commandId: null, message: null, result: null });
+                continue;
+              }
               this.repository.updateStep(step, {
                 state: 'pending',
                 attempt: step.attempt + 1,
                 message: null,
-                result: { ...step.result, phases, ...(step.action === 'task_status' && step.result?.cleanupConfirmation && request.body?.confirmWorktreeCleanup === true ? { confirmWorktreeCleanup: true } : {}) },
+                result: { ...step.result, phases, ...(step.result?.cleanupConfirmation && request.body?.confirmWorktreeCleanup === true ? { confirmWorktreeCleanup: true } : {}) },
               });
             }
           }
           this.repository.updateState(run.id, 'queued');
           return { statusCode: 202, body: this.repository.view(this.repository.get(run.id)!) };
         });
-        this.authorized.add(run.id);
-        setImmediate(() => this.kick(run.id));
-        return reply.code(result.statusCode).send(result.body);
+        if (accepted) {
+          this.authorized.add(run.id);
+          setImmediate(() => this.kick(run.id));
+        }
+        this.changed(run.id);
+        return reply.code(result.statusCode).send(this.view(this.repository.get(run.id)!));
+      } catch (error) {
+        return fail(reply, error);
+      }
+    });
+    server.post<{ Params: { projectId: string; runId: string }; Body: Record<string, never> }>('/api/projects/:projectId/git-delivery-runs/:runId/stop', async (request, reply) => {
+      try {
+        this.assertWritable();
+        const run = requireRun(request.params.projectId, request.params.runId);
+        if (run.state === 'succeeded' || this.stopping.has(run.id) || this.repository.view(run).stopped) return reply.code(202).send(this.view(run));
+        let accepted = false;
+        mutations.execute({ method: 'POST', url: request.url, body: request.body, key: request.headers['idempotency-key'] }, () => {
+          accepted = true;
+          this.repository.updateState(run.id, 'attention');
+          return { statusCode: 202, body: { id: run.id } };
+        });
+        if (accepted) this.requestStop(run.id);
+        return reply.code(202).send(this.view(this.repository.get(run.id)!));
       } catch (error) {
         return fail(reply, error);
       }
@@ -375,7 +478,7 @@ export class GitDeliveryExecution {
       async (request, reply) => {
         try {
           this.assertWritable();
-          const run = requireRun(request.params.projectId, request.params.runId);
+          const run = requireRun(request.params.projectId, request.params.runId, true);
           const step = run.steps.find((item) => item.id === request.params.stepId);
           const merge = step?.result?.merge as GitDeliveryMergeResult | undefined;
           const taskIntegration = step?.integrationId ? this.options.taskIntegrations.getById(step.integrationId) : undefined;
@@ -401,12 +504,13 @@ export class GitDeliveryExecution {
       async (request, reply) => {
         try {
           this.assertWritable();
-          const run = requireRun(request.params.projectId, request.params.runId);
+          const run = requireRun(request.params.projectId, request.params.runId, true);
           const step = run.steps.find((item) => item.id === request.params.stepId);
           if (!step || step.action !== 'merge' || step.state !== 'attention' || this.active.has(run.id) || step.conversationId) throw deliveryError('请打开已有冲突会话，或等待当前操作完成。');
           if (!['auto', 'full-access'].includes(request.body.permissionMode) || typeof request.body.path !== 'string' || typeof request.body.content !== 'string' || typeof request.body.fingerprint !== 'string')
             throw deliveryError('冲突 AI 请求无效。', undefined, 400);
           const result = mutations.execute({ method: 'POST', url: request.url, body: request.body, key: request.headers['idempotency-key'] }, () => {
+            for (const current of run.steps) if (current.result?.deliveryStopped) this.repository.updateStep(current, { result: { ...current.result, deliveryStopped: false } });
             for (const pending of run.steps.filter((item) => item.action === 'merge' && (item.state === 'attention' || item.state === 'pending') && !item.conversationId)) {
               /** 权限覆盖本次交付全部冲突仓库，手工草稿只属于当前确切步骤。 */
               const authorization = pending.id === step.id ? request.body : { permissionMode: request.body.permissionMode, skillId: request.body.skillId, path: '', content: '', fingerprint: '' };
@@ -428,22 +532,45 @@ export class GitDeliveryExecution {
   /** 恢复只读取已保存事实，未知步骤不盲目重放。 */
   recover(): void {
     if (this.options.readOnly) return;
+    /** 包含已完成运行的旧冲突会话，按持久交付身份补齐任务关联。 */
+    for (const row of this.options.db.select<{ id: string }>(
+      'SELECT DISTINCT conversation.id FROM conversations conversation JOIN git_delivery_steps step ON step.conversation_id = conversation.id WHERE conversation.task_id IS NULL AND step.action = ?',
+      ['merge'],
+    ))
+      this.options.conversations.attachDeliveryConflictTask(row.id);
     for (const run of this.repository.unfinished()) {
       for (const step of run.steps) if (step.state === 'running') this.repository.updateStep(step, { state: 'unknown', message: '宿主已重启，请继续以核对原命令结果。' });
       this.repository.updateState(run.id, 'attention');
     }
-    // 事件遗漏时只核对已授权运行的 AI 状态，不扫描 Git 或重复推进仍在等待的运行。
+    // 事件遗漏时只核对已授权运行的 AI 和命令状态，不扫描 Git 或重复推进仍在等待的运行。
     this.timer ??= setInterval(() => this.wakeWaiting(), 30_000);
     this.timer.unref();
   }
 
-  /** 会话状态变化唤醒关联交付；仍在运行的 AI 不触发仓库读取。 */
+  /** 会话或命令状态变化唤醒关联交付，仍在运行的步骤不重复推进。 */
   wakeWaiting(conversationId?: string): void {
     if (this.stopped) return;
+    /** 停止回执迟到时只核对原运行，原进程确认退出后自动释放队列。 */
+    for (const id of this.projectOwners.values()) {
+      if (this.authorized.has(id) || this.active.has(id) || this.stopping.has(id)) continue;
+      const run = this.repository.get(id);
+      if (run && (!conversationId || run.steps.some((step) => step.conversationId === conversationId))) this.requestStop(id);
+    }
     for (const id of this.authorized) {
       /** 每次读取当前步骤，不能沿用上一次冲突会话身份。 */
       const run = this.repository.get(id);
-      if (!run?.steps.some((step) => step.state === 'waiting' && step.conversationId && (!conversationId || step.conversationId === conversationId) && this.options.conversationState(step.conversationId) !== 'running')) continue;
+      if (
+        !run?.steps.some((step) => {
+          if (step.state !== 'waiting') return false;
+          if (step.action === 'command' && !conversationId) {
+            /** 只有命令进入终态或记录缺失才唤醒，不反复刷新仍在运行的进程。 */
+            const command = new CommandRunRepository(this.options.db).getById(`${step.id}:${step.attempt}:confirmation`);
+            return !command || !['starting', 'running', 'stopping'].includes(command.status);
+          }
+          return step.conversationId && (!conversationId || step.conversationId === conversationId) && this.options.conversationState(step.conversationId) !== 'running';
+        })
+      )
+        continue;
       if (this.active.has(id)) this.pendingWakeups.add(id);
       else this.kick(id);
     }
@@ -454,17 +581,119 @@ export class GitDeliveryExecution {
     this.stopped = true;
     this.shutdown.abort();
     clearInterval(this.timer);
-    await Promise.allSettled(this.active.values());
+    await Promise.allSettled([...this.active.values(), ...this.stopping.values()]);
+  }
+
+  /** 每个项目只推进队首；继续运行按新的接纳时间排到队尾。 */
+  private releaseProject(projectId: string, id: string): void {
+    if (this.projectOwners.get(projectId) === id) this.projectOwners.delete(projectId);
+    if (this.stopped || this.projectOwners.has(projectId)) return;
+    for (const candidate of this.authorized) {
+      if (this.repository.get(candidate)?.projectId !== projectId) continue;
+      this.kick(candidate);
+      return;
+    }
+  }
+
+  /** 终止只撤销尚未发出的写入；已开始的操作先保存原回执，再停止关联进程。 */
+  private requestStop(id: string): void {
+    this.authorized.delete(id);
+    this.pendingWakeups.delete(id);
+    const work = (async () => {
+      await this.active.get(id);
+      const run = this.repository.get(id)!;
+      await this.stopBackgroundWork(run);
+      const remaining = this.repository.get(id)!.steps.find((step) => step.state !== 'succeeded');
+      if (remaining) {
+        this.repository.updateStep(remaining, { state: remaining.state === 'unknown' ? 'unknown' : 'attention', message: remaining.message || '已终止，可继续未完成步骤。', result: { ...remaining.result, deliveryStopped: true } });
+        this.repository.updateState(id, 'attention');
+      } else this.repository.updateState(id, 'succeeded');
+    })();
+    this.stopping.set(id, work);
+    this.changed(id);
+    void work.then(
+      () => {
+        this.stopping.delete(id);
+        this.changed(id);
+        this.releaseProject(this.repository.get(id)!.projectId, id);
+      },
+      (error: unknown) => {
+        this.stopping.delete(id);
+        const run = this.repository.get(id)!;
+        const step = run.steps.find((item) => item.state !== 'succeeded');
+        if (step) this.repository.updateStep(step, { message: error instanceof Error ? error.message : '终止结果尚未确认，请重新终止或核对原运行。' });
+        this.repository.updateState(id, 'attention');
+        this.changed(id);
+        // 未确认停止时保留项目队首，避免后台进程与下一项同时写入。
+      },
+    );
+  }
+
+  /** 关联命令和冲突 AI 使用各自现有的停止协议及稳定操作身份。 */
+  private async stopBackgroundWork(run: GitDeliveryRunRecord): Promise<void> {
+    for (const step of run.steps) {
+      if (step.state === 'succeeded') continue;
+      if (step.action === 'command') {
+        const command = new CommandRunRepository(this.options.db).getById(postPushCommandRunId(step));
+        if (command && ['starting', 'running', 'stopping'].includes(command.status)) {
+          if (command.status !== 'running') throw deliveryError('命令尚未确认停止，请在命令页核对原运行后继续。');
+          await this.http('POST', `/api/command-runs/${encodeURIComponent(command.id)}/stop`, gitDeliveryCommand(commandCenterCommandTypes.runStop, 'command_run', command.id, `${run.id}:${step.id}:${step.attempt}:stop`, {}));
+          const stopped = new CommandRunRepository(this.options.db).getById(command.id);
+          if (!stopped || ['starting', 'running', 'stopping'].includes(stopped.status)) throw deliveryError('命令停止结果尚未确认，请核对原运行。');
+        }
+        const observed = command ? new CommandRunRepository(this.options.db).getById(command.id) : undefined;
+        if (observed && observed.status !== 'pending_confirmation') {
+          if (observed.runtimeSessionId && !(await this.options.waitForCommandExit?.(observed.runtimeSessionId))) throw deliveryError('命令进程尚未确认退出，请等待停止结果。');
+          this.observePostPushCommand(step, observed);
+        }
+      }
+      if (!step.conversationId || !['running', 'waiting'].includes(this.options.conversationState(step.conversationId))) continue;
+      const base = `/api/projects/${encodeURIComponent(run.projectId)}/conversations/${encodeURIComponent(step.conversationId)}`;
+      for (const submission of this.options.conversationSubmissions.listByConversation(step.conversationId)) {
+        if (!['queued', 'dispatching'].includes(submission.status)) continue;
+        await this.http(
+          'DELETE',
+          `${base}/queue/${encodeURIComponent(submission.id)}`,
+          gitDeliveryCommand(conversationDispatchWireCommandTypes.queueDelete, 'submission', submission.id, `${run.id}:${step.attempt}:${submission.id}:stop`, {}),
+        );
+        const current = this.step(step);
+        this.repository.updateStep(current, { result: { ...current.result, stoppedSubmissions: [...((current.result?.stoppedSubmissions as string[] | undefined) ?? []), submission.id] } });
+      }
+      const turn = this.options.conversationTurns?.getLatestActiveByConversation(step.conversationId);
+      if (turn)
+        await this.http(
+          'POST',
+          `${base}/turns/${encodeURIComponent(turn.id)}/interrupt`,
+          gitDeliveryCommand(conversationDispatchWireCommandTypes.turnInterrupt, 'turn', turn.providerTurnId ?? turn.id, `${run.id}:${step.attempt}:${turn.id}:stop`, {}),
+        );
+      else if (this.options.conversationState(step.conversationId) === 'running') throw deliveryError('冲突 AI 的停止结果尚未确认，请核对原会话。');
+      const current = this.step(step);
+      this.repository.updateStep(current, { state: current.state === 'unknown' ? 'unknown' : 'attention', result: { ...current.result, resumeStoppedConversation: true } });
+      /** 接纳中断不等于进程已退出，确认前不能释放项目队首。 */
+      const deadline = Date.now() + 10_000;
+      while (['running', 'waiting'].includes(this.options.conversationState(step.conversationId))) {
+        if (Date.now() >= deadline) throw deliveryError('冲突 AI 的停止结果尚未确认，请核对原会话。');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+
+  /** 终止中的投影来自当前执行器，已终止标记继续读取耐久步骤结果。 */
+  private view(run: GitDeliveryRunRecord): GitDeliveryRun {
+    return { ...this.repository.view(run), stopping: this.stopping.has(run.id) };
   }
 
   /** 同一运行最多一轮推进，仓库之间保留独立结果。 */
   private kick(id: string): void {
-    if (this.stopped || this.active.has(id)) return;
+    if (this.stopped || !this.authorized.has(id) || this.active.has(id) || this.stopping.has(id)) return;
     const run = this.repository.get(id);
     if (!run || run.state === 'succeeded') {
       this.authorized.delete(id);
       return;
     }
+    const owner = this.projectOwners.get(run.projectId);
+    if (owner && owner !== id) return;
+    this.projectOwners.set(run.projectId, id);
     const work = withGitOperationSignal(this.shutdown.signal, () => this.advance(run))
       .catch((error) => {
         this.authorized.delete(id);
@@ -476,20 +705,48 @@ export class GitDeliveryExecution {
         this.changed(id);
         if (this.pendingWakeups.delete(id)) this.wakeWaiting();
         if (!this.authorized.has(id)) this.publishedProgress.delete(id);
+        if (!this.authorized.has(id) && !this.stopping.has(id)) this.releaseProject(run.projectId, id);
       });
     this.active.set(id, work);
   }
 
+  /** 旧会话交付曾把来源合入当前分支；保留其回执与隔离目录，禁止反向结果继续进入推送或收尾。 */
+  private assertMergeDirection(run: GitDeliveryRunRecord): void {
+    if (run.scope.kind !== 'conversation' || !run.input.settings.merge) return;
+    for (const selection of run.input.repositories) {
+      /** 优先使用完整候选；崩溃恢复可能暂时只有已接纳的 Git 回执。 */
+      const step = run.steps.find((candidate) => candidate.repositoryId === selection.repositoryId && candidate.action === 'merge');
+      const merge = step?.result?.merge as GitDeliveryMergeResult | undefined;
+      const started = (step?.result?.phases as Record<string, Record<string, unknown>> | undefined)?.merge;
+      if (!merge && !started && step?.state !== 'succeeded') continue;
+      if ((merge?.sourceBranch ?? started?.taskBranch) !== selection.expectedBranch || (merge?.targetBranch ?? started?.targetBranch) !== selection.mergeBranch)
+        throw deliveryError(
+          `${step?.repositoryName ?? selection.repositoryId} 的旧交付结果不是“${selection.expectedBranch} → ${selection.mergeBranch}”。原结果已保留，请重新发起交付，不能继续复用这次运行。`,
+          'ZEUS_GIT_DELIVERY_MERGE_DIRECTION_CHANGED',
+        );
+    }
+  }
+
   /** 每仓依次推进，失败仓库不阻塞其他仓库。 */
   private async advance(run: GitDeliveryRunRecord): Promise<void> {
+    this.assertMergeDirection(run);
     this.repository.updateState(run.id, 'running');
+    this.changed(run.id);
     await Promise.all(
       run.input.repositories.map(async (selection) => {
+        // 推送后命令等待期间不重读已成功仓库，已完成的 Git 操作不再次进入执行链。
+        if (
+          this.repository
+            .get(run.id)!
+            .steps.filter((step) => step.repositoryId === selection.repositoryId)
+            .every((step) => step.state === 'succeeded')
+        )
+          return;
         try {
           const context = await this.resolve(run.projectId, run.input, selection);
           await withGitRepositoryOperation(context.repositoryPath ?? context.path, async () => {
             for (const original of this.repository.get(run.id)!.steps.filter((step) => step.repositoryId === selection.repositoryId)) {
-              if (this.stopped) return;
+              if (this.stopped || !this.authorized.has(run.id)) return;
               if (original.state === 'succeeded') continue;
               if (original.state === 'attention') return;
               if (original.state === 'waiting' && original.conversationId && this.options.conversationState(original.conversationId) === 'running') return;
@@ -515,22 +772,27 @@ export class GitDeliveryExecution {
       }),
     );
     let current = this.repository.get(run.id)!;
-    if (!this.stopped && current.steps.filter((step) => step.action !== 'task_status').every((step) => step.state === 'succeeded')) {
-      const status = current.steps.find((step) => step.action === 'task_status');
+    if (!this.stopped && this.authorized.has(run.id) && current.steps.filter((step) => step.repositoryId !== null).every((step) => step.state === 'succeeded')) {
+      await this.advancePostPushCommands(current);
+      current = this.repository.get(run.id)!;
+    }
+    if (!this.stopped && this.authorized.has(run.id) && current.steps.filter((step) => step.action !== 'task_status' && step.action !== 'conversation_archive').every((step) => step.state === 'succeeded')) {
+      const status = current.steps.find((step) => step.action === 'task_status' || step.action === 'conversation_archive');
       if (status && status.state !== 'succeeded' && status.state !== 'attention') {
         try {
-          await this.changeTaskStatus(current, status);
+          if (status.action === 'conversation_archive') await this.archiveConversation(current, status);
+          else await this.changeTaskStatus(current, status);
         } catch (error) {
           const latest = this.step(status);
           const details = (error as { details?: Record<string, unknown> }).details;
           this.repository.updateStep(latest, {
             state: /OUTCOME_UNKNOWN|RESULT_MISSING/u.test(String((error as { code?: string }).code)) ? 'unknown' : 'attention',
-            message: error instanceof Error ? error.message : '任务状态变更失败。',
-            ...(details?.error === 'ZEUS_TASK_WORKTREE_CLEANUP_CONFIRMATION_REQUIRED'
+            message: error instanceof Error ? error.message : '交付收尾失败。',
+            ...(['ZEUS_TASK_WORKTREE_CLEANUP_CONFIRMATION_REQUIRED', 'ZEUS_CONVERSATION_WORKTREE_CLEANUP_CONFIRMATION_REQUIRED'].includes(String(details?.error))
               ? {
                   result: {
                     ...latest.result,
-                    cleanupConfirmation: { dirtyWorkspaceCount: details.dirtyWorkspaceCount, activeConversationCount: details.activeConversationCount, activeRuntimeSessionCount: details.activeRuntimeSessionCount },
+                    cleanupConfirmation: { dirtyWorkspaceCount: details?.dirtyWorkspaceCount, activeConversationCount: details?.activeConversationCount, activeRuntimeSessionCount: details?.activeRuntimeSessionCount },
                   },
                 }
               : {}),
@@ -539,9 +801,106 @@ export class GitDeliveryExecution {
       }
     }
     current = this.repository.get(run.id)!;
-    const state = current.steps.every((step) => step.state === 'succeeded') ? 'succeeded' : current.steps.some((step) => step.state === 'waiting') ? 'running' : 'attention';
+    const state = current.steps.every((step) => step.state === 'succeeded') ? 'succeeded' : this.authorized.has(run.id) && current.steps.some((step) => step.state === 'waiting') ? 'running' : 'attention';
     this.repository.updateState(run.id, state);
     if (state !== 'running') this.authorized.delete(run.id);
+  }
+
+  /** 接纳前及真正执行前核对原命令版本、参数与权限，不创建另一份脚本。 */
+  private requirePostPushCommand(projectId: string, selection: { commandId: string; expectedRevision: number }): CommandDefinition {
+    /** 仅允许当前项目可运行的命令，定义更新不能静默改变已接纳的组合。 */
+    const definition = new CommandDefinitionRepository(this.options.db).getById(selection.commandId);
+    if (!definition || !definition.enabled || (definition.scope === 'project' && definition.projectId !== projectId)) throw deliveryError('所选推送后命令已停用、删除或不属于当前项目。');
+    if (definition.revision !== selection.expectedRevision) throw deliveryError(`命令「${definition.title}」已修改，请重新审阅并运行组合。`);
+    /** 已配置的默认参数与独立运行使用同一校验，不把缺参留到推送完成才发现。 */
+    const parameters = normalizeCommandRunParameters(definition.parameters, {});
+    if ('issues' in parameters) throw deliveryError(`命令「${definition.title}」缺少有效默认参数：${parameters.issues.map((issue) => issue.field).join('、')}。请先在命令页配置。`);
+    /** 权限失败发生在 Git 副作用之前，运行时的权限收紧仍由命令中心拦截。 */
+    const security = this.options.commandSecurity(projectId);
+    if (!security.allowShell || (definition.riskFlags.gitWrite && !security.allowGitWrite)) throw deliveryError(`命令「${definition.title}」缺少项目命令权限，请先在命令页开启。`);
+    return definition;
+  }
+
+  /** 命令只在全部仓库推送完成后顺序执行，不占用仓库锁。 */
+  private async advancePostPushCommands(run: GitDeliveryRunRecord): Promise<void> {
+    for (const original of run.steps.filter((step) => step.action === 'command')) {
+      if (this.stopped || !this.authorized.has(run.id) || original.state === 'attention') return;
+      if (original.state === 'succeeded') continue;
+      try {
+        if (!(await this.executePostPushCommand(run, original))) return;
+        this.changed(run.id);
+      } catch (error) {
+        /** 已开始的命令交给原运行记录核对，不能把传输异常当成确定未执行。 */
+        const step = this.step(original);
+        const message = error instanceof Error ? error.message : '推送后命令执行失败。';
+        const receipt = step.commandId ? this.options.commands.inspectOutcome(step.commandId)?.attempts.at(-1)?.receipt : undefined;
+        /** 命令中心参数校验在持久接纳和进程启动之前拒绝，不属于未知外部结果。 */
+        const rejectedBeforeWrite = (error as { code?: string }).code === 'ZEUS_COMMAND_CENTER_COMMAND_INVALID';
+        const unknown = !rejectedBeforeWrite && (step.state === 'unknown' || (step.result?.pendingCommand && !receipt) || /OUTCOME_UNKNOWN|RESULT_MISSING/u.test(String((error as { code?: string }).code)));
+        this.repository.updateStep(step, { state: unknown ? 'unknown' : 'attention', message });
+        return;
+      }
+    }
+  }
+
+  /** 启动使用原命令确认及执行入口，完成只认命令中心持久状态。 */
+  private async executePostPushCommand(run: GitDeliveryRunRecord, original: GitDeliveryStepRecord): Promise<boolean> {
+    /** 已开始命令在定义后续变化时仍核对自己的冻结快照。 */
+    const existing = new CommandRunRepository(this.options.db).getById(postPushCommandRunId(original));
+    if (existing && existing.status !== 'pending_confirmation') return this.observePostPushCommand(original, existing);
+    if (original.state === 'unknown' || original.state === 'running') {
+      await this.reconcile(original);
+      if (this.step(original).state === 'unknown') return false;
+    }
+    /** 从固定输入查找版本，不能从最新命令列表重建授权。 */
+    const selection = run.input.postPushCommands?.find((command) => command.commandId === original.commandDefinitionId);
+    if (!selection) throw deliveryError('缺少本次命令的固定选择。');
+    this.requirePostPushCommand(run.projectId, selection);
+    /** 身份和阶段先持久保存，再调用原运行入口。 */
+    const step = this.step(original);
+    /** 核对明确未接纳的请求会推进尝试次数，运行身份必须取核对后的步骤。 */
+    const runId = postPushCommandRunId(step);
+    this.repository.updateStep(step, { state: 'running', message: null });
+    /** 命令确认紧邻启动生成，不会在漫长 Git 操作期间过期。 */
+    const confirmation = await this.command(
+      run,
+      step,
+      'confirmation',
+      `/api/projects/${encodeURIComponent(run.projectId)}/commands/${encodeURIComponent(selection.commandId)}/confirmations`,
+      commandCenterCommandTypes.confirmationCreate,
+      'command_run',
+      runId,
+      { trigger: 'desktop', expectedRevision: selection.expectedRevision },
+    );
+    await this.command(run, this.step(step), 'start', `/api/projects/${encodeURIComponent(run.projectId)}/commands/${encodeURIComponent(selection.commandId)}/runs`, commandCenterCommandTypes.runStart, 'command_run', runId, {
+      runId,
+      confirmationId: confirmation.id,
+    });
+    /** HTTP 接纳不代表进程成功，重新读取命令中心的运行事实。 */
+    const started = new CommandRunRepository(this.options.db).getById(runId);
+    if (!started) throw deliveryError('命令已接纳但运行记录不可读，请核对原运行。', 'ZEUS_GIT_DELIVERY_OUTCOME_UNKNOWN');
+    return this.observePostPushCommand(this.step(step), started);
+  }
+
+  /** 真实退出结果决定交付步骤；失败保留原因，继续时只重试这一条命令。 */
+  private observePostPushCommand(original: GitDeliveryStepRecord, command: CommandRun): boolean {
+    /** 读取最新阶段回执，不能用进入异步前的快照覆盖启动记录。 */
+    const step = this.step(original);
+    if (command.status === 'succeeded') {
+      this.succeed(step);
+      return true;
+    }
+    // 启动写入未确认时保持未知，不能把未绑定进程的 starting 当成仍在正常运行。
+    if (command.status === 'starting' && !command.runtimeSessionId && (!step.commandId || this.options.commands.inspectOutcome(step.commandId)?.attempts.at(-1)?.receipt?.outcome !== 'accepted')) {
+      this.repository.updateStep(step, { state: 'unknown', message: command.failureReason || '命令启动结果尚未确认，请在命令页核对原运行。' });
+      return false;
+    }
+    if (['starting', 'running', 'stopping'].includes(command.status)) {
+      this.repository.updateStep(step, { state: 'waiting', message: null });
+      return false;
+    }
+    this.repository.updateStep(step, { state: 'attention', message: command.failureReason || `命令未完成（${command.status}${command.exitCode === null ? '' : `，退出码 ${command.exitCode}`}）。` });
+    return false;
   }
 
   /** 重启后仅恢复已经存在的命令结果；没有写出标记才允许重新进入步骤。 */
@@ -554,7 +913,8 @@ export class GitDeliveryExecution {
     const snapshot = this.options.commands.inspectOutcome(step.commandId);
     const latest = snapshot?.attempts.at(-1);
     if (!snapshot || latest?.receipt?.outcome === 'failed_before_write' || latest?.receipt?.outcome === 'explicitly_rejected') {
-      this.repository.updateStep(step, { state: 'pending', attempt: step.attempt + 1, message: null });
+      /** 命令重试使用新运行身份，确认和启动回执不能跨尝试复用。 */
+      this.repository.updateStep(step, { state: 'pending', attempt: step.attempt + 1, message: null, ...(step.action === 'command' ? { commandId: null, result: null } : {}) });
       return;
     }
     if (latest?.receipt?.outcome !== 'accepted') {
@@ -596,6 +956,8 @@ export class GitDeliveryExecution {
       if (step.state === 'unknown') return false;
     }
     const phases = (step.result?.phases ?? {}) as Record<string, Record<string, unknown>>;
+    /** 结果核对可能刚恢复旧命令回执，重建候选前再次验证真实合入方向。 */
+    this.assertMergeDirection(this.repository.get(run.id)!);
     if ((step.action === 'commit' && phases.commit) || (step.action === 'push' && phases.push)) {
       this.succeed(step);
       return true;
@@ -611,8 +973,8 @@ export class GitDeliveryExecution {
             ...step.result,
             merge: {
               integrationPath: saved.integrationPath,
-              sourceBranch: selection.mergeBranch,
-              targetBranch: selection.expectedBranch,
+              sourceBranch: selection.expectedBranch,
+              targetBranch: selection.mergeBranch,
               sourceHeadSha: saved.taskHeadSha,
               targetHeadSha: saved.targetHeadSha,
               conflictFiles: saved.conflictFiles,
@@ -654,9 +1016,21 @@ export class GitDeliveryExecution {
     const committedResult = committed?.commit;
     const committedHead = (committedResult?.result as { headSha?: string } | undefined)?.headSha ?? committedResult?.headSha;
     const mergedStep = previousSteps.find((item) => item.action === 'merge');
-    const mergedHead = scope.kind === 'task' && mergedStep?.integrationId ? this.options.taskIntegrations.getById(mergedStep.integrationId)?.taskHeadSha : (mergedStep?.result?.merge as GitDeliveryMergeResult | undefined)?.resultHeadSha;
+    /** 合入推进的是目标分支，当前开发分支仍应停留在已交付的输入提交。 */
+    const mergedHead = scope.kind === 'task' && mergedStep?.integrationId ? this.options.taskIntegrations.getById(mergedStep.integrationId)?.taskHeadSha : (mergedStep?.result?.merge as GitDeliveryMergeResult | undefined)?.sourceHeadSha;
     const expectedHead = mergedHead ?? (typeof committedHead === 'string' ? committedHead : selection.expectedHeadSha);
     if (snapshot.headSha !== expectedHead) throw deliveryError('运行范围之外出现了新提交，请重新审阅后运行。');
+    /** 用户继续后，在排到项目队首且原分支仍有效时恢复原冲突会话。 */
+    if (step.result?.resumeStoppedConversation && step.conversationId) {
+      const base = `/api/projects/${encodeURIComponent(run.projectId)}/conversations/${encodeURIComponent(step.conversationId)}`;
+      for (const submissionId of (step.result.stoppedSubmissions as string[] | undefined) ?? []) {
+        await this.command(run, this.step(step), `resume_ai_${step.attempt}_${submissionId}`, `${base}/queue/${encodeURIComponent(submissionId)}/retry`, conversationDispatchWireCommandTypes.queueRetry, 'submission', submissionId, {});
+      }
+      await this.command(run, this.step(step), `resume_ai_${step.attempt}`, `${base}/queue/resume`, conversationDispatchWireCommandTypes.queueResume, 'product_conversation', step.conversationId, {});
+      const current = this.step(step);
+      this.repository.updateStep(current, { state: 'waiting', message: null, result: { ...current.result, resumeStoppedConversation: false, stoppedSubmissions: [] } });
+      return false;
+    }
     if (step.action === 'merge' && (step.integrationId || step.result?.merge)) return this.finishMerge(run, step, selection, context);
     if (step.state === 'unknown') throw deliveryError('上次写入结果尚未确定，请核对原命令回执和仓库状态；不会重复执行。', 'ZEUS_GIT_DELIVERY_OUTCOME_UNKNOWN');
     this.repository.updateStep(step, { state: 'running', message: null });
@@ -705,21 +1079,21 @@ export class GitDeliveryExecution {
           this.repository.updateStep(this.step(step), { integrationId: integration.id });
         }
       } else {
-        const result = await this.external(run, step, 'merge', { source: selection.mergeBranch, target: selection.expectedBranch, head: snapshot.headSha }, () =>
+        const result = await this.external(run, step, 'merge', { source: selection.expectedBranch, target: selection.mergeBranch, head: snapshot.headSha }, () =>
           startTaskBranchIntegration({
-            repositoryPath: context.path,
+            repositoryPath: context.repositoryPath ?? context.path,
             projectSlug: run.projectId,
             integrationId: `${step.id}_${step.attempt}`,
-            targetBranch: selection.expectedBranch,
-            taskBranch: selection.mergeBranch,
+            targetBranch: selection.mergeBranch,
+            taskBranch: selection.expectedBranch,
             mode: 'merge',
-            commitMessage: run.input.message || `Merge ${selection.mergeBranch}`,
+            commitMessage: run.input.message || `Merge ${selection.expectedBranch} into ${selection.mergeBranch}`,
           }),
         );
         const merge: GitDeliveryMergeResult = {
           integrationPath: result.integrationPath as string,
-          sourceBranch: selection.mergeBranch,
-          targetBranch: selection.expectedBranch,
+          sourceBranch: selection.expectedBranch,
+          targetBranch: selection.mergeBranch,
           sourceHeadSha: result.taskHeadSha as string,
           targetHeadSha: result.targetHeadSha as string,
           conflictFiles: result.conflictFiles as string[],
@@ -743,15 +1117,22 @@ export class GitDeliveryExecution {
         await this.command(run, step, 'push', `/api/tasks/${scope.taskId}/integrations/${integration.id}/push`, workspaceGitCommandTypes.taskIntegrationPush, 'task_integration', integration.id, {});
       } else {
         if (!snapshot.remotes.length) throw deliveryError('仓库未配置远端。');
-
+        /** 启用合入时只推送已同步的目标分支；未启用合入才推送当前分支。 */
+        const merge = mergedStep?.result?.merge as GitDeliveryMergeResult | undefined;
+        const branch = run.input.settings.merge ? selection.mergeBranch : snapshot.branch;
+        const headSha = await getGitBranchHead(context.repositoryPath ?? context.path, branch);
+        if (run.input.settings.merge && (!merge?.resultHeadSha || merge.targetBranch !== branch || headSha !== merge.resultHeadSha)) throw deliveryError('目标分支尚未完成本次合入或已出现新提交，不能推送。');
+        /** 目标分支的上游独立于当前开发分支，不借用当前分支的远端目标。 */
+        const upstream = run.input.settings.merge ? snapshot.branchUpstreams?.[branch] : snapshot.upstream;
+        const remote = snapshot.remotes.find((name) => upstream?.startsWith(`${name}/`)) ?? snapshot.remotes[0]!;
         const action: ProjectGitAction = {
           type: 'push',
-          remote: snapshot.upstream?.split('/')[0] ?? snapshot.remotes[0]!,
-          sourceBranch: snapshot.branch,
-          targetBranch: snapshot.upstream?.split('/').slice(1).join('/') || snapshot.branch,
-          setUpstream: !snapshot.upstream,
+          remote,
+          sourceBranch: branch,
+          targetBranch: upstream?.startsWith(`${remote}/`) ? upstream.slice(remote.length + 1) : branch,
+          setUpstream: !upstream,
         };
-        this.repository.updateStep(this.step(step), { result: { ...this.step(step).result, pushProof: { remote: action.remote, branch: action.targetBranch, headSha: snapshot.headSha } } });
+        this.repository.updateStep(this.step(step), { result: { ...this.step(step).result, pushProof: { remote: action.remote, branch: action.targetBranch, headSha } } });
         await this.external(run, step, 'push', action, () => executeProjectGitAction(context.path, action, this.shutdown.signal));
       }
       this.succeed(this.step(step));
@@ -845,13 +1226,17 @@ export class GitDeliveryExecution {
       return true;
     }
     const merge = step.result?.merge as GitDeliveryMergeResult;
-    const target = await getProjectGitRepositorySnapshot(context.path);
+    /** 接收合入的目标分支可以在另一 worktree 检出，也可以没有检出目录。 */
+    const repositoryPath = context.repositoryPath ?? context.path;
+    const repository = await getGitRepositoryContext(repositoryPath);
+    /** 空仓库的来源分支尚无引用，首次交付仍可由原 Git 同步流程创建它。 */
+    const targetHead = !merge.targetHeadSha && !repository.detached && repository.branch === merge.targetBranch && !repository.headSha ? '' : await getGitBranchHead(repositoryPath, merge.targetBranch, repository);
     const finalizedBefore = (step.result?.phases as Record<string, Record<string, unknown>> | undefined)?.finalize;
-    if (finalizedBefore?.localSyncStatus === 'synced' && target.branch === merge.targetBranch && target.headSha === merge.resultHeadSha) {
+    if (finalizedBefore?.localSyncStatus === 'synced' && targetHead === merge.resultHeadSha) {
       this.succeed(step);
       return true;
     }
-    if ((await getGitBranchHead(context.path, merge.sourceBranch)) !== merge.sourceHeadSha) throw deliveryError('合入来源分支已推进，请重新审阅后运行；隔离结果已保留。');
+    if ((await getGitBranchHead(repositoryPath, merge.sourceBranch)) !== merge.sourceHeadSha) throw deliveryError('待交付的当前分支已推进，请重新审阅后运行；隔离结果已保留。');
     const files = await readTaskIntegrationConflictPaths(merge.integrationPath);
     if (files.length) {
       if ((!run.input.settings.resolveConflicts && !ai) || step.conversationId) throw deliveryError('仍有合入冲突，请打开冲突页处理后继续。');
@@ -883,9 +1268,10 @@ export class GitDeliveryExecution {
       const conversationId = (response.conversation as { id?: string } | undefined)?.id;
       if (!conversationId) throw deliveryError('冲突会话未返回持久身份。');
       this.repository.updateStep(this.step(step), { state: 'waiting', conversationId, result: { ...this.step(step).result, manualResolution: false } });
+      this.options.conversations.attachDeliveryConflictTask(conversationId);
       return false;
     }
-    if (target.branch !== merge.targetBranch || target.headSha !== merge.targetHeadSha || !target.clean) throw deliveryError('原目标分支或工作目录已变化，已保留隔离结果，请核对后继续。');
+    if (targetHead !== merge.targetHeadSha) throw deliveryError('接收合入的目标分支已变化，已保留隔离结果，请核对后继续。');
     if (!merge.resultHeadSha) {
       const completed = await this.external(run, step, 'complete', { sourceHeadSha: merge.sourceHeadSha, targetHeadSha: merge.targetHeadSha }, () =>
         completeTaskIntegrationCommit({ integrationPath: merge.integrationPath, mode: 'merge', commitMessage: run.input.message || `Merge ${merge.sourceBranch}` }),
@@ -894,7 +1280,7 @@ export class GitDeliveryExecution {
       this.repository.updateStep(this.step(step), { result: { ...this.step(step).result, merge } });
     }
     const finalized = await this.external(run, step, 'finalize', { targetBranch: merge.targetBranch, targetHeadSha: merge.targetHeadSha, resultHeadSha: merge.resultHeadSha }, () =>
-      finalizeTaskBranchIntegration({ repositoryPath: context.path, integrationPath: merge.integrationPath, targetBranch: merge.targetBranch, targetHeadSha: merge.targetHeadSha, resultHeadSha: merge.resultHeadSha! }),
+      finalizeTaskBranchIntegration({ repositoryPath, integrationPath: merge.integrationPath, targetBranch: merge.targetBranch, targetHeadSha: merge.targetHeadSha, resultHeadSha: merge.resultHeadSha! }),
     );
     if (finalized.localSyncStatus !== 'synced') throw deliveryError('隔离合入已保留，原工作目录尚未安全同步。');
     this.succeed(this.step(step));
@@ -909,9 +1295,9 @@ export class GitDeliveryExecution {
     /** 每个原任务仓库只允许一个交付开发线，避免原分支与冲突分支互相覆盖。 */
     const roots = new Map<string, (typeof workspaces)[number]>();
     for (const selection of input.repositories) {
-      /** 全目录交付只能使用当前开发线持久记录的来源分支。 */
+      /** 合入目标由本次请求冻结；工作区仍必须属于当前任务。 */
       const workspace = workspaces.find((candidate) => candidate.id === selection.repositoryId);
-      if (!workspace || selection.mergeBranch !== workspace.sourceBranch) throw deliveryError('完整交付必须合入每个仓库记录的来源分支，请刷新后继续。');
+      if (!workspace) throw deliveryError('交付工作区不属于当前任务，请刷新后继续。');
       /** 不通过分支后缀猜测冲突开发线来源。 */
       const root = resolveGitDeliveryRootWorkspace(workspaces, selection.repositoryId);
       if (!root) throw deliveryError('原工作目录关联缺失，请刷新交付范围后继续。');
@@ -947,14 +1333,15 @@ export class GitDeliveryExecution {
 
   /** 管理状态只在全部仓库完成后使用现有业务命令更新。 */
   private async changeTaskStatus(run: GitDeliveryRunRecord, step: GitDeliveryStepRecord): Promise<void> {
-    if (run.scope.kind !== 'task' || !run.input.settings.finalTaskStatus) throw deliveryError('任务状态步骤归属无效。');
+    const taskId = run.scope.kind === 'task' ? run.scope.taskId : this.options.conversations.getRecordById(run.scope.conversationId)?.taskId;
+    if (!taskId || !run.input.settings.finalTaskStatus) throw deliveryError('任务状态步骤归属无效。');
     if (step.state === 'unknown') {
       await this.reconcile(step);
       step = this.step(step);
       if (step.state === 'unknown') return;
     }
-    const task = this.options.tasks.getById(run.scope.taskId);
-    if (!task) throw deliveryError('任务已不存在。');
+    const task = this.options.tasks.getById(taskId);
+    if (!task || task.projectId !== run.projectId) throw deliveryError('任务已不存在或已不属于当前项目。');
     if (task.managementStatus === run.input.settings.finalTaskStatus) {
       this.succeed(step);
       return;
@@ -977,6 +1364,30 @@ export class GitDeliveryExecution {
     this.succeed(this.step(step));
   }
 
+  /** 归档复用公共会话命令及 worktree 清理确认，不直接写归档标记。 */
+  private async archiveConversation(run: GitDeliveryRunRecord, step: GitDeliveryStepRecord): Promise<void> {
+    if (run.scope.kind !== 'conversation' || !run.input.settings.archiveConversation) throw deliveryError('归档步骤归属无效。');
+    if (step.state === 'unknown') {
+      await this.reconcile(step);
+      step = this.step(step);
+      if (step.state === 'unknown') return;
+    }
+    const conversation = this.options.conversations.getRecordById(run.scope.conversationId);
+    if (!conversation || conversation.taskId || conversation.projectId !== run.projectId) throw deliveryError('会话归属已变化，不能自动归档。');
+    this.repository.updateStep(step, { state: 'running' });
+    await this.command(
+      run,
+      step,
+      'archive',
+      `/api/projects/${run.projectId}/conversations/${conversation.id}/archive`,
+      conversationCommandTypes.archive,
+      'product_conversation',
+      conversation.id,
+      step.result?.confirmWorktreeCleanup === true ? { confirmWorktreeCleanup: true } : {},
+    );
+    this.succeed(this.step(step));
+  }
+
   /** 内部请求仍经过认证、命令幂等和现有业务校验。 */
   private async command(
     run: GitDeliveryRunRecord,
@@ -989,11 +1400,12 @@ export class GitDeliveryExecution {
     value: object,
     method: 'POST' | 'PATCH' = 'POST',
   ): Promise<Record<string, unknown>> {
-    this.shutdown.signal.throwIfAborted();
+    this.assertAdvancing(run.id);
     const step = this.step(original);
     const results = (step.result?.phases ?? {}) as Record<string, Record<string, unknown>>;
     if (results[phase]) return results[phase]!;
-    const operation = `${step.id}:${step.attempt}:${phase}`;
+    /** 命令中心确认协议要求操作身份与运行身份一致；其他阶段各自保持幂等身份。 */
+    const operation = type === commandCenterCommandTypes.confirmationCreate ? scopeId : `${step.id}:${step.attempt}:${phase}`;
     const body = gitDeliveryCommand(type, scopeKind, scopeId, operation, value);
     this.repository.updateStep(step, { commandId: body.command.commandId, result: { ...step.result, pendingCommand: { phase, kind: 'http', url, method, body } } });
     const result = await this.http(method, url, body);
@@ -1003,7 +1415,7 @@ export class GitDeliveryExecution {
 
   /** 普通目录使用相同 Git 回执应用层包装隔离操作。 */
   private async external<T extends object>(run: GitDeliveryRunRecord, original: GitDeliveryStepRecord, phase: string, input: object, invoke: () => Promise<T>): Promise<Record<string, unknown>> {
-    this.shutdown.signal.throwIfAborted();
+    this.assertAdvancing(run.id);
     const step = this.step(original);
     const results = (step.result?.phases ?? {}) as Record<string, Record<string, unknown>>;
     if (results[phase]) return results[phase]!;
@@ -1027,7 +1439,7 @@ export class GitDeliveryExecution {
 
   /** 后台复用原生成接口的模型、脱敏和内容校验；已生成文本随步骤保存。 */
   private async generateCommitMessage(run: GitDeliveryRunRecord, original: GitDeliveryStepRecord, selection: GitDeliverySelection, context: DeliveryRepositoryContext): Promise<string> {
-    this.shutdown.signal.throwIfAborted();
+    this.assertAdvancing(run.id);
     /** 恢复时仍核对同一组文件，不能让旧说明用于新的内容。 */
     const fingerprint = await readCommitFingerprint(context.path, selection.paths);
     /** 成功生成后手动继续复用原文本，不重复调用模型。 */
@@ -1042,7 +1454,7 @@ export class GitDeliveryExecution {
     const generation = run.input.commitMessageGeneration;
     if (!generation) throw deliveryError('本次运行缺少 AI 提交信息模型设置，请重新运行。');
     /** 普通项目仓库转换为原生成接口的稳定身份；任务与会话工作树沿用自身身份。 */
-    const isolated = run.scope.kind === 'task' || selection.repositoryId === `conversation:${run.scope.conversationId}`;
+    const isolated = run.scope.kind === 'task' || selection.repositoryId === `conversation:${run.scope.conversationId}` || selection.repositoryId.startsWith(`conversation:${run.scope.conversationId}:`);
     /** 目录来自本次已经核验的仓库，客户端不能指定任意绝对路径。 */
     const relativePath = isolated
       ? '.'
@@ -1065,7 +1477,7 @@ export class GitDeliveryExecution {
       },
       this.shutdown.signal,
     );
-    this.shutdown.signal.throwIfAborted();
+    this.assertAdvancing(run.id);
     /** 生成接口已限制标题格式，这里只接受实际成功返回的非空说明。 */
     const message = typeof result.message === 'string' ? result.message.trim() : '';
     if (!message) throw deliveryError('AI 未返回有效提交信息，请手动继续。');
@@ -1075,7 +1487,7 @@ export class GitDeliveryExecution {
   }
 
   /** 仅本机服务内注入，不发送凭据到任何远端；生成请求随宿主退出取消。 */
-  private async http(method: 'GET' | 'POST' | 'PATCH', url: string, body?: object, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private async http(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, body?: object, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const response = await this.options.server.inject({ method, url, headers: { authorization: `Bearer ${this.options.apiToken}` }, ...(body ? { payload: body } : {}), ...(signal ? { signal } : {}) });
     const value = response.json() as Record<string, unknown>;
     if (response.statusCode >= 400)
@@ -1098,7 +1510,8 @@ export class GitDeliveryExecution {
       };
     }
     const workspace = await resolveConversationGitWorkspace(project, input.scope.conversationId, this.options.conversations, this.options.conversationSubmissions);
-    if (selection.repositoryId === workspace.id) return { path: workspace.localPath, name: workspace.name };
+    const member = workspace.repositories.find((repository) => repository.id === selection.repositoryId);
+    if (member) return { path: member.localPath, repositoryPath: member.repositoryPath, name: member.name };
     if (workspace.workspaceMode !== 'direct') throw deliveryError('不能扩大会话工作树的交付范围。');
     const repositories = await discoverGitRepositories(workspace.localPath);
     const registered = this.options.projectRepositories.getById(selection.repositoryId);
@@ -1111,6 +1524,11 @@ export class GitDeliveryExecution {
   /** 防止存储故障或只读诊断变成后台写入。 */
   private assertWritable(): void {
     if (this.options.readOnly || this.stopped) throw deliveryError('当前宿主不接受交付操作。');
+  }
+  /** 每个写入阶段再次核对终止意图，不在当前命令结束后启动下一阶段。 */
+  private assertAdvancing(id: string): void {
+    this.shutdown.signal.throwIfAborted();
+    if (!this.authorized.has(id) || this.stopping.has(id)) throw deliveryError('交付已终止，可继续未完成步骤。', 'ZEUS_GIT_DELIVERY_STOPPED');
   }
   /** 每次更新前读取最新事实，避免旧对象覆盖 AI 身份。 */
   private step(step: GitDeliveryStepRecord): GitDeliveryStepRecord {
@@ -1125,7 +1543,8 @@ export class GitDeliveryExecution {
     const run = this.repository.get(id);
     if (!run) return;
     /** 时间戳不代表业务变化，比较对外可见的运行和步骤状态。 */
-    const progress = JSON.stringify([run.state, this.repository.view(run).steps]);
+    const view = this.view(run);
+    const progress = JSON.stringify([run.state, view.steps, view.stopping, view.stopped]);
     if (this.publishedProgress.get(id) === progress) return;
     this.publishedProgress.set(id, progress);
     this.options.publish('project.git_delivery.changed', { projectId: run.projectId, runId: run.id, ...(run.scope.kind === 'task' ? { taskId: run.scope.taskId } : { conversationId: run.scope.conversationId }) });

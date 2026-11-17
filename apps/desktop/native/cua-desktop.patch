@@ -1226,8 +1226,8 @@ index 682a6ff..9259b1d 100644
          pid as i32
      };
  
-+    // 用户主动接管受控应用后，尊重实体操作的焦点选择。
-+    if crate::input::user_guard::user_has_control(activated_pid) {
++    // 用户主动操作受控应用时，尊重实体操作的焦点选择。
++    if crate::input::user_guard::user_selected_focus(activated_pid) {
 +        return;
 +    }
      let restore_pids = dispatcher.snapshot_matches(activated_pid);
@@ -1569,32 +1569,44 @@ diff --git a/crates/platform-macos/src/input/user_guard.rs b/crates/platform-mac
 new file mode 100644
 --- /dev/null
 +++ b/crates/platform-macos/src/input/user_guard.rs
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,385 @@
 +//! Zeus 私有 worker 的只读用户输入监听及协作取消，不生成全局输入。
 +
 +use std::collections::{HashMap, HashSet};
 +use std::ffi::c_void;
-+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 +use std::sync::{Mutex, OnceLock};
 +
-+/// 自身合成事件的标记，避免将后台输入误认成用户接管。
++/// 自身合成事件的标记，避免将后台输入误认成用户实体输入。
 +pub const VIRTUAL_EVENT_COOKIE: i64 = 0x5a455553435541;
-+/// 用户操作受控应用后的明确暂停原因。
-+const USER_CONTROL: &str = "ZEUS_COMPUTER_USER_CONTROL";
 +/// 屏幕布局变化后必须重新观察的原因。
 +const DISPLAY_CHANGED: &str = "ZEUS_COMPUTER_DISPLAY_CHANGED";
-+/// 系统共享入口停止或撤销采集时的暂停原因。
++/// 用户通过系统共享入口明确停止时的暂停原因。
 +const SHARING_STOPPED: &str = "ZEUS_COMPUTER_SHARING_STOPPED";
++/// 用户拒绝系统捕获权限时禁止自动恢复。
++const PERMISSION_REQUIRED: &str = "ZEUS_COMPUTER_PERMISSION_REQUIRED";
++/// 捕获故障使旧观察失效，重新观察可以恢复，不代表用户撤销控制。
++const CAPTURE_UNAVAILABLE: &str = "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE";
++
++/// 暂停原因与系统诊断一起保留，避免把所有捕获故障解释为用户停止。
++struct Pause {
++    /// 宿主识别的固定错误码。
++    reason: &'static str,
++    /// 当前共享或捕获故障的原始诊断。
++    detail: String,
++}
 +/// 本轮原生调用的取消信号，仅在下一次私有请求开始时重置。
 +static CANCELLED: AtomicBool = AtomicBool::new(false);
++/// 本次原生请求期间用户操作的应用，只用于尊重焦点选择，不暂停控制。
++static USER_INPUT_PID: AtomicI32 = AtomicI32::new(0);
 +/// 原生输入监听是否实际建立且具有辅助功能授权。
 +static MONITOR_READY: AtomicBool = AtomicBool::new(false);
 +/// 只统计其他应用的实体键盘事件数量，验收并行输入时不读取任何文本。
 +static OTHER_KEYBOARD_EVENTS: AtomicU64 = AtomicU64::new(0);
 +/// 生命周期会话与其成功观察的精确窗口。
 +static WINDOWS: OnceLock<Mutex<HashMap<String, HashSet<(i32, u32)>>>> = OnceLock::new();
-+/// 用户让权和屏幕失效按应用记录，保护同一应用共享的菜单及键盘焦点。
-+static PAUSED: OnceLock<Mutex<HashMap<i32, &'static str>>> = OnceLock::new();
++/// 系统共享、权限和屏幕失效按应用记录。
++static PAUSED: OnceLock<Mutex<HashMap<i32, Pause>>> = OnceLock::new();
 +/// 实体拖动的起始应用，穿过其他窗口时不会改认输入归属。
 +static USER_DRAG: Mutex<Option<i32>> = Mutex::new(None);
 +
@@ -1604,7 +1616,7 @@ new file mode 100644
 +}
 +
 +/// 取得应用暂停原因。
-+fn paused() -> &'static Mutex<HashMap<i32, &'static str>> {
++fn paused() -> &'static Mutex<HashMap<i32, Pause>> {
 +    PAUSED.get_or_init(|| Mutex::new(HashMap::new()))
 +}
 +
@@ -1661,9 +1673,10 @@ new file mode 100644
 +/// 每个串行私有请求开始时建立新的取消边界。
 +pub fn begin_operation() {
 +    CANCELLED.store(false, Ordering::Release);
++    USER_INPUT_PID.store(0, Ordering::Release);
 +}
 +
-+/// 成功观察后登记窗口；新观察仅解除显示器失效，不解除用户接管。
++/// 新观察可解除捕获故障和显示器失效，不能解除主动停止或权限不足。
 +pub fn observe_window(session: &str, pid: i32, window_id: u32) -> anyhow::Result<()> {
 +    windows()
 +        .lock()
@@ -1672,7 +1685,10 @@ new file mode 100644
 +        .or_default()
 +        .insert((pid, window_id));
 +    let mut reasons = paused().lock().unwrap();
-+    if reasons.get(&pid) == Some(&DISPLAY_CHANGED) {
++    if reasons
++        .get(&pid)
++        .is_some_and(|pause| matches!(pause.reason, DISPLAY_CHANGED | CAPTURE_UNAVAILABLE))
++    {
 +        reasons.remove(&pid);
 +    }
 +    drop(reasons);
@@ -1682,11 +1698,16 @@ new file mode 100644
 +        }
 +        return Err(error);
 +    }
++    // 各命名会话在自己的新观察成功后恢复光标，不替其他会话恢复旧控制。
++    crate::cursor::overlay::send_command(
++        session.to_owned(),
++        cursor_overlay::OverlayCommand::SetEnabled(true),
++    );
 +    Ok(())
 +}
 +
-+/// 立即撤销整个应用，系统停止和实体用户操作使用同一输入边界。
-+fn pause_application(pid: i32, reason: &'static str) {
++/// 立即撤销整个应用的旧观察，并将固定原因和诊断一起通知宿主。
++fn pause_application(pid: i32, reason: &'static str, detail: &str) {
 +    let sessions = windows()
 +        .lock()
 +        .unwrap()
@@ -1694,8 +1715,23 @@ new file mode 100644
 +        .filter(|(_, entries)| entries.iter().any(|(target, _)| *target == pid))
 +        .map(|(session, _)| session.clone())
 +        .collect::<Vec<_>>();
-+    if sessions.is_empty() || paused().lock().unwrap().insert(pid, reason) == Some(reason) {
-+        return;
++    {
++        let mut reasons = paused().lock().unwrap();
++        if sessions.is_empty()
++            || reasons.get(&pid).is_some_and(|pause| {
++                pause.reason == reason
++                    || matches!(pause.reason, SHARING_STOPPED | PERMISSION_REQUIRED)
++            })
++        {
++            return;
++        }
++        reasons.insert(
++            pid,
++            Pause {
++                reason,
++                detail: detail.chars().take(1_000).collect(),
++            },
++        );
 +    }
 +    for session in sessions {
 +        crate::cursor::overlay::send_command(
@@ -1706,11 +1742,18 @@ new file mode 100644
 +    crate::window_sharing::stop_application(pid);
 +    // 固定前缀只传受控身份与原因，通过私有进程 stderr 即时通知宿主。
 +    if let Some(token) = event_token() {
-+        eprintln!("_ZEUS_COMPUTER_EVENT_ {{\"token\":\"{}\",\"workerPid\":{},\"pid\":{},\"reason\":\"{}\",\"otherKeyboardEvents\":{}}}", token, std::process::id(), pid, reason, OTHER_KEYBOARD_EVENTS.load(Ordering::Acquire));
++        eprintln!(
++            "_ZEUS_COMPUTER_EVENT_ {}",
++            serde_json::json!({
++                "token": token, "workerPid": std::process::id(), "pid": pid,
++                "reason": reason, "detail": detail.chars().take(1_000).collect::<String>(),
++                "otherKeyboardEvents": OTHER_KEYBOARD_EVENTS.load(Ordering::Acquire)
++            })
++        );
 +    }
 +}
 +
-+/// 正常关闭只移除该窗口，不解除已有用户接管或系统停止状态。
++/// 正常关闭只移除该窗口，不解除已有系统停止状态。
 +pub fn forget_closed_window(pid: i32, window_id: u32) {
 +    let mut records = windows().lock().unwrap();
 +    for entries in records.values_mut() {
@@ -1720,25 +1763,37 @@ new file mode 100644
 +
 +/// 系统窗口共享停止后不能自动重开，必须结束旧会话并接受新指令。
 +pub fn sharing_stopped(pid: i32) {
-+    pause_application(pid, SHARING_STOPPED);
++    pause_application(
++        pid,
++        SHARING_STOPPED,
++        "用户已从系统停止窗口共享；收到新指令后调用 get_window_state 重新观察。",
++    );
++}
++
++/// 捕获故障立即停止后台输入，保留系统错误并允许下一次新观察重建捕获。
++pub fn capture_failed(pid: i32, detail: &str) {
++    pause_application(pid, CAPTURE_UNAVAILABLE, detail);
++}
++
++/// 系统明确拒绝捕获授权时保持停止，并保留原始权限错误。
++pub fn permission_required(pid: i32, detail: &str) {
++    pause_application(pid, PERMISSION_REQUIRED, detail);
 +}
 +
 +/// 为窗口观察附加真实监听与让权状态，不改变截图或控件身份。
 +pub fn state(pid: i32) -> serde_json::Value {
-+    let reason = paused().lock().unwrap().get(&pid).copied();
-+    serde_json::json!({ "monitoring": MONITOR_READY.load(Ordering::Acquire), "events_ready": event_token().is_some(), "paused": reason.is_some(), "reason": reason, "other_keyboard_events": OTHER_KEYBOARD_EVENTS.load(Ordering::Acquire) })
++    let reasons = paused().lock().unwrap();
++    let pause = reasons.get(&pid);
++    serde_json::json!({ "monitoring": MONITOR_READY.load(Ordering::Acquire), "events_ready": event_token().is_some(), "paused": pause.is_some(), "reason": pause.map(|pause| pause.reason), "detail": pause.map(|pause| pause.detail.as_str()), "other_keyboard_events": OTHER_KEYBOARD_EVENTS.load(Ordering::Acquire) })
 +}
 +
-+/// 输入前检查取消和用户优先；既有按键、按钮的抬起不经过本闸门。
++/// 输入前检查取消和共享状态；既有按键、按钮的抬起不经过本闸门。
 +pub fn check_pid(pid: i32) -> anyhow::Result<()> {
 +    if CANCELLED.load(Ordering::Acquire) {
 +        anyhow::bail!("ZEUS_COMPUTER_STOPPED: 当前后台动作已取消，结果需要重新观察。");
 +    }
-+    if let Some(reason) = paused().lock().unwrap().get(&pid).copied() {
-+        anyhow::bail!("{reason}: 用户已接管或显示器布局已变化，停止后台输入并重新观察。");
-+    }
-+    if !MONITOR_READY.load(Ordering::Acquire) {
-+        anyhow::bail!("ZEUS_COMPUTER_INPUT_MONITOR_UNAVAILABLE: 用户操作监听不可用，未投递后台输入，请检查辅助功能授权。");
++    if let Some(pause) = paused().lock().unwrap().get(&pid) {
++        anyhow::bail!("{}: {}", pause.reason, pause.detail);
 +    }
 +    Ok(())
 +}
@@ -1766,7 +1821,10 @@ new file mode 100644
 +        .collect::<HashSet<_>>();
 +    let mut reasons = paused().lock().unwrap();
 +    for pid in pids {
-+        reasons.entry(pid).or_insert(DISPLAY_CHANGED);
++        reasons.entry(pid).or_insert_with(|| Pause {
++            reason: DISPLAY_CHANGED,
++            detail: "显示器布局已变化，请调用 get_window_state 重新观察。".to_owned(),
++        });
 +    }
 +}
 +
@@ -1838,20 +1896,19 @@ new file mode 100644
 +        _ => None,
 +    };
 +    if let Some(pid) = pid {
++        USER_INPUT_PID.store(pid, Ordering::Release);
 +        let controlled = windows()
 +            .lock()
 +            .unwrap()
 +            .values()
 +            .any(|entries| entries.iter().any(|(target, _)| *target == pid));
-+        if controlled {
-+            pause_application(pid, USER_CONTROL);
-+        } else if matches!(kind, 10 | 11 | 12) {
++        if !controlled && matches!(kind, 10 | 11 | 12) {
 +            OTHER_KEYBOARD_EVENTS.fetch_add(1, Ordering::AcqRel);
 +        }
 +    }
 +}
 +
-+/// 在 AppKit 主线程安装只读全局监听；普通鼠标移动不触发暂停。
++/// 在 AppKit 主线程安装只读全局监听，仅记录焦点选择和无内容的键盘计数。
 +pub unsafe fn install_monitor() {
 +    use objc2::runtime::AnyObject;
 +    use objc2::{class, msg_send};
@@ -1884,11 +1941,12 @@ new file mode 100644
 +}
 +
 +/// 用户主动进入应用时，禁止焦点保护把用户切回之前的应用。
-+pub fn user_has_control(pid: i32) -> bool {
-+    matches!(
-+        paused().lock().unwrap().get(&pid),
-+        Some(&USER_CONTROL) | Some(&SHARING_STOPPED)
-+    )
++pub fn user_selected_focus(pid: i32) -> bool {
++    USER_INPUT_PID.load(Ordering::Acquire) == pid
++        || matches!(
++            paused().lock().unwrap().get(&pid).map(|pause| pause.reason),
++            Some(SHARING_STOPPED | PERMISSION_REQUIRED)
++        )
 +}
 +
 +/// 只读原生等待允许被取消，不等待原谓词窗口超时。
@@ -1901,7 +1959,7 @@ diff --git a/crates/platform-macos/src/window_sharing.rs b/crates/platform-macos
 new file mode 100644
 --- /dev/null
 +++ b/crates/platform-macos/src/window_sharing.rs
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,657 @@
 +//! Zeus 的真实单窗口共享、有限帧缓存及系统停止生命周期。
 +
 +use image::ImageEncoder;
@@ -1971,9 +2029,32 @@ new file mode 100644
 +struct ShareDelegate(std::sync::Weak<WindowShare>);
 +
 +impl SCStreamDelegateTrait for ShareDelegate {
-+    /// 已关闭目标的来源丢失只结束该窗口，用户停止和权限错误仍撤销应用输入。
++    /// 已关闭目标只结束该窗口；用户停止或拒绝授权时禁止自动恢复。
 +    fn did_stop_with_error(&self, error: screencapturekit::error::SCError) {
 +        if let Some(share) = self.0.upgrade() {
++            // 明确的用户停止和权限拒绝优先于之前的 inactive 或捕获故障通知。
++            if matches!(
++                error.stream_error_code(),
++                Some(
++                    screencapturekit::error::SCStreamErrorCode::UserStopped
++                        | screencapturekit::error::SCStreamErrorCode::UserDeclined
++                )
++            ) {
++                share.stopped.store(true, Ordering::Release);
++                share.active.store(false, Ordering::Release);
++                share.ready.notify_all();
++                if error.stream_error_code()
++                    == Some(screencapturekit::error::SCStreamErrorCode::UserDeclined)
++                {
++                    crate::input::user_guard::permission_required(
++                        share.pid,
++                        &format!("ScreenCaptureKit: {error}"),
++                    );
++                } else {
++                    crate::input::user_guard::sharing_stopped(share.pid);
++                }
++                return;
++            }
 +            if !share.stopped.swap(true, Ordering::AcqRel) {
 +                share.active.store(false, Ordering::Release);
 +                share.ready.notify_all();
@@ -1984,13 +2065,16 @@ new file mode 100644
 +                if closed_source {
 +                    retire_closed_window(&share);
 +                } else {
-+                    crate::input::user_guard::sharing_stopped(share.pid);
++                    crate::input::user_guard::capture_failed(
++                        share.pid,
++                        &format!("ScreenCaptureKit: {error}"),
++                    );
 +                }
 +            }
 +        }
 +    }
 +
-+    /// 已关闭的窗口单独收尾；窗口仍存在或身份未知时继续停止整个应用。
++    /// inactive 表示共享来源退出，不等同于用户主动停止；未知窗口状态要求新观察。
 +    fn stream_did_become_inactive(&self) {
 +        if let Some(share) = self.0.upgrade() {
 +            if !share.stopped.swap(true, Ordering::AcqRel) {
@@ -1999,7 +2083,7 @@ new file mode 100644
 +                if crate::windows::is_window_confirmed_closed(share.window_id) {
 +                    retire_closed_window(&share);
 +                } else {
-+                    crate::input::user_guard::sharing_stopped(share.pid);
++                    crate::input::user_guard::capture_failed(share.pid, "ScreenCaptureKit streamDidBecomeInactive: 共享来源已退出，尚未确认窗口关闭，请重新观察。");
 +                }
 +            }
 +        }
@@ -2215,10 +2299,11 @@ new file mode 100644
 +    crate::input::user_guard::check_pid(pid)?;
 +    let key = (pid, window_id);
 +    let existing = shares().lock().unwrap().get(&key).cloned();
-+    if let Some(share) = existing {
++    // 已停止的故障流由清理线程释放；输入闸门已排除用户主动停止，才能新建流。
++    if let Some(share) = existing.filter(|share| !share.stopped.load(Ordering::Acquire)) {
 +        anyhow::ensure!(
 +            share.active.load(Ordering::Acquire) && !share.stopped.load(Ordering::Acquire),
-+            "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享已停止，需要新指令。"
++            "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口捕获尚未就绪，请重新观察。"
 +        );
 +        refresh_share(&share)?;
 +        share.sessions.lock().unwrap().insert(session.to_owned());
@@ -2314,7 +2399,7 @@ new file mode 100644
 +    crate::input::user_guard::check_pid(share.pid)?;
 +    anyhow::ensure!(
 +        !share.stopped.load(Ordering::Acquire),
-+        "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享已停止。"
++        "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口共享已停止。"
 +    );
 +    let stream = owned_stream
 +        .as_ref()
@@ -2335,7 +2420,7 @@ new file mode 100644
 +    let mut owned_stream = share.stream.lock().unwrap();
 +    anyhow::ensure!(
 +        !share.stopped.load(Ordering::Acquire),
-+        "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享在启动前已停止。"
++        "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口共享在启动前已停止。"
 +    );
 +    let (filter, config, geometry) = share_configuration(share)?;
 +    let mut stream =
@@ -2393,7 +2478,7 @@ new file mode 100644
 +    crate::input::user_guard::check_pid(share.pid)?;
 +    anyhow::ensure!(
 +        !share.stopped.load(Ordering::Acquire),
-+        "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享在启动期间已停止。"
++        "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口共享在启动期间已停止。"
 +    );
 +    anyhow::ensure!(
 +        current_geometry(share)? == geometry,
@@ -2422,7 +2507,7 @@ new file mode 100644
 +            crate::input::user_guard::check_pid(share.pid)?;
 +            anyhow::ensure!(
 +                share.active.load(Ordering::Acquire) && !share.stopped.load(Ordering::Acquire),
-+                "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享已停止。"
++                "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口共享已停止。"
 +            );
 +            if frame.verified_at.is_some_and(|time| time >= requested_at) {
 +                if let Some(sample) = frame.sample.clone() {
@@ -2509,7 +2594,7 @@ new file mode 100644
 +    crate::input::user_guard::check_pid(share.pid)?;
 +    anyhow::ensure!(
 +        !share.stopped.load(Ordering::Acquire),
-+        "ZEUS_COMPUTER_SHARING_STOPPED: 窗口共享在编码期间停止。"
++        "ZEUS_COMPUTER_CAPTURE_UNAVAILABLE: 窗口共享在编码期间停止。"
 +    );
 +    *share.captured_at.lock().unwrap() = Some(captured_at.round() as u64);
 +    Ok(png)
@@ -2533,14 +2618,17 @@ new file mode 100644
 +        })
 +}
 diff --git a/crates/cua-driver-sdk/src/embedded.rs b/crates/cua-driver-sdk/src/embedded.rs
+index f17dacc..a3abfc6 100644
 --- a/crates/cua-driver-sdk/src/embedded.rs
 +++ b/crates/cua-driver-sdk/src/embedded.rs
-@@ -865,6 +865,8 @@
+@@ -865,6 +865,10 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                  | "CUA_LOG"
                  | "CUA_DRIVER_RS_TELEMETRY_ENABLED"
                  | "CUA_TELEMETRY_ENABLED"
-+                // Zeus 私有通知仅允许这一项认证密钥，保留其他环境限制。
++                // Zeus 私有通知和浏览器桥只接收宿主生成的身份与地址。
 +                | "ZEUS_CUA_EVENT_TOKEN"
++                | "ZEUS_CUA_BROWSER_ENDPOINT"
++                | "ZEUS_CUA_BROWSER_PID"
          )
  }
  
@@ -2799,3 +2887,676 @@ diff --git a/crates/platform-macos/src/windows.rs b/crates/platform-macos/src/wi
  }
  
  /// Enumerate all windows (including off-screen).
+diff --git a/crates/cua-driver-core/src/browser/engine.rs b/crates/cua-driver-core/src/browser/engine.rs
+index 5c987cb..7f0185d 100644
+--- a/crates/cua-driver-core/src/browser/engine.rs
++++ b/crates/cua-driver-core/src/browser/engine.rs
+@@ -58,7 +58,8 @@ use super::store::{
+ };
+ use super::types::{
+     BindingQuality, BrowserClassification, BrowserEngineFamily, BrowserProcessRole,
+-    EndpointAccessClass, NativeWindowInfo, OwnedEndpoint, Rect,
++    EndpointAccessClass, EndpointOwnershipMethod, EndpointOwnershipProof, EndpointTransport,
++    NativeWindowInfo, OwnedEndpoint, Rect,
+ };
+ 
+ /// Bounds tolerance (device pixels) for native ↔ CDP window correlation.
+@@ -90,6 +91,40 @@ fn refuse(code: BrowserRefusalCode, msg: impl Into<String>) -> BrowserRefusal {
+     BrowserRefusal::new(code, msg)
+ }
+ 
++/// 私有宿主地址只从受控 worker 环境读取；调用参数不能指定端点或冒充其他进程。
++pub(crate) fn hosted_browser_endpoint(session: &str, pid: i64) -> Option<OwnedEndpoint> {
++    if std::env::var("ZEUS_CUA_BROWSER_PID")
++        .ok()?
++        .parse::<i64>()
++        .ok()?
++        != pid
++    {
++        return None;
++    }
++    let mut url = url::Url::parse(&std::env::var("ZEUS_CUA_BROWSER_ENDPOINT").ok()?).ok()?;
++    if url.scheme() != "ws" || url.host_str() != Some("127.0.0.1") || url.port().is_none() {
++        return None;
++    }
++    let context = crate::tool::current_dispatch_authorization_context()?;
++    let prefix = context.runtime_session_key("");
++    let public_session = session.strip_prefix(&prefix)?;
++    url.path_segments_mut()
++        .ok()?
++        .pop_if_empty()
++        .push(public_session);
++    Some(OwnedEndpoint {
++        http_port: url.port(),
++        ws_url: url.to_string(),
++        transport: EndpointTransport::EmbeddedDescendant,
++        ownership: EndpointOwnershipProof {
++            method: EndpointOwnershipMethod::PlatformAttested,
++            owner_pid: pid,
++            listener_pid: Some(pid),
++            detail: Some("Zeus private host transport".to_owned()),
++        },
++    })
++}
++
+ fn authorize_live_browser_origin(
+     manifest: Option<&crate::session_manifest::SessionManifest>,
+     live_url: &str,
+@@ -1240,7 +1275,20 @@ impl BrowserEngine {
+         pid: i64,
+         window_id: u64,
+     ) -> Result<(String, TargetRecord), BrowserRefusal> {
+-        let class = self.platform.classify_browser(pid).await?;
++        let hosted = hosted_browser_endpoint(session, pid);
++        let class = if hosted.is_some() {
++            BrowserClassification {
++                is_browser: true,
++                engine: BrowserEngineFamily::Chromium,
++                product_kind: super::types::BrowserProduct::Electron,
++                product: Some("Zeus embedded browser".to_owned()),
++                channel: None,
++                process_role: BrowserProcessRole::EmbeddedApplication,
++                supports_cdp: true,
++            }
++        } else {
++            self.platform.classify_browser(pid).await?
++        };
+         if !class.is_browser {
+             return Err(refuse(
+                 BrowserRefusalCode::BrowserRouteUnavailable,
+@@ -1262,7 +1310,9 @@ impl BrowserEngine {
+ 
+         let native = self.native_window_checked(pid, window_id).await?;
+         let fingerprint = self.platform.process_fingerprint(pid).await?;
+-        let endpoint = if let Some(live_grant) = &grant {
++        let endpoint = if let Some(endpoint) = hosted {
++            endpoint
++        } else if let Some(live_grant) = &grant {
+             self.existing_profile_endpoint(pid, &live_grant.endpoint_ws_url)
+                 .await?
+         } else {
+@@ -1487,8 +1537,11 @@ impl BrowserEngine {
+                 }
+             }
+             EndpointAccessClass::EmbeddedApplication => {
++                let hosted = hosted_browser_endpoint(session, record.pid)
++                    .is_some_and(|endpoint| endpoint.ws_url == record.ws_url);
+                 let classification = self.platform.classify_browser(record.pid).await?;
+-                if classification.process_role != BrowserProcessRole::EmbeddedApplication {
++                if !hosted && classification.process_role != BrowserProcessRole::EmbeddedApplication
++                {
+                     return Err(refuse(
+                         BrowserRefusalCode::BrowserBindingStale,
+                         "the process is no longer proven to be the approved embedded browser host",
+@@ -1522,7 +1575,9 @@ impl BrowserEngine {
+             .await?;
+ 
+         // 3. Endpoint still owned and unchanged.
+-        let endpoint = if record.generation > 0 {
++        let endpoint = if let Some(endpoint) = hosted_browser_endpoint(session, record.pid) {
++            endpoint
++        } else if record.generation > 0 {
+             self.existing_profile_endpoint(record.pid, &record.ws_url)
+                 .await?
+         } else {
+@@ -1680,25 +1735,63 @@ impl BrowserEngine {
+         viewport_y: f64,
+         kind: BrowserVisualActionKind,
+     ) {
++        // 宿主提供内容区 DIP 和真实缩放；页面输入与光标渲染仍由 CUA 执行。
++        let hosted = hosted_browser_endpoint(session, validated.native.pid).is_some();
++        let surface = if hosted {
++            validated
++                .conn
++                .call(None, "Zeus.getBrowserSurface", json!({}))
++                .await
++                .ok()
++                .filter(|value| {
++                    value.get("windowId").and_then(Value::as_u64)
++                        == Some(validated.native.window_id)
++                        && value.get("targetId").and_then(Value::as_str)
++                            == Some(validated.tab.cdp_target_id.as_str())
++                })
++        } else {
++            None
++        };
+         // `document.visibilityState` distinguishes the selected tab without
+         // focusing its native window or invoking any CDP activation command.
+         // Treat an unavailable or malformed proof as inactive: omitting
+         // feedback is safer than drawing a cursor over another tab.
+-        let tab_is_active = validated
+-            .conn
+-            .call(
+-                Some(&validated.cdp_session),
+-                "Runtime.evaluate",
+-                json!({
+-                    "expression": "document.visibilityState === 'visible'",
+-                    "returnByValue": true,
+-                    "awaitPromise": false,
+-                }),
+-            )
+-            .await
+-            .ok()
+-            .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
+-            .unwrap_or(false);
++        let tab_is_active = if hosted {
++            surface
++                .as_ref()
++                .and_then(|value| value.get("active"))
++                .and_then(Value::as_bool)
++                .unwrap_or(false)
++        } else {
++            validated
++                .conn
++                .call(
++                    Some(&validated.cdp_session),
++                    "Runtime.evaluate",
++                    json!({
++                        "expression": "document.visibilityState === 'visible'",
++                        "returnByValue": true,
++                        "awaitPromise": false,
++                    }),
++                )
++                .await
++                .ok()
++                .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
++                .unwrap_or(false)
++        };
++
++        let viewport_bounds = surface
++            .as_ref()
++            .and_then(|value| value.get("bounds"))
++            .and_then(|bounds| {
++                Some(Rect::new(
++                    bounds.get("x")?.as_f64()?,
++                    bounds.get("y")?.as_f64()?,
++                    bounds.get("width")?.as_f64()?,
++                    bounds.get("height")?.as_f64()?,
++                ))
++            })
++            .unwrap_or(validated.native.bounds);
+ 
+         let screen_point = if cdp_session == validated.cdp_session {
+             validated
+@@ -1707,12 +1800,25 @@ impl BrowserEngine {
+                 .await
+                 .ok()
+                 .and_then(|metrics| {
+-                    viewport_point_to_screen(
+-                        validated.native.bounds,
+-                        &metrics,
+-                        viewport_x,
+-                        viewport_y,
+-                    )
++                    if hosted {
++                        let zoom = surface.as_ref()?.get("zoom")?.as_f64()?;
++                        let x = viewport_x * zoom;
++                        let y = viewport_y * zoom;
++                        if !zoom.is_finite()
++                            || zoom <= 0.0
++                            || !x.is_finite()
++                            || !y.is_finite()
++                            || x < 0.0
++                            || y < 0.0
++                            || x > viewport_bounds.width
++                            || y > viewport_bounds.height
++                        {
++                            return None;
++                        }
++                        Some((viewport_bounds.x + x, viewport_bounds.y + y))
++                    } else {
++                        viewport_point_to_screen(viewport_bounds, &metrics, viewport_x, viewport_y)
++                    }
+                 })
+         } else {
+             // Child-frame coordinates are not necessarily in the top-level
+@@ -2506,6 +2612,29 @@ impl BrowserEngine {
+         scope_ref: Option<&str>,
+         query: Option<&str>,
+         continuation: Option<&str>,
++    ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
++        self.snapshot_tab_semantic_with_budget(
++            session,
++            target_id,
++            tab_id,
++            scope_ref,
++            query,
++            continuation,
++            DEFAULT_SEMANTIC_NODE_BUDGET,
++        )
++        .await
++    }
++
++    /// 宿主的观察预算直接作用于 CUA 语义选择和分页，不在返回后截断有效引用。
++    pub(crate) async fn snapshot_tab_semantic_with_budget(
++        &self,
++        session: &str,
++        target_id: &str,
++        tab_id: &str,
++        scope_ref: Option<&str>,
++        query: Option<&str>,
++        continuation: Option<&str>,
++        node_budget: usize,
+     ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
+         if let Some(token) = continuation {
+             if scope_ref.is_some() || query.is_some() {
+@@ -2556,7 +2685,7 @@ impl BrowserEngine {
+             })?;
+             let page = document.page(
+                 continuation.offset,
+-                DEFAULT_SEMANTIC_NODE_BUDGET,
++                node_budget,
+                 continuation.query.as_deref(),
+                 continuation.scope_backend_node_id,
+             );
+@@ -2723,12 +2852,7 @@ impl BrowserEngine {
+             OopifStatus::Unsupported
+         };
+ 
+-        let page = semantic.page(
+-            0,
+-            DEFAULT_SEMANTIC_NODE_BUDGET,
+-            query,
+-            scope_backend_node_id,
+-        );
++        let page = semantic.page(0, node_budget, query, scope_backend_node_id);
+         let next_offset = page.next_offset;
+         let snapshot_id = self.store.mint_snapshot_id();
+         let scope = if scope_ref.is_some() {
+diff --git a/crates/cua-driver-core/src/browser/tools.rs b/crates/cua-driver-core/src/browser/tools.rs
+index e7be285..9d668ab 100644
+--- a/crates/cua-driver-core/src/browser/tools.rs
++++ b/crates/cua-driver-core/src/browser/tools.rs
+@@ -16,7 +16,7 @@ use crate::tool_args::ArgsExt;
+ 
+ use super::cdp_ws::CdpConnection;
+ use super::download::BrowserDownloadTool;
+-use super::engine::{BrowserEngine, BrowserTabScreenshot};
++use super::engine::{hosted_browser_endpoint, BrowserEngine, BrowserTabScreenshot};
+ use super::platform::{BrowserVisualActionKind, PrepareProfile, PrepareRequest, PrepareStrategy};
+ use super::pointer::BrowserPointerTool;
+ use super::refusal::{BrowserRefusal, BrowserRefusalCode};
+@@ -276,6 +276,10 @@ impl GetBrowserStateTool {
+                         "type": "string",
+                         "description": "Read-only semantic match over role, accessible name, and visible text."
+                     },
++                    "node_budget": {
++                        "type": "integer", "minimum": 1, "maximum": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
++                        "description": "Maximum semantic nodes returned per observation; continuation preserves omitted content."
++                    },
+                     "continuation": {
+                         "type": "string",
+                         "description": "Opaque continuation minted by an earlier semantic_v2 response."
+@@ -373,15 +377,30 @@ impl Tool for GetBrowserStateTool {
+                 );
+             }
+             if snapshot_format == "semantic_v2" {
++                let node_budget = match args.get("node_budget") {
++                    None => super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
++                    Some(value) => match value.as_u64().filter(|budget| {
++                        *budget > 0
++                            && *budget <= super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET as u64
++                    }) {
++                        Some(budget) => budget as usize,
++                        None => {
++                            return ToolResult::error(
++                                "node_budget must be an integer within the semantic node limit",
++                            )
++                        }
++                    },
++                };
+                 let snapshot = match self
+                     .engine
+-                    .snapshot_tab_semantic(
++                    .snapshot_tab_semantic_with_budget(
+                         &session,
+                         &target_id,
+                         &tab_id,
+                         args.opt_str("scope_ref").as_deref(),
+                         args.opt_str("query").as_deref(),
+                         args.opt_str("continuation").as_deref(),
++                        node_budget,
+                     )
+                     .await
+                 {
+@@ -415,7 +434,7 @@ impl Tool for GetBrowserStateTool {
+                                 "scope": outcome.scope,
+                                 "selected_nodes": outcome.selected_nodes,
+                                 "total_nodes": outcome.total_nodes,
+-                                "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
++                                "node_budget": node_budget,
+                                 "omitted": {
+                                     "css_hidden": outcome.omissions.css_hidden,
+                                     "offscreen": outcome.omissions.offscreen,
+@@ -1481,6 +1500,139 @@ pub struct BrowserTypeTool {
+     engine: Arc<BrowserEngine>,
+ }
+ 
++/// 私有嵌入页面的按键沿用 CUA 窗口复核、串行和 CDP 传输，不聚焦宿主窗口。
++async fn hosted_browser_key(engine: &BrowserEngine, args: &Value) -> ToolResult {
++    let (session, target_id, tab_id, key) = match (
++        require_explicit_session(args),
++        args.require_str("target_id"),
++        args.require_str("tab_id"),
++        args.require_str("key"),
++    ) {
++        (Ok(session), Ok(target), Ok(tab), Ok(key)) => (session, target, tab, key),
++        (Err(error), _, _, _)
++        | (_, Err(error), _, _)
++        | (_, _, Err(error), _)
++        | (_, _, _, Err(error)) => return error,
++    };
++    if args.get("text").is_some() || args.get("ref").is_some() || key.is_empty() || key.len() > 64 {
++        return ToolResult::error("key requires a nonempty logical key without text or ref");
++    }
++    let modifiers = match args.get("modifiers") {
++        None => 0,
++        Some(value) => match value.as_u64().filter(|value| *value <= 15) {
++            Some(value) => value,
++            None => return ToolResult::error("modifiers must be a CDP bitmask from 0 to 15"),
++        },
++    };
++    if modifiers & 6 != 0 && ["c", "v", "x"].contains(&key.to_ascii_lowercase().as_str()) {
++        return ToolResult::error("clipboard shortcuts require the host clipboard capability");
++    }
++    let _mutation = match engine.lock_mutation(&session, &target_id, &tab_id).await {
++        Ok(guard) => guard,
++        Err(error) => return error.to_tool_result(),
++    };
++    let validated = match engine
++        .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
++        .await
++    {
++        Ok(value) => value,
++        Err(error) => return error.to_tool_result(),
++    };
++    if !hosted_browser_endpoint(&session, validated.record.pid)
++        .is_some_and(|endpoint| endpoint.ws_url == validated.record.ws_url)
++    {
++        return ToolResult::error("key dispatch requires the private embedded host route");
++    }
++    let virtual_key = match key.as_str() {
++        "Enter" => 13,
++        "Tab" => 9,
++        "Escape" => 27,
++        "Backspace" => 8,
++        "Delete" => 46,
++        "ArrowLeft" => 37,
++        "ArrowUp" => 38,
++        "ArrowRight" => 39,
++        "ArrowDown" => 40,
++        "Home" => 36,
++        "End" => 35,
++        "PageUp" => 33,
++        "PageDown" => 34,
++        " " => 32,
++        value if value.len() == 1 && value.is_ascii() => {
++            value.as_bytes()[0].to_ascii_uppercase() as u32
++        }
++        value if value.starts_with('F') => match value[1..].parse::<u32>() {
++            Ok(number @ 1..=24) => 111 + number,
++            _ => 0,
++        },
++        _ => 0,
++    };
++    if virtual_key == 0 && key.chars().count() != 1 {
++        return ToolResult::error("unsupported logical key; use a standard browser key name");
++    }
++    let focus = validated
++        .conn
++        .call(
++            Some(&validated.cdp_session),
++            "Emulation.setFocusEmulationEnabled",
++            json!({ "enabled": true }),
++        )
++        .await;
++    if let Err(error) = focus {
++        return ToolResult::error(format!("background key focus is unavailable: {error}"));
++    }
++    let code = if key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic() {
++        format!("Key{}", key.to_ascii_uppercase())
++    } else if key.len() == 1 && key.as_bytes()[0].is_ascii_digit() {
++        format!("Digit{key}")
++    } else if key == " " {
++        "Space".to_owned()
++    } else {
++        key.clone()
++    };
++    let mut down = json!({ "type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": virtual_key, "modifiers": modifiers });
++    if key.chars().count() == 1 && modifiers & 6 == 0 {
++        down["text"] = Value::String(key.clone());
++    }
++    if key == "Enter" && modifiers & 6 == 0 {
++        down["text"] = Value::String("\r".to_owned());
++    }
++    let mut failure = None;
++    for event in [
++        down,
++        json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": virtual_key, "modifiers": modifiers }),
++    ] {
++        if let Err(error) = validated
++            .conn
++            .call(
++                Some(&validated.cdp_session),
++                "Input.dispatchKeyEvent",
++                event,
++            )
++            .await
++        {
++            failure = Some(error);
++            break;
++        }
++    }
++    let restored = validated
++        .conn
++        .call(
++            Some(&validated.cdp_session),
++            "Emulation.setFocusEmulationEnabled",
++            json!({ "enabled": false }),
++        )
++        .await;
++    if let Some(error) = failure.or_else(|| restored.err()) {
++        return ToolResult::error(format!(
++            "key delivery is unconfirmed; inspect the page before retrying: {error}"
++        ));
++    }
++    ToolResult::text("key dispatched; business outcome requires observation").with_structured(
++        json!({ "status": "ok", "effect": "dispatched", "key": key, "modifiers": modifiers }),
++    )
++}
++
+ impl BrowserTypeTool {
+     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+         let def = ToolDef {
+@@ -1491,7 +1643,8 @@ impl BrowserTypeTool {
+                 at the caret, so typing into a field that already holds text appends \
+                 to it; pass replace=true to set the field instead, or to clear it by \
+                 typing an empty string. Pass a ref to an editable element from the \
+-                latest snapshot. A ref is required; heuristic bindings are refused."
++                latest snapshot. Text requires a ref; the private embedded host may \
++                instead dispatch a logical key with key/modifiers. Heuristic bindings are refused."
+                 .into(),
+             input_schema: json!({
+                 "type": "object",
+@@ -1500,6 +1653,8 @@ impl BrowserTypeTool {
+                     "tab_id": schema_tab_id(),
+                     "session": schema_session(),
+                     "text": { "type": "string", "description": "Text to type." },
++                    "key": { "type": "string", "description": "Private embedded host: dispatch a logical key such as Enter or Tab without text/ref." },
++                    "modifiers": { "type": "integer", "minimum": 0, "maximum": 15, "description": "Private host key modifiers: Alt=1, Control=2, Meta=4, Shift=8." },
+                     "ref": schema_ref(),
+                     "mode": {
+                         "type": "string",
+@@ -1517,7 +1672,7 @@ impl BrowserTypeTool {
+                             framework state stays consistent."
+                     },
+                 },
+-                "required": ["target_id", "tab_id", "ref", "text"],
++                "required": ["target_id", "tab_id"],
+                 "additionalProperties": true
+             }),
+             read_only: false,
+@@ -1560,6 +1715,9 @@ impl Tool for BrowserTypeTool {
+     }
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
++        if args.get("key").is_some() {
++            return hosted_browser_key(&self.engine, &args).await;
++        }
+         let (target_id, tab_id, text) = match (
+             args.require_str("target_id"),
+             args.require_str("tab_id"),
+diff --git a/crates/platform-macos/src/browser/electron_js.rs b/crates/platform-macos/src/browser/electron_js.rs
+index fd6bde6f..7e32de98 100644
+--- a/crates/platform-macos/src/browser/electron_js.rs
++++ b/crates/platform-macos/src/browser/electron_js.rs
+@@ -8,6 +8,83 @@ use super::cdp_client::{listening_ports, CdpClient};
+ pub struct ElectronJs;
+ 
+ impl ElectronJs {
++    /// 从同一系统用户的私有凭证连接 Zeus 窗口，只允许后台文本输入。
++    pub async fn type_text_background(
++        pid: i32,
++        window_id: u32,
++        rect: [f64; 4],
++        text: &str,
++        replace: bool,
++    ) -> Option<cua_driver_core::protocol::ToolResult> {
++        use cua_driver_core::{browser::cdp_ws::CdpConnection, protocol::ToolResult};
++        use std::io::Read;
++        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++
++        let uid = unsafe { libc::geteuid() };
++        let directory = std::env::temp_dir().join(format!("zeus-cua-electron-{uid}"));
++        let metadata = std::fs::symlink_metadata(&directory).ok()?;
++        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
++            return None;
++        }
++        let file = std::fs::OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_NOFOLLOW)
++            .open(directory.join(format!("{pid}-{window_id}.json")))
++            .ok()?;
++        let metadata = file.metadata().ok()?;
++        if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
++            return None;
++        }
++        let mut bytes = Vec::new();
++        file.take(8193).read_to_end(&mut bytes).ok()?;
++        if bytes.len() > 8192 {
++            return None;
++        }
++        let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
++        if record["pid"].as_i64() != Some(pid as i64)
++            || record["windowId"].as_u64() != Some(window_id as u64)
++        {
++            return None;
++        }
++        let endpoint = record["endpoint"].as_str()?;
++        let connection = match CdpConnection::connect(endpoint).await {
++            Ok(connection) => connection,
++            Err(_) => return Some(ToolResult::error("Electron background input was not started: private window bridge is unavailable; observe the window again.")),
++        };
++        if let Err(error) = crate::input::user_guard::check_pid(pid) {
++            return Some(ToolResult::error(error.to_string()));
++        }
++        // 每次只投递一次；传输或页面异常不回退到 AX、系统键盘或前台输入。
++        let result = tokio::time::timeout(
++            Duration::from_secs(10),
++            connection.call(
++                None,
++                "Zeus.insertText",
++                serde_json::json!({
++                    "pid": pid, "windowId": window_id, "rect": rect, "text": text, "replace": replace,
++                }),
++            ),
++        )
++        .await;
++        let verified = match result {
++            Ok(Ok(value)) => value["verified"].as_bool() == Some(true),
++            _ => return Some(ToolResult::error("Electron background input result is unknown; observe the window before any further action. Do not repeat the input.")),
++        };
++        Some(ToolResult::text(if verified {
++            "Inserted text through the private Electron renderer bridge; DOM value verified."
++        } else {
++            "Electron renderer input was dispatched but the DOM value could not be confirmed; observe the window and do not repeat the input."
++        }).with_structured(serde_json::json!({
++            "pid": pid,
++            "window_id": window_id,
++            "path": "electron_cdp",
++            "verified": verified,
++            "effect": if verified { "confirmed" } else { "unverifiable" },
++            "delivery": { "mode": "background" },
++            "delivered_chars": if verified { Some(text.chars().count()) } else { None },
++        })))
++    }
++
+     /// Returns true if the process at `pid` is an Electron app.
+     pub fn is_electron(pid: i32) -> bool {
+         // Look up the bundle path from list_running_apps.
+diff --git a/crates/platform-macos/src/tools/type_text.rs b/crates/platform-macos/src/tools/type_text.rs
+index 8d7e2aa2..87916978 100644
+--- a/crates/platform-macos/src/tools/type_text.rs
++++ b/crates/platform-macos/src/tools/type_text.rs
+@@ -327,6 +327,23 @@ impl Tool for TypeTextTool {
+                 element_ptr,
+                 window_id,
+             ));
++        // 仅在原有精确窗口与语义控件校验通过后使用自有 Electron 的私有通道。
++        if !delivery_mode.is_foreground() && electron_background_ax_unsafe {
++            if let (Some((element, _)), Some(wid)) = (element_ptr, window_id) {
++                if let Some(rect) =
++                    unsafe { crate::ax::bindings::element_screen_rect(element as AXUIElementRef) }
++                {
++                    if let Some(result) =
++                        crate::browser::electron_js::ElectronJs::type_text_background(
++                            pid, wid, rect, &text, false,
++                        )
++                        .await
++                    {
++                        return result;
++                    }
++                }
++            }
++        }
+         if let Some(refusal) = electron_background_ax_refusal(
+             delivery_mode,
+             element_ptr.is_some(),
+diff --git a/crates/platform-macos/src/tools/set_value.rs b/crates/platform-macos/src/tools/set_value.rs
+index 79bcca10..1730494f 100644
+--- a/crates/platform-macos/src/tools/set_value.rs
++++ b/crates/platform-macos/src/tools/set_value.rs
+@@ -165,6 +165,33 @@ impl Tool for SetValueTool {
+             Err(refusal_result) => return refusal_result,
+         };
+ 
++        // 自有 Electron 文本控件复用页面输入通道，替换与清空同样触发真实编辑事件。
++        let text_control =
++            unsafe { crate::ax::bindings::copy_string_attr(element_ptr as _, "AXRole") }
++                .is_some_and(|role| {
++                    matches!(
++                        role.as_str(),
++                        "AXTextField"
++                            | "AXTextArea"
++                            | "AXSearchField"
++                            | "AXComboBox"
++                            | "AXIncrementor"
++                    )
++                });
++        if text_control && crate::browser::electron_js::ElectronJs::is_electron(pid) {
++            if let Some(rect) =
++                unsafe { crate::ax::bindings::element_screen_rect(element_ptr as _) }
++            {
++                if let Some(result) = crate::browser::electron_js::ElectronJs::type_text_background(
++                    pid, window_id, rect, &value, true,
++                )
++                .await
++                {
++                    return result;
++                }
++            }
++        }
++
+         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+         let center_guard = element_guard.clone();
+         if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {

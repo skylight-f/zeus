@@ -9,7 +9,6 @@ import type {
   MoveProjectSourceEntryInput,
   NetworkProxyCheckTarget,
   NetworkProxyConnectionResult,
-  NetworkProxySettings,
   ProjectSourceContentSearchOptions,
   ProjectSourceContentSearchResult,
   ProjectSourceTextSearchInput,
@@ -30,6 +29,9 @@ import type {
   ZeusBrowserEvent,
   ZeusBrowserPreparedSubmission,
   ZeusBrowserSettings,
+  ZeusBrowserPasswordAccount,
+  ZeusBrowserPasswordImportPreview,
+  ZeusBrowserPasswordImportResult,
   ZeusComputerControlIdentity,
   ZeusComputerPreview,
   ZeusComputerSettings,
@@ -135,12 +137,19 @@ declare global {
       }>;
       /** 任务、普通会话与项目提交按钮共用同一原生窗口入口。 */
       openTaskGitDeliveryWindow: (
-        input:
+        input: (
           | { taskId: string; workspaceId?: string | null; projectId?: never; conversationId?: never; repositoryId?: never; pathPrefix?: never }
           | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId?: never; pathPrefix?: never }
           | { taskId?: never; workspaceId?: never; projectId: string; conversationId: string; repositoryId?: never; pathPrefix?: never }
-          | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId: string; pathPrefix?: string },
-      ) => Promise<{ opened: true; reused: boolean; taskId?: string; projectId?: string; conversationId?: string }>;
+          | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId: string; pathPrefix?: string }
+        ) & { /** 只准备当前范围，不显示窗口。 */ preload?: boolean },
+      ) => Promise<{ opened: boolean; reused: boolean; taskId?: string; projectId?: string; conversationId?: string }>;
+      /** 真实绘制帧只上报类型与耗时，不传文件正文。 */
+      reportGitDeliveryFrame: (input: { kind: 'window' | 'diff'; durationMs?: number }) => void;
+      /** 原生展示预热窗口后请求一次实际绘制回执。 */
+      onGitDeliveryFrameRequested: (listener: () => void) => () => void;
+      /** 提交期间立即隐藏窗口，失败时恢复并保留原有输入。 */
+      setTaskGitDeliverySubmissionState: (state: 'pending' | 'accepted' | 'failed') => Promise<{ state: 'pending' | 'accepted' | 'failed' }>;
       /** 所有范围都关闭当前真实交付窗口。 */
       closeTaskGitDeliveryWindow: () => Promise<{ closed: true; taskId?: string; projectId?: string; conversationId?: string }>;
       getTaskGitDeliveryCurrentContext: () => Promise<{ taskId: string | null; workspaceId: string | null }>;
@@ -150,6 +159,8 @@ declare global {
       /** 任务工作区文件在独立窗口中只读查看。 */
       openTaskGitDiffWindow: (input: Extract<import('@zeus/shared').FilePreviewRequest, { kind: 'task-git' }>) => Promise<{ opened: true }>;
       openProjectGitDiffWindow: (input: {
+        /** 会话工作树沿用交付窗口的读取范围；普通项目省略。 */
+        conversationId?: string;
         projectId: string;
         repositoryId: string;
         filePath: string;
@@ -162,14 +173,21 @@ declare global {
       }) => Promise<{ opened: true }>;
       /** 按调用窗口身份读取展示快照，不接受其他窗口或本机路径。 */
       loadProjectGitDiffSnapshot: () => Promise<{ filePath: string; diff: import('./apiClient.js').GitDiffSummary }>;
-      loadProjectGitWorkbench: (projectId: string) => Promise<import('./apiClient.js').ProjectGitWorkbenchSnapshot>;
+      loadProjectGitWorkbench: (projectId: string, includePatches?: boolean) => Promise<import('./apiClient.js').ProjectGitWorkbenchSnapshot>;
       /** 只读获取当前项目的耐久 Git 操作历史页。 */
       loadProjectGitOperations: (input: { projectId: string; cursor?: string }) => Promise<import('./apiClient.js').ProjectGitOperationPage>;
       loadProjectGitHistory: (input: { projectId: string; repositoryId: string; offset: number; ref?: string }) => Promise<{ commits: import('./apiClient.js').ProjectGitRepositorySnapshot['recentCommits']; hasMore: boolean }>;
       loadProjectGitCommit: (input: { projectId: string; repositoryId: string; commitHash: string }) => Promise<import('./apiClient.js').ProjectGitCommitDetail>;
       /** 按指定远端目标读取待推送范围。 */
       loadProjectGitPushPreview: (input: { projectId: string; repositoryId: string; selection: import('./apiClient.js').ProjectGitPushPreviewInput }) => Promise<import('./apiClient.js').ProjectGitPushPreview>;
-      loadProjectGitComparisonDiff: (input: { projectId: string; repositoryId: string; ref: string; mode: 'current' | 'working-tree' }) => Promise<import('./apiClient.js').GitDiffSummary>;
+      loadProjectGitComparisonDiff: (input: {
+        projectId: string;
+        repositoryId: string;
+        ref: string;
+        mode: 'current' | 'working-tree' | 'staged' | 'unstaged';
+        path?: string;
+        summaryOnly?: boolean;
+      }) => Promise<import('./apiClient.js').GitDiffSummary>;
       cancelProjectGitAction: (repositoryId: string) => Promise<{ cancelled: boolean }>;
       executeProjectGitAction: (input: {
         projectId: string;
@@ -188,6 +206,8 @@ declare global {
       onOpenTaskNotification?: (listener: (input: { projectId?: string; taskId?: string; reminderId?: string }) => void) => () => void;
       onOpenConversationNotification: (listener: (input: { projectId: string; conversationId: string }) => void) => () => void;
       getRequestingWindowForeground: () => Promise<{ foreground: boolean }>;
+      /** 已确认退出时为 true；退出中止并保留窗口时为 false。 */
+      onQuitStateChanged: (listener: (quitting: boolean) => void) => () => void;
       onRequestingWindowForegroundChanged: (listener: (foreground: boolean) => void) => () => void;
       hideMenuBarUsage: () => Promise<{ hidden: true }>;
       updateMenuBarUsageTray: (image: { dataUrl: string; darkDataUrl: string; tooltip: string }) => Promise<void>;
@@ -195,6 +215,9 @@ declare global {
       showMainWindowFromMenuBarUsage: () => Promise<{ shown: boolean }>;
       openMenuBarUsageSettings: (category: 'usage' | 'runtime') => Promise<{ opened: boolean; category: 'usage' | 'runtime' }>;
       quitFromMenuBarUsage: () => Promise<{ quitting: true }>;
+      /** 只读取项目已有的 worktree，切换结果复用源码工作区身份。 */
+      listProjectSourceWorktrees: (projectId: string) => Promise<import('@zeus/shared').ProjectSourceWorktree[]>;
+      selectProjectSourceWorktree: (input: { projectId: string; worktreeId: string }) => Promise<import('@zeus/shared').FilePreviewSourceWorkspace>;
       listProjectSourceDirectory: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDirectorySnapshot>;
       searchProjectSourceEntries: (input: { projectId: string; query: string }) => Promise<ProjectSourceSearchResult>;
       searchProjectSourceContent: (input: { projectId: string; query: string } & ProjectSourceContentSearchOptions) => Promise<ProjectSourceContentSearchResult>;
@@ -204,10 +227,20 @@ declare global {
 
       /** 跨入口共用的受授权文件预览。 */
       loadFilePreview: (input: FilePreviewRequest) => Promise<FilePreviewItem[]>;
+      /** 按原授权监听当前文件；历史快照不会随工作区变化。 */
+      watchFilePreview: (input: FilePreviewRequest) => Promise<string | null>;
+      /** 当前窗口已授权文件的磁盘变更通知。 */
+      onFilePreviewChanged: (listener: (id: string) => void) => () => void;
+      /** 读取当前授权文件版本的 Git 审阅，不重新传入磁盘路径。 */
+      loadFilePreviewReview: (id: string) => Promise<import('@zeus/shared').FileReview | undefined>;
       /** 页面关闭和选择变化时撤销短期资源。 */
       releaseFilePreview: (ids: string[]) => Promise<void>;
       /** 用户主动请求系统查看或导出当前预览版本。 */
+      /** 交付菜单共享任务与项目工作区操作。 */
+      actOnGitDeliveryFiles: (input: import('@zeus/shared').GitDeliveryFileActionInput) => Promise<{ completed: true }>;
       actOnFilePreview: (id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit') => Promise<void>;
+      /** 只复制或另存预览图片的 PNG 像素，不接收本地文件路径。 */
+      actOnImagePreview: (dataUrl: string, action: 'copy' | 'export', name: string) => Promise<void>;
       /** 只恢复两端预览中选中的行区块，并返回更新后的预览授权。 */
       /** 将完整草稿保存到当前授权工作区文件。 */
       saveFilePreview: (input: import('@zeus/shared').FilePreviewSaveInput) => Promise<import('@zeus/shared').FilePreviewItem[]>;
@@ -234,6 +267,10 @@ declare global {
       onProjectSourceEvent: (listener: (event: ProjectSourceEvent) => void) => () => void;
       reportRendererFatalFailure: (message: string) => void;
       reportRendererRuntimeError: (message: string) => void;
+      /** 关联当前工作面身份，不包含会话正文。 */
+      reportFaultContext: (context: Record<string, unknown>) => void;
+      /** 记录有界操作轨迹，宿主只接受已登记事件和白名单字段。 */
+      reportFaultBreadcrumb: (entry: { event: string; context?: Record<string, unknown>; details?: Record<string, unknown> }) => void;
       /** 本机输入建议阶段日志，不包含草稿或回复正文。 */
       reportInputSuggestionDiagnostic: (entry: import('@zeus/shared').InputSuggestionUiDiagnostic) => void;
       reportRendererBootstrapReady: () => void;
@@ -298,7 +335,7 @@ declare global {
       getTaskAttachmentPreview: (path: string) => Promise<{ previewUrl: string; mimeType: string } | null>;
       openTaskAttachment: (path: string) => Promise<{ opened: boolean; error?: string }>;
       /** 读取第三方任务详情，返回可编辑草稿。 */
-      parseThirdPartyTaskLink: (url: string) => Promise<ThirdPartyTaskExtract>;
+      parseThirdPartyTaskLink: (url: string, onMetadata?: (result: ThirdPartyTaskExtract) => void) => Promise<ThirdPartyTaskExtract>;
       /** 在共享登录状态的 Zeus 窗口打开来源页面。 */
       openThirdPartyTaskLogin: (url: string) => Promise<boolean>;
       exportSettingsSnapshotToFile: (snapshot: unknown) => Promise<{ saved: boolean; filePath: string | null }>;
@@ -314,7 +351,7 @@ declare global {
       }>;
       clearNetworkCache: () => Promise<{ cleared: boolean; clearedAt: string }>;
       /** 使用当前草稿检查指定的浏览器或模型宿主网络。 */
-      checkNetworkProxyConnection: (settings: NetworkProxySettings, address: string, checkTarget: NetworkProxyCheckTarget) => Promise<NetworkProxyConnectionResult>;
+      checkNetworkProxyConnection: (address: string, checkTarget: NetworkProxyCheckTarget) => Promise<NetworkProxyConnectionResult>;
       exportPatchToFile: (patch: unknown) => Promise<{ saved: boolean; filePath: string | null }>;
       openSource: (source: { projectRoot?: string; sourceRef: string; lineStart?: number }) => Promise<{
         opened: boolean;
@@ -376,6 +413,10 @@ declare global {
         sourceFilePath?: string;
         logs: Array<{ createdAt: string; stream: string; text: string }>;
       }) => Promise<{ saved: boolean; filePath: string | null }>;
+      /** 上报故障时由 Main 填充环境并保存本地副本。 */
+      submitFaultReport: (payload: import('@zeus/shared').FaultReportInput) => Promise<import('@zeus/shared').FaultReportReceipt>;
+      /** 导出与当前故障身份一致的已保存诊断包。 */
+      exportFaultReport: (reportId: string) => Promise<{ saved: boolean }>;
       beginWindowDrag: (point: { screenX: number; screenY: number }) => Promise<{ dragging: boolean }>;
       moveWindowDrag: (point: { screenX: number; screenY: number }) => Promise<{ dragging: boolean; x?: number; y?: number }>;
       endWindowDrag: () => Promise<{ dragging: false }>;
@@ -395,7 +436,30 @@ declare global {
         canSplit: boolean;
         expanded: boolean;
       }) => Promise<
-        'new_tab' | 'close_tab' | 'close_other_tabs' | 'back' | 'forward' | 'reload' | 'stop' | 'find' | 'copy_url' | 'open_external' | 'zoom_in' | 'zoom_out' | 'zoom_reset' | 'devtools' | 'toggle_expanded' | 'reset_size' | 'close' | null
+        | 'new_tab'
+        | 'close_tab'
+        | 'close_other_tabs'
+        | 'back'
+        | 'forward'
+        | 'reload'
+        | 'stop'
+        | 'find'
+        | 'translate'
+        | 'restore_original'
+        | 'translation_login'
+        | { action: 'translation_service'; serviceId: string }
+        | 'translation_google'
+        | 'translation_microsoft'
+        | 'copy_url'
+        | 'open_external'
+        | 'zoom_in'
+        | 'zoom_out'
+        | 'zoom_reset'
+        | 'devtools'
+        | 'toggle_expanded'
+        | 'reset_size'
+        | 'close'
+        | null
       >;
       getBrowserSnapshot: (conversationId: string) => Promise<ZeusBrowserConversationSnapshot>;
       openBrowserTab: (input: { conversationId: string; url?: string }) => Promise<ZeusBrowserConversationSnapshot>;
@@ -406,12 +470,25 @@ declare global {
       /** 关闭当前会话全部标签，返回清理后的权威状态。 */
       closeBrowserConversation: (conversationId: string) => Promise<ZeusBrowserConversationSnapshot>;
       runBrowserCommand: (input: { conversationId: string; tabId: string; command: ZeusBrowserCommand }) => Promise<ZeusBrowserConversationSnapshot>;
-      setBrowserLayout: (input: { conversationId: string; tabId: string; bounds: { x: number; y: number; width: number; height: number }; visible: boolean }) => Promise<{ applied: boolean }>;
+      /** 遮挡原生网页时可请求一张内存快照，供当前标签保留弹窗背景。 */
+      setBrowserLayout: (input: {
+        conversationId: string;
+        tabId: string;
+        bounds: { x: number; y: number; width: number; height: number };
+        visible: boolean;
+        capturePreview?: boolean;
+      }) => Promise<{ applied: boolean; previewImageUrl?: string }>;
       prepareBrowserComments: (input: { conversationId: string; tabId: string; commentIds?: string[] }) => Promise<ZeusBrowserPreparedSubmission>;
       getBrowserCommentPreview: (path: string) => Promise<{ previewUrl: string; mimeType: 'image/png' } | null>;
       markBrowserCommentsSent: (input: { conversationId: string; tabId: string; commentIds: string[] }) => Promise<ZeusBrowserConversationSnapshot>;
       respondToBrowserApproval: (input: { requestId: string; decision: ZeusBrowserApprovalDecision }) => Promise<{ resolved: boolean }>;
       getBrowserSettings: () => Promise<ZeusBrowserSettings>;
+      /** 密码管理只接收元数据、冲突来源与统计回执。 */
+      listBrowserPasswords: () => Promise<ZeusBrowserPasswordAccount[]>;
+      prepareBrowserPasswordImport: () => Promise<ZeusBrowserPasswordImportPreview | null>;
+      cancelBrowserPasswordImport: (token: string) => Promise<void>;
+      commitBrowserPasswordImport: (input: { token: string; choices: Record<string, number> }) => Promise<ZeusBrowserPasswordImportResult>;
+      deleteBrowserPassword: (id: string) => Promise<{ deleted: boolean }>;
       updateBrowserSettings: (input: Partial<ZeusBrowserSettings>) => Promise<ZeusBrowserSettings>;
       clearBrowserData: () => Promise<{ cleared: boolean }>;
       getRetiredNativeRuntimeState: () => Promise<ZeusRetiredNativeRuntimeState>;

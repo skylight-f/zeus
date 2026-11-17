@@ -1,8 +1,119 @@
 import { distributionAppName, distributionArtifactPrefix } from './desktop-distribution.mjs';
 import { zeusDistribution, versionFromReleaseTag } from './desktop-distribution.mjs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 
+/** CI 与 Release 正文使用的官方分发目录，与客户端可信来源保持一致。 */
+export const releaseCdnBaseUrl = 'https://zeus-download.hyphatech.cn/zeus';
+
+/** 可变下载入口与更新清单最多缓存一分钟，版本目录继续使用长期缓存。 */
+export const releaseCdnStableCacheControl = 'public,max-age=60,must-revalidate,no-transform';
+
+/** 并发发布操作全部结束后才返回或报错，防止清理临时文件时仍有上传在运行。 */
+export async function waitForReleaseOperations(operations) {
+  /** 保留任务顺序，同时收齐已启动操作的结果。 */
+  const results = await Promise.allSettled(operations);
+  /** 首个失败保留原始错误，且不会遗留后台写入。 */
+  const failure = results.find((result) => result.status === 'rejected');
+  if (failure) throw failure.reason;
+  return results.map((result) => result.value);
+}
+
+/** 固定版本的任一文件写入后即占用版本号，不能等公开 tag 创建后才识别旧候选。 */
+export async function readReleaseCdnFiles(version, request = fetch) {
+  requiredVersion(version);
+  /** 安装包可先于平台清单上传，五个固定对象都参与版本占用判断。 */
+  const fileNames = [`Zeus-${version}-arm64.dmg`, `Zeus-${version}-win32-x64.exe`, `Zeus-${version}-win32-arm64.exe`, 'zeus-release-manifest.json', 'zeus-release-manifest-win32.json'];
+  /** 只读取元数据；网络、权限和身份异常均不能被当成版本尚未使用。 */
+  const files = await waitForReleaseOperations(
+    fileNames.map(async (fileName) => {
+      /** 独立检查地址并禁止缓存，避免新版本的缺失响应污染正常下载地址。 */
+      const response = await request(`${releaseCdnBaseUrl}/releases/${version}/${fileName}?zeus-release-inspect=${randomUUID()}`, {
+        method: 'HEAD',
+        headers: { 'Accept-Encoding': 'identity', 'Cache-Control': 'no-cache, no-store' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.status === 404) return null;
+      if (!response.ok) throw new Error(`无法确认 CDN 版本占用：${version}/${fileName}，HTTP ${response.status}`);
+      /** 对象的候选身份来自上传时保留的 OSS 元数据。 */
+      const sourceCommit = response.headers.get('x-oss-meta-source-commit');
+      if (!/^[a-f0-9]{40}$/u.test(sourceCommit ?? '')) throw new Error(`CDN 已存文件缺少有效候选身份：${version}/${fileName}`);
+      return { fileName, sourceCommit };
+    }),
+  );
+  return files.filter(Boolean);
+}
+
+/** 固定下载名仅接受正式支持的平台与架构，不能构造任意 OSS 对象路径。 */
+export function stableReleaseArtifactFileName(version, fileName) {
+  const prefix = `Zeus-${requiredVersion(version)}-`;
+  const suffix = fileName.slice(prefix.length);
+  if (!fileName.startsWith(prefix) || !['arm64.dmg', 'win32-x64.exe', 'win32-arm64.exe'].includes(suffix)) throw new Error(`固定下载入口的安装包名称无效：${fileName}`);
+  return `Zeus-${suffix}`;
+}
+
+/** 公开固定入口必须提供当前候选；只为一分钟内的旧缓存保留有界等待。 */
+export async function verifyPublicCdnDownload(manifest, artifact, request = fetch) {
+  const fileName = stableReleaseArtifactFileName(manifest.version, artifact.fileName);
+  for (let attempt = 0; attempt <= 12; attempt += 1) {
+    const response = await request(`${releaseCdnBaseUrl}/updates/${fileName}`, { method: 'HEAD', headers: { 'Accept-Encoding': 'identity' }, redirect: 'error', signal: AbortSignal.timeout(15_000) });
+    if (
+      response.ok &&
+      response.headers.get('x-oss-meta-sha256') === artifact.sha256 &&
+      response.headers.get('x-oss-meta-source-commit') === manifest.sourceCommit &&
+      response.headers.get('content-length') === String(artifact.sizeBytes) &&
+      response.headers.get('cache-control') === releaseCdnStableCacheControl &&
+      response.headers.get('content-disposition') === `attachment; filename="${artifact.fileName}"`
+    )
+      return;
+    if (attempt === 12 || (!response.ok && response.status !== 404)) throw new Error(`CDN 固定下载入口与当前候选不一致：${fileName}，HTTP ${response.status}`);
+    await delay(5_000);
+  }
+}
+
+/** CDN 清单保留候选身份、摘要、签名和平台，只替换安装包的传输地址。 */
+export function cdnReleaseManifest(manifest) {
+  requiredVersion(manifest.version);
+  return {
+    ...manifest,
+    artifacts: manifest.artifacts.map((artifact) => ({ ...artifact, downloadUrl: `${releaseCdnBaseUrl}/releases/${manifest.version}/${encodeURIComponent(artifact.fileName)}` })),
+  };
+}
+
+/** 从公开固定版本地址回读小型清单，确认 CDN 实际提供的是本次候选。 */
+export async function verifyPublicCdnManifest(manifest, fileName, request = fetch, latest = false) {
+  /** GitHub 和 CDN 清单必须由同一候选生成，不能只比较版本号。 */
+  const expected = `${JSON.stringify(cdnReleaseManifest(manifest), null, 2)}\n`;
+  /** 发布验收同时读取稳定指针，避免只上传固定文件便误报更新已生效。 */
+  const url = latest ? `${releaseCdnBaseUrl}/updates/${fileName}` : `${releaseCdnBaseUrl}/releases/${manifest.version}/${fileName}`;
+  /** 限制连接与正文读取总时间，避免阻塞发布验收。 */
+  const response = await request(url, { redirect: 'error', signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`CDN 公开清单不可用：HTTP ${response.status}，${fileName}`);
+  /** 清单只能是小型 JSON，安装包不能误传到清单地址。 */
+  const content = await response.text();
+  if (content.length > 1024 * 1024 || sha256Text(content) !== sha256Text(expected)) throw new Error(`CDN 公开清单与固定候选不一致：${fileName}`);
+}
+
+/** 为正文增加当前正式支持平台的固定版本下载链接，重复执行不追加重复区块。 */
+export function renderCdnReleaseNotes(markdown, version) {
+  requiredVersion(version);
+  /** 仅替换本函数拥有的生成区块，保留发布说明其余文字。 */
+  const content = markdown.replace(/\r\n/gu, '\n').replace(/\n?<!-- zeus-cdn-downloads -->[\s\S]*?<!-- \/zeus-cdn-downloads -->\n?/u, '');
+  /** 原有验收要求版本标题仍位于正文首行。 */
+  const title = `# Zeus ${version} 更新内容`;
+  if (!content.startsWith(`${title}\n`)) throw new Error('CDN 下载链接不能加入版本标题不匹配的 Release notes。');
+  /** 三个名称对应主发布流程实际生成的 macOS 与 Windows 安装包。 */
+  const downloads = [
+    ['macOS Apple Silicon', `Zeus-${version}-arm64.dmg`],
+    ['Windows x64', `Zeus-${version}-win32-x64.exe`],
+    ['Windows ARM64', `Zeus-${version}-win32-arm64.exe`],
+  ];
+  /** 版本固定在 URL 路径中，长期缓存不会混用不同安装包。 */
+  const links = downloads.map(([label, fileName]) => `- [${label}](${releaseCdnBaseUrl}/releases/${version}/${fileName})`).join('\n');
+  return `${title}\n\n<!-- zeus-cdn-downloads -->\n## CDN 加速下载\n\n${links}\n<!-- /zeus-cdn-downloads -->\n\n${content.slice(title.length).trimStart()}`;
+}
 export function requiredVersion(rawValue, name = 'RELEASE_VERSION') {
   const version = rawValue?.trim() ?? '';
   if (!/^\d+\.\d+\.\d+$/u.test(version)) throw new Error(`${name} 为必填稳定版本号，例如 0.1.10。`);

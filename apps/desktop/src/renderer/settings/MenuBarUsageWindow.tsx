@@ -38,7 +38,7 @@ const copy = {
     remainingCredits: '剩余点数',
     allProviders: '全部供应源',
     providers: '供应商',
-    reorderHelp: '拖动手柄排序，也可聚焦手柄后按 ↑ ↓',
+    reorderHelp: '拖动排序，或按 ↑ ↓ 调整顺序',
     reorder: '排序',
     loading: '正在读取用量',
     noProviders: '还没有可统计的用量',
@@ -106,7 +106,7 @@ const copy = {
     remainingCredits: 'Credits remaining',
     allProviders: 'All providers',
     providers: 'Provider',
-    reorderHelp: 'Drag to reorder, or focus a handle and press ↑ ↓',
+    reorderHelp: 'Drag to reorder, or press ↑ ↓ to move',
     reorder: 'Reorder',
     loading: 'Loading usage',
     noProviders: 'No usage recorded yet',
@@ -187,6 +187,7 @@ export function MenuBarUsageWindow(props: { client: UsageClient; language: Langu
         setLoading(true);
         try {
           const next = await props.client.loadUsageOverview(refresh);
+          if (!Array.isArray(next.providers)) throw new Error('用量概览缺少供应商列表，请重试。');
           setSnapshot(next);
           setHasLoaded(true);
           storeSnapshot(next);
@@ -429,9 +430,9 @@ function AllProviders(props: { providers: UsageProviderSummary[]; language: Lang
   return (
     <section className="menu-bar-usage-provider-list" aria-label={text.allProviders}>
       {props.providers.length > 1 ? (
-        <small className="menu-bar-usage-reorder-hint" id="menu-bar-usage-reorder-hint">
+        <span className="menu-bar-usage-sr-only" id="menu-bar-usage-reorder-hint">
           {text.reorderHelp}
-        </small>
+        </span>
       ) : null}
       <span className="menu-bar-usage-sr-only" role="status">
         {announcement}

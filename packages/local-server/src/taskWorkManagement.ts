@@ -240,8 +240,22 @@ export interface TaskWorkManagementController {
   /** 自动领取只绑定现行安排中的待领分工。 */
   claimPlannedWork(taskId: string, employeeId: string): boolean;
   /** 自动化沿用原安排领取分工，回执固定到准确安排代次，不另建独立工作。 */
-  claimPlannedAutomationWork(input: { taskId: string; employeeId: string; sourceRef: string; permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access' }): Promise<AutomationExecutionReference | null | undefined>;
-  createAutomatedWorkItem(input: { taskId: string; employeeId: string; sourceRef: string; permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access' }): Promise<{ item: TaskWorkItemRecord; run: TaskWorkRunRecord }>;
+  claimPlannedAutomationWork(input: {
+    taskId: string;
+    employeeId: string;
+    sourceRef: string;
+    permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
+    /** 统一自动化的新领取在接纳事务内复核当前控制状态。 */
+    assertCanAccept?: () => void;
+  }): Promise<AutomationExecutionReference | null | undefined>;
+  createAutomatedWorkItem(input: {
+    taskId: string;
+    employeeId: string;
+    sourceRef: string;
+    permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
+    /** 统一自动化预检完成后，在创建工作前复核当前控制状态。 */
+    assertCanAccept?: () => void;
+  }): Promise<{ item: TaskWorkItemRecord; run: TaskWorkRunRecord }>;
   /** 接纳整个流程时固定最终模型配置，并检查全部节点 Skill。 */
   freezeWorkflowConfiguration(projectId: string, employeeId: string, settings: EmployeeWorkSettings, taskId?: string): Promise<EmployeeWorkSettings>;
   /** 数字团队按冻结节点创建工作项，旧自动调度器不会接管此来源。 */
@@ -284,6 +298,8 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let active: Promise<void> | null = null;
   let closed = false;
+  /** 保留本进程上次扫描位置，每轮最多处理 100 条，扫描到末尾后从头轮转。 */
+  let recoveryCursor: Pick<TaskWorkRunRecord, 'createdAt' | 'id'> | undefined;
   /** 数字团队工具在两个协调器都完成构造后绑定。 */
   let digitalTeamTools: TaskWorkToolPort | null = null;
   /** 团队与独立工作共用同一个串行调度循环，避免双定时器争抢。 */
@@ -632,9 +648,8 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
           });
           for (const previous of previousItems) {
             if (isDigitalTeamWorkItem(previous)) throw new TaskWorkStoreError('ZEUS_TASK_WORK_HANDOFF_TEAM_REQUIRED', '原团队工作尚未收口，请从原团队处理。');
-            await stopWorkItemRuntime(options, previous, `handoff:${parsed.operationIdentity}:${previous.id}`);
+            const stopped = await stopWorkItemRuntime(options, previous, `handoff:${parsed.operationIdentity}:${previous.id}`);
             /** 停止期间若换代或仍有未知结果，不得取消新工作或接纳新执行。 */
-            const stopped = options.items.getById(previous.id)!;
             const run = stopped.currentRunId ? options.runs.getById(stopped.currentRunId) : undefined;
             if (stopped.currentRunId !== previous.currentRunId || run?.status === 'outcome_unknown') throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_STATE_CHANGED', '原工作的停止结果尚未确认，请核对原会话。');
             if (!['completed', 'failed', 'cancelled'].includes(stopped.status)) cancelWorkItem(options, stopped, stopped.revision);
@@ -724,14 +739,18 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
       route(reply, async () => {
         const item = requireOwnedItem(options, request.params.taskId, request.params.workItemId);
         const parsed = options.application.parse<TaskWorkActionInput>({ value: request.body, commandType: workManagementCommandTypes.taskWorkItemCancel, scopeKind: 'task', expectedScopeId: () => item.taskId });
+        /** 已接纳命令直接返回原回执，避免重发请求再次停止外部执行。 */
+        const replay = options.application.replayAcceptedCore<TaskWorkActionInput, TaskWorkItemRecord>({ parsed, destinationId: 'task-work-item-repository', resourceId: `task_work_item:${item.id}` });
+        if (replay) return replay.result;
+        assertWorkItemCancellationSnapshot(options, item, parsed.input.expectedRevision);
         const stopping = item.arrangement && item.status !== 'cancelled' ? options.planning.requestCancellation(item.id, parsed.input.expectedRevision) : item;
         await options.save();
-        await stopWorkItemRuntime(options, stopping, `cancel:${parsed.operationIdentity}:${item.id}`);
+        const stopped = await stopWorkItemRuntime(options, stopping, `cancel:${parsed.operationIdentity}:${item.id}`);
         const result = options.application.executeCore({
           parsed,
           destinationId: 'task-work-item-repository',
           resourceId: `task_work_item:${item.id}`,
-          mutateBusinessState: () => cancelWorkItem(options, stopping, stopping.revision),
+          mutateBusinessState: () => cancelWorkItem(options, stopped, stopped.revision),
         });
         await options.save();
         publishChanged(options, item.taskId, item.id, 'cancelled');
@@ -789,7 +808,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
       return true;
     },
     hasExistingTaskWork: (taskId) => options.items.listByTask(taskId).some((item) => !item.arrangement && item.status !== 'cancelled'),
-    claimPlannedAutomationWork: async ({ taskId, employeeId, sourceRef, permissionMode }) => {
+    claimPlannedAutomationWork: async ({ taskId, employeeId, sourceRef, permissionMode, assertCanAccept }) => {
       /** 固定来源命令先读原接纳回执，重启后不能领取另一代安排或另一组分工。 */
       const identity = `automation-planned:${sourceRef}`;
       const input = { taskId, employeeId, sourceRef, ...(permissionMode ? { permissionMode } : {}) };
@@ -809,6 +828,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
         destinationId: 'task-work-automation-planned',
         resourceId: `task:${taskId}`,
         mutateBusinessState: (): AutomationExecutionReference | null => {
+          assertCanAccept?.();
           const task = requireTaskOrThrow(options, taskId);
           const plan = options.planning.get(taskId);
           const employee = requireEmployeeOrThrow(options, task.projectId, employeeId);
@@ -837,7 +857,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
       return result.result;
     },
     hasAutomationSource: (sourceRef) => Boolean(options.items.getBySource('automation', sourceRef)),
-    createAutomatedWorkItem: async ({ taskId, employeeId, sourceRef, permissionMode }) => {
+    createAutomatedWorkItem: async ({ taskId, employeeId, sourceRef, permissionMode, assertCanAccept }) => {
       const replay = options.items.getBySource('automation', sourceRef);
       if (replay?.currentRunId) {
         const run = options.runs.getById(replay.currentRunId);
@@ -848,6 +868,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
       const preview = await resolvePreview(options, task, { employeeId, permissionMode, workspace: { mode: 'create' } });
       const blockers = preview.blockers;
       if (blockers.length > 0) throw new TaskWorkStoreError(blockers[0]!.code, blockers[0]!.message);
+      assertCanAccept?.();
       const created = createWorkItemFromPreview(options, task, employee, preview, stableIdentity('task_work_item', sourceRef), { source: 'automation', sourceRef });
       await options.save();
       publishChanged(options, task.id, created.item.id, 'automation_created');
@@ -1284,9 +1305,8 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
     const previousRun = previousRunId ? options.runs.getById(previousRunId) : undefined;
     /** 已收口运行不重复停止，也不覆盖正式成功或失败结果。 */
     if (previousRun && (['succeeded', 'failed'].includes(previousRun.status) || (previousRun.status === 'cancelled' && item.status === 'cancelled'))) return;
-    await stopWorkItemRuntime(options, item, operationIdentity);
+    const current = await stopWorkItemRuntime(options, item, operationIdentity);
     /** Provider 停止期间若工作已换代，不可取消后来接纳的新运行。 */
-    const current = options.items.getById(item.id)!;
     if (current.currentRunId !== previousRunId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_STATE_CHANGED', '停止期间工作运行已经变化，请核对当前运行。');
     const run = current.currentRunId ? options.runs.getById(current.currentRunId) : undefined;
     if (run?.status === 'outcome_unknown') throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_OUTCOME_UNKNOWN', '此工作仍有未知外部结果，不能记为取消完成。');
@@ -1308,8 +1328,15 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
     }
     if (processDigitalTeams) await processDigitalTeams();
     await processArrangements();
-    for (const runRecord of options.runs.listRecoverable(100)) {
+    /** 空页表示已到末尾；同轮回到起点，避免额外空转一个调度周期。 */
+    let recoverable = options.runs.listRecoverable(100, recoveryCursor);
+    if (!recoverable.length && recoveryCursor) {
+      recoveryCursor = undefined;
+      recoverable = options.runs.listRecoverable(100);
+    }
+    for (const runRecord of recoverable) {
       if (closed) return;
+      recoveryCursor = { createdAt: runRecord.createdAt, id: runRecord.id };
       const current = options.runs.getById(runRecord.id);
       if (!current || options.items.getById(current.workItemId)?.arrangement?.cancellationRequested) continue;
       /** 数字团队运行由 DAG 协调器依据 node attempt 派发，旧循环不得抢跑或按最终文字收口。 */
@@ -1348,8 +1375,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
       if (plan) {
         for (const item of plan.stages.flatMap((stage) => stage.items).filter((item) => item.arrangement?.cancellationRequested && !['completed', 'cancelled'].includes(item.status))) {
           try {
-            await stopWorkItemRuntime(options, item, `work-cancel:${item.id}`);
-            const latest = options.items.getById(item.id)!;
+            const latest = await stopWorkItemRuntime(options, item, `work-cancel:${item.id}`);
             cancelWorkItem(options, latest, latest.revision);
           } catch (cause) {
             const latest = options.items.getById(item.id)!;
@@ -1364,8 +1390,7 @@ export function registerTaskWorkManagement(options: TaskWorkManagementOptions): 
           for (const item of stage.items) {
             if (['completed', 'cancelled'].includes(item.status) || item.arrangement?.blockedReason || item.arrangement?.cancellationRequested) continue;
             try {
-              await stopWorkItemRuntime(options, item, `plan-cancel:${plan.id}:${item.id}`);
-              const latest = options.items.getById(item.id)!;
+              const latest = await stopWorkItemRuntime(options, item, `plan-cancel:${plan.id}:${item.id}`);
               cancelWorkItem(options, latest, latest.revision);
             } catch (cause) {
               const latest = options.items.getById(item.id);
@@ -1768,6 +1793,7 @@ async function processAgentRun(options: TaskWorkManagementOptions, run: TaskWork
   const executionState = conversationWorkExecutionState(conversation, options.conversationSubmissions.listByConversation(conversation.id), options.conversationTurns.listByConversation(conversation.id));
   if (executionState.type === 'cancelled') {
     const item = options.items.getById(run.workItemId)!;
+    if (item.currentRunId !== run.id) return;
     cancelWorkItem(options, item, item.revision, executionState);
     publishChanged(options, run.taskId, run.workItemId, 'cancelled');
     return;
@@ -1882,6 +1908,10 @@ async function dispatchAgent(options: TaskWorkManagementOptions, run: TaskWorkRu
   }
   const supplementalInfo = await buildAgentSupplementalInfo(options, run, [...currentSkills.nativeSkills, ...currentSkills.pluginSkills]);
   const supplementalAttachments = Array.isArray(run.entrypointSnapshot.supplementalAttachments) ? run.entrypointSnapshot.supplementalAttachments : [];
+  /** 自动化新建任务的需求正文就是用户提示词，内部员工上下文只供模型执行。 */
+  const taskSource = safeJsonParse(task.sourceContextJson);
+  /** 使用运行冻结的正文，避免任务后续编辑改变本次发送的显示内容。 */
+  const displayText = isRecord(taskSource) && taskSource.type === 'automation' ? run.contextManifest.task.description : undefined;
   const body: Record<string, unknown> = {
     mode: 'create',
     model: model.id,
@@ -1894,6 +1924,7 @@ async function dispatchAgent(options: TaskWorkManagementOptions, run: TaskWorkRu
     ...(typeof run.entrypointSnapshot.autonomyObjective === 'string' && run.entrypointSnapshot.autonomyObjective ? { goalObjective: run.entrypointSnapshot.autonomyObjective } : {}),
     workMode: run.entrypointSnapshot.workMode === 'plan' ? 'plan' : 'default',
     supplementalInfo,
+    ...(displayText?.trim() ? { displayText } : {}),
     ...(supplementalAttachments.length > 0 ? { supplementalAttachments } : {}),
     workspace,
     ...(pluginReferences.length > 0 ? { pluginReferences } : {}),
@@ -1914,7 +1945,20 @@ async function dispatchAgent(options: TaskWorkManagementOptions, run: TaskWorkRu
     /** 独立和自动化员工同样提交冻结权限，不允许 task_push 从任务默认重新扩大能力。 */
     attachDigitalTeamTaskPushPolicy(body, { purpose: 'work', allowCodeChanges: authority.allowCodeChanges === true, allowTests: authority.allowTests === true, allowGitCommit: authority.allowCommit === true });
   }
-  const accepted = await options.executeTaskConversationIdempotent(project, task, body, `task-work-run:${run.id}`);
+  /** 派发前复核任务终态与当前权限，覆盖预检期间发生的任务变化。 */
+  const currentTask = requireRunnableTask(options, run.taskId);
+  /** 只冻结需求字段，历史任务状态与授权不能覆盖当前记录。 */
+  const executionTask: ZeusTaskRecord =
+    isRecord(taskSource) && taskSource.type === 'automation'
+      ? {
+          ...currentTask,
+          title: run.contextManifest.task.title,
+          description: run.contextManifest.task.description,
+          taskType: run.contextManifest.task.taskType as ZeusTaskRecord['taskType'],
+          tags: [...run.contextManifest.task.tags],
+        }
+      : currentTask;
+  const accepted = await options.executeTaskConversationIdempotent(project, executionTask, body, `task-work-run:${run.id}`);
   const response = isRecord(accepted.body) ? accepted.body : {};
   const projection = isRecord(response.conversation) ? response.conversation : {};
   /** 耐久 submission 身份供数字团队绑定准确轮次，普通工作仍可忽略。 */
@@ -2308,6 +2352,7 @@ function requireReviewableWork(options: TaskWorkManagementOptions, deliverable: 
   return { run, item };
 }
 
+/** 显式重试创建新运行，并在同一事务中关闭该工作的旧待办。 */
 function retryWorkItem(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, expectedRevision: number) {
   if (item.revision !== expectedRevision) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REVISION_CONFLICT', '工作项已更新，请刷新后重试。');
   if (!['failed', 'blocked'].includes(item.status)) throw new TaskWorkStoreError('ZEUS_TASK_WORK_NOT_RETRYABLE', '只有失败或已明确解除阻塞的工作项可以重试。');
@@ -2315,6 +2360,8 @@ function retryWorkItem(options: TaskWorkManagementOptions, item: TaskWorkItemRec
   if (!previous || previous.status === 'outcome_unknown') throw new TaskWorkStoreError('ZEUS_TASK_WORK_OUTCOME_UNKNOWN', '结果未知的运行不能自动重发。');
   const next = cloneRun(options, item, previous);
   const activeItem = options.items.update(item.id, { expectedRevision, status: 'active', currentRunId: next.id });
+  for (const decision of options.decisions.listByTask(item.taskId))
+    if (decision.workItemId === item.id && decision.status === 'pending') options.decisions.resolve(decision.id, decision.revision, { action: 'work_retried', runId: next.id }, 'dismissed');
   if (next.entrypointKind === 'command') {
     const dispatching = options.runs.update(next.id, { status: 'dispatching', startedAt: options.now().toISOString() });
     const waitingRun = options.runs.update(dispatching.id, { status: 'waiting_input' });
@@ -2337,7 +2384,9 @@ function retryWorkItem(options: TaskWorkManagementOptions, item: TaskWorkItemRec
   return { item: activeItem, run: next };
 }
 
+/** 新尝试沿用已接纳的模型和权限，不重新继承员工配置。 */
 function cloneRun(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, previous: TaskWorkRunRecord, entrypointPatch: Record<string, unknown> = {}, context: WorkContextManifestV1 = previous.contextManifest): TaskWorkRunRecord {
+  requireRunnableTask(options, item.taskId);
   /** 再次运行重核员工可用性；经验身份、模型与权限继续使用原冻结值。 */
   const employee = requireEmployeeOrThrow(options, previous.projectId, previous.employeeId);
   if (!employee.enabled) throw new TaskWorkStoreError('ZEUS_DIGITAL_EMPLOYEE_UNAVAILABLE', '执行人已停用，请重新指派可用员工。');
@@ -2394,6 +2443,7 @@ function cloneSkillReferences(options: TaskWorkManagementOptions, previous: Task
 
 /** 确认外部执行停止后收口运行与工作项，不删除已经产生的成果证据。 */
 function cancelWorkItem(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, expectedRevision: number, reason?: { code: string; message: string }) {
+  assertWorkItemCancellationSnapshot(options, item, expectedRevision);
   const completedAt = options.now().toISOString();
   const run = item.currentRunId ? options.runs.getById(item.currentRunId) : undefined;
   if (run && ['prepared', 'dispatching', 'active', 'waiting_input', 'runtime_completed'].includes(run.status))
@@ -2451,9 +2501,33 @@ async function pauseTaskWorkGoal(options: TaskWorkManagementOptions, run: TaskWo
   return response.statusCode === 200 && Boolean(after && after.status !== 'active');
 }
 
-async function stopWorkItemRuntime(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, operationIdentity: string): Promise<void> {
-  const run = item.currentRunId ? options.runs.getById(item.currentRunId) : undefined;
+/** 在外部停止及本地收口之前核对版本、运行身份和未知结果，防止旧请求影响新运行。 */
+function assertWorkItemCancellationSnapshot(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, expectedRevision: number): void {
+  const current = options.items.getById(item.id);
+  if (!current || current.currentRunId !== item.currentRunId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_STATE_CHANGED', '工作运行已经变化，请刷新后重试。');
+  if (current.revision !== expectedRevision) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REVISION_CONFLICT', '工作项已更新，请刷新后重试。');
+  const run = current.currentRunId ? options.runs.getById(current.currentRunId) : undefined;
+  if (run?.status === 'outcome_unknown') throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_OUTCOME_UNKNOWN', '此工作仍有未知外部结果，请先核对原会话的实际状态。');
+}
+
+/** 停止始终绑定传入运行；返回停止后的快照，供各入口在收口前再次校验。 */
+async function stopWorkItemRuntime(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, operationIdentity: string): Promise<TaskWorkItemRecord> {
+  assertWorkItemCancellationSnapshot(options, item, item.revision);
+  await interruptWorkItemRuntime(options, item, operationIdentity);
+  const current = options.items.getById(item.id);
+  if (!current || current.currentRunId !== item.currentRunId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_STATE_CHANGED', '停止期间工作运行已经变化，请核对当前运行。');
+  assertWorkItemCancellationSnapshot(options, current, current.revision);
+  return current;
+}
+
+/** 暂停自主目标并请求准确会话轮次或命令停止，只有确认终态才返回。 */
+async function interruptWorkItemRuntime(options: TaskWorkManagementOptions, item: TaskWorkItemRecord, operationIdentity: string): Promise<void> {
+  let run = item.currentRunId ? options.runs.getById(item.currentRunId) : undefined;
   if (run && !(await pauseTaskWorkGoal(options, run, `goal-stop:${run.id}`))) throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_OUTCOME_UNKNOWN', '自主目标暂停尚未确认，请在原会话核对目标状态。');
+  /** 暂停目标需要等待外部响应；继续停止前重新核对原运行并读取其最新状态。 */
+  const current = options.items.getById(item.id);
+  assertWorkItemCancellationSnapshot(options, item, current?.revision ?? item.revision);
+  run = item.currentRunId ? options.runs.getById(item.currentRunId) : undefined;
   if (run?.status === 'outcome_unknown') throw new TaskWorkStoreError('ZEUS_TASK_WORK_STOP_OUTCOME_UNKNOWN', '此工作仍有未知外部结果，请先核对原会话的实际状态。');
   if (!run || !['dispatching', 'active', 'waiting_input'].includes(run.status)) return;
   if (run.entrypointKind === 'agent') {
@@ -2511,19 +2585,36 @@ async function confirmAutomatedCommand(options: TaskWorkManagementOptions, decis
   await startCommandRun(options, item, run, parameters, { command } as TaskWorkPreview);
 }
 
+/** 人工核对未知结果后，Agent 恢复原会话的成果收集，命令按核对结果收口。 */
 function resolveUnknownOutcome(options: TaskWorkManagementOptions, decision: TaskWorkDecisionRecord, response: Record<string, unknown>): void {
   const run = decision.runId ? options.runs.getById(decision.runId) : undefined;
   const item = options.items.getById(decision.workItemId);
-  if (!run || !item || run.status !== 'outcome_unknown' || item.status !== 'blocked') throw new TaskWorkStoreError('ZEUS_TASK_WORK_OUTCOME_DECISION_STALE', '未知结果工作项已变化，请刷新后重试。');
+  if (!run || !item || item.currentRunId !== run.id || run.status !== 'outcome_unknown' || item.status !== 'blocked') throw new TaskWorkStoreError('ZEUS_TASK_WORK_OUTCOME_DECISION_STALE', '未知结果工作项已变化，请刷新后重试。');
   if (response.action === 'mark_succeeded') {
-    options.runs.update(run.id, { status: 'succeeded', completedAt: options.now().toISOString() });
-    options.items.update(item.id, { status: 'completed', completedAt: options.now().toISOString() });
+    if (run.entrypointKind === 'agent') {
+      requireRunnableTask(options, run.taskId);
+      /** 只接纳原任务会话的已完成事实，不用人工确认替代 Provider 结果。 */
+      const conversation = run.conversationId ? options.conversations.getById(run.conversationId) : undefined;
+      if (
+        !conversation ||
+        conversation.taskId !== run.taskId ||
+        conversation.projectId !== run.projectId ||
+        conversationWorkExecutionState(conversation, options.conversationSubmissions.listByConversation(conversation.id), options.conversationTurns.listByConversation(conversation.id)).type !== 'completed'
+      )
+        throw new TaskWorkStoreError('ZEUS_TASK_WORK_AGENT_OUTCOME_UNCONFIRMED', '原 Agent 会话尚未确认完成，请先在原会话核对并恢复。');
+      /** 核对成功只恢复原运行的结果收集，后续仍检查自主目标、子工作和成果验收。 */
+      options.runs.update(run.id, { status: 'active', errorCode: null, errorMessage: null, completedAt: null });
+      options.items.update(item.id, { status: 'active', completedAt: null });
+    } else {
+      options.runs.update(run.id, { status: 'succeeded', completedAt: options.now().toISOString() });
+      options.items.update(item.id, { status: 'completed', completedAt: options.now().toISOString() });
+    }
   } else if (response.action === 'mark_failed') {
     options.runs.update(run.id, { status: 'failed', completedAt: options.now().toISOString() });
     options.items.update(item.id, { status: 'failed' });
-    createCommandFailureDecision(options, run, '管理者核对现场后确认该命令失败。', 'outcome_reconciled');
+    if (run.entrypointKind === 'command') createCommandFailureDecision(options, run, '管理者核对现场后确认该命令失败。', 'outcome_reconciled');
   } else {
-    throw new TaskWorkStoreError('ZEUS_TASK_WORK_OUTCOME_ACTION_INVALID', '请选择“确认成功”或“确认失败”；处置不会自动重发命令。', 400);
+    throw new TaskWorkStoreError('ZEUS_TASK_WORK_OUTCOME_ACTION_INVALID', '请选择“确认成功”或“确认失败”；处置不会自动重发本次执行。', 400);
   }
 }
 
@@ -2554,13 +2645,14 @@ function commandDecisionSnapshot(options: TaskWorkManagementOptions, run: TaskWo
   };
 }
 
+/** 先核对并记录当前待办，再原子更新工作，避免重试清理误关正在回复的待办。 */
 function resolveManagerDecision(options: TaskWorkManagementOptions, decision: TaskWorkDecisionRecord, expectedRevision: number, response: Record<string, unknown>) {
-  if (decision.kind === 'outcome_unknown') resolveUnknownOutcome(options, decision, response);
-  if (decision.kind === 'command_failure') retryFailedCommand(options, decision, response);
   const resolved = options.decisions.resolve(decision.id, expectedRevision, {
     responseSha256: sha256(canonicalJson(response)),
     responseRecordedBy: 'manager_action',
   });
+  if (decision.kind === 'outcome_unknown') resolveUnknownOutcome(options, decision, response);
+  if (decision.kind === 'command_failure') retryFailedCommand(options, decision, response);
   return resolved;
 }
 
@@ -3020,6 +3112,12 @@ function requireTaskOrThrow(options: TaskWorkManagementOptions, taskId: string):
   if (!task) throw new TaskWorkStoreError('ZEUS_TASK_NOT_FOUND', '任务不存在。', 404);
   return task;
 }
+/** 新尝试和派发必须使用未结束的任务，重试不能绕过重新打开流程。 */
+function requireRunnableTask(options: TaskWorkManagementOptions, taskId: string): ZeusTaskRecord {
+  const task = requireTaskOrThrow(options, taskId);
+  if (options.isTaskTerminal(task) || task.status === 'completed' || task.status === 'cancelled') throw new TaskWorkStoreError('ZEUS_TASK_WORK_TASK_TERMINAL', '重新打开任务后才能启动或重试工作。');
+  return task;
+}
 function requireEmployeeOrThrow(options: TaskWorkManagementOptions, projectId: string, employeeId: string): DigitalEmployeeRecord {
   const employee = options.employees.getById(employeeId);
   if (!employee || employee.projectId !== projectId) throw new TaskWorkStoreError('ZEUS_DIGITAL_EMPLOYEE_NOT_FOUND', '数字员工不存在。', 404);
@@ -3059,7 +3157,7 @@ function isCapabilityModel(value: unknown): value is ConversationCapabilityModel
     isRecord(value) &&
     typeof value.id === 'string' &&
     typeof value.model === 'string' &&
-    (value.agentKind === 'codex' || value.agentKind === 'pi') &&
+    (value.agentKind === 'codex' || value.agentKind === 'pi' || value.agentKind === 'copilot') &&
     typeof value.available === 'boolean' &&
     Array.isArray(value.supportedReasoningEfforts) &&
     Array.isArray(value.serviceTiers)

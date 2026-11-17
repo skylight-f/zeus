@@ -1,9 +1,8 @@
 import { copyText } from '../ui/clipboard.js';
 import { displayedFilePath } from '../ui/filePathActions.js';
-import { projectSourcePreviewKind } from '@zeus/shared';
+import { projectSourcePreviewKind, sourceLanguageOptions } from '@zeus/shared';
 import { isMacOSPlatform } from '../platform.js';
 import { FilePreview } from './FilePreview.js';
-import type { FilePreviewRequest } from '@zeus/shared';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
 import { createPortal } from 'react-dom';
 import { MenuSurface } from '../ui/MenuSurface.js';
@@ -16,36 +15,51 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
-import { sourceWorkspaces, sourceModels, sourceModelKey, retainSourceModels, releaseSourceWorkspace } from './sourceEditorState.js';
-import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
+import { sourceConflictExtensions } from './sourceConflictExtensions.js';
+import { FileTypeIcon } from './FileTypeIcon.js';
+import { projectGitFileStatuses } from '../git/projectGitWorkbenchState.js';
+import { FilePlusIcon as FilePlus } from '@phosphor-icons/react/dist/csr/FilePlus';
+import { FolderPlusIcon as FolderPlus } from '@phosphor-icons/react/dist/csr/FolderPlus';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
-import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
-import type { ProjectCodeWorkspacePreference, ProjectSourceDirectorySnapshot, ProjectSourceDocument, ProjectSourceEntry, ProjectSourceEvent } from '@zeus/shared';
+import { EyeIcon as Eye } from '@phosphor-icons/react/dist/csr/Eye';
+import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
+import { ColumnsIcon as Columns } from '@phosphor-icons/react/dist/csr/Columns';
+import type { ConversationFileLocation, ProjectCodeWorkspacePreference, ProjectSourceDirectorySnapshot, ProjectSourceDocument, ProjectSourceEntry, ProjectSourceEvent } from '@zeus/shared';
+import type { Text } from '@codemirror/state';
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import './projectSourceWorkspace.css';
-import { ProjectSourceSearch, type SourceSearchFile } from './ProjectSourceSearch.js';
-import { replaceProjectSourceTextMatches } from '@zeus/shared';
-import { SourceGitChanges, fileDiff, type SourceGitClient } from './SourceGitChanges.js';
-import type { GitDiffSummary } from '../features/git/gitContracts.js';
-import { SideBySideDiff } from '../git/ProjectGitDiffViewer.js';
+import type { ProjectGitWorkbenchSnapshot } from '../features/git/gitContracts.js';
+import { Form } from '../ui/Form.js';
 
-const ProjectSourceRenderedPreview = lazy(() => import('./ProjectSourceRenderedPreview.js').then((module) => ({ default: module.ProjectSourceRenderedPreview })));
 const ProjectSourceEditor = lazy(() => import('./ProjectSourceEditor.js').then((module) => ({ default: module.ProjectSourceEditor })));
 const CodeEditor = lazy(() => import('./CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
+/** 效果预览按需加载，不增加普通源码文件的首屏成本。 */
+const ProjectSourceRenderedPreview = lazy(() => import('./ProjectSourceRenderedPreview.js').then((module) => ({ default: module.ProjectSourceRenderedPreview })));
+/** 文件展示模式只影响当前源码标签。 */
+type SourceViewMode = 'source' | 'preview' | 'split';
+/** 三个固定入口只使用图标，名称同时用于悬停和键盘辅助。 */
+const sourceViewModes = [
+  { id: 'source', zh: '源码', en: 'Source', icon: FileCode },
+  { id: 'preview', zh: '预览', en: 'Preview', icon: Eye },
+  { id: 'split', zh: '分栏', en: 'Split view', icon: Columns },
+] as const;
 // 文件系统事件在这个时间窗内按目录和文件去重，避免批量写入触发重复读取与渲染。
 const sourceEventRefreshDelayMs = 100;
 
@@ -54,12 +68,12 @@ type AppLanguage = 'zh-CN' | 'en-US';
 interface SourceTab {
   document: ProjectSourceDocument;
   /** 编辑期间保留文档树，跨进程保存时才展开全文。 */
-  draft: string;
+  draft: string | Text;
   dirty: boolean;
   saving: boolean;
   externalChange: boolean;
-  revealLine?: number | null;
-  revealColumn?: number | null;
+  /** 每次点击都保留新的定位对象，同一行重复打开仍会重新滚动。 */
+  revealLocation?: ConversationFileLocation;
   cursorLine: number;
   cursorColumn: number;
 }
@@ -77,11 +91,15 @@ export interface ProjectSourceWorkspaceHandle {
   hasDirtyFiles(): boolean;
   saveAll(): Promise<boolean>;
   discardAll(): void;
+  /** 搜索命中可传入一基行列，普通目录打开仍只传路径。 */
   openFile(relativePath: string, line?: number, column?: number): Promise<void>;
 }
 
 export interface ProjectSourceWorkspaceProps {
-  gitClient?: SourceGitClient;
+  /** 顶部目录选择由所属项目提供，编辑根目录仍来自受信工作区身份。 */
+  workspaceSelector?: ReactNode;
+  /** 文件树复用底部工作台的 Git 快照，不单独读取仓库。 */
+  gitSnapshot?: ProjectGitWorkbenchSnapshot | null;
   project: { id: string; name: string; localPath: string };
   language: AppLanguage;
   preference?: ProjectCodeWorkspacePreference;
@@ -93,21 +111,24 @@ export interface ProjectSourceWorkspaceProps {
 export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, ProjectSourceWorkspaceProps>(function ProjectSourceWorkspace(props, ref) {
   const zh = props.language === 'zh-CN';
   const [conflictComparison, setConflictComparison] = useState<{ current: string; incoming: string } | null>(null);
-  const compareConflict = useCallback((current: string, incoming: string) => setConflictComparison({ current, incoming }), []);
+  const conflictExtensions = useMemo(() => sourceConflictExtensions(zh, (current, incoming) => setConflictComparison({ current, incoming })), [zh]);
   const bridge = typeof window === 'undefined' ? undefined : window.zeus;
   const initialPreference = normalizePreference(props.preference);
   const [directories, setDirectories] = useState<Record<string, ProjectSourceDirectorySnapshot>>({});
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set(initialPreference.expandedDirectories));
   const [tabs, setTabs] = useState<SourceTab[]>([]);
   const [activePath, setActivePath] = useState<string | null>(initialPreference.activeFile);
-  /** 复用更改面板的真实 Git 快照，文件树和标签不额外扫描仓库。 */
-  const [gitFileStatuses, setGitFileStatuses] = useState<Record<string, string>>({});
-  const [changePreview, setChangePreview] = useState<{ projectId: string; path: string; diff: GitDiffSummary; revision: string; request: FilePreviewRequest } | null>(null);
+  /** 每个文件记住本次会话中的查看方式，不影响已有源码偏好。 */
+  const [viewModes, setViewModes] = useState<Record<string, SourceViewMode>>({});
+  /** 文件状态跟随同一个 Git 工作台；项目切换时忽略其他项目的快照。 */
+  const gitFileStatuses = useMemo(() => projectGitFileStatuses(props.gitSnapshot, props.project.id), [props.gitSnapshot, props.project.id]);
   const [treeWidth, setTreeWidth] = useState(initialPreference.treeWidth);
-  const [sourceShare, setSourceShare] = useState(55);
   const [treeDrawerOpen, setTreeDrawerOpen] = useState(false);
   /** 窄布局遮罩退出完成后再移除，关闭立即停止命中。 */
   const treeBackdrop = useMotionPresence<HTMLButtonElement>(treeDrawerOpen);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<ProjectSourceEntry[]>([]);
+  const [searchTruncated, setSearchTruncated] = useState(false);
   const [loadingTree, setLoadingTree] = useState(true);
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -121,76 +142,25 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
   const directoriesRef = useRef(directories);
   const tabsRef = useRef(tabs);
   const activePathRef = useRef(activePath);
+  /** 切换或恢复文件后显示完整标签，包括独立关闭入口。 */
+  const activeTabElementRef = useRef<HTMLDivElement | null>(null);
   const dirtyRef = useRef(false);
   const fileOpenRequestedRef = useRef(false);
-  const searchProjectRef = useRef<string | null>(props.project.id);
-  useEffect(() => {
-    searchProjectRef.current = props.project.id;
-    return () => {
-      searchProjectRef.current = null;
-    };
-  }, [props.project.id]);
   directoriesRef.current = directories;
   tabsRef.current = tabs;
   activePathRef.current = activePath;
-  /** 每个文件的效果模式与未保存草稿分别保存。 */
-  const [viewModes, setViewModes] = useState<Record<string, 'source' | 'preview' | 'split'>>({});
   const activeTab = tabs.find((tab) => tab.document.relativePath === activePath) ?? null;
-  const previewKind = activeTab?.document.editable ? projectSourcePreviewKind(activeTab.document.relativePath) : null;
-  const viewMode = previewKind && activePath ? (viewModes[activePath] ?? 'source') : 'source';
+  /** 只为可编辑且有实际效果的格式提供模式切换。 */
+  const renderedPreviewKind = activeTab?.document.editable ? projectSourcePreviewKind(activeTab.document.relativePath) : null;
+  /** 普通代码文件保持源码显示，预览文件首次打开也保留原编辑入口。 */
+  const viewMode: SourceViewMode = renderedPreviewKind && activePath ? (viewModes[activePath] ?? 'source') : 'source';
   const dirty = tabs.some((tab) => tab.dirty);
   dirtyRef.current = dirty;
-  const searchBuffers = useMemo(() => tabs.filter((tab) => tab.document.editable).map((tab) => ({ relativePath: tab.document.relativePath, content: tab.draft, revision: tab.document.revision })), [tabs]);
 
-  const replaceSearchFile = useCallback(
-    async (file: SourceSearchFile, replacement: string): Promise<'draft' | 'saved'> => {
-      const relativePath = file.relativePath;
-      const changedMessage = zh ? '文件已变化，请重新搜索后替换。' : 'The file changed. Search again before replacing.';
-      if (searchProjectRef.current !== props.project.id) throw new Error(changedMessage);
-      const updateOpenFile = (tab: SourceTab, expectedContent: string): 'draft' => {
-        const model = sourceModels.get(sourceModelKey(props.project.id, relativePath))?.model;
-        const content = model?.getValue() ?? tab.draft;
-        if (!tab.document.editable || tab.saving || content !== expectedContent) throw new Error(changedMessage);
-        const next = replaceProjectSourceTextMatches(content, file.matches, replacement);
-        if (model) {
-          // 保留编辑器的撤销边界，替换不自动保存用户正在编辑的文件。
-          model.pushStackElement();
-          model.pushEditOperations(
-            [],
-            file.matches.map((match) => {
-              const start = model.getPositionAt(match.offset);
-              const end = model.getPositionAt(match.offset + match.length);
-              return { range: { startLineNumber: start.lineNumber, startColumn: start.column, endLineNumber: end.lineNumber, endColumn: end.column }, text: replacement };
-            }),
-            () => null,
-          );
-          model.pushStackElement();
-        }
-        setTabs((current) => current.map((candidate) => (candidate.document.relativePath === relativePath ? { ...candidate, draft: next, dirty: next !== candidate.document.content } : candidate)));
-        return 'draft';
-      };
-      const openTab = tabsRef.current.find((tab) => tab.document.relativePath === relativePath);
-      if (file.bufferContent !== undefined) {
-        if (!openTab) throw new Error(changedMessage);
-        return updateOpenFile(openTab, file.bufferContent);
-      }
-      if (!bridge?.readProjectSourceFile || !bridge.saveProjectSourceFile) throw new Error(zh ? '文件编辑服务尚未连接。' : 'File editing is not connected.');
-      const document = await bridge.readProjectSourceFile({ projectId: props.project.id, relativePath });
-      if (searchProjectRef.current !== props.project.id) throw new Error(changedMessage);
-      if (!document.editable || document.revision.sha256 !== file.revision.sha256 || document.revision.byteLength !== file.revision.byteLength) throw new Error(changedMessage);
-      const currentTab = tabsRef.current.find((tab) => tab.document.relativePath === relativePath);
-      if (currentTab) return updateOpenFile(currentTab, document.content);
-      const content = replaceProjectSourceTextMatches(document.content, file.matches, replacement);
-      const saved = await bridge.saveProjectSourceFile({ projectId: props.project.id, relativePath, content, expectedRevision: document.revision, eol: document.eol, hasBom: document.hasBom });
-      if (searchProjectRef.current !== props.project.id) return 'saved';
-      // 保存期间可能打开文件；只同步尚未编辑的标签，晚到的保存回执不能覆盖草稿。
-      setTabs((current) =>
-        current.map((tab) => (tab.document.relativePath !== relativePath ? tab : tab.draft === document.content ? { ...tab, document: saved, draft: saved.content, dirty: false, externalChange: false } : { ...tab, externalChange: true })),
-      );
-      return 'saved';
-    },
-    [bridge, props.project.id, zh],
-  );
+  /** 标签恢复和切换后，只滚动标签列表的必要范围。 */
+  useEffect(() => {
+    activeTabElementRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activePath, tabs.length]);
 
   const loadDirectory = useCallback(
     async (relativePath: string, force = false) => {
@@ -203,12 +173,14 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
 
   const openFile = useCallback(
     async (relativePath: string, line?: number, column?: number) => {
-      setChangePreview(null);
-      if (line !== undefined) setViewModes((current) => ({ ...current, [relativePath]: 'source' }));
       fileOpenRequestedRef.current = true;
+      /** 保留每次定位的对象身份，重复查找同一位置也能重新定位。 */
+      const revealLocation = line === undefined ? undefined : { line, column };
+      // 搜索与 Git 的行定位必须显示源码，不能把位置藏在效果预览后。
+      if (line !== undefined) setViewModes((current) => ({ ...current, [relativePath]: 'source' }));
       const existing = tabsRef.current.find((tab) => tab.document.relativePath === relativePath);
       if (existing) {
-        setTabs((current) => current.map((tab) => (tab.document.relativePath === relativePath ? { ...tab, revealLine: line ?? tab.revealLine, revealColumn: column ?? (line ? 1 : tab.revealColumn) } : tab)));
+        setTabs((current) => current.map((tab) => (tab.document.relativePath === relativePath ? { ...tab, revealLocation: revealLocation ?? tab.revealLocation } : tab)));
         setActivePath(relativePath);
         setTreeDrawerOpen(false);
         return;
@@ -221,9 +193,11 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       setError(null);
       try {
         const document = await bridge.readProjectSourceFile({ projectId: props.project.id, relativePath });
+        // 后端返回的规范路径同时用于去重、行定位和选中，避免入口路径写法差异生成重复标签。
+        if (line !== undefined) setViewModes((current) => ({ ...current, [document.relativePath]: 'source' }));
         setTabs((current) => {
-          if (current.some((tab) => tab.document.relativePath === relativePath)) {
-            return current.map((tab) => (tab.document.relativePath === relativePath ? { ...tab, revealLine: line ?? tab.revealLine, revealColumn: column ?? (line ? 1 : tab.revealColumn) } : tab));
+          if (current.some((tab) => tab.document.relativePath === document.relativePath)) {
+            return current.map((tab) => (tab.document.relativePath === document.relativePath ? { ...tab, revealLocation: revealLocation ?? tab.revealLocation } : tab));
           }
           const available =
             current.length < 20
@@ -235,9 +209,9 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
             setError(zh ? '已打开 20 个文件，请先关闭一个标签。' : 'Twenty files are already open. Close a tab first.');
             return current;
           }
-          return [...available, { document, draft: document.content, dirty: false, saving: false, externalChange: false, revealLine: line, revealColumn: column, cursorLine: line ?? 1, cursorColumn: column ?? 1 }];
+          return [...available, { document, draft: document.content, dirty: false, saving: false, externalChange: false, revealLocation, cursorLine: line ?? 1, cursorColumn: column ?? 1 }];
         });
-        setActivePath(relativePath);
+        setActivePath(document.relativePath);
         setTreeDrawerOpen(false);
       } catch (loadError) {
         setError(loadError);
@@ -248,83 +222,14 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
     [bridge, props.project.id, zh],
   );
 
-  const openPaths = tabs.map((tab) => tab.document.relativePath).join('\0');
-  useEffect(() => {
-    retainSourceModels(props.project.id, openPaths ? openPaths.split('\0') : []);
-  }, [props.project.id, openPaths]);
-  useEffect(() => () => releaseSourceWorkspace(props.project.id), [props.project.id]);
-  useEffect(() => {
-    const projectId = props.project.id;
-    const actions = {
-      hasOpenFile(path: string) {
-        return tabsRef.current.some((tab) => tab.document.relativePath === path);
-      },
-      buffers() {
-        return tabsRef.current
-          .filter((tab) => tab.document.editable)
-          .map((tab) => {
-            const model = sourceModels.get(sourceModelKey(projectId, tab.document.relativePath))?.model;
-            return { relativePath: tab.document.relativePath, content: model?.getValue() ?? tab.draft, version: model?.getVersionId() ?? 0 };
-          });
-      },
-      async open(path: string, range?: import('@zeus/shared').SourceRange) {
-        await openFile(path, range?.startLineNumber);
-        if (range) setTabs((current) => current.map((tab) => (tab.document.relativePath === path ? { ...tab, revealLine: range.startLineNumber, revealColumn: range.startColumn } : tab)));
-        // 等标签页提交视图，VS Code 的跳转服务才能定位新编辑器。
-        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-      },
-      changed(path: string, content: string) {
-        setTabs((current) => current.map((tab) => (tab.document.relativePath === path ? { ...tab, draft: content, dirty: content !== tab.document.content, revealLine: null, revealColumn: null } : tab)));
-      },
-      reportStatus(message: string) {
-        setNotice(message);
-      },
-      async prepareEdits(edits: import('@zeus/shared').SourceLanguageEdit[], contents: Record<string, string>) {
-        if (!bridge) throw new Error('项目源码服务不可用。');
-        const paths = [...new Set(edits.map((edit) => edit.relativePath))];
-        const missing = paths.filter((path) => !tabsRef.current.some((tab) => tab.document.relativePath === path));
-        if (tabsRef.current.length + missing.length > 20) throw new Error('重命名需要打开更多文件，请先关闭部分标签（最多 20 个）。');
-        const documents = await Promise.all(missing.map((relativePath) => bridge.readProjectSourceFile({ projectId, relativePath })));
-        for (const path of paths) {
-          const tab = tabsRef.current.find((item) => item.document.relativePath === path);
-          const document = tab?.document ?? documents.find((item) => item.relativePath === path);
-          const content = sourceModels.get(sourceModelKey(projectId, path))?.model.getValue() ?? tab?.draft ?? document?.content;
-          if (!document?.editable || content !== contents[path]) throw new Error('重命名分析期间文件内容发生变化，请重试。');
-        }
-        try {
-          const runtime = await import('./monacoRuntime.js');
-          await Promise.all(
-            paths.map((path) => {
-              const tab = tabsRef.current.find((item) => item.document.relativePath === path);
-              const document = tab?.document ?? documents.find((item) => item.relativePath === path)!;
-              return runtime.ensureSourceModel(projectId, path, { content: tab?.draft ?? document.content, language: document.language });
-            }),
-          );
-          if (sourceWorkspaces.get(projectId) !== actions) throw new Error('项目已关闭，请重新打开后重试。');
-          const remaining = paths.filter((path) => !tabsRef.current.some((tab) => tab.document.relativePath === path));
-          if (tabsRef.current.length + remaining.length > 20) throw new Error('重命名需要打开更多文件，请先关闭部分标签（最多 20 个）。');
-          // 全部目标验证成功后才发布标签；原生 WorkspaceEdit 随后统一更新模型。
-          for (const path of paths) if (sourceModels.get(sourceModelKey(projectId, path))?.model.getValue() !== contents[path]) throw new Error('文件已变化，请重新执行重命名。');
-          const additions: SourceTab[] = documents.map((document) => ({ document, draft: document.content, dirty: false, saving: false, externalChange: false, cursorLine: 1, cursorColumn: 1 }));
-          setTabs((current) => [...current, ...additions.filter((addition) => !current.some((tab) => tab.document.relativePath === addition.document.relativePath))]);
-          // 防止模型事件早于 React 标签状态的发布。
-          tabsRef.current = [...tabsRef.current, ...additions.filter((addition) => !tabsRef.current.some((tab) => tab.document.relativePath === addition.document.relativePath))];
-        } catch (error) {
-          const opened =
-            sourceWorkspaces
-              .get(projectId)
-              ?.buffers()
-              .map((buffer) => buffer.relativePath) ?? [];
-          retainSourceModels(projectId, opened);
-          throw error;
-        }
-      },
-    };
-    sourceWorkspaces.set(projectId, actions);
-    return () => {
-      if (sourceWorkspaces.get(projectId) === actions) sourceWorkspaces.delete(projectId);
-    };
-  }, [props.project.id, bridge, openFile]);
+  /** 文档内的本地链接继续打开源码标签，并沿用文档预览模式。 */
+  const openPreviewFile = useCallback(
+    async (path: string) => {
+      if (projectSourcePreviewKind(path)) setViewModes((current) => ({ ...current, [path]: 'preview' }));
+      await openFile(path);
+    },
+    [openFile],
+  );
 
   const saveTab = useCallback(
     async (relativePath: string): Promise<boolean> => {
@@ -333,7 +238,6 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       if (!tab.document.editable || !bridge?.saveProjectSourceFile) return false;
       setTabs((current) => current.map((candidate) => (candidate.document.relativePath === relativePath ? { ...candidate, saving: true } : candidate)));
       setError(null);
-      setNotice(null);
       try {
         const document = await bridge.saveProjectSourceFile({
           projectId: props.project.id,
@@ -500,16 +404,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       }
       try {
         const document = await sourceBridge.readProjectSourceFile({ projectId: props.project.id, relativePath });
-        if (active)
-          setTabs((current) =>
-            current.map((candidate) =>
-              candidate.document.relativePath !== relativePath
-                ? candidate
-                : candidate.dirty
-                  ? { ...candidate, externalChange: document.revision.sha256 !== candidate.document.revision.sha256 }
-                  : { ...candidate, document, draft: document.content, externalChange: false },
-            ),
-          );
+        if (active) setTabs((current) => current.map((candidate) => (candidate.document.relativePath === relativePath ? { ...candidate, document, draft: document.content, externalChange: false } : candidate)));
       } catch {
         if (active) {
           // 外部删除、重命名或暂时不可访问只更新标签状态，保留内容，不弹出操作失败提示。
@@ -518,6 +413,24 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       }
     }
   }, [bridge, props.project.id]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      if (!searchQuery.trim() || !bridge?.searchProjectSourceEntries) {
+        setSearchResults([]);
+        setSearchTruncated(false);
+        return;
+      }
+      void bridge
+        .searchProjectSourceEntries({ projectId: props.project.id, query: searchQuery })
+        .then((result) => {
+          setSearchResults(result.entries);
+          setSearchTruncated(result.truncated);
+        })
+        .catch(setError);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [bridge, props.project.id, searchQuery]);
 
   useEffect(() => {
     if (loadingTree) return undefined;
@@ -584,6 +497,9 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
     reveal: macShortcuts ? '⌘⇧R' : 'Ctrl+Shift+R',
     delete: macShortcuts ? '⌘⌫' : 'Delete',
   };
+  /** 无障碍快捷键使用标准修饰键名称，不复用展示符号。 */
+  const fileShortcutModifier = macShortcuts ? 'Meta' : 'Control';
+
   /** 文件树菜单复制真实名称或完整路径，失败保留在当前工作区。 */
   async function copySourceEntry(entry: ProjectSourceEntry, path: boolean): Promise<void> {
     setContextMenu(null);
@@ -725,7 +641,53 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
     }
   }
 
-  /** 记录本次拖拽起点；指针捕获保证离开分隔条后仍能平顺拖动。 */
+  /** 保留网格中的分隔轨道，实际拖拽面延伸至当前工作台顶部。 */
+  const treeResizeTrackRef = useRef<HTMLDivElement>(null);
+  /** 浮动拖拽面使用实际布局坐标，不假定顶栏高度或侧栏布局。 */
+  const [treeResizeSurface, setTreeResizeSurface] = useState<{ host: HTMLElement; left: number; top: number; width: number; height: number } | null>(null);
+  /** 所有入口共用真实布局测量，位置没有变化时不重复渲染。 */
+  const updateTreeResizeSurface = useCallback(() => {
+    const track = treeResizeTrackRef.current;
+    const host = track?.closest<HTMLElement>('.zeus-shell');
+    if (!track || !host) return;
+    const bounds = track.getBoundingClientRect();
+    const top = host.getBoundingClientRect().top;
+    const next = bounds.width > 0 && bounds.height > 0 ? { host, left: bounds.left, top, width: bounds.width, height: Math.max(0, bounds.bottom - top) } : null;
+    setTreeResizeSurface((current) => (current?.host === next?.host && current?.left === next?.left && current?.top === next?.top && current?.width === next?.width && current?.height === next?.height ? current : next));
+  }, []);
+  /** React 已知的宽度、底栏及提示变化立即同步，不等待下一帧观察通知。 */
+  useLayoutEffect(updateTreeResizeSurface, [treeWidth, notice, activeTab?.externalChange, updateTreeResizeSurface]);
+  useLayoutEffect(() => {
+    /** 所有测量均来自当前源码页，项目切换后释放观察器。 */
+    const track = treeResizeTrackRef.current;
+    /** 宿主保留当前主题，并避开源码工作区的顶部裁剪。 */
+    const host = track?.closest<HTMLElement>('.zeus-shell');
+    if (!track || !host) return;
+    updateTreeResizeSurface();
+    /** 只观察影响分隔面的位置与尺寸，避免观察浮层自身形成循环。 */
+    const observer = new ResizeObserver(updateTreeResizeSurface);
+    observer.observe(track);
+    observer.observe(host);
+    if (track.parentElement) observer.observe(track.parentElement);
+    if (track.previousElementSibling) observer.observe(track.previousElementSibling);
+    window.addEventListener('resize', updateTreeResizeSurface);
+    document.addEventListener('scroll', updateTreeResizeSurface, true);
+    /** 工作面进入动效不会改变布局尺寸，结束或取消时仍需重新对齐坐标。 */
+    host.addEventListener('animationend', updateTreeResizeSurface, true);
+    host.addEventListener('animationcancel', updateTreeResizeSurface, true);
+    host.addEventListener('transitionend', updateTreeResizeSurface, true);
+    host.addEventListener('transitioncancel', updateTreeResizeSurface, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateTreeResizeSurface);
+      document.removeEventListener('scroll', updateTreeResizeSurface, true);
+      host.removeEventListener('animationend', updateTreeResizeSurface, true);
+      host.removeEventListener('animationcancel', updateTreeResizeSurface, true);
+      host.removeEventListener('transitionend', updateTreeResizeSurface, true);
+      host.removeEventListener('transitioncancel', updateTreeResizeSurface, true);
+    };
+  }, [props.project.id, updateTreeResizeSurface]);
+  /** 记录本次拖拽起点，指针捕获保留原有调宽行为。 */
   const treeResize = useRef<{ x: number; width: number } | null>(null);
   /** 只有主鼠标键开始调宽，右键保持菜单行为。 */
   function startTreeResize(event: ReactPointerEvent<HTMLDivElement>): void {
@@ -745,176 +707,12 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
 
   const breadcrumbs = activePath?.split('/') ?? [];
 
-  return (
-    <section data-file-root={props.project.localPath} className="project-source-workspace" style={{ '--zeus-source-tree-width': `${treeWidth}px` } as CSSProperties} data-tree-open={treeDrawerOpen ? 'true' : 'false'}>
-      {notice || activeTab?.externalChange ? (
-        <div className={`project-source-message ${activeTab?.externalChange ? 'failed' : 'success'}`} role="status">
-          <span>{activeTab?.externalChange ? (zh ? '文件已在外部发生变化，请重新加载或另存为。' : 'The file changed externally. Reload it or save it as a new file.') : notice}</span>
-          {activeTab?.externalChange ? (
-            <>
-              <button type="button" onClick={() => beginOperation({ kind: 'save-as', tabPath: activeTab.document.relativePath })}>
-                {zh ? '另存为' : 'Save as'}
-              </button>
-              <button type="button" onClick={() => void reloadActiveTab()}>
-                {zh ? '重新加载' : 'Reload'}
-              </button>
-            </>
-          ) : null}
-          <button type="button" aria-label={zh ? '关闭提示' : 'Dismiss'} onClick={() => setNotice(null)}>
-            <X aria-hidden="true" />
-          </button>
-        </div>
-      ) : null}
-
-      {error ? (
-        <div className="project-source-message" role="alert">
-          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
-          <button type="button" aria-label={zh ? '关闭错误提示' : 'Dismiss error'} onClick={() => setError(null)}>
-            <X aria-hidden="true" />
-          </button>
-        </div>
-      ) : null}
-
-      {conflictComparison ? (
-        <ModalPortal rootClassName="project-source-modal-root" backdropClassName="project-source-modal-backdrop" onDismiss={() => setConflictComparison(null)} role="dialog" aria-label={zh ? '比较变更' : 'Compare changes'}>
-          <section className="project-source-conflict-comparison" data-modal-surface="dialog">
-            <header>
-              <strong>{zh ? '比较变更' : 'Compare changes'}</strong>
-              <button type="button" onClick={() => setConflictComparison(null)}>
-                {zh ? '关闭' : 'Close'}
-              </button>
-            </header>
-            <div className="project-source-conflict-columns">
-              <section>
-                <h3>{zh ? '当前更改' : 'Current changes'}</h3>
-                <Suspense fallback={null}>
-                  <CodeEditor path="conflict-current" language={activeTab?.document.language ?? null} content={conflictComparison.current} readOnly />
-                </Suspense>
-              </section>
-              <section>
-                <h3>{zh ? '传入更改' : 'Incoming changes'}</h3>
-                <Suspense fallback={null}>
-                  <CodeEditor path="conflict-incoming" language={activeTab?.document.language ?? null} content={conflictComparison.incoming} readOnly />
-                </Suspense>
-              </section>
-            </div>
-          </section>
-        </ModalPortal>
-      ) : null}
-      <div className="project-source-main">
-        <aside className="project-source-tree" style={{ '--source-module-share': `${sourceShare}%` } as CSSProperties} aria-label={zh ? '代码目录' : 'Source tree'}>
-          <details className="project-source-module" open>
-            <summary>
-              <span>{zh ? '源码' : 'Source'}</span>
-              <span className="project-source-module-actions" aria-label={zh ? '源码操作' : 'Source actions'}>
-                <button
-                  type="button"
-                  title={zh ? '新建文件' : 'New file'}
-                  aria-label={zh ? '新建文件' : 'New file'}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    beginOperation({ kind: 'create-file', parentRelativePath: activePath ? parentPath(activePath) : '' });
-                  }}
-                >
-                  <Plus size={16} aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  title={zh ? '新建目录' : 'New folder'}
-                  aria-label={zh ? '新建目录' : 'New folder'}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    beginOperation({ kind: 'create-directory', parentRelativePath: activePath ? parentPath(activePath) : '' });
-                  }}
-                >
-                  <Plus size={16} aria-hidden="true" />
-                </button>
-              </span>
-            </summary>
-            <ProjectSourceSearch key={props.project.id} projectId={props.project.id} zh={zh} buffers={searchBuffers} onOpen={(path, line, column) => void openFile(path, line, column)} onReplace={replaceSearchFile}>
-              <div className="project-source-tree-scroll" role="tree" aria-busy={loadingTree}>
-                {loadingTree ? (
-                  <p className="project-source-empty">{zh ? '正在读取项目目录…' : 'Loading the project folder…'}</p>
-                ) : (
-                  <TreeRows
-                    directoryPath=""
-                    depth={0}
-                    directories={directories}
-                    expandedDirectories={expandedDirectories}
-                    activePath={activePath}
-                    gitFileStatuses={gitFileStatuses}
-                    busyPath={busyPath}
-                    onToggle={(path) => void toggleDirectory(path)}
-                    onOpen={(path) => void openFile(path)}
-                    onShortcut={handleFileShortcut}
-                    onContextMenu={openFileContextMenu}
-                  />
-                )}
-              </div>
-            </ProjectSourceSearch>
-          </details>
-          <div
-            className="project-source-module-resizer"
-            role="separator"
-            aria-orientation="horizontal"
-            aria-label={zh ? '调整源码与更改模块高度' : 'Resize source and changes panels'}
-            aria-valuemin={15}
-            aria-valuemax={85}
-            aria-valuenow={sourceShare}
-            tabIndex={0}
-            onPointerDown={(event) => {
-              event.preventDefault();
-              event.currentTarget.setPointerCapture(event.pointerId);
-            }}
-            onPointerMove={(event) => {
-              if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
-              const bounds = event.currentTarget.parentElement!.getBoundingClientRect();
-              setSourceShare(Math.max(15, Math.min(85, ((event.clientY - bounds.top) / bounds.height) * 100)));
-            }}
-            onPointerUp={(event) => {
-              if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-            }}
-            onDoubleClick={() => setSourceShare(55)}
-            onKeyDown={(event) => {
-              if (!['ArrowUp', 'ArrowDown', 'Home'].includes(event.key)) return;
-              event.preventDefault();
-              setSourceShare((value) => (event.key === 'Home' ? 55 : Math.max(15, Math.min(85, value + (event.key === 'ArrowUp' ? -5 : 5)))));
-            }}
-          />
-          <SourceGitChanges
-            key={props.project.id}
-            projectId={props.project.id}
-            client={props.gitClient}
-            zh={zh}
-            onConflict={(path) => void openFile(path)}
-            onOpenFile={(path) => {
-              setChangePreview(null);
-              void openFile(path);
-            }}
-            onBeforeCommit={saveAll}
-            onOpen={({ path, diff, repositoryId, repositoryPath, revision }) =>
-              setChangePreview({ projectId: props.project.id, path, diff, revision, request: { kind: 'project-git', projectId: props.project.id, repositoryId, path: repositoryPath, stage: 'combined' } })
-            }
-            onSnapshot={(snapshot) => {
-              setGitFileStatuses(
-                Object.fromEntries(
-                  snapshot.repositories.flatMap((repository) => repository.snapshot.fileStatuses.map((file) => [[repository.relativePath === '.' ? '' : repository.relativePath, file.path].filter(Boolean).join('/'), file.category])),
-                ),
-              );
-              setChangePreview((current) => {
-                if (!current || current.request.kind !== 'project-git') return current;
-                const request = current.request;
-                const repository = snapshot.repositories.find((item) => item.id === request.repositoryId);
-                if (!repository || !repository.snapshot.fileStatuses.some((file) => file.path === request.path)) return null;
-                return { ...current, diff: fileDiff(repository, request.path), revision: snapshot.refreshedAt };
-              });
-            }}
-          />
-        </aside>
+  /** 同一拖拽入口贯通顶部，继续复用原有指针与键盘调宽行为。 */
+  const sourceTreeResizer = treeResizeSurface
+    ? createPortal(
         <div
-          className="project-source-tree-resizer"
+          className="project-source-tree-resizer project-source-tree-resizer-overlay"
+          style={{ left: treeResizeSurface.left, top: treeResizeSurface.top, width: treeResizeSurface.width, height: treeResizeSurface.height }}
           role="separator"
           aria-orientation="vertical"
           aria-label={zh ? '调整代码目录宽度' : 'Resize source tree'}
@@ -935,79 +733,235 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
             event.preventDefault();
             setTreeWidth(event.key === 'Home' ? 260 : clampTreeWidth(treeWidth + (event.key === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 24 : 8)));
           }}
-        />
+        />,
+        treeResizeSurface.host,
+      )
+    : null;
+
+  return (
+    <section data-file-root={props.project.localPath} className="project-source-workspace" style={{ '--zeus-source-tree-width': `${treeWidth}px` } as CSSProperties} data-tree-open={treeDrawerOpen ? 'true' : 'false'}>
+      {notice || activeTab?.externalChange ? (
+        <div className="project-source-message success" role="status">
+          <span>{notice ?? (zh ? '文件已在外部发生变化，请重新加载或另存为。' : 'The file changed externally. Reload it or save it as a new file.')}</span>
+          {activeTab?.externalChange ? (
+            <>
+              <Button unstyled type="button" onClick={() => beginOperation({ kind: 'save-as', tabPath: activeTab.document.relativePath })}>
+                {zh ? '另存为' : 'Save as'}
+              </Button>
+              <Button unstyled type="button" onClick={() => reloadActiveTab()}>
+                {zh ? '重新加载' : 'Reload'}
+              </Button>
+            </>
+          ) : null}
+          <Button unstyled type="button" aria-label={zh ? '关闭提示' : 'Dismiss'} onClick={() => setNotice(null)}>
+            <X aria-hidden="true" />
+          </Button>
+        </div>
+      ) : null}
+
+      {error ? (
+        <div className="project-source-message" role="alert">
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+          <Button unstyled type="button" aria-label={zh ? '关闭错误提示' : 'Dismiss error'} onClick={() => setError(null)}>
+            <X aria-hidden="true" />
+          </Button>
+        </div>
+      ) : null}
+
+      {conflictComparison ? (
+        <ModalPortal rootClassName="project-source-modal-root" backdropClassName="project-source-modal-backdrop" onDismiss={() => setConflictComparison(null)} role="dialog" aria-label={zh ? '比较变更' : 'Compare changes'}>
+          <section className="project-source-conflict-comparison" data-modal-surface="dialog">
+            <header>
+              <strong>{zh ? '比较变更' : 'Compare changes'}</strong>
+              <Button unstyled type="button" onClick={() => setConflictComparison(null)}>
+                {zh ? '关闭' : 'Close'}
+              </Button>
+            </header>
+            <div className="project-source-conflict-columns">
+              <section>
+                <h3>{zh ? '当前更改' : 'Current changes'}</h3>
+                <Suspense fallback={null}>
+                  <CodeEditor path="conflict-current" language={activeTab?.document.language ?? null} content={conflictComparison.current} readOnly />
+                </Suspense>
+              </section>
+              <section>
+                <h3>{zh ? '传入更改' : 'Incoming changes'}</h3>
+                <Suspense fallback={null}>
+                  <CodeEditor path="conflict-incoming" language={activeTab?.document.language ?? null} content={conflictComparison.incoming} readOnly />
+                </Suspense>
+              </section>
+            </div>
+          </section>
+        </ModalPortal>
+      ) : null}
+      {sourceTreeResizer}
+      <div className="project-source-main">
+        <aside className="project-source-tree" aria-label={zh ? '代码目录' : 'Source tree'}>
+          <div className="project-source-module">
+            <div className="project-source-module-header">
+              <span className="project-source-worktree-slot">{props.workspaceSelector ?? <span title={props.project.localPath}>{props.project.name}</span>}</span>
+            </div>
+            <div className="project-source-search-row">
+              <label className="project-source-search">
+                <MagnifyingGlass aria-hidden="true" />
+                <input type="search" value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} aria-label={zh ? '搜索文件名' : 'Search file names'} placeholder={zh ? '搜索文件名' : 'Search file names'} />
+              </label>
+              {/* 新建入口与搜索同行，默认位置继续使用当前文件的父目录。 */}
+              <span className="project-source-module-actions" role="group" aria-label={zh ? '新建文件或目录' : 'Create files or folders'}>
+                <Button
+                  unstyled
+                  type="button"
+                  data-icon-tooltip={zh ? '新建文件' : 'New file'}
+                  aria-label={zh ? '新建文件' : 'New file'}
+                  onClick={() => beginOperation({ kind: 'create-file', parentRelativePath: activePath ? parentPath(activePath) : '' })}
+                >
+                  <FilePlus size={16} aria-hidden="true" />
+                </Button>
+                <Button
+                  unstyled
+                  type="button"
+                  data-icon-tooltip={zh ? '新建目录' : 'New folder'}
+                  aria-label={zh ? '新建目录' : 'New folder'}
+                  onClick={() => beginOperation({ kind: 'create-directory', parentRelativePath: activePath ? parentPath(activePath) : '' })}
+                >
+                  <FolderPlus size={16} aria-hidden="true" />
+                </Button>
+              </span>
+            </div>
+            <div className="project-source-tree-scroll" role="tree" aria-busy={loadingTree}>
+              {searchQuery.trim() ? (
+                <SearchResults
+                  entries={searchResults}
+                  activePath={activePath}
+                  gitFileStatuses={gitFileStatuses}
+                  truncated={searchTruncated}
+                  busyPath={busyPath}
+                  onOpen={(path) => openFile(path)}
+                  onContextMenu={openFileContextMenu}
+                  onShortcut={handleFileShortcut}
+                  zh={zh}
+                />
+              ) : loadingTree ? (
+                <p className="project-source-empty">{zh ? '正在读取项目目录…' : 'Loading the project folder…'}</p>
+              ) : (
+                <TreeRows
+                  directoryPath=""
+                  depth={0}
+                  directories={directories}
+                  expandedDirectories={expandedDirectories}
+                  activePath={activePath}
+                  gitFileStatuses={gitFileStatuses}
+                  busyPath={busyPath}
+                  onToggle={(path) => toggleDirectory(path)}
+                  onOpen={(path) => openFile(path)}
+                  onContextMenu={openFileContextMenu}
+                  onShortcut={handleFileShortcut}
+                />
+              )}
+            </div>
+          </div>
+        </aside>
+        <div ref={treeResizeTrackRef} className="project-source-tree-resizer-track" aria-hidden="true" />
 
         <main className="project-source-editor-pane">
-          <div className="project-source-tabs" role="tablist" aria-label={zh ? '已打开文件' : 'Open files'}>
-            <button type="button" className="project-source-tree-toggle" onClick={() => setTreeDrawerOpen((open) => !open)} aria-label={zh ? '显示代码目录' : 'Show source tree'} aria-expanded={treeDrawerOpen}>
-              <FolderOpen aria-hidden="true" />
-            </button>
-            {tabs.map((tab) => (
-              <div
-                key={tab.document.relativePath}
-                className={`project-source-tab${!changePreview && tab.document.relativePath === activePath ? ' active' : ''}`}
-                onAuxClick={(event) => {
-                  if (event.button !== 1) return;
-                  event.preventDefault();
-                  closeTab(tab.document.relativePath);
-                }}
+          <div className="project-source-editor-header">
+            <div className="project-source-tabs zeus-workspace-tabs" role="tablist" aria-label={zh ? '已打开文件' : 'Open files'}>
+              <Button
+                unstyled
+                data-icon-tooltip={zh ? '显示代码目录' : 'Show source tree'}
+                type="button"
+                className="project-source-tree-toggle"
+                onClick={() => setTreeDrawerOpen((open) => !open)}
+                aria-label={zh ? '显示代码目录' : 'Show source tree'}
+                aria-expanded={treeDrawerOpen}
               >
-                <button
-                  type="button"
-                  role="tab"
-                  title={tab.document.relativePath}
-                  aria-selected={!changePreview && tab.document.relativePath === activePath}
-                  onClick={() => {
-                    setChangePreview(null);
-                    setActivePath(tab.document.relativePath);
+                <FolderOpen aria-hidden="true" />
+              </Button>
+              {tabs.map((tab, index) => (
+                <div
+                  key={tab.document.relativePath}
+                  ref={tab.document.relativePath === activePath ? activeTabElementRef : undefined}
+                  className="zeus-workspace-tab-shell"
+                  data-active={tab.document.relativePath === activePath || undefined}
+                  onAuxClick={(event) => {
+                    if (event.button !== 1) return;
+                    event.preventDefault();
+                    closeTab(tab.document.relativePath);
                   }}
                 >
-                  <File aria-hidden="true" />
-                  <span data-file-status={gitFileStatuses[tab.document.relativePath]}>{tab.document.name}</span>
-                  {tab.dirty ? (
-                    <i aria-label={zh ? '未保存' : 'Unsaved'}>●</i>
-                  ) : tab.externalChange ? (
-                    <i className="external" aria-label={zh ? '外部已更改' : 'Changed externally'}>
-                      !
-                    </i>
-                  ) : null}
-                </button>
-                <button
-                  type="button"
-                  className="project-source-tab-close"
-                  title={zh ? `关闭 ${tab.document.name}` : `Close ${tab.document.name}`}
-                  aria-label={zh ? `关闭 ${tab.document.name}` : `Close ${tab.document.name}`}
-                  disabled={tab.saving}
-                  onClick={() => closeTab(tab.document.relativePath)}
-                >
-                  <X size={14} aria-hidden="true" />
-                </button>
-              </div>
-            ))}
+                  <Button
+                    unstyled
+                    type="button"
+                    role="tab"
+                    data-icon-tooltip={tab.document.name}
+                    data-file-path={tab.document.relativePath}
+                    aria-selected={tab.document.relativePath === activePath}
+                    tabIndex={tab.document.relativePath === activePath ? 0 : -1}
+                    className="zeus-workspace-tab"
+                    onClick={() => {
+                      setActivePath(tab.document.relativePath);
+                    }}
+                    onKeyDown={(event) => {
+                      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                      event.preventDefault();
+                      /** 复用终端标签的循环选择方式，首尾键直接定位边界。 */
+                      const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                      setActivePath(tabs[nextIndex]!.document.relativePath);
+                      event.currentTarget.closest('[role="tablist"]')?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus();
+                    }}
+                  >
+                    <FileTypeIcon name={tab.document.name} />
+                    <span data-file-status={gitFileStatuses[tab.document.relativePath]}>{tab.document.name}</span>
+                    {tab.dirty ? (
+                      <i aria-label={zh ? '未保存' : 'Unsaved'}>●</i>
+                    ) : tab.externalChange ? (
+                      <i className="external" aria-label={zh ? '外部已更改' : 'Changed externally'}>
+                        !
+                      </i>
+                    ) : null}
+                  </Button>
+                  <Button
+                    unstyled
+                    type="button"
+                    className="zeus-workspace-tab-close"
+                    data-icon-tooltip={zh ? `关闭 ${tab.document.name}` : `Close ${tab.document.name}`}
+                    aria-label={zh ? `关闭 ${tab.document.name}` : `Close ${tab.document.name}`}
+                    disabled={tab.saving}
+                    onClick={() => closeTab(tab.document.relativePath)}
+                  >
+                    <X size={14} aria-hidden="true" />
+                  </Button>
+                </div>
+              ))}
+            </div>
           </div>
-          {changePreview?.projectId === props.project.id ? (
+          {activeTab ? (
             <>
-              <div className="project-source-editor-track-placeholder" aria-hidden="true" />
-              <section className="project-source-change-preview">
-                <SideBySideDiff key={changePreview.path} revision={changePreview.revision} previewRequest={changePreview.request} diff={changePreview.diff} zh={zh} title={changePreview.path} onClose={() => setChangePreview(null)} fill />
-              </section>
-            </>
-          ) : activeTab ? (
-            <>
-              <nav className="project-source-breadcrumbs" aria-label={zh ? '文件路径' : 'File path'}>
-                {breadcrumbs.map((part, index) => (
-                  <span key={`${part}-${index}`}>{part}</span>
-                ))}
-                {previewKind ? (
-                  <span role="group" aria-label={zh ? '文件展示方式' : 'File view mode'}>
-                    {(['source', 'preview', 'split'] as const).map((mode) => (
-                      <button key={mode} type="button" aria-pressed={viewMode === mode} onClick={() => setViewModes((current) => ({ ...current, [activeTab.document.relativePath]: mode }))}>
-                        {mode === 'source' ? (zh ? '源码' : 'Source') : mode === 'preview' ? (zh ? '预览' : 'Preview') : zh ? '分栏' : 'Split'}
-                      </button>
+              <div className="project-source-file-toolbar">
+                <nav className="project-source-breadcrumbs" aria-label={zh ? '文件路径' : 'File path'}>
+                  {breadcrumbs.map((part, index) => (
+                    <span key={`${part}-${index}`}>{part}</span>
+                  ))}
+                </nav>
+                {renderedPreviewKind ? (
+                  <div className="project-source-view-modes" role="group" aria-label={zh ? '源码显示方式' : 'Source view mode'}>
+                    {sourceViewModes.map(({ id, zh: chinese, en, icon: Icon }) => (
+                      <Button
+                        unstyled
+                        key={id}
+                        type="button"
+                        data-source-view-mode={id}
+                        aria-label={zh ? chinese : en}
+                        data-icon-tooltip={zh ? chinese : en}
+                        aria-pressed={viewMode === id}
+                        onClick={() => setViewModes((current) => ({ ...current, [activeTab.document.relativePath]: id }))}
+                      >
+                        <Icon size={16} aria-hidden="true" />
+                      </Button>
                     ))}
-                  </span>
+                  </div>
                 ) : null}
-              </nav>
+              </div>
               {!activeTab.document.editable ? (
                 <FilePreview
                   request={{ kind: 'source', projectId: props.project.id, path: activeTab.document.relativePath }}
@@ -1017,41 +971,37 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                 />
               ) : (
                 <div className="project-source-document-views" data-view-mode={viewMode}>
-                  <div className="project-source-document-editor" hidden={viewMode === 'preview'}>
-                    <Suspense fallback={<div className="project-source-code-editor-loading">{zh ? '正在加载代码编辑器…' : 'Loading code editor…'}</div>}>
+                  <div className="project-source-document-editor" hidden={viewMode === 'preview'} inert={viewMode === 'preview'}>
+                    <Suspense fallback={null}>
                       <ProjectSourceEditor
                         projectId={props.project.id}
                         revision={activeTab.document.revision.sha256}
                         dirty={activeTab.dirty}
                         zh={zh}
-                        onCompareConflict={compareConflict}
+                        extensions={conflictExtensions}
                         path={activeTab.document.relativePath}
                         language={activeTab.document.language}
                         content={activeTab.draft}
                         savedContent={activeTab.document.content}
                         readOnly={false}
-                        revealLine={activeTab.revealLine}
-                        revealColumn={activeTab.revealColumn}
-                        onCursorChange={(cursorLine, cursorColumn) =>
-                          setTabs((current) => current.map((tab) => (tab.document.relativePath === activeTab.document.relativePath ? { ...tab, cursorLine, cursorColumn, revealLine: null, revealColumn: null } : tab)))
-                        }
-                        onSave={() => void saveTab(activeTab.document.relativePath)}
-                        onSaveAll={() => void saveAll()}
+                        location={activeTab.revealLocation}
+                        onDocumentChange={(content, dirty) => setTabs((current) => current.map((tab) => (tab.document.relativePath === activeTab.document.relativePath ? { ...tab, draft: content, dirty, revealLocation: undefined } : tab)))}
+                        onCursorChange={(cursorLine, cursorColumn) => setTabs((current) => current.map((tab) => (tab.document.relativePath === activeTab.document.relativePath ? { ...tab, cursorLine, cursorColumn } : tab)))}
+                        onSave={() => saveTab(activeTab.document.relativePath)}
+                        onSaveAll={() => saveAll()}
                       />
                     </Suspense>
                   </div>
-                  {previewKind && viewMode !== 'source' ? (
-                    <Suspense fallback={<p role="status">{zh ? '正在打开预览…' : 'Opening preview…'}</p>}>
+                  {renderedPreviewKind && viewMode !== 'source' ? (
+                    <Suspense fallback={null}>
                       <ProjectSourceRenderedPreview
+                        key={`${props.project.id}:${activeTab.document.relativePath}`}
                         projectId={props.project.id}
                         path={activeTab.document.relativePath}
-                        kind={previewKind}
+                        kind={renderedPreviewKind}
                         draft={activeTab.draft}
                         language={props.language}
-                        openFile={async (path) => {
-                          setViewModes((current) => ({ ...current, [path]: 'preview' }));
-                          await openFile(path);
-                        }}
+                        openFile={openPreviewFile}
                       />
                     </Suspense>
                   ) : null}
@@ -1074,7 +1024,22 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                 <span>{zh ? '文件预览 · 只读' : 'File preview · Read-only'}</span>
               ) : (
                 <>
-                  <span>{activeTab.document.language}</span>
+                  <select
+                    aria-label={zh ? '源码高亮语言' : 'Source syntax language'}
+                    value={activeTab.document.language}
+                    onChange={(event) => {
+                      /** 仅调整当前标签的高亮，不产生正文改动或保存操作。 */
+                      const language = event.currentTarget.value;
+                      setTabs((current) => current.map((tab) => (tab.document.relativePath === activePath ? { ...tab, document: { ...tab.document, language } } : tab)));
+                    }}
+                  >
+                    <option value="text">{zh ? '纯文本' : 'Plain text'}</option>
+                    {sourceLanguageOptions.map((language) => (
+                      <option key={language} value={language}>
+                        {language}
+                      </option>
+                    ))}
+                  </select>
                   <span>UTF-8{activeTab.document.hasBom ? ' BOM' : ''}</span>
                   <span>{activeTab.document.eol.toUpperCase()}</span>
                   <span>
@@ -1091,7 +1056,8 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       </div>
 
       {treeBackdrop.present ? (
-        <button
+        <Button
+          unstyled
           ref={treeBackdrop.ref}
           data-motion-state={treeDrawerOpen ? 'open' : 'closing'}
           inert={!treeDrawerOpen}
@@ -1108,45 +1074,61 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
         <div className="macos-ai-app project-source-menu-layer" style={{ display: 'contents' }}>
           <MotionPresence>
             {contextMenu ? (
-              <MenuSurface onClose={() => setContextMenu(null)} className="project-source-context-menu" role="menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+              <MenuSurface
+                onClose={() => setContextMenu(null)}
+                className="project-source-context-menu"
+                role="menu"
+                style={{ left: contextMenu.x, top: contextMenu.y }}
+                onPointerDown={(event) => event.stopPropagation()}
+                onKeyDown={(event) => handleFileShortcut(contextMenu.entry, event)}
+              >
                 {contextMenu.entry.kind === 'directory' ? (
                   <>
-                    <button role="menuitem" type="button" onClick={() => beginOperation({ kind: 'create-file', parentRelativePath: contextMenu.entry.relativePath })}>
-                      {zh ? '新建文件' : 'New file'}
-                    </button>
-                    <button role="menuitem" type="button" onClick={() => beginOperation({ kind: 'create-directory', parentRelativePath: contextMenu.entry.relativePath })}>
-                      {zh ? '新建目录' : 'New folder'}
-                    </button>
+                    <Button unstyled role="menuitem" type="button" aria-keyshortcuts={`${fileShortcutModifier}+N`} onClick={() => beginOperation({ kind: 'create-file', parentRelativePath: contextMenu.entry.relativePath })}>
+                      <span>{zh ? '新建文件' : 'New file'}</span>
+                      <kbd>{fileShortcutLabels.createFile}</kbd>
+                    </Button>
+                    <Button unstyled role="menuitem" type="button" aria-keyshortcuts={`${fileShortcutModifier}+Shift+N`} onClick={() => beginOperation({ kind: 'create-directory', parentRelativePath: contextMenu.entry.relativePath })}>
+                      <span>{zh ? '新建目录' : 'New folder'}</span>
+                      <kbd>{fileShortcutLabels.createDirectory}</kbd>
+                    </Button>
                   </>
                 ) : null}
-                <button role="menuitem" type="button" onClick={() => void copySourceEntry(contextMenu.entry, false)}>
+                <Button unstyled role="menuitem" type="button" onClick={() => copySourceEntry(contextMenu.entry, false)}>
                   <span>{zh ? '复制文件名' : 'Copy file name'}</span>
                   <kbd>{macShortcuts ? '⌘C' : 'Ctrl+C'}</kbd>
-                </button>
-                <button role="menuitem" type="button" onClick={() => void copySourceEntry(contextMenu.entry, true)}>
+                </Button>
+                <Button unstyled role="menuitem" type="button" onClick={() => copySourceEntry(contextMenu.entry, true)}>
                   <span>{zh ? '复制路径' : 'Copy path'}</span>
                   <kbd>{macShortcuts ? '⌘⇧C' : 'Ctrl+Shift+C'}</kbd>
-                </button>
-                <button role="menuitem" type="button" aria-keyshortcuts="F2" onClick={() => beginOperation({ kind: 'rename', entry: contextMenu.entry })}>
+                </Button>
+                <Button unstyled role="menuitem" type="button" aria-keyshortcuts="F2" onClick={() => beginOperation({ kind: 'rename', entry: contextMenu.entry })}>
                   <span>{zh ? '重命名' : 'Rename'}</span>
                   <kbd>{fileShortcutLabels.rename}</kbd>
-                </button>
-                <button role="menuitem" type="button" onClick={() => beginOperation({ kind: 'move', entry: contextMenu.entry })}>
-                  {zh ? '移动…' : 'Move…'}
-                </button>
-                <button
+                </Button>
+                <Button unstyled role="menuitem" type="button" aria-keyshortcuts={`${fileShortcutModifier}+Shift+M`} onClick={() => beginOperation({ kind: 'move', entry: contextMenu.entry })}>
+                  <span>{zh ? '移动…' : 'Move…'}</span>
+                  <kbd>{fileShortcutLabels.move}</kbd>
+                </Button>
+                <Button
+                  unstyled
                   role="menuitem"
                   type="button"
+                  aria-keyshortcuts={`${fileShortcutModifier}+Shift+R`}
                   onClick={() => {
-                    void bridge?.revealProjectSourceEntry({ projectId: props.project.id, relativePath: contextMenu.entry.relativePath });
+                    /** 菜单立即关闭，文件管理器操作继续由共享按钮接纳结果。 */
+                    const pending = bridge?.revealProjectSourceEntry({ projectId: props.project.id, relativePath: contextMenu.entry.relativePath });
                     setContextMenu(null);
+                    return pending;
                   }}
                 >
-                  {zh ? '在 Finder 中显示' : 'Reveal in Finder'}
-                </button>
-                <button role="menuitem" type="button" className="danger" onClick={() => beginOperation({ kind: 'delete', entry: contextMenu.entry })}>
-                  {zh ? '移入废纸篓…' : 'Move to Trash…'}
-                </button>
+                  <span>{zh ? '在 Finder 中显示' : 'Reveal in Finder'}</span>
+                  <kbd>{fileShortcutLabels.reveal}</kbd>
+                </Button>
+                <Button unstyled role="menuitem" type="button" aria-keyshortcuts={macShortcuts ? 'Meta+Backspace' : 'Delete'} className="danger" onClick={() => beginOperation({ kind: 'delete', entry: contextMenu.entry })}>
+                  <span>{zh ? '移入废纸篓…' : 'Move to Trash…'}</span>
+                  <kbd>{fileShortcutLabels.delete}</kbd>
+                </Button>
               </MenuSurface>
             ) : null}
           </MotionPresence>
@@ -1157,19 +1139,19 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       <MotionPresence>
         {operation ? (
           <ModalPortal rootClassName="project-source-modal-root" backdropClassName="project-source-modal-backdrop" onDismiss={() => setOperation(null)} dismissDisabled={Boolean(busyPath)} role="dialog">
-            <form
+            <Form
               className="project-source-operation-modal zeus-solid-form-surface"
               onSubmit={(event) => {
                 event.preventDefault();
-                void submitOperation();
+                return submitOperation();
               }}
               data-modal-surface="dialog"
             >
               <header>
                 <strong>{operationTitle(operation, zh)}</strong>
-                <button type="button" aria-label={zh ? '关闭' : 'Close'} onClick={() => setOperation(null)} disabled={Boolean(busyPath)}>
+                <Button unstyled type="button" aria-label={zh ? '关闭' : 'Close'} onClick={() => setOperation(null)} disabled={Boolean(busyPath)}>
                   <X size={16} aria-hidden="true" />
-                </button>
+                </Button>
               </header>
               <div>
                 {operation.kind === 'delete' ? (
@@ -1197,7 +1179,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                   {operation.kind === 'delete' ? (zh ? '移入废纸篓' : 'Move to Trash') : zh ? '确认' : 'Confirm'}
                 </Button>
               </footer>
-            </form>
+            </Form>
           </ModalPortal>
         ) : null}
       </MotionPresence>
@@ -1241,7 +1223,7 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
                   onClick={() => {
                     const path = pendingClosePath;
                     setBusyPath('close-tab');
-                    void saveAll()
+                    return saveAll()
                       .then((saved) => {
                         if (saved && path) {
                           setPendingClosePath(null);
@@ -1268,7 +1250,6 @@ export const ProjectSourceWorkspace = forwardRef<ProjectSourceWorkspaceHandle, P
       const document = await bridge.readProjectSourceFile({ projectId: props.project.id, relativePath: activeTab.document.relativePath });
       setTabs((current) => current.map((tab) => (tab.document.relativePath === document.relativePath ? { ...tab, document, draft: document.content, dirty: false, externalChange: false } : tab)));
       setError(null);
-      setNotice(zh ? `已重新加载 ${document.relativePath}` : `Reloaded ${document.relativePath}`);
     } catch (reloadError) {
       setError(reloadError);
     }
@@ -1287,6 +1268,7 @@ function TreeRows(props: {
   onToggle(path: string): void;
   onOpen(path: string): void;
   onContextMenu(entry: ProjectSourceEntry, event: ReactMouseEvent<HTMLButtonElement>): void;
+  /** 文件行与右键菜单共享操作快捷键。 */
   onShortcut(entry: ProjectSourceEntry, event: ReactKeyboardEvent<HTMLElement>): void;
 }) {
   const directory = props.directories[props.directoryPath];
@@ -1296,7 +1278,9 @@ function TreeRows(props: {
     const expanded = directoryEntry && props.expandedDirectories.has(entry.relativePath);
     return (
       <div key={entry.relativePath} role="none">
-        <button
+        <Button
+          data-busy-behavior="background"
+          unstyled
           type="button"
           role="treeitem"
           aria-selected={entry.relativePath === props.activePath}
@@ -1313,10 +1297,10 @@ function TreeRows(props: {
           <span className="project-source-disclosure" aria-hidden="true">
             {directoryEntry ? expanded ? <CaretDown size={12} /> : <CaretRight size={12} /> : null}
           </span>
-          {directoryEntry ? expanded ? <FolderOpen weight="regular" aria-hidden="true" /> : <Folder weight="regular" aria-hidden="true" /> : <File aria-hidden="true" />}
+          {directoryEntry ? expanded ? <FolderOpen weight="regular" aria-hidden="true" /> : <Folder weight="regular" aria-hidden="true" /> : <FileTypeIcon name={entry.name} />}
           <span data-file-status={directoryEntry ? undefined : props.gitFileStatuses[entry.relativePath]}>{entry.name}</span>
           {entry.kind === 'symlink' ? <small>↗</small> : null}
-        </button>
+        </Button>
         {directoryEntry ? (
           <Collapsible open={expanded}>
             <TreeRows {...props} directoryPath={entry.relativePath} depth={props.depth + 1} />
@@ -1325,6 +1309,49 @@ function TreeRows(props: {
       </div>
     );
   });
+}
+
+/** 搜索结果沿用目录树的选中态和 Git 状态色。 */
+function SearchResults(props: {
+  entries: ProjectSourceEntry[];
+  activePath: string | null;
+  gitFileStatuses: Record<string, string>;
+  truncated: boolean;
+  busyPath: string | null;
+  onOpen(path: string): void;
+  onContextMenu(entry: ProjectSourceEntry, event: ReactMouseEvent<HTMLButtonElement>): void;
+  onShortcut(entry: ProjectSourceEntry, event: ReactKeyboardEvent<HTMLElement>): void;
+  zh: boolean;
+}) {
+  if (props.entries.length === 0) return <p className="project-source-empty">{props.zh ? '没有匹配的文件。' : 'No matching files.'}</p>;
+  return (
+    <>
+      {props.entries.map((entry) => (
+        <Button
+          data-busy-behavior="background"
+          unstyled
+          key={entry.relativePath}
+          type="button"
+          role="treeitem"
+          className={entry.relativePath === props.activePath ? 'selected' : ''}
+          aria-selected={entry.relativePath === props.activePath}
+          disabled={!entry.accessible || entry.kind === 'directory' || props.busyPath === entry.relativePath}
+          onClick={() => props.onOpen(entry.relativePath)}
+          onContextMenu={(event) => props.onContextMenu(entry, event)}
+          data-file-path={entry.relativePath}
+          data-icon-tooltip={entry.name}
+          onKeyDown={(event) => props.onShortcut(entry, event)}
+        >
+          {entry.kind === 'directory' ? <Folder weight="regular" aria-hidden="true" /> : <FileTypeIcon name={entry.name} />}
+          <span>
+            <strong data-file-status={props.gitFileStatuses[entry.relativePath]}>{entry.name}</strong>
+            <small>{entry.relativePath}</small>
+          </span>
+        </Button>
+      ))}
+      {props.truncated ? <p className="project-source-empty">{props.zh ? '仅显示前 200 项，请缩小搜索范围。' : 'Showing the first 200 results. Refine your search.'}</p> : null}
+    </>
+  );
 }
 
 function normalizePreference(value: ProjectCodeWorkspacePreference | undefined): ProjectCodeWorkspacePreference {

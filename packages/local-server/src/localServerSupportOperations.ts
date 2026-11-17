@@ -147,6 +147,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
     projects,
     publishRealtimeEvent,
     publishRuntimeSessionEvent,
+    readManagedCodexStandalone,
     recordTaskEvent,
     releaseEnvironment,
     releaseUpdateManifestUrl,
@@ -352,7 +353,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
       ...process.env,
       ...platformMutableState.runtimeSettings.terminalEnv,
       ZEUS_RUNTIME_TIMEOUT_SECONDS: String(platformMutableState.runtimeSettings.executionTimeoutSeconds),
-      ...(platformMutableState.runtimeSettings.adapterCliPaths.codex ? { ZEUS_CODEX_COMMAND_PATH: platformMutableState.runtimeSettings.adapterCliPaths.codex } : {}),
+      ZEUS_CODEX_COMMAND_PATH: readManagedCodexStandalone().commandPath ?? '',
       ...shellEnv,
     });
     return {

@@ -1,4 +1,5 @@
 import type { TaskWorkToolPort } from './taskWorkDynamicTools.js';
+import type { ConversationDispatchPerformanceSample } from './performanceObservability.js';
 import type { AsyncQuestionAnswer } from '@zeus/shared';
 import type { ConversationSourceContextReader } from './conversationSourceContext.js';
 import type { UserFacingErrorCause } from '@zeus/shared';
@@ -64,8 +65,14 @@ export interface CreateCodexNativeConversationCoordinatorOptions {
   toolResults: ManagedConversationToolResultStore;
   eventFlow: ConversationEventFlowControl;
   broadcast: (type: string, payload: Record<string, unknown>) => void;
+  /** 本地派发诊断只记录阶段和耗时，不影响提交接纳与恢复。 */
+  recordDispatchPerformance?: (sample: ConversationDispatchPerformanceSample) => void;
   now: () => string;
   browserAutomation?: BrowserAutomationPort;
+  /** 操作模型委派复用宿主管理的普通子代理。 */
+  automationAgents?: Pick<BrowserAutomationPort, 'invoke'>;
+  /** 主会话停止时联动停止已接纳的子任务。 */
+  stopSubagents?(conversationId: string): Promise<void>;
   /** 当前任务的本地编排工具。 */
   workTools?: TaskWorkToolPort;
   /** 具备产品来源查询时，向模型注册只读历史入口。 */
@@ -83,7 +90,7 @@ export interface CreateCodexNativeConversationCoordinatorOptions {
     executionWorkspaceMode?: 'direct' | 'worktree';
   } | null>;
   /** 实际目标发送或恢复前校验冻结预算；不按旧模型替代新路由。 */
-  validateContextCapacity(budget: number | null, sourceId: string | null, modelId: string, runtime: 'codex' | 'pi'): void;
+  validateContextCapacity(budget: number | null, sourceId: string | null, modelId: string, runtime: 'codex' | 'pi' | 'copilot'): void;
   compileDispatchContext: ProviderDispatchContextCompiler;
   preflightCodexModelBudget: (input: { modelId: string; modelSourceId: string | null; providerGenerationId: string | null }) => void;
 }
@@ -357,6 +364,10 @@ export interface StartTaskConversationInput {
 }
 
 export interface StartProjectConversationInput {
+  /** 可选关联任务仍使用本次新对话选择的工作目录。 */
+  taskId?: string;
+  /** 应用层在一个事务中创建任务与会话。 */
+  createRecord?: ConversationRepository['create'];
   /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
   conversationContext?: Record<string, unknown>;
   /** 首发与后续消息共用结构化网页批注。 */

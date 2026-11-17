@@ -20,7 +20,8 @@ const outputRateMeasurementCondition = `r.measurement_complete = 1
 
 export const conversationSchemaGeneration = '2026-08-16-unified-conversation-segments';
 
-export type ConversationRuntimeKind = 'codex' | 'pi';
+/** 执行片段使用实际 Provider 身份决定恢复和归档边界。 */
+export type ConversationRuntimeKind = 'codex' | 'pi' | 'copilot';
 export type ConversationSegmentState = 'provisional' | 'current' | 'sealed' | 'abandoned';
 export type ConversationSwitchState = 'preflight' | 'provisional' | 'outcome_unknown' | 'accepted' | 'failed' | 'cancelled';
 export type ConversationProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'waiting' | 'warning';
@@ -768,12 +769,18 @@ export class ConversationExecutionRepository {
     return this.segmentById(operation.targetSegmentId)!;
   }
 
+  /** 回显可能先于 RPC 回执建立轮次；两条接纳路径必须使用同一持久身份。 */
+  resolveAcceptedTurnId(conversationId: string, providerThreadId: string, providerTurnId: string, proposedTurnId: string): string {
+    return this.db.get<{ id: string }>('SELECT id FROM conversation_turns WHERE conversation_id = ? AND provider_thread_id = ? AND provider_turn_id = ?', [conversationId, providerThreadId, providerTurnId])?.id ?? proposedTurnId;
+  }
+
   /** 接纳与外部回执共同提交，同时清除接纳前的暂停及错误状态。 */
   acceptSwitchDurably(input: AcceptSwitchInput, settleExternalReceipt?: () => void): ConversationSwitchOperationRecord {
     return this.db.durableTransactionSync(() => {
       const operation = this.requireOpenSwitch(input.operationId);
       const target = this.segmentById(operation.targetSegmentId);
       if (!target || target.state !== 'provisional' || !target.nativeSessionId) throw new Error('候选运行分段尚未具备可提升的原生身份。');
+      input = { ...input, turnId: this.resolveAcceptedTurnId(operation.conversationId, target.nativeSessionId, input.providerTurnId, input.turnId) };
       if (operation.sourceSegmentId) {
         this.db.execute(
           `UPDATE conversation_runtime_segments
@@ -859,6 +866,7 @@ export class ConversationExecutionRepository {
     this.db.durableTransactionSync(() => {
       const segment = this.currentSegment(input.conversationId);
       if (!segment || segment.id !== input.segmentId || !segment.nativeSessionId) throw new Error('当前运行分段无法接受该提交。');
+      input = { ...input, turnId: this.resolveAcceptedTurnId(input.conversationId, segment.nativeSessionId, input.providerTurnId, input.turnId) };
       const timelineSequence = this.nextSequence(input.conversationId, 'timeline_sequence');
       // Provider 回显先落库时复用其历史，避免普通发送重复显示。
       const modelHistorySequence = this.appendModelHistory({
@@ -1752,7 +1760,11 @@ export class ConversationExecutionRepository {
     const providerItemId =
       stringOrNull(content.providerItemId) ??
       stringOrNull(input.toolPairId) ??
-      (content.agentKind === 'pi' || this.db.get<{ runtime_kind: string }>(`SELECT runtime_kind FROM conversation_runtime_segments WHERE id = ?`, [input.segmentId])?.runtime_kind === 'pi' ? stringOrNull(content.stageId) : null) ??
+      (content.agentKind === 'pi' ||
+      content.agentKind === 'copilot' ||
+      ['pi', 'copilot'].includes(this.db.get<{ runtime_kind: string }>(`SELECT runtime_kind FROM conversation_runtime_segments WHERE id = ?`, [input.segmentId])?.runtime_kind ?? '')
+        ? stringOrNull(content.stageId)
+        : null) ??
       stringOrNull(reasoning.itemId) ??
       stringOrNull(reasoning.providerItemId);
     const reasoningBlock = input.role === 'assistant' && reasoning.readableSummary === true;
@@ -1877,6 +1889,39 @@ export class ConversationExecutionRepository {
   }
 }
 
+/** 只修复有唯一提交、分段及 Provider 轮次证据的悬空关联，保留正文、序号和消息身份。 */
+export function migrateAcceptedConversationTurnReferences(db: ZeusDatabasePort): void {
+  /** 接纳顺序曾使历史引用未实际插入的轮次编号。 */
+  const migrationId = '20261116_accepted_conversation_turn_references';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    const references = db.select<{ conversation_id: string; previous_turn_id: string; accepted_turn_id: string }>(
+      `SELECT history.conversation_id, history.turn_id AS previous_turn_id, MIN(accepted.id) AS accepted_turn_id
+         FROM conversation_model_history AS history
+         JOIN conversation_submissions AS submission ON submission.id = history.submission_id AND submission.conversation_id = history.conversation_id
+         JOIN conversation_runtime_segments AS segment ON segment.id = history.segment_id AND segment.conversation_id = history.conversation_id
+         JOIN conversation_turns AS accepted ON accepted.conversation_id = history.conversation_id
+          AND accepted.client_submission_id = submission.id AND accepted.provider_turn_id = submission.provider_turn_id
+          AND accepted.provider_thread_id = segment.native_session_id
+        WHERE history.role = 'user' AND NOT EXISTS (SELECT 1 FROM conversation_turns WHERE id = history.turn_id)
+        GROUP BY history.conversation_id, history.turn_id HAVING COUNT(DISTINCT accepted.id) = 1`,
+    );
+    const execution = new ConversationExecutionRepository(db);
+    for (const reference of references) {
+      for (const table of ['conversation_model_history', 'conversation_config_evidence', 'conversation_timeline_events', 'conversation_transcript_entries']) {
+        db.execute(`UPDATE ${table} SET turn_id = ? WHERE conversation_id = ? AND turn_id = ?`, [reference.accepted_turn_id, reference.conversation_id, reference.previous_turn_id]);
+      }
+      execution.recordRecoveryEvent({ conversationId: reference.conversation_id, eventKind: 'accepted_turn_identity_reconciled', payload: reference, occurredAt: new Date().toISOString() });
+    }
+    db.execute('INSERT INTO schema_migrations (migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [
+      migrationId,
+      '按已接纳提交修复悬空轮次关联',
+      `sha256:${createHash('sha256').update(migrationId).digest('hex')}`,
+      new Date().toISOString(),
+    ]);
+  });
+}
+
 /** 升级时只补有完整原文和精确身份的已确认用户消息，不改变发送状态或触发 Provider 重放。 */
 export function migrateConfirmedUserMessageHistory(db: ZeusDatabasePort): void {
   /** 一次性补全标识；后续消息由共同保存入口维护。 */
@@ -1930,7 +1975,7 @@ function sealLegacyProviderSessions(db: ZeusDatabasePort, migratedAt: string): v
     `SELECT id, agent_kind, provider_id, provider_thread_id, provider_thread_path, provider_model,
             provider_protocol_version, provider_binary_version, native_session_path, created_at
        FROM conversations
-      WHERE provider_thread_id IS NOT NULL AND agent_kind IN ('codex', 'pi')
+      WHERE provider_thread_id IS NOT NULL AND agent_kind IN ('codex', 'pi', 'copilot')
       ORDER BY created_at, id`,
   );
   for (const row of rows) {

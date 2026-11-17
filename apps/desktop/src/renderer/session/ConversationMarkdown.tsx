@@ -6,11 +6,14 @@ import type { ConversationFileLocation, ConversationOpenTarget, ConversationReso
 import { conversationFileLocationFromReference, conversationMarkdownReferences, enableConversationCjkStrong, filePreviewLimits, normalizeConversationResourceReference } from '@zeus/shared';
 import MarkdownRender, { MermaidBlockNode, TableNode, setCustomComponents, type CustomComponentMap, type NodeComponentProps, type NodeRendererProps } from 'markstream-react';
 import 'markstream-react/index.css';
+// 公式与字体资源随应用打包，供所有 Markdown 展示入口共用。
+import 'katex/dist/katex.min.css';
 import { memo, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { ConversationInlineResource, ConversationMarkdownImage, isImageResource } from './ConversationResources.js';
 import { MessageCheckIcon } from './SessionMessageIcons.js';
 import { MarkdownDocumentOutline } from './MarkdownDocumentOutline.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
+import { Button } from '../ui/Button.js';
 
 export type ConversationMarkdownPhase = 'streaming' | 'final';
 
@@ -344,7 +347,7 @@ function SecureLinkNode(props: NodeComponentProps<MarkstreamNode>) {
         href="#"
         onClick={(event) => {
           event.preventDefault();
-          void runtime.filePreview?.openLink(href);
+          return runtime.filePreview?.openLink(href);
         }}
       >
         {label}
@@ -389,14 +392,15 @@ function SecureImageNode(props: NodeComponentProps<MarkstreamNode>) {
       <span className="session-markdown-image-unavailable" role="status" aria-busy={preparing || undefined}>
         <span>{`${status}：${label}`}</span>
         {!preparing && imageResources?.reload ? (
-          <button
+          <Button
+            unstyled
             type="button"
             onClick={() => {
-              void Promise.resolve(imageResources.reload?.()).catch(() => undefined);
+              return Promise.resolve(imageResources.reload?.()).catch(() => undefined);
             }}
           >
             {runtime?.language === 'zh-CN' ? '重新加载' : 'Retry'}
-          </button>
+          </Button>
         ) : null}
       </span>
     );
@@ -447,9 +451,9 @@ function SecureCodeBlockNode(props: NodeComponentProps<MarkstreamNode>) {
           <Code aria-hidden="true" weight="regular" />
           <span>{title}</span>
         </span>
-        <button type="button" aria-label={wrapLabel} aria-pressed={wrap} data-icon-tooltip={wrapLabel} onClick={() => setWrap((current) => !current)}>
+        <Button unstyled type="button" aria-label={wrapLabel} aria-pressed={wrap} data-icon-tooltip={wrapLabel} onClick={() => setWrap((current) => !current)}>
           {wrap ? <ArrowElbowDownLeft aria-hidden="true" weight="regular" /> : <ArrowLineRight aria-hidden="true" weight="regular" />}
-        </button>
+        </Button>
         <ConversationMarkdownCopyButton label={languageLabels.copyCode} copiedLabel={languageLabels.copied} text={code} />
       </div>
       <pre>
@@ -552,9 +556,9 @@ function ConversationMermaidNode(props: ComponentProps<typeof MermaidBlockNode>)
         {!showSource && !diagnostic ? <span className="session-mermaid-zoom-slot" aria-hidden="true" /> : null}
         {/* 查看源码不改变图形内容；语法错误时直接显示源码与原因。 */}
         {!diagnostic ? (
-          <button type="button" onClick={() => setShowSource((current) => !current)}>
+          <Button unstyled type="button" onClick={() => setShowSource((current) => !current)}>
             {showSource ? languageLabels.showDiagramPreview : languageLabels.showDiagramSource}
-          </button>
+          </Button>
         ) : null}
         <ConversationMarkdownCopyButton label={languageLabels.copyDiagram} copiedLabel={languageLabels.copied} text={props.node.code} />
       </div>
@@ -594,11 +598,6 @@ function ConversationTableNode(props: ComponentProps<typeof TableNode>) {
       <TableNode {...props} />
     </div>
   );
-}
-
-function PlainMathNode(props: NodeComponentProps<MarkstreamNode>) {
-  const content = typeof props.node.raw === 'string' ? props.node.raw : typeof props.node.content === 'string' ? props.node.content : '';
-  return props.node.type === 'math_block' ? <pre className="session-markdown-math-plain">{content}</pre> : <span className="session-markdown-math-plain">{content}</span>;
 }
 
 /** 用户消息已完成的文本节点只按原标签切出结构化胶囊，普通 Markdown 结构仍由外层节点处理。 */
@@ -649,8 +648,6 @@ export const conversationMarkdownComponents = {
   infographic: SecureCodeBlockNode,
   d2: SecureCodeBlockNode,
   d2lang: SecureCodeBlockNode,
-  math_inline: PlainMathNode,
-  math_block: PlainMathNode,
 } as unknown as CustomComponentMap;
 
 setCustomComponents(CUSTOM_COMPONENTS_ID, conversationMarkdownComponents);
@@ -672,7 +669,8 @@ function ConversationMarkdownCopyButton(props: { label: string; copiedLabel: str
     return () => clearTimeout(timer);
   }, [result]);
   return (
-    <button
+    <Button
+      unstyled
       type="button"
       className="session-copy-button"
       aria-label={feedback || props.label}
@@ -691,7 +689,7 @@ function ConversationMarkdownCopyButton(props: { label: string; copiedLabel: str
       <span className="session-sr-only" role="status">
         {feedback}
       </span>
-    </button>
+    </Button>
   );
 }
 

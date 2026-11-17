@@ -1,7 +1,7 @@
 import { zeusDistribution } from './desktopDistribution.js';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -17,7 +17,7 @@ import {
   verifyReadOnlyValidationDescriptor,
   type ZeusDataLayout,
 } from '@zeus/local-server';
-import { type ReadOnlyValidationDescriptor, readOnlyValidationIdentity, type ReadOnlyValidationIdentity, sameReadOnlyValidationIdentity } from '@zeus/shared';
+import { type ReadOnlyValidationDescriptor, readOnlyValidationIdentity, type ReadOnlyValidationIdentity, redactUserFacingErrorDetails, sameReadOnlyValidationIdentity } from '@zeus/shared';
 import { startDesktopBrowserAutomationBridge } from './browserAutomationBridge.js';
 import { createExecutionHostStopActiveCommandRequest } from './executionHostStopCommand.js';
 import { createReadOnlyValidationCodexManager } from './readOnlyValidationCodexManager.js';
@@ -46,6 +46,7 @@ import {
   writeExecutionHostBootstrap,
 } from './executionHostProtocol.js';
 import type { DesktopLocalServerCloseMode } from './beforeQuitCleanup.js';
+import { withCloseTimeout } from './executionHostClosePlan.js';
 import { sameZeusDataRootHostIdentity, verifyZeusDataRootHostIdentity, type ZeusDataRootHostIdentity } from './dataRootIdentity.js';
 
 const readOnlyValidationVerifiedBeforeOwnedCoreLock = new WeakSet<ReadOnlyValidationDescriptor>();
@@ -92,6 +93,8 @@ export interface DesktopLocalServerRuntime {
 
 export interface StartDesktopLocalServerOptions {
   userDataPath: string;
+  /** Main 进入退出清理后，取消尚未完成的独立 Core 启动。 */
+  shutdownSignal?: AbortSignal;
   dataLayout?: ZeusDataLayout;
   projectRoot: string;
   /** Main 已从 0600 root marker 核验；Browser/Core/Host 写入前必须再次匹配。 */
@@ -316,6 +319,10 @@ function advertisedHostIdentityError(detail: string): ExecutionHostOwnershipErro
  * 因而窗口重启、Main 退出或 App 原子替换不会直接终止正在执行的轮次。
  */
 export async function startDesktopLocalServer(options: StartDesktopLocalServerOptions): Promise<DesktopLocalServerRuntime> {
+  /** 关闭连接时同时撤销启动和恢复，避免清理期间再次创建后台宿主。 */
+  const closingController = new AbortController();
+  /** Main 关闭与连接关闭共享取消边界，已连接的 Core 仍由正常关闭协议收尾。 */
+  const shutdownSignal = options.shutdownSignal ? AbortSignal.any([options.shutdownSignal, closingController.signal]) : closingController.signal;
   assertReadOnlyValidationDesktopOptions(options);
   await assertDataRootAndAdvertisedHostIdentityBeforeEffects(options);
   if (!options.browserAutomation) throw new Error('Zeus execution-host requires the Electron BrowserHost bridge.');
@@ -333,7 +340,7 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
   let heartbeatFailureStartedAt: number | undefined;
   let closing = false;
   try {
-    const initialConnection = await connectOrLaunchExecutionHost(options);
+    const initialConnection = await connectOrLaunchExecutionHost(options, shutdownSignal);
     let connection = initialConnection.rendezvous;
     let client = createExecutionHostControlClient(connection);
     const currentAppVersion = options.appVersion?.trim() || '0.0.0';
@@ -465,7 +472,7 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
       executionHost.instanceId = next.instanceId;
       executionHost.pid = next.pid;
       executionHost.protocolVersion = next.protocolVersion;
-      if (changed) await options.onRestarted?.(config);
+      if (changed && !closing) await options.onRestarted?.(config);
     };
 
     const replaceMismatchedHost = async (): Promise<void> => {
@@ -481,7 +488,7 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
         await previousClient.stopActiveWork(stopCommand);
         await previousClient.shutdown();
         await waitForExecutionHostExit(options.userDataPath, previousInstanceId, previousPid, options.dataRootIdentity);
-        const next = await connectOrLaunchExecutionHost(options);
+        const next = await connectOrLaunchExecutionHost(options, shutdownSignal);
         await attach(next);
       })();
       const tracked = switching.finally(() => {
@@ -514,7 +521,7 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
             // 陈旧 rendezvous 不能成为第二数据库写入者的创建依据，由单实例锁继续裁决。
           }
         }
-        await attach(await connectOrLaunchExecutionHost(options));
+        await attach(await connectOrLaunchExecutionHost(options, shutdownSignal));
       })();
       const tracked = recovering.finally(() => {
         if (recoveryPromise === tracked) recoveryPromise = undefined;
@@ -545,6 +552,8 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
     };
 
     const forceTerminateCurrentHost = async (): Promise<void> => {
+      // 正常关闭可能已让 Core 退出；此时无需再向已撤销的控制面索取身份。
+      if (!processExists(connection.pid) && inspectExecutionHostKernelLease(options.userDataPath, options.dataRootIdentity) === 'available') return;
       let identityConfirmed = false;
       try {
         const status = await client.health();
@@ -576,7 +585,7 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
       } catch (error) {
         if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
       }
-      await waitForExecutionHostExit(options.userDataPath, connection.instanceId, connection.pid, options.dataRootIdentity);
+      await waitForExecutionHostExit(options.userDataPath, connection.instanceId, connection.pid, options.dataRootIdentity, 5_000);
     };
 
     const maintainLease = async (): Promise<void> => {
@@ -660,17 +669,16 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
         }
       },
       close: (mode = 'final_quit') => {
+        closing = true;
+        closingController.abort();
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = undefined;
+        if (handoffTimer) clearInterval(handoffTimer);
+        handoffTimer = undefined;
+        // 强制关闭是超时后的独立出口，不能复用仍在等待的正常关闭 Promise。
+        if (mode === 'force_quit') return forceTerminateCurrentHost().finally(() => browserBridge.close());
         if (closePromise) return closePromise;
         closePromise = (async () => {
-          closing = true;
-          if (heartbeatTimer) {
-            clearInterval(heartbeatTimer);
-            heartbeatTimer = undefined;
-          }
-          if (handoffTimer) {
-            clearInterval(handoffTimer);
-            handoffTimer = undefined;
-          }
           const errors: unknown[] = [];
           const pendingHeartbeat = heartbeatCyclePromise;
           if (pendingHeartbeat) {
@@ -705,10 +713,12 @@ export async function startDesktopLocalServer(options: StartDesktopLocalServerOp
             }
           }
           try {
-            if (mode === 'force_quit') {
-              await forceTerminateCurrentHost();
-            } else if (mode === 'final_quit' || mode === 'upgrade_shutdown') {
+            if (mode === 'final_quit' || mode === 'upgrade_shutdown') {
               try {
+                // 先把中断意图交给持久化命令；失败仍继续关闭，不能把明确退出改成后台驻留。
+                await withCloseTimeout(client.stopActiveWork(createExecutionHostStopActiveCommandRequest()), 10_000, 'Zeus 停止后台工作超过十秒。').catch((error: unknown) => {
+                  console.error('Zeus 停止后台工作未完成，继续关闭 Core。', error);
+                });
                 await client.shutdown();
                 await waitForExecutionHostExit(options.userDataPath, connection.instanceId, connection.pid, options.dataRootIdentity);
               } catch (error) {
@@ -822,7 +832,6 @@ export async function startOwnedDesktopLocalServer(options: StartDesktopLocalSer
       telegramToken: options.telegramToken,
       telegramAllowedUserIds: options.telegramAllowedUserIds,
       codexNativeEnabled: options.codexNativeEnabled ?? true,
-      codexRuntimeCommandPath: 'codex',
       codexLegacyImportRoot: options.codexLegacyImportRoot,
       codexHome: options.codexHome,
       codexConfigImportSourceRoot: options.codexConfigImportSourceRoot,
@@ -1096,7 +1105,25 @@ function sameExecutionHostLaunchIdentity(current: ExecutionHostRendezvous, expec
   );
 }
 
-async function connectOrLaunchExecutionHost(options: StartDesktopLocalServerOptions): Promise<ExecutionHostConnection> {
+/** 只读取本次启动的 stderr 尾部，并在进入界面错误详情前移除凭据、个人路径和堆栈。 */
+function executionHostChildExitError(descriptor: number, code: number | null, signal: NodeJS.Signals | null): Error {
+  const summary = `Zeus Core 在发布控制面前退出（code=${String(code)}, signal=${String(signal)}）。`;
+  try {
+    /** 启动诊断最多读取 16 KiB，避免异常输出阻塞 Main 或占用无界内存。 */
+    const maximumBytes = 16 * 1024;
+    const size = fstatSync(descriptor).size;
+    const bytes = Buffer.alloc(Math.min(size, maximumBytes));
+    const length = readSync(descriptor, bytes, 0, bytes.length, Math.max(0, size - maximumBytes));
+    const detail = redactUserFacingErrorDetails(bytes.toString('utf8', 0, length));
+    return new Error(detail ? `${summary}\n${detail}` : summary);
+  } catch {
+    // 诊断文件不可读时仍保留实际退出结果，不把日志错误替换为启动原因。
+    return new Error(summary);
+  }
+}
+
+/** 复用已核验的唯一 Core；新启动的失败原因经 Main 脱敏后返回现有错误详情。 */
+async function connectOrLaunchExecutionHost(options: StartDesktopLocalServerOptions, shutdownSignal?: AbortSignal): Promise<ExecutionHostConnection> {
   const dataLayout = assertReadOnlyValidationDesktopOptions(options) ?? options.dataLayout ?? createZeusDataLayout(options.userDataPath);
   const expectedValidationIdentity = options.readOnlyValidation ? readOnlyValidationIdentity(options.readOnlyValidation) : undefined;
   const ownerBeforeConnect = await readExecutionHostOwnerState(options.userDataPath, options.dataRootIdentity, expectedValidationIdentity);
@@ -1110,6 +1137,7 @@ async function connectOrLaunchExecutionHost(options: StartDesktopLocalServerOpti
   // PID/JSON 只用于诊断，不能代替由 SQLite/OS 裁决的互斥事实。
   if (ownerBeforeConnect.ownerPresent) {
     const awaited = await waitForExecutionHostReady({
+      shutdownSignal,
       userDataPath: options.userDataPath,
       initialOwnerPid: ownerBeforeConnect.pid,
       allowOwnerExit: true,
@@ -1159,45 +1187,80 @@ async function connectOrLaunchExecutionHost(options: StartDesktopLocalServerOpti
     ...(options.readOnlyValidation ? {} : { CODEX_HOME: options.codexHome ?? dataLayout.codexHome }),
     ...(!options.readOnlyValidation && options.telegramToken ? { ZEUS_TELEGRAM_BOT_TOKEN: options.telegramToken } : {}),
   };
-  const child =
-    process.platform === 'win32'
-      ? spawnDetachedWindowsRuntime(process.execPath, [entryPath], { cwd: options.projectRoot, env: executionEnvironment, generation: requestedInstanceId })
-      : spawn(process.execPath, [entryPath], { detached: true, stdio: 'ignore', env: executionEnvironment });
-  let childFailure: Error | null = null;
-  child.once('error', (error) => {
-    childFailure = error;
-  });
-  child.once('exit', (code, signal) => {
-    childFailure ??= new Error(`Zeus Core 在发布控制面前退出（code=${String(code)}, signal=${String(signal)}）。`);
-    // 控制面发布后的退出也要留证，不能只有下一次心跳失败而没有退出身份。
-    void appendFile(join(dataLayout.executionHost, 'host.log'), `${JSON.stringify({ timestamp: new Date().toISOString(), event: 'execution_host.process_exited', mainPid: process.pid, executionHostPid: child.pid, code, signal })}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    }).catch(() => undefined);
-  });
-  child.unref();
-  const launched = await waitForExecutionHostReady({
-    userDataPath: options.userDataPath,
-    initialOwnerPid: child.pid ?? null,
-    allowOwnerExit: false,
-    expectedDataRootIdentity: options.dataRootIdentity,
-    expectedValidationIdentity,
-    childFailure: () => childFailure,
-  });
-  if (launched) {
-    /** Windows spawn 返回 Job helper，清理授权绑定其仍持有的真实 Core，而非把 helper PID 当作 Core。 */
-    const owned = process.platform === 'win32' ? inspectWindowsRuntimeIdentity(requestedInstanceId, child.pid) : undefined;
-    const spawnedHostPid = process.platform === 'win32' ? (owned?.state === 'verified' ? (owned.childIdentity?.pid ?? null) : null) : (child.pid ?? null);
-    const cleanupCapability = createExecutionHostLaunchCleanupCapability({
-      userDataPath: options.userDataPath,
-      dataRootIdentity: options.dataRootIdentity,
-      requestedGenerationId: requestedInstanceId,
-      spawnedPid: spawnedHostPid,
-      rendezvous: launched,
+  // bootstrap 已验证宿主目录私有权限；每轮独占文件防止并发启动混入其他 Core 的报错。
+  // 继承文件句柄让 Core 在 Main 退出后继续运行，不把后台宿主绑定到 Main 的管道寿命。
+  const diagnosticPath = join(dataLayout.executionHost, `host-startup-${requestedInstanceId}.log`);
+  shutdownSignal?.throwIfAborted();
+  const diagnosticDescriptor = openSync(diagnosticPath, 'ax+', 0o600);
+  let diagnosticOpen = true;
+  try {
+    const child =
+      process.platform === 'win32'
+        ? spawnDetachedWindowsRuntime(process.execPath, [entryPath], { cwd: options.projectRoot, env: executionEnvironment, generation: requestedInstanceId, stderr: diagnosticDescriptor })
+        : spawn(process.execPath, [entryPath], { detached: true, stdio: ['ignore', 'ignore', diagnosticDescriptor], env: executionEnvironment });
+    let childFailure: Error | null = null;
+    child.once('error', (error) => {
+      childFailure = error;
     });
-    return cleanupCapability ? { rendezvous: launched, launchedByThisInvocation: true, cleanupCapability } : existingExecutionHostConnection(launched);
+    child.once('exit', (code, signal) => {
+      childFailure ??= diagnosticOpen ? executionHostChildExitError(diagnosticDescriptor, code, signal) : new Error(`Zeus Core 已退出（code=${String(code)}, signal=${String(signal)}）。`);
+      // 控制面发布后的退出也要留证，不能只有下一次心跳失败而没有退出身份。
+      void appendFile(join(dataLayout.executionHost, 'host.log'), `${JSON.stringify({ timestamp: new Date().toISOString(), event: 'execution_host.process_exited', mainPid: process.pid, executionHostPid: child.pid, code, signal })}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      }).catch(() => undefined);
+    });
+    child.unref();
+    /** 只结束本次尚未交付的启动进程；Windows 关闭 helper 同时回收其 Job。 */
+    const cancelLaunch = (): void => {
+      if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+      try {
+        if (process.platform === 'win32') child.kill('SIGKILL');
+        else process.kill(-child.pid, 'SIGKILL');
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) console.error('Zeus 无法结束正在启动的 Core。', error);
+      }
+    };
+    shutdownSignal?.addEventListener('abort', cancelLaunch, { once: true });
+    if (shutdownSignal?.aborted) cancelLaunch();
+    /** 发现结果仍须绑定本轮创建身份，不能用同名进程替代。 */
+    let launched: ExecutionHostRendezvous | null;
+    try {
+      launched = await waitForExecutionHostReady({
+        shutdownSignal,
+        userDataPath: options.userDataPath,
+        initialOwnerPid: child.pid ?? null,
+        allowOwnerExit: false,
+        expectedDataRootIdentity: options.dataRootIdentity,
+        expectedValidationIdentity,
+        childFailure: () => childFailure,
+      });
+    } catch (error) {
+      // 启动失败也必须回收本次子进程，不能留下失去连接所有权的 Core。
+      cancelLaunch();
+      throw error;
+    } finally {
+      shutdownSignal?.removeEventListener('abort', cancelLaunch);
+      if (shutdownSignal?.aborted && child.pid) await waitForProcessExit(child.pid, Date.now() + 5_000);
+    }
+    if (launched) {
+      /** Windows spawn 返回 Job helper，清理授权绑定其仍持有的真实 Core，而非把 helper PID 当作 Core。 */
+      const owned = process.platform === 'win32' ? inspectWindowsRuntimeIdentity(requestedInstanceId, child.pid) : undefined;
+      const spawnedHostPid = process.platform === 'win32' ? (owned?.state === 'verified' ? (owned.childIdentity?.pid ?? null) : null) : (child.pid ?? null);
+      const cleanupCapability = createExecutionHostLaunchCleanupCapability({
+        userDataPath: options.userDataPath,
+        dataRootIdentity: options.dataRootIdentity,
+        requestedGenerationId: requestedInstanceId,
+        spawnedPid: spawnedHostPid,
+        rendezvous: launched,
+      });
+      return cleanupCapability ? { rendezvous: launched, launchedByThisInvocation: true, cleanupCapability } : existingExecutionHostConnection(launched);
+    }
+    throw new Error('Zeus Core 未发布可连接控制面。');
+  } finally {
+    diagnosticOpen = false;
+    closeSync(diagnosticDescriptor);
   }
-  throw new Error('Zeus Core 未发布可连接控制面。');
 }
 
 /**
@@ -1266,6 +1329,8 @@ const executionHostUnconfirmedOwnerLimitMs = 5_000;
 const executionHostChildExitDiscoveryGraceMs = 5_000;
 
 async function waitForExecutionHostReady(input: {
+  /** 退出时中止发现等待，不再等满启动时限。 */
+  shutdownSignal?: AbortSignal;
   userDataPath: string;
   initialOwnerPid: number | null;
   allowOwnerExit: boolean;
@@ -1279,6 +1344,7 @@ async function waitForExecutionHostReady(input: {
   let ownerUnconfirmedSince: number | null = null;
   let childFailureObservedAt: number | null = null;
   while (Date.now() < deadline) {
+    input.shutdownSignal?.throwIfAborted();
     const healthy = await readHealthyExecutionHost(input.userDataPath, input.expectedDataRootIdentity, input.expectedValidationIdentity);
     if (healthy) return healthy;
 
@@ -1475,15 +1541,16 @@ function cloneRendererLocalServerConfig(config: RendererLocalServerConfig): Rend
   };
 }
 
-async function waitForExecutionHostExit(userDataPath: string, instanceId: string, pid: number, dataRootIdentity: ZeusDataRootHostIdentity): Promise<void> {
-  const deadline = Date.now() + 45_000;
+/** 等待 Core 和内核租约实际释放；正常关闭最多四十五秒，强制结束最多五秒。 */
+async function waitForExecutionHostExit(userDataPath: string, instanceId: string, pid: number, dataRootIdentity: ZeusDataRootHostIdentity, timeoutMs = 45_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     // Main 永不清理 lock/rendezvous 路径；旧宿主在仍持有内核租约时清理自己的身份，随后才退出。
     // SIGKILL 等异常路径允许保留诊断残迹，下一任宿主会在取得内核租约后原子替换，避免 check-then-unlink 误删新身份。
     if (!processExists(pid) && inspectExecutionHostKernelLease(userDataPath, dataRootIdentity) === 'available') return;
     await wait(200);
   }
-  throw new Error(`Zeus execution-host 未能在 45 秒内完成安全退出（generation=${instanceId}, pid=${pid}）。`);
+  throw new Error(`Zeus execution-host 未能在 ${timeoutMs / 1_000} 秒内完成安全退出（generation=${instanceId}, pid=${pid}）。`);
 }
 
 async function readHealthyExecutionHost(userDataPath: string, expectedDataRootIdentity: ZeusDataRootHostIdentity, expectedValidationIdentity?: ReadOnlyValidationIdentity): Promise<ExecutionHostRendezvous | null> {

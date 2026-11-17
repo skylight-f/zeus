@@ -1,12 +1,22 @@
 import { ZeusSelect } from '../ZeusSelect.js';
-import { SettingsSaveStatus } from './useSettingsAutosave.js';
-import { useEffect, useState, type ReactNode } from 'react';
+import { SettingsSaveStatus, useSettingsAutosave } from './useSettingsAutosave.js';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { ZeusBrowserSettings, ZeusComputerSettings, ZeusRetiredNativeRuntimeState } from '@zeus/shared';
 import { Button } from '../ui/Button.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { BrowserPasswordsSection } from './BrowserPasswordsSection.js';
+import { AutomationModelSettings } from './AutomationModelSettings.js';
+import type { AppShellSettings } from '../features/settings/settingsContracts.js';
+import type { SettingsApiClient } from '../features/settings/settingsApiClient.js';
 
 interface BrowserSettingsPaneProps {
   language: 'zh-CN' | 'en-US';
+  /** 操作模型沿用全局应用设置，与原生浏览器资料分开。 */
+  appSettings: AppShellSettings;
+  /** 复用设置命令的串行保存。 */
+  client: SettingsApiClient | null;
+  /** 更新主界面的操作模型快照。 */
+  onAppSettingsChange: (update: (value: AppShellSettings) => AppShellSettings) => unknown;
 }
 const copy = {
   'zh-CN': {
@@ -36,7 +46,7 @@ const copy = {
     // 单个开关保存不能暗示页面中的其他草稿也已保存。
     switchSaved: '开关设置已保存。',
     clear: '清除浏览器数据',
-    clearHelp: '清除 Cookie、缓存、站点存储、站点授权和页面评论，并把现有标签重置为空白页。',
+    clearHelp: '清除 Cookie、缓存、站点存储、站点授权和页面评论，并把现有标签重置为空白页。已保存密码保留。',
     cleared: '浏览器数据已清除。',
     clearConfirm: '将清除独立浏览器 Profile 中的登录态、站点数据、授权和评论。此操作不可撤销，确定继续吗？',
     computerTitle: 'Computer Use',
@@ -98,7 +108,7 @@ const copy = {
     // 只确认本次开关已经保存。
     switchSaved: 'Switch setting saved.',
     clear: 'Clear browser data',
-    clearHelp: 'Clears cookies, cache, site storage, site grants, and page comments, then resets open tabs to blank pages.',
+    clearHelp: 'Clears cookies, cache, site storage, site grants, and page comments, then resets open tabs to blank pages. Saved passwords are kept.',
     cleared: 'Browser data cleared.',
     clearConfirm: 'This clears sign-in state, site data, grants, and comments from the independent browser profile. It cannot be undone. Continue?',
     computerTitle: 'Computer Use',
@@ -141,7 +151,13 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
   const [settings, setSettings] = useState<ZeusBrowserSettings | null>(null);
   const [computerSettings, setComputerSettings] = useState<ZeusComputerSettings | null>(null);
   const [retiredRuntimeState, setRetiredRuntimeState] = useState<ZeusRetiredNativeRuntimeState | null>(null);
-  const [busy, setBusy] = useState(false);
+  /** 浏览器偏好串行保存，电脑权限与旧资料迁移只锁定各自的操作组。 */
+  const saving = useSettingsAutosave(window.zeus);
+  const [computerBusy, setComputerBusy] = useState(false);
+  const [retiredBusy, setRetiredBusy] = useState(false);
+  /** 回滚只使用已确认的设置，不把上次未保存的值当成成功结果。 */
+  const confirmedSettings = useRef<ZeusBrowserSettings | null>(null);
+  const fieldRevisions = useRef<Partial<Record<keyof ZeusBrowserSettings, number>>>({});
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
 
@@ -155,7 +171,10 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     void bridge
       .getBrowserSettings()
       .then((value) => {
-        if (active) setSettings(value);
+        if (active) {
+          confirmedSettings.current = value;
+          setSettings(value);
+        }
       })
       .catch((loadError) => {
         if (active) setError(loadError instanceof Error ? loadError : labels.unavailable);
@@ -185,27 +204,14 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     };
   }, [labels.unavailable]);
 
-  /** 开关直接保存单个字段，成功后更新显示，保留其他尚未保存的输入。 */
+  /** 开关立即反馈，写入仍由同一偏好队列确认或回滚。 */
   async function setBoolean(key: 'enabled' | 'askWhereToSave' | 'externalChromeEnabled' | 'externalEdgeEnabled', value: boolean): Promise<void> {
-    if (!settings || busy || !window.zeus?.updateBrowserSettings) return;
-    setBusy(true);
-    setStatus(null);
-    setError(null);
-    try {
-      // 只提交点击的开关，避免顺带提交下载目录等草稿。
-      const saved = await window.zeus.updateBrowserSettings({ [key]: value });
-      setSettings((current) => (current ? { ...current, [key]: saved[key] } : current));
-      setStatus(labels.switchSaved);
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError : labels.saveFailed);
-    } finally {
-      setBusy(false);
-    }
+    await save({ [key]: value });
   }
 
   async function setComputerEnabled(enabled: boolean): Promise<void> {
     if (!window.zeus?.updateComputerSettings) return;
-    setBusy(true);
+    setComputerBusy(true);
     setError(null);
     try {
       setComputerSettings(await window.zeus.updateComputerSettings({ enabled }));
@@ -213,26 +219,26 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     } catch (computerError) {
       setError(computerError);
     } finally {
-      setBusy(false);
+      setComputerBusy(false);
     }
   }
 
   async function stopComputer(): Promise<void> {
     if (!window.zeus?.stopComputerUse) return;
-    setBusy(true);
+    setComputerBusy(true);
     setError(null);
     try {
       setComputerSettings(await window.zeus.stopComputerUse());
     } catch (computerError) {
       setError(computerError);
     } finally {
-      setBusy(false);
+      setComputerBusy(false);
     }
   }
 
   async function requestComputerPermissions(): Promise<void> {
     if (!window.zeus?.requestComputerPermissions) return;
-    setBusy(true);
+    setComputerBusy(true);
     setStatus(null);
     setError(null);
     try {
@@ -240,13 +246,13 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     } catch (computerError) {
       setError(computerError);
     } finally {
-      setBusy(false);
+      setComputerBusy(false);
     }
   }
 
   async function openComputerPermissionSettings(permission: 'accessibility' | 'screen_capture'): Promise<void> {
     if (!window.zeus?.openComputerPermissionSettings) return;
-    setBusy(true);
+    setComputerBusy(true);
     setStatus(null);
     setError(null);
     try {
@@ -255,13 +261,13 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     } catch (computerError) {
       setError(computerError);
     } finally {
-      setBusy(false);
+      setComputerBusy(false);
     }
   }
 
   async function archiveRetiredRuntimes(): Promise<void> {
     if (!window.zeus?.archiveRetiredNativeRuntimes || !window.confirm(labels.retiredArchiveConfirm)) return;
-    setBusy(true);
+    setRetiredBusy(true);
     setError(null);
     try {
       setRetiredRuntimeState(await window.zeus.archiveRetiredNativeRuntimes());
@@ -269,13 +275,13 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     } catch (archiveError) {
       setError(archiveError);
     } finally {
-      setBusy(false);
+      setRetiredBusy(false);
     }
   }
 
   async function restoreRetiredRuntimes(): Promise<void> {
     if (!window.zeus?.restoreRetiredNativeRuntimes || !window.confirm(labels.retiredRestoreConfirm)) return;
-    setBusy(true);
+    setRetiredBusy(true);
     setError(null);
     try {
       setRetiredRuntimeState(await window.zeus.restoreRetiredNativeRuntimes());
@@ -283,42 +289,48 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     } catch (restoreError) {
       setError(restoreError);
     } finally {
-      setBusy(false);
+      setRetiredBusy(false);
     }
   }
 
   /** 仅保存此次选择或输入完成的字段。 */
   async function save(patch: Partial<ZeusBrowserSettings>): Promise<void> {
     if (!settings || !window.zeus?.updateBrowserSettings) return;
-    setBusy(true);
+    const keys = Object.keys(patch) as Array<keyof ZeusBrowserSettings>;
+    const revisions = Object.fromEntries(keys.map((key) => [key, (fieldRevisions.current[key] = (fieldRevisions.current[key] ?? 0) + 1)]));
+    setSettings((current) => (current ? { ...current, ...patch } : current));
     setStatus(null);
     setError(null);
-    try {
-      setSettings((current) => (current ? { ...current, ...patch } : current));
-      /** 使用部分更新，避免顺带提交安全开关。 */
-      const saved = await window.zeus.updateBrowserSettings(patch);
-      setSettings((current) => (current ? { ...current, ...Object.fromEntries(Object.keys(patch).map((key) => [key, saved[key as keyof ZeusBrowserSettings]])) } : current));
-      setStatus(labels.saved);
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError : labels.saveFailed);
-    } finally {
-      setBusy(false);
-    }
+    await saving.save(async () => {
+      try {
+        confirmedSettings.current = await window.zeus!.updateBrowserSettings!(patch);
+        setStatus(labels.saved);
+      } catch (saveError) {
+        setError(saveError instanceof Error ? saveError : labels.saveFailed);
+        throw saveError;
+      } finally {
+        /** 迟到回执只校准仍对应本次输入的字段，输入中的新草稿继续保留。 */
+        setSettings((current) =>
+          current && confirmedSettings.current
+            ? {
+                ...current,
+                ...Object.fromEntries(keys.filter((key) => fieldRevisions.current[key] === revisions[key] && Object.is(current[key], patch[key])).map((key) => [key, confirmedSettings.current![key]])),
+              }
+            : current,
+        );
+      }
+    });
   }
 
   async function clear(): Promise<void> {
-    if (!window.zeus?.clearBrowserData || !window.zeus.getBrowserSettings || !window.confirm(labels.clearConfirm)) return;
-    setBusy(true);
+    if (!window.zeus?.clearBrowserData || !window.confirm(labels.clearConfirm)) return;
     setStatus(null);
     setError(null);
     try {
       await window.zeus.clearBrowserData();
-      setSettings(await window.zeus.getBrowserSettings());
       setStatus(labels.cleared);
     } catch (clearError) {
       setError(clearError instanceof Error ? clearError : labels.clearFailed);
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -326,6 +338,7 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
     return (
       <section className="settings-product-pane browser-settings-product-pane" aria-label={labels.title}>
         <h2 className="settings-page-title">{labels.title}</h2>
+        <AutomationModelSettings value={props.appSettings} client={props.client} onChange={props.onAppSettingsChange} />
         <p className="browser-settings-status" role={error ? 'alert' : 'status'}>
           {error ? <VisibleApplicationError error={error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} /> : labels.loading}
         </p>
@@ -339,21 +352,22 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
         <span>
           <h2 className="settings-page-title">{labels.title}</h2>
         </span>
-        <SettingsSaveStatus language={props.language} status={busy ? 'saving' : error ? 'failed' : status === labels.saved || status === labels.switchSaved ? 'saved' : 'idle'} />
+        <SettingsSaveStatus language={props.language} status={saving.status} />
       </header>
+      <AutomationModelSettings value={props.appSettings} client={props.client} onChange={props.onAppSettingsChange} />
       <section className="settings-product-section">
         <h3>{props.language === 'zh-CN' ? '打开方式' : 'Open preferences'}</h3>
         <section className="native-settings-pane browser-settings-pane" aria-label={props.language === 'zh-CN' ? '打开方式' : 'Open preferences'}>
           <BrowserSettingRow title={labels.enabled} description={labels.enabledHelp}>
-            <BrowserSwitch label={labels.enabled} checked={settings.enabled} disabled={busy} onChange={(checked) => void setBoolean('enabled', checked)} />
+            <BrowserSwitch label={labels.enabled} checked={settings.enabled} onChange={(checked) => setBoolean('enabled', checked)} />
           </BrowserSettingRow>
           <BrowserSettingRow title={labels.webLinks}>
             <ZeusSelect
               size="regular"
               ariaLabel={labels.webLinks}
               value={settings.webLinkOpenTarget}
-              disabled={busy}
-              onChange={(value) => void save({ webLinkOpenTarget: value })}
+
+              onChange={(value) => save({ webLinkOpenTarget: value })}
               options={[
                 { value: 'zeus_browser', label: labels.zeusBrowser },
                 { value: 'system_default', label: labels.externalBrowser },
@@ -365,8 +379,8 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
               size="regular"
               ariaLabel={labels.localWeb}
               value={settings.localWebOpenTarget}
-              disabled={busy}
-              onChange={(value) => void save({ localWebOpenTarget: value })}
+
+              onChange={(value) => save({ localWebOpenTarget: value })}
               options={[
                 { value: 'zeus_browser', label: labels.zeusBrowser },
                 { value: 'system_default', label: labels.externalBrowser },
@@ -378,8 +392,8 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
               size="regular"
               ariaLabel={labels.files}
               value={settings.fileOpenTarget}
-              disabled={busy}
-              onChange={(value) => void save({ fileOpenTarget: value })}
+
+              onChange={(value) => save({ fileOpenTarget: value })}
               options={[
                 { value: 'zeus_source', label: labels.zeusPreview },
                 { value: 'system_default', label: labels.systemDefault },
@@ -392,6 +406,7 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
           </BrowserSettingRow>
         </section>
       </section>
+      <BrowserPasswordsSection language={props.language} />
       <section className="settings-product-section">
         <h3>{props.language === 'zh-CN' ? '下载' : 'Downloads'}</h3>
         <section className="native-settings-pane browser-settings-pane" aria-label={props.language === 'zh-CN' ? '下载' : 'Downloads'}>
@@ -399,16 +414,16 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
             <input
               aria-label={labels.downloads}
               value={settings.downloadDirectory}
-              disabled={busy}
+
               onChange={(event) => {
                 setStatus(null);
                 setSettings({ ...settings, downloadDirectory: event.currentTarget.value });
               }}
-              onBlur={(event) => void save({ downloadDirectory: event.currentTarget.value })}
+              onBlur={(event) => save({ downloadDirectory: event.currentTarget.value })}
             />
           </BrowserSettingRow>
           <BrowserSettingRow title={labels.askWhere}>
-            <BrowserSwitch label={labels.askWhere} checked={settings.askWhereToSave} disabled={busy} onChange={(checked) => void setBoolean('askWhereToSave', checked)} />
+            <BrowserSwitch label={labels.askWhere} checked={settings.askWhereToSave} onChange={(checked) => setBoolean('askWhereToSave', checked)} />
           </BrowserSettingRow>
         </section>
       </section>
@@ -420,8 +435,8 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
               size="regular"
               ariaLabel={labels.screenshots}
               value={settings.screenshotMode}
-              disabled={busy}
-              onChange={(value) => void save({ screenshotMode: value })}
+
+              onChange={(value) => save({ screenshotMode: value })}
               options={[
                 { value: 'always', label: labels.always },
                 { value: 'necessary', label: labels.necessary },
@@ -429,17 +444,17 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
             />
           </BrowserSettingRow>
           <BrowserSettingRow title={labels.chromeEnable} description={labels.chromeHelp}>
-            <BrowserSwitch label={labels.chromeEnable} checked={settings.externalChromeEnabled} disabled={busy} onChange={(checked) => void setBoolean('externalChromeEnabled', checked)} />
+            <BrowserSwitch label={labels.chromeEnable} checked={settings.externalChromeEnabled} onChange={(checked) => setBoolean('externalChromeEnabled', checked)} />
           </BrowserSettingRow>
           <BrowserSettingRow title={labels.edgeEnable} description={labels.edgeHelp}>
-            <BrowserSwitch label={labels.edgeEnable} checked={settings.externalEdgeEnabled} disabled={busy} onChange={(checked) => void setBoolean('externalEdgeEnabled', checked)} />
+            <BrowserSwitch label={labels.edgeEnable} checked={settings.externalEdgeEnabled} onChange={(checked) => setBoolean('externalEdgeEnabled', checked)} />
           </BrowserSettingRow>
           {computerSettings ? (
             <BrowserSettingRow title={labels.computerTitle} description={`${labels.computerHelp}${computerSettings.detail ? ` ${computerSettings.detail}` : ''}`} danger>
               <span className="computer-permission-panel">
                 <span className="browser-settings-actions">
-                  <BrowserSwitch label={labels.computerEnable} checked={computerSettings.enabled} disabled={busy} onChange={(checked) => void setComputerEnabled(checked)} />
-                  <Button variant="danger" size="compact" onClick={() => void stopComputer()} busy={busy} disabled={!computerSettings.enabled && computerSettings.serviceState === 'disabled'}>
+                  <BrowserSwitch label={labels.computerEnable} checked={computerSettings.enabled} disabled={computerBusy} onChange={(checked) => setComputerEnabled(checked)} />
+                  <Button variant="danger" size="compact" onClick={() => stopComputer()} disabled={computerBusy || (!computerSettings.enabled && computerSettings.serviceState === 'disabled')}>
                     {labels.computerStop}
                   </Button>
                 </span>
@@ -466,16 +481,16 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
                             : labels.computerMissing}
                     </span>
                     <span className="browser-settings-actions">
-                      <Button variant="secondary" size="compact" onClick={() => void requestComputerPermissions()} busy={busy}>
+                      <Button variant="secondary" size="compact" disabled={computerBusy} onClick={() => requestComputerPermissions()}>
                         {labels.computerRequestPermissions}
                       </Button>
                       {computerSettings.permissionCheckState === 'checked' && !computerSettings.accessibilityTrusted ? (
-                        <Button variant="secondary" size="compact" onClick={() => void openComputerPermissionSettings('accessibility')} busy={busy}>
+                        <Button variant="secondary" size="compact" disabled={computerBusy} onClick={() => openComputerPermissionSettings('accessibility')}>
                           {labels.computerOpenAccessibility}
                         </Button>
                       ) : null}
                       {computerSettings.permissionCheckState === 'checked' && !computerSettings.screenCaptureAvailable ? (
-                        <Button variant="secondary" size="compact" onClick={() => void openComputerPermissionSettings('screen_capture')} busy={busy}>
+                        <Button variant="secondary" size="compact" disabled={computerBusy} onClick={() => openComputerPermissionSettings('screen_capture')}>
                           {labels.computerOpenScreenCapture}
                         </Button>
                       ) : null}
@@ -496,17 +511,17 @@ export function BrowserSettingsPane(props: BrowserSettingsPaneProps) {
               description={`${labels.retiredHelp} ${retiredRuntimeState.entries.length > 0 ? retiredRuntimeState.entries.join('、') : labels.retiredNone}${retiredRuntimeState.latestBackupRoot ? ` ${retiredRuntimeState.latestBackupRoot}` : ''}`}
             >
               <span className="browser-settings-actions">
-                <Button variant="secondary" size="compact" onClick={() => void archiveRetiredRuntimes()} busy={busy} disabled={retiredRuntimeState.entries.length === 0}>
+                <Button variant="secondary" size="compact" onClick={() => archiveRetiredRuntimes()} disabled={retiredBusy || retiredRuntimeState.entries.length === 0}>
                   {labels.retiredArchive}
                 </Button>
-                <Button variant="secondary" size="compact" onClick={() => void restoreRetiredRuntimes()} busy={busy} disabled={!retiredRuntimeState.latestBackupRoot || Boolean(retiredRuntimeState.restoredAt)}>
+                <Button variant="secondary" size="compact" onClick={() => restoreRetiredRuntimes()} disabled={retiredBusy || !retiredRuntimeState.latestBackupRoot || Boolean(retiredRuntimeState.restoredAt)}>
                   {labels.retiredRestore}
                 </Button>
               </span>
             </BrowserSettingRow>
           ) : null}
           <div className="browser-settings-actions">
-            <Button variant="danger" size="compact" onClick={() => void clear()} busy={busy}>
+            <Button variant="danger" size="compact" onClick={() => clear()}>
               {labels.clear}
             </Button>
           </div>

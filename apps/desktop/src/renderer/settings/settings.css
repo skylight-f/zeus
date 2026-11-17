@@ -463,6 +463,67 @@
     justify-content: flex-end;
     min-inline-size: 0;
   }
+  /* 多行终端命令使用完整宽度，长命令与解释保持在同一分组内。 */
+  .native-control-row.terminal-startup-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .browser-settings-actions {
+    flex-wrap: wrap;
+  }
+  /* 网络页只展示正式生效的出口，保存状态沿用页面标题旁的共享组件。 */
+  .network-runtime-summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    padding: 4px var(--settings-card-padding);
+  }
+  .network-runtime-summary > div {
+    display: grid;
+    gap: 4px;
+    min-inline-size: 0;
+    padding: 14px 0;
+  }
+  .network-runtime-summary span {
+    color: var(--zeus-product-muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .network-runtime-summary strong {
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    font-weight: 620;
+  }
+  /* 网络配置和两类诊断各自成组，卡片间留白表示不同操作。 */
+  .network-settings-group {
+    display: grid;
+    gap: 0;
+    padding: var(--settings-card-padding);
+  }
+  .network-settings-group-heading {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+    padding-block: 14px 4px;
+  }
+  .network-settings-group-heading h3 {
+    margin: 1px 0 3px;
+    color: var(--zeus-product-text);
+    font-size: 15px;
+    line-height: 1.35;
+  }
+  .network-settings-group-heading p {
+    margin: 0;
+    color: var(--zeus-product-muted);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .network-settings-group .native-control-row {
+    min-block-size: 64px;
+    padding-block: 12px;
+  }
   /* 代理模式保留原生单选键盘操作，与独立端口输入使用同页对齐线。 */
   .network-proxy-modes {
     display: grid;
@@ -623,6 +684,14 @@
     background: transparent;
     max-block-size: 560px;
   }
+  /* 目录冷读只占列表原有行高，编辑器保持可输入。 */
+  .model-connection-list-loading {
+    position: relative;
+    display: block;
+    block-size: 66px;
+    border-radius: 6px;
+    overflow: hidden;
+  }
   .model-connection-list > button {
     display: grid;
     justify-content: stretch;
@@ -651,6 +720,7 @@
     font-style: normal;
   }
   .model-connection-editor {
+    animation: zeus-settings-content-enter var(--zeus-motion-duration-object) var(--zeus-motion-ease-out) both;
     display: grid;
     align-content: start;
     gap: 18px;
@@ -1455,6 +1525,21 @@
     }
     .network-proxy-check-row {
       grid-template-columns: minmax(0, 1fr);
+    }
+    .network-proxy-results {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .network-proxy-results > div + div {
+      padding-inline: 0;
+      border-inline-start: 0;
+      border-block-start: 1px solid var(--zeus-product-border);
+    }
+    .network-model-connection-results {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .network-model-connection-results li:nth-child(n) {
+      padding-inline: 0;
+      border-inline-start: 0;
     }
     .task-enum-order-grid {
       grid-template-columns: 1fr;

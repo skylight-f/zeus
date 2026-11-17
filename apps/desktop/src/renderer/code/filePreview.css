@@ -8,28 +8,54 @@
   overflow: auto;
   color: inherit;
 }
+/* 带行号引用在全文预览中持续标出目标行，不依赖输入焦点。 */
+.file-preview-text .cm-line[data-selected='true'] {
+  background: var(--zeus-source-list-selected, var(--zeus-code-editor-active-line));
+}
 .file-preview-toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
+  gap: 4px;
+  padding: 4px 10px;
   flex: 0 0 auto;
 }
-.file-preview button {
+.file-preview-toolbar button,
+.file-preview-toolbar .file-preview-icon-button {
   font: inherit;
   color: inherit;
   background: transparent;
-  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border: 0;
   border-radius: 5px;
   padding: 3px 8px;
   cursor: pointer;
 }
-.file-preview button[aria-pressed='true'] {
-  background: color-mix(in srgb, #7255dc 15%, transparent);
+.file-preview-toolbar button:hover:not(:disabled),
+.file-preview-toolbar .file-preview-icon-button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 8%, transparent);
 }
-.file-preview button:focus-visible {
-  outline: 2px solid #7255dc;
+/* 所有预览入口共用同一图标点击盒，悬浮名称由按钮 title 提供。 */
+.file-preview-toolbar .file-preview-icon-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+.file-preview-icon-button > svg {
+  pointer-events: none;
+}
+.file-preview-toolbar button[aria-pressed='true'],
+.file-preview-toolbar .file-preview-icon-button[aria-pressed='true'] {
+  color: var(--zeus-control-accent);
+  background: color-mix(in srgb, var(--zeus-control-accent) 10%, transparent);
+}
+.file-preview-toolbar button:focus-visible,
+.file-preview-toolbar .file-preview-icon-button:focus-visible {
+  outline: 2px solid var(--zeus-control-accent);
   outline-offset: 2px;
 }
 .file-preview p {
@@ -54,16 +80,20 @@
   min-width: 0;
   min-height: 0;
   flex: 1;
+  container-type: inline-size;
 }
-.file-preview-content > header {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 12px;
-  overflow-wrap: anywhere;
+/* 增删统计跟随审阅按钮并入文件工具栏，不额外占用内容高度。 */
+.file-review-stats {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
-.file-preview-content > header small {
-  opacity: 0.65;
+.file-review-stats > .is-addition {
+  color: var(--zeus-code-addition-text);
+}
+.file-review-stats > .is-deletion {
+  color: var(--zeus-control-danger-text);
 }
 .file-preview-image {
   display: flex;
@@ -72,26 +102,34 @@
   flex: 1;
   min-width: 0;
 }
-/* 透明网格沿用当前主题的面板和分隔色，图片像素保持原样。 */
+/* 预览画布只承担居中、滚动与留白，避免透明网格扩散到图片范围之外。 */
 .file-preview-checker {
   overflow: auto;
+  overscroll-behavior: contain;
   min-height: 180px;
   flex: 1;
   display: grid;
   place-items: center;
-  padding: 20px;
-  background-color: var(--zeus-product-panel);
-  background-image: conic-gradient(var(--zeus-product-line) 25%, transparent 0 50%, var(--zeus-product-line) 0 75%, transparent 0);
-  background-size: 20px 20px;
+  padding: clamp(24px, 4vw, 52px);
+  background: color-mix(in srgb, var(--zeus-product-canvas) 78%, var(--zeus-product-panel));
   color: var(--zeus-product-text);
 }
+/* 棋盘格只铺在图片元素自身，透明范围清晰但不会形成整屏视觉噪声。 */
 .file-preview-checker img {
   display: block;
-  width: 100%;
-  height: min(45vh, 420px);
+  width: auto;
+  height: auto;
   max-width: 100%;
   max-height: 60vh;
   object-fit: contain;
+  background-color: var(--zeus-product-panel, #fff);
+  background-image: conic-gradient(color-mix(in srgb, var(--zeus-product-text) 6%, transparent) 25%, transparent 0 50%, color-mix(in srgb, var(--zeus-product-text) 6%, transparent) 0 75%, transparent 0);
+  background-size: 12px 12px;
+  border-radius: 4px;
+  outline: 1px solid color-mix(in srgb, var(--zeus-product-text) 10%, transparent);
+  box-shadow:
+    0 18px 44px -28px rgb(15 23 42 / 0.46),
+    0 4px 14px -10px rgb(15 23 42 / 0.24);
 }
 .file-preview-checker img.is-actual-size {
   width: auto;
@@ -138,48 +176,44 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--zeus-product-panel, #fff);
+  background: var(--zeus-solid-surface-bg, var(--zeus-product-panel, #fff));
   color: var(--zeus-product-text, #222);
-  border-radius: 12px;
-  box-shadow: 0 12px 50px #0004;
+  border-radius: 14px;
+  box-shadow:
+    0 28px 80px -28px rgb(15 23 42 / 0.48),
+    0 10px 28px -18px rgb(15 23 42 / 0.32);
 }
+/* 标题栏以文件名为主信息，类型退居辅助位置。 */
 .file-preview-dialog-header {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: var(--zeus-product-panel, #fff);
+  background: var(--zeus-solid-surface-bg, var(--zeus-product-panel, #fff));
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 12px 8px 18px;
   flex-shrink: 0;
+  border-bottom: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
 }
 .file-preview-dialog-header > strong {
-  flex-shrink: 0;
-  font-size: 14px;
-}
-/* 长附件名仅占一行，完整名称由悬停提示保留。 */
-.file-preview-dialog-header > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
-  opacity: 0.6;
+  font-size: 13px;
+  font-weight: 600;
 }
 .file-preview-dialog-header .file-preview-close {
   display: grid;
   place-items: center;
-  flex: 0 0 32px;
-  height: 32px;
+  flex: 0 0 36px;
+  height: 36px;
   padding: 0;
   margin-left: auto;
   border: 0;
-  border-radius: 6px;
-}
-.file-preview-dialog-header .file-preview-close:hover,
-.file-preview-image-compact button:hover {
-  background: color-mix(in srgb, currentColor 8%, transparent);
+  border-radius: 8px;
 }
 /* 单图使用弹窗剩余空间；仅画布滚动，标题和缩放始终可达。 */
 .file-preview-simple-image,
@@ -187,35 +221,65 @@
   min-height: 0;
   overflow: hidden;
 }
+
+/* 单图窗口随内容收紧高度，宽截图无需占满整屏空白。 */
+.file-preview-dialog:has(.file-preview-simple-image) {
+  height: auto;
+  max-height: 90vh;
+  border-radius: 10px;
+}
+
+.file-preview-dialog:has(.file-preview-simple-image) .file-preview-dialog-header {
+  box-sizing: border-box;
+  min-height: 48px;
+  padding: 6px 12px;
+}
+
+.file-preview-dialog:has(.file-preview-simple-image) .file-preview-close {
+  flex-basis: 32px;
+  height: 32px;
+}
+
 .file-preview-image-compact > .file-preview-toolbar {
+  box-sizing: border-box;
   order: 1;
-  justify-content: center;
-  padding: 8px 16px;
+  justify-content: flex-end;
+  min-height: 44px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--zeus-product-line-soft, var(--zeus-product-line));
+  background: var(--zeus-product-panel, #fff);
   font-size: 12px;
 }
 .file-preview-image-compact > .file-preview-toolbar > span {
   margin-right: auto;
-  opacity: 0.6;
+  color: var(--zeus-product-muted);
   font-variant-numeric: tabular-nums;
 }
 .file-preview-image-compact button {
+  box-sizing: border-box;
   min-width: 32px;
   min-height: 32px;
-  border: 0;
+  border-color: transparent;
+  border-radius: 8px;
 }
-/* 低对比棋盘跟随产品主题，保留透明区域辨识能力。 */
+/* 单图弹窗沿用中性画布，小图保持原生尺寸，只有大图才缩小适配。 */
 .file-preview-image-compact > .file-preview-checker {
   min-height: 0;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
-  background-color: var(--zeus-product-panel, #fff);
-  background-image: conic-gradient(color-mix(in srgb, currentColor 5%, transparent) 25%, transparent 0 50%, color-mix(in srgb, currentColor 5%, transparent) 0 75%, transparent 0);
-  background-size: 16px 16px;
+  padding: 24px;
+  background: color-mix(in srgb, var(--zeus-product-text) 2%, var(--zeus-product-panel));
   color: inherit;
 }
 .file-preview-image-compact img:not(.is-actual-size) {
-  height: 100%;
-  max-height: 100%;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  /* 标题栏、缩放栏与画布留白共占 140px，图片始终适配剩余视口。 */
+  max-height: calc(90vh - 140px);
+  border-radius: 0;
+  outline: none;
+  box-shadow: none;
 }
 /* 放大后从左上角开始滚动，避免居中裁掉超出画布的图片边缘。 */
 .file-preview-image-compact .is-actual-size {
@@ -228,33 +292,123 @@
   }
 }
 
-/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
-.file-review-stats {
-  display: inline-flex;
-  gap: 8px;
+/* 文件来源和阅读设置放在状态栏，路径操作栏只保留文件动作。 */
+.file-preview-statusbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  min-height: 28px;
+  padding: 2px 12px;
+  border-top: 1px solid var(--zeus-control-border);
+  color: var(--session-text-muted, var(--zeus-control-muted-text));
   font-size: 11px;
-  font-variant-numeric: tabular-nums;
 }
-.file-review-stats > .is-addition {
-  color: var(--zeus-code-addition-text);
+.file-preview-statusbar > small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: inherit;
 }
-.file-review-stats > .is-deletion {
-  color: var(--zeus-control-danger-text);
+.file-preview-settings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin-inline-start: auto;
 }
 .file-preview-setting {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  white-space: nowrap;
+}
+/* 状态栏保留原生菜单和键盘操作，不继承表单输入框的高度与阴影。 */
+.file-preview-statusbar .file-preview-setting select {
+  appearance: auto;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 130px;
+  min-height: 24px;
+  height: 24px;
+  padding: 2px 4px;
+  font: inherit;
+  line-height: 1.4;
+  color: var(--zeus-control-text);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+}
+
+/* 工作表和选中单元格固定在上方，大表滚动交给 AG Grid 虚拟视口。 */
+.spreadsheet-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 280px;
+  overflow: hidden;
+}
+.spreadsheet-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+}
+.spreadsheet-preview-toolbar > span {
+  flex: 0 0 auto;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--zeus-control-muted-text);
 }
-.file-preview-setting select {
-  max-width: 130px;
+.spreadsheet-preview-toolbar .zeus-select {
   min-width: 0;
-  font: inherit;
-  color: var(--zeus-control-text);
-  background: var(--zeus-control-bg);
+  max-width: min(280px, 55vw);
+}
+/* 完整正文使用原生只读文本框，长答案可滚动、选择和复制。 */
+.spreadsheet-preview-cell {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 0 12px 8px;
+  font-size: 12px;
+}
+.spreadsheet-preview-cell > span {
+  min-width: 36px;
+  padding-block: 5px;
+  color: var(--zeus-control-muted-text);
+}
+.spreadsheet-preview-cell textarea {
+  flex: 1;
+  min-width: 0;
+  min-height: 42px;
+  max-height: 160px;
+  resize: vertical;
+  padding: 4px 6px;
   border: 1px solid var(--zeus-control-border);
   border-radius: 4px;
-  padding: 3px 4px;
+  color: inherit;
+  background: var(--zeus-product-canvas);
+  font: inherit;
+}
+.spreadsheet-preview-table {
+  flex: 1 1 0;
+  min-height: 200px;
+  min-width: 0;
+}
+.spreadsheet-preview-table .ag-cell {
+  white-space: pre;
+}
+/* 合并区域盖住底层空白单元格，行列号仍保留原始位置。 */
+.spreadsheet-preview-table .spreadsheet-preview-merged {
+  z-index: 1;
+  background: var(--zeus-product-canvas);
+}
+.spreadsheet-preview-table .spreadsheet-preview-row-number {
+  text-align: right;
+  color: var(--zeus-control-muted-text);
+  background: var(--zeus-card-background);
 }

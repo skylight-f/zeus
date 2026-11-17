@@ -5,9 +5,11 @@ import { browserFrozenContractEntry, browserFrozenContractVersion, browserFrozen
 import { zeusBrowserDynamicTools } from './browserDynamicTools.js';
 import { zeusComputerDynamicTools } from './computerDynamicTools.js';
 import { conversationSourceDynamicTools, type ConversationSourceContextReader } from './conversationSourceContext.js';
+import { browserAutomationDeadline, remainingBrowserAutomationTime } from './browserAutomationFlow.js';
+import { automationAgentDynamicTools } from './automationAgentDynamicTools.js';
 
 /** 注册、调用分派和 Pi 名称映射共用的原生工具归属集合。 */
-export const zeusNativeToolNamespaces = ['zeus_browser', 'zeus_computer', 'zeus_work', 'zeus_conversation'] as const;
+export const zeusNativeToolNamespaces = ['zeus_browser', 'zeus_computer', 'zeus_work', 'zeus_conversation', 'zeus_automation'] as const;
 export type ZeusNativeToolNamespace = (typeof zeusNativeToolNamespaces)[number];
 
 export interface ZeusToolRegistry {
@@ -39,6 +41,8 @@ export interface ZeusToolAuditEvent {
 }
 
 export interface CreateZeusToolBrokerOptions {
+  /** 操作模型委派在 Core 复用普通子代理。 */
+  automationAgents?: Pick<BrowserAutomationPort, 'invoke'>;
   /** 来源历史由产品查询执行，不转交桌面自动化宿主。 */
   sources?: Pick<ConversationSourceContextReader, 'invoke'>;
   /** 工作工具由本地业务服务执行，不转交浏览器宿主。 */
@@ -47,8 +51,13 @@ export interface CreateZeusToolBrokerOptions {
   audit?: (event: ZeusToolAuditEvent) => void | Promise<void>;
 }
 
-export function createZeusToolRegistry(options: { automation?: boolean; work?: boolean; sources?: boolean } = {}): ZeusToolRegistry {
-  const codexTools = [...(options.automation !== false ? [...zeusBrowserDynamicTools(), ...zeusComputerDynamicTools()] : []), ...(options.work ? zeusWorkDynamicTools() : []), ...(options.sources ? conversationSourceDynamicTools() : [])];
+export function createZeusToolRegistry(options: { automation?: boolean; automationAgents?: boolean; work?: boolean; sources?: boolean } = {}): ZeusToolRegistry {
+  const codexTools = [
+    ...(options.automation !== false ? [...zeusBrowserDynamicTools(), ...zeusComputerDynamicTools()] : []),
+    ...(options.automationAgents ? automationAgentDynamicTools() : []),
+    ...(options.work ? zeusWorkDynamicTools() : []),
+    ...(options.sources ? conversationSourceDynamicTools() : []),
+  ];
   const mapping = new Map<string, { namespace: ZeusNativeToolNamespace; tool: string }>();
   const piTools: PiZeusToolDefinitionSpec[] = [];
   for (const namespace of codexTools.filter(isNamespace)) {
@@ -75,13 +84,22 @@ export function createZeusToolRegistry(options: { automation?: boolean; work?: b
 }
 
 export function createZeusToolBroker(automation: BrowserAutomationPort | undefined, options: CreateZeusToolBrokerOptions = {}): ZeusToolBroker {
-  const registry = createZeusToolRegistry({ automation: Boolean(automation), work: Boolean(options.work), sources: Boolean(options.sources) });
+  const registry = createZeusToolRegistry({ automation: Boolean(automation), automationAgents: Boolean(options.automationAgents), work: Boolean(options.work), sources: Boolean(options.sources) });
   const timeoutMs = options.timeoutMs ?? 120_000;
   const invoke = async (input: BrowserAutomationToolCall & { namespace: ZeusNativeToolNamespace }): Promise<BrowserAutomationToolResult> => {
     validateToolIdentity(input);
     if (!registry.has(input.namespace, input.tool)) throw Object.assign(new Error(`Zeus 原生工具不存在：${input.namespace}.${input.tool}`), { code: 'ZEUS_NATIVE_TOOL_UNSUPPORTED' });
     if (input.namespace === 'zeus_browser' && input.tool === 'invoke') validateAdvancedBrowserCall(input.arguments);
-    const surface = input.namespace === 'zeus_conversation' ? 'conversation' : input.namespace === 'zeus_computer' ? 'computer' : typeof input.arguments.surface === 'string' ? input.arguments.surface : 'built_in';
+    const surface =
+      input.namespace === 'zeus_automation'
+        ? 'automation'
+        : input.namespace === 'zeus_conversation'
+          ? 'conversation'
+          : input.namespace === 'zeus_computer'
+            ? 'computer'
+            : typeof input.arguments.surface === 'string'
+              ? input.arguments.surface
+              : 'built_in';
     if (input.namespace === 'zeus_browser' && input.tool === 'invoke') {
       const path = String(input.arguments.path);
       const browserSurface = surface === 'chrome' || surface === 'edge' ? surface : 'built_in';
@@ -93,13 +111,24 @@ export function createZeusToolBroker(automation: BrowserAutomationPort | undefin
     await options.audit?.({ phase: 'started', conversationId: input.conversationId, threadId: input.threadId, turnId: input.turnId, callId: input.callId, namespace: input.namespace, tool: input.tool, surface });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      /** 调度端已有截止时间不会在工具代理内被延长。 */
+      const deadlineUnixMs = input.namespace === 'zeus_browser' ? browserAutomationDeadline(Math.min(input.deadlineUnixMs ?? Infinity, Date.now() + timeoutMs)) : Math.min(input.deadlineUnixMs ?? Infinity, Date.now() + timeoutMs);
+      /** 排队与桥接继续沿用此绝对期限。 */
+      const remainingMs = remainingBrowserAutomationTime(deadlineUnixMs);
       const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(Object.assign(new Error(`Zeus 原生工具调用超时：${input.namespace}.${input.tool}`), { code: 'ZEUS_NATIVE_TOOL_TIMEOUT' })), timeoutMs);
+        timer = setTimeout(() => reject(Object.assign(new Error(`Zeus 原生工具调用超时：${input.namespace}.${input.tool}。已发出的动作可能已执行，请先观察，不要自动重放。`), { code: 'ZEUS_NATIVE_TOOL_TIMEOUT' })), remainingMs);
         timer.unref();
       });
       /** 宿主共用本次截止时间，外层超时后不得遗留可执行的确认框。 */
-      const boundedInput = { ...input, deadlineUnixMs: Date.now() + timeoutMs };
-      const operation = input.namespace === 'zeus_conversation' ? options.sources!.invoke(boundedInput) : input.namespace === 'zeus_work' ? options.work!.invoke(boundedInput) : automation!.invoke(boundedInput);
+      const boundedInput = { ...input, deadlineUnixMs };
+      const operation =
+        input.namespace === 'zeus_automation'
+          ? options.automationAgents!.invoke(boundedInput)
+          : input.namespace === 'zeus_conversation'
+            ? options.sources!.invoke(boundedInput)
+            : input.namespace === 'zeus_work'
+              ? options.work!.invoke(boundedInput)
+              : automation!.invoke(boundedInput);
       const result = await Promise.race([operation, timeout]);
       await options.audit?.({
         phase: 'completed',
@@ -147,6 +176,8 @@ export function createZeusToolBroker(automation: BrowserAutomationPort | undefin
 }
 
 export function isZeusNativeToolMutation(namespace: ZeusNativeToolNamespace, tool: string, args: Record<string, unknown>): boolean {
+  // 委派不授予额外操作权限，实际动作仍在子轮次逐项校验。
+  if (namespace === 'zeus_automation') return false;
   if (namespace === 'zeus_conversation') return false;
   if (namespace === 'zeus_work') return tool !== 'inspect';
   if (namespace === 'zeus_computer') return !['list_apps', 'list_windows', 'get_window_state', 'verify_state'].includes(tool);
@@ -190,6 +221,7 @@ function asSchemaRecord(value: unknown): Record<string, unknown> {
 }
 
 function isSequentialTool(namespace: ZeusNativeToolNamespace, tool: string): boolean {
+  if (namespace === 'zeus_automation') return !['settings', 'list'].includes(tool);
   if (namespace === 'zeus_conversation') return false;
   if (namespace === 'zeus_work') return tool !== 'inspect';
   if (namespace === 'zeus_computer') return !['list_apps', 'list_windows'].includes(tool);
@@ -197,6 +229,6 @@ function isSequentialTool(namespace: ZeusNativeToolNamespace, tool: string): boo
 }
 
 function piToolLabel(namespace: ZeusNativeToolNamespace, tool: string): string {
-  const prefix = namespace === 'zeus_conversation' ? '会话来源' : namespace === 'zeus_work' ? '任务工作' : namespace === 'zeus_browser' ? '浏览器' : '电脑';
+  const prefix = namespace === 'zeus_automation' ? '操作智能体' : namespace === 'zeus_conversation' ? '会话来源' : namespace === 'zeus_work' ? '任务工作' : namespace === 'zeus_browser' ? '浏览器' : '电脑';
   return `${prefix} · ${tool}`;
 }

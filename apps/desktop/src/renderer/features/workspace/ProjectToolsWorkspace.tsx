@@ -1,4 +1,5 @@
-import { lazy, Suspense, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { isMacOSPlatform } from '../../platform.js';
 import { ArrowsInSimpleIcon } from '@phosphor-icons/react/dist/csr/ArrowsInSimple';
 import { ArrowsOutSimpleIcon } from '@phosphor-icons/react/dist/csr/ArrowsOutSimple';
 import { MinusIcon } from '@phosphor-icons/react/dist/csr/Minus';
@@ -8,8 +9,9 @@ import type { ProjectGitWorkbenchSnapshot } from '../git/gitContracts.js';
 import { GitPaneSeparator } from '../../git/GitPaneSeparator.js';
 import { ProjectToolContext } from './projectToolContext.js';
 import './projectToolsWorkspace.css';
+import { Button } from '../../ui/Button.js';
 
-/** Git 与源码的分支控件复用同一个工作台实例。 */
+/** 项目 Git 保留唯一工作台实例，源码目录选择独立使用现有 worktree。 */
 const ProjectGitWorkbench = lazy(() => import('../../git/ProjectGitWorkbench.js').then((module) => ({ default: module.ProjectGitWorkbench })));
 
 /** 工具和底层页面共用当前项目身份，不保存任务工作区的替代身份。 */
@@ -22,7 +24,7 @@ interface ProjectToolsWorkspaceProps {
   project?: ProjectRecord;
   /** Git 底栏覆盖当前页面，源码和命令保留原展示方式。 */
   open: boolean;
-  /** 源码可见时加载 Git，为目录提供分支控件和文件状态。 */
+  /** 源码可见时加载 Git，为项目目录提供文件状态。 */
   sourceVisible: boolean;
   /** 全文搜索也需要文件状态，复用同一 Git 实例和刷新订阅。 */
   fileSearchOpen: boolean;
@@ -30,8 +32,6 @@ interface ProjectToolsWorkspaceProps {
   gitClient?: ProjectGitWorkbenchProps['client'];
   /** 控件文案跟随应用语言。 */
   language: 'zh-CN' | 'en-US';
-  /** 源码整页提供分支控件挂载位置。 */
-  branchToolbarContainer: HTMLElement | null;
   /** 源码文件状态继续读取同一 Git 快照。 */
   onSnapshot(snapshot: ProjectGitWorkbenchSnapshot | null): void;
   /** 分支操作需要显示 Git 时只打开底栏。 */
@@ -115,7 +115,8 @@ export function ProjectToolsWorkspace(props: ProjectToolsWorkspaceProps) {
           {open && !fullWidth ? <GitPaneSeparator name="project-git-height" axis="y" target=".project-tools-layout" label={zh ? '调整 Git 高度' : 'Resize Git height'} initial={55} min={20} max={95} reverse /> : null}
           <header className="project-tools-header">
             <strong>{props.project?.name} · Git</strong>
-            <button
+            <Button
+              unstyled
               type="button"
               aria-label={expanded ? (zh ? '恢复高度' : 'Restore height') : zh ? '全屏展开' : 'Expand to full height'}
               data-icon-tooltip={expanded ? (zh ? '恢复高度' : 'Restore height') : zh ? '全屏展开' : 'Expand to full height'}
@@ -123,10 +124,10 @@ export function ProjectToolsWorkspace(props: ProjectToolsWorkspaceProps) {
               onClick={() => setExpanded(!expanded)}
             >
               {expanded ? <ArrowsInSimpleIcon aria-hidden="true" /> : <ArrowsOutSimpleIcon aria-hidden="true" />}
-            </button>
-            <button type="button" aria-label={zh ? '最小化 Git' : 'Minimize Git'} data-icon-tooltip={zh ? '最小化 Git' : 'Minimize Git'} onClick={closePanel}>
+            </Button>
+            <Button unstyled type="button" aria-label={zh ? '最小化 Git' : 'Minimize Git'} data-icon-tooltip={zh ? '最小化 Git' : 'Minimize Git'} onClick={closePanel}>
               <MinusIcon aria-hidden="true" />
-            </button>
+            </Button>
           </header>
           {props.project ? <ProjectGitPanel key={props.project.id} {...props} /> : null}
         </aside>
@@ -138,22 +139,30 @@ export function ProjectToolsWorkspace(props: ProjectToolsWorkspaceProps) {
 
 /** 每个项目只有一个 Git 实例，收起保留提交草稿和工作台位置。 */
 function ProjectGitPanel(props: ProjectToolsWorkspaceProps) {
+  /** 更新请求保留到 Git 懒加载结束，切换项目时随实例清空。 */
+  const [updateRequest, setUpdateRequest] = useState(0);
+  useEffect(() => {
+    /** 项目快捷键在编辑器和终端之前处理；已有模态窗口继续独占键盘。 */
+    function onUpdateShortcut(event: KeyboardEvent): void {
+      if (!props.gitClient || event.defaultPrevented || event.repeat || event.isComposing || event.altKey || event.shiftKey) return;
+      if (!(isMacOSPlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) || event.key.toLowerCase() !== 't') return;
+      if (document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setUpdateRequest((request) => request + 1);
+    }
+    window.addEventListener('keydown', onUpdateShortcut, true);
+    return () => window.removeEventListener('keydown', onUpdateShortcut, true);
+  }, [props.gitClient]);
   /** 首次打开 Git、源码或文件搜索时加载，随后保留到切换项目。 */
   const [mounted, setMounted] = useState(props.open || props.sourceVisible || props.fileSearchOpen);
-  if (!mounted && (props.open || props.sourceVisible || props.fileSearchOpen)) setMounted(true);
+  if (!mounted && (props.open || props.sourceVisible || props.fileSearchOpen || updateRequest > 0)) setMounted(true);
   if (!props.project || !mounted) return null;
   return (
     <div className="project-tool-content">
       <Suspense fallback={null}>
         {props.gitClient ? (
-          <ProjectGitWorkbench
-            project={props.project}
-            client={props.gitClient}
-            language={props.language}
-            branchToolbarContainer={props.sourceVisible && !props.open ? props.branchToolbarContainer : null}
-            onSnapshot={props.onSnapshot}
-            onOpenPanel={props.onOpenGit}
-          />
+          <ProjectGitWorkbench project={props.project} client={props.gitClient} language={props.language} updateRequest={updateRequest} onSnapshot={props.onSnapshot} onOpenPanel={props.onOpenGit} />
         ) : (
           <p role="status">{props.language === 'zh-CN' ? 'Git 服务尚未连接。' : 'The Git service is not connected.'}</p>
         )}

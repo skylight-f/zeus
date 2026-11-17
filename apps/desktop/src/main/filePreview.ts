@@ -1,11 +1,11 @@
 import { activeSystemWindow } from './systemWindows.js';
 import { openRegularFileNoFollow } from '@zeus/storage/platform-security';
-import { BrowserWindow, dialog, ipcMain, nativeImage, protocol, shell } from 'electron';
+import { BrowserWindow, clipboard, dialog, ipcMain, nativeImage, protocol, shell } from 'electron';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat } from 'node:fs/promises';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { constants, createReadStream, createWriteStream, watch, type FSWatcher } from 'node:fs';
+import { copyFile, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
@@ -20,10 +20,12 @@ import {
   type FilePreviewSource,
   type FilePreviewRevertInput,
   type FilePreviewSaveInput,
+  type FileReview,
+  type GitDeliveryFileActionInput,
 } from '@zeus/shared';
 import { ProjectSourceWorkspaceService } from './projectSourceWorkspace.js';
 import type { MainCommandLedger, MainCommandRequest } from './mainCommandLedger.js';
-import { getFilePreviewBlame } from '@zeus/git-core';
+import { executeProjectGitAction, getFilePreviewBlame, getFileReview, getGitStatus, withGitRepositoryOperation } from '@zeus/git-core';
 
 /** 只读媒体协议必须在 Electron 就绪前登记；不允许任意 file URL。 */
 protocol.registerSchemesAsPrivileged([
@@ -53,6 +55,8 @@ interface PreviewGrant {
   temporary?: string;
   /** 渲染层可见的有限描述。 */
   item: FilePreviewItem;
+  /** 当前授权版本的审阅读取，正文和媒体加载不等待 Git。 */
+  reviewRead?: Promise<FileReview>;
   /** ICNS 的只读 PNG 预览；系统操作和导出继续使用原始文件。 */
   image?: Buffer;
 }
@@ -127,6 +131,8 @@ export function registerFilePreview(services: {
 }): void {
   /** 随机令牌只授予单个文件，绝不包含本地服务密钥。 */
   const grants = new Map<string, PreviewGrant>();
+  /** 文件监听使用独立令牌，正文重读和原子替换不会中断订阅。 */
+  const watches = new Map<string, { owner: number; watchers: FSWatcher[] }>();
   /** 避免重复安装窗口销毁监听。 */
   const owners = new Set<number>();
   /** 系统快速预览随页内资源关闭。 */
@@ -135,6 +141,11 @@ export function registerFilePreview(services: {
   /** 撤销令牌并删除本服务创建的历史副本。 */
   async function release(ids: string[], owner: number): Promise<void> {
     for (const id of ids) {
+      const subscription = watches.get(id);
+      if (subscription?.owner === owner) {
+        watches.delete(id);
+        for (const watcher of subscription.watchers) watcher.close();
+      }
       /** 当前窗口持有的资源授权。 */
       const grant = grants.get(id);
       if (!grant || grant.owner !== owner) continue;
@@ -148,6 +159,47 @@ export function registerFilePreview(services: {
       if (grant.temporary) await rm(grant.temporary, { recursive: true, force: true });
     }
   }
+
+  /** 窗口关闭后同时释放正文授权和目录监听。 */
+  function retainOwner(window: BrowserWindow): void {
+    if (owners.has(window.id)) return;
+    owners.add(window.id);
+    window.once('closed', () => {
+      owners.delete(window.id);
+      void release([...grants.keys(), ...watches.keys()], window.id);
+    });
+  }
+
+  ipcMain.handle('zeus:file-preview:watch', async (event, input: FilePreviewRequest) => {
+    const window = services.requireWindow(event);
+    retainOwner(window);
+    /** 路径只能由现有业务授权解析，不能接受渲染层提交的磁盘路径。 */
+    const intent = await services.resolve(input, window);
+    const id = randomUUID();
+    const watchers: FSWatcher[] = [];
+    try {
+      for (const source of intent.sides.slice(0, 2)) {
+        if (source.blob || source.sha256 || source.missing || source.reason || source.submodule) continue;
+        const path = await authorizedPath(source);
+        /** 监听父目录，文件被删除后重建或原子替换时仍能收到通知。 */
+        const watcher = watch(dirname(path), (_kind, name) => {
+          if ((!name || name.toString() === basename(path)) && !window.isDestroyed()) window.webContents.send('zeus:file-preview:changed', id);
+        });
+        watcher.on('error', (error) => {
+          watcher.close();
+          console.error('File preview watcher failed', error);
+        });
+        watchers.push(watcher);
+      }
+      if (window.isDestroyed()) throw new Error('文件预览窗口已关闭。');
+      if (!watchers.length) return null;
+      watches.set(id, { owner: window.id, watchers });
+      return id;
+    } catch (error) {
+      for (const watcher of watchers) watcher.close();
+      throw error;
+    }
+  });
 
   /** 流式请求和系统操作前再次确认授权及文件身份。 */
   async function currentPath(grant: PreviewGrant): Promise<string> {
@@ -223,13 +275,7 @@ export function registerFilePreview(services: {
   async function loadPreview(input: FilePreviewRequest, window: BrowserWindow): Promise<FilePreviewItem[]> {
     /** 一次读取固定两端关系。 */
     const batch = randomUUID();
-    if (!owners.has(window.id)) {
-      owners.add(window.id);
-      window.once('closed', () => {
-        owners.delete(window.id);
-        void release([...grants.keys()], window.id);
-      });
-    }
+    retainOwner(window);
     /** 由业务身份解析出的文件读取授权。 */
     const intent = await services.resolve(input, window);
     /** 文件数固定为一份或前后两份，避免批量预加载。 */
@@ -252,6 +298,19 @@ export function registerFilePreview(services: {
         /** 解码内容绑定本次授权，释放时随授权回收。 */
         let image: Buffer | undefined;
         try {
+          if (source.submodule) {
+            /** 与 Git 原生 gitlink 补丁保持相同正文，复用已有只读 Diff。 */
+            const content = `Subproject commit ${source.submodule.commit}${source.submodule.dirty ? '-dirty' : ''}\n`;
+            return {
+              ...item,
+              submodule: source.submodule,
+              label: `${source.label} · 子模块${source.submodule.initialized === false ? ' · 未初始化（记录版本）' : source.submodule.dirty ? ' · 有本地修改' : ''}`,
+              kind: 'text',
+              mime: 'text/plain',
+              content,
+              byteLength: Buffer.byteLength(content),
+            };
+          }
           if (source.reason) return { ...item, reason: source.reason };
           if (source.blob || source.sha256) {
             await mkdir(services.temporaryRoot, { recursive: true, mode: 0o700 });
@@ -364,6 +423,10 @@ export function registerFilePreview(services: {
             item.kind = 'system';
             item.reason = '图片超过 16 MiB 页内预览上限。';
           }
+          if (item.kind === 'spreadsheet' && item.byteLength > filePreviewLimits.spreadsheet) {
+            item.kind = 'system';
+            item.reason = 'Excel 文件超过 10 MiB 页内预览上限，请用系统应用打开。';
+          }
           if (item.kind === 'system' && !item.reason)
             item.reason =
               item.mime === 'application/octet-stream' && item.byteLength > filePreviewLimits.text
@@ -371,16 +434,7 @@ export function registerFilePreview(services: {
                 : item.mime === 'image/icns' && item.byteLength > filePreviewLimits.image
                   ? '图标超过 16 MiB 页内预览上限，请用系统应用打开。'
                   : '请用系统应用打开此格式。';
-          // Git 差异沿用随正文读取的归属；普通文件仍通过版本令牌按需读取。
-          if (source.git && (source.blob || source.git.baseRef !== undefined) && item.content !== undefined && !item.truncated) {
-            try {
-              /** 使用已授权原文件保留 BOM 和换行，其他编码不冒充 UTF-8 工作区归属。 */
-              if (item.encoding !== 'utf-8' && !source.git.ref) throw new Error('此编码的工作区文本暂不提供逐行提交归属。');
-              item.blame = (await getFilePreviewBlame(source.git, previewPath)).lines;
-            } catch (error) {
-              item.blameError = error instanceof Error ? error.message : '读取提交归属失败。';
-            }
-          }
+          // 提交归属由现有版本令牌接口另读，正文返回不等待 Git 历史遍历。
           if ((await fileIdentity(previewPath)) !== identity) throw new Error('读取期间文件发生变化，请刷新。');
           if (source.edit && item.kind === 'text') {
             try {
@@ -392,7 +446,7 @@ export function registerFilePreview(services: {
             }
           }
           item.id = randomUUID();
-          if (['image', 'pdf', 'audio', 'video'].includes(item.kind)) item.url = `zeus-preview://${item.id}/${encodeURIComponent(basename(source.name))}`;
+          if (['image', 'pdf', 'audio', 'video', 'spreadsheet'].includes(item.kind)) item.url = `zeus-preview://${item.id}/${encodeURIComponent(basename(source.name))}`;
           grants.set(item.id, { owner: window.id, batch, request: input, source, path: previewPath, temporary, identity, item, image });
           return item;
         } catch (error) {
@@ -445,6 +499,69 @@ export function registerFilePreview(services: {
   }
 
   ipcMain.handle('zeus:file-preview:load', (event, input: FilePreviewRequest) => loadPreview(input, services.requireWindow(event)));
+
+  // 三种交付入口共用身份解析、命令回执和 Git 仓库锁。
+  ipcMain.handle('zeus:git-delivery:file-action', (event, request: MainCommandRequest<GitDeliveryFileActionInput>) => {
+    /** 授权固定在发起操作的窗口。 */
+    const window = services.requireWindow(event);
+    return services.commandLedger().execute(request, 'desktop.git_delivery.file_action', async (input, command) => {
+      if (!input || !['stage', 'rollback', 'trash', 'source'].includes(input.action) || !Array.isArray(input.requests) || !input.requests.length) throw new Error('交付文件操作无效。');
+      /** 所有文件先解析完成，避免后续无效身份造成部分写入。 */
+      const targets: Array<{ root: string; path: string; request: FilePreviewRequest }> = [];
+      for (const item of input.requests) {
+        if (!item || !['project-git', 'task-git'].includes(item.kind)) throw new Error('文件不属于代码交付范围。');
+        if (
+          input.action !== 'source' &&
+          ((item.kind === 'task-git' && item.scope !== 'working') || (item.kind === 'project-git' && (item.commitHash || item.comparisonRef || item.comparisonMode || (item.stage && item.stage !== 'combined'))))
+        )
+          throw new Error('已提交成果不能执行工作区操作。');
+        /** 仓库或任务身份由既有预览解析器授权，历史重命名也返回当前编辑目标。 */
+        const intent = await services.resolve(item, window);
+        /** 已丢弃或没有工作树的任务不授予文件修改目标。 */
+        const edit = intent.sides.find((side) => side.edit)?.edit;
+        if (!edit) throw new Error('当前文件没有可操作的工作区。');
+        /** 操作锁和路径检查使用同一真实目录。 */
+        const root = await realpath(edit.root);
+        /** 保留授权解析器返回的当前文件，不能从历史路径猜测编辑目标。 */
+        const path = relative(edit.root, edit.path).split(sep).join('/');
+        if (!path || path.startsWith('../') || isAbsolute(path) || path.split('/').includes('.git')) throw new Error('文件超出仓库范围。');
+        if (targets.length && targets[0]!.root !== root) throw new Error('一次文件操作不能跨越仓库。');
+        if (!targets.some((target) => target.path === path)) targets.push({ root, path, request: item });
+      }
+      /** 所有目标已确认属于同一工作目录。 */
+      const root = targets[0]!.root;
+      if (input.action === 'source') {
+        if (targets.length !== 1) throw new Error('请选择一个文件查看源码。');
+        /** 源码导航仅接受仍存在的普通文件。 */
+        const path = await authorizedPath({ root, path: resolve(root, targets[0]!.path), name: targets[0]!.path, label: '源码' });
+        await command.markWriteStarted();
+        await services.openSource(window, { root, path }, targets[0]!.request);
+        return { completed: true };
+      }
+      return withGitRepositoryOperation(root, async () => {
+        /** 防止旧菜单对已经提交或消失的文件执行操作。 */
+        const status = await getGitStatus(root);
+        if (targets.some((target) => !status.fileStatuses.some((file) => file.path === target.path && (input.action !== 'stage' || file.indexStatus === '?')))) throw new Error('所选文件状态已变化，请刷新后重试。');
+        if (input.action === 'trash') {
+          /** 删除复用源码的路径边界与系统回收站。 */
+          const workspace = new ProjectSourceWorkspaceService({ loadProjectRoot: async () => root, trashItem: (path) => shell.trashItem(path) });
+          // 文件菜单不递归删除目录或嵌套仓库。
+          for (const target of targets) {
+            /** 先校验全部目标，目录不能借文件菜单被递归删除。 */
+            const path = await workspace.revealPath('delivery', target.path);
+            if (!(await lstat(path)).isFile()) throw new Error('只能删除普通文件，不能删除目录或子仓库。');
+          }
+          for (const target of targets) await workspace.trashEntry('delivery', target.path, () => command.markWriteStarted());
+        } else if (input.action === 'stage' || input.action === 'rollback') {
+          await executeProjectGitAction(root, { type: input.action, paths: targets.map((target) => target.path) }, undefined, undefined, async (text) => {
+            await command.recordExecutionCommand(text);
+            await command.markWriteStarted();
+          });
+        }
+        return { completed: true };
+      });
+    });
+  });
 
   /** 同一文件的页内保存和区块恢复共用写锁，跨窗口也不能并发覆盖。 */
   const reverting = new Set<string>();
@@ -536,22 +653,62 @@ export function registerFilePreview(services: {
     return release(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [], window.id);
   });
 
+  ipcMain.handle('zeus:file-preview:review', async (event, id: string) => {
+    const window = services.requireWindow(event);
+    const grant = grants.get(id);
+    if (!grant || grant.owner !== window.id) throw new Error('预览授权已失效。');
+    if (grant.request.kind !== 'resource' || grant.request.comparison || grant.item.kind !== 'text') return grant.item.review;
+    const path = await currentPath(grant);
+    if (!grant.reviewRead) {
+      grant.reviewRead = getFileReview(path).then(async (review) => {
+        await currentPath(grant);
+        grant.item.review = { ...review, location: grant.item.review?.location };
+        return grant.item.review;
+      });
+    }
+    return grant.reviewRead;
+  });
+
   ipcMain.handle('zeus:file-preview:blame', async (event, id: string) => {
     /** 归属读取只能使用当前窗口持有的版本令牌。 */
     const window = services.requireWindow(event);
     /** 查不到授权、截断文本和未记录 Git 身份的快照都不能借用其他版本。 */
     const grant = grants.get(id);
     if (!grant || grant.owner !== window.id) throw new Error('预览授权已失效。');
-    if (!grant.source.git || grant.item.truncated || grant.item.encoding !== 'utf-8') return null;
+    if (!grant.source.git || grant.item.truncated || (grant.item.encoding !== 'utf-8' && !grant.source.git.ref)) return null;
     /** 读取前后均验证预览文件身份，防止磁盘变更导致归属错行。 */
     const path = await currentPath(grant);
-    // 已随正文读取的归属绑定同一授权文件，复用结果避免重复启动 Git。
+    // 同一授权版本复用已完成的归属读取，避免重复启动 Git。
     if (grant.item.blame !== undefined) return { path: grant.source.git.path, lines: grant.item.blame };
     if (grant.item.blameError) throw new Error(grant.item.blameError);
     /** 复用 Git Core 的跨平台进程管理。 */
     const result = await getFilePreviewBlame(grant.source.git, path);
     await currentPath(grant);
+    // 校验后缓存到同一授权版本，布局切换不重复读取历史。
+    grant.item.blame = result.lines;
     return result;
+  });
+
+  /** 图片像素仅由受信窗口提交；不接受任意路径或通过 URL 读取本机文件。 */
+  ipcMain.handle('zeus:image-preview:action', async (event, dataUrl: unknown, action: unknown, name: unknown) => {
+    /** 对话框归属发起操作的受信窗口。 */
+    const window = services.requireWindow(event);
+    if ((action !== 'copy' && action !== 'export') || typeof name !== 'string' || !name || name.length > 255) throw new Error('图片操作无效。');
+    /** 只接受预览画布输出的 PNG，编码前后均受现有图片大小上限约束。 */
+    const prefix = 'data:image/png;base64,';
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith(prefix) || dataUrl.length > prefix.length + Math.ceil(filePreviewLimits.image / 3) * 4) throw new Error('图片数据无效或超过大小上限。');
+    /** 限制后的像素数据不包含来源路径与预览授权令牌。 */
+    const bytes = Buffer.from(dataUrl.slice(prefix.length), 'base64');
+    if (bytes.length > filePreviewLimits.image || bytes.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') throw new Error('图片数据不是有效的 PNG。');
+    /** 剪贴板使用系统图片格式，不能把图片地址作为文字复制。 */
+    const image = nativeImage.createFromBuffer(bytes);
+    if (image.isEmpty()) throw new Error('图片无法解码。');
+    if (action === 'copy') clipboard.writeImage(image);
+    else {
+      /** 只有用户选定的目标才允许写入，取消保存不产生文件。 */
+      const result = await dialog.showSaveDialog(activeSystemWindow(window), { defaultPath: `${basename(name, '.png')}.png`, filters: [{ name: 'PNG', extensions: ['png'] }] });
+      if (!result.canceled && result.filePath) await writeFile(result.filePath, bytes);
+    }
   });
 
   ipcMain.handle('zeus:file-preview:action', async (event, id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit') => {

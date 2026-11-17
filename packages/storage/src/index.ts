@@ -1,4 +1,6 @@
-import { migrateGitDelivery } from './gitDeliveryStore.js';
+import { migrateGitDelivery, migrateGitDeliveryCommands, migrateGitDeliveryArchiving, migrateGitDeliveryNotificationRevision } from './gitDeliveryStore.js';
+import { migrateConversationWorktreeRecovery } from './conversationWorktreeRecoveryStore.js';
+export * from './conversationWorktreeRecoveryStore.js';
 export * from './gitDeliveryStore.js';
 import { migrateTaskReminders } from './taskReminderStore.js';
 /** 任务提醒与任务共用数据库和耐久事务。 */
@@ -16,7 +18,7 @@ import { migrateCommandCenterSchema } from './commands.js';
 import { migrateArtifactStoreSchema } from './artifactStore.js';
 import { migrateCommandDeliverySchema } from './commandDeliveryStore.js';
 import { CONVERSATION_HOT_QUERY_INDEX_CHECKSUM_SOURCE, CONVERSATION_HOT_QUERY_INDEX_MIGRATION_ID, conversationHotQueryIndexes } from './conversationHotQueryIndexes.js';
-import { migrateConfirmedUserMessageHistory, migrateUnifiedConversationStoreSchema } from './conversationExecutionStore.js';
+import { migrateAcceptedConversationTurnReferences, migrateConfirmedUserMessageHistory, migrateUnifiedConversationStoreSchema } from './conversationExecutionStore.js';
 import { migrateConversationLegacyCutoverSchema } from './conversationLegacyCutover.js';
 import { migrateCompletedProviderPlansToConversationHistory, migrateConversationProviderItemStoreSchema } from './conversationProviderItemStore.js';
 import { migrateConversationSyncEventStoreSchema, migrateConversationSyncProtocolV2 } from './conversationSyncEventStore.js';
@@ -37,7 +39,8 @@ import { migrateEmployeeMemorySchema } from './employeeMemoryMigration.js';
 import { migrateLongTermMemorySchema } from './longTermMemoryStore.js';
 import { migratePluginStoreSchema } from './pluginStore.js';
 import { migrateTaskEventFileProjectionSchema } from './taskEventFileProjectionStore.js';
-import { migrateTaskStageSchema } from './taskStageStore.js';
+import { migrateInputSuggestionSchema } from './inputSuggestionStore.js';
+import { migrateTaskStageCopilotSchema, migrateTaskStageSchema } from './taskStageStore.js';
 import { migrateTaskWorkReviewSchema } from './taskWorkReviewStore.js';
 import { migrateTaskWorkDeploymentSchema } from './taskWorkDeploymentStore.js';
 import { migrateTaskWorkPlanningSchema } from './taskWorkPlanningStore.js';
@@ -82,6 +85,7 @@ export * from './conversationSyncEventStore.js';
 export * from './longTermMemoryStore.js';
 export * from './pluginStore.js';
 export * from './taskEventFileProjectionStore.js';
+export * from './inputSuggestionStore.js';
 export * from './taskStageStore.js';
 export * from './taskWorkStore.js';
 export * from './taskWorkPlanningStore.js';
@@ -1015,6 +1019,10 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateCoreSchema(zeusDb);
     migrateTaskReminders(zeusDb);
     migrateGitDelivery(zeusDb);
+    migrateGitDeliveryCommands(zeusDb);
+    migrateGitDeliveryArchiving(zeusDb);
+    migrateGitDeliveryNotificationRevision(zeusDb);
+    migrateConversationWorktreeRecovery(zeusDb);
     migrateRetiredCodeGraph(zeusDb);
     migrateTaskBoardSchema(zeusDb);
     migrateRetiredUnitTestTemplate(zeusDb);
@@ -1029,6 +1037,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateAgentRuntimeSchema(zeusDb);
     migrateCodexUsageLedgerSchema(zeusDb);
     migrateConversationStageSchema(zeusDb);
+    migrateConversationTitleSourceSchema(zeusDb);
     migrateRemoteConversationTurnSchema(zeusDb);
     migrateTaskGitWorkspaceSchema(zeusDb);
     migrateMultiRepositoryTaskSchema(zeusDb);
@@ -1045,6 +1054,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateTaskWorkSchema(zeusDb);
     migrateTaskWorkWorkspaceBindingSchema(zeusDb);
     migrateTaskWorkPlanningSchema(zeusDb);
+    migrateTaskStageCopilotSchema(zeusDb);
     migrateTaskWorkReviewSchema(zeusDb);
     migrateTaskWorkDeploymentSchema(zeusDb);
     migrateDigitalTeamWorkflowSchema(zeusDb);
@@ -1053,6 +1063,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateWorkArtifactSchema(zeusDb);
     migrateProviderEventReceipts(zeusDb);
     migrateUnifiedConversationStoreSchema(zeusDb);
+    migrateInputSuggestionSchema(zeusDb);
     migrateConversationExpertSchema(zeusDb);
     migrateConversationRuntimeSchema(zeusDb);
     migrateConversationLegacyCutoverSchema(zeusDb);
@@ -1060,6 +1071,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateCompletedProviderPlansToConversationHistory(zeusDb);
     migrateConfirmedUserMessageHistory(zeusDb);
     migrateConversationTranscriptStoreSchema(zeusDb);
+    migrateAcceptedConversationTurnReferences(zeusDb);
     await initializeConversationTranscriptIndexes(zeusDb, true);
     migrateArtifactStoreSchema(zeusDb);
     migrateTaskWorkCurrentSkillReferences(zeusDb);
@@ -2474,6 +2486,24 @@ function migrateCodexUsageLedgerSchema(db: ZeusDatabase): void {
     migrationId: '20260810_0001_codex_usage_ledger',
     description: '增加与项目、会话生命周期独立的 Codex 逐轮用量账本',
     checksumSource: 'codex_usage_ledger:provider,account_scope,project,conversation,thread,turn,model,tier,token_breakdown,estimate,occurred_at',
+  });
+}
+
+/** 存量原始标题可在下轮补命名；新会话由首发入口明确启用。 */
+function migrateConversationTitleSourceSchema(db: ZeusDatabase): void {
+  /** 迁移身份与标题状态字段一一对应。 */
+  const migrationId = '20261110_0001_conversation_title_source';
+  if (db.get(`SELECT migration_id FROM schema_migrations WHERE migration_id = ?`, [migrationId])) return;
+  db.transaction(() => {
+    // SQLite 的字段业务注释放在 DDL 内，CHECK 同时限制合法状态。
+    db.execute(
+      `ALTER TABLE conversations ADD COLUMN title_source /* 标题命名状态：initial 初始未启用，pending 待命名，automatic 自动完成，manual 手动命名；存量默认待命名。 */ TEXT NOT NULL DEFAULT 'pending' CHECK (title_source IN ('initial', 'pending', 'automatic', 'manual'))`,
+    );
+    recordSchemaMigration(db, {
+      migrationId,
+      description: '保存会话标题命名状态，保护手动名称并停止重复自动命名',
+      checksumSource: 'conversations:title_source:initial,pending,automatic,manual',
+    });
   });
 }
 

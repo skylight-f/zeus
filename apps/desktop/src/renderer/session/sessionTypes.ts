@@ -164,6 +164,8 @@ export interface NativeItemSnapshot {
 export type NativeSubagentStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'interrupted' | 'failed' | 'unknown';
 
 export interface NativeSubagentSummary {
+  /** 服务端核实的操作代理，原生子线程不推断此字段。 */
+  operation?: 'browser' | 'computer';
   id: string;
   parentThreadId: string | null;
   title: string;
@@ -939,6 +941,10 @@ export interface NativeConversationMessage {
 }
 
 export interface NativeConversationChoice {
+  /** 侧栏所属主会话的稳定身份，由服务端从已核验的来源关系投影。 */
+  sourceConversationId?: string | null;
+  /** 自动冲突会话所属的原交付会话；普通会话为空。 */
+  deliverySourceConversationId?: string | null;
   /** 上下文窗口容量；空值使用默认。 */
   contextCapacityTokens?: number | null;
   workspaceMode?: 'direct' | 'worktree' | null;
@@ -995,7 +1001,7 @@ export interface NativeConversationChoice {
 }
 
 export interface NativeAgentIdentity {
-  kind: 'codex' | 'pi' | 'claude' | null;
+  kind: 'codex' | 'pi' | 'copilot' | 'claude' | null;
   transport: 'app_server' | 'rpc' | 'sdk' | null;
   supportStatus: 'unavailable' | 'framework_only' | 'experimental' | 'verified';
   capabilitySnapshotId: string | null;
@@ -1012,7 +1018,7 @@ export interface NativeSessionIdentity {
 }
 
 export interface AgentCatalogItem {
-  kind: 'codex' | 'pi' | 'claude';
+  kind: 'codex' | 'pi' | 'copilot' | 'claude';
   displayName: string;
   transport: 'app_server' | 'rpc' | 'sdk';
   supportStatus: 'unavailable' | 'framework_only' | 'experimental' | 'verified';
@@ -1059,7 +1065,7 @@ export interface CodexTaskPushModelCapability {
   id: string;
   model: string;
   displayName?: string;
-  agentKind?: 'codex' | 'pi';
+  agentKind?: 'codex' | 'pi' | 'copilot';
   sourceId?: string;
   sourceName?: string;
   available?: boolean;
@@ -1221,6 +1227,8 @@ export interface TaskWorkspaceRecord {
 }
 
 export interface TaskGitFileStatus {
+  /** 子模块引用沿用文件选择身份，但保留独立类型。 */
+  isSubmodule?: boolean;
   path: string;
   originalPath?: string;
   indexStatus: string;
@@ -1236,6 +1244,8 @@ export interface TaskGitDiffLine {
 }
 
 export interface TaskGitFileDiff {
+  /** 子模块沿用父仓库的版本引用差异，不作为目录正文。 */
+  isSubmodule?: boolean;
   oldPath: string;
   newPath: string;
   changeType: 'added' | 'deleted' | 'modified' | 'renamed' | 'copied';
@@ -1252,6 +1262,8 @@ export interface TaskGitDiffSummary {
 }
 
 export interface TaskBranchFileChange {
+  /** 已提交的子模块版本引用。 */
+  isSubmodule?: boolean;
   path: string;
   originalPath?: string;
   changeType: TaskGitFileDiff['changeType'];
@@ -1434,7 +1446,7 @@ export interface TaskIntegrationConflictFile {
 
 export interface TaskIntegrationConflictAiSession {
   path: string;
-  agentKind: 'codex' | 'pi';
+  agentKind: 'codex' | 'pi' | 'copilot';
   modelSourceId: string | null;
   modelId: string;
   conversationId: string;
@@ -1465,7 +1477,7 @@ export interface NativeTurnSettingsSelection {
   /** 下一轮选择的上下文容量。 */
   contextCapacityTokens?: number | null;
   model: string;
-  agentKind?: 'codex' | 'pi';
+  agentKind?: 'codex' | 'pi' | 'copilot';
   effort?: string;
   serviceTier?: string | null;
   permissionMode: NativePermissionMode;
@@ -1486,7 +1498,7 @@ export interface PluginSkillReference {
 export interface StartTaskModelPushRequest {
   /** 上下文窗口容量；空值使用默认。 */
   contextCapacityTokens?: number | null;
-  agentKind?: 'codex' | 'pi' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
   mode: 'create';
   source: 'task_push';
   stageId?: string;
@@ -1546,7 +1558,7 @@ export type StartNativeConversationRequest =
       effort?: string;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
       goalObjective?: string;
       pluginReferences?: PluginSkillReference[];
       expertMentions?: Array<{ employeeId: string }>;
@@ -1561,7 +1573,7 @@ export type StartNativeConversationRequest =
       collaborationMode: NativeCollaborationMode;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
     }
   | {
       mode: 'reference_legacy';
@@ -1572,10 +1584,12 @@ export type StartNativeConversationRequest =
       collaborationMode: NativeCollaborationMode;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
     };
 
 export interface StartProjectConversationRequest {
+  /** 与新会话一起创建关联任务；命名由服务端异步完成。 */
+  createTask?: boolean;
   /** 首发与后续消息共用选区评论，保留原文与用户问题。 */
   conversationContext?: ConversationContextDraft;
   /** 首条消息的结构化网页批注，复用后续消息的处理链路。 */
@@ -1588,7 +1602,7 @@ export interface StartProjectConversationRequest {
   inheritConversationId?: string;
   worktree?: ConversationWorktreeOptions;
   workspaceMode?: 'direct' | 'worktree';
-  agentKind?: 'codex' | 'pi' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
   mode: 'create';
   content: string;
   attachments: NativeConversationAttachment[];
@@ -1614,7 +1628,7 @@ export interface SendNativeMessageRequest {
   contextCapacityTokens?: number | null;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
   questionAnswer?: AsyncQuestionAnswer;
-  agentKind?: 'codex' | 'pi' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
   content: string;
   displayText?: string;
   composerDraft?: string;
@@ -1706,6 +1720,8 @@ type NativeTurnEventPayload = NativeEventIdentity & {
   startedAt?: string;
   completedAt?: string;
   hasUnreadAttention?: boolean;
+  /** 轮次终态携带结算后的权威队列，与失败状态同时接管界面。 */
+  queue?: NativeQueueSnapshot;
 };
 type NativeItemEventPayload = NativeEventIdentity & {
   turnId: string;

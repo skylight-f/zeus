@@ -1,6 +1,7 @@
 import { PROJECT_WORKSPACE_ENTRIES } from './workspaceSupport.js';
 import { useEffect } from 'react';
 import { isMacOSPlatform } from '../../platform.js';
+import { conversationGitDeliveryTarget } from '../../git/conversationGitDeliveryTarget.js';
 import { isDurableNativeConversationAcceptance } from '../../session/SessionWorkspace.js';
 import { clearPendingConflictAiStart, listPendingConflictAiStarts } from '../../task/TaskGitMergeModal.js';
 import { ZeusApiError } from '../../apiClient.js';
@@ -13,11 +14,12 @@ import type { WorkspaceOperations } from './useWorkspaceOperations.js';
 export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions: WorkspaceDomainActions, operations: WorkspaceOperations): void {
   const {
     activeNavTarget,
+    activeProjectSection,
     activeProjectIdRef,
     archivedConversationLoadState,
     codexConfigImportLoading,
     codexConfigImportPreview,
-    latestConversationContentVisible,
+    latestContentVisibleConversations,
     nativeConversationChoiceLoadCoordinator,
     nativeConversationStatusSyncState,
     nativeConversationStartEnvelopeManager,
@@ -184,19 +186,21 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
     return () => window.cancelAnimationFrame(frame);
   }, [sessionDrawerReady, sessionDrawerTarget]);
   useEffect(() => {
-    /** macOS 的 Cmd+K 与 Windows 的 Ctrl+K 共用任务代码交付入口。 */
+    /** macOS 的 Cmd+K 与 Windows 的 Ctrl+K 沿用会话按钮的交付范围。 */
     function onCodeDeliveryShortcut(event: globalThis.KeyboardEvent): void {
       if (!(isMacOSPlatform() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey || event.repeat || event.isComposing || event.defaultPrevented) return;
-      if (event.key.toLowerCase() !== 'k' || !selectedNativeConversation?.taskId || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
-      /** 文本输入保留编辑器自己的快捷键，交付操作只处理工作区按键。 */
-      const target = event.target;
-      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+      if (event.key.toLowerCase() !== 'k' || !selectedNativeConversation || selectedNativeConversation.taskPushCreating || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
+      if (!sessionDrawerReady && !((activeNavTarget === 'projects' || activeNavTarget === 'conversations') && activeProjectSection === 'sessions')) return;
       event.preventDefault();
-      openTaskGitDelivery(selectedNativeConversation.taskId, selectedNativeConversation.workspaceId);
+      /** 输入框聚焦也能打开交付；子编辑器已消费的按键仍由 defaultPrevented 排除。 */
+      const target = conversationGitDeliveryTarget(selectedNativeConversation);
+      if (target.taskId) openTaskGitDelivery(target.taskId, target.workspaceId);
+      else if (window.zeus?.openTaskGitDeliveryWindow) void window.zeus.openTaskGitDeliveryWindow(target).catch((error: unknown) => recordLocalError('task-git-delivery-window-open', error));
+      else recordLocalError('task-git-delivery-window-open', new Error('当前环境无法打开代码交付窗口。 / The code delivery window is unavailable in this environment.'));
     }
     window.addEventListener('keydown', onCodeDeliveryShortcut);
     return () => window.removeEventListener('keydown', onCodeDeliveryShortcut);
-  }, [openTaskGitDelivery, selectedNativeConversation?.taskId, selectedNativeConversation?.workspaceId]);
+  }, [openTaskGitDelivery, recordLocalError, selectedNativeConversation, sessionDrawerReady, activeNavTarget, activeProjectSection]);
   useEffect(() => {
     /** 保留原有快捷键，源码整页、Git 侧栏与命令弹窗共用鼠标入口语义。 */
     function onProjectWorkspaceShortcut(event: globalThis.KeyboardEvent): void {
@@ -243,8 +247,11 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
   }, []);
 
   useEffect(() => {
-    // 断线或校准期间保留提醒，恢复后只确认当前前台实际可见的最新修订。
-    if (nativeConversationStatusSyncState !== 'connected' || !selectedNativeConversation?.hasUnreadAttention || selectedNativeConversation.taskPushCreating || !zeusWindowForeground || !latestConversationContentVisible) return;
-    acknowledgeNativeConversationAttention(selectedNativeConversation.projectId, selectedNativeConversation.id, selectedNativeConversation.attentionRevision);
-  }, [acknowledgeNativeConversationAttention, latestConversationContentVisible, nativeConversationAttentionRetryRevision, nativeConversationStatusSyncState, selectedNativeConversation, zeusWindowForeground]);
+    // 断线或校准期间保留提醒；主栏和侧栏只确认各自前台实际可见的最新修订。
+    if (nativeConversationStatusSyncState !== 'connected' || !zeusWindowForeground) return;
+    for (const conversation of latestContentVisibleConversations) {
+      if (!conversation.hasUnreadAttention || conversation.taskPushCreating) continue;
+      acknowledgeNativeConversationAttention(conversation.projectId, conversation.id, conversation.attentionRevision);
+    }
+  }, [acknowledgeNativeConversationAttention, latestContentVisibleConversations, nativeConversationAttentionRetryRevision, nativeConversationStatusSyncState, zeusWindowForeground]);
 }

@@ -1,6 +1,6 @@
 {
   "name": "zeus",
-  "version": "0.4.30",
+  "version": "0.4.69",
   "private": true,
   "type": "module",
   "scripts": {
@@ -21,6 +21,7 @@
     "release:publish": "node scripts/publish-release.mjs",
     "verify:publish": "node scripts/verify-publish.mjs",
     "verify:release-remote-read": "node scripts/verify-release-remote-read-resilience.mjs",
+    "verify:release-cdn": "node --import tsx scripts/verify-release-cdn.mjs",
     "verify:release": "bash scripts/verify-release.sh",
     "verify:architecture": "node --import tsx scripts/verify-architecture-governance.ts",
     "verify:model-reasoning-profile": "tsx scripts/verify-model-reasoning-profile.ts",
@@ -75,6 +76,7 @@
     "electron": "42.11.10",
     "electron-builder": "^26.15.3",
     "eslint": "^9.39.5",
+    "globals": "14.0.0",
     "prettier": "^3.9.9",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.71.0",
@@ -86,7 +88,7 @@
     "node": ">=24 <26",
     "pnpm": ">=10 <11"
   },
-  "license": "Apache-2.0",
+  "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/skylight-f/zeus.git"

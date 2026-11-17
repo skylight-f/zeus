@@ -110,6 +110,8 @@ const ownershipGroups = [
       'digital_team_workflow_templates_global',
       'digital_team_workflow_runs',
       'digital_team_node_attempts',
+      // 扩展节点与状态约束时使用的迁移中间表，事务完成后改回正式尝试表名。
+      'digital_team_node_attempts_next',
       // 项目流程、正式缺陷与可重建资料目录均由工作管理维护耐久关系。
       'digital_team_project_workflows',
       'digital_team_task_repair_budgets',
@@ -144,8 +146,10 @@ const ownershipGroups = [
     authorityClass: 'mixed',
     tables: [
       'conversations',
+      'conversation_worktree_recovery',
       'conversation_submissions',
       'conversation_turns',
+      'input_suggestion_jobs',
       'conversation_goals',
       'conversation_goal_events',
       'conversation_plan_actions',
@@ -199,6 +203,9 @@ const ownershipGroups = [
       // 任务与会话共用的代码交付运行及步骤由执行与资产维护耐久进度。
       'git_delivery_runs',
       'git_delivery_steps',
+      // 命令与归档动作迁移的中间表同属执行与资产，事务内改回正式步骤表名。
+      'git_delivery_steps_with_commands',
+      'git_delivery_steps_with_archive',
       'git_snapshots',
       'git_changes',
       'turn_change_sets',

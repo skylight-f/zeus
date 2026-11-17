@@ -49,7 +49,7 @@ export interface FileReview {
 }
 
 /** 文件内容的展示方式，与模型附件上传能力独立。 */
-export type FilePreviewKind = 'text' | 'image' | 'pdf' | 'audio' | 'video' | 'system' | 'unavailable';
+export type FilePreviewKind = 'text' | 'image' | 'pdf' | 'audio' | 'video' | 'spreadsheet' | 'system' | 'unavailable';
 
 /** 只读预览允许的编码；显式选择不改变原文件或编辑器保存编码。 */
 export const filePreviewTextEncodings = ['utf-8', 'utf-16le', 'utf-16be', 'gb18030', 'windows-1252'] as const;
@@ -71,6 +71,8 @@ export type FilePreviewRequest = (
 
 /** 仅供受信主进程使用的读取授权，不向渲染层返回文件系统权限。 */
 export interface FilePreviewSource {
+  /** Git 子模块只展示固定提交和工作区状态，不授予目录文件的读写权限。 */
+  submodule?: { commit: string; dirty?: boolean; initialized?: boolean };
   /** 逐行归属绑定仓库路径和固定提交；无 ref 时以本次预览内容计算未提交行。 */
   git?: { root: string; path: string; ref?: string; baseRef?: string };
   /** 编辑目标由宿主解析；历史副本与快照目录不能成为编辑目标。 */
@@ -103,6 +105,8 @@ export interface FilePreviewIntent {
 
 /** 单个预览资源；令牌只能用于所属窗口且关闭后撤销。 */
 export interface FilePreviewItem {
+  /** 子模块版本元数据不作为普通文件大小或可编辑正文。 */
+  submodule?: FilePreviewSource['submodule'];
   /** 已解析文件的显示路径，仅供复制；打开和读写继续使用资源身份。 */
   path?: string;
   /** 当前文本可按同次预览的旧侧恢复区块；历史副本和只读编码不提供此能力。 */
@@ -166,12 +170,12 @@ export interface FilePreviewSourceWorkspace {
   ownerProjectId: string;
   /** 临时作用域身份只在所属窗口内有效。 */
   project: { id: string; name: string; localPath: string };
-  /** 第一次打开的工作区相对文件路径。 */
+  /** 需要打开的工作区相对文件路径；仅切换目录时为空字符串。 */
   relativePath: string;
 }
 
-/** 页内文本与图片沿用小内容限制，媒体使用流式读取。 */
-export const filePreviewLimits = { text: 2 * 1024 * 1024, image: 16 * 1024 * 1024, historical: 512 * 1024 * 1024 } as const;
+/** 页内正文按字节限制；工作簿需要整体解析，历史副本另设磁盘读取上限。 */
+export const filePreviewLimits = { text: 2 * 1024 * 1024, image: 16 * 1024 * 1024, spreadsheet: 10 * 1024 * 1024, historical: 512 * 1024 * 1024 } as const;
 
 /** 浏览器原生支持的安全媒体类型；未知格式交由系统查看。 */
 const previewMimeTypes: Record<string, string> = {
@@ -217,8 +221,9 @@ export function filePreviewMime(name: string): string {
   return previewMimeTypes[name.split('.').pop()?.toLowerCase() ?? ''] ?? 'application/octet-stream';
 }
 
-/** 可视媒体优先于文本，SVG 不作为活动 HTML 文档执行。 */
+/** 工作簿使用只读表格，SVG 不作为活动 HTML 文档执行。 */
 export function filePreviewKind(mime: string): FilePreviewKind {
+  if (mime === previewMimeTypes.xls || mime === previewMimeTypes.xlsx) return 'spreadsheet';
   return mime === 'image/icns' ? 'system' : mime.startsWith('image/') ? 'image' : mime === 'application/pdf' ? 'pdf' : mime.startsWith('audio/') ? 'audio' : mime.startsWith('video/') ? 'video' : 'system';
 }
 
@@ -239,4 +244,12 @@ export interface FilePreviewSaveInput {
   id: string;
   /** 完整 UTF-8 正文，换行和 BOM 由源码保存服务保留。 */
   content: string;
+}
+
+/** 交付文件操作沿用预览身份，不接收渲染层指定的本地目录。 */
+export interface GitDeliveryFileActionInput {
+  /** 一次操作只包含同一实际仓库的文件。 */
+  requests: FilePreviewRequest[];
+  /** 删除进入系统回收站，源码导航不改写内容。 */
+  action: 'stage' | 'rollback' | 'trash' | 'source';
 }

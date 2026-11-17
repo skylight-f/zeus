@@ -3,7 +3,7 @@ export interface BrowserAutomationToolCall {
   threadId: string;
   turnId: string;
   callId: string;
-  namespace?: 'zeus_browser' | 'zeus_computer' | 'zeus_work' | 'zeus_conversation';
+  namespace?: 'zeus_browser' | 'zeus_computer' | 'zeus_work' | 'zeus_conversation' | 'zeus_automation';
   tool: string;
   arguments: Record<string, unknown>;
   /** 调度端指定的调用截止时间，跨进程传递，不接受模型参数延长。 */
@@ -29,6 +29,6 @@ export interface BrowserAutomationPort {
   /** 使用无登录凭据的临时浏览器读取动态价格正文，不占用用户会话标签页。 */
   readPricingPage?(input: { url: string }): Promise<string>;
   invoke(input: BrowserAutomationToolCall): Promise<BrowserAutomationToolResult>;
-  /** 轮次结束或用户中断时撤销桌面控制；浏览器会话不受影响。 */
+  /** 轮次结束或用户中断时撤销桌面与浏览器控制；保留用户标签和登录态。 */
   endComputerUse?(input: { conversationId: string; turnId: string }): Promise<void>;
 }

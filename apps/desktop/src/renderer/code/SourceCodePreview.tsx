@@ -1,19 +1,21 @@
-import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { memo, useEffect, useRef, type RefObject } from 'react';
 import { useReadingScroll, useReadingSnapshot } from '../ui/readingState.js';
 import { Compartment, EditorState } from '@codemirror/state';
 import { defaultKeymap } from '@codemirror/commands';
+import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import { syntaxHighlighting } from '@codemirror/language';
-import { Decoration, ViewPlugin, type ViewUpdate, EditorView, GutterMarker, WidgetType, drawSelection, gutter, keymap, lineNumbers } from '@codemirror/view';
+import { Decoration, EditorView, GutterMarker, WidgetType, drawSelection, gutter, keymap, lineNumbers } from '@codemirror/view';
 import { classHighlighter } from '@lezer/highlight';
 import type { ConversationFileLocation, FilePreviewBlameLine } from '@zeus/shared';
 import { blameDecorations } from './blameDecorations.js';
 import { loadSourceLanguage } from './sourceLanguageRegistry.js';
 import { useGitBlame } from './useGitBlame.js';
+import { sourceLocationDecorations } from './sourceLocationDecorations.js';
 import './blameGutter.css';
 import { useCodeReadingOptions } from './codeReadingOptions.js';
 import type { GitBlameLine } from '../features/git/gitContracts.js';
 
+/** 文件查找采用编辑器原生文案表，界面与会话语言一致。 */
 const sourceSearchPhrases = {
   Find: '查找',
   Replace: '替换',
@@ -115,26 +117,14 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
     content: props.content,
   });
   /** 当前准确版本的逐行归属。 */
-  const lines = props.blame ?? props.blameLines ?? gitBlame.blame?.lines;
+  const lines = props.blame ?? props.blameLines ?? gitBlame?.lines;
   /** 左侧菜单与项目编辑器完全一致。 */
   const reading = useCodeReadingOptions(hostRef, lines, props.locale);
 
   useEffect(() => {
     if (!hostRef.current) return;
     /** 仅对可视行添加定位样式，定位范围再大也不创建全文行节点。 */
-    const selectedLines = ViewPlugin.define(
-      (view) => ({
-        /** 当前可视范围的行定位装饰。 */
-        decorations: selectedLineDecorations(view, propsRef.current.location),
-        /** 滚动和定位更新时重新计算可视行，成本不随文件长度增长。 */
-        update(update: ViewUpdate) {
-          this.decorations = selectedLineDecorations(update.view, propsRef.current.location);
-        },
-      }),
-      {
-        decorations: (plugin) => plugin.decorations,
-      },
-    );
+    const selectedLines = sourceLocationDecorations(() => propsRef.current.location);
     /** 预览仍允许键盘选择与复制，所有编辑操作由只读状态拒绝。 */
     const view = new EditorView({
       parent: hostRef.current,
@@ -160,8 +150,7 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
                 class: 'session-source-comment-gutter',
                 lineMarker: (editor, line) => new CommentMarker(editor.state.doc.lineAt(line.from).number, propsRef),
               })
-            : [],
-          lineNumbers(),
+            : lineNumbers(),
         ],
       }),
     });
@@ -179,6 +168,7 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
   }, [props.content, props.path, props.label, commentsEnabled, blameSlot, highlightSlot, languageSlot, widgetSlot, readingScroll]);
 
   useEffect(() => {
+    /** Markdown 搜索切到源码后也查找完整文档，不受可视行范围限制。 */
     const view = viewRef.current;
     if (view && props.searchRequest) openSearchPanel(view);
   }, [props.searchRequest, props.content, props.path, props.label, commentsEnabled]);
@@ -279,7 +269,7 @@ export const SourceCodePreview = memo(function SourceCodePreview(props: SourceCo
   );
 });
 
-/** 只为可视代码行提供原有的加号与键盘可达的评论按钮。 */
+/** 评论入口覆盖当前行号，不为每行另占一列宽度。 */
 class CommentMarker extends GutterMarker {
   /** 按钮绑定当前行，事件由最新的预览回调处理。 */
   constructor(
@@ -296,14 +286,18 @@ class CommentMarker extends GutterMarker {
 
   /** 原生按钮支持鼠标、Shift 范围选择及键盘触发。 */
   toDOM(): HTMLElement {
+    /** 行号正常显示；悬停或聚焦时由评论入口覆盖。 */
+    const marker = document.createElement('span');
+    marker.className = 'session-source-line-number';
+    marker.textContent = String(this.line);
     /** 原生按钮自带焦点与键盘语义。 */
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'session-code-comment-add';
-    button.textContent = '+';
     button.setAttribute('aria-label', this.props.current.commentLabel(this.line));
     button.onclick = (event) => this.props.current.onComment?.(this.line, event.shiftKey);
-    return button;
+    marker.append(button);
+    return marker;
   }
 }
 
@@ -323,22 +317,4 @@ export class CommentWidget extends WidgetType {
   toDOM(): HTMLElement {
     return this.element;
   }
-}
-
-/** 高亮仅遍历当前可视范围，避免长范围定位重新展开全文。 */
-function selectedLineDecorations(view: EditorView, location?: ConversationFileLocation) {
-  /** 每次只保存屏幕附近的行装饰。 */
-  const decorations = [];
-  // 编辑器已经计算好可视范围，无须扫描全文。
-  for (const range of view.visibleRanges) {
-    for (let position = range.from; position <= range.to;) {
-      /** 根据文档偏移读取当前行。 */
-      const line = view.state.doc.lineAt(position);
-      /** 高亮原始请求范围内的可视行。 */
-      const selected = Boolean(location?.line && line.number >= location.line && line.number <= (location.endLine ?? location.line));
-      decorations.push(Decoration.line({ attributes: { 'data-source-line': String(line.number), ...(selected ? { 'data-selected': 'true' } : {}) } }).range(line.from));
-      position = line.to + 1;
-    }
-  }
-  return Decoration.set(decorations, true);
 }

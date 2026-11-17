@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import type { GitDiffSummary, GitStatusSummary } from '@zeus/git-core';
 import type { ProjectGitPushPreviewInput } from '@zeus/git-core';
+import type { GitEnvironmentSummary } from '@zeus/shared';
 import type { ProjectRepository, ProjectRepositoryRegistrationRepository, ZeusProjectRecord } from '@zeus/storage';
 
 export interface ProjectGitReadEffectPort {
@@ -9,12 +10,12 @@ export interface ProjectGitReadEffectPort {
   /** 以下端口只允许 Git 读取，不得 fetch、checkout、更新索引或写入 Core DB。 */
   readStatus(localPath: string): Promise<GitStatusSummary>;
   readDiff(localPath: string): Promise<GitDiffSummary>;
-  readRepositorySnapshot(localPath: string): Promise<unknown>;
+  readRepositorySnapshot(localPath: string, includePatches?: boolean): Promise<unknown>;
   readCommit(localPath: string, commitHash: string): Promise<unknown>;
   /** 只读推送范围，与提交查询保持同一仓库隔离边界。 */
   readPushPreview(localPath: string, input: ProjectGitPushPreviewInput): Promise<unknown>;
   readHistory(localPath: string, offset: number, ref?: string): Promise<unknown>;
-  readComparison(localPath: string, ref: string, mode: 'current' | 'working-tree'): Promise<unknown>;
+  readComparison(localPath: string, ref: string, mode: 'current' | 'working-tree' | 'staged' | 'unstaged', path?: string, summaryOnly?: boolean): Promise<unknown>;
 }
 
 interface ProjectGitQueryPorts {
@@ -22,6 +23,11 @@ interface ProjectGitQueryPorts {
   repositories: Pick<ProjectRepositoryRegistrationRepository, 'listByProject'>;
   effects: ProjectGitReadEffectPort;
   now(): Date;
+  /** 会话工作区可能包含多个仓库，查询列表保留完整成员。 */
+  resolveConversationWorkspace(
+    project: ZeusProjectRecord,
+    conversationId: string,
+  ): Promise<{ repositories: Array<{ id: string; name: string; relativePath: string; localPath: string }>; sourceBranches?: GitEnvironmentSummary['sourceBranches'] }>;
   resolveConversationRepository(project: ZeusProjectRecord, conversationId: string): Promise<{ id: string; name: string; relativePath: string; localPath: string }>;
 }
 
@@ -42,15 +48,18 @@ export class ProjectGitQueryApplication {
     return this.ports.effects.readDiff(scope.path);
   }
 
-  async readWorkbench(projectId: string, conversationId?: string): Promise<{ projectId: string; projectName: string; refreshedAt: string; repositories: Array<Record<string, unknown>> }> {
+  async readWorkbench(projectId: string, conversationId?: string, includePatches = true): Promise<{ projectId: string; projectName: string; refreshedAt: string; repositories: Array<Record<string, unknown>> }> {
     const project = this.requireProject(projectId);
-    const repositories = conversationId ? [await this.ports.resolveConversationRepository(project, conversationId)] : this.ports.repositories.listByProject(project.id);
+    /** 会话来源与环境卡片复用同一份已核验记录。 */
+    const workspace = conversationId ? await this.ports.resolveConversationWorkspace(project, conversationId) : null;
+    const repositories = workspace?.repositories ?? this.ports.repositories.listByProject(project.id);
     const items = await mapWithConcurrency(repositories, async (repository) => ({
       id: repository.id,
       name: repository.name,
       relativePath: repository.relativePath,
       localPath: repository.localPath,
-      snapshot: await this.ports.effects.readRepositorySnapshot(repository.localPath),
+      sourceBranch: workspace?.sourceBranches?.find((source) => source.repositoryRelativePath === repository.relativePath)?.branch ?? null,
+      snapshot: await this.ports.effects.readRepositorySnapshot(repository.localPath, includePatches),
     }));
     return { projectId: project.id, projectName: project.name, refreshedAt: this.ports.now().toISOString(), repositories: items };
   }
@@ -67,11 +76,13 @@ export class ProjectGitQueryApplication {
     return this.ports.effects.readPushPreview(repository.localPath, input);
   }
 
-  async readComparison(projectId: string, repositoryId: string, rawRef: string | undefined, rawMode: string | undefined): Promise<unknown> {
+  async readComparison(projectId: string, repositoryId: string, rawRef: string | undefined, rawMode: string | undefined, path?: string, summaryOnly = false): Promise<unknown> {
     const repository = await this.requireRepository(this.requireProject(projectId), repositoryId);
     const ref = rawRef?.trim();
     if (!ref) throw queryError('ZEUS_GIT_REF_REQUIRED', 'A comparison branch is required.');
-    return this.ports.effects.readComparison(repository.localPath, ref, rawMode === 'working-tree' ? 'working-tree' : 'current');
+    const mode = rawMode ?? 'current';
+    if (mode !== 'current' && mode !== 'working-tree' && mode !== 'staged' && mode !== 'unstaged') throw queryError('ZEUS_GIT_COMPARISON_MODE_INVALID', 'Git 比较范围无效。');
+    return this.ports.effects.readComparison(repository.localPath, ref, mode, path, summaryOnly);
   }
 
   async readHistory(projectId: string, repositoryId: string, offset: number, ref?: string) {

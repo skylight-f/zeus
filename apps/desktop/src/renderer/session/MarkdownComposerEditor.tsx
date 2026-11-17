@@ -5,6 +5,7 @@ import { drawSelection, EditorView, keymap, placeholder } from '@codemirror/view
 import { type ClipboardEventHandler, type KeyboardEventHandler, type RefObject, useLayoutEffect, useRef } from 'react';
 import type { StructuredToken } from './StructuredComposerInput.js';
 import { composerMarkdownPreview } from './composerMarkdownPreview.js';
+import { canAppendCompletion, composerInlineCompletion } from './composerInlineCompletion.js';
 import { markdownListKeymap } from '../code/markdownListKeymap.js';
 
 /** 标签位置随润色事务进入原生撤销历史，不另建有限长度的草稿缓存。 */
@@ -14,6 +15,8 @@ const composerTokenReplacement = StateEffect.define<{ before: StructuredToken[];
 export type ComposerInputHandle = Pick<HTMLTextAreaElement, 'value' | 'selectionStart' | 'selectionEnd' | 'focus' | 'setSelectionRange' | 'isConnected' | 'contains'> & {
   /** 明确采用建议或润色后，以独立可撤销事务替换仍与界面一致的当前原文。 */
   replaceDraft?: (expected: string, text: string) => boolean;
+  /** 仅在原文未变且光标位于末尾时，以独立撤销事务追加可见后缀。 */
+  appendCompletion?: (expected: string, text: string) => boolean;
 };
 
 /** 润色必须保留所有引用标签的顺序和数量，无法确定位置时拒绝替换。 */
@@ -49,6 +52,10 @@ interface MarkdownComposerEditorProps {
   placeholder: string;
   /** 灰字只属于 placeholder，不改变文档、撤销栈或草稿。 */
   suggestion?: string | null;
+  /** 末尾灰字不属于正文，Tab 采用后才追加。 */
+  completion?: string | null;
+  /** 请求层只在聚焦并位于文末时启动停顿计时。 */
+  onCompletionActiveChange?: (active: boolean) => void;
   language: 'zh-CN' | 'en-US';
   listboxId?: string;
   activeDescendant?: string;
@@ -76,6 +83,8 @@ export function MarkdownComposerEditor(props: MarkdownComposerEditorProps) {
   const undoSlot = useRef(new Compartment());
   /** 标识外部草稿回写，避免再次通知调用方。 */
   const applying = useRef(false);
+  /** 从原生组合输入开始到最终文本收取期间，保持 Markdown 装饰的 DOM 边界。 */
+  const composing = useRef(false);
 
   useLayoutEffect(() => {
     if (!hostRef.current) return;
@@ -94,7 +103,12 @@ export function MarkdownComposerEditor(props: MarkdownComposerEditorProps) {
           drawSelection(),
           markdownListKeymap,
           keymap.of([{ key: 'Shift-Enter', run: insertNewline }, ...defaultKeymap, ...historyKeymap]),
-          composerMarkdownPreview(() => latest.current.tokens, latest.current.language),
+          composerMarkdownPreview(
+            () => latest.current.tokens,
+            latest.current.language,
+            () => composing.current,
+          ),
+          composerInlineCompletion(() => ({ draft: latest.current.value, text: latest.current.completion, menuOpen: Boolean(latest.current.listboxId), onActiveChange: latest.current.onCompletionActiveChange })),
           options.current.of([]),
           EditorView.updateListener.of((update) => {
             if (applying.current) return;
@@ -138,6 +152,17 @@ export function MarkdownComposerEditor(props: MarkdownComposerEditorProps) {
         });
         return true;
       },
+      /** 追加不移动已有引用标签，撤销只移除本次接受的后缀。 */
+      appendCompletion: (expected, text) => {
+        if (!text || latest.current.completion !== text || latest.current.listboxId || !canAppendCompletion(view) || view.state.doc.toString() !== expected) return false;
+        view.dispatch({
+          changes: { from: view.state.doc.length, insert: text },
+          selection: { anchor: view.state.doc.length + text.length },
+          annotations: [Transaction.userEvent.of('input.complete'), isolateHistory.of('full')],
+          scrollIntoView: true,
+        });
+        return true;
+      },
       setSelectionRange: (start, end) => {
         view.dispatch({ selection: { anchor: Math.max(0, Math.min(start ?? 0, view.state.doc.length)), head: Math.max(0, Math.min(end ?? 0, view.state.doc.length)) }, scrollIntoView: true });
       },
@@ -163,26 +188,30 @@ export function MarkdownComposerEditor(props: MarkdownComposerEditorProps) {
           'aria-multiline': 'true',
           'aria-label': props.ariaLabel,
           /** placeholder 不属于正文；辅助技术通过描述读出建议及采纳方法。 */
-          'aria-description': props.suggestion
+          'aria-description': props.completion
             ? props.language === 'zh-CN'
-              ? `输入建议：${props.suggestion} 按 Tab 采纳后编辑，或点击发送按钮直接发送；按 Escape 清除。`
-              : `Input suggestion: ${props.suggestion} Press Tab to accept and edit, click Send to send directly, or press Escape to dismiss.`
-            : '',
+              ? `补全：${props.completion} 按 Tab 追加到正文，按 Escape 清除。`
+              : `Completion: ${props.completion} Press Tab to append, or Escape to dismiss.`
+            : props.suggestion
+              ? props.language === 'zh-CN'
+                ? `输入建议：${props.suggestion} 按 Tab 采纳后编辑，或点击发送按钮直接发送；按 Escape 清除。`
+                : `Input suggestion: ${props.suggestion} Press Tab to accept and edit, click Send to send directly, or press Escape to dismiss.`
+              : '',
           'aria-keyshortcuts': props.ariaKeyShortcuts ?? '',
           'aria-disabled': String(Boolean(props.disabled)),
-          'aria-autocomplete': props.listboxId ? 'list' : 'none',
+          'aria-autocomplete': props.listboxId ? 'list' : props.completion ? 'inline' : 'none',
           'aria-expanded': String(Boolean(props.listboxId)),
           'aria-controls': props.listboxId ?? '',
           'aria-activedescendant': props.activeDescendant ?? '',
         }),
       ]),
     });
-  }, [props.disabled, props.placeholder, props.suggestion, props.language, props.ariaLabel, props.ariaKeyShortcuts, props.listboxId, props.activeDescendant]);
+  }, [props.disabled, props.placeholder, props.suggestion, props.completion, props.language, props.ariaLabel, props.ariaKeyShortcuts, props.listboxId, props.activeDescendant]);
 
   useLayoutEffect(() => {
     /** 本地输入的回显不替换文档；发送清空同时清理撤销，避免下一轮撤销恢复已发消息。 */
     const view = viewRef.current;
-    if (!view || view.composing) return;
+    if (!view || composing.current || view.composing) return;
     if (view.state.doc.toString() === props.value) {
       // 标签的偏移也会随输入更新，空事务只刷新装饰而不动文档和选区。
       view.dispatch({});
@@ -209,11 +238,20 @@ export function MarkdownComposerEditor(props: MarkdownComposerEditorProps) {
         // 单元格文本由原生输入控件粘贴，避免按外层光标位置写进别的正文。
         if (!(event.target instanceof HTMLInputElement)) props.onPaste?.(event);
       }}
-      onCompositionStart={props.onCompositionStart}
+      onCompositionStartCapture={(event) => {
+        // 单元格拥有独立原生输入；仅正文组合输入需要冻结 CodeMirror 的装饰。
+        composing.current = !(event.target instanceof HTMLInputElement);
+        props.onCompositionStart();
+      }}
       onCompositionEnd={() => {
         // 等待编辑器收取最终组合文本，再解除调用方的草稿持久化保护。
         requestAnimationFrame(() => {
-          if (viewRef.current) latest.current.onCompositionEnd(viewRef.current.state.doc.toString());
+          if (viewRef.current) {
+            composing.current = false;
+            latest.current.onCompositionEnd(viewRef.current.state.doc.toString());
+            // 输入法结束后刷新焦点条件，最终上屏事务可能仍处于组合输入标记内。
+            viewRef.current.dispatch({});
+          }
         });
       }}
       onBlur={() => props.onBlur?.(viewRef.current?.state.doc.toString() ?? props.value)}

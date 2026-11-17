@@ -1,0 +1,134 @@
+/* 可编辑差异保留真实正文，双栏容器由共享编辑器和 MergeView 共同管理。 */
+.code-diff-editable {
+  position: relative;
+  display: flex;
+}
+.code-diff-editable > .editable-diff-host {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+.code-diff-editable > .project-source-code-editor {
+  flex: 1;
+}
+/* 两栏共用纵向滚动容器，恢复箭头始终与真实区块共同滚动。 */
+.code-diff-editable .cm-mergeView {
+  height: 100%;
+  min-width: 0;
+  overflow: auto;
+}
+.code-diff-editable .cm-mergeViewEditors {
+  height: auto;
+  min-height: 100%;
+  min-width: 0;
+}
+.code-diff-editable .cm-mergeViewEditor {
+  min-width: 0;
+}
+.code-diff-editable .cm-editor {
+  height: 100%;
+}
+.code-diff-editable:not(.has-line-actions) .cm-lineNumbers {
+  display: flex !important;
+}
+.code-diff-editable .cm-merge-revert {
+  width: 24px;
+  min-width: 24px;
+  background: var(--zeus-product-panel-muted);
+}
+/* 新旧全文及软换行补位统一采用已有的增删改色板。 */
+.code-diff-editable .cm-line.code-diff-line.is-addition,
+.code-diff-editable .cm-mergeSpacer[data-diff-tone='addition'] {
+  background: var(--diff-addition);
+}
+.code-diff-editable .cm-line.code-diff-line.is-deletion,
+.code-diff-editable .cm-mergeSpacer[data-diff-tone='deletion'] {
+  background: var(--diff-deletion);
+}
+.code-diff-editable .cm-line.code-diff-line.is-replacement {
+  background: var(--diff-replacement);
+}
+/* 修改块的短侧保留空白，中缝按两侧真实内容高度连接。 */
+.code-diff-editable .cm-mergeSpacer[data-diff-tone='replacement'] {
+  background: transparent;
+}
+.code-diff-editable .cm-insertedLine,
+.code-diff-editable .cm-deletedLine {
+  background: transparent;
+}
+/* 独立插入或删除仅使用区块背景；局部修改的字词才使用强调色。 */
+.code-diff-editable .cm-insertedText,
+.code-diff-editable .cm-deletedText,
+.code-diff-editable .cm-editor .cm-changedText {
+  background: transparent;
+  text-decoration: none;
+  background-image: none;
+}
+.code-diff-editable .cm-editor.cm-merge-a .code-diff-line.is-replacement .cm-changedText {
+  background: var(--diff-word-deletion);
+}
+.code-diff-editable .cm-editor:not(.cm-merge-a) .code-diff-line.is-replacement .cm-changedText {
+  background: var(--diff-word-addition);
+}
+/* 统一视图的旧行仍采用删除底色，不给整行文字重复加深。 */
+.code-diff-editable .cm-editor .cm-deletedChunk {
+  background: var(--diff-deletion);
+}
+.code-diff-editable .cm-editor .cm-deletedChunk .cm-deletedText {
+  background: transparent;
+  text-decoration: none;
+}
+/* 统一视图的配对修改也用浅蓝，仅旧侧变化字词使用灰色强调。 */
+.code-diff-editable .cm-editor .cm-deletedChunk[data-diff-tone='replacement'] {
+  background: var(--diff-replacement);
+}
+.code-diff-editable .cm-editor .cm-deletedChunk[data-diff-tone='replacement'] .cm-deletedText {
+  background: var(--diff-word-deletion);
+}
+.code-diff-editable .cm-editor .cm-changedLineGutter {
+  background: var(--diff-replacement);
+}
+/* 统一视图旧文段的细轨道也使用删除灰色，避免残留默认红条。 */
+.code-diff-editable .cm-editor .cm-deletedLineGutter {
+  background: var(--diff-word-deletion);
+}
+/* 覆盖统一视图默认的白色按钮文字，使恢复入口在浅色区块中清晰可见。 */
+.code-diff-editable .cm-editor .cm-chunkButtons button.code-diff-revert {
+  color: var(--zeus-product-muted);
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.diff-edit-status {
+  color: var(--zeus-product-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.diff-edit-save {
+  white-space: nowrap;
+}
+/* 恢复轨道侧缘提供工作台原有拖动条，按真实可用宽度分配两侧。 */
+.code-diff-editable .cm-mergeViewEditor:first-child {
+  flex-basis: calc(var(--git-diff, 50%) - 12px);
+}
+.code-diff-editable .cm-mergeViewEditor:last-child {
+  flex-basis: calc(100% - var(--git-diff, 50%) - 12px);
+}
+.code-diff-editable > .git-pane-separator {
+  position: absolute;
+  inset: 0 auto 0 calc(var(--git-diff, 50%) - 14px);
+  z-index: 1;
+  width: 4px;
+}
+
+/* 恢复按钮在连接色带上方，恢复动作与键盘行为沿用 MergeView。 */
+.code-diff-editable .cm-merge-revert button.code-diff-revert {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* MergeView 的区块坐标不含正文顶端留白，使用同一变量补足。 */
+  margin-block-start: var(--diff-content-inset);
+  z-index: 2;
+}

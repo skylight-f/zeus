@@ -2,7 +2,7 @@ import type { SideQuestionState } from './SideQuestionWorkspace.js';
 import { ProjectToolContext } from '../features/workspace/projectToolContext.js';
 import { useCallback, useContext, useSyncExternalStore, type SetStateAction } from 'react';
 import type { ConversationFileLocation, FilePreviewRequest } from '@zeus/shared';
-import type { ConversationResourcePreview, NativeSessionItemBuffer, NativeSessionState } from './sessionTypes.js';
+import type { ConversationResourcePreview, NativeConversationChoice, NativeSessionItemBuffer, NativeSessionState } from './sessionTypes.js';
 import type { SourceWorkspaceState, SourceWorkspaceViewMode } from './SourceWorkspace.js';
 
 /** 会话右侧工作区仅在用户打开或关闭内容时改变。 */
@@ -37,6 +37,28 @@ const workspaces = new Map<string, SessionContextState>();
 /** 只有正在展示的工作区订阅变化。 */
 const listeners = new Set<() => void>();
 
+/** 打开空侧栏只建立本地草稿，首次发送才创建产品会话。 */
+export function createSideQuestionState(): SideQuestionState {
+  return { id: crypto.randomUUID(), draft: '', annotations: [], attachments: [], conversation: null };
+}
+
+/** 返回主会话时补回持久子会话；明确选择子会话时更新身份并保留面板开闭状态。 */
+export function restoreSideQuestionWorkspace(source: NativeConversationChoice, conversation: NativeConversationChoice, selectConversation = false): void {
+  if (conversation.sourceConversationId !== source.id || conversation.projectId !== source.projectId || conversation.taskId !== source.taskId || source.archived || conversation.archived) return;
+  /** 创建期的导航身份继续承载原主会话的分栏和草稿。 */
+  const key = JSON.stringify([source.projectId, source.navigationId ?? source.id]);
+  /** 已有本地状态优先，目录刷新不能重新展开用户已关闭的侧栏。 */
+  const current = workspaces.get(key) ?? emptyState;
+  if (current.questionState && !selectConversation) return;
+  workspaces.set(key, {
+    ...current,
+    workspace: current.questionState ? current.workspace : { kind: 'question' },
+    fullWidth: current.questionState ? current.fullWidth : false,
+    questionState: { ...(current.questionState ?? createSideQuestionState()), conversation },
+  });
+  for (const listener of listeners) listener();
+}
+
 /** 归档回执同步到所有主会话保存的侧栏引用，未挂载的侧栏也不能继续复用旧会话。 */
 export function markSideQuestionConversationArchived(conversationId: string): void {
   /** 仅在有引用变化时通知页面，重复回执不触发重绘。 */
@@ -62,7 +84,7 @@ export function replaceArchivedSideQuestion(current: SideQuestionState | null, c
     draft: state.draft || current.draft,
     attachments: [...new Map([...state.attachments, ...current.attachments].map((attachment) => [attachment.localPath ?? attachment.uploadRef, attachment])).values()],
     annotations: [...new Map([...state.contextDraft.responseAnnotations, ...current.annotations].map((annotation) => [annotation.id, annotation])).values()],
-    codeComments: state.contextDraft.codeComments,
+    codeComments: [...new Map([...state.contextDraft.codeComments, ...(current.codeComments ?? [])].map((comment) => [comment.id, comment])).values()],
   };
 }
 

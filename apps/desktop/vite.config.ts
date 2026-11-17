@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import distribution from '../../packages/distribution/src/config.json';
 
 /** 普通渲染模块按此体积分块；有初始化依赖的运行库单独保留完整共享模块。 */
 const rendererChunkTargetBytes = 360 * 1024;
@@ -10,43 +9,22 @@ export default defineConfig(({ command }) => ({
   // Electron 打包后通过 file:// 加载 index.html，必须使用相对资源路径，避免 /assets 指向磁盘根目录导致白屏。
   base: './',
   // 启动入口含一次性宿主初始化，不可作为 Fast Refresh 边界重复执行。
-  plugins: [
-    react(command === 'serve' ? { exclude: /\/src\/renderer\/main\.tsx$/ } : {}),
-    { name: 'distribution-title', transformIndexHtml: (html) => html.replace('<title>Zeus</title>', `<title>${distribution.appName ?? 'Zeus'}</title>`) },
-    {
-      name: 'editor-runtime-singleton',
-      handleHotUpdate({ file, server }) {
-        // 编辑器模块引用 VS Code 单例服务；相关代码变更统一重新载入，避免热更新重复注册。
-        if (/\/src\/renderer\/code\/.*\.(?:tsx?|json)$/.test(file)) {
-          server.ws.send({ type: 'full-reload' });
-          return [];
-        }
-      },
-    },
-  ],
-  optimizeDeps: { exclude: ['monaco-editor', '@codingame/monaco-vscode-api'] },
-  // Blob Worker 没有相对文件基址，其动态依赖也必须内联。
-  worker: { format: 'es', rolldownOptions: { output: { codeSplitting: false } } },
+  plugins: [react(command === 'serve' ? { exclude: /\/src\/renderer\/main\.tsx$/ } : {})],
   build: {
-    assetsInlineLimit: 0,
     outDir: 'dist/renderer',
     emptyOutDir: true,
+    // 保留匹配构建的错误栈映射，不向运行时脚本添加 sourceMappingURL。
+    sourcemap: 'hidden',
     rolldownOptions: {
       output: {
         codeSplitting: {
           maxSize: rendererChunkTargetBytes,
           groups: [
             {
-              // 共享预加载辅助函数不能被大型编辑器包吸收，否则首屏会反向加载整个编辑器。
-              name: 'vite-runtime',
-              test: /\0vite[\\/]/u,
-              priority: 110,
-            },
-            {
               // Vite 预加载助手也要独立，避免它把 Markdown 等业务运行库重新带回启动入口。
               name: 'startup-runtime',
               test: /(?:src[\\/]renderer[\\/]bootstrap\.ts$|vite\/preload-helper\.js$)/u,
-              priority: 120,
+              priority: 110,
             },
             {
               name: 'react-runtime',
@@ -54,25 +32,11 @@ export default defineConfig(({ command }) => ({
               priority: 100,
             },
             {
-              // 拖拽库内部存在循环引用；整体分块避免键盘方向枚举在模块初始化前被读取。
-              name: 'dnd-kit-runtime',
-              test: /node_modules[\\/]@dnd-kit[\\/][^\\/]+[\\/]/u,
-              priority: 99,
-              maxSize: 2 * 1024 * 1024,
-            },
-            {
               // 会话正文与文件预览共用同一 Markdown 运行时，保持其内部模块在同一代码包中。
               name: 'markdown-runtime',
               test: /node_modules[\\/](?:markstream-react|markstream-core|stream-markdown-parser|markdown-it(?:-[^\\/]+)?|linkify-it|mdurl|uc\.micro|entities|punycode\.js|@floating-ui[\\/][^\\/]+|clsx)[\\/]/u,
               priority: 95,
               maxSize: 2 * 1024 * 1024,
-            },
-            {
-              // VS Code 服务使用共享注册表并存在循环引用，保持同一运行时分块以保证初始化顺序。
-              name: 'monaco-vscode-runtime',
-              test: (id) => /node_modules[\\/]/u.test(id) && /(?:@codingame[\\/+]monaco-vscode|monaco-editor)/u.test(id),
-              priority: 97,
-              maxSize: 48 * 1024 * 1024,
             },
             {
               // Mermaid 共享模块之间含初始化依赖，拆分会在首次加载时调用尚未初始化的函数。
@@ -118,13 +82,14 @@ export default defineConfig(({ command }) => ({
             },
             {
               name: 'vendor-runtime',
-              test: (id) => /node_modules[\\/]/u.test(id) && !/(?:@codingame[\\/+]|@shikijs[\\/+]|monaco-editor)/u.test(id),
+              test: /node_modules[\\/]/u,
               priority: 20,
             },
             {
               name: 'renderer-runtime',
               // 源码预览与高亮重模块必须保留为动态入口；renderer-runtime 若吞入它们，Vite 会重新在首屏预加载全部语法解析器。
-              test: /src[\\/]renderer[\\/](?!bootstrap\.ts$|code[\\/](?:CodeEditor|CodeDiffView|ConflictCodeEditor|SourceCodePreview|ProjectSourceEditor|sourceLanguageRegistry|monacoRuntime|monacoGrammars|monacoSourceDecorations|monacoConflictAlignment|sourceLanguageProviders)\.(?:ts|tsx)$)/u,
+              // 轻量启动入口也必须独立，否则业务模块初始化失败会发生在错误捕获之前。
+              test: /src[\\/]renderer[\\/](?!bootstrap\.ts$|code[\\/](?:CodeEditor|CodeDiffView|ConflictCodeEditor|SourceCodePreview|sourceLanguageRegistry)\.(?:ts|tsx)$)/u,
               priority: 10,
             },
           ],

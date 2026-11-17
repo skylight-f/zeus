@@ -1,11 +1,31 @@
 import type { ProfilerOnRenderCallback } from 'react';
 import type { ZeusClientPerformanceSpan } from './apiClient.js';
-import { completeConversationNavigationTrace, readyConversationNavigationTrace } from './performanceTraceContext.js';
+import { completeConversationNavigationTrace, conversationContentReadyEvent, readyConversationNavigationTrace } from './performanceTraceContext.js';
 
 const rendererPerformanceCapacity = 2_048;
+/** 首发提交到持久接纳的 Performance Timeline 名称，不含正文。 */
+const conversationAcceptanceMeasureName = 'zeus.renderer.conversation-submit-to-acceptance';
 
 export type RendererPerformanceSample =
   | ({ kind: 'api' } & ZeusClientPerformanceSpan)
+  | {
+      kind: 'interaction';
+      name: string;
+      interactionId: number;
+      startTimeMs: number;
+      durationMs: number;
+      inputDelayMs: number;
+      processingMs: number;
+      completedAt: string;
+    }
+  | {
+      kind: 'conversation_acceptance';
+      conversationId: string;
+      clientUserMessageId: string;
+      startTimeMs: number;
+      durationMs: number;
+      completedAt: string;
+    }
   | {
       kind: 'react_commit';
       componentId: string;
@@ -38,6 +58,8 @@ export interface RendererPerformanceSnapshot {
   sampleCount: number;
   generatedAt: string;
   conversationNavigationLatency: RendererLatencyPercentiles;
+  /** Event Timing 只报告至少 16 ms 的交互，不能当作全部点击的耗时分布。 */
+  observedInteractionLatency?: RendererLatencyPercentiles;
   samples: RendererPerformanceSample[];
 }
 
@@ -80,9 +102,35 @@ export class RendererPerformanceCollector {
   };
 
   install(): void {
+    // 正文在正式构建同样会通知就绪；Profiler 只作为开发期的提交诊断。
+    window.addEventListener(conversationContentReadyEvent, () => {
+      const navigation = readyConversationNavigationTrace();
+      if (navigation && this.pendingConversationFrameTraceId !== navigation.traceId) this.scheduleConversationFirstFrame(navigation.traceId);
+    });
     if (typeof PerformanceObserver !== 'function') return;
     this.observeEntryType('longtask', 'long_task');
     this.observeEntryType('paint', 'paint');
+    this.observeInteractions();
+    if (PerformanceObserver.supportedEntryTypes.includes('measure')) {
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (entry.name !== conversationAcceptanceMeasureName) continue;
+          const detail: unknown = (entry as PerformanceMeasure).detail;
+          if (!detail || typeof detail !== 'object' || !('conversationId' in detail) || !('clientUserMessageId' in detail)) continue;
+          if (typeof detail.conversationId !== 'string' || typeof detail.clientUserMessageId !== 'string') continue;
+          this.append({
+            kind: 'conversation_acceptance',
+            conversationId: detail.conversationId,
+            clientUserMessageId: detail.clientUserMessageId,
+            startTimeMs: entry.startTime,
+            durationMs: roundMetric(entry.duration),
+            completedAt: new Date().toISOString(),
+          });
+        }
+      });
+      observer.observe({ type: 'measure' });
+      this.observers.push(observer);
+    }
   }
 
   recordFirstContentFrame(startedAtMs: number): void {
@@ -107,6 +155,7 @@ export class RendererPerformanceCollector {
       sampleCount: this.samples.length,
       generatedAt: new Date().toISOString(),
       conversationNavigationLatency: latencyPercentiles(conversationNavigationDurations),
+      observedInteractionLatency: latencyPercentiles(this.samples.flatMap((sample) => (sample.kind === 'interaction' ? [sample.durationMs] : []))),
       samples: [...this.samples],
     };
   }
@@ -114,6 +163,29 @@ export class RendererPerformanceCollector {
   disconnect(): void {
     for (const observer of this.observers) observer.disconnect();
     this.observers.length = 0;
+  }
+
+  /** 使用浏览器原生 Event Timing 分开记录输入排队、处理和下一帧呈现，不收集按键或 DOM。 */
+  private observeInteractions(): void {
+    if (!PerformanceObserver.supportedEntryTypes.includes('event')) return;
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries() as PerformanceEventTiming[]) {
+        const interactionId: unknown = Reflect.get(entry, 'interactionId');
+        if (typeof interactionId !== 'number' || interactionId <= 0) continue;
+        this.append({
+          kind: 'interaction',
+          name: entry.name,
+          interactionId,
+          startTimeMs: roundMetric(entry.startTime),
+          durationMs: roundMetric(entry.duration),
+          inputDelayMs: roundMetric(entry.processingStart - entry.startTime),
+          processingMs: roundMetric(entry.processingEnd - entry.processingStart),
+          completedAt: new Date().toISOString(),
+        });
+      }
+    });
+    observer.observe({ type: 'event', buffered: true, durationThreshold: 16 } as PerformanceObserverInit);
+    this.observers.push(observer);
   }
 
   private observeEntryType(entryType: string, kind: 'long_task' | 'paint'): void {
@@ -140,12 +212,13 @@ export class RendererPerformanceCollector {
   }
 
   private scheduleConversationFirstFrame(traceId: string): void {
+    if (document.visibilityState !== 'visible') return;
     this.pendingConversationFrameTraceId = traceId;
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         if (this.pendingConversationFrameTraceId === traceId) this.pendingConversationFrameTraceId = null;
         const navigation = completeConversationNavigationTrace(traceId);
-        if (!navigation) return;
+        if (!navigation || document.visibilityState !== 'visible') return;
         const completedAtMs = performance.now();
         const sample: RendererPerformanceSample = {
           kind: 'conversation_first_frame',
@@ -161,6 +234,12 @@ export class RendererPerformanceCollector {
       });
     });
   }
+}
+
+/** 持久接纳和首帧分别计时，避免把 UI 导航或模型等待混成 HTTP 耗时。 */
+export function recordConversationAcceptancePerformance(conversationId: string, clientUserMessageId: string, startedAtMs: number): void {
+  performance.clearMeasures(conversationAcceptanceMeasureName);
+  recordPerformanceMeasure(conversationAcceptanceMeasureName, startedAtMs, performance.now() - startedAtMs, { conversationId, clientUserMessageId });
 }
 
 function recordPerformanceMeasure(name: string, start: number, duration: number, detail: unknown): void {

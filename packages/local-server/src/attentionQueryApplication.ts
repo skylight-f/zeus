@@ -156,7 +156,7 @@ export class AttentionQueryApplication {
           id: `team:${attempt.id}`,
           projectId: run.projectId,
           title: final ? '数字团队成果等待最终验收' : '数字团队计划等待批准',
-          summary: stringValue(node?.data.instructions),
+          summary: stringValue(node && 'instructions' in node.data ? node.data.instructions : undefined),
           kind: final ? 'review' : 'approval',
           source: 'digital_team',
           sourceTitle: task.title,

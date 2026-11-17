@@ -1,27 +1,26 @@
+import type { NativeConversationChoice } from '../session/sessionTypes.js';
+import { compareConversationCreatedAsc } from '../session/conversationOrdering.js';
 import { TaskDeadlineEditor } from './TaskDeadlineField.js';
-import { CaretDownIcon } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { DotsThreeIcon } from '@phosphor-icons/react/dist/csr/DotsThree';
+import { CopySimpleIcon } from '@phosphor-icons/react/dist/csr/CopySimple';
+import { FolderOpenIcon } from '@phosphor-icons/react/dist/csr/FolderOpen';
+import { PlusIcon } from '@phosphor-icons/react/dist/csr/Plus';
+import { LinkSimpleIcon } from '@phosphor-icons/react/dist/csr/LinkSimple';
+import { XIcon } from '@phosphor-icons/react/dist/csr/X';
 import { GitBranchIcon } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { TrashIcon } from '@phosphor-icons/react/dist/csr/Trash';
 import { retainInputFocus } from '../ui/retainInputFocus.js';
 import { type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
-import { isTaskPriority, type TaskAttachmentField, type TaskAttachmentReference, type TaskManagementStatusDefinition, type UserFacingErrorCause } from '@zeus/shared';
+import { isTaskPriority, type TaskAttachmentField, type TaskAttachmentReference, type TaskManagementStatusDefinition } from '@zeus/shared';
 import { type ProjectRecord, type TaskEventRecord, type TaskManagementStatus, type TaskPriority, type TaskRecord, type TaskType, type UpdateTaskRelationshipsRequest, type UpdateTaskRequest, ZeusApiError } from '../apiClient.js';
-import type { CodexTaskPushCapabilities, NativeConversationChoice } from '../session/sessionTypes.js';
-import { compareConversationCreatedAsc } from '../session/conversationOrdering.js';
 import { Button } from '../ui/Button.js';
-import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { FormDialog } from '../ui/FormDialog.js';
+import { formatVisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { PENDING_RESOURCE_LONG_TEXT_THRESHOLD } from '../ui/pendingResourcePolicy.js';
 import { clipboardNeedsResourceRead, clipboardTextAfterResources, dataTransferFiles, usePendingResourcePreviews } from '../ui/usePendingResourcePreviews.js';
 import type { PendingResourceCardItem } from '../ui/PendingResourceCards.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { TaskAttachmentPreviewList } from './TaskAttachmentPreviewList.js';
-import { TaskDigitalEmployeeExecutor, TaskDigitalEmployeePanel, useTaskDigitalEmployeeManagement } from '../features/digital-employees/TaskDigitalEmployeePanel.js';
-import type { DigitalEmployeeApiClient } from '../features/digital-employees/digitalEmployeeApiClient.js';
-import type { DigitalTeamApiClient } from '../features/digital-teams/digitalTeamApiClient.js';
-import type { DigitalTeamProgressSubscription } from '../features/digital-teams/TaskDigitalTeamProgress.js';
-import type { DigitalTeamEntrySelection } from '../features/digital-teams/DigitalTeamWorkspace.js';
-import type { TaskWorkflowClient } from './TaskWorkflowSection.js';
-import type { TaskStageRecord } from '../features/tasks/taskContracts.js';
 import {
   mergeTaskAttachments,
   parseTaskAttachments,
@@ -38,21 +37,22 @@ import type { DashboardClient } from '../dashboardClient.js';
 import { readTaskZentaoLink, ZentaoPushModal } from './ZentaoSyncModal.js';
 import { ZentaoEffortModal } from './ZentaoEffortModal.js';
 import { useZentaoInstances } from './useZentaoInstances.js';
+import './task-detail.css';
 
 export interface TaskDetailPaneCopy {
   requestTitle: string;
   noRequest: string;
   eventsTitle: string;
   noEvents: string;
+  /** 推送及会话导航沿用任务工作区文案。 */
   pushNewConversation: string;
+  taskActionChecking: string;
+  taskActionRetry: string;
+  taskActionTerminalHelp: string;
   conversationsTitle: string;
   conversationEmptyTitle: string;
-  conversationEmptyHelp: string;
   conversationLoading: string;
-  conversationError: string;
-  openConversation: string;
   archivedConversation: string;
-  terminalConversationHelp: string;
   retryConversationLoad: string;
   detailStatusSelectAria: string;
   primaryActionsTitle: string;
@@ -96,36 +96,17 @@ export interface TaskDetailPaneContentProps {
   statusDefinitions: readonly TaskManagementStatusDefinition[];
   priorityOptions: ReadonlyArray<{ value: TaskPriority; label: string }>;
   busy: boolean;
-  terminalReadOnly: boolean;
-  digitalEmployeeClient?: DigitalEmployeeApiClient | null;
-  conversations?: NativeConversationChoice[];
-  conversationsLoading?: boolean;
-  conversationsError?: string | null;
-  modelPushOperation?: { errorCause?: UserFacingErrorCause; canRetry?: boolean; status: 'submitting' | 'failed' | 'accepted'; error: string | null; conversationId?: string };
-  /** 接入检查保留在原推送按钮，读取失败可按原任务阶段重查。 */
-  modelPushEntry?: { checking: boolean; error: string | null; onRetry: () => void };
-  onOpenConversation: (taskId: string, conversationId: string) => void;
-  /** 选择原会话时保留任务详情。 */
-  onSelectConversation?(taskId: string, conversationId: string): Promise<void>;
-  /** 当前唯一会话控制器身份。 */
-  activeConversationId?: string | null;
-  /** 同源会话阅读和发送组件。 */
-  conversationWorkspace?: ReactNode;
-  /** 首次讨论复用原新建会话输入与耐久接纳。 */
-  newConversationWorkspace?: ReactNode;
-  /** 从任务详情选择已保存流程、既有运行或管理入口。 */
-  onUseDigitalTeam?(selection: DigitalTeamEntrySelection): void;
-  /** 任务详情只读取数字团队模板和当前任务运行。 */
-  digitalTeamClient?: Pick<DigitalTeamApiClient, 'loadDigitalTeamTemplates' | 'loadDigitalTeamRuns' | 'loadDigitalTeamRun'> | null;
-  /** 团队和员工工作使用已有实时订阅校准。 */
-  onSubscribeRealtimeEvents?: DigitalTeamProgressSubscription;
-  /** 打开当前项目员工管理，补齐可指派员工。 */
-  onManageEmployees?(): void;
+  /** 与任务表格一致的推送检查状态及终态限制。 */
+  pushState?: 'checking' | 'error';
+  pushDisabled: boolean;
   onPushNewConversation: (taskId: string) => void;
-  onRetryModelPush?: (taskId: string) => void;
+  /** 服务端返回的原会话记录，含可阅读的归档会话。 */
+  conversations: readonly NativeConversationChoice[];
+  conversationsLoading: boolean;
+  conversationsError?: string | null;
+  onOpenConversation: (taskId: string, conversationId: string) => void;
+  onReloadConversations: (taskId: string) => void;
   onOpenCodeDelivery?: (taskId: string) => void;
-  onCommitCode?: (taskId: string) => void;
-  onPushCode?: (taskId: string) => void;
   onUpdateTaskContent: (taskId: string, input: UpdateTaskRequest) => Promise<TaskEditResult>;
   onUpdateRelationships: (taskId: string, input: UpdateTaskRelationshipsRequest) => Promise<TaskEditResult>;
   onCreateChild: (taskId: string) => void;
@@ -136,12 +117,8 @@ export interface TaskDetailPaneContentProps {
   onAuthorizeFiles?: (files: File[], source: 'paste') => Promise<TaskResourceAuthorizationResult>;
   onMaterializeResources?: (resources: TaskResourcePayload[]) => Promise<TaskAttachmentCandidate[]>;
   onReadClipboardResources?: () => Promise<{ resources: TaskAttachmentCandidate[]; text: string }>;
-  onReloadConversations?: (taskId: string) => void;
   onLoadAttachmentPreview?: (path: string) => Promise<{ previewUrl: string; mimeType: string } | null>;
   onOpenAttachment?: (path: string) => Promise<{ opened: boolean; error?: string }>;
-  workflowClient?: TaskWorkflowClient;
-  onLoadWorkflowCapabilities?: () => Promise<CodexTaskPushCapabilities>;
-  onStartTaskStage?: (stage: TaskStageRecord) => Promise<void>;
 }
 
 export type TaskEditResult = { kind: 'updated'; task: TaskRecord } | { kind: 'conflict'; latest: TaskRecord };
@@ -192,7 +169,7 @@ const taskEditCopies: Record<'zh-CN' | 'en-US', TaskEditCopy> = {
     editDescription: '编辑任务说明',
     editTags: '编辑任务标签',
     titleRequired: '标题不能为空。',
-    noTags: '暂无标签，点击添加',
+    noTags: '添加标签',
     addAttachment: '添加附件',
     removeAttachment: '移除附件关联',
     undoAttachment: '撤销移除',
@@ -206,7 +183,7 @@ const taskEditCopies: Record<'zh-CN' | 'en-US', TaskEditCopy> = {
     editDescription: 'Edit task description',
     editTags: 'Edit task tags',
     titleRequired: 'Title cannot be empty.',
-    noTags: 'No tags. Click to add',
+    noTags: 'Add tags',
     addAttachment: 'Add attachment',
     removeAttachment: 'Remove attachment link',
     undoAttachment: 'Undo removal',
@@ -601,16 +578,16 @@ function InlineTaskTextField(props: {
               <Button variant="secondary" size="compact" disabled={saveState.kind === 'saving' || props.resourcesProcessing} onPointerDown={(event) => event.preventDefault()} onClick={cancelEditing}>
                 {props.copy === taskEditCopies['zh-CN'] ? '取消' : 'Cancel'}
               </Button>
-              <Button variant="primary" size="compact" busy={saveState.kind === 'saving'} disabled={props.resourcesProcessing} onPointerDown={(event) => event.preventDefault()} onClick={() => void commitDraft()}>
+              <Button variant="primary" size="compact" busy={saveState.kind === 'saving'} disabled={props.resourcesProcessing} onPointerDown={(event) => event.preventDefault()} onClick={() => commitDraft()}>
                 {props.copy === taskEditCopies['zh-CN'] ? '保存' : 'Save'}
               </Button>
             </span>
           ) : null}
         </span>
       ) : (
-        <button type="button" className="task-inline-edit-trigger" onClick={beginEditing} disabled={props.disabled} aria-label={props.label}>
+        <Button unstyled type="button" className="task-inline-edit-trigger" onClick={beginEditing} disabled={props.disabled} aria-label={props.label}>
           {props.display}
-        </button>
+        </Button>
       )}
       <TaskEditFeedback state={saveState} copy={props.copy} statusId={statusId} onRetry={retrySave} onLoadLatest={loadLatestValue} />
     </span>
@@ -626,6 +603,8 @@ function TaskImmediateSelect<T extends string>(props: {
   disabled?: boolean;
   className?: string;
   colorized?: boolean;
+  /** 行内属性通过图标区分含义，菜单行为仍由共用选择器管理。 */
+  triggerIcon?: ReactNode;
   /** 状态切换静默保存，其他属性仍沿用加载动效。 */
   showSaveSpinner?: boolean;
   onSave: (value: T, expectedUpdatedAt: string) => Promise<TaskEditResult | undefined>;
@@ -691,6 +670,8 @@ function TaskImmediateSelect<T extends string>(props: {
         ariaLabel={props.ariaLabel}
         value={displayValue}
         options={props.options}
+        triggerIcon={props.triggerIcon}
+        triggerClassName={props.colorized ? undefined : 'task-detail-property-trigger'}
         className={props.colorized ? 'task-status-select task-status-custom' : undefined}
         style={props.colorized ? ({ '--task-status-tone': props.options.find((option) => option.value === displayValue)?.color ?? '#6b7280' } as CSSProperties) : undefined}
         onChange={(value) => {
@@ -702,7 +683,7 @@ function TaskImmediateSelect<T extends string>(props: {
             setSaveState({ kind: 'error', message: props.copy.saveFailed });
             return;
           }
-          void saveValue(value, expectedUpdatedAt);
+          return saveValue(value, expectedUpdatedAt);
         }}
         disabled={props.disabled || saveState.kind === 'saving'}
         searchable={false}
@@ -713,34 +694,35 @@ function TaskImmediateSelect<T extends string>(props: {
   );
 }
 
-/** 项目归属与移动复制始终展开；修改需明确提交，失败保留目标便于调整。 */
-function TaskProjectActions(props: Pick<TaskDetailPaneContentProps, 'task' | 'projects' | 'language' | 'busy' | 'onUpdateTaskContent' | 'onCopyTask'>) {
-  /** 默认保持当前项目，仅按钮提交时执行修改。 */
-  const [projectId, setProjectId] = useState(props.task.projectId);
-  /** 防止重复点击和复制尚未完成的移动。 */
+/** 移动通过共用表单提交；失败保留目标项目，不占用任务正文。 */
+function TaskProjectMoveDialog(props: Pick<TaskDetailPaneContentProps, 'task' | 'projects' | 'language' | 'busy' | 'onUpdateTaskContent'> & { onClose(): void }) {
+  /** 明确选定其他项目后才允许提交。 */
+  const [projectId, setProjectId] = useState('');
+  /** 保存期间禁止关闭和重复提交。 */
   const [saving, setSaving] = useState(false);
-  /** 具体失败原因在当前操作下展示。 */
+  /** 具体失败原因在选择器下展示。 */
   const [error, setError] = useState('');
   /** 跟随应用的语言设置。 */
   const zh = props.language === 'zh-CN';
-  /** 展示实际归属，不把尚未提交的目标当成当前项目。 */
-  const currentProjectName = props.projects.find((project) => project.id === props.task.projectId)?.name ?? props.task.projectId;
 
-  /** 保存经过现有串行编辑队列，冲突时提示用户检查最新任务。 */
+  /** 保存沿用串行编辑队列；冲突和拒绝移动均保留当前表单。 */
   async function moveTask(): Promise<void> {
-    if (saving || props.busy || projectId === props.task.projectId) return;
+    if (saving || props.busy || !projectId || projectId === props.task.projectId) return;
     setSaving(true);
     setError('');
     try {
-      /** 服务端会在同一事务内完成编号、关系和归属修改。 */
       const result = await props.onUpdateTaskContent(props.task.id, { projectId, expectedUpdatedAt: props.task.updatedAt ?? '' });
-      if (result.kind === 'conflict') setError(zh ? '任务已被修改，请检查最新内容后重新移动。' : 'The task changed. Review the latest content before moving again.');
+      if (result.kind === 'conflict') {
+        setError(zh ? '任务已被修改，请检查最新内容后重新移动。' : 'The task changed. Review the latest content before moving again.');
+      } else {
+        props.onClose();
+      }
     } catch (cause) {
       setError(
         cause instanceof ZeusApiError && cause.error === 'ZEUS_TASK_PROJECT_CHANGE_UNAVAILABLE'
           ? zh
-            ? '此任务已有会话或执行资源，无法直接修改项目。请使用“复制到其他项目”保留原任务的执行历史。'
-            : 'This task has conversations or execution resources. Copy it to another project to preserve its history.'
+            ? '此任务已有会话或执行资源，无法直接修改项目。请使用“复制任务”保留原任务的执行历史。'
+            : 'This task has conversations or execution resources. Copy the task to preserve its history.'
           : taskEditErrorMessage(cause, zh ? '修改项目失败，请重试。' : 'Could not change the project. Try again.', zh ? 'zh-CN' : 'en'),
       );
     } finally {
@@ -749,47 +731,48 @@ function TaskProjectActions(props: Pick<TaskDetailPaneContentProps, 'task' | 'pr
   }
 
   return (
-    <section className="task-detail-block task-detail-project-settings" aria-label={zh ? '移动与复制' : 'Move and copy'}>
-      <header className="task-detail-section-heading">
-        <strong>{zh ? '移动与复制' : 'Move and copy'}</strong>
-        <small data-icon-tooltip={currentProjectName}>{currentProjectName}</small>
-      </header>
-      <div className="task-detail-project-settings-content">
+    <FormDialog
+      title={zh ? '移动任务' : 'Move task'}
+      className="task-project-move-dialog"
+      zh={zh}
+      busy={saving || props.busy}
+      submitLabel={zh ? '移动任务' : 'Move task'}
+      submitDisabled={!projectId || projectId === props.task.projectId}
+      onClose={props.onClose}
+      onSubmit={(event) => {
+        event.preventDefault();
+        return moveTask();
+      }}
+    >
+      <label>
+        <span>{zh ? '目标项目' : 'Target project'}</span>
         <ZeusSelect
-          size="compact"
+          size="regular"
           ariaLabel={zh ? '选择目标项目' : 'Choose target project'}
           value={projectId}
-          options={props.projects.map((project) => ({ value: project.id, label: project.name }))}
+          options={[{ value: '', label: zh ? '选择项目' : 'Choose a project', disabled: true }, ...props.projects.filter((project) => project.id !== props.task.projectId).map((project) => ({ value: project.id, label: project.name }))]}
           searchPlaceholder={zh ? '搜索项目' : 'Search projects'}
-          emptyLabel={zh ? '没有匹配的项目' : 'No matching projects'}
+          emptyLabel={zh ? '没有其他项目' : 'No other projects'}
           onChange={(value) => {
             setProjectId(value);
             setError('');
           }}
           disabled={props.busy || saving}
         />
-        {projectId !== props.task.projectId ? (
-          <p className="task-flow-context">
-            {zh
-              ? '移动后使用目标项目的新编号与初始状态，解除原项目内的父子和关联关系。子任务留在原项目。'
-              : 'Moving assigns a new project number and initial status, and removes parent, child and related-task links. Child tasks stay in the original project.'}
-          </p>
-        ) : null}
-        <div className="task-detail-project-actions">
-          <Button variant="secondary" size="compact" busy={saving} disabled={props.busy || projectId === props.task.projectId} onClick={() => void moveTask()}>
-            {saving ? (zh ? '正在移动…' : 'Moving…') : zh ? '移动到此项目' : 'Move to project'}
-          </Button>
-          <Button variant="secondary" size="compact" disabled={props.busy || saving} onClick={() => props.onCopyTask(props.task)}>
-            {zh ? '复制到其他项目' : 'Copy to another project'}
-          </Button>
-        </div>
-        {error ? (
-          <p role="alert" className="task-inline-edit-feedback is-error">
-            {error}
-          </p>
-        ) : null}
-      </div>
-    </section>
+      </label>
+      {projectId ? (
+        <p className="task-flow-context">
+          {zh
+            ? '移动后使用目标项目的新编号与初始状态，解除原项目内的父子和关联关系。子任务留在原项目。'
+            : 'Moving assigns a new project number and initial status, and removes parent, child and related-task links. Child tasks stay in the original project.'}
+        </p>
+      ) : null}
+      {error ? (
+        <p role="alert" className="task-inline-edit-feedback is-error">
+          {error}
+        </p>
+      ) : null}
+    </FormDialog>
   );
 }
 
@@ -805,6 +788,8 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
   const [zentaoSyncOpen, setZentaoSyncOpen] = useState(false);
   /** 工时弹窗的打开状态。 */
   const [zentaoEffortOpen, setZentaoEffortOpen] = useState(false);
+  /** 项目移动只在任务菜单明确选择后进入表单。 */
+  const [projectMoveOpen, setProjectMoveOpen] = useState(false);
   useEffect(() => {
     if (!zentaoAvailable) {
       setZentaoSyncOpen(false);
@@ -814,7 +799,10 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
   const zh = props.language === 'zh-CN';
   const editCopy = taskEditCopies[props.language];
   const managementStatus = resolveTaskManagementStatus(props.task);
-  const latestEvent = props.events.at(-1);
+  /** 会话按创建顺序展示任务的发展时间线。 */
+  const conversations = [...props.conversations].sort(compareConversationCreatedAsc);
+  /** 重试仍进入原推送流程，避免产生第二套提交状态。 */
+  const pushLabel = props.pushState === 'checking' ? props.copy.taskActionChecking : props.pushState === 'error' ? props.copy.taskActionRetry : props.copy.pushNewConversation;
   const taskAttachments = parseTaskAttachments(props.task.sourceContextJson);
   /** 任务详情的所有正文与标签字段共用即时预览和场景清理。 */
   const previews = usePendingResourcePreviews(
@@ -827,8 +815,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
   const latestTask = useRef(props.task);
   latestTask.current = props.task;
 
-  const modelPushCreating = props.modelPushOperation?.status === 'submitting';
-  const modelPushFailed = props.modelPushOperation?.status === 'failed';
   const attachmentStatusId = `${useId()}-status`;
   /** 原生弹出层自动处理点击外部和 Escape，标识在多个详情入口间保持独立。 */
   const moreActionsId = useId();
@@ -840,19 +826,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
   const [attachmentSaveState, setAttachmentSaveState] = useState<TaskFieldSaveState>({ kind: 'idle' });
   const [undoAttachment, setUndoAttachment] = useState<TaskAttachmentView | null>(null);
   const [relationshipSaveState, setRelationshipSaveState] = useState<TaskFieldSaveState>({ kind: 'idle' });
-  /** 关系操作的前置条件提示，不冒充保存失败。 */
-  const [relationshipHint, setRelationshipHint] = useState('');
-  /** 提示归属对应操作，避免长列表把反馈推离按钮。 */
-  const [relationshipHintTarget, setRelationshipHintTarget] = useState<'child' | 'relation'>('child');
-  const [relatedTaskCandidateId, setRelatedTaskCandidateId] = useState('');
-  const digitalEmployeeManagement = useTaskDigitalEmployeeManagement({
-    taskId: props.task.id,
-    projectId: props.task.projectId,
-    client: props.digitalEmployeeClient ?? null,
-    teamClient: props.digitalTeamClient,
-    subscribe: props.onSubscribeRealtimeEvents,
-    language: props.language,
-  });
   /** Escape 优先关闭当前操作层，避免外层任务弹窗同时关闭。 */
   function closeMoreActionsOnEscape(event: ReactKeyboardEvent<HTMLDivElement>): void {
     if (event.key !== 'Escape' || !moreActionsRef.current?.matches(':popover-open')) return;
@@ -864,8 +837,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     setAttachmentSaveState({ kind: 'idle' });
     setUndoAttachment(null);
     setRelationshipSaveState({ kind: 'idle' });
-    setRelationshipHint('');
-    setRelatedTaskCandidateId('');
+    setProjectMoveOpen(false);
     moreActionsRef.current?.hidePopover();
     attachmentPasteRetryRef.current = null;
     if (undoTimerRef.current !== null) window.clearTimeout(undoTimerRef.current);
@@ -880,11 +852,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     },
     [],
   );
-  const conversations = [...(props.conversations ?? [])].sort(compareConversationCreatedAsc);
-  /** 真实工作接纳后才展开协作布局，读取失败不会被猜成任务结束。 */
-  const hasTaskWork = Boolean(digitalEmployeeManagement.teams.length || digitalEmployeeManagement.projection?.workItems.length || digitalEmployeeManagement.pendingAssignment);
-  /** 有原会话时提供稳定阅读高度，空任务输入紧接任务说明。 */
-  const hasTaskActivity = hasTaskWork || conversations.length > 0;
   const taskById = new Map(props.allTasks.map((task) => [task.id, task]));
   const directChildren = props.allTasks.filter((task) => task.parentTaskId === props.task.id).sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''));
   const relatedTasks = (props.task.relatedTaskIds ?? [])
@@ -924,7 +891,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
     try {
       const result = await props.onUpdateRelationships(props.task.id, { ...input, expectedUpdatedAt });
       setRelationshipSaveState(result.kind === 'conflict' ? { kind: 'conflict', latest: result.latest } : { kind: 'saved' });
-      if (result.kind === 'updated') setRelatedTaskCandidateId('');
     } catch (error) {
       const relationshipMessage =
         error instanceof ZeusApiError && error.error === 'ZEUS_TASK_PARENT_CYCLE' ? (zh ? '不能把当前任务移动到它自己下面。' : 'A task cannot be moved below itself.') : taskEditErrorMessage(error, editCopy.saveFailed, zh ? 'zh-CN' : 'en');
@@ -1201,7 +1167,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
             copy={props.copy}
             editCopy={editCopy}
             disabled={props.busy || resourcesProcessing || attachmentSaveState.kind === 'saving'}
-            onRemove={(path) => void removeAttachment(path)}
+            onRemove={(path) => removeAttachment(path)}
             onLoadPreview={props.onLoadAttachmentPreview}
             onOpenAttachment={props.onOpenAttachment}
           />
@@ -1232,436 +1198,377 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
       {zentaoAvailable && zentaoEffortOpen && props.zentaoClient && zentaoLink?.kind === 'task' ? (
         <ZentaoEffortModal language={props.language} client={props.zentaoClient} task={props.task} onClose={() => setZentaoEffortOpen(false)} />
       ) : null}
-      <header className="task-detail-pane-header task-detail-summary-row">
-        <span className="task-detail-pane-title">
-          <InlineTaskTextField
-            resourcesProcessing={resourcesProcessing}
-            task={props.task}
-            label={editCopy.editTitle}
-            value={props.task.title}
-            display={<strong>{props.task.title}</strong>}
-            required
-            copy={editCopy}
-            disabled={props.busy}
-            buildPatch={(title) => ({ title: title.trim() })}
-            valueFromTask={(task) => task.title}
-            onSave={(input) => props.onUpdateTaskContent(props.task.id, input)}
-          />
-        </span>
-        <div className="task-detail-header-actions" aria-label={props.copy.primaryActionsTitle} onKeyDown={closeMoreActionsOnEscape}>
-          {/* 保留创建进度的读屏播报，视觉反馈由操作按钮承担。 */}
-          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-            {modelPushCreating ? (zh ? '正在后台创建会话' : 'Creating conversation in the background') : props.modelPushOperation?.status === 'accepted' ? (zh ? '会话已创建' : 'Conversation created') : ''}
+      {projectMoveOpen ? (
+        <TaskProjectMoveDialog key={props.task.id} task={props.task} projects={props.projects} language={props.language} busy={props.busy} onUpdateTaskContent={props.onUpdateTaskContent} onClose={() => setProjectMoveOpen(false)} />
+      ) : null}
+      <header className="task-detail-header">
+        <div className="task-detail-titlebar">
+          <span className="task-detail-title">
+            <InlineTaskTextField
+              resourcesProcessing={resourcesProcessing}
+              task={props.task}
+              label={editCopy.editTitle}
+              value={props.task.title}
+              display={<strong>{props.task.title}</strong>}
+              required
+              copy={editCopy}
+              disabled={props.busy}
+              buildPatch={(title) => ({ title: title.trim() })}
+              valueFromTask={(task) => task.title}
+              onSave={(input) => props.onUpdateTaskContent(props.task.id, input)}
+            />
           </span>
-          {props.terminalReadOnly ? (
-            <span className="task-detail-closed-note">{zh ? '调整任务状态后可继续协作' : 'Change task status to resume collaboration'}</span>
-          ) : (
+          <span className="task-detail-header-status">
+            <TaskImmediateSelect
+              task={props.task}
+              value={managementStatus}
+              options={props.statusDefinitions.map((status) => ({
+                value: status.id,
+                label: props.statusLabels[status.id] ?? status.id,
+                color: status.color,
+              }))}
+              colorized
+              showSaveSpinner={false}
+              ariaLabel={props.copy.detailStatusSelectAria}
+              copy={editCopy}
+              disabled={props.busy}
+              onSave={(status, expectedUpdatedAt) => props.onManagementStatusChange(props.task.id, status, expectedUpdatedAt)}
+            />
+          </span>
+          <div className="task-detail-header-actions" aria-label={props.copy.primaryActionsTitle} onKeyDown={closeMoreActionsOnEscape}>
             <Button
               variant="primary"
-              size="regular"
-              className="task-detail-primary-action"
-              onClick={() => (props.modelPushEntry?.error ? props.modelPushEntry.onRetry() : props.onPushNewConversation(props.task.id))}
-              busy={props.busy || modelPushCreating || props.modelPushEntry?.checking}
+              size="compact"
+              busy={props.pushState === 'checking'}
+              disabled={props.busy || props.pushDisabled}
+              title={props.pushDisabled ? props.copy.taskActionTerminalHelp : undefined}
+              onClick={() => props.onPushNewConversation(props.task.id)}
             >
-              {props.modelPushEntry?.checking
-                ? zh
-                  ? '正在检查模型…'
-                  : 'Checking models…'
-                : props.modelPushEntry?.error
-                  ? zh
-                    ? '重新检查'
-                    : 'Check again'
-                  : modelPushCreating
-                    ? zh
-                      ? '正在创建会话…'
-                      : 'Creating conversation…'
-                    : props.copy.pushNewConversation}
+              {pushLabel}
             </Button>
-          )}
-          {/* 创建结果的操作与推送按钮共用标题栏，不为成功状态另占一行。 */}
-          {modelPushFailed && props.modelPushOperation?.canRetry && props.onRetryModelPush ? (
-            <Button variant="secondary" size="regular" onClick={() => props.onRetryModelPush?.(props.task.id)}>
-              {zh ? '重试创建' : 'Retry creation'}
+            <Button variant="secondary" size="compact" className="task-detail-more-trigger" popoverTarget={moreActionsId} aria-label={zh ? '更多任务操作' : 'More task actions'} data-icon-tooltip={zh ? '更多任务操作' : 'More task actions'}>
+              <DotsThreeIcon size={22} weight="bold" aria-hidden="true" />
             </Button>
-          ) : props.modelPushOperation?.status === 'accepted' && props.modelPushOperation.conversationId && !conversations.some((conversation) => conversation.id === props.modelPushOperation?.conversationId) ? (
-            <Button variant="secondary" size="regular" onClick={() => props.onOpenConversation(props.task.id, props.modelPushOperation?.conversationId ?? '')}>
-              {zh ? '打开会话' : 'Open conversation'}
-            </Button>
-          ) : null}
-          <Button variant="secondary" size="regular" className="task-detail-more-trigger" popoverTarget={moreActionsId} aria-label={zh ? '更多任务操作' : 'More task actions'} data-icon-tooltip={zh ? '更多任务操作' : 'More task actions'}>
-            {zh ? '任务操作' : 'Task actions'}
-            <CaretDownIcon size={14} aria-hidden="true" />
-          </Button>
-          <section
-            ref={moreActionsRef}
-            id={moreActionsId}
-            popover="auto"
-            className="task-detail-more-popover"
-            aria-label={zh ? '更多任务操作' : 'More task actions'}
-            onToggle={(event) => {
-              // 展开后从首个可用操作开始键盘导航，收起时由原生弹出层恢复焦点。
-              if (event.newState === 'open') moreActionsRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
-            }}
-          >
-            {props.onOpenCodeDelivery ? (
-              <Button
-                variant="secondary"
-                size="regular"
-                onClick={() => {
-                  moreActionsRef.current?.hidePopover();
-                  props.onOpenCodeDelivery?.(props.task.id);
-                }}
-                busy={props.busy}
-              >
-                <GitBranchIcon size={16} aria-hidden="true" />
-                {zh ? '代码交付…' : 'Code delivery…'}
-              </Button>
-            ) : null}
-            {zentaoAvailable ? (
-              <Button
-                variant="secondary"
-                size="regular"
-                onClick={() => {
-                  moreActionsRef.current?.hidePopover();
-                  setZentaoSyncOpen(true);
-                }}
-                disabled={props.busy}
-              >
-                {zh ? '同步到禅道…' : 'Sync to ZenTao…'}
-              </Button>
-            ) : null}
-            {zentaoAvailable && zentaoLink?.kind === 'task' ? (
-              <Button
-                variant="secondary"
-                size="regular"
-                onClick={() => {
-                  moreActionsRef.current?.hidePopover();
-                  setZentaoEffortOpen(true);
-                }}
-                disabled={props.busy}
-              >
-                {zh ? '禅道工时…' : 'ZenTao hours…'}
-              </Button>
-            ) : null}
-            <Button
-              variant="danger"
-              size="regular"
-              onClick={() => {
-                moreActionsRef.current?.hidePopover();
-                props.onDeleteTask(props.task.id);
+            <section
+              ref={moreActionsRef}
+              id={moreActionsId}
+              popover="auto"
+              className="task-detail-more-popover"
+              aria-label={zh ? '更多任务操作' : 'More task actions'}
+              onToggle={(event) => {
+                // 展开后从首个可用操作开始键盘导航，收起时由原生弹出层恢复焦点。
+                if (event.newState === 'open') moreActionsRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
               }}
-              disabled={props.busy}
             >
-              <TrashIcon size={16} aria-hidden="true" />
-              {zh ? '删除任务…' : 'Delete task…'}
-            </Button>
-          </section>
+              {props.onOpenCodeDelivery ? (
+                <Button
+                  variant="secondary"
+                  size="regular"
+                  onClick={() => {
+                    moreActionsRef.current?.hidePopover();
+                    return props.onOpenCodeDelivery?.(props.task.id);
+                  }}
+                  busy={props.busy}
+                >
+                  <GitBranchIcon size={16} aria-hidden="true" />
+                  {zh ? '代码交付…' : 'Code delivery…'}
+                </Button>
+              ) : null}
+              {zentaoAvailable ? (
+                <Button
+                  variant="secondary"
+                  size="regular"
+                  onClick={() => {
+                    moreActionsRef.current?.hidePopover();
+                    setZentaoSyncOpen(true);
+                  }}
+                  disabled={props.busy}
+                >
+                  {zh ? '同步到禅道…' : 'Sync to ZenTao…'}
+                </Button>
+              ) : null}
+              {zentaoAvailable && zentaoLink?.kind === 'task' ? (
+                <Button
+                  variant="secondary"
+                  size="regular"
+                  onClick={() => {
+                    moreActionsRef.current?.hidePopover();
+                    setZentaoEffortOpen(true);
+                  }}
+                  disabled={props.busy}
+                >
+                  {zh ? '禅道工时…' : 'ZenTao hours…'}
+                </Button>
+              ) : null}
+              <Button
+                variant="secondary"
+                size="regular"
+                onClick={() => {
+                  moreActionsRef.current?.hidePopover();
+                  setProjectMoveOpen(true);
+                }}
+                disabled={props.busy}
+              >
+                <FolderOpenIcon size={16} aria-hidden="true" />
+                {zh ? '移动到其他项目…' : 'Move to another project…'}
+              </Button>
+              <Button
+                data-busy-behavior="background"
+                variant="secondary"
+                size="regular"
+                onClick={() => {
+                  moreActionsRef.current?.hidePopover();
+                  return props.onCopyTask(props.task);
+                }}
+                disabled={props.busy}
+              >
+                <CopySimpleIcon size={16} aria-hidden="true" />
+                {zh ? '复制任务…' : 'Copy task…'}
+              </Button>
+              <Button
+                variant="danger"
+                size="regular"
+                onClick={() => {
+                  moreActionsRef.current?.hidePopover();
+                  return props.onDeleteTask(props.task.id);
+                }}
+                disabled={props.busy}
+              >
+                <TrashIcon size={16} aria-hidden="true" />
+                {zh ? '删除任务…' : 'Delete task…'}
+              </Button>
+            </section>
+          </div>
         </div>
       </header>
 
-      {props.modelPushEntry?.error || modelPushFailed ? (
-        <section className="task-detail-feedback-rail" aria-label={zh ? '创建会话进度' : 'Conversation creation status'}>
-          {props.modelPushEntry?.error ? (
-            <span className="task-detail-model-push-feedback is-failed" role="status">
-              <VisibleApplicationError error={props.modelPushEntry.error} language={zh ? 'zh-CN' : 'en'} />
-            </span>
-          ) : null}
-          {modelPushFailed && props.modelPushOperation ? (
-            <span className="task-detail-model-push-feedback is-failed" role="alert" aria-live="assertive" aria-atomic="true">
-              <span>
-                <strong>
-                  <VisibleApplicationError error={props.modelPushOperation.errorCause ?? props.modelPushOperation.error} language={zh ? 'zh-CN' : 'en'} />
-                </strong>
-              </span>
-            </span>
-          ) : null}
-        </section>
-      ) : null}
-
-      {/* 高频管理项共用一行并允许自然换行，避免数字团队单独占用整行。 */}
-      <div className="task-detail-arrangement" aria-label={zh ? '状态、执行人与数字团队' : 'Status, employees, and digital team'}>
-        <span className="task-detail-summary-row">
-          <small>{zh ? '状态' : 'Status'}</small>
-          <TaskImmediateSelect
-            task={props.task}
-            value={managementStatus}
-            options={props.statusDefinitions.map((status) => ({
-              value: status.id,
-              label: props.statusLabels[status.id] ?? status.id,
-              color: status.color,
-            }))}
-            colorized
-            showSaveSpinner={false}
-            ariaLabel={props.copy.detailStatusSelectAria}
-            copy={editCopy}
-            disabled={props.busy}
-            onSave={(status, expectedUpdatedAt) => props.onManagementStatusChange(props.task.id, status, expectedUpdatedAt)}
-          />
-        </span>
-        {!props.terminalReadOnly ? (
-          <span className="task-detail-summary-row task-detail-executor-row">
-            {!hasTaskWork && props.onUseDigitalTeam ? (
-              <Button variant="secondary" size="compact" onClick={() => props.onUseDigitalTeam!({ kind: 'manage' })}>
-                {zh ? '使用数字团队' : 'Use a digital team'}
-              </Button>
-            ) : null}
-            <TaskDigitalEmployeeExecutor
-              taskId={props.task.id}
-              activeConversationId={props.activeConversationId}
-              projectId={props.task.projectId}
-              terminalReadOnly={props.terminalReadOnly}
-              client={props.digitalEmployeeClient ?? null}
-              language={props.language}
-              management={digitalEmployeeManagement}
-              onManageEmployees={props.onManageEmployees}
-              onLoadCapabilities={props.onLoadWorkflowCapabilities}
-            />
-          </span>
-        ) : null}
-      </div>
-      <div className="task-detail-workspace" data-has-activity={hasTaskActivity}>
-        {/* 主区连续展示说明与会话，信息列直接展开；断点只改布局，不重建编辑和会话组件。 */}
-        <div className="task-detail-reading">
+      <div className="task-detail-layout">
+        {/* 正文依次展示说明、属性和关系，右侧保留完整事件历史。 */}
+        <div className="task-detail-body">
           <section className="task-detail-requirements" aria-label={zh ? '任务说明' : 'Requirements'}>
             {taskOverview}
           </section>
-          <div className="task-detail-main">
-            <TaskDigitalEmployeePanel
-              onArrangeTeam={props.onUseDigitalTeam ? () => props.onUseDigitalTeam!({ kind: 'manage' }) : undefined}
-              onOpenTeamRun={props.onUseDigitalTeam ? (runId) => props.onUseDigitalTeam!({ kind: 'run', runId }) : undefined}
-              key={props.task.id}
-              taskId={props.task.id}
-              projectId={props.task.projectId}
-              terminalReadOnly={props.terminalReadOnly}
-              client={props.digitalEmployeeClient ?? null}
-              management={digitalEmployeeManagement}
-              language={props.language}
-              conversations={conversations}
-              conversationsLoading={props.conversationsLoading}
-              conversationsError={props.conversationsError}
-              activeConversationId={props.activeConversationId}
-              conversationWorkspace={props.conversationWorkspace}
-              newConversationWorkspace={props.terminalReadOnly ? null : props.newConversationWorkspace}
-              onSelectConversation={props.onSelectConversation ? (conversationId) => props.onSelectConversation!(props.task.id, conversationId) : undefined}
-              onReloadConversations={props.onReloadConversations ? () => props.onReloadConversations!(props.task.id) : undefined}
-              onOpenConversation={(conversationId) => props.onOpenConversation(props.task.id, conversationId)}
-            />
-          </div>
-        </div>
-        <aside className="task-detail-properties" aria-label={zh ? '任务信息' : 'Task information'}>
-          <section className="task-detail-metadata-section" aria-label={props.copy.metadataTitle}>
-            <h2 className="task-detail-information-heading">{zh ? '任务属性' : 'Task properties'}</h2>
-            <section className="task-detail-summary-grid task-detail-task-facts" aria-label={props.copy.metadataTitle}>
-              <span className="task-detail-summary-row">
-                <small>{zh ? '类型' : 'Type'}</small>
-                <TaskImmediateSelect
-                  task={props.task}
-                  value={props.task.taskType}
-                  options={taskTypeOptions}
-                  ariaLabel={zh ? '修改任务类型' : 'Change task type'}
-                  copy={editCopy}
-                  disabled={props.busy}
-                  onSave={(taskType, expectedUpdatedAt) => props.onUpdateTaskContent(props.task.id, { expectedUpdatedAt, taskType })}
-                />
-              </span>
-              <span className="task-detail-summary-row">
-                <small>{props.copy.priorityLabel ?? (zh ? '优先级' : 'Priority')}</small>
-                <TaskImmediateSelect
-                  task={props.task}
-                  value={taskPriority}
-                  options={priorityOptions}
-                  ariaLabel={zh ? '修改任务优先级' : 'Change task priority'}
-                  copy={editCopy}
-                  disabled={props.busy}
-                  onSave={(priority, expectedUpdatedAt) =>
-                    isTaskPriority(priority) ? props.onUpdateTaskContent(props.task.id, { expectedUpdatedAt, priority }) : Promise.reject(new Error(zh ? '无效的任务优先级。' : 'Invalid task priority.'))
-                  }
-                />
-              </span>
-              <div className="task-detail-summary-row">
-                <small>{zh ? '截止时间' : 'Deadline'}</small>
-                <TaskDeadlineEditor key={props.task.id} task={props.task} language={props.language} disabled={props.busy} onSave={(deadline, expectedUpdatedAt) => props.onUpdateTaskContent(props.task.id, { deadline, expectedUpdatedAt })} />
+          <section className="task-detail-block" aria-label={props.copy.conversationsTitle} aria-busy={props.conversationsLoading}>
+            <h2 className="task-detail-section-heading">{props.copy.conversationsTitle}</h2>
+            {props.conversationsError ? (
+              <div role="alert" className="task-inline-edit-feedback is-error">
+                {props.conversationsError}
+                <Button variant="secondary" size="compact" disabled={props.conversationsLoading} onClick={() => props.onReloadConversations(props.task.id)}>
+                  {props.copy.retryConversationLoad}
+                </Button>
               </div>
-              <span className="task-detail-summary-row">
-                <small>{props.copy.sourceLabel ?? (zh ? '上下文来源' : 'Context source')}</small>
-                <strong>{formatTaskSource(props.task, props.copy.sourceLabels)}</strong>
-              </span>
-              <span className="task-detail-summary-row">
-                <small>{props.copy.updatedAtLabel ?? (zh ? '更新时间' : 'Updated')}</small>
-                <strong>{formatTaskUpdatedAt(props.task.updatedAt, props.copy.updatedAtMissing ?? (zh ? '未记录' : 'Not recorded'))}</strong>
-              </span>
-              <span className="task-detail-summary-row task-detail-evidence-row">
-                <small>{props.copy.latestEvidenceLabel ?? (zh ? '最近事件' : 'Latest event')}</small>
-                <strong>
-                  {latestEvent ? (
-                    <>
-                      {formatTaskEventTitle(latestEvent, props.language)}
-                      <small>{formatTaskUpdatedAt(latestEvent.createdAt, props.copy.updatedAtMissing ?? (zh ? '未记录' : 'Not recorded'))}</small>
-                    </>
-                  ) : (
-                    (props.copy.noEvidence ?? (zh ? '暂无执行证据' : 'No task events yet'))
-                  )}
-                </strong>
-              </span>
-            </section>
-
-            <section className="task-detail-block task-detail-tags" aria-label={zh ? '任务标签' : 'Task tags'}>
-              <span className="task-detail-section-heading">
-                <strong>{zh ? '标签' : 'Tags'}</strong>
-                <small>{props.task.tags?.length ?? 0}</small>
-              </span>
-              <TaskDetailFieldAttachments
-                zh={zh}
-                field="tags"
-                attachments={taskAttachments}
-                pendingResources={previews.pendingResources}
-                copy={props.copy}
-                editCopy={editCopy}
-                disabled={props.busy || resourcesProcessing || attachmentSaveState.kind === 'saving'}
-                onRemove={(path) => void removeAttachment(path)}
-                onLoadPreview={props.onLoadAttachmentPreview}
-                onOpenAttachment={props.onOpenAttachment}
-              />
-              <InlineTaskTextField
-                resourcesProcessing={resourcesProcessing}
+            ) : null}
+            {conversations.length ? (
+              <ul className="task-detail-linked-list">
+                {conversations.map((conversation) => (
+                  <li key={conversation.id}>
+                    <Button unstyled type="button" className="task-detail-linked-task" onClick={() => props.onOpenConversation(props.task.id, conversation.id)}>
+                      <span>{conversation.title}</span>
+                      {conversation.archived ? <small>{props.copy.archivedConversation}</small> : null}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            ) : props.conversationsLoading ? (
+              <p role="status">{props.copy.conversationLoading}</p>
+            ) : !props.conversationsError ? (
+              <p>{props.copy.conversationEmptyTitle}</p>
+            ) : null}
+          </section>
+          <section className="task-detail-attributes" aria-label={props.copy.metadataTitle}>
+            <h2 className="task-detail-attributes-title">{props.copy.metadataTitle}</h2>
+            <div className="task-detail-attribute task-detail-inline-select">
+              <span className="task-detail-attribute-label">{zh ? '类型' : 'Type'}</span>
+              <TaskImmediateSelect
                 task={props.task}
-                label={editCopy.editTags}
-                value={taskTagsDraft(props.task.tags)}
-                display={
-                  props.task.tags && props.task.tags.length > 0 ? (
-                    <span className="task-detail-tag-list">
-                      {props.task.tags.map((tag) => (
-                        <span key={tag}>{tag}</span>
-                      ))}
-                    </span>
-                  ) : (
-                    <span className="task-inline-edit-empty">{editCopy.noTags}</span>
-                  )
-                }
+                value={props.task.taskType}
+                options={taskTypeOptions}
+                ariaLabel={zh ? '修改任务类型' : 'Change task type'}
                 copy={editCopy}
                 disabled={props.busy}
-                enterSeparates
-                buildPatch={(tags) => ({ tags: normalizeTaskTagsInput(tags) })}
-                valueFromTask={(task) => taskTagsDraft(task.tags)}
-                onSave={(input) => props.onUpdateTaskContent(props.task.id, input)}
-                onPasteResources={(request) => pasteTaskDetailResources('tags', request)}
+                onSave={(taskType, expectedUpdatedAt) => props.onUpdateTaskContent(props.task.id, { expectedUpdatedAt, taskType })}
               />
-            </section>
-          </section>
-          <section className="task-detail-block task-detail-relationships" aria-label={zh ? '任务关系' : 'Task relationships'}>
-            <header className="task-detail-section-heading">
-              <strong>{zh ? '任务关系' : 'Task relationships'}</strong>
-            </header>
-            <div className="task-detail-relationships-content">
-              <span className="task-detail-section-heading">
-                <span>
-                  <strong>{zh ? '父子关系' : 'Hierarchy'}</strong>
-                  <small>{zh ? `当前第 ${currentTaskDepth} 级` : `Level ${currentTaskDepth}`}</small>
-                </span>
-                <Button
-                  variant="secondary"
-                  size="compact"
-                  onClick={() => {
-                    setRelationshipHint('');
-                    props.onCreateChild(props.task.id);
-                  }}
-                  disabled={props.busy}
-                >
-                  {zh ? '新增子任务' : 'Add child task'}
-                </Button>
-              </span>
-              {relationshipHint && relationshipHintTarget === 'child' ? <p role="status">{relationshipHint}</p> : null}
-              <label className="task-detail-relationship-control">
-                <small>{zh ? '父任务' : 'Parent task'}</small>
-                <ZeusSelect
-                  size="regular"
-                  ariaLabel={zh ? '更换父任务' : 'Change parent task'}
-                  value={props.task.parentTaskId ?? ''}
-                  options={[{ value: '', label: zh ? '无父任务（根任务）' : 'No parent (root task)' }, ...validParentTasks.map((task) => ({ value: task.id, label: `${task.taskCode ?? task.id} · ${task.title}` }))]}
-                  onChange={(parentTaskId) => void saveRelationships({ parentTaskId: parentTaskId || null })}
-                  disabled={props.busy || relationshipSaveState.kind === 'saving'}
-                />
-              </label>
-              {directChildren.length > 0 ? (
-                <div className="task-detail-relationship-list">
-                  <small>{zh ? `直接子任务 ${directChildren.length} 个` : `${directChildren.length} direct children`}</small>
-                  {directChildren.map((task) => (
-                    <span key={task.id} className="task-detail-relationship-row">
-                      <button type="button" className="task-detail-relationship-link" onClick={() => props.onOpenRelatedTask(task.id)} aria-label={zh ? `打开任务详情：${task.title}` : `Open task details: ${task.title}`}>
-                        <strong>{task.title}</strong>
-                        <small>{task.taskCode ?? task.id}</small>
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-
-              <span className="task-detail-section-heading task-detail-related-heading">
-                <span>
-                  <strong>{zh ? '关联任务' : 'Related tasks'}</strong>
-                  <small>{relatedTasks.length}</small>
-                </span>
-              </span>
-              <div className="task-detail-related-add">
-                <ZeusSelect
-                  size="regular"
-                  ariaLabel={zh ? '选择要关联的任务' : 'Choose a related task'}
-                  value={relatedTaskCandidateId}
-                  options={[{ value: '', label: zh ? '请选择要关联的任务' : 'Select a task to relate', disabled: true }, ...relatedCandidateTasks.map((task) => ({ value: task.id, label: `${task.taskCode ?? task.id} · ${task.title}` }))]}
-                  onChange={(taskId) => {
-                    setRelatedTaskCandidateId(taskId);
-                    setRelationshipHint('');
-                  }}
-                  disabled={props.busy || relationshipSaveState.kind === 'saving' || relatedCandidateTasks.length === 0}
-                />
-                <Button
-                  variant="secondary"
-                  size="compact"
-                  disabled={props.busy || relationshipSaveState.kind === 'saving'}
-                  onClick={() => {
-                    // 必选条件通过反馈说明，空目标不得进入持久化请求。
-                    if (!relatedTaskCandidateId) {
-                      setRelationshipHintTarget('relation');
-                      setRelationshipHint(
-                        relatedCandidateTasks.length === 0
-                          ? zh
-                            ? '当前没有可关联的任务。请先在本项目创建其他任务。'
-                            : 'No tasks are available to link. Create another task in this project first.'
-                          : zh
-                            ? '请先从上方下拉框选择要关联的任务。'
-                            : 'Choose a task from the dropdown above first.',
-                      );
-                      return;
-                    }
-                    setRelationshipHint('');
-                    void saveRelationships({ relatedTaskIds: [...(props.task.relatedTaskIds ?? []), relatedTaskCandidateId] });
-                  }}
-                >
-                  {zh ? '添加关联' : 'Add relation'}
-                </Button>
-              </div>
-              {relationshipHint && relationshipHintTarget === 'relation' ? <p role="status">{relationshipHint}</p> : null}
-              <div className="task-detail-relationship-list" role="list">
-                {relatedTasks.map((task) => (
-                  <span key={task.id} className="task-detail-relationship-row" role="listitem">
-                    <button type="button" className="task-detail-relationship-link" onClick={() => props.onOpenRelatedTask(task.id)} aria-label={zh ? `打开任务详情：${task.title}` : `Open task details: ${task.title}`}>
-                      <strong>{task.title}</strong>
-                      <small>{task.taskCode ?? task.id}</small>
-                    </button>
-                    <Button
-                      variant="secondary"
-                      size="compact"
-                      onClick={() => void saveRelationships({ relatedTaskIds: (props.task.relatedTaskIds ?? []).filter((taskId) => taskId !== task.id) })}
-                      disabled={props.busy || relationshipSaveState.kind === 'saving'}
-                    >
-                      {zh ? '移除' : 'Remove'}
-                    </Button>
-                  </span>
-                ))}
-              </div>
-              <TaskEditFeedback state={relationshipSaveState} copy={editCopy} statusId={`${attachmentStatusId}-relationships`} />
             </div>
+            <div className="task-detail-attribute task-detail-inline-select">
+              <span className="task-detail-attribute-label">{props.copy.priorityLabel ?? (zh ? '优先级' : 'Priority')}</span>
+              <TaskImmediateSelect
+                task={props.task}
+                value={taskPriority}
+                options={priorityOptions}
+                ariaLabel={zh ? '修改任务优先级' : 'Change task priority'}
+                copy={editCopy}
+                disabled={props.busy}
+                onSave={(priority, expectedUpdatedAt) =>
+                  isTaskPriority(priority) ? props.onUpdateTaskContent(props.task.id, { expectedUpdatedAt, priority }) : Promise.reject(new Error(zh ? '无效的任务优先级。' : 'Invalid task priority.'))
+                }
+              />
+            </div>
+            <div className="task-detail-attribute task-detail-deadline" aria-label={zh ? '截止时间' : 'Deadline'}>
+              <span className="task-detail-attribute-label">{zh ? '截止时间' : 'Deadline'}</span>
+              <TaskDeadlineEditor key={props.task.id} task={props.task} language={props.language} disabled={props.busy} onSave={(deadline, expectedUpdatedAt) => props.onUpdateTaskContent(props.task.id, { deadline, expectedUpdatedAt })} />
+            </div>
+            <div className="task-detail-labels" aria-label={zh ? '任务标签' : 'Task tags'}>
+              <span className="task-detail-attribute-label">{zh ? '标签' : 'Tags'}</span>
+              <div className="task-detail-tag-value">
+                <TaskDetailFieldAttachments
+                  zh={zh}
+                  field="tags"
+                  attachments={taskAttachments}
+                  pendingResources={previews.pendingResources}
+                  copy={props.copy}
+                  editCopy={editCopy}
+                  disabled={props.busy || resourcesProcessing || attachmentSaveState.kind === 'saving'}
+                  onRemove={(path) => removeAttachment(path)}
+                  onLoadPreview={props.onLoadAttachmentPreview}
+                  onOpenAttachment={props.onOpenAttachment}
+                />
+                <InlineTaskTextField
+                  resourcesProcessing={resourcesProcessing}
+                  task={props.task}
+                  label={editCopy.editTags}
+                  value={taskTagsDraft(props.task.tags)}
+                  display={
+                    props.task.tags && props.task.tags.length > 0 ? (
+                      <span className="task-detail-tag-list">
+                        {props.task.tags.map((tag) => (
+                          <span key={tag}>{tag}</span>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="task-inline-edit-empty">{editCopy.noTags}</span>
+                    )
+                  }
+                  copy={editCopy}
+                  disabled={props.busy}
+                  enterSeparates
+                  buildPatch={(tags) => ({ tags: normalizeTaskTagsInput(tags) })}
+                  valueFromTask={(task) => taskTagsDraft(task.tags)}
+                  onSave={(input) => props.onUpdateTaskContent(props.task.id, input)}
+                  onPasteResources={(request) => pasteTaskDetailResources('tags', request)}
+                />
+              </div>
+            </div>
+            <dl className="task-detail-provenance">
+              <div>
+                <dt>{zh ? '项目' : 'Project'}</dt>
+                <dd>{props.projects.find((project) => project.id === props.task.projectId)?.name ?? props.task.projectId}</dd>
+              </div>
+              <div>
+                <dt>{props.copy.sourceLabel ?? (zh ? '来源' : 'Source')}</dt>
+                <dd>{formatTaskSource(props.task, props.copy.sourceLabels)}</dd>
+              </div>
+              <div>
+                <dt>{props.copy.updatedAtLabel ?? (zh ? '更新于' : 'Updated')}</dt>
+                <dd>
+                  <time dateTime={props.task.updatedAt ?? undefined}>{formatTaskUpdatedAt(props.task.updatedAt, props.copy.updatedAtMissing ?? (zh ? '未记录' : 'Not recorded'))}</time>
+                </dd>
+              </div>
+            </dl>
           </section>
+          <section className="task-detail-relations" aria-label={zh ? '任务关系' : 'Task relationships'}>
+            <header className="task-detail-relations-heading">
+              <h2>{zh ? '任务关系' : 'Relationships'}</h2>
+              <div className="task-detail-relations-actions">
+                <ZeusSelect
+                  className="task-detail-inline-select task-detail-link-picker"
+                  triggerClassName="task-detail-property-trigger"
+                  size="compact"
+                  ariaLabel={zh ? '关联任务' : 'Link a task'}
+                  value=""
+                  triggerLabel={zh ? '关联任务' : 'Link task'}
+                  triggerIcon={<LinkSimpleIcon size={14} aria-hidden="true" />}
+                  options={relatedCandidateTasks.map((task) => ({ value: task.id, label: `${task.taskCode ?? task.id} · ${task.title}` }))}
+                  searchPlaceholder={zh ? '搜索任务' : 'Search tasks'}
+                  emptyLabel={zh ? '没有可关联的任务' : 'No tasks available to link'}
+                  popoverMinWidth={300}
+                  onChange={(taskId) => saveRelationships({ relatedTaskIds: [...(props.task.relatedTaskIds ?? []), taskId] })}
+                  disabled={props.busy || relationshipSaveState.kind === 'saving'}
+                />
+                <Button className="task-detail-text-action" variant="secondary" size="compact" onClick={() => props.onCreateChild(props.task.id)} disabled={props.busy}>
+                  <PlusIcon size={14} aria-hidden="true" />
+                  {zh ? '子任务' : 'Subtask'}
+                </Button>
+              </div>
+            </header>
+            <div className="task-detail-parent">
+              <small>{zh ? '父任务' : 'Parent'}</small>
+              <ZeusSelect
+                className="task-detail-inline-select"
+                triggerClassName="task-detail-property-trigger"
+                size="compact"
+                ariaLabel={zh ? '更换父任务' : 'Change parent task'}
+                value={props.task.parentTaskId ?? ''}
+                options={[{ value: '', label: zh ? '根任务' : 'Root task' }, ...validParentTasks.map((task) => ({ value: task.id, label: `${task.taskCode ?? task.id} · ${task.title}` }))]}
+                searchPlaceholder={zh ? '搜索任务' : 'Search tasks'}
+                popoverMinWidth={300}
+                onChange={(parentTaskId) => saveRelationships({ parentTaskId: parentTaskId || null })}
+                disabled={props.busy || relationshipSaveState.kind === 'saving'}
+              />
+              {currentTaskDepth > 1 ? <small>{zh ? `第 ${currentTaskDepth} 级` : `Level ${currentTaskDepth}`}</small> : null}
+            </div>
+            {directChildren.length > 0 ? (
+              <div className="task-detail-linked-group">
+                <h3>
+                  {zh ? '子任务' : 'Subtasks'} <small>{directChildren.length}</small>
+                </h3>
+                <ul className="task-detail-linked-list">
+                  {directChildren.map((task) => (
+                    <li key={task.id}>
+                      <Button
+                        data-busy-behavior="background"
+                        unstyled
+                        type="button"
+                        className="task-detail-linked-task"
+                        onClick={() => props.onOpenRelatedTask(task.id)}
+                        aria-label={zh ? `打开任务详情：${task.title}` : `Open task details: ${task.title}`}
+                      >
+                        <small>{task.taskCode ?? task.id}</small>
+                        <span>{task.title}</span>
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {relatedTasks.length > 0 ? (
+              <div className="task-detail-linked-group">
+                <h3>
+                  {zh ? '关联任务' : 'Linked tasks'} <small>{relatedTasks.length}</small>
+                </h3>
+                <ul className="task-detail-linked-list">
+                  {relatedTasks.map((task) => (
+                    <li key={task.id}>
+                      <Button
+                        data-busy-behavior="background"
+                        unstyled
+                        type="button"
+                        className="task-detail-linked-task"
+                        onClick={() => props.onOpenRelatedTask(task.id)}
+                        aria-label={zh ? `打开任务详情：${task.title}` : `Open task details: ${task.title}`}
+                      >
+                        <small>{task.taskCode ?? task.id}</small>
+                        <span>{task.title}</span>
+                      </Button>
+                      <Button
+                        className="task-detail-unlink"
+                        variant="secondary"
+                        size="compact"
+                        aria-label={zh ? `解除关联：${task.title}` : `Unlink task: ${task.title}`}
+                        title={zh ? '解除关联' : 'Unlink task'}
+                        onClick={() => saveRelationships({ relatedTaskIds: (props.task.relatedTaskIds ?? []).filter((taskId) => taskId !== task.id) })}
+                        disabled={props.busy || relationshipSaveState.kind === 'saving'}
+                      >
+                        <XIcon size={14} aria-hidden="true" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            <TaskEditFeedback state={relationshipSaveState} copy={editCopy} statusId={`${attachmentStatusId}-relationships`} />
+          </section>
+        </div>
+        <aside className="task-detail-activity" aria-label={props.copy.eventsTitle} tabIndex={0}>
           <section className="task-detail-block task-detail-events" aria-label={props.copy.eventsTitle}>
             <header className="task-detail-section-heading">
               <strong>{props.copy.eventsTitle}</strong>
@@ -1683,15 +1590,6 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
               </ol>
             )}
           </section>
-          <TaskProjectActions
-            key={`${props.task.id}:${props.task.projectId}`}
-            task={props.task}
-            projects={props.projects}
-            language={props.language}
-            busy={props.busy}
-            onUpdateTaskContent={props.onUpdateTaskContent}
-            onCopyTask={props.onCopyTask}
-          />
         </aside>
       </div>
       {undoAttachment || attachmentSaveState.kind === 'saving' || attachmentSaveState.kind === 'error' || attachmentSaveState.kind === 'conflict' ? (
@@ -1700,7 +1598,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
           {undoAttachment ? (
             <span className="task-detail-attachment-undo">
               <small role="status">{zh ? `已解除 ${undoAttachment.name} 的任务关联。` : `Removed ${undoAttachment.name} from this task.`}</small>
-              <Button variant="secondary" size="compact" onClick={() => void restoreRemovedAttachment()}>
+              <Button variant="secondary" size="compact" onClick={() => restoreRemovedAttachment()}>
                 {editCopy.undoAttachment}
               </Button>
             </span>

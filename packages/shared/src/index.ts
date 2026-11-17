@@ -579,6 +579,7 @@ export function normalizeTaskBoardViewSettings(value: unknown, fallback: TaskBoa
 }
 
 export * from './browser.js';
+export * from './browserTranslation.js';
 export * from './commands.js';
 export * from './conversationContext.js';
 export * from './conversationResources.js';
@@ -879,6 +880,7 @@ export type DigitalEmployeeAvatarId = (typeof digitalEmployeeAvatarIds)[number];
 export * from './distribution.js';
 
 export * from './conversationCapabilities.js';
+export * from './faultReport.js';
 export * from './employeeWorkPlanning.js';
 export * from './employeeIdentity.js';
 export * from './automationActions.js';
@@ -888,4 +890,6 @@ export * from './projectSourceLanguage.js';
 export type { McpConfigurationCatalog } from './mcpServiceCatalog.js';
 export type { AttentionItem, AttentionKind, AttentionSnapshot, AttentionTarget, AttentionItemState, SetAttentionItemClosedInput } from './attention.js';
 export { gitConflictPreservationInstructions } from './gitConflictGuidance.js';
-export type { GitEnvironmentScope, GitEnvironmentWorkspace, GitEnvironmentSummary } from './gitEnvironmentSummary.js';
+export type { GitEnvironmentScope, GitEnvironmentWorkspace, GitEnvironmentSummary, GitEnvironmentStatus } from './gitEnvironmentSummary.js';
+
+export * from './workflowPrimitives.js';

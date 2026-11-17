@@ -1,11 +1,12 @@
 import type { FilePreviewIntent, FilePreviewRequest } from '@zeus/shared';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createHash } from 'node:crypto';
 import type { MainCommandHistoryCursor, MainCommandLedger, MainCommandOutcome } from './mainCommandLedger.js';
 import {
   discoverGitRepositories,
+  projectGitRepositoryId,
   executeProjectGitAction,
+  withGitRepositoryOperation,
   getProjectGitCommitDetail,
   getProjectGitPushPreview,
   type ProjectGitPushPreviewInput,
@@ -68,20 +69,25 @@ export class ProjectGitWorkbenchService {
   private readonly activeRepositories = new Set<string>();
   constructor(private readonly loadProject: (projectId: string) => Promise<ProjectGitProjectIdentity>) {}
 
-  async loadWorkbench(projectId: string): Promise<ProjectGitWorkbenchSnapshot> {
+  /** 打开窗口只核对归属，不提前生成窗口随后还会读取的完整快照。 */
+  async validateDeliveryScope(projectId: string, repositoryId?: string): Promise<void> {
+    if (repositoryId !== undefined) await this.resolveRepository(projectId, repositoryId);
+    else await this.requireProject(projectId);
+  }
+
+  /** 文件列表读取可跳过补丁，完整工作台仍保留原有快照。 */
+  async loadWorkbench(projectId: string, includePatches = true): Promise<ProjectGitWorkbenchSnapshot> {
     const project = await this.requireProject(projectId);
     const repositories = await discoverGitRepositories(project.localPath);
     return {
       projectId: project.id,
       projectName: project.name,
       refreshedAt: new Date().toISOString(),
-      repositories: await mapWithConcurrency(repositories, async (repository) => ({
-        ...(await loadNavigationMetadata(repository.localPath)),
-        id: stableRepositoryId(project.id, repository.relativePath),
-        name: repository.name,
-        relativePath: repository.relativePath,
-        snapshot: await getProjectGitRepositorySnapshot(repository.localPath),
-      })),
+      repositories: await mapWithConcurrency(repositories, async (repository) => {
+        /** 导航元数据与工作区状态互不依赖，在既有并发上限内一起读取。 */
+        const [navigation, snapshot] = await Promise.all([loadNavigationMetadata(repository.localPath), getProjectGitRepositorySnapshot(repository.localPath, includePatches, repository.context)]);
+        return { ...navigation, id: projectGitRepositoryId(project.id, repository.relativePath), name: repository.name, relativePath: repository.relativePath, snapshot };
+      }),
     };
   }
 
@@ -95,7 +101,7 @@ export class ProjectGitWorkbenchService {
     /** 项目身份与正常工作台入口共用校验。 */
     const project = await this.requireProject(projectId);
     /** 仓库名称从当前发现结果取得，不信任历史输出内的名称或路径。 */
-    const repositories = new Map((await discoverGitRepositories(project.localPath)).map((repository) => [stableRepositoryId(project.id, repository.relativePath), repository.name]));
+    const repositories = new Map((await discoverGitRepositories(project.localPath)).map((repository) => [projectGitRepositoryId(project.id, repository.relativePath), repository.name]));
     /** 游标与项目绑定，禁止拿另一项目的分页位置混合记录。 */
     const position = parseOperationCursor(project.id, cursor);
     /** 账本只读取本页结果，投影之后不把仓库快照传到页面。 */
@@ -118,10 +124,10 @@ export class ProjectGitWorkbenchService {
     return getProjectGitPushPreview(resolved.repository.localPath, input);
   }
 
-  async loadComparison(projectId: string, repositoryId: string, ref: string, mode: 'current' | 'working-tree'): Promise<GitDiffSummary> {
+  async loadComparison(projectId: string, repositoryId: string, ref: string, mode: 'current' | 'working-tree' | 'staged' | 'unstaged', path?: string, summaryOnly = false): Promise<GitDiffSummary> {
     const resolved = await this.resolveRepository(projectId, repositoryId);
     if (!ref.trim()) throw projectGitError('ZEUS_GIT_REF_REQUIRED', '必须选择一个比较分支。');
-    return getProjectGitComparisonDiff(resolved.repository.localPath, ref, mode);
+    return getProjectGitComparisonDiff(resolved.repository.localPath, ref, mode, path, summaryOnly);
   }
 
   /** 桌面仓库身份由自身发现服务校验，不与宿主数据库的登记 ID 混用。 */
@@ -150,31 +156,34 @@ export class ProjectGitWorkbenchService {
     if (this.activeRepositories.has(repositoryPath)) throw projectGitError('ZEUS_GIT_BUSY', '该仓库已有 Git 操作正在执行，请等待完成。');
     this.activeRepositories.add(repositoryPath);
     try {
-      await beforeWrite(resolved.repository, action);
-      signal?.throwIfAborted();
-      // 桌面、Core 和模型子进程继承同一系统认证入口，不为每次操作创建临时提示程序。
-      const result = await executeProjectGitAction(resolved.repository.localPath, action, signal, undefined, onCommand).catch((error: unknown) => {
-        // 取消也保留底层的恢复信息，尤其是尚未恢复的智能暂存编号。
-        const message = redactGitOutput(error instanceof Error ? error.message : String(error));
-        const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
-        const details = isRecord(error) && typeof error.details === 'string' ? error.details : undefined;
-        if (signal?.aborted) throw projectGitError('ZEUS_GIT_CANCELLED', `Git 操作已中止，请刷新核对仓库状态。已完成的写入不会自动撤销；推送结果需要核对远端。\n${message}`);
-        if (/authentication failed|could not read Username|terminal prompts disabled|permission denied.*publickey/iu.test(message)) {
-          throw projectGitError('ZEUS_GIT_AUTH_REQUIRED', `Git 鉴权失败。请检查系统凭据管理器、SSH agent 和仓库访问权限后重试。\n${message}`);
-        }
-        if (/host key verification failed/iu.test(message)) throw projectGitError('ZEUS_GIT_HOST_UNVERIFIED', `SSH 主机验证失败，请核对服务器指纹和 known_hosts 后重试。\n${message}`);
-        if (/SIGKILL|ETIMEDOUT/iu.test(message)) throw projectGitError('ZEUS_GIT_TIMEOUT', 'Git 操作超过两分钟，已停止等待。请刷新仓库核对操作结果；推送结果也需要核对远端。');
-        // Git Core 已经识别出的可处理原因不能再次降级成通用失败，否则界面会丢失具体提示。
-        if (code.startsWith('ZEUS_GIT_') && code !== 'ZEUS_GIT_COMMAND_FAILED') throw projectGitError(code, message, details);
-        throw projectGitError('ZEUS_GIT_ACTION_FAILED', message, details);
+      // 锁竞争必须发生在耐久写标记之前；底层 Git 执行器复用同一锁的可重入所有权。
+      return await withGitRepositoryOperation(repositoryPath, async () => {
+        await beforeWrite(resolved.repository, action);
+        signal?.throwIfAborted();
+        // 桌面、Core 和模型子进程继承同一系统认证入口，不为每次操作创建临时提示程序。
+        const result = await executeProjectGitAction(repositoryPath, action, signal, undefined, onCommand);
+        return {
+          projectId: resolved.project.id,
+          repositoryId: resolved.id,
+          repositoryName: resolved.repository.name,
+          result,
+          snapshot: await getProjectGitRepositorySnapshot(repositoryPath),
+        };
       });
-      return {
-        projectId: resolved.project.id,
-        repositoryId: resolved.id,
-        repositoryName: resolved.repository.name,
-        result,
-        snapshot: await getProjectGitRepositorySnapshot(resolved.repository.localPath),
-      };
+    } catch (error: unknown) {
+      // 取消也保留底层的恢复信息，尤其是尚未恢复的智能暂存编号。
+      const message = redactGitOutput(error instanceof Error ? error.message : String(error));
+      const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
+      const details = isRecord(error) && typeof error.details === 'string' ? error.details : undefined;
+      if (signal?.aborted) throw projectGitError('ZEUS_GIT_CANCELLED', `Git 操作已中止，请刷新核对仓库状态。已完成的写入不会自动撤销；推送结果需要核对远端。\n${message}`);
+      if (/authentication failed|could not read Username|terminal prompts disabled|permission denied.*publickey/iu.test(message)) {
+        throw projectGitError('ZEUS_GIT_AUTH_REQUIRED', `Git 鉴权失败。请检查系统凭据管理器、SSH agent 和仓库访问权限后重试。\n${message}`);
+      }
+      if (/host key verification failed/iu.test(message)) throw projectGitError('ZEUS_GIT_HOST_UNVERIFIED', `SSH 主机验证失败，请核对服务器指纹和 known_hosts 后重试。\n${message}`);
+      if (/SIGKILL|ETIMEDOUT/iu.test(message)) throw projectGitError('ZEUS_GIT_TIMEOUT', 'Git 操作超过两分钟，已停止等待。请刷新仓库核对操作结果；推送结果也需要核对远端。');
+      // Git Core 已经识别出的可处理原因不能再次降级成通用失败，否则界面会丢失具体提示。
+      if (code.startsWith('ZEUS_GIT_') && code !== 'ZEUS_GIT_COMMAND_FAILED') throw projectGitError(code, message, details);
+      throw projectGitError('ZEUS_GIT_ACTION_FAILED', message, details);
     } finally {
       this.activeRepositories.delete(repositoryPath);
     }
@@ -195,7 +204,7 @@ export class ProjectGitWorkbenchService {
     const normalizedRepositoryId = repositoryId.trim();
     if (!normalizedRepositoryId) throw projectGitError('ZEUS_GIT_REPOSITORY_REQUIRED', '必须选择一个项目仓库。');
     const repositories = await discoverGitRepositories(project.localPath);
-    const repository = repositories.find((candidate) => stableRepositoryId(project.id, candidate.relativePath) === normalizedRepositoryId);
+    const repository = repositories.find((candidate) => projectGitRepositoryId(project.id, candidate.relativePath) === normalizedRepositoryId);
     if (!repository) throw projectGitError('ZEUS_GIT_REPOSITORY_NOT_FOUND', '所选仓库已不属于当前项目，请刷新 Git 工作台。');
     return { id: normalizedRepositoryId, project, repository };
   }
@@ -266,10 +275,6 @@ function projectOperationRecord(projectId: string, repositoryId: string, reposit
   };
 }
 
-function stableRepositoryId(projectId: string, relativePath: string): string {
-  return `project_git_repository_${createHash('sha256').update(`${projectId}\0${relativePath}`).digest('hex').slice(0, 24)}`;
-}
-
 /** 解析桌面动作白名单，并保留用户确认的目标快照供共享 Git 层核验。 */
 function parseProjectGitAction(value: unknown): ProjectGitAction {
   if (!isRecord(value) || typeof value.type !== 'string') throw projectGitError('ZEUS_GIT_ACTION_INVALID', '必须选择受支持的 Git 动作。');
@@ -291,8 +296,9 @@ function parseProjectGitAction(value: unknown): ProjectGitAction {
       return { type: value.type, kind: value.kind };
     case 'fetch':
       return { type: 'fetch', remote: stringValue('remote') };
+    case 'rollback':
     case 'discard':
-      return { type: 'discard', paths: paths() };
+      return { type: value.type, paths: paths() };
     case 'rename_branch':
       return { type: 'rename_branch', branchName: stringValue('branchName') ?? '', newName: stringValue('newName') ?? '' };
     case 'create_tag':

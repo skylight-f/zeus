@@ -36,9 +36,9 @@ interface ConversationChoiceQueryPorts {
   snapshots: Pick<ConversationSnapshotV2Repository, 'searchContent' | 'pendingAsyncQuestionConversationIds'>;
   projects: Pick<ProjectRepository, 'list' | 'listArchived' | 'getById'>;
   tasks: Pick<TaskRepository, 'getById' | 'listByProject' | 'summariesByIds'>;
-  conversations: Pick<ConversationRepository, 'getById' | 'hasMessages' | 'listRecordsByProject' | 'listRecordsByTask' | 'listUnarchivedRecords' | 'meaningfulActivityAt' | 'workStartedAt'>;
+  conversations: Pick<ConversationRepository, 'getById' | 'getDeliveryConflictOrigin' | 'hasMessages' | 'listRecordsByProject' | 'listRecordsByTask' | 'listUnarchivedRecords' | 'meaningfulActivityAt' | 'workStartedAt'>;
   requests: Pick<ConversationServerRequestRepository, 'listPending' | 'listPendingByConversation'>;
-  submissions: Pick<ConversationSubmissionRepository, 'listRecoverable' | 'getEarliestCreatedByConversation' | 'getEarliestOperationIdentityByConversation'>;
+  submissions: Pick<ConversationSubmissionRepository, 'listRecoverable' | 'getEarliestCreatedByConversation' | 'getEarliestOperationIdentityByConversation' | 'getSourceConversationId'>;
   turns: Pick<ConversationTurnRepository, 'listInProgress'>;
   workspaces: Pick<TaskWorkspaceRepository, 'listByProject' | 'getById'>;
   codexNativeEnabled: boolean;
@@ -268,14 +268,19 @@ export class ConversationChoiceQueryApplication {
             ? 'direct'
             : null;
 
+    /** 同一投影只读取一次交付关联，任务和交付入口使用同一来源。 */
+    const deliveryOrigin = this.ports.conversations.getDeliveryConflictOrigin(conversation.id);
     return {
       id: conversation.id,
+      sourceConversationId: this.ports.submissions.getSourceConversationId(conversation.id),
       workspaceMode,
       executionPath,
       /** 列表与创建回执共用持久创建身份，使提前到达的真实会话归入同一次推送。 */
       creationOperationIdentity: this.ports.submissions.getEarliestOperationIdentityByConversation(conversation.id),
       projectId: conversation.projectId,
-      taskId: conversation.taskId,
+      taskId: conversation.taskId ?? deliveryOrigin?.taskId ?? null,
+      /** 交付按钮和快捷键返回原运行，不从冲突隔离目录另建交付。 */
+      deliverySourceConversationId: deliveryOrigin?.conversationId ?? null,
       workspaceId: conversation.workspaceId,
       environmentId: conversation.environmentId,
       workspace: conversation.workspaceId ? (context.workspaceById.get(conversation.workspaceId) ?? this.ports.workspaces.getById(conversation.workspaceId) ?? null) : null,
@@ -304,7 +309,7 @@ export class ConversationChoiceQueryApplication {
       agent: {
         kind: conversation.agentKind,
         transport: conversation.agentTransport,
-        supportStatus: conversation.agentKind === 'codex' && this.ports.codexNativeEnabled ? 'verified' : conversation.agentKind === 'pi' ? 'experimental' : 'unavailable',
+        supportStatus: conversation.agentKind === 'codex' && this.ports.codexNativeEnabled ? 'verified' : conversation.agentKind === 'pi' || conversation.agentKind === 'copilot' ? 'experimental' : 'unavailable',
         capabilitySnapshotId: conversation.capabilitySnapshotId,
       },
       model: { sourceId: conversation.modelSourceId, id: conversation.modelId ?? conversation.providerModel },

@@ -66,6 +66,8 @@ export interface GitCommitSummary {
 }
 
 export interface GitFileStatusSummary {
+  /** 来自 Git 原始模式的子模块类型。 */
+  isSubmodule?: boolean;
   path: string;
   originalPath?: string;
   indexStatus: string;
@@ -99,6 +101,8 @@ export interface ProjectGitRecentRef {
 }
 
 export interface ProjectGitRepositorySnapshot {
+  /** 当前分支创建时的固定提交；null 表示无法确定起点。 */
+  sourceHeadSha?: string | null;
   submodules?: { path: string; initialized: boolean }[];
   branch: string;
   detached: boolean;
@@ -131,6 +135,8 @@ export interface ProjectGitRepositorySnapshot {
 }
 
 export interface ProjectGitRepositoryWorkbenchItem {
+  /** 创建会话工作树时记录的来源；普通目录或历史缺失为空。 */
+  sourceBranch?: string | null;
   /** 服务端校验过的会话工作树目录。 */
   localPath?: string;
   id: string;
@@ -153,6 +159,8 @@ export interface ProjectGitWorkbenchSnapshot {
 
 export type ProjectGitAction =
   | { type: 'discard'; paths: string[] }
+  /** 恢复所选文件的暂存与工作区版本。 */
+  | { type: 'rollback'; paths: string[] }
   | { type: 'rename_branch'; branchName: string; newName: string }
   | { type: 'create_tag'; tagName: string; revision: string; message?: string }
   | { type: 'push_tag'; tagName: string; remote: string }

@@ -4,22 +4,28 @@ import { installIconTooltips } from './iconTooltip.js';
 import { installMarkdownListInput } from './markdownListInput.js';
 import { selectionCommentIcons } from './selectionCommentIcons.js';
 import selectionCommentStyles from '../renderer/session/selectionComment.css?inline';
+import { createBrowserPageTranslation, translationSourceElement, sourceText, isTranslationNode } from './browserTranslation.js';
+import type { BrowserTranslationSegment } from '@zeus/shared';
+import { installBrowserPasswordAutofill } from './browserPasswordAutofill.js';
 
-function invokeBrowserPageCommand(commandType: string, body: unknown): Promise<unknown> {
+function invokeBrowserPageCommand(commandType: string, body: unknown, channel = 'zeus:browser-page:save-comment'): Promise<unknown> {
   const commandId = globalThis.crypto.randomUUID();
   const envelope = Object.freeze({
     schemaGeneration: 'zeus-command-envelope-v1',
     commandId,
     commandType,
     actor: Object.freeze({ kind: 'user', id: 'desktop-browser-page-user' }),
-    scope: Object.freeze({ kind: 'artifact', id: 'browser-page-comment' }),
+    scope: Object.freeze({ kind: 'artifact', id: channel === 'zeus:browser-page:save-comment' ? 'browser-page-comment' : 'browser-passwords' }),
     expectedRevision: null,
     idempotencyKey: `desktop-browser-page:${commandId}`,
     issuedAt: new Date().toISOString(),
-    payload: Object.freeze({ transport: 'electron-ipc', channel: 'zeus:browser-page:save-comment' }),
+    payload: Object.freeze({ transport: 'electron-ipc', channel }),
   });
-  return ipcRenderer.invoke('zeus:browser-page:save-comment', Object.freeze({ envelope, body }));
+  return ipcRenderer.invoke(channel, Object.freeze({ envelope, body }));
 }
+
+/** 登录字段识别、动态监听与填充统一由固定的上游内容脚本负责。 */
+installBrowserPasswordAutofill((generation) => invokeBrowserPageCommand('desktop.browser.autofill', { generation }, 'zeus:browser-page:show-passwords'));
 
 type Rect = { x: number; y: number; width: number; height: number };
 type DesignChange = { kind: 'text' | 'style'; selector?: string; property?: string; previous: string; next: string };
@@ -87,6 +93,8 @@ const state = {
   editorAnchor: null as PageAnchor | null,
   editorPoint: null as { x: number; y: number } | null,
   editorTarget: null as HTMLElement | null,
+  /** 当前批注的本地提交独占浮层，回执不能关闭或复活另一条批注。 */
+  editorSaving: false,
   renderScheduled: false,
 };
 
@@ -98,6 +106,19 @@ let markerLayer: HTMLDivElement | null = null;
 let editorPin: HTMLDivElement | null = null;
 let editor: HTMLDivElement | null = null;
 let speechRecognition: SpeechRecognitionLike | null = null;
+
+/** 翻译走隔离预加载与 Main；网页不获得模型调用接口。 */
+const pageTranslation = createBrowserPageTranslation({
+  translate: async (runId, segments) => {
+    /** 业务错误不带 Electron IPC 前缀，工具栏直接显示可操作的原因。 */
+    const result = (await ipcRenderer.invoke('zeus:browser-page:translate', { runId, segments })) as { segments?: BrowserTranslationSegment[]; error?: string };
+    if (!result.segments) throw new Error(result.error || '翻译失败，请重试。');
+    return result.segments;
+  },
+  report: (runId, state, message) => ipcRenderer.send('zeus:browser-page:translation-state', { runId, state, message }),
+  onLayout: () => render(),
+});
+window.addEventListener('pagehide', () => pageTranslation.stop(), { once: true });
 
 function install(): void {
   if (document.getElementById(overlayRootId)) return;
@@ -287,7 +308,7 @@ function openEditor(
   },
   existing?: BrowserComment,
 ): void {
-  if (!editor) return;
+  if (!editor || state.editorSaving) return;
   state.editingCommentId = existing?.id;
   state.editorAnchor = anchor;
   state.editorPoint = point;
@@ -323,7 +344,10 @@ function openEditor(
   editor.querySelector('[data-action="save"]')?.addEventListener('click', () => void saveComment());
   const voiceButton = editor.querySelector<HTMLButtonElement>('[data-action="voice"]');
   if (voiceButton) installVoiceInput(voiceButton, textarea);
-  textarea.addEventListener('input', () => syncEditorActions(textarea));
+  textarea.addEventListener('input', () => {
+    textarea.setCustomValidity('');
+    syncEditorActions(textarea);
+  });
   textarea.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       event.preventDefault();
@@ -371,7 +395,7 @@ function syncEditorActions(textarea: HTMLTextAreaElement): void {
   textarea.style.height = `${Math.min(112, Math.max(28, textarea.scrollHeight))}px`;
   const hasBody = Boolean(textarea.value.trim());
   const saveButton = editor.querySelector<HTMLButtonElement>('[data-action="save"]');
-  if (saveButton) saveButton.disabled = !hasBody;
+  if (saveButton) saveButton.disabled = state.editorSaving || !hasBody;
   editor.dataset.expanded = String(textarea.scrollHeight > 36 || editor.querySelector('[data-action="options"]')?.getAttribute('aria-expanded') === 'true');
   if (state.editorAnchor) positionEditor(state.editorAnchor);
 }
@@ -397,6 +421,7 @@ function installVoiceInput(button: HTMLButtonElement, textarea: HTMLTextAreaElem
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.onresult = (event) => {
+      if (state.editorSaving || editor?.querySelector('textarea') !== textarea) return;
       const transcript = [...Array(event.results.length).keys()]
         .map((index) => event.results[index]?.[0]?.transcript ?? '')
         .join(' ')
@@ -409,7 +434,7 @@ function installVoiceInput(button: HTMLButtonElement, textarea: HTMLTextAreaElem
       button.dataset.listening = 'false';
       button.dataset.iconTooltip = '语音输入';
       button.setAttribute('aria-label', '语音输入');
-      speechRecognition = null;
+      if (speechRecognition === recognition) speechRecognition = null;
     };
     recognition.onend = finish;
     recognition.onerror = finish;
@@ -422,7 +447,7 @@ function installVoiceInput(button: HTMLButtonElement, textarea: HTMLTextAreaElem
 }
 
 async function saveComment(): Promise<void> {
-  if (!editor || !state.editorAnchor) return;
+  if (!editor || !state.editorAnchor || state.editorSaving) return;
   const textarea = editor.querySelector<HTMLTextAreaElement>('textarea');
   const body = textarea?.value.trim() ?? '';
   // 输入法提交和重复点击不得创建多条相同评论。
@@ -432,9 +457,14 @@ async function saveComment(): Promise<void> {
     return;
   }
   const buttons = [...editor.querySelectorAll<HTMLButtonElement>('button')];
+  /** 已显示的正文在本地回执前保留，失败时仍可原地编辑与重试。 */
+  state.editorSaving = true;
+  speechRecognition?.stop();
   for (const button of buttons) button.disabled = true;
-  editor.hidden = true;
-  render();
+  editor.setAttribute('aria-busy', 'true');
+  editor.querySelector('[data-action="save"]')?.setAttribute('aria-busy', 'true');
+  if (textarea) textarea.readOnly = true;
+  renderMarkers();
   try {
     await invokeBrowserPageCommand('desktop.browser.save_comment', {
       commentId: state.editingCommentId,
@@ -443,18 +473,28 @@ async function saveComment(): Promise<void> {
       // 保留旧评论的已存调整信息，新评论只记录用户内容。
       designChanges: state.comments.find((comment) => comment.id === state.editingCommentId)?.designChanges ?? [],
     });
+    state.editorSaving = false;
     closeEditor();
   } catch (error) {
-    editor.hidden = false;
-    render();
-    for (const button of buttons) button.disabled = false;
+    if (textarea) textarea.readOnly = false;
     textarea?.setCustomValidity(error instanceof Error ? error.message : String(error));
     textarea?.reportValidity();
+  } finally {
+    state.editorSaving = false;
+    editor.removeAttribute('aria-busy');
+    editor.querySelector('[data-action="save"]')?.removeAttribute('aria-busy');
+    for (const button of buttons) button.disabled = false;
+    if (textarea) {
+      textarea.readOnly = false;
+      syncEditorActions(textarea);
+    }
+    renderMarkers();
   }
 }
 
 /** 关闭评论仅清理浮层，不修改被评论的网页内容。 */
 function closeEditor(): void {
+  if (state.editorSaving) return;
   if (speechRecognition) {
     speechRecognition.stop();
     speechRecognition = null;
@@ -480,8 +520,8 @@ function elementAnchor(element: Element): PageAnchor {
   const role = element.getAttribute('role') || implicitRole(element);
   const explicitAccessibleName = element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || '';
   const inputValue = element instanceof HTMLInputElement ? element.value : '';
-  const semanticText = element instanceof HTMLElement ? firstVisibleTextNode(element)?.data : element.textContent;
-  const accessibleName = explicitAccessibleName || (role === 'button' || role === 'link' || role === 'heading' ? normalizedText(inputValue || semanticText || element.textContent, 1_000) : '');
+  const semanticText = element instanceof HTMLElement ? firstVisibleTextNode(element)?.data : sourceText(element);
+  const accessibleName = explicitAccessibleName || (role === 'button' || role === 'link' || role === 'heading' ? normalizedText(inputValue || semanticText || sourceText(element), 1_000) : '');
   return baseAnchor('element', rect, {
     selector: selectorFor(element),
     elementPath: elementPath(element),
@@ -489,16 +529,18 @@ function elementAnchor(element: Element): PageAnchor {
     role,
     accessibleName,
     tagName: element.tagName,
-    immediateText: normalizedText(element.textContent, 2_000),
-    nearbyText: normalizedText(element.parentElement?.textContent, 2_000),
+    immediateText: normalizedText(sourceText(element), 2_000),
+    nearbyText: normalizedText(sourceText(element.parentElement), 2_000),
     fixed: style.position === 'fixed' || style.position === 'sticky',
   });
 }
 
 function regionAnchor(rect: Rect): PageAnchor {
-  const element = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+  const target = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+  /** 译文浮层所在区域使用原文元素保存定位。 */
+  const element = target ? translationSourceElement(target) : null;
   return baseAnchor('region', rect, {
-    ...(element ? { selector: selectorFor(element), elementPath: elementPath(element), nearbyText: normalizedText(element.parentElement?.textContent, 2_000) } : {}),
+    ...(element ? { selector: selectorFor(element), elementPath: elementPath(element), nearbyText: normalizedText(sourceText(element.parentElement), 2_000) } : {}),
   });
 }
 
@@ -508,8 +550,10 @@ function textAnchor(selection: Selection): PageAnchor {
   const rect = unionRects(rects);
   const startElement = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
   const endElement = range.endContainer instanceof Element ? range.endContainer : range.endContainer.parentElement;
+  // 译文字数与原文偏移不同，保存原文元素锚点，避免恢复原文后留下失效的文本范围。
+  if (startElement && (isTranslationNode(range.startContainer) || isTranslationNode(range.endContainer))) return elementAnchor(translationSourceElement(startElement));
   return baseAnchor('text', rect, {
-    ...(startElement ? { selector: selectorFor(startElement), elementPath: elementPath(startElement), nearbyText: normalizedText(startElement.parentElement?.textContent, 2_000) } : {}),
+    ...(startElement ? { selector: selectorFor(startElement), elementPath: elementPath(startElement), nearbyText: normalizedText(sourceText(startElement.parentElement), 2_000) } : {}),
     immediateText: normalizedText(selection.toString(), 20_000),
     textRange: {
       text: selection.toString(),
@@ -648,6 +692,7 @@ function renderMarkers(): void {
     const marker = document.createElement('button');
     marker.className = 'marker session-response-annotation-marker';
     marker.type = 'button';
+    marker.disabled = state.editorSaving;
     marker.textContent = String(comment.number);
     marker.dataset.commentId = comment.id;
     marker.dataset.iconTooltip = `编辑第${comment.number}条网页评论`;
@@ -747,7 +792,8 @@ function isOverlayEvent(event: Event): boolean {
 }
 
 function annotationTargetFromEvent(event: Event): Element | null {
-  const raw = event.composedPath().find((candidate): candidate is Element => candidate instanceof Element && !isOverlayNode(candidate));
+  const target = event.composedPath().find((candidate): candidate is Element => candidate instanceof Element && !isOverlayNode(candidate));
+  const raw = target ? translationSourceElement(target) : null;
   if (!raw) return null;
   return raw.closest('button,a[href],input,textarea,select,summary,[role],[contenteditable="true"]') ?? raw;
 }
@@ -813,7 +859,7 @@ function firstVisibleTextNode(element: HTMLElement): Text | null {
       const parent = node.parentElement;
       /** 样式只用于判断可见性。 */
       const style = parent ? getComputedStyle(parent) : null;
-      if (parent && !parent.closest('script,style,noscript,[aria-hidden="true"]') && style?.display !== 'none' && style?.visibility !== 'hidden') return node;
+      if (parent && !isTranslationNode(node) && !parent.closest('script,style,noscript,[aria-hidden="true"]') && style?.display !== 'none' && style?.visibility !== 'hidden') return node;
     }
     node = walker.nextNode();
   }
@@ -823,13 +869,21 @@ function firstVisibleTextNode(element: HTMLElement): Text | null {
 function commonSelectionElement(selection: Selection): HTMLElement | null {
   if (!selection.rangeCount) return null;
   const container = selection.getRangeAt(0).commonAncestorContainer;
-  return container instanceof HTMLElement ? container : container.parentElement;
+  /** 选择译文时，编辑器和保存锚点都跟随原文。 */
+  const element = container instanceof HTMLElement ? container : container.parentElement;
+  /** 上游把每个译文容器映射回对应的原文宿主。 */
+  const source = element ? translationSourceElement(element) : null;
+  return source instanceof HTMLElement ? source : null;
 }
 
 ipcRenderer.on('zeus-browser-page:command', (_event, message: unknown) => {
   if (!message || typeof message !== 'object') return;
-  const command = message as { type?: unknown; enabled?: unknown; comments?: unknown; annotationMode?: unknown; commentId?: unknown };
-  if (command.type === 'set_annotation_mode') {
+  const command = message as { type?: unknown; enabled?: unknown; comments?: unknown; annotationMode?: unknown; commentId?: unknown; runId?: unknown; serviceId?: unknown };
+  if (command.type === 'start_translation' && typeof command.runId === 'string' && typeof command.serviceId === 'string') {
+    pageTranslation.start(command.runId, command.serviceId);
+  } else if (command.type === 'stop_translation') {
+    pageTranslation.stop();
+  } else if (command.type === 'set_annotation_mode') {
     state.enabled = command.enabled === true;
     if (!state.enabled) {
       hide(hoverOutline);

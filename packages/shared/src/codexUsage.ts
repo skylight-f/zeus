@@ -138,6 +138,10 @@ export interface UsageModelPricePeriod {
 
 /** 同一模型、计费档位和价格快照归为一行，调价后的记录保持分开。 */
 export interface UsageModelCostBreakdown {
+  /** 该费用行的价格依据；缺价时仍可展示已配置的公开页面。 */
+  sourceUrls?: string[];
+  /** 缺价原因独立于账户连接状态，全部费用明细入口共用。 */
+  missingPriceReason?: 'sync_failed' | 'unconfirmed';
   model: string;
   rate: UsageModelRate | null;
   /** Codex 请求快照的服务档位，统一普通和快速档位别名；其他供应源为空。 */
@@ -174,6 +178,32 @@ export interface UsageOverviewRangeSummary {
   complete: boolean;
 }
 
+/** Kilo Pass 本周期额度，金额单位均为美元；与账户充值余额分别统计。 */
+export interface KiloPassUsage {
+  /** 本周期付费基础额度。 */
+  currentPeriodBaseCreditsUsd: number;
+  /** 本周期已发放的赠送额度。 */
+  currentPeriodBonusCreditsUsd: number;
+  /** 官方统计的本周期消耗。 */
+  currentPeriodUsageUsd: number;
+  /** 下次账单时间；官方未提供时为空。 */
+  nextBillingAt: string | null;
+}
+
+/** Kilo 官方账户快照；查询失败保留已有数据并标明错误，不生成零额度。 */
+export interface KiloAccountUsage {
+  /** 账户可用余额，单位美元；尚未成功查询时为空。 */
+  balanceUsd: number | null;
+  /** 没有有效订阅或尚未取得订阅数据时为空，失败由 error 区分。 */
+  pass: KiloPassUsage | null;
+  /** 最近一次查询结束时间；尚未查询时为空。 */
+  checkedAt: string | null;
+  /** 任一数据查询失败或超过刷新间隔时为真。 */
+  stale: boolean;
+  /** 查询失败的安全摘要，不含接口正文或凭据。 */
+  error: string | null;
+}
+
 export interface UsageProviderSummary {
   providerId: string;
   sourceId: string;
@@ -186,6 +216,8 @@ export interface UsageProviderSummary {
   rateLimitWindows: CodexOfficialRateWindow[];
   officialCreditBalance: string | null;
   officialCreditsUnlimited: boolean;
+  /** 仅 Kilo 官方连接提供，保持充值余额与 Pass 额度各自的计量口径。 */
+  kiloAccount?: KiloAccountUsage;
   accountTodayTokens: number | null;
   accountSevenDayTokens: number | null;
   dailyAccount: Array<{ date: string; totalTokens: number }> | null;
@@ -219,6 +251,8 @@ export function formatCodexCredits(value: string | number | null | undefined, la
 }
 
 export interface UsageOverviewSnapshot {
+  /** 当前正在后台读取的官方来源；不属于账本或持久化统计。 */
+  refreshingSources?: string[];
   providers: UsageProviderSummary[];
   updatedAt: string;
   providerCoverage: 'all-recorded' | 'codex-only-compatibility';
@@ -278,6 +312,8 @@ export interface UsageProviderAnalytics {
     catalogDate: string | null;
     sourceUrls: string[];
     note: string;
+    /** 官方价格同步状态，与账户用量刷新分开记录。 */
+    sync?: { checkedAt: string | null; succeededAt: string | null; error: string | null };
   };
 }
 
@@ -316,6 +352,8 @@ export interface CodexUsageAnalyticsSnapshot {
     catalogDate: string;
     sourceUrls: string[];
     note: string;
+    /** 官方价格同步状态，与账户用量刷新分开记录。 */
+    sync?: { checkedAt: string | null; succeededAt: string | null; error: string | null };
   };
   updatedAt: string;
 }

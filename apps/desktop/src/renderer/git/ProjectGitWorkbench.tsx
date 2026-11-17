@@ -1,75 +1,70 @@
-import { ClockCounterClockwiseIcon as History } from '@phosphor-icons/react/dist/csr/ClockCounterClockwise';
-import { GitFileStatusIcon, gitFileStatusCategory, gitFileStatusLabel } from './GitFileStatusIcon.js';
+import { PushDialog } from './GitPushDialog.js';
 import { DotsThreeIcon as DotsThree } from '@phosphor-icons/react/dist/csr/DotsThree';
+import { isMacOSPlatform } from '../platform.js';
 import { GitCommitIcon as GitCommit } from '@phosphor-icons/react/dist/csr/GitCommit';
 import { GitMergeIcon as GitMerge } from '@phosphor-icons/react/dist/csr/GitMerge';
 import { ArrowDownIcon as ArrowDown } from '@phosphor-icons/react/dist/csr/ArrowDown';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { projectGitWorkbenchCacheEntry, readCachedProjectGitWorkbench, requestProjectGitWorkbench, subscribeProjectGitRefresh, notifyProjectGitChanged, visibleRepositoryFiles } from './projectGitWorkbenchState.js';
 import { createProjectGitMergeAction } from './projectGitMergeAction.js';
-import { BranchSwitcher, MergeBranchDialog, UpdateProjectDialog, NewBranchDialog, RemoteBranchCheckoutDialog, CheckoutRevisionDialog, BranchDirectoryTree, BranchContextMenu, StashDialog, PullDialog } from './GitRepositoryControls.js';
+import {
+  BranchSwitcher,
+  MergeBranchDialog,
+  UpdateProjectDialog,
+  readUpdateStrategy,
+  readSkipUpdateDialog,
+  NewBranchDialog,
+  RemoteBranchCheckoutDialog,
+  CheckoutRevisionDialog,
+  BranchDirectoryTree,
+  BranchContextMenu,
+  StashDialog,
+  PullDialog,
+} from './GitRepositoryControls.js';
+import type { ProjectGitUpdateStrategy } from './gitWorkbenchTypes.js';
 import type { ExecutionOutcome } from './gitWorkbenchTypes.js';
 import type { BranchKind } from './gitWorkbenchTypes.js';
 import type { OperationTone } from './gitWorkbenchTypes.js';
 import type { BusyState } from './gitWorkbenchTypes.js';
 import { MenuSurface } from '../ui/MenuSurface.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
-import { useGitCommitDrafts } from './useGitCommitDrafts.js';
 import { repositoryColor } from './repositoryColor.js';
-import { loadGitCommitModelOptions, readGitCommitGenerationSettings, saveGitCommitGenerationSettings } from './gitCommitModels.js';
-import type { GitCommitModelOption } from '../features/git/gitApiClient.js';
 import { useGitOperationHistory } from './useGitOperationHistory.js';
 import { GitContextMenu, GitMenuActionDialog, type GitMenuItem, type GitMenuConfirmation } from './GitContextMenu.js';
 import { GitPaneSeparator } from './GitPaneSeparator.js';
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent as ReactMouseEvent } from 'react';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import { createPortal } from 'react-dom';
 import { ArchiveIcon as Archive } from '@phosphor-icons/react/dist/csr/Archive';
 import { ArrowsClockwiseIcon as ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
-import { StopIcon as Stop } from '@phosphor-icons/react/dist/csr/Stop';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CaretRightIcon as CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
 import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
-import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
-import { ListBulletsIcon as ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
-import { TreeStructureIcon as TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
-import type {
-  DashboardClient,
-  GitDiffHunk,
-  GitDiffSummary,
-  GitFileDiff,
-  ProjectGitAction,
-  ProjectGitCommitDetail,
-  ProjectGitOperationRecord,
-  ProjectGitRepositoryWorkbenchItem,
-  ProjectGitWorkbenchSnapshot,
-  ProjectRecord,
-} from '../apiClient.js';
+import type { DashboardClient, GitDiffSummary, ProjectGitAction, ProjectGitCommitDetail, ProjectGitOperationRecord, ProjectGitRepositoryWorkbenchItem, ProjectGitWorkbenchSnapshot, ProjectRecord } from '../apiClient.js';
 import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
-import { reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-import { PushDialog } from './GitPushDialog.js';
+import { formatVisibleApplicationError, reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { SideBySideDiff } from './ProjectGitDiffViewer.js';
 
-type GitTab = 'changes' | 'stash' | 'log' | 'console';
+/** Git 工作区保留浏览页面，代码交付通过共用弹窗打开。 */
+type GitTab = 'stash' | 'log' | 'console';
 type ChangeStage = 'staged' | 'unstaged';
 interface GitContextTarget {
-  kind: 'file' | 'directory' | 'stage' | 'local' | 'remote' | 'tag' | 'commit' | 'stash' | 'repository';
+  kind: 'local' | 'remote' | 'tag' | 'commit' | 'stash' | 'repository';
   repositoryId: string;
   ref: string;
-  stage?: ChangeStage;
 }
 
 export interface ProjectGitWorkbenchProps {
   /** 嵌入工作区提供额外工具入口。 */
   toolbarActions?: ReactNode;
-  /** 源码目录顶行提供挂载位置，分支控件仍使用本工作台的仓库和操作状态。 */
-  branchToolbarContainer?: HTMLElement | null;
+  /** 主工作区的更新快捷键请求，允许 Git 尚未加载或处于收起状态。 */
+  updateRequest?: number;
   /** 顶部分支菜单发起操作时展开底栏，使提交表单和操作反馈可见。 */
   onOpenPanel?(): void;
   /** 将工作台快照同步给源码文件树，保持状态标记一致。 */
@@ -79,9 +74,9 @@ export interface ProjectGitWorkbenchProps {
   client: Pick<
     DashboardClient,
     | 'loadConversationGitHistory'
-    | 'loadProjectGitPushPreview'
     | 'loadProjectGitWorkbench'
     | 'loadProjectGitOperations'
+    | 'loadProjectGitPushPreview'
     | 'loadProjectGitCommit'
     | 'loadProjectGitComparisonDiff'
     | 'executeProjectGitAction'
@@ -98,7 +93,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   /** 快捷键只投递到当前可见工具栏，继续使用按钮原有禁用条件和操作流程。 */
   const workbenchRef = useRef<HTMLElement>(null);
   /** 数字与工具栏操作顺序对应，避开源码及全局导航的既有快捷键。 */
-  const macShortcuts = typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac');
+  const macShortcuts = isMacOSPlatform();
   /** 无障碍快捷键使用平台主键，显示提示使用常见键盘符号。 */
   const toolbarShortcut = (digit: number) => ({
     'data-git-toolbar-key': String(digit),
@@ -127,8 +122,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   const [snapshot, setSnapshot] = useState<ProjectGitWorkbenchSnapshot | null>(() => readCachedProjectGitWorkbench(props.client, props.project.id));
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>(() => (snapshot ? 'ready' : 'loading'));
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<GitTab>(() => (props.conversationScope ? 'changes' : readRememberedTab(props.project.id)));
-  const [subtree, setSubtree] = useState<{ repositoryId: string; path: string } | null>(null);
+  const [tab, setTab] = useState<GitTab>(() => (props.conversationScope ? 'log' : readRememberedTab(props.project.id)));
   const [selectedRepositoryId, setSelectedRepositoryId] = useState(() => projectGitViewPreferences.get(props.project.id)?.repositoryId ?? '');
   /** 只有用户点选才建立提交选择，并绑定仓库，避免初始加载或换仓库产生伪选中。 */
   const [selectedCommit, setSelectedCommit] = useState<{ repositoryId: string; ref: string } | null>(null);
@@ -137,68 +131,29 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   const [commitDetail, setCommitDetail] = useState<ProjectGitCommitDetail | null>(null);
   const [commitLoading, setCommitLoading] = useState(false);
   const [selectedFilePath, setSelectedFilePath] = useState('');
-  const [selectedFileStage, setSelectedFileStage] = useState<ChangeStage>('unstaged');
   const [searchQuery, setSearchQuery] = useState(() => projectGitViewPreferences.get(props.project.id)?.searchQuery ?? '');
   useEffect(() => {
     projectGitViewPreferences.set(props.project.id, { repositoryId: selectedRepositoryId, searchQuery });
   }, [props.project.id, selectedRepositoryId, searchQuery]);
   const [operationsOpen, setOperationsOpen] = useState(false);
-  const [pushOpen, setPushOpen] = useState(false);
+  /** 打开次数同时用于唤回已存在的系统窗口。 */
+  const [pushOpen, setPushOpen] = useState(0);
   const [pullOpen, setPullOpen] = useState(false);
   const [stashRepositoryId, setStashRepositoryId] = useState<string | null>(null);
   const operationsTriggerRef = useRef<HTMLButtonElement>(null);
-  const [commitOpen, setCommitOpen] = useState(false);
-  const [commitRequest] = useState(0);
   const [mergeOpen, setMergeOpen] = useState(false);
-  const [fileQuery, setFileQuery] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; title: string; items: GitMenuItem[] } | null>(null);
   const [menuConfirmation, setMenuConfirmation] = useState<GitMenuConfirmation | null>(null);
-  const [commitDrafts, setCommitDrafts] = useGitCommitDrafts(props.project.id);
-  const [commitModels, setCommitModels] = useState<GitCommitModelOption[]>([]);
-  const [commitModelRef, setCommitModelRef] = useState('');
-  const [commitModelsLoading, setCommitModelsLoading] = useState(true);
-  const [commitModelsError, setCommitModelsError] = useState('');
-  const [commitModelsRefresh, setCommitModelsRefresh] = useState(0);
-  useEffect(() => {
-    let active = true;
-    setCommitModelsLoading(true);
-    setCommitModelsError('');
-    setCommitModelRef('');
-    setCommitModels([]);
-    void loadGitCommitModelOptions(props.client, props.project.id)
-      .then((models) => {
-        if (!active) return;
-        // 单个来源不可用不代表整个模型列表失败；有可用模型时不阻挡生成反馈。
-        setCommitModelsError(models.items.length ? '' : models.warning);
-        setCommitModels(models.items);
-        setCommitModelRef(models.modelRef);
-      })
-      .catch((reason: unknown) => {
-        if (active) setCommitModelsError(errorMessage(reason, zh));
-      })
-      .finally(() => {
-        if (active) setCommitModelsLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [props.client, props.project.id, zh, commitModelsRefresh]);
-  function selectCommitModel(modelRef: string): void {
-    setCommitModelRef(modelRef);
-    /** 工作台切换模型时仍沿用同一个模型的推理与速率偏好。 */
-    const model = commitModels.find((item) => item.id === modelRef);
-    if (model) saveGitCommitGenerationSettings(props.project.id, readGitCommitGenerationSettings(props.project.id, model, 'project'));
-  }
-  const [generatingCommitFor, setGeneratingCommitFor] = useState<string | null>(null);
-  const generatingCommitRef = useRef(false);
-  const commitGenerationController = useRef<AbortController | null>(null);
-  useEffect(() => () => commitGenerationController.current?.abort(), [props.project.id]);
-  const [commitGenerationFeedback, setCommitGenerationFeedback] = useState<Record<string, string>>({});
   const [updateOpen, setUpdateOpen] = useState(false);
+  /** 同一快捷键请求只消费一次，加载期间保留最后一次请求。 */
+  const handledUpdateRequest = useRef(0);
+  /** 多仓库更新期间不接受第二轮更新。 */
+  const updatingProject = useRef(false);
   const [newBranchOpen, setNewBranchOpen] = useState(false);
   const [newBranchBase, setNewBranchBase] = useState('');
   const [remoteCheckoutTarget, setRemoteCheckoutTarget] = useState<{ repositoryId: string; remoteRef: string } | null>(null);
   const [revisionOpen, setRevisionOpen] = useState(false);
+  /** 工作台 Git 动作沿用原有执行状态。 */
   const [busy, setBusy] = useState<BusyState>(null);
   const actionBusyRef = useRef(false);
   /** 控制台缓存可以销毁，历史由桌面耐久账本恢复。 */
@@ -219,14 +174,40 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     return items.map((repository) => ({ ...repository, snapshot: { ...repository.snapshot, fileStatuses: visibleRepositoryFiles(repository, items) } }));
   }, [snapshot]);
   const selectedRepository = repositories.find((repository) => repository.id === selectedRepositoryId) ?? repositories[0] ?? null;
+  /** 工作区可见时准备全项目交付窗口，与提交按钮和未提交更改行共用同一范围。 */
+  const preloadCommit = useCallback(() => {
+    const root = workbenchRef.current;
+    if (!root || root.closest('[hidden], [inert]') || !root.getClientRects().length) return;
+    void window.zeus?.openTaskGitDeliveryWindow({ projectId: props.project.id, preload: true }).catch(() => undefined);
+  }, [props.project.id]);
+  useEffect(() => {
+    if (!repositories.length) return;
+    const idle = window.requestIdleCallback(preloadCommit, { timeout: 500 });
+    window.addEventListener('focus', preloadCommit);
+    return () => {
+      window.cancelIdleCallback(idle);
+      window.removeEventListener('focus', preloadCommit);
+    };
+  }, [repositories.length, preloadCommit]);
+  useEffect(() => {
+    if (!props.updateRequest || handledUpdateRequest.current === props.updateRequest || loadState === 'loading') return;
+    handledUpdateRequest.current = props.updateRequest;
+    if (actionBusyRef.current || updatingProject.current) return;
+    if (loadState === 'error' || !repositories.length) {
+      props.onOpenPanel?.();
+      return;
+    }
+    if (readSkipUpdateDialog(props.project.id)) void updateProject(readUpdateStrategy(props.project.id));
+    else setUpdateOpen(true);
+  }, [props.updateRequest, loadState]);
   const stashRepository = repositories.find((repository) => repository.id === stashRepositoryId) ?? null;
   const remoteCheckoutRepository = repositories.find((repository) => repository.id === remoteCheckoutTarget?.repositoryId) ?? null;
   const activeStash = selectedRepository?.snapshot.stashes.find((stash) => stash.ref === selectedStashRef) ?? selectedRepository?.snapshot.stashes[0] ?? null;
   const activeStashRef = activeStash?.ref ?? '';
   /** 其他仓库的选择不能借用当前仓库读取详情。 */
   const selectedCommitHash = selectedCommit?.repositoryId === selectedRepository?.id ? (selectedCommit?.ref ?? '') : '';
-  // 角标与文件列表使用同一个仓库，不能把其他子模块的改动算进来。
-  const changedCount = selectedRepository?.snapshot.fileStatuses.length ?? 0;
+  /** 全局提交覆盖项目内全部仓库，同名文件按所属仓库分别计数。 */
+  const changedCount = repositories.reduce((total, repository) => total + new Set(repository.snapshot.fileStatuses.map((file) => file.path)).size, 0);
   const conflictCount = repositories.reduce((total, repository) => total + repository.snapshot.conflictFiles.length, 0);
   const allCommits = useMemo(
     () =>
@@ -254,17 +235,28 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     if (append && historyInFlight.current === historyRequest.current) return;
     const key = `${selectedRepository.id}:${historyRef}`;
     const previous = append && historyPage?.key === key ? historyPage.commits : [];
+    /** 后台刷新重读已展开的范围，不能把多页历史缩回首批。 */
+    const retainedCount = !append && historyPage?.key === key ? historyPage.commits.length : 0;
     const request = ++historyRequest.current;
     historyInFlight.current = request;
     setHistoryLoading(true);
     setHistoryError('');
     try {
-      const page = props.conversationScope
-        ? await props.client.loadConversationGitHistory(props.project.id, selectedRepository.id, previous.length, historyRef || undefined)
-        : await window.zeus!.loadProjectGitHistory!({ projectId: props.project.id, repositoryId: selectedRepository.id, offset: previous.length, ...(historyRef ? { ref: historyRef } : {}) });
-      if (request !== historyRequest.current) return;
-      const commits = [...previous, ...page.commits].filter((commit, index, items) => items.findIndex((item) => item.hash === commit.hash) === index);
-      setHistoryPage({ key, commits, hasMore: page.hasMore });
+      /** 已读页面一次发布，避免每页结果改变列表高度。 */
+      const commits = [...previous];
+      /** 偏移量使用服务端返回条数，不受去重后的长度影响。 */
+      let offset = previous.length;
+      let hasMore = false;
+      do {
+        const page = props.conversationScope
+          ? await props.client.loadConversationGitHistory(props.project.id, selectedRepository.id, offset, historyRef || undefined)
+          : await window.zeus!.loadProjectGitHistory!({ projectId: props.project.id, repositoryId: selectedRepository.id, offset, ...(historyRef ? { ref: historyRef } : {}) });
+        if (request !== historyRequest.current) return;
+        commits.push(...page.commits);
+        offset += page.commits.length;
+        hasMore = page.hasMore && page.commits.length > 0;
+      } while (!append && hasMore && offset < retainedCount);
+      setHistoryPage({ key, commits: commits.filter((commit, index, items) => items.findIndex((item) => item.hash === commit.hash) === index), hasMore });
     } catch (reason) {
       if (request === historyRequest.current) setHistoryError(errorMessage(reason, zh));
     } finally {
@@ -277,8 +269,9 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
 
   useEffect(() => {
     // 缓存仅用于首屏，进入页面和回到应用时都重新读取外部 Git 变化。
-    const refresh = () => {
-      if (document.visibilityState === 'visible' && !actionBusyRef.current) void loadWorkbench();
+    const refresh = (force = false) => {
+      if (force) projectGitWorkbenchCacheEntry(props.client, props.project.id).invalidate();
+      if (document.visibilityState === 'visible' && !actionBusyRef.current) void loadWorkbench(force);
     };
     refresh();
     const unsubscribe = subscribeProjectGitRefresh(props.project.id, refresh);
@@ -290,7 +283,10 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
 
   /** 缓存和源码状态均跟随工作台快照，包括 Git 操作后的更新。 */
   useEffect(() => {
-    if (snapshot?.projectId === props.project.id) projectGitWorkbenchCacheEntry(props.client, props.project.id).snapshot = snapshot;
+    if (snapshot?.projectId === props.project.id) {
+      const cache = projectGitWorkbenchCacheEntry(props.client, props.project.id);
+      if (cache.getSnapshot().value !== snapshot) cache.set(snapshot);
+    }
     props.onSnapshot?.(snapshot);
   }, [props.client, props.project.id, props.onSnapshot, snapshot]);
 
@@ -301,29 +297,6 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
   useEffect(() => {
     if (!props.conversationScope && tab === 'console') void operationHistory.refresh();
   }, [tab, operationHistory.refresh, props.conversationScope]);
-
-  useEffect(() => {
-    if (tab !== 'changes' || !snapshot) return;
-    const repository = snapshot.repositories.find((candidate) => candidate.id === selectedRepositoryId) ?? snapshot.repositories[0];
-    if (!repository) {
-      if (selectedFilePath) setSelectedFilePath('');
-      return;
-    }
-    if (repository.id !== selectedRepositoryId) setSelectedRepositoryId(repository.id);
-    const unstagedPaths = new Set(repository.snapshot.fileStatuses.filter((file) => file.workingTreeStatus !== ' ' || file.indexStatus === '?').map((file) => file.path));
-    const stagedPaths = new Set(repository.snapshot.fileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?').map((file) => file.path));
-    const selectedPaths = selectedFileStage === 'staged' ? stagedPaths : unstagedPaths;
-    if (selectedPaths.has(selectedFilePath)) return;
-    const otherStagePaths = selectedFileStage === 'staged' ? unstagedPaths : stagedPaths;
-    if (otherStagePaths.has(selectedFilePath)) {
-      setSelectedFileStage(selectedFileStage === 'staged' ? 'unstaged' : 'staged');
-      return;
-    }
-    const firstUnstagedPath = unstagedPaths.values().next().value;
-    const firstStagedPath = stagedPaths.values().next().value;
-    setSelectedFilePath(firstUnstagedPath ?? firstStagedPath ?? '');
-    setSelectedFileStage(firstUnstagedPath ? 'unstaged' : 'staged');
-  }, [snapshot, tab, selectedRepositoryId, selectedFilePath, selectedFileStage]);
 
   useEffect(() => {
     // 新选择立即清除旧详情，避免旧行高亮在异步读取期间冒充当前选择。
@@ -353,14 +326,14 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     };
   }, [props.project.id, selectedRepository?.id, selectedCommitHash, activeStashRef, activeStash?.hash, tab]);
 
-  async function loadWorkbench(): Promise<void> {
+  async function loadWorkbench(force = false): Promise<void> {
     // 历史与仓库快照独立读取，仓库刷新失败不能伪装成没有操作记录。
     if (!props.conversationScope) void operationHistory.refresh();
     const version = ++requestVersionRef.current;
     setLoadState('loading');
     setError(null);
     try {
-      const next = await requestProjectGitWorkbench(props.client, props.project.id);
+      const next = await requestProjectGitWorkbench(props.client, props.project.id, force);
       if (version !== requestVersionRef.current) return;
       setSnapshot(next);
       setSelectedRepositoryId((current) => (next.repositories.some((repository) => repository.id === current) ? current : (next.repositories[0]?.id ?? '')));
@@ -372,13 +345,27 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     }
   }
 
+  /** 更新当前项目的全部仓库；失败或冲突后停止，保留原执行链的恢复入口。 */
+  async function updateProject(strategy: ProjectGitUpdateStrategy): Promise<void> {
+    if (actionBusyRef.current || updatingProject.current) return;
+    updatingProject.current = true;
+    setUpdateOpen(false);
+    try {
+      for (const repository of repositories) {
+        if ((await execute(repository, { type: 'update', strategy, smart: true }, zh ? '更新项目' : 'Update project')) !== 'completed') break;
+      }
+    } finally {
+      updatingProject.current = false;
+    }
+  }
+
   /** 所有入口共用执行状态与错误反馈；源码中的操作先展开工作台。 */
   async function execute(repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string): Promise<ExecutionOutcome> {
     if (actionBusyRef.current) return null;
     props.onOpenPanel?.();
     actionBusyRef.current = true;
     requestVersionRef.current += 1;
-    projectGitWorkbenchCacheEntry(props.client, props.project.id).request = null;
+    projectGitWorkbenchCacheEntry(props.client, props.project.id).invalidate();
     setBusy({ repositoryId: repository.id, action: action.type });
     setError(null);
     const previousOperationErrors = { ...operationErrorsByRepositoryRef.current };
@@ -396,18 +383,20 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
             }
           : current,
       );
-      if (action.type === 'submodule_update' || action.type === 'subtree') await loadWorkbench();
+      // 父仓库签出会同时更新子模块，不能保留子模块的旧分支快照。
+      if (
+        action.type === 'submodule_update' ||
+        action.type === 'subtree' ||
+        ((action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch') && repository.snapshot.submodules?.some((module) => module.initialized))
+      )
+        await loadWorkbench(true);
       notifyProjectGitChanged(props.project.id);
-      if (response.result.outcome === 'conflict') setTab('changes');
+      if (response.result.outcome === 'conflict') openDelivery(repository.id);
       return response.result.outcome;
     } catch (reason) {
-      const switchingBranch = action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch';
-      const message = errorMessage(switchingBranch ? gitSwitchFailureCause(reason) : reason, zh, {
-        title: gitOperationErrorTitle(action, label, zh),
-        // Git 的 stderr 才是用户处理合并、变基和远端拒绝的依据；失败时直接展开，避免把原因藏在二级入口中。
-        showDetails: true,
-        detailTitle: zh ? 'Git 日志' : 'Git log',
-        ...(switchingBranch && errorHasCode(reason, 'ZEUS_GIT_CHECKOUT_BLOCKED')
+      const message = errorMessage(reason, zh, {
+        title: label,
+        ...((action.type === 'checkout' || action.type === 'checkout_revision' || action.type === 'create_branch') && errorHasCode(reason, 'ZEUS_GIT_CHECKOUT_BLOCKED')
           ? {
               action: {
                 label: zh ? '打开贮藏入口' : 'Open stash action',
@@ -420,60 +409,13 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
           : {}),
       });
       operationErrorsByRepositoryRef.current = { ...operationErrorsByRepositoryRef.current, [repository.id]: message };
-      await loadWorkbench();
+      await loadWorkbench(true);
       setError(`${label}: ${message}`);
       return null;
     } finally {
       actionBusyRef.current = false;
       setBusy(null);
       if (!props.conversationScope) void operationHistory.refresh(true);
-    }
-  }
-
-  async function generateCommitMessage(repository: ProjectGitRepositoryWorkbenchItem): Promise<void> {
-    if (generatingCommitRef.current || busy || commitModelsLoading || !commitModelRef) return;
-    generatingCommitRef.current = true;
-    const controller = new AbortController();
-    commitGenerationController.current = controller;
-    setGeneratingCommitFor(repository.id);
-    setCommitGenerationFeedback((current) => ({ ...current, [repository.id]: '' }));
-    const originalMessage = commitDrafts[repository.id] ?? '';
-    let lastGenerated = originalMessage;
-    const updateGenerated = (message: string) => {
-      const expected = lastGenerated;
-      lastGenerated = message;
-      setCommitDrafts((current) => ((current[repository.id] ?? '') === expected ? { ...current, [repository.id]: message } : current));
-    };
-    try {
-      /** 提交说明生成不能丢弃交付面板保存的档位。 */
-      const models = await loadGitCommitModelOptions(props.client, props.project.id, controller.signal);
-      controller.signal.throwIfAborted();
-      if (!models.modelRef) throw new Error(models.warning || (zh ? '所选模型不可用，请刷新模型列表。' : 'The selected model is unavailable. Refresh the model list.'));
-      setCommitModels(models.items);
-      setCommitModelRef(models.modelRef);
-      const result = await props.client.generateGitCommitMessage(
-        props.project.id,
-        { repositoryId: repository.id, relativePath: repository.relativePath, language: zh ? 'zh-CN' : 'en', ...models.settings },
-        (text) => {
-          if (!controller.signal.aborted) updateGenerated(text);
-        },
-        controller.signal,
-      );
-      controller.signal.throwIfAborted();
-      updateGenerated(result.message);
-      setCommitGenerationFeedback((current) => ({
-        ...current,
-        [repository.id]:
-          (zh ? `已由 ${result.model} 生成，请检查后提交。` : `Generated by ${result.model}. Review before committing.`) +
-          (result.truncated ? (zh ? ' 部分大文件或生成文件仅提供摘要，请核对完整性。' : ' Large or generated files were summarized; check completeness.') : ''),
-      }));
-    } catch (reason) {
-      updateGenerated(originalMessage);
-      setCommitGenerationFeedback((current) => ({ ...current, [repository.id]: controller.signal.aborted ? (zh ? '已停止生成，已保留原提交说明。' : 'Generation stopped. The original message was preserved.') : errorMessage(reason, zh) }));
-    } finally {
-      generatingCommitRef.current = false;
-      if (commitGenerationController.current === controller) commitGenerationController.current = null;
-      setGeneratingCommitFor(null);
     }
   }
 
@@ -502,29 +444,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         run: () => setMenuConfirmation({ title, description: `${repository.name} · ${target.ref}`, field, initialValue, run: async (text) => (await execute(repository, build(text), title)) === 'completed' }),
       });
     const newBranch = (baseRef: string) => form(label('新建分支…', 'New branch…'), label('分支名称', 'Branch name'), (branchName) => ({ type: 'create_branch', branchName, baseRef }));
-    if (target.kind === 'file' || target.kind === 'directory' || target.kind === 'stage') {
-      const files = repository.snapshot.fileStatuses
-        .filter((file) => !subtree || subtree.repositoryId !== repository.id || file.path === subtree.path || file.path.startsWith(`${subtree.path}/`))
-        .filter(
-          (file) =>
-            (target.kind === 'stage' || file.path === target.ref || (target.kind === 'directory' && file.path.startsWith(`${target.ref}/`))) &&
-            (target.stage === 'staged' ? file.indexStatus !== ' ' && file.indexStatus !== '?' : file.workingTreeStatus !== ' ' || file.indexStatus === '?'),
-        );
-      const paths = files.map((file) => file.path);
-      action(target.stage === 'staged' ? label('取消暂存', 'Unstage') : label('暂存', 'Stage'), { type: target.stage === 'staged' ? 'unstage' : 'stage', paths }, undefined, false, !paths.length);
-      if (target.kind === 'file') items.push({ label: label('查看差异', 'View diff'), run: () => openDiffWindow(repository, target.ref, { stage: target.stage }) });
-      if (target.stage !== 'staged') {
-        const tracked = files.filter((file) => file.indexStatus !== '?').map((file) => file.path);
-        action(
-          label('丢弃未暂存修改…', 'Discard unstaged changes…'),
-          { type: 'discard', paths: tracked },
-          label(`将 ${tracked.length} 个已跟踪文件恢复为暂存区内容。未跟踪文件不会被删除。此操作无法撤销。\n${tracked.join('\n')}`, `Restore ${tracked.length} tracked files from the index. Untracked files are kept. This cannot be undone.`),
-          true,
-          !tracked.length || repository.snapshot.conflictFiles.length > 0,
-        );
-      }
-      if (target.kind !== 'stage') items.push({ label: label('复制相对路径', 'Copy relative path'), run: () => copy(target.ref) });
-    } else if (target.kind === 'local' || target.kind === 'remote') {
+    if (target.kind === 'local' || target.kind === 'remote') {
       const current = target.kind === 'local' && !repository.snapshot.detached && repository.snapshot.branch === target.ref;
       if (target.kind === 'local') action(label('切换到此分支', 'Checkout branch'), { type: 'checkout', branchName: target.ref }, undefined, false, current);
       else {
@@ -628,10 +548,10 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       items.push({ label: label('复制贮藏引用', 'Copy stash reference'), run: () => copy(target.ref) });
     } else {
       items.push({
-        label: label('查看文件状态', 'View file status'),
+        label: label('代码交付', 'Code delivery'),
         run: () => {
           setSelectedRepositoryId(repository.id);
-          setTab('changes');
+          openDelivery(repository.id);
         },
       });
       items.push({
@@ -661,7 +581,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         disabled: busy !== null,
         run: () => {
           setSelectedRepositoryId(repository.id);
-          setPushOpen(true);
+          setPushOpen((count) => count + 1);
         },
       });
       items.push({
@@ -683,19 +603,18 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     setSelectedCommit({ repositoryId: repository.id, ref: commitHash });
   }
 
-  /** 提交入口先展开底栏，再显示现有提交表单。 */
   /** 所有变更入口直接使用既有原生交付窗口服务，工作台不挂载交付页面。 */
-  function openDelivery(repositoryId?: string, pathPrefix?: string): void {
+  function openDelivery(repositoryId?: string, pathPrefix?: string): void | Promise<unknown> {
     if (!window.zeus?.openTaskGitDeliveryWindow) {
       setError(errorMessage(new Error(zh ? '当前环境无法打开代码交付窗口。' : 'The code delivery window is unavailable in this environment.'), zh));
       return;
     }
-    void window.zeus.openTaskGitDeliveryWindow(repositoryId ? { projectId: props.project.id, repositoryId, pathPrefix } : { projectId: props.project.id }).catch((reason: unknown) => setError(errorMessage(reason, zh)));
+    return window.zeus.openTaskGitDeliveryWindow(repositoryId ? { projectId: props.project.id, repositoryId, pathPrefix } : { projectId: props.project.id }).catch((reason: unknown) => setError(errorMessage(reason, zh)));
   }
 
   /** 全局提交与冲突入口覆盖项目内全部仓库，文件树负责后续选择。 */
-  function openCommit(): void {
-    if (repositories.length) openDelivery();
+  function openCommit(): void | Promise<unknown> {
+    if (repositories.length) return openDelivery();
   }
 
   function openDiffWindow(repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { stage?: 'combined' | ChangeStage; commitHash?: string; comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }): void {
@@ -704,7 +623,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         ? props.client.loadProjectGitComparisonDiff(props.project.id, repository.id, options.comparisonRef, options.comparisonMode ?? 'current')
         : options?.commitHash
           ? props.client.loadProjectGitCommit(props.project.id, repository.id, options.commitHash).then((detail) => detail.diff)
-          : Promise.resolve(options?.stage === 'staged' ? repository.snapshot.stagedDiff : options?.stage === 'unstaged' ? repository.snapshot.unstagedDiff : repository.snapshot.diff);
+          : props.client.loadProjectGitComparisonDiff(props.project.id, repository.id, 'HEAD', options?.stage === 'staged' || options?.stage === 'unstaged' ? options.stage : 'working-tree', filePath);
       void request
         .then((diff) =>
           setConversationDiff({
@@ -726,7 +645,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
     });
   }
 
-  /** 只改变现有分支控件的显示位置，不创建第二份仓库选择或执行状态。 */
+  /** 分支检出与 Git 操作保留在项目工作台内。 */
   const branchSwitcher = selectedRepository ? (
     <BranchSwitcher
       cascadeRepositories
@@ -739,7 +658,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       onOpenDiff={openDiffWindow}
       onOpenUpdate={() => setUpdateOpen(true)}
       onOpenCommit={openCommit}
-      onOpenPush={() => setPushOpen(true)}
+      onOpenPush={() => setPushOpen((count) => count + 1)}
       onOpenNewBranch={(baseRef) => {
         setNewBranchBase(baseRef ?? '');
         setNewBranchOpen(true);
@@ -764,7 +683,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       <section className="project-git-workbench-state" role="alert">
         {props.toolbarActions ? <div className="project-git-state-actions">{props.toolbarActions}</div> : null}
         <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
-        <Button variant="secondary" onClick={() => void loadWorkbench()}>
+        <Button variant="secondary" onClick={() => loadWorkbench(true)}>
           {zh ? '重新读取' : 'Reload'}
         </Button>
       </section>
@@ -778,7 +697,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         <GitBranch aria-hidden="true" />
         <strong>{zh ? '这个项目中没有发现 Git 仓库' : 'No Git repository was found'}</strong>
         <span>{zh ? '请检查项目目录是否包含 Git 仓库，然后重新扫描。' : 'Check that the project folder contains a Git repository, then scan again.'}</span>
-        <Button variant="secondary" onClick={() => void loadWorkbench()}>
+        <Button variant="secondary" onClick={() => loadWorkbench(true)}>
           {zh ? '重新扫描' : 'Scan again'}
         </Button>
       </section>
@@ -795,6 +714,48 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       }}
       aria-label={zh ? '项目 Git 工作台' : 'Project Git workbench'}
     >
+      {error ? (
+        <section className="project-git-workbench-state" role="alert">
+          <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+        </section>
+      ) : null}
+      {busy || selectedRepository?.snapshot.integrationState ? (
+        <div className="git-integration-actions">
+          {' '}
+          {busy && !props.conversationScope && window.zeus?.cancelProjectGitAction ? (
+            <Button
+              variant="secondary"
+              size="compact"
+              onClick={() => {
+                return window.zeus!.cancelProjectGitAction(busy.repositoryId).catch((reason: unknown) => setError(errorMessage(reason, zh)));
+              }}
+            >
+              {zh ? '中止操作' : 'Stop operation'}
+            </Button>
+          ) : null}
+          {selectedRepository?.snapshot.integrationState ? (
+            <>
+              <Button
+                variant="secondary"
+                size="compact"
+                disabled={busy !== null || selectedRepository.snapshot.conflictFiles.length > 0}
+                onClick={() => execute(selectedRepository, { type: 'continue_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '继续合并或变基' : 'Continue integration')}
+              >
+                {zh ? '继续' : 'Continue'}
+              </Button>
+              <Button
+                variant="secondary"
+                size="compact"
+                disabled={busy !== null}
+                onClick={() => execute(selectedRepository, { type: 'abort_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '终止合并或变基' : 'Abort integration')}
+              >
+                {zh ? '终止合并/变基' : 'Abort integration'}
+              </Button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       <MotionPresence>
         {conversationDiff ? (
           <ModalPortal role="dialog" aria-label={zh ? '文件差异' : 'File diff'} onDismiss={() => setConversationDiff(null)}>
@@ -809,40 +770,176 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         ) : null}
       </MotionPresence>
 
+      {conflictCount > 0 ? (
+        <section className="project-git-conflict-banner" role="alert">
+          <WarningCircle aria-hidden="true" />
+          <span>
+            <strong>{zh ? `存在 ${conflictCount} 个冲突文件` : `${conflictCount} conflicted files`}</strong>
+            <small>{zh ? '请在代码交付弹窗逐个检查冲突，解决后暂存文件，再继续合并或变基。' : 'Review each file in Code Delivery, stage resolved files, then continue the merge or rebase.'}</small>
+          </span>
+          <Button variant="secondary" size="compact" onClick={openCommit}>
+            {zh ? '处理冲突' : 'Resolve conflicts'}
+          </Button>
+        </section>
+      ) : null}
+
+      {/* 工具栏跨越整个 Git 工作区，底线与左右工作面同时衔接。 */}
+      <header className="project-git-toolbar git-command-toolbar" aria-label={zh ? 'Git 工具栏' : 'Git toolbar'}>
+        <strong className="git-workspace-heading">{zh ? '工作区' : 'Workspace'}</strong>
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(1)}
+          aria-haspopup="dialog"
+          aria-label={toolbarLabel(zh ? `提交 · ${changedCount} 个待提交文件` : `Commit · ${changedCount} pending files`, 1)}
+          data-icon-tooltip={toolbarLabel(zh ? `提交 · ${repositories.length} 个仓库 · ${changedCount} 个待提交文件` : `Commit · ${repositories.length} repositories · ${changedCount} pending files`, 1)}
+          disabled={!selectedRepository || busy !== null}
+          onPointerEnter={preloadCommit}
+          onFocus={preloadCommit}
+          onClick={openCommit}
+        >
+          <GitCommit aria-hidden="true" />
+          {changedCount > 0 ? <small aria-hidden="true">{changedCount}</small> : null}
+        </Button>
+        <i />
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(2)}
+          aria-label={toolbarLabel(zh ? '拉取' : 'Pull', 2)}
+          data-icon-tooltip={toolbarLabel(zh ? '拉取' : 'Pull', 2)}
+          disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || !selectedRepository.snapshot.remotes.length}
+          onClick={() => setPullOpen(true)}
+        >
+          <ArrowDown aria-hidden="true" />
+          {selectedRepository?.snapshot.behind ? <small>{selectedRepository.snapshot.behind}</small> : null}
+        </Button>
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(3)}
+          aria-label={toolbarLabel(zh ? '推送' : 'Push', 3)}
+          data-icon-tooltip={toolbarLabel(zh ? '推送' : 'Push', 3)}
+          disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || !selectedRepository.snapshot.remotes.length}
+          onClick={() => setPushOpen((count) => count + 1)}
+        >
+          <ArrowUp aria-hidden="true" />
+          {selectedRepository?.snapshot.ahead ? <small>{selectedRepository.snapshot.ahead}</small> : null}
+        </Button>
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(4)}
+          aria-label={toolbarLabel(zh ? '抓取' : 'Fetch', 4)}
+          data-icon-tooltip={toolbarLabel(zh ? '抓取' : 'Fetch', 4)}
+          disabled={!selectedRepository || busy !== null || !selectedRepository.snapshot.remotes.length}
+          onClick={() => {
+            if (selectedRepository) return execute(selectedRepository, { type: 'fetch' }, zh ? '获取远端' : 'Fetch');
+          }}
+        >
+          <ArrowsClockwise aria-hidden="true" />
+        </Button>
+        <i />
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(5)}
+          aria-label={toolbarLabel(zh ? '分支' : 'Branch', 5)}
+          data-icon-tooltip={toolbarLabel(zh ? '分支' : 'Branch', 5)}
+          disabled={!selectedRepository || busy !== null}
+          onClick={() => {
+            setNewBranchBase('');
+            setNewBranchOpen(true);
+          }}
+        >
+          <GitBranch aria-hidden="true" />
+        </Button>
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(6)}
+          aria-label={toolbarLabel(zh ? '合并' : 'Merge', 6)}
+          data-icon-tooltip={toolbarLabel(zh ? '合并' : 'Merge', 6)}
+          disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || Boolean(selectedRepository.snapshot.integrationState)}
+          onClick={() => setMergeOpen(true)}
+        >
+          <GitMerge aria-hidden="true" />
+        </Button>
+        <Button
+          unstyled
+          type="button"
+          {...toolbarShortcut(7)}
+          aria-label={toolbarLabel(zh ? '贮藏' : 'Stash', 7)}
+          data-icon-tooltip={toolbarLabel(zh ? '贮藏' : 'Stash', 7)}
+          disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.clean || selectedRepository.snapshot.conflictFiles.length > 0}
+          onClick={() => {
+            if (selectedRepository) setStashRepositoryId(selectedRepository.id);
+          }}
+        >
+          <Archive aria-hidden="true" />
+        </Button>
+        <span className="project-git-menu-anchor">
+          <Button
+            unstyled
+            ref={operationsTriggerRef}
+            type="button"
+            {...toolbarShortcut(8)}
+            aria-label={toolbarLabel(zh ? '操作' : 'Actions', 8)}
+            data-icon-tooltip={toolbarLabel(zh ? '操作' : 'Actions', 8)}
+            aria-haspopup="menu"
+            aria-expanded={operationsOpen}
+            disabled={busy !== null}
+            onClick={() => setOperationsOpen((current) => !current)}
+          >
+            <DotsThree aria-hidden="true" />
+          </Button>
+          <MotionPresence>
+            {operationsOpen ? (
+              <OperationsMenu
+                anchor={operationsTriggerRef.current}
+                zh={zh}
+                onClose={() => setOperationsOpen(false)}
+                onOpenCommit={openCommit}
+                onOpenPush={() => setPushOpen((count) => count + 1)}
+                onOpenUpdate={() => setUpdateOpen(true)}
+                onOpenNewBranch={() => {
+                  setNewBranchBase('');
+                  setNewBranchOpen(true);
+                }}
+                onOpenRevision={() => setRevisionOpen(true)}
+                onSelectTab={setTab}
+                onOpenConsole={props.conversationScope ? undefined : () => setTab('console')}
+                onOpenSubtree={() => setSubtreeDialogOpen(true)}
+              />
+            ) : null}
+          </MotionPresence>
+        </span>
+
+        <Button unstyled type="button" {...toolbarShortcut(9)} aria-label={toolbarLabel(zh ? '刷新' : 'Refresh', 9)} data-icon-tooltip={toolbarLabel(zh ? '刷新' : 'Refresh', 9)} disabled={busy !== null} onClick={() => loadWorkbench(true)}>
+          <ArrowsClockwise aria-hidden="true" />
+        </Button>
+        {props.toolbarActions}
+      </header>
       <div className="project-git-browser-layout">
         <aside className="project-git-navigator" aria-label={zh ? 'Git 导航' : 'Git navigation'}>
           <div className="git-toolbar-identity">{branchSwitcher}</div>
-          <nav className="git-workspace-navigation" aria-label={zh ? 'Git 工作区' : 'Git workspace'}>
-            <strong>{zh ? '工作区' : 'Workspace'}</strong>
-            {(
-              [
-                ['changes', zh ? '文件状态' : 'File Status', <File key="file" />, changedCount],
-                ['log', zh ? '历史' : 'History', <History key="history" />, null],
-              ] as const
-            ).map(([id, label, icon, count]) => (
-              <button type="button" key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => setTab(id)}>
-                {icon}
-                <span>{label}</span>
-                {count !== null ? <small>{count}</small> : null}
-              </button>
-            ))}
-          </nav>
           {selectedRepository?.snapshot.submodules?.length ? (
             <details>
               <summary className="project-git-reference-section-heading">
                 <span>{zh ? '子模块初始化与更新' : 'Initialize / update submodules'}</span>
               </summary>
               {selectedRepository.snapshot.submodules.map((module) => (
-                <button
+                <Button
+                  unstyled
                   type="button"
                   key={module.path}
                   disabled={busy !== null}
-                  title={zh ? '检出父仓库记录的子模块提交，保留未提交修改；有冲突时 Git 会拒绝更新。' : 'Check out the recorded submodule commit without forcing local changes.'}
-                  onClick={() => void execute(selectedRepository, { type: 'submodule_update', path: module.path }, zh ? '初始化/更新子模块' : 'Initialize/update submodule')}
+                  data-icon-tooltip={zh ? '检出父仓库记录的子模块提交，保留未提交修改；有冲突时 Git 会拒绝更新。' : 'Check out the recorded submodule commit without forcing local changes.'}
+                  onClick={() => execute(selectedRepository, { type: 'submodule_update', path: module.path }, zh ? '初始化/更新子模块' : 'Initialize/update submodule')}
                 >
                   <span>{module.path}</span>
                   <small>{module.initialized ? (zh ? '更新' : 'Update') : zh ? '初始化' : 'Initialize'}</small>
-                </button>
+                </Button>
               ))}
             </details>
           ) : null}
@@ -862,7 +959,6 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
                   zh={zh}
                   selectedId={selectedRepository?.id}
                   onSelect={(id) => {
-                    setSubtree(null);
                     setSelectedRepositoryId(id);
                     setSelectedFilePath('');
                     setSelectedCommit(null);
@@ -941,7 +1037,8 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
                   <small>{selectedRepository.snapshot.stashes.length}</small>
                 </summary>
                 {selectedRepository.snapshot.stashes.map((stash) => (
-                  <button
+                  <Button
+                    unstyled
                     key={stash.ref}
                     className="project-git-navigation-stash"
                     data-git-context={JSON.stringify({ kind: 'stash', repositoryId: selectedRepository.id, ref: stash.ref })}
@@ -951,11 +1048,11 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
                       setSelectedStashRef(stash.ref);
                       setTab('stash');
                     }}
-                    title={stash.subject}
+                    data-icon-tooltip={stash.subject}
                   >
                     <Archive aria-hidden="true" />
                     <span>{stash.subject}</span>
-                  </button>
+                  </Button>
                 ))}
               </details>
               <details>
@@ -963,18 +1060,10 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
                   <span>{zh ? '子树' : 'Subtrees'}</span>
                 </summary>
                 {(selectedRepository.subtreePaths ?? []).map((path) => (
-                  <button
-                    key={path}
-                    type="button"
-                    onClick={() => {
-                      setSubtree({ repositoryId: selectedRepository.id, path });
-                      setSelectedFilePath('');
-                      setTab('changes');
-                    }}
-                  >
+                  <Button unstyled key={path} type="button" onClick={() => openDelivery(selectedRepository.id, path)}>
                     <Folder aria-hidden="true" />
                     <span>{path}</span>
-                  </button>
+                  </Button>
                 ))}
               </details>
             </>
@@ -982,208 +1071,17 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
         </aside>
         <GitPaneSeparator name="navigation" label={zh ? '调整 Git 导航宽度' : 'Resize Git navigation'} initial={20} min={12} max={40} />
         <div className="project-git-browser-content">
-          <header className="project-git-toolbar git-command-toolbar" aria-label={zh ? 'Git 工具栏' : 'Git toolbar'}>
-            <button {...toolbarShortcut(1)} title={toolbarLabel(zh ? '提交' : 'Commit', 1)} type="button" disabled={!selectedRepository || busy !== null} onClick={openCommit}>
-              <GitCommit />
-              <span>{zh ? '提交' : 'Commit'}</span>
-            </button>
-            <i />
-            <button
-              {...toolbarShortcut(2)}
-              title={toolbarLabel(zh ? '拉取' : 'Pull', 2)}
-              type="button"
-              disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || !selectedRepository.snapshot.remotes.length}
-              onClick={() => setPullOpen(true)}
-            >
-              <ArrowDown />
-              <span>{zh ? '拉取' : 'Pull'}</span>
-              {selectedRepository?.snapshot.behind ? <small>{selectedRepository.snapshot.behind}</small> : null}
-            </button>
-            <button
-              {...toolbarShortcut(3)}
-              title={toolbarLabel(zh ? '推送' : 'Push', 3)}
-              type="button"
-              disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || !selectedRepository.snapshot.remotes.length}
-              onClick={() => setPushOpen(true)}
-            >
-              <ArrowUp />
-              <span>{zh ? '推送' : 'Push'}</span>
-              {selectedRepository?.snapshot.ahead ? <small>{selectedRepository.snapshot.ahead}</small> : null}
-            </button>
-            <button
-              {...toolbarShortcut(4)}
-              title={toolbarLabel(zh ? '抓取' : 'Fetch', 4)}
-              type="button"
-              disabled={!selectedRepository || busy !== null || !selectedRepository.snapshot.remotes.length}
-              onClick={() => {
-                if (selectedRepository) void execute(selectedRepository, { type: 'fetch' }, zh ? '获取远端' : 'Fetch');
-              }}
-            >
-              <ArrowsClockwise />
-              <span>{zh ? '抓取' : 'Fetch'}</span>
-            </button>
-            <i />
-            <button
-              {...toolbarShortcut(5)}
-              title={toolbarLabel(zh ? '分支' : 'Branch', 5)}
-              type="button"
-              disabled={!selectedRepository || busy !== null}
-              onClick={() => {
-                setNewBranchBase('');
-                setNewBranchOpen(true);
-              }}
-            >
-              <GitBranch />
-              <span>{zh ? '分支' : 'Branch'}</span>
-            </button>
-            <button
-              {...toolbarShortcut(6)}
-              title={toolbarLabel(zh ? '合并' : 'Merge', 6)}
-              type="button"
-              disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.detached || Boolean(selectedRepository.snapshot.integrationState)}
-              onClick={() => setMergeOpen(true)}
-            >
-              <GitMerge />
-              <span>{zh ? '合并' : 'Merge'}</span>
-            </button>
-            {selectedRepository?.snapshot.integrationState ? (
-              <>
-                <button
-                  className="git-command-integration-action"
-                  type="button"
-                  disabled={busy !== null || selectedRepository.snapshot.conflictFiles.length > 0}
-                  onClick={() => void execute(selectedRepository, { type: 'continue_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '继续合并或变基' : 'Continue integration')}
-                >
-                  <CheckCircle aria-hidden="true" />
-                  <span>{zh ? '继续' : 'Continue'}</span>
-                </button>
-                <button
-                  className="git-command-integration-action"
-                  type="button"
-                  disabled={busy !== null}
-                  onClick={() => void execute(selectedRepository, { type: 'abort_integration', kind: selectedRepository.snapshot.integrationState! }, zh ? '终止合并或变基' : 'Abort integration')}
-                >
-                  <Stop aria-hidden="true" />
-                  <span>{zh ? '终止合并/变基' : 'Abort integration'}</span>
-                </button>
-              </>
-            ) : null}
-            <button
-              {...toolbarShortcut(7)}
-              title={toolbarLabel(zh ? '贮藏' : 'Stash', 7)}
-              type="button"
-              disabled={!selectedRepository || busy !== null || selectedRepository.snapshot.clean || selectedRepository.snapshot.conflictFiles.length > 0}
-              onClick={() => {
-                if (selectedRepository) setStashRepositoryId(selectedRepository.id);
-              }}
-            >
-              <Archive />
-              <span>{zh ? '贮藏' : 'Stash'}</span>
-            </button>
-            <span className="project-git-menu-anchor">
-              <button
-                {...toolbarShortcut(8)}
-                title={toolbarLabel(zh ? '操作' : 'Actions', 8)}
-                ref={operationsTriggerRef}
-                type="button"
-                aria-haspopup="menu"
-                aria-expanded={operationsOpen}
-                onClick={() => setOperationsOpen((current) => !current)}
-              >
-                <DotsThree aria-hidden="true" />
-                <span>{zh ? '操作' : 'Actions'}</span>
-              </button>
-              <MotionPresence>
-                {operationsOpen ? (
-                  <OperationsMenu
-                    anchor={operationsTriggerRef.current}
-                    zh={zh}
-                    onClose={() => setOperationsOpen(false)}
-                    onOpenCommit={openCommit}
-                    onOpenPush={() => setPushOpen(true)}
-                    onOpenUpdate={() => setUpdateOpen(true)}
-                    onOpenNewBranch={() => {
-                      setNewBranchBase('');
-                      setNewBranchOpen(true);
-                    }}
-                    onOpenRevision={() => setRevisionOpen(true)}
-                    onSelectTab={setTab}
-                    onOpenConsole={props.conversationScope ? undefined : () => setTab('console')}
-                    onOpenSubtree={() => setSubtreeDialogOpen(true)}
-                  />
-                ) : null}
-              </MotionPresence>
-            </span>
-
-            {busy && !props.conversationScope && window.zeus?.cancelProjectGitAction ? (
-              <button
-                className="git-command-trailing-action"
-                type="button"
-                onClick={() => {
-                  void window.zeus!.cancelProjectGitAction(busy.repositoryId).catch((reason: unknown) => setError(errorMessage(reason, zh)));
-                }}
-              >
-                <Stop aria-hidden="true" />
-                <span>{zh ? '中止操作' : 'Stop operation'}</span>
-              </button>
-            ) : (
-              <button className="git-command-trailing-action" type="button" disabled={busy !== null} onClick={() => void loadWorkbench()}>
-                <ArrowsClockwise aria-hidden="true" />
-                <span>{zh ? '刷新' : 'Refresh'}</span>
-              </button>
-            )}
-          </header>
           <div className="git-content-toolbar">
-            <strong>{tab === 'changes' ? (zh ? '文件状态' : 'File Status') : tab === 'log' ? (zh ? '提交历史' : 'Commit history') : tab === 'stash' ? (zh ? '贮藏' : 'Stashes') : zh ? '操作记录' : 'Operation history'}</strong>
-            {conflictCount > 0 ? (
-              <button
-                className="git-conflict-summary"
-                type="button"
-                title={zh ? '查看冲突文件，解决后暂存，再继续合并或变基。' : 'Review conflicted files, stage the resolutions, then continue the merge or rebase.'}
-                onClick={() => {
-                  const target = selectedRepository?.snapshot.conflictFiles.length ? selectedRepository : repositories.find((repository) => repository.snapshot.conflictFiles.length > 0);
-                  setTab('changes');
-                  setFileQuery('');
-                  setSubtree(null);
-                  if (!target) return;
-                  setSelectedRepositoryId(target.id);
-                  setSelectedFilePath(target.snapshot.conflictFiles[0] ?? '');
-                  setSelectedFileStage('unstaged');
-                }}
-              >
-                <WarningCircle aria-hidden="true" />
-                <span>{zh ? `${conflictCount} 个冲突文件` : `${conflictCount} conflicts`}</span>
-                <small>{zh ? '处理' : 'Resolve'}</small>
-              </button>
-            ) : null}
-            {tab === 'log' && selectedRepository ? (
-              <select
-                aria-label={zh ? '历史分支范围' : 'History branch scope'}
-                value={historyRef}
-                onChange={(event) => {
-                  setHistoryRef(event.currentTarget.value);
-                  setSelectedCommit(null);
-                  setSelectedFilePath('');
-                }}
-              >
-                <option value="">{zh ? '全部分支' : 'All branches'}</option>
-                <option value="HEAD">{zh ? '当前分支' : 'Current branch'}</option>
-                {[...new Set([...selectedRepository.snapshot.localBranches, ...selectedRepository.snapshot.remoteBranches, ...selectedRepository.snapshot.tags])].map((ref) => (
-                  <option key={ref} value={ref}>
-                    {ref}
-                  </option>
-                ))}
-              </select>
-            ) : null}
-            {tab === 'changes' || tab === 'log' ? (
+            <strong>{tab === 'log' ? (zh ? '提交历史' : 'Commit history') : tab === 'stash' ? (zh ? '贮藏' : 'Stashes') : zh ? '操作记录' : 'Operation history'}</strong>
+            {tab === 'log' ? (
               <label>
                 <MagnifyingGlass />
                 <input
-                  aria-label={tab === 'changes' ? (zh ? '筛选更改文件' : 'Filter changed files') : zh ? '搜索提交' : 'Search commits'}
+                  aria-label={zh ? '搜索提交' : 'Search commits'}
                   type="search"
-                  value={tab === 'changes' ? fileQuery : searchQuery}
-                  onChange={(event) => (tab === 'changes' ? setFileQuery(event.currentTarget.value) : setSearchQuery(event.currentTarget.value))}
-                  placeholder={tab === 'changes' ? (zh ? '筛选文件…' : 'Filter files…') : zh ? '搜索提交、作者或哈希…' : 'Search commits, authors or hashes…'}
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.currentTarget.value)}
+                  placeholder={zh ? '搜索提交、作者或哈希…' : 'Search commits, authors or hashes…'}
                 />
               </label>
             ) : null}
@@ -1197,7 +1095,7 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
               historyLoading={historyLoading}
               historyError={historyError}
               historyHasMore={historyPage?.key === `${selectedRepository?.id}:${historyRef}` && historyPage.hasMore}
-              onLoadMore={() => void loadHistory(true)}
+              onLoadMore={() => loadHistory(true)}
               selectedRepository={selectedRepository}
               selectedCommitHash={commitDetail?.commit.hash ?? selectedCommitHash}
               commitDetail={commitDetail}
@@ -1205,7 +1103,8 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
               selectedFilePath={selectedFilePath}
               onSelectRepository={setSelectedRepositoryId}
               onSelectCommit={selectCommit}
-              onOpenChanges={() => setTab('changes')}
+              onOpenChanges={openCommit}
+              onPreloadChanges={preloadCommit}
               onSelectFile={setSelectedFilePath}
               busy={busy}
               onExecute={execute}
@@ -1218,50 +1117,6 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
                   run: async () => (await execute(repository, action, title)) === 'completed',
                 })
               }
-            />
-          ) : tab === 'changes' ? (
-            <LocalChangesSurface
-              query={fileQuery}
-              commitRequest={commitRequest}
-              previewRevision={snapshot?.refreshedAt}
-              projectId={props.project.id}
-              subtree={subtree}
-              onClearSubtree={() => setSubtree(null)}
-              zh={zh}
-              onOpenStash={() => setTab('stash')}
-              repositories={repositories}
-              selectedRepository={selectedRepository}
-              selectedFilePath={selectedFilePath}
-              selectedFileStage={selectedFileStage}
-              busy={busy}
-              onSelectRepository={setSelectedRepositoryId}
-              onSelectFile={(path, stage) => {
-                setSelectedFilePath(path);
-                setSelectedFileStage(stage);
-              }}
-              onOpenDiff={openDiffWindow}
-              onExecute={execute}
-              onConfirmAction={(repository, action, title, description, danger) =>
-                setMenuConfirmation({
-                  title,
-                  description: `${repository.name}\n${description}`,
-                  danger,
-                  run: async () => (await execute(repository, action, title)) === 'completed',
-                })
-              }
-              onCommit={() => setCommitOpen(true)}
-              commitDrafts={commitDrafts}
-              commitModels={commitModels}
-              commitModelRef={commitModelRef}
-              commitModelsLoading={commitModelsLoading}
-              commitModelsError={commitModelsError}
-              onSelectCommitModel={selectCommitModel}
-              onRefreshCommitModels={() => setCommitModelsRefresh((current) => current + 1)}
-              generatingCommitFor={generatingCommitFor}
-              generationFeedback={selectedRepository ? commitGenerationFeedback[selectedRepository.id] : undefined}
-              onGenerateCommitMessage={generateCommitMessage}
-              onStopCommitGeneration={() => commitGenerationController.current?.abort()}
-              onCommitMessageChange={(repositoryId, message) => setCommitDrafts((current) => ({ ...current, [repositoryId]: message }))}
             />
           ) : tab === 'stash' ? (
             <StashSurface
@@ -1289,21 +1144,9 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
       </MotionPresence>
       <MotionPresence>{contextMenu ? <GitContextMenu {...contextMenu} onClose={() => setContextMenu(null)} onError={(reason) => setError(errorMessage(reason, zh))} /> : null}</MotionPresence>
       <MotionPresence>{menuConfirmation ? <GitMenuActionDialog value={menuConfirmation} zh={zh} onClose={() => setMenuConfirmation(null)} /> : null}</MotionPresence>
-      <MotionPresence>{commitOpen ? <CommitDialog open={commitOpen} zh={zh} repositories={repositories} busy={busy} onClose={() => setCommitOpen(false)} onExecute={execute} /> : null}</MotionPresence>
       <MotionPresence>{stashRepository ? <StashDialog key={stashRepository.id} repository={stashRepository} zh={zh} busy={busy} onClose={() => setStashRepositoryId(null)} onExecute={execute} /> : null}</MotionPresence>
       <MotionPresence>
-        {updateOpen ? (
-          <UpdateProjectDialog
-            open={updateOpen}
-            projectId={props.project.id}
-            zh={zh}
-            repositories={repositories}
-            busy={busy}
-            errorsByRepository={operationErrorsByRepositoryRef.current}
-            onClose={() => setUpdateOpen(false)}
-            onExecute={execute}
-          />
-        ) : null}
+        {updateOpen ? <UpdateProjectDialog key={props.project.id} projectId={props.project.id} zh={zh} busy={busy} onClose={() => setUpdateOpen(false)} onUpdate={(strategy) => updateProject(strategy)} /> : null}
       </MotionPresence>
       <MotionPresence>
         {newBranchOpen ? (
@@ -1333,14 +1176,15 @@ export function ProjectGitWorkbench(props: ProjectGitWorkbenchProps) {
             projectId={props.project.id}
             client={props.client}
             revision={snapshot?.refreshedAt ?? ''}
-            open={pushOpen}
+            open={pushOpen > 0}
+            activation={pushOpen}
             zh={zh}
             repositories={repositories}
             selectedRepository={selectedRepository}
             busy={busy}
             results={pushResults}
             onClose={() => {
-              setPushOpen(false);
+              setPushOpen(0);
               setPushResults([]);
             }}
             onPush={async (selections, forceWithLease, pushTags) => {
@@ -1392,6 +1236,8 @@ function GitLogSurface(props: {
   onSelectRepository: (repositoryId: string) => void;
   onSelectCommit: (repository: ProjectGitRepositoryWorkbenchItem, commitHash: string) => void;
   onOpenChanges: () => void;
+  /** 靠近未提交更改入口时复用同一个后台窗口。 */
+  onPreloadChanges: () => void;
   onSelectFile: (path: string) => void;
   busy: BusyState;
   onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
@@ -1424,14 +1270,14 @@ function GitLogSurface(props: {
         </header>
         {props.repositories.map((repository) => (
           <section key={repository.id} className={repository.id === props.selectedRepository?.id ? 'is-current' : ''}>
-            <button type="button" className="project-git-repository-row" onClick={() => props.onSelectRepository(repository.id)}>
+            <Button unstyled type="button" className="project-git-repository-row" onClick={() => props.onSelectRepository(repository.id)}>
               <GitBranch aria-hidden="true" />
               <span>
                 <strong>{repository.name}</strong>
                 <small>{repository.relativePath === '.' ? repository.snapshot.branch : `${repository.relativePath} · ${repository.snapshot.branch}`}</small>
               </span>
               {repository.snapshot.fileStatuses.length > 0 ? <em>{repository.snapshot.fileStatuses.length}</em> : null}
-            </button>
+            </Button>
             <div className="project-git-branch-tree">
               <span>{props.zh ? '本地分支' : 'Local branches'}</span>
               <BranchDirectoryTree
@@ -1468,7 +1314,7 @@ function GitLogSurface(props: {
           <span>{props.zh ? '日期' : 'Date'}</span>
         </header>
         {props.selectedRepository && props.selectedRepository.snapshot.fileStatuses.length > 0 ? (
-          <button type="button" className="project-git-commit-row git-working-copy-row" onClick={props.onOpenChanges}>
+          <Button unstyled type="button" className="project-git-commit-row git-working-copy-row" onPointerEnter={props.onPreloadChanges} onFocus={props.onPreloadChanges} onClick={props.onOpenChanges}>
             <span className="project-git-commit-subject">
               <strong>{props.zh ? '未提交的更改' : 'Uncommitted changes'}</strong>
               <small>{props.selectedRepository.snapshot.fileStatuses.length}</small>
@@ -1476,7 +1322,7 @@ function GitLogSurface(props: {
             <code>—</code>
             <span>—</span>
             <span />
-          </button>
+          </Button>
         ) : null}
         <div className="project-git-commit-scroll" ref={historyScroll}>
           <CommitGraph commits={props.commits.map(({ commit }) => commit)} />
@@ -1485,7 +1331,8 @@ function GitLogSurface(props: {
             {props.commits.map(({ repository, commit }) => {
               const selected = repository.id === props.selectedRepository?.id && commit.hash === props.selectedCommitHash;
               return (
-                <button
+                <Button
+                  unstyled
                   key={`${repository.id}:${commit.hash}`}
                   data-git-context={JSON.stringify({ kind: 'commit', repositoryId: repository.id, ref: commit.hash })}
                   type="button"
@@ -1506,7 +1353,7 @@ function GitLogSurface(props: {
                   <time dateTime={commit.authoredAt} data-icon-tooltip={new Date(commit.authoredAt).toLocaleString()}>
                     {formatRelativeTime(commit.authoredAt, props.zh)}
                   </time>
-                </button>
+                </Button>
               );
             })}
             <div ref={historySentinel} role="status" className="project-git-history-status">
@@ -1579,13 +1426,14 @@ function GitLogSurface(props: {
                 {commitMenu && props.selectedRepository
                   ? createPortal(
                       <MenuSurface className="project-git-context-menu" aria-label={props.zh ? '提交操作' : 'Commit actions'} style={{ left: commitMenu.x, top: commitMenu.y }} onClose={() => setCommitMenu(null)}>
-                        <button
+                        <Button
+                          unstyled
                           type="button"
                           role="menuitem"
                           disabled={props.busy !== null || props.selectedRepository.snapshot.detached}
                           onClick={() => {
                             setCommitMenu(null);
-                            props.onConfirmAction(
+                            return props.onConfirmAction(
                               props.selectedRepository!,
                               { type: 'cherry_pick', revision: props.commitDetail!.commit.hash },
                               props.zh ? '拣选到当前分支' : 'Cherry-pick commit',
@@ -1594,15 +1442,16 @@ function GitLogSurface(props: {
                           }}
                         >
                           {props.zh ? '拣选到当前分支' : 'Cherry-pick to current branch'}
-                        </button>
-                        <button
+                        </Button>
+                        <Button
+                          unstyled
                           type="button"
                           role="menuitem"
                           data-danger="true"
                           disabled={props.busy !== null}
                           onClick={() => {
                             setCommitMenu(null);
-                            props.onConfirmAction(
+                            return props.onConfirmAction(
                               props.selectedRepository!,
                               { type: 'revert', revision: props.commitDetail!.commit.hash },
                               props.zh ? '撤销此提交' : 'Revert commit',
@@ -1612,7 +1461,7 @@ function GitLogSurface(props: {
                           }}
                         >
                           {props.zh ? '撤销此提交' : 'Revert this commit'}
-                        </button>
+                        </Button>
                       </MenuSurface>,
                       document.querySelector('.macos-ai-app') ?? document.body,
                     )
@@ -1630,7 +1479,7 @@ function GitLogSurface(props: {
                 selectedPath={props.selectedFilePath}
                 onSelect={props.onSelectFile}
                 onOpen={(path) => {
-                  if (props.selectedRepository) props.onOpenDiff(props.selectedRepository, path, { commitHash: props.commitDetail?.commit.hash });
+                  if (props.selectedRepository) return props.onOpenDiff(props.selectedRepository, path, { commitHash: props.commitDetail?.commit.hash });
                 }}
               />
             </section>
@@ -1684,7 +1533,9 @@ function CommitFileTreeEntry(props: Parameters<typeof CommitFileDirectoryTree>[0
     );
   }
   return (
-    <button
+    <Button
+      data-busy-behavior="background"
+      unstyled
       type="button"
       data-file-path={props.node.path}
       className={props.node.path === props.selectedPath ? 'is-current' : ''}
@@ -1698,7 +1549,7 @@ function CommitFileTreeEntry(props: Parameters<typeof CommitFileDirectoryTree>[0
       </span>
       <em>+{props.node.stats.additions}</em>
       <i>-{props.node.stats.deletions}</i>
-    </button>
+    </Button>
   );
 }
 
@@ -1836,7 +1687,9 @@ function RepositoryNavigationTree(props: { repositories: ProjectGitRepositoryWor
               : 'Synced';
     const row =
       repository && snapshot ? (
-        <button
+        <Button
+          data-busy-behavior="background"
+          unstyled
           data-git-context={JSON.stringify({ kind: 'repository', repositoryId: repository.id, ref: repository.name })}
           type="button"
           className="project-git-navigation-repository"
@@ -1852,7 +1705,7 @@ function RepositoryNavigationTree(props: { repositories: ProjectGitRepositoryWor
           <span className="git-tracking-badge" aria-label={relation}>
             {relation}
           </span>
-        </button>
+        </Button>
       ) : null;
     if (!node.children.size) return <div key={node.path}>{row}</div>;
     return (
@@ -1870,492 +1723,6 @@ function RepositoryNavigationTree(props: { repositories: ProjectGitRepositoryWor
     );
   };
   return <>{[...root.children.values()].sort((a, b) => a.name.localeCompare(b.name)).map(render)}</>;
-}
-
-function LocalChangesSurface(props: {
-  query: string;
-  commitRequest: number;
-  /** 刷新时即使二进制补丁相同，也重新读取当前文件。 */
-  previewRevision?: string;
-  /** 仓库预览所属项目。 */
-  projectId: string;
-  subtree: { repositoryId: string; path: string } | null;
-  onClearSubtree: () => void;
-  zh: boolean;
-  onOpenStash: () => void;
-  repositories: ProjectGitRepositoryWorkbenchItem[];
-  selectedRepository: ProjectGitRepositoryWorkbenchItem | null;
-  selectedFilePath: string;
-  selectedFileStage: ChangeStage;
-  busy: BusyState;
-  onSelectRepository: (repositoryId: string) => void;
-  onSelectFile: (path: string, stage: ChangeStage) => void;
-  onOpenDiff: (repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { stage?: 'combined' | ChangeStage; commitHash?: string; comparisonRef?: string; comparisonMode?: 'current' | 'working-tree' }) => void;
-  onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
-  onConfirmAction: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, title: string, description: string, danger: boolean) => void;
-  onCommit: () => void;
-  commitDrafts: Record<string, string>;
-  commitModels: Array<{ id: string; label: string }>;
-  commitModelRef: string;
-  commitModelsLoading: boolean;
-  commitModelsError: string;
-  onSelectCommitModel: (modelRef: string) => void;
-  onRefreshCommitModels: () => void;
-  generatingCommitFor: string | null;
-  generationFeedback?: string;
-  onGenerateCommitMessage: (repository: ProjectGitRepositoryWorkbenchItem) => Promise<void>;
-  onStopCommitGeneration: () => void;
-  onCommitMessageChange: (repositoryId: string, message: string) => void;
-}) {
-  const committingRef = useRef(false);
-  const [fileView, setFileView] = useState<'tree' | 'flat'>(() => {
-    try {
-      return localStorage.getItem('zeus.git.file-view.v1') === 'flat' ? 'flat' : 'tree';
-    } catch {
-      return 'tree';
-    }
-  });
-  const [conflictsExpanded, setConflictsExpanded] = useState(true);
-  const [editingRepository, setEditingRepository] = useState<string | null>(null);
-  const commitInputRef = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => {
-    if (props.commitRequest && props.selectedRepository) setEditingRepository(props.selectedRepository.id);
-  }, [props.commitRequest]);
-  const commitActive = Boolean(props.selectedRepository && editingRepository === props.selectedRepository.id);
-  useEffect(() => {
-    if (commitActive) commitInputRef.current?.focus();
-  }, [commitActive]);
-  const repository = props.selectedRepository;
-  const message = repository ? (props.commitDrafts[repository.id] ?? '') : '';
-  const stagedCount = repository?.snapshot.fileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?').length ?? 0;
-  const generating = props.generatingCommitFor === repository?.id;
-  const canCommit = Boolean(repository && stagedCount > 0 && message.trim() && !props.busy && !generating);
-  async function commitCurrentRepository(): Promise<void> {
-    if (!repository || !canCommit || committingRef.current) return;
-    committingRef.current = true;
-    try {
-      const outcome = await props.onExecute(repository, { type: 'commit', message: message.trim() }, props.zh ? '提交已暂存变更' : 'Commit staged changes');
-      if (outcome === 'completed') {
-        props.onCommitMessageChange(repository.id, '');
-        setEditingRepository(null);
-      }
-    } finally {
-      committingRef.current = false;
-    }
-  }
-  const subtree = props.subtree;
-  const matchesSubtree = (path: string) => !subtree || subtree.repositoryId !== props.selectedRepository?.id || path === subtree.path || path.startsWith(`${subtree.path}/`);
-  const visibleFileStatuses = repository?.snapshot.fileStatuses.filter((file) => matchesSubtree(file.path) && file.path.toLocaleLowerCase().includes(props.query.trim().toLocaleLowerCase())) ?? [];
-  const visibleChangeCount = visibleFileStatuses.length;
-  const emptyVisibleChanges = Boolean(repository && visibleChangeCount === 0 && repository.snapshot.conflictFiles.length === 0);
-  const workspaceClean = Boolean(emptyVisibleChanges && repository?.snapshot.fileStatuses.length === 0);
-  const visibleStageFiles = {
-    staged: visibleFileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?').map((file) => file.path),
-    unstaged: visibleFileStatuses.filter((file) => file.workingTreeStatus !== ' ' || file.indexStatus === '?').map((file) => file.path),
-  };
-  const stageDiff = props.selectedFileStage === 'staged' ? props.selectedRepository?.snapshot.stagedDiff : props.selectedRepository?.snapshot.unstagedDiff;
-  const selectedDiff = stageDiff?.fileDiffs.find((file) => (file.newPath === props.selectedFilePath || file.oldPath === props.selectedFilePath) && matchesSubtree(file.newPath || file.oldPath)) ?? null;
-  return (
-    <div className="project-git-changes-layout project-git-navigator-layout" data-commit-active={commitActive}>
-      <aside className="project-git-change-tree" data-empty={emptyVisibleChanges || undefined}>
-        {repository && repository.snapshot.conflictFiles.length > 0 ? (
-          <section className="project-git-conflict-files" aria-label={props.zh ? '冲突文件' : 'Conflicted files'}>
-            <header>
-              <button type="button" aria-expanded={conflictsExpanded} onClick={() => setConflictsExpanded((expanded) => !expanded)}>
-                <WarningCircle aria-hidden="true" />
-                <strong>{props.zh ? `冲突文件 (${repository.snapshot.conflictFiles.length})` : `Conflicts (${repository.snapshot.conflictFiles.length})`}</strong>
-                <CaretDown aria-hidden="true" />
-              </button>
-            </header>
-            {conflictsExpanded ? (
-              <div className="project-git-conflict-file-list">
-                {repository.snapshot.conflictFiles.map((path) => (
-                  <button key={path} type="button" className={path === props.selectedFilePath ? 'is-current' : ''} onClick={() => props.onSelectFile(path, 'unstaged')} title={path}>
-                    <span>{path}</span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </section>
-        ) : null}
-        <header>
-          <strong>{props.zh ? '变更文件' : 'Changed files'}</strong>
-          <span className="project-git-file-view-control" data-icon-tooltip={fileView === 'flat' ? (props.zh ? '平铺结构' : 'Flat view') : props.zh ? '树状结构' : 'Tree view'}>
-            {fileView === 'flat' ? <ListBullets aria-hidden="true" /> : <TreeStructure aria-hidden="true" />}
-            <CaretDown aria-hidden="true" />
-            <select
-              className="project-git-file-view-select"
-              aria-label={props.zh ? `文件显示方式：${fileView === 'flat' ? '平铺结构' : '树状结构'}` : `File view: ${fileView === 'flat' ? 'Flat view' : 'Tree view'}`}
-              value={fileView}
-              disabled={!repository || visibleChangeCount === 0}
-              onChange={(event) => {
-                const next = event.currentTarget.value === 'flat' ? 'flat' : 'tree';
-                setFileView(next);
-                try {
-                  localStorage.setItem('zeus.git.file-view.v1', next);
-                } catch {
-                  /* 存储不可用时保留当前会话选择。 */
-                }
-              }}
-            >
-              <option value="tree">{props.zh ? '树状结构' : 'Tree view'}</option>
-              <option value="flat">{props.zh ? '平铺结构' : 'Flat view'}</option>
-            </select>
-          </span>
-          <span>{visibleChangeCount}</span>
-          {subtree?.repositoryId === props.selectedRepository?.id ? (
-            <button type="button" onClick={props.onClearSubtree}>
-              {props.zh ? '清除目录筛选' : 'Clear folder filter'}
-            </button>
-          ) : null}
-        </header>
-        {emptyVisibleChanges ? (
-          <div className="project-git-clean-state" role="status">
-            <span className="project-git-empty-symbol">
-              <CheckCircle aria-hidden="true" />
-            </span>
-            <strong>{workspaceClean ? (props.zh ? '工作区干净' : 'Working tree clean') : props.zh ? '没有匹配的更改' : 'No matching changes'}</strong>
-            <span>{workspaceClean ? (props.zh ? '没有待暂存或提交的文件。' : 'There are no files to stage or commit.') : props.zh ? '调整文件或目录筛选可查看其他更改。' : 'Adjust the file or folder filter to view other changes.'}</span>
-          </div>
-        ) : (
-          <div className="project-git-stage-panels">
-            {(['staged', 'unstaged'] as const).map((stage) => {
-              const files = visibleStageFiles[stage];
-              const title = stage === 'staged' ? (props.zh ? '已暂存' : 'Staged') : props.zh ? '未暂存' : 'Unstaged';
-              return (
-                <Fragment key={stage}>
-                  {stage === 'unstaged' ? <GitPaneSeparator name="stages" label={props.zh ? '调整已暂存与未暂存区域高度' : 'Resize staged and unstaged panels'} axis="y" initial={50} min={15} max={85} /> : null}
-                  <section className="project-git-stage-panel" aria-label={title}>
-                    <header data-git-context={repository ? JSON.stringify({ kind: 'stage', repositoryId: repository.id, ref: title, stage }) : undefined}>
-                      <label className="project-git-stage-select-all">
-                        <input
-                          type="checkbox"
-                          checked={stage === 'staged' && files.length > 0}
-                          disabled={!repository || !files.length || props.busy !== null}
-                          aria-label={stage === 'staged' ? (props.zh ? '取消暂存全部显示文件' : 'Unstage all displayed files') : props.zh ? '暂存全部显示文件' : 'Stage all displayed files'}
-                          data-icon-tooltip={stage === 'staged' ? (props.zh ? '取消暂存全部显示文件' : 'Unstage all displayed files') : props.zh ? '暂存全部显示文件' : 'Stage all displayed files'}
-                          onChange={() => {
-                            if (repository && files.length && !props.busy)
-                              void props.onExecute(
-                                repository,
-                                { type: stage === 'staged' ? 'unstage' : 'stage', paths: files },
-                                stage === 'staged' ? (props.zh ? '取消暂存全部显示文件' : 'Unstage all displayed files') : props.zh ? '暂存全部显示文件' : 'Stage all displayed files',
-                              );
-                          }}
-                        />
-                        <strong>{title}</strong>
-                      </label>
-                      <span>{files.length}</span>
-                    </header>
-                    <div className="project-git-stage-scroll">
-                      {repository && files.length > 0 ? (
-                        <ChangeDirectoryTree
-                          view={fileView}
-                          files={files}
-                          stage={stage}
-                          repository={repository}
-                          selectedRepositoryId={repository.id}
-                          selectedFilePath={props.selectedFilePath}
-                          selectedFileStage={props.selectedFileStage}
-                          busy={props.busy}
-                          zh={props.zh}
-                          onSelectRepository={props.onSelectRepository}
-                          onSelectFile={props.onSelectFile}
-                          onOpenDiff={props.onOpenDiff}
-                          onExecute={props.onExecute}
-                        />
-                      ) : (
-                        <p className="project-git-stage-empty">{stage === 'staged' ? (props.zh ? '暂无已暂存文件' : 'No staged files') : props.zh ? '暂无未暂存文件' : 'No unstaged files'}</p>
-                      )}
-                    </div>
-                  </section>
-                </Fragment>
-              );
-            })}
-          </div>
-        )}
-      </aside>
-      <GitPaneSeparator name="files" label={props.zh ? '调整文件列表宽度' : 'Resize file list'} initial={30} min={15} max={65} />
-      <main className="project-git-change-diff">
-        {emptyVisibleChanges ? (
-          <div className="project-git-change-diff-empty" role="status">
-            <span className="project-git-empty-symbol">
-              <CheckCircle aria-hidden="true" />
-            </span>
-            <strong>{workspaceClean ? (props.zh ? '当前分支没有本地更改' : 'No local changes on this branch') : props.zh ? '当前目录没有可比较的变更' : 'No comparable changes in this folder'}</strong>
-            <span>
-              {workspaceClean
-                ? props.zh
-                  ? '修改文件后，可在这里逐项查看差异。'
-                  : 'Edit a file to inspect its diff here.'
-                : props.zh
-                  ? '清除目录筛选，或选择其他目录查看差异。'
-                  : 'Clear the folder filter or select another folder to inspect changes.'}
-            </span>
-          </div>
-        ) : (
-          <SideBySideDiff
-            previewRequest={repository && props.selectedFilePath ? { kind: 'project-git', projectId: props.projectId, repositoryId: repository.id, path: props.selectedFilePath, stage: props.selectedFileStage } : undefined}
-            revision={props.previewRevision}
-            diff={selectedDiff ? { isRepository: true, files: [selectedDiff.newPath || selectedDiff.oldPath], diffText: stageDiff?.diffText ?? '', fileDiffs: [selectedDiff] } : null}
-            zh={props.zh}
-            partitionHunks
-            hunkActionsDisabled={props.busy !== null}
-            onHunkAction={
-              repository && selectedDiff && selectedDiff.changeType === 'modified'
-                ? (file, hunk) => {
-                    const patch = buildGitHunkPatch(file, hunk);
-                    void props.onExecute(
-                      repository,
-                      { type: 'apply_patch', patch, reverse: props.selectedFileStage === 'staged' },
-                      props.selectedFileStage === 'staged' ? (props.zh ? '取消暂存区块' : 'Unstage hunk') : props.zh ? '暂存区块' : 'Stage hunk',
-                    );
-                  }
-                : undefined
-            }
-            hunkActionLabel={props.selectedFileStage === 'staged' ? (props.zh ? '取消暂存区块' : 'Unstage hunk') : props.zh ? '暂存区块' : 'Stage hunk'}
-            onHunkDiscard={
-              repository && selectedDiff && selectedDiff.changeType === 'modified' && props.selectedFileStage === 'unstaged'
-                ? (file, hunk, index) => {
-                    const patch = buildGitHunkPatch(file, hunk);
-                    const title = props.zh ? `放弃区块 ${index + 1}` : `Discard hunk ${index + 1}`;
-                    props.onConfirmAction(
-                      repository,
-                      { type: 'apply_patch', patch, reverse: true, target: 'worktree' },
-                      title,
-                      props.zh ? `将“${file.newPath || file.oldPath}”的区块 ${index + 1} 恢复为暂存区内容。此操作无法撤销。` : `Restore hunk ${index + 1} in '${file.newPath || file.oldPath}' to the index version. This cannot be undone.`,
-                      true,
-                    );
-                  }
-                : undefined
-            }
-            hunkDiscardLabel={props.zh ? '放弃区块' : 'Discard hunk'}
-          />
-        )}
-      </main>
-      {commitActive ? (
-        <>
-          <GitPaneSeparator name="commit" label={props.zh ? '调整提交区域高度' : 'Resize commit panel'} axis="y" initial={65} min={25} max={85} />
-          <aside className="project-git-commit-rail project-git-commit-composer">
-            <div className="project-git-commit-summary" role="status">
-              <strong>{repository?.name ?? (props.zh ? '请选择仓库' : 'Select a repository')}</strong>
-              <small>{props.zh ? `${stagedCount} 个已暂存文件 · 仅提交当前仓库` : `${stagedCount} staged files · Current repository only`}</small>
-              {stagedCount === 0 ? <small>{props.zh ? '勾选左侧文件进行暂存后即可提交。' : 'Select files on the left to stage them before committing.'}</small> : null}
-            </div>
-            <div className="project-git-commit-message">
-              <div className="project-git-commit-message-heading">
-                <label htmlFor="project-git-commit-message">{props.zh ? '提交说明' : 'Commit message'}</label>
-                <div className="project-git-commit-generation-controls">
-                  <small className="project-git-commit-generation-feedback" role="status" data-icon-tooltip={props.commitModelsError || undefined}>
-                    {!props.commitModelsLoading && !props.commitModels.length
-                      ? props.zh
-                        ? '暂无可用模型，请在设置中配置模型连接后刷新。'
-                        : 'No models available. Configure a model connection in Settings, then refresh.'
-                      : props.generationFeedback || props.commitModelsError}
-                  </small>
-                  <select
-                    aria-label={props.zh ? '生成提交说明的模型' : 'Commit message model'}
-                    value={props.commitModelRef}
-                    disabled={props.commitModelsLoading || props.generatingCommitFor !== null || props.commitModels.length === 0}
-                    onChange={(event) => props.onSelectCommitModel(event.currentTarget.value)}
-                  >
-                    {!props.commitModelRef ? <option value="">{props.commitModelsLoading ? (props.zh ? '正在加载模型…' : 'Loading models…') : props.zh ? '没有可用模型' : 'No available models'}</option> : null}
-                    {props.commitModels.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.label}
-                      </option>
-                    ))}
-                  </select>
-                  <Button
-                    variant="secondary"
-                    disabled={props.commitModelsLoading || props.generatingCommitFor !== null}
-                    onClick={props.onRefreshCommitModels}
-                    data-icon-tooltip={props.zh ? '刷新模型列表' : 'Refresh models'}
-                    aria-label={props.zh ? '刷新模型列表' : 'Refresh models'}
-                  >
-                    <ArrowsClockwise aria-hidden="true" />
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    disabled={!generating && (!repository || stagedCount === 0 || props.busy !== null || props.generatingCommitFor !== null || props.commitModelsLoading || !props.commitModelRef)}
-                    onClick={() => {
-                      if (generating) props.onStopCommitGeneration();
-                      else if (repository) void props.onGenerateCommitMessage(repository);
-                    }}
-                  >
-                    {generating ? (props.zh ? '停止生成' : 'Stop generating') : props.zh ? 'AI 生成' : 'Generate with AI'}
-                  </Button>
-                </div>
-              </div>
-              <textarea
-                ref={commitInputRef}
-                id="project-git-commit-message"
-                value={message}
-                rows={3}
-                placeholder={props.zh ? '简要描述本次修改，可换行补充详情' : 'Describe this change; add details on subsequent lines'}
-                disabled={!repository || props.busy !== null || generating}
-                onChange={(event) => {
-                  if (repository) props.onCommitMessageChange(repository.id, event.currentTarget.value);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === 'Escape' && !event.nativeEvent.isComposing && !props.busy && !generating) {
-                    event.preventDefault();
-                    setEditingRepository(null);
-                  }
-                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    void commitCurrentRepository();
-                  }
-                }}
-              />
-            </div>
-            <div className="project-git-commit-actions">
-              <Button variant="secondary" disabled={props.busy !== null || generating} onClick={() => setEditingRepository(null)}>
-                {props.zh ? '取消' : 'Cancel'}
-              </Button>
-              <Button variant="primary" onClick={() => void commitCurrentRepository()} disabled={!canCommit} busy={props.busy?.action === 'commit'}>
-                {props.zh ? '提交已暂存变更' : 'Commit staged changes'}
-              </Button>
-              {props.repositories.length > 1 ? (
-                <Button variant="secondary" onClick={props.onCommit} disabled={props.busy !== null}>
-                  {props.zh ? '多仓库提交…' : 'Commit across repositories…'}
-                </Button>
-              ) : null}
-            </div>
-          </aside>
-        </>
-      ) : (
-        <aside className="project-git-commit-collapsed">
-          <span data-icon-tooltip={repository?.name}>{repository?.name ?? (props.zh ? '提交' : 'Commit')}</span>
-          <button
-            type="button"
-            disabled={!repository || workspaceClean}
-            aria-label={workspaceClean ? (props.zh ? '当前仓库没有可提交的变更' : 'No changes to commit in this repository') : props.zh ? '展开提交说明编辑区' : 'Expand commit message editor'}
-            onClick={() => {
-              if (repository) setEditingRepository(repository.id);
-            }}
-          >
-            {message.split(/\r?\n/u)[0] ||
-              (workspaceClean
-                ? props.zh
-                  ? '工作区干净'
-                  : 'Working tree clean'
-                : stagedCount > 0
-                  ? props.zh
-                    ? '填写提交说明…'
-                    : 'Enter a commit message…'
-                  : props.zh
-                    ? '先暂存文件，再填写提交说明…'
-                    : 'Stage files before entering a commit message…')}
-          </button>
-        </aside>
-      )}
-    </div>
-  );
-}
-
-interface ChangeTreeNode {
-  name: string;
-  path: string;
-  children: Map<string, ChangeTreeNode>;
-  file: boolean;
-}
-
-function ChangeDirectoryTree(props: {
-  view?: 'tree' | 'flat';
-  files: string[];
-  stage: ChangeStage;
-  repository: ProjectGitRepositoryWorkbenchItem;
-  selectedRepositoryId?: string;
-  selectedFilePath: string;
-  selectedFileStage: ChangeStage;
-  busy: BusyState;
-  zh: boolean;
-  onSelectRepository: (repositoryId: string) => void;
-  onSelectFile: (path: string, stage: ChangeStage) => void;
-  onOpenDiff: (repository: ProjectGitRepositoryWorkbenchItem, filePath: string, options?: { stage?: 'combined' | ChangeStage }) => void;
-  onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
-}) {
-  const nodes = useMemo(
-    () => (props.view === 'flat' ? [...props.files].sort((a, b) => a.localeCompare(b)).map((path): ChangeTreeNode => ({ name: path, path, file: true, children: new Map() })) : [...buildChangeTree(props.files).children.values()]),
-    [props.files.join('\0'), props.view],
-  );
-  if (props.files.length === 0) return null;
-  return (
-    <div className="project-git-change-directory-tree">
-      {nodes.map((node) => (
-        <ChangeTreeEntry key={node.path} node={node} depth={0} {...props} />
-      ))}
-    </div>
-  );
-}
-
-/** 暂存与未暂存入口沿用同一文件状态展示，选择高亮不覆盖名称颜色。 */
-function ChangeTreeEntry(props: Parameters<typeof ChangeDirectoryTree>[0] & { node: ChangeTreeNode; depth: number }) {
-  if (!props.node.file) {
-    return (
-      <details className="project-git-change-folder" open>
-        <summary data-git-context={JSON.stringify({ kind: 'directory', repositoryId: props.repository.id, ref: props.node.path, stage: props.stage })} style={{ paddingLeft: `${props.depth * 13 + 6}px` }}>
-          <CaretRight aria-hidden="true" />
-          <Folder weight="regular" aria-hidden="true" />
-          <span>{props.node.name}</span>
-        </summary>
-        {Array.from(props.node.children.values()).map((child) => (
-          <ChangeTreeEntry key={child.path} {...props} node={child} depth={props.depth + 1} />
-        ))}
-      </details>
-    );
-  }
-  const selected = props.repository.id === props.selectedRepositoryId && props.node.path === props.selectedFilePath && props.stage === props.selectedFileStage;
-  const checked = props.stage === 'staged';
-  const status = props.repository.snapshot.fileStatuses.find((file) => file.path === props.node.path);
-  const category = gitFileStatusCategory(status, props.stage);
-  const submodule = props.repository.snapshot.submodules?.some((item) => item.path === props.node.path) ?? false;
-  return (
-    <div data-git-context={JSON.stringify({ kind: 'file', repositoryId: props.repository.id, ref: props.node.path, stage: props.stage })} className={`project-git-change-file-row${selected ? ' is-current' : ''}`}>
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={props.busy !== null}
-        aria-label={checked ? (props.zh ? `取消暂存 ${props.node.path}` : `Unstage ${props.node.path}`) : props.zh ? `暂存 ${props.node.path}` : `Stage ${props.node.path}`}
-        onChange={() =>
-          void props.onExecute(
-            props.repository,
-            checked ? { type: 'unstage', paths: [props.node.path] } : { type: 'stage', paths: [props.node.path] },
-            checked ? (props.zh ? '取消暂存文件' : 'Unstage file') : props.zh ? '暂存文件' : 'Stage file',
-          )
-        }
-      />
-      <button
-        type="button"
-        style={{ marginLeft: `${props.depth * 13}px` }}
-        title={`${props.node.path} · ${gitFileStatusLabel(category, props.zh)}`}
-        onClick={() => {
-          props.onSelectRepository(props.repository.id);
-          props.onSelectFile(props.node.path, props.stage);
-        }}
-        onDoubleClick={() => props.onOpenDiff(props.repository, props.node.path, { stage: props.stage })}
-      >
-        {submodule ? <Folder aria-hidden="true" /> : <GitFileStatusIcon category={category} zh={props.zh} />}
-        <span>{props.node.name}</span>
-      </button>
-    </div>
-  );
-}
-
-function buildChangeTree(paths: string[]): ChangeTreeNode {
-  const root: ChangeTreeNode = { name: '', path: '', children: new Map(), file: false };
-  for (const path of [...paths].sort((left, right) => left.localeCompare(right))) {
-    let current = root;
-    const parts = path.split('/').filter(Boolean);
-    parts.forEach((part, index) => {
-      const childPath = parts.slice(0, index + 1).join('/');
-      const next = current.children.get(part) ?? { name: part, path: childPath, children: new Map<string, ChangeTreeNode>(), file: index === parts.length - 1 };
-      current.children.set(part, next);
-      current = next;
-    });
-  }
-  return root;
 }
 
 function StashSurface(props: {
@@ -2397,13 +1764,13 @@ function StashSurface(props: {
           </span>
         </span>
         <span className="project-git-stash-actions">
-          <Button variant="secondary" size="compact" disabled={props.busy !== null} onClick={() => void props.onExecute(repository, { type: 'apply_stash', stashRef: stash.ref }, props.zh ? '应用 Stash' : 'Apply stash')}>
+          <Button variant="secondary" size="compact" disabled={props.busy !== null} onClick={() => props.onExecute(repository, { type: 'apply_stash', stashRef: stash.ref }, props.zh ? '应用 Stash' : 'Apply stash')}>
             {props.zh ? '应用' : 'Apply'}
           </Button>
-          <Button variant="secondary" size="compact" disabled={props.busy !== null} onClick={() => void props.onExecute(repository, { type: 'apply_stash', stashRef: stash.ref, pop: true }, props.zh ? '弹出 Stash' : 'Pop stash')}>
+          <Button variant="secondary" size="compact" disabled={props.busy !== null} onClick={() => props.onExecute(repository, { type: 'apply_stash', stashRef: stash.ref, pop: true }, props.zh ? '弹出 Stash' : 'Pop stash')}>
             {props.zh ? '弹出' : 'Pop'}
           </Button>
-          <Button variant="danger" size="compact" disabled={props.busy !== null} onClick={() => void props.onExecute(repository, { type: 'drop_stash', stashRef: stash.ref }, props.zh ? '删除 Stash' : 'Drop stash')}>
+          <Button variant="danger" size="compact" disabled={props.busy !== null} onClick={() => props.onExecute(repository, { type: 'drop_stash', stashRef: stash.ref }, props.zh ? '删除 Stash' : 'Drop stash')}>
             {props.zh ? '删除' : 'Delete'}
           </Button>
         </span>
@@ -2524,14 +1891,14 @@ function ConsoleSurface(props: { zh: boolean; history: ReturnType<typeof useGitO
               {props.zh ? '操作历史读取失败：' : 'Could not read operation history: '}
               {props.history.error}
             </span>
-            <Button variant="secondary" size="compact" onClick={() => void props.history.retry()}>
+            <Button variant="secondary" size="compact" onClick={() => props.history.retry()}>
               {props.zh ? '重试读取' : 'Retry loading'}
             </Button>
           </>
         ) : props.history.loading || props.history.total === null ? (
           <span role="status">{props.zh ? '正在加载操作记录…' : 'Loading operation records…'}</span>
         ) : props.history.nextCursor ? (
-          <Button variant="secondary" size="compact" onClick={() => void props.history.loadMore()}>
+          <Button variant="secondary" size="compact" onClick={() => props.history.loadMore()}>
             {props.zh ? '加载更多' : 'Load more'}
           </Button>
         ) : props.history.items.length > 0 ? (
@@ -2545,6 +1912,7 @@ function ConsoleSurface(props: { zh: boolean; history: ReturnType<typeof useGitO
 /** 动作名称只按已保存的类型翻译，不从 Git 输出猜测操作。 */
 const operationActionLabels: Record<ProjectGitAction['type'], [string, string]> = {
   discard: ['放弃修改', 'Discard changes'],
+  rollback: ['回滚文件', 'Rollback files'],
   rename_branch: ['重命名分支', 'Rename branch'],
   create_tag: ['创建标签', 'Create tag'],
   push_tag: ['推送标签', 'Push tag'],
@@ -2615,113 +1983,48 @@ function OperationsMenu(props: {
   };
   return createPortal(
     <MenuSurface onClose={props.onClose} ref={menuRef} className="macos-ai-app project-git-operations-menu" role="menu" style={{ left: Math.max(8, (bounds?.right ?? 228) - 220), top: (bounds?.bottom ?? 0) + 5 }}>
-      <button type="button" role="menuitem" onClick={action(props.onOpenCommit)}>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenCommit)}>
         {props.zh ? '提交…' : 'Commit…'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(props.onOpenPush)}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenPush)}>
         {props.zh ? '推送…' : 'Push…'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(props.onOpenUpdate)}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenUpdate)}>
         {props.zh ? '更新项目…' : 'Update Project…'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(props.onOpenSubtree)}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenSubtree)}>
         {props.zh ? '管理子树…' : 'Manage subtrees…'}
-      </button>
+      </Button>
       <hr />
-      <button type="button" role="menuitem" onClick={action(props.onOpenNewBranch)}>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenNewBranch)}>
         {props.zh ? '新建分支…' : 'New Branch…'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(props.onOpenRevision)}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenRevision)}>
         {props.zh ? '切换到标签或提交…' : 'Switch to a tag or commit…'}
-      </button>
+      </Button>
       <hr />
-      <button type="button" role="menuitem" onClick={action(() => props.onSelectTab('log'))}>
+      <Button unstyled type="button" role="menuitem" onClick={action(() => props.onSelectTab('log'))}>
         {props.zh ? '显示 Git 历史' : 'Show Git History'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(() => props.onSelectTab('changes'))}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenCommit)}>
         {props.zh ? '未提交的变更' : 'Uncommitted Changes'}
-      </button>
-      <button type="button" role="menuitem" onClick={action(() => props.onSelectTab('stash'))}>
+      </Button>
+      <Button unstyled type="button" role="menuitem" onClick={action(() => props.onSelectTab('stash'))}>
         {props.zh ? '贮藏' : 'Stashes'}
-      </button>
+      </Button>
       {props.onOpenConsole ? (
-        <button type="button" role="menuitem" onClick={action(props.onOpenConsole)}>
+        <Button unstyled type="button" role="menuitem" onClick={action(props.onOpenConsole)}>
           {props.zh ? '控制台 / 操作记录' : 'Console / Operation history'}
-        </button>
+        </Button>
       ) : null}
     </MenuSurface>,
     document.body,
   );
 }
 
-function CommitDialog(props: {
-  open: boolean;
-  zh: boolean;
-  repositories: ProjectGitRepositoryWorkbenchItem[];
-  busy: BusyState;
-  onClose: () => void;
-  onExecute: (repository: ProjectGitRepositoryWorkbenchItem, action: ProjectGitAction, label: string) => Promise<ExecutionOutcome>;
-}) {
-  const [message, setMessage] = useState('');
-  const staged = props.repositories.filter((repository) => repository.snapshot.fileStatuses.some((file) => file.indexStatus !== ' ' && file.indexStatus !== '?'));
-  if (!props.open) return null;
-  return (
-    <ModalPortal
-      rootClassName="project-git-modal-root"
-      backdropClassName="project-git-modal-backdrop"
-      onDismiss={props.onClose}
-      dismissDisabled={props.busy !== null}
-      role="dialog"
-      aria-label={props.zh ? '提交已暂存变更' : 'Commit staged changes'}
-    >
-      <section className="project-git-commit-dialog" data-modal-surface="dialog">
-        <header>
-          <strong>{props.zh ? '提交已暂存变更' : 'Commit staged changes'}</strong>
-          <small>{props.zh ? '每个仓库会分别创建提交。' : 'Each repository will receive a separate commit.'}</small>
-        </header>
-        <main>
-          {staged.map((repository) => (
-            <span key={repository.id}>
-              <GitBranch aria-hidden="true" />
-              <strong>{repository.name}</strong>
-              <small>
-                {repository.snapshot.fileStatuses.filter((file) => file.indexStatus !== ' ' && file.indexStatus !== '?').length} {props.zh ? '个文件' : 'files'}
-              </small>
-            </span>
-          ))}
-          <label>
-            <span>{props.zh ? '提交说明' : 'Commit message'}</span>
-            <textarea value={message} onChange={(event) => setMessage(event.currentTarget.value)} autoFocus />
-          </label>
-        </main>
-        <footer>
-          <Button variant="secondary" onClick={props.onClose} disabled={props.busy !== null}>
-            {props.zh ? '取消' : 'Cancel'}
-          </Button>
-          <Button
-            variant="primary"
-            busy={props.busy?.action === 'commit'}
-            disabled={!message.trim() || staged.length === 0 || props.busy !== null}
-            onClick={async () => {
-              for (const repository of staged) {
-                const outcome = await props.onExecute(repository, { type: 'commit', message: message.trim() }, props.zh ? '提交已暂存变更' : 'Commit staged changes');
-                if (outcome !== 'completed') return;
-              }
-              setMessage('');
-              props.onClose();
-            }}
-          >
-            {props.zh ? `提交 ${staged.length} 个仓库` : `Commit ${staged.length} repositories`}
-          </Button>
-        </footer>
-      </section>
-    </ModalPortal>
-  );
-}
-
 function readRememberedTab(projectId: string): GitTab {
   const value = typeof window === 'undefined' ? null : window.localStorage.getItem(`zeus.project-git-tab-v2:${projectId}`);
-  return value === 'changes' || value === 'stash' || value === 'console' ? value : 'log';
+  return value === 'stash' || value === 'console' ? value : 'log';
 }
 
 function displayStashSubject(subject: string, zh: boolean): string {
@@ -2729,43 +2032,8 @@ function displayStashSubject(subject: string, zh: boolean): string {
   return cleaned || (zh ? '未命名 Stash' : 'Untitled stash');
 }
 
-function errorMessage(error: unknown, zh: boolean, options: { title?: string; showDetails?: boolean; detailTitle?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {}): string {
-  return reportApplicationError(error, { language: zh ? 'zh-CN' : 'en', ...options });
-}
-
-/** Git 写操作失败时标题说明动作本身，合并失败与普通应用错误区分开。 */
-function gitOperationErrorTitle(action: ProjectGitAction, fallback: string, zh: boolean): string {
-  const operationLabels: Partial<Record<ProjectGitAction['type'], string>> = zh
-    ? {
-        merge: '合并',
-        rebase: '变基',
-        pull: '拉取',
-        push: '推送',
-        commit: '提交',
-        stash: '贮藏',
-        apply_stash: '应用贮藏',
-        fetch: '获取远端',
-        checkout: '切换分支',
-        checkout_revision: '切换到提交',
-        create_branch: '新建分支',
-        update: '更新项目',
-      }
-    : {
-        merge: 'Merge',
-        rebase: 'Rebase',
-        pull: 'Pull',
-        push: 'Push',
-        commit: 'Commit',
-        stash: 'Stash',
-        apply_stash: 'Apply stash',
-        fetch: 'Fetch',
-        checkout: 'Checkout',
-        checkout_revision: 'Checkout revision',
-        create_branch: 'Create branch',
-        update: 'Update project',
-      };
-  const operation = operationLabels[action.type];
-  return operation ? (zh ? `${operation}时发生错误` : `${operation} failed`) : fallback;
+function errorMessage(error: unknown, zh: boolean, options: { title?: string; action?: { label: string; onClick: () => void | Promise<void> } } = {}): string {
+  return options.title || options.action ? reportApplicationError(error, { language: zh ? 'zh-CN' : 'en', ...options }) : formatVisibleApplicationError(error, zh ? 'zh-CN' : 'en');
 }
 
 function errorHasCode(error: unknown, expected: string): boolean {
@@ -2780,18 +2048,6 @@ function errorHasCode(error: unknown, expected: string): boolean {
   return false;
 }
 
-/** 分支切换弹窗以 Git 原因作为正文，避免命令账本包装信息把实际 Git 输出挤到滚动区末尾。 */
-function gitSwitchFailureCause(error: unknown): unknown {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4 && current; depth += 1) {
-    if (typeof current !== 'object' || Array.isArray(current)) return error;
-    const candidate = current as { code?: unknown; cause?: unknown };
-    if (typeof candidate.code === 'string' && /^ZEUS_GIT_(?:CHECKOUT|SWITCH)_/u.test(candidate.code)) return current;
-    current = candidate.cause;
-  }
-  return error;
-}
-
 function formatRelativeTime(value: string, zh: boolean): string {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return value;
@@ -2802,19 +2058,6 @@ function formatRelativeTime(value: string, zh: boolean): string {
   if (hours < 24) return zh ? `${hours} 小时前` : `${hours}h ago`;
   const days = Math.round(hours / 24);
   return zh ? `${days} 天前` : `${days}d ago`;
-}
-
-/** 将当前文件的单个 hunk 重建为 Git 可接受的 patch，供暂存、取消暂存或放弃使用。 */
-function buildGitHunkPatch(file: GitFileDiff, hunk: GitDiffHunk): string {
-  const oldPath = file.oldPath || file.newPath;
-  const newPath = file.newPath || file.oldPath;
-  const lines = hunk.lines.map((line) => {
-    if (line.type === 'addition') return `+${line.content}`;
-    if (line.type === 'deletion') return `-${line.content}`;
-    if (line.type === 'context') return ` ${line.content}`;
-    return line.content;
-  });
-  return [`diff --git a/${oldPath} b/${newPath}`, file.changeType === 'added' ? '--- /dev/null' : `--- a/${oldPath}`, file.changeType === 'deleted' ? '+++ /dev/null' : `+++ b/${newPath}`, hunk.header, ...lines, ''].join('\n');
 }
 
 function SubtreeManagementDialog(props: {
@@ -2869,7 +2112,7 @@ function SubtreeManagementDialog(props: {
           <Button
             disabled={props.busy !== null || !path || !remote || !branch}
             onClick={() =>
-              void props.onExecute(props.repository, { type: 'subtree', operation, path, remote, branch }, props.zh ? '子树操作' : 'Subtree operation').then((result) => {
+              props.onExecute(props.repository, { type: 'subtree', operation, path, remote, branch }, props.zh ? '子树操作' : 'Subtree operation').then((result) => {
                 if (result === 'completed') props.onClose();
               })
             }

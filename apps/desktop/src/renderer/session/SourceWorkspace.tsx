@@ -6,6 +6,7 @@ import { FileMagnifyingGlassIcon as FileMagnifyingGlass } from '@phosphor-icons/
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/csr/Check';
+import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { OpenWithMenu } from './ConversationResources.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { Button } from '../ui/Button.js';
@@ -16,14 +17,15 @@ import { Suspense, lazy, useEffect, useRef, useState, type Dispatch, type SetSta
 import { createPortal } from 'react-dom';
 import { ArrowsInIcon as ArrowsIn } from '@phosphor-icons/react/dist/csr/ArrowsIn';
 import { ArrowsOutIcon as ArrowsOut } from '@phosphor-icons/react/dist/csr/ArrowsOut';
-import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
+import { FileWorkspaceToolbar } from '../code/FileWorkspaceToolbar.js';
+import { useFilePreviewRefresh } from '../code/useFilePreviewRefresh.js';
 import { fileStatusLabel } from '../code/fileStatus.js';
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
 import type { ConversationResourcePreview } from './sessionTypes.js';
 import { copyText, type SessionUiLanguage } from './ThreadItemView.js';
 import { ConversationMarkdown } from './ConversationMarkdown.js';
-import type { FilePreviewRequest, ConversationCodeComment } from '@zeus/shared';
+import type { FilePreviewItem, FilePreviewRequest, ConversationCodeComment } from '@zeus/shared';
 import { ReadingStateScope, useReadingScroll } from '../ui/readingState.js';
 /** 与项目源码编辑器一样按需加载，避免会话首屏加载编辑器和评论运行时。 */
 const CommentableSourceCodePreview = lazy(() => import('./CommentableSourceCodePreview.js').then((module) => ({ default: module.CommentableSourceCodePreview })));
@@ -59,6 +61,8 @@ export function SourceWorkspace(
     state: SourceWorkspaceState | null;
     /** 所有标签操作写回所属会话。 */
     onStateChange: Dispatch<SetStateAction<SourceWorkspaceState | null>>;
+    /** 重新读取资源正文与 Git 状态，不触发打开、导航或焦点变化。 */
+    onLoadPreview?: (resource: ConversationResource) => Promise<ConversationResourcePreview>;
   },
 ) {
   /** 隐藏的侧栏不接管其他工作面的关闭命令。 */
@@ -83,6 +87,49 @@ export function SourceWorkspace(
   }, [props.onStateChange, props.preview, props.viewMode]);
   /** 外部预览到达但状态尚未同步时仍显示真实文件。 */
   const active = tabs.find((tab) => sourceWorkspaceTabId(tab.preview) === activeId) ?? tabs[0]!;
+  /** 异步读取按代次接纳，较早回执不能覆盖较新内容。 */
+  const readRevision = useRef(0);
+  /** 刷新反馈绑定文件身份，切换标签不显示其他文件的状态。 */
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [refreshError, setRefreshError] = useState<{ id: string; error: unknown } | null>(null);
+  /** 原标签原位接纳新正文，保留阅读模式、标签顺序与行定位。 */
+  async function refreshPreview(): Promise<void> {
+    if (!props.onLoadPreview) return;
+    const preview = active.preview;
+    const id = sourceWorkspaceTabId(preview);
+    const revision = ++readRevision.current;
+    setRefreshingId(id);
+    setRefreshError(null);
+    try {
+      const refreshed = await props.onLoadPreview(preview.resource);
+      if (revision !== readRevision.current) return;
+      props.onStateChange((current) =>
+        current
+          ? {
+              ...current,
+              tabs: current.tabs.map((tab) =>
+                sourceWorkspaceTabId(tab.preview) === id ? { ...tab, preview: refreshed.kind === 'source' && tab.preview.kind === 'source' ? { ...refreshed, location: tab.preview.location } : refreshed } : tab,
+              ),
+            }
+          : current,
+      );
+    } catch (error) {
+      if (revision === readRevision.current) setRefreshError({ id, error });
+    } finally {
+      if (revision === readRevision.current) setRefreshingId(null);
+    }
+  }
+  useFilePreviewRefresh(
+    props.onLoadPreview ? { kind: 'resource', projectId: active.preview.resource.projectId, conversationId: active.preview.resource.conversationId, resourceId: active.preview.resource.id } : null,
+    refreshPreview,
+    (error) => setRefreshError({ id: sourceWorkspaceTabId(active.preview), error }),
+  );
+  useEffect(
+    () => () => {
+      readRevision.current += 1;
+    },
+    [],
+  );
   /** 原生快捷键和关闭按钮共享同一标签更新，连续命令读取最新状态。 */
   function closeTab(id?: string): void {
     /** 仅最后一个标签需要关闭整个侧栏。 */
@@ -118,6 +165,9 @@ export function SourceWorkspace(
         {...props}
         workspaceRef={workspaceRef}
         preview={active.preview}
+        onRefresh={props.onLoadPreview ? refreshPreview : undefined}
+        refreshing={refreshingId === sourceWorkspaceTabId(active.preview)}
+        refreshError={refreshError?.id === sourceWorkspaceTabId(active.preview) ? refreshError.error : null}
         viewMode={active.mode}
         tabs={tabs.map((tab) => tab.preview)}
         onSelectTab={(preview) => props.onStateChange((current) => (current ? { ...current, activeId: sourceWorkspaceTabId(preview) } : current))}
@@ -130,6 +180,12 @@ export function SourceWorkspace(
 
 /** 会话资源共用的预览入口，源码交给可视区域渲染，图片与 Markdown 保持原有展示。 */
 function SourceWorkspaceView(props: {
+  /** 刷新使用当前资源授权，不重新打开标签。 */
+  onRefresh?: () => void | Promise<void>;
+  /** 当前文件正在读取时提供忙碌状态并阻止重复点击。 */
+  refreshing?: boolean;
+  /** 刷新失败时保留原正文并显示具体原因。 */
+  refreshError?: unknown;
   /** 原生快捷键根据真实工作面的可见性确认归属。 */
   workspaceRef?: RefObject<HTMLElement | null>;
   /** 文件标题与浏览器标签共用会话顶栏位置。 */
@@ -222,8 +278,8 @@ function SourceWorkspaceView(props: {
       setOpenError(error);
     }
   }
-  /** 另存为只使用宿主发放的文件令牌，操作结束撤销全部令牌。 */
-  async function fileAction(action: 'export'): Promise<void> {
+  /** 图片和文件操作只使用宿主发放的文件令牌，操作结束撤销全部令牌。 */
+  async function fileAction(action: 'export' | 'open' | 'reveal'): Promise<void> {
     /** 当前受信桥接同时负责授权读取、系统操作和授权释放。 */
     const bridge = window.zeus;
     if (!bridge) {
@@ -258,7 +314,7 @@ function SourceWorkspaceView(props: {
   useEffect(() => {
     titleRef.current?.focus();
     titleRef.current?.parentElement?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  }, [tabId, props.preview]);
+  }, [tabId, sourcePreview?.location]);
 
   /** 顶栏展示文件名与预览操作，正文从文件信息行直接开始。 */
   const header = (
@@ -279,7 +335,8 @@ function SourceWorkspaceView(props: {
       >
         {(props.tabs ?? [props.preview]).map((preview) => (
           <div className="zeus-workspace-tab-shell" data-active={sourceWorkspaceTabId(preview) === tabId || undefined} key={sourceWorkspaceTabId(preview)}>
-            <button
+            <Button
+              unstyled
               type="button"
               ref={sourceWorkspaceTabId(preview) === tabId ? titleRef : undefined}
               role="tab"
@@ -292,8 +349,9 @@ function SourceWorkspaceView(props: {
             >
               {supportsMarkdownPreview(preview) ? <File aria-hidden="true" /> : <FileTypeIcon name={preview.resource.kind === 'file' ? preview.resource.projectRelativePath : preview.resource.displayName} />}
               <span data-file-status={preview.review?.status}>{basename(preview.resource.kind === 'file' ? preview.resource.projectRelativePath : preview.resource.displayName)}</span>
-            </button>
-            <button
+            </Button>
+            <Button
+              unstyled
               type="button"
               className="zeus-workspace-tab-close"
               aria-label={`${zh ? '关闭' : 'Close'} ${preview.resource.displayName}`}
@@ -301,7 +359,7 @@ function SourceWorkspaceView(props: {
               onClick={() => (props.onCloseTab ? props.onCloseTab(preview) : props.onClose())}
             >
               <X aria-hidden="true" />
-            </button>
+            </Button>
           </div>
         ))}
         {props.onOpenFile && props.resources?.length ? (
@@ -314,7 +372,7 @@ function SourceWorkspaceView(props: {
               data-icon-tooltip={zh ? '打开本会话中的文件' : 'Open a file from this conversation'}
               onChange={(event) => {
                 const resource = props.resources?.find((candidate) => candidate.id === event.currentTarget.value);
-                if (resource) void Promise.resolve(props.onOpenFile?.(resource)).catch(setOpenError);
+                if (resource) return Promise.resolve(props.onOpenFile?.(resource)).catch(setOpenError);
               }}
             >
               <option value="">{zh ? '打开文件…' : 'Open file…'}</option>
@@ -328,7 +386,8 @@ function SourceWorkspaceView(props: {
         ) : null}
       </div>
       <nav aria-label={zh ? '源码预览操作' : 'Source preview actions'}>
-        <button
+        <Button
+          unstyled
           type="button"
           aria-label={props.fullWidth ? (zh ? '恢复分栏' : 'Restore split') : zh ? '扩展为全宽' : 'Expand full width'}
           disabled={props.canSplit === false}
@@ -336,7 +395,7 @@ function SourceWorkspaceView(props: {
           onClick={() => props.onFullWidthChange(!props.fullWidth)}
         >
           {props.fullWidth ? <ArrowsIn aria-hidden="true" /> : <ArrowsOut aria-hidden="true" />}
-        </button>
+        </Button>
       </nav>
     </header>
   );
@@ -348,13 +407,13 @@ function SourceWorkspaceView(props: {
       aria-label={props.preview.kind === 'image' ? (zh ? '图片预览' : 'Image preview') : renderedMarkdown ? (zh ? 'Markdown 预览' : 'Markdown preview') : zh ? '源码预览' : 'Source preview'}
     >
       {props.toolbarHost ? createPortal(header, props.toolbarHost) : header}
-      {openError ? (
+      {props.refreshError || openError ? (
         <p role="alert">
-          <VisibleApplicationError error={openError} language={zh ? 'zh-CN' : 'en'} />
+          <VisibleApplicationError error={props.refreshError ?? openError} language={zh ? 'zh-CN' : 'en'} />
         </p>
       ) : null}
       <FileReviewContent
-        onSaved={() => props.onOpenFile?.(props.preview.resource)}
+        onSaved={props.onRefresh}
         previewRequest={
           props.preview.resource.kind === 'file'
             ? { kind: 'resource', projectId: props.preview.resource.projectId, conversationId: props.preview.resource.conversationId, resourceId: props.preview.resource.id, comparison: 'head' }
@@ -366,96 +425,93 @@ function SourceWorkspaceView(props: {
         zh={zh}
         toolbar={(reviewActions) => (
           <>
-            <div className="session-source-toolbar">
-              <nav className="session-source-breadcrumbs" aria-label={zh ? '文件路径' : 'File path'} tabIndex={0} data-file-path={displayPath} data-icon-tooltip={displayPath.split('/').join('›')}>
-                {displayPath.split('/').map((part, index) => (
-                  <span key={index}>
-                    {index > 0 ? <span aria-hidden="true">›</span> : null}
-                    {part}
-                  </span>
-                ))}
-              </nav>
-              <div className="session-source-actions">
-                {reviewActions}
-                {sourcePreview && props.preview.resource.kind === 'file' ? (
-                  <FileSourceEditButton zh={zh} request={{ kind: 'resource', projectId: props.preview.resource.projectId, conversationId: props.preview.resource.conversationId, resourceId: props.preview.resource.id }} />
-                ) : null}
-                <button
-                  type="button"
-                  aria-label={zh ? '在文件中搜索' : 'Find in file'}
-                  data-icon-tooltip={zh ? '在文件中搜索' : 'Find in file'}
-                  disabled={!sourcePreview}
-                  onClick={() => {
-                    props.onViewModeChange('source');
-                    setSearchRequest((request) => request + 1);
-                  }}
-                >
-                  <FileMagnifyingGlass aria-hidden="true" />
-                </button>
-                {markdownPreview ? (
-                  <Button size="compact" className="session-source-mode-toggle" onClick={() => props.onViewModeChange(renderedMarkdown ? 'source' : 'preview')}>
-                    {renderedMarkdown ? (zh ? '查看源代码' : 'View source') : zh ? '查看预览' : 'View preview'}
-                  </Button>
-                ) : null}
-                <button
-                  type="button"
-                  aria-label={copyLabel}
-                  data-icon-tooltip={
-                    !sourcePreview ? (zh ? '当前文件没有可复制的文本' : 'This file has no text to copy') : sourcePreview.truncated ? (zh ? '预览不完整，无法复制全文' : 'The preview is incomplete; full text cannot be copied') : copyLabel
+            <FileWorkspaceToolbar path={displayPath} zh={zh}>
+              {reviewActions}
+              {props.onRefresh ? (
+                <Button unstyled type="button" aria-label={zh ? '刷新文件' : 'Refresh file'} data-icon-tooltip={zh ? '刷新文件' : 'Refresh file'} aria-busy={props.refreshing} disabled={props.refreshing} onClick={() => props.onRefresh?.()}>
+                  <ArrowClockwise aria-hidden="true" />
+                </Button>
+              ) : null}
+              {sourcePreview && props.preview.resource.kind === 'file' ? (
+                <FileSourceEditButton zh={zh} request={{ kind: 'resource', projectId: props.preview.resource.projectId, conversationId: props.preview.resource.conversationId, resourceId: props.preview.resource.id }} />
+              ) : null}
+              <Button
+                unstyled
+                type="button"
+                aria-label={zh ? '在文件中搜索' : 'Find in file'}
+                data-icon-tooltip={zh ? '在文件中搜索' : 'Find in file'}
+                disabled={!sourcePreview}
+                onClick={() => {
+                  props.onViewModeChange('source');
+                  setSearchRequest((request) => request + 1);
+                }}
+              >
+                <FileMagnifyingGlass aria-hidden="true" />
+              </Button>
+              {markdownPreview ? (
+                <Button size="compact" className="session-source-mode-toggle" onClick={() => props.onViewModeChange(renderedMarkdown ? 'source' : 'preview')}>
+                  {renderedMarkdown ? (zh ? '查看源代码' : 'View source') : zh ? '查看预览' : 'View preview'}
+                </Button>
+              ) : null}
+              <Button
+                unstyled
+                type="button"
+                aria-label={copyLabel}
+                data-icon-tooltip={
+                  !sourcePreview ? (zh ? '当前文件没有可复制的文本' : 'This file has no text to copy') : sourcePreview.truncated ? (zh ? '预览不完整，无法复制全文' : 'The preview is incomplete; full text cannot be copied') : copyLabel
+                }
+                disabled={!sourcePreview || sourcePreview.truncated}
+                onClick={() => copyFullText()}
+              >
+                {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+              </Button>
+              <span role="status" className="session-source-copy-status">
+                {copied ? copyLabel : ''}
+              </span>
+              <div className="session-source-open-group">
+                <Button unstyled type="button" disabled={!props.onOpen} data-icon-tooltip={openApplication?.label} onClick={() => openResource(openTarget ?? 'system_default')}>
+                  {openApplication?.iconDataUrl ? (
+                    <img src={openApplication.iconDataUrl} alt="" width={18} height={18} />
+                  ) : openTarget === 'system_default' ? (
+                    <FolderOpen className="session-open-with-default-icon" aria-hidden="true" weight="duotone" />
+                  ) : (
+                    <AppWindow aria-hidden="true" />
+                  )}
+                  {zh ? '打开' : 'Open'}
+                </Button>
+                <OpenWithMenu
+                  key={props.preview.resource.id}
+                  resource={props.preview.resource}
+                  language={props.language}
+                  disabled={!props.onOpen}
+                  applicationsOnly
+                  preferBelow
+                  targets={openTargets.length ? openTargets : undefined}
+                  footer={
+                    <>
+                      <Button unstyled type="button" role="menuitem" onClick={() => openResource('file_manager')}>
+                        {zh ? '打开所在文件夹' : 'Show in folder'}
+                      </Button>
+                      <Button unstyled type="button" role="menuitem" onClick={() => fileAction('export')}>
+                        {zh ? '另存为…' : 'Save as…'}
+                      </Button>
+                    </>
                   }
-                  disabled={!sourcePreview || sourcePreview.truncated}
-                  onClick={() => void copyFullText()}
-                >
-                  {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-                </button>
-                <span role="status" className="session-source-copy-status">
-                  {copied ? copyLabel : ''}
-                </span>
-                <div className="session-source-open-group">
-                  <button type="button" disabled={!props.onOpen} data-icon-tooltip={openApplication?.label} onClick={() => void openResource(openTarget ?? 'system_default')}>
-                    {openApplication?.iconDataUrl ? (
-                      <img src={openApplication.iconDataUrl} alt="" width={18} height={18} />
-                    ) : openTarget === 'system_default' ? (
-                      <FolderOpen className="session-open-with-default-icon" aria-hidden="true" weight="duotone" />
-                    ) : (
-                      <AppWindow aria-hidden="true" />
-                    )}
-                    {zh ? '打开' : 'Open'}
-                  </button>
-                  <OpenWithMenu
-                    key={props.preview.resource.id}
-                    resource={props.preview.resource}
-                    language={props.language}
-                    disabled={!props.onOpen}
-                    applicationsOnly
-                    preferBelow
-                    targets={openTargets.length ? openTargets : undefined}
-                    footer={
-                      <>
-                        <button type="button" role="menuitem" onClick={() => void openResource('file_manager')}>
-                          {zh ? '打开所在文件夹' : 'Show in folder'}
-                        </button>
-                        <button type="button" role="menuitem" onClick={() => void fileAction('export')}>
-                          {zh ? '另存为…' : 'Save as…'}
-                        </button>
-                      </>
-                    }
-                    onOpen={(target) => {
-                      setOpenTarget(target);
-                      return openResource(target);
-                    }}
-                    label=""
-                  />
-                </div>
+                  onOpen={(target) => {
+                    setOpenTarget(target);
+                    return openResource(target);
+                  }}
+                  label=""
+                />
               </div>
-            </div>
+            </FileWorkspaceToolbar>
             {sourcePreview?.truncated ? <div role="status">{zh ? '预览已截断' : 'Preview truncated'}</div> : null}
           </>
         )}
       >
         <div ref={contentScroll} className={renderedMarkdown ? 'session-source-markdown-scroll' : `session-source-scroll ${props.preview.kind === 'image' ? 'session-image-preview' : ''}`}>
           {props.preview.kind === 'image' ? (
-            <PreviewImage key={props.preview.dataUrl} url={props.preview.dataUrl} name={props.preview.resource.displayName} zh={zh} />
+            <PreviewImage key={props.preview.dataUrl} url={props.preview.dataUrl} name={props.preview.resource.displayName} zh={zh} onFileAction={fileAction} />
           ) : renderedMarkdown ? (
             <ConversationMarkdown text={props.preview.content} streamId={`source-preview:${tabId}`} phase="final" language={props.language} documentMode />
           ) : (
@@ -470,12 +526,6 @@ function SourceWorkspaceView(props: {
                 projectId={props.preview.resource.kind === 'file' ? props.preview.resource.projectId : undefined}
                 conversationId={props.preview.resource.kind === 'file' ? props.preview.resource.conversationId : undefined}
                 resourceId={props.preview.resource.kind === 'file' ? props.preview.resource.id : undefined}
-                blameLabels={{
-                  locale: props.language,
-                  loading: zh ? '正在加载 Git blame…' : 'Loading Git blame…',
-                  unavailable: zh ? 'Git blame 暂不可用' : 'Git blame unavailable',
-                  retry: zh ? '重试' : 'Retry',
-                }}
                 locale={props.language}
                 searchRequest={searchRequest}
                 location={props.preview.location}
@@ -529,38 +579,48 @@ export function FilePreviewWorkspace(props: {
 }) {
   /** 当前界面的中英文文案。 */
   const zh = props.language === 'zh-CN';
-  /** 每次切换文件将焦点移到审阅标题。 */
-  const titleRef = useRef<HTMLSpanElement>(null);
+  /** 每次切换文件将焦点移到当前文件标签。 */
+  const titleRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     titleRef.current?.focus();
   }, [props.request]);
-  /** 与源码和浏览器一样将操作栏放入会话顶栏。 */
-  const header = (
-    <header className="session-context-workspace-header">
-      <span className="session-context-workspace-title" ref={titleRef} tabIndex={-1}>
-        <FileCode aria-hidden="true" />
-        <strong>{zh ? '文件审阅' : 'File review'}</strong>
-      </span>
-      <nav aria-label={zh ? '文件审阅操作' : 'File review actions'}>
-        <button
-          type="button"
-          disabled={!props.canSplit}
-          data-icon-tooltip={!props.canSplit ? (zh ? '窗口较窄，已自动全宽显示' : 'This window is too narrow for split view') : props.fullWidth ? (zh ? '恢复分栏' : 'Restore split') : zh ? '扩展为全宽' : 'Expand full width'}
-          aria-label={props.fullWidth ? (zh ? '恢复分栏' : 'Restore split') : zh ? '扩展为全宽' : 'Expand full width'}
-          onClick={() => props.onFullWidthChange(!props.fullWidth)}
-        >
-          {props.fullWidth ? <ArrowsIn aria-hidden="true" /> : <ArrowsOut aria-hidden="true" />}
-        </button>
-        <button type="button" aria-label={zh ? '关闭文件审阅' : 'Close file review'} onClick={props.onClose}>
-          <X aria-hidden="true" />
-        </button>
-      </nav>
-    </header>
-  );
+  /** 文件标签使用本次预览返回的名称，加载前使用已有展示路径。 */
+  function renderHeader(item: FilePreviewItem | null) {
+    /** 标题只读取展示信息，不用路径申请额外文件授权。 */
+    const name = item?.name ?? basename(props.commentPath ?? ('path' in props.request ? props.request.path : zh ? '文件审阅' : 'File review'));
+    /** 文件审阅复用源码标签的尺寸、关闭入口和键盘焦点样式。 */
+    const header = (
+      <header className="session-context-workspace-header session-source-header">
+        <div className="session-source-tabs zeus-workspace-tabs" role="tablist" aria-label={zh ? '已打开文件' : 'Open files'}>
+          <div className="zeus-workspace-tab-shell" data-active="true">
+            <Button unstyled type="button" role="tab" aria-selected="true" className="zeus-workspace-tab" ref={titleRef} data-icon-tooltip={name}>
+              <FileTypeIcon name={name} />
+              <span data-file-status={item?.review?.status}>{name}</span>
+            </Button>
+            <Button unstyled type="button" className="zeus-workspace-tab-close" aria-label={`${zh ? '关闭' : 'Close'} ${name}`} data-icon-tooltip={`${zh ? '关闭' : 'Close'} ${name}`} onClick={props.onClose}>
+              <X aria-hidden="true" />
+            </Button>
+          </div>
+        </div>
+        <nav aria-label={zh ? '文件审阅操作' : 'File review actions'}>
+          <Button
+            unstyled
+            type="button"
+            disabled={!props.canSplit}
+            data-icon-tooltip={!props.canSplit ? (zh ? '窗口较窄，已自动全宽显示' : 'This window is too narrow for split view') : props.fullWidth ? (zh ? '恢复分栏' : 'Restore split') : zh ? '扩展为全宽' : 'Expand full width'}
+            aria-label={props.fullWidth ? (zh ? '恢复分栏' : 'Restore split') : zh ? '扩展为全宽' : 'Expand full width'}
+            onClick={() => props.onFullWidthChange(!props.fullWidth)}
+          >
+            {props.fullWidth ? <ArrowsIn aria-hidden="true" /> : <ArrowsOut aria-hidden="true" />}
+          </Button>
+        </nav>
+      </header>
+    );
+    return props.toolbarHost ? createPortal(header, props.toolbarHost) : header;
+  }
   return (
     <section className="session-context-workspace session-source-workspace" aria-label={zh ? '文件审阅' : 'File review'}>
-      {props.toolbarHost ? createPortal(header, props.toolbarHost) : header}
-      <FilePreview request={props.request} location={props.location} zh={zh} commentPath={props.commentPath} comments={props.comments} onCommentsChange={props.onCommentsChange} />
+      <FilePreview request={props.request} location={props.location} zh={zh} renderHeader={renderHeader} commentPath={props.commentPath} comments={props.comments} onCommentsChange={props.onCommentsChange} />
     </section>
   );
 }

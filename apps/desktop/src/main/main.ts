@@ -2,6 +2,8 @@ import { distributionAppName, distributionVersion, isZeusReleaseUrl } from './de
 
 import { registerFilePreview } from './filePreview.js';
 import { hideMenuBarPopover, showMenuBarPopover, updateMenuBarPopoverAppearance, applyMenuBarTray } from './menuBarAppearance.js';
+import { listProjectSourceWorktrees } from './projectSourceWorktrees.js';
+import { startInputSuggestionNetworkBridge } from './inputSuggestionNetworkBridge.js';
 import { getApplicationIcon } from './applicationIcon.js';
 import {
   type CreateProjectSourceEntryInput,
@@ -14,7 +16,6 @@ import {
   type FilePreviewSourceWorkspace,
   type MoveProjectSourceEntryInput,
   normalizeInputSuggestionUiDiagnostic,
-  normalizeNetworkProxySettings,
   type ReadOnlyValidationDescriptor,
   type SaveProjectSourceFileInput,
   type TrashProjectSourceEntryInput,
@@ -22,7 +23,7 @@ import {
   type ZentaoInstanceRecord,
   zentaoSecretAccount,
 } from '@zeus/shared';
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, protocol, screen, session, shell, Tray } from 'electron';
+import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, protocol, screen, session, shell, Tray } from 'electron';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, type FSWatcher, mkdtempSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -35,12 +36,15 @@ import { promisify } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { type BeforeQuitCleanupFailureAction, createBeforeQuitCleanupHandler, type DesktopLocalServerCloseMode } from './beforeQuitCleanup.js';
+import { withCloseTimeout } from './executionHostClosePlan.js';
 import type { DesktopLocalServerRuntime, ExecutionHostMaintenanceStatus } from './localServerRuntime.js';
 import { createStartupCoordinator } from './startupCoordinator.js';
 import { createRendererBootstrapMonitor } from './rendererBootstrapMonitor.js';
 import { ensureWindowsCodexRemoteControl } from './codexRemoteControlBootstrap.js';
 import { exportPatchToFile } from './patchExport.js';
 import { exportRuntimeLogsToFile } from './runtimeLogExport.js';
+import { exportFaultReport, submitFaultReport } from './faultReporting.js';
+import { startFaultMonitor } from './faultMonitor.js';
 import { chooseProjectDirectory } from './projectDirectoryPicker.js';
 import { exportSettingsSnapshotToFile, importBusinessDataSnapshotFromFile, importSettingsSnapshotFromFile } from './settingsPortability.js';
 import { openSourceLocation, type SourceLocation } from './sourceOpen.js';
@@ -64,9 +68,12 @@ import {
   isSupportedImageInputMimeType,
   readTaskClipboardAttachmentsFromClipboard,
   readTaskClipboardFileReferencesFromClipboard,
+  resolveTaskClipboardFilePath,
   type TaskClipboardAttachmentPayload,
 } from './taskClipboard.js';
 import { type BrowserHost, browserPartition, createBrowserHost } from './browserHost.js';
+import { BrowserPasswordStore } from './browserPasswords.js';
+import { createBrowserTranslationClient } from './browserTranslationClient.js';
 import { computerBackgroundLaunchSwitch, type ComputerHost, computerTargetDisplaySwitch, createComputerHost } from './computerHost.js';
 import { createNativeAutomationHost } from './nativeAutomationHost.js';
 import { createExternalBrowserHost, type ExternalBrowserHost } from './externalBrowserHost.js';
@@ -96,9 +103,9 @@ import { createHomebrewUpdateService } from './homebrewUpdateService.js';
 import { createHomebrewUpdateController, type HomebrewUpdateController, type HomebrewUpdateIndicatorState } from './homebrewUpdateController.js';
 import { type AutomaticUpdateScheduler, createAutomaticUpdateScheduler } from './automaticUpdateScheduler.js';
 import { createZeusDataLayout, type ZeusDataLayout } from '@zeus/local-server/zeus-data-layout';
-import { applyNetworkProxyAtStartup, createInputSuggestionDiagnosticLog, createPlatformSecretStore, readUnifiedConversationStoreMigrationStatus } from '@zeus/local-server';
+import { closeNetworkProxyRuntime, createInputSuggestionDiagnosticLog, createPlatformSecretStore, readUnifiedConversationStoreMigrationStatus } from '@zeus/local-server';
 import { getFileBlame, type GitDiffSummary, parseGitUnifiedDiff } from '@zeus/git-core';
-import { checkNetworkProxyConnection, chromiumNetworkProxyConfig } from './networkProxy.js';
+import { applyDesktopNetworkProxy, checkNetworkProxyConnection } from './networkProxy.js';
 import { prepareZeusDataRoot } from './zeusDataMigration.js';
 import { loadDesktopReadOnlyValidationDescriptor, readOnlyValidationManifestEnvironmentName, readPackagedDesktopApplicationId, resolveDesktopTestDataRoot, verifyDesktopReadOnlyValidationDescriptor } from './readOnlyValidationManifest.js';
 import { installReadOnlyValidationIpcFence } from './readOnlyValidationIpcFence.js';
@@ -127,12 +134,22 @@ delete process.env.ZEUS_COMPUTER_BACKGROUND_LAUNCH;
 delete process.env.ZEUS_COMPUTER_TARGET_DISPLAY_ID;
 let mainWindow: BrowserWindow | undefined;
 const windows = new Set<BrowserWindow>();
+/** 独立故障监控不依赖任何业务窗口的 Renderer。 */
+let desktopFaultMonitor: ReturnType<typeof startFaultMonitor> | undefined;
 let tray: Tray | undefined;
 let menuBarUsageWindow: BrowserWindow | undefined;
 let menuBarUsageWindowBlurTimer: ReturnType<typeof setTimeout> | undefined;
 let menuBarClassicImage: { image: Electron.NativeImage; light: Buffer; dark: Buffer; tooltip: string } | undefined;
 /** 任务与会话交付复用同一种原生窗口，分别按真实范围定位已有实例。 */
 const taskGitDeliveryWindows = new Map<string, BrowserWindow>();
+/** 接纳期间隐藏交付窗口并保留 Renderer，防止关闭中断提交请求。 */
+const submittingTaskGitDeliveryWindowIds = new Set<number>();
+/** 只保留当前会话一个尚未显示的预热窗口，切换范围时释放旧预热。 */
+let preloadedTaskGitDeliveryWindow: { window: BrowserWindow; reveal: () => void } | undefined;
+/** 迟到的预热请求不能替换用户后来打开或准备的范围。 */
+let taskGitDeliveryPreloadGeneration = 0;
+/** 真实打开请求到首个可读帧的起点；预热不产生打开耗时样本。 */
+const taskGitDeliveryFirstFrames = new Map<number, { startedAt: number; mode: 'cold' | 'preloaded' | 'reused' }>();
 const projectGitDiffWindows = new Set<BrowserWindow>();
 /** 推送差异只保存窗口私有展示快照，不把文件路径当作读取授权。 */
 const projectGitDiffSnapshots = new Map<number, { filePath: string; diff: GitDiffSummary }>();
@@ -148,6 +165,10 @@ const appCloseLayerActivityByWindow = new Map<number, boolean>();
 let currentTaskGitDeliveryContext: TaskGitDeliveryCurrentContext = { taskId: null, workspaceId: null };
 let menuBarUsageMenu: Menu | undefined;
 let localServerRuntime: DesktopLocalServerRuntime | undefined;
+/** 退出时等待尚在建立的 Core 连接，避免初始化完成后留下新的后台进程。 */
+let localServerStartup: Promise<DesktopLocalServerRuntime> | undefined;
+/** 退出清理开始后取消尚未完成的 Core 创建和发现。 */
+const desktopShutdown = new AbortController();
 /** 界面日志由 Main 单独拥有，避免与 Core 同时轮转同一文件。 */
 let inputSuggestionUiDiagnostics: ReturnType<typeof createInputSuggestionDiagnosticLog> | undefined;
 let resolveRendererRuntimeReady!: (runtime: DesktopLocalServerRuntime) => void;
@@ -425,7 +446,7 @@ const menuBarUsageWindowSize = { width: 360, height: 520 } as const;
 const menuBarUsageWindowBlurDelayMs = 150;
 /** 两个原生窗口之间允许指针跨越的延迟。 */
 
-const taskGitDeliveryMinimumSize = { width: 920, height: 640 } as const;
+const taskGitDeliveryMinimumSize = { width: 560, height: 420 } as const;
 const automaticUpdateIntervalMs = 60 * 60_000;
 const automaticUpdateInitialDelayMs = 15_000;
 
@@ -687,15 +708,6 @@ function ensureMacOSDockIconVisible(): void {
   });
 }
 
-/** 继续后台运行时只隐藏界面，保留 Main、Core、通知和 Dock 图标。 */
-function continueApplicationInBackground(): void {
-  for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.hide();
-  }
-  if (process.platform === 'darwin') app.hide();
-  ensureMacOSDockIconVisible();
-}
-
 function nativeUpdateProgressHelperPath(): string {
   const root = desktopRoot();
   if (app.isPackaged && basename(root) === 'app.asar') return join(dirname(root), 'app.asar.unpacked', 'dist', 'native', 'ZeusUpdateProgress');
@@ -834,11 +846,17 @@ function configureWindowSecurity(window: BrowserWindow, rendererUrl: string): vo
   window.webContents.once('preload-error', (_event, preloadPath, error) => {
     rendererBootstrapMonitor.fail(window, new Error(`Renderer preload failed (${preloadPath}): ${error.message}`));
   });
-  window.webContents.once('render-process-gone', (_event, details) => {
-    rendererBootstrapMonitor.fail(window, new Error(`Renderer process exited during bootstrap (${details.reason}, exit ${details.exitCode})`));
+  window.webContents.on('render-process-gone', (_event, details) => {
+    if (details.reason === 'clean-exit' || window.isDestroyed()) return;
+    const error = new Error(`Renderer process exited (${details.reason}, exit ${details.exitCode})`);
+    if (!rendererBootstrapMonitor.fail(window, error)) desktopFaultMonitor?.fault('renderer_crashed', window, error.message);
   });
   window.on('unresponsive', () => {
-    rendererBootstrapMonitor.fail(window, new Error('Renderer became unresponsive during bootstrap'));
+    desktopFaultMonitor?.responsive(window, false);
+  });
+  window.on('responsive', () => desktopFaultMonitor?.responsive(window, true));
+  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) desktopFaultMonitor?.loading(window);
   });
   window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return;
@@ -902,6 +920,15 @@ async function openFileSourceWorkspace(parent: BrowserWindow, target: { root: st
   const project = await loadProjectIdentity(projectId);
   /** 路径使用源码页的跨平台相对格式。 */
   const relativePath = relative(target.root, target.path).split(sep).join('/');
+  const workspace = await registerSourceWorkspace(owner, project, target.root, relativePath);
+  if (owner.isDestroyed()) throw new Error('主窗口已关闭。');
+  owner.webContents.send('zeus:file-preview:source-open-workspace', workspace);
+  owner.show();
+  owner.focus();
+}
+
+/** 预览编辑与 worktree 选择共用窗口内目录授权，旧草稿保存期间仍保留旧目录。 */
+async function registerSourceWorkspace(owner: BrowserWindow, project: ProjectGitProjectIdentity, root: string, relativePath: string): Promise<FilePreviewSourceWorkspace> {
   /** 同一主窗口复用服务，原项目与多个工作树可以独立保存草稿。 */
   let scope = fileSourceWorkspaces.get(owner);
   if (!scope) {
@@ -923,23 +950,24 @@ async function openFileSourceWorkspace(parent: BrowserWindow, target: { root: st
     });
   }
   /** 项目目录复用原项目身份；任务工作树按准确根目录复用临时身份。 */
-  const existing = [...scope.workspaces.values()].find((entry) => entry.ownerProjectId === projectId && entry.project.localPath === target.root);
+  const existing = [...scope.workspaces.values()].find((entry) => entry.ownerProjectId === project.id && entry.project.localPath === root);
   /** 文件定位与目录身份分开，重复编辑复用同一个目录作用域。 */
   const workspace: FilePreviewSourceWorkspace = {
-    ownerProjectId: projectId,
-    project: existing?.project ?? ((await realpath(project.localPath)) === target.root ? project : { id: `file-source:${randomUUID()}`, name: `${project.name} · ${basename(target.root)}`, localPath: target.root }),
+    ownerProjectId: project.id,
+    project: existing?.project ?? ((await realpath(project.localPath)) === root ? project : { id: `file-source:${randomUUID()}`, name: `${project.name} · ${basename(root)}`, localPath: root }),
     relativePath,
   };
   scope.workspaces.set(workspace.project.id, workspace);
-  if (owner.isDestroyed()) throw new Error('主窗口已关闭。');
-  owner.webContents.send('zeus:file-preview:source-open-workspace', workspace);
-  owner.show();
-  owner.focus();
+  return workspace;
 }
 
 /** 项目与任务文件共用原生差异窗口，读取身份通过参数明确区分。 */
 /** 系统差异窗口复用持久化边界；快照模式不重新读取仓库或工作区。 */
-async function openProjectGitDiffWindow(parent: BrowserWindow, input: Extract<FilePreviewRequest, { kind: 'project-git' | 'task-git' }>, snapshot?: GitDiffSummary): Promise<{ opened: true }> {
+async function openProjectGitDiffWindow(
+  parent: BrowserWindow,
+  input: Extract<FilePreviewRequest, { kind: 'project-git' | 'task-git' }> & { /** 会话工作树的列表与仓库读取使用同一范围。 */ conversationId?: string },
+  snapshot?: GitDiffSummary,
+): Promise<{ opened: true }> {
   /** 业务身份与只读快照使用不同入口，快照地址不携带仓库读取参数。 */
   const rendererUrl = rendererEntryUrl(
     'project-git-diff',
@@ -954,6 +982,7 @@ async function openProjectGitDiffWindow(parent: BrowserWindow, input: Extract<Fi
           }
         : {
             projectId: input.projectId,
+            ...(input.conversationId ? { conversationId: input.conversationId } : {}),
             repositoryId: input.repositoryId,
             filePath: input.path,
             stage: input.stage ?? 'combined',
@@ -971,8 +1000,8 @@ async function openProjectGitDiffWindow(parent: BrowserWindow, input: Extract<Fi
     y: Math.round(workArea.y + (workArea.height - height) / 2),
     width,
     height,
-    minWidth: Math.min(760, width),
-    minHeight: Math.min(520, height),
+    minWidth: Math.min(560, width),
+    minHeight: Math.min(420, height),
     parent,
     modal: false,
     title: `${appShellSettings.appLanguage === 'zh-CN' ? '仓库差异' : 'Repository Diff'} · ${desktopDisplayName()}`,
@@ -1055,16 +1084,49 @@ function initialTaskGitDeliveryWindowBounds(parent: BrowserWindow): Electron.Rec
   };
 }
 
+/** 显示交付窗口，并在后台打开模式下也请求实际绘制回执。 */
 function revealTaskGitDeliveryWindow(window: BrowserWindow): void {
   if (window.isDestroyed()) return;
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
   app.focus({ steal: true });
+  window.webContents.send('zeus:task-git-delivery:request-frame');
+}
+
+/** 未指定任务工作区时，自动创建任务沿用持久来源会话的目录和窗口身份。 */
+async function resolveTaskGitDeliveryTarget(taskId: string): Promise<GitDeliveryWindowTarget> {
+  if (!localServerRuntime) throw new Error('Zeus local server is not ready.');
+  /** 记录从当前宿主读取，客户端不能指定来源会话或本机目录。 */
+  const config = await localServerRuntime.refreshConfig();
+  /** 读取任务及来源会话时保留接口失败，不降级到其他工作目录。 */
+  async function readRecord(path: string): Promise<Record<string, unknown>> {
+    /** 只访问当前认证宿主，读取最长等待 10 秒。 */
+    const response = await fetch(`${config.baseUrl}${path}`, { headers: { authorization: `Bearer ${config.apiToken}` }, signal: AbortSignal.timeout(10000) });
+    /** 响应先核对对象形状，再读取业务字段。 */
+    const value = (await response.json()) as Record<string, unknown>;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('代码交付来源记录无效。');
+    if (!response.ok) throw new Error(typeof value.message === 'string' ? value.message : '无法读取代码交付来源。');
+    return value;
+  }
+  /** 任务创建来源决定默认交付范围。 */
+  const task = await readRecord(`/api/tasks/${encodeURIComponent(taskId)}`);
+  if (task.id !== taskId || typeof task.projectId !== 'string') throw new Error('代码交付任务身份无效。');
+  if (task.createdFrom !== 'conversation') return { taskId };
+  /** 来源只取创建任务时保存的会话，不猜测最近会话或第一条开发线。 */
+  const source = JSON.parse(typeof task.sourceContextJson === 'string' ? task.sourceContextJson : '{}') as { conversationId?: unknown } | null;
+  if (!source || typeof source.conversationId !== 'string' || !source.conversationId) throw new Error('任务缺少来源会话，请从目标会话打开代码交付。');
+  /** 来源会话必须仍归属于该任务和项目。 */
+  const conversation = await readRecord(`/api/projects/${encodeURIComponent(task.projectId)}/conversations/${encodeURIComponent(source.conversationId)}/choice`);
+  if (conversation.id !== source.conversationId || conversation.taskId !== taskId || conversation.projectId !== task.projectId) throw new Error('代码交付来源会话不属于当前任务。');
+  if (conversation.workspaceMode === 'direct') return { projectId: task.projectId };
+  if (conversation.workspaceId || conversation.environmentId) return { taskId };
+  if (conversation.workspaceMode !== 'worktree') throw new Error('来源会话的工作目录尚未就绪。');
+  return { projectId: task.projectId, conversationId: source.conversationId };
 }
 
 /** 所有代码交付按钮共用窗口创建、尺寸记忆、安全配置及实例复用。 */
-async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliveryWindowTarget): Promise<GitDeliveryWindowTarget & { opened: true; reused: boolean }> {
+async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliveryWindowTarget, preload = false, requestedAt = performance.now()): Promise<GitDeliveryWindowTarget & { opened: boolean; reused: boolean }> {
   /** 按真实交付范围隔离身份，同一范围重复点击唤回原窗口。 */
   const key = JSON.stringify(
     target.taskId
@@ -1078,9 +1140,20 @@ async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliv
   /** 查找已经加载或正在加载的窗口，避免重复创建。 */
   const existing = taskGitDeliveryWindows.get(key);
   if (existing && !existing.isDestroyed()) {
-    revealTaskGitDeliveryWindow(existing);
-    return { ...target, opened: true, reused: true };
+    if (!preload) {
+      const prepared = preloadedTaskGitDeliveryWindow;
+      taskGitDeliveryFirstFrames.set(existing.id, { startedAt: requestedAt, mode: prepared?.window === existing ? 'preloaded' : 'reused' });
+      if (prepared?.window === existing) {
+        preloadedTaskGitDeliveryWindow = undefined;
+        prepared.reveal();
+      } else revealTaskGitDeliveryWindow(existing);
+    }
+    return { ...target, opened: existing.isVisible(), reused: true };
   }
+
+  /** 尚未展示的窗口没有用户草稿；已打开窗口继续沿用原有关闭流程。 */
+  if (preloadedTaskGitDeliveryWindow && !preloadedTaskGitDeliveryWindow.window.isDestroyed()) preloadedTaskGitDeliveryWindow.window.destroy();
+  preloadedTaskGitDeliveryWindow = undefined;
 
   /** 新建窗口前核对资源，已有窗口仍可唤回并保存工作。 */
   const rendererUrl = rendererEntryUrl(
@@ -1120,8 +1193,25 @@ async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliv
     },
   });
   taskGitDeliveryWindows.set(key, window);
+  if (!preload) taskGitDeliveryFirstFrames.set(window.id, { startedAt: requestedAt, mode: 'cold' });
+  if (preload)
+    preloadedTaskGitDeliveryWindow = {
+      window,
+      reveal: () => {
+        reveal(() => revealTaskGitDeliveryWindow(window));
+      },
+    };
   taskGitDeliveryTargetByWindowId.set(window.id, target);
+  /** 接纳前的关闭只隐藏窗口；应用退出仍沿用原有关闭流程。 */
+  window.on('close', (event) => {
+    if (!submittingTaskGitDeliveryWindowIds.has(window.id) || desktopShutdown.signal.aborted) return;
+    event.preventDefault();
+    window.hide();
+  });
   window.on('closed', () => {
+    submittingTaskGitDeliveryWindowIds.delete(window.id);
+    taskGitDeliveryFirstFrames.delete(window.id);
+    if (preloadedTaskGitDeliveryWindow?.window === window) preloadedTaskGitDeliveryWindow = undefined;
     taskGitDeliveryTargetByWindowId.delete(window.id);
     appCloseLayerActivityByWindow.delete(window.id);
     if (taskGitDeliveryWindows.get(key) === window) taskGitDeliveryWindows.delete(key);
@@ -1130,17 +1220,18 @@ async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliv
     if (isMainFrame && errorCode !== -3) console.warn(`Zeus 代码交付窗口加载失败：${validatedUrl} ${errorDescription} (${errorCode})`);
   });
   window.once('ready-to-show', () => {
-    reveal(() => revealTaskGitDeliveryWindow(window));
+    // 预热不显示、不抢焦点；用户已经点击时仍完成原生展示流程。
+    if (!preload || preloadedTaskGitDeliveryWindow?.window !== window) reveal(() => revealTaskGitDeliveryWindow(window));
     window.webContents.send('zeus:task-git-delivery:current-context', currentTaskGitDeliveryContext);
   });
   configureWindowSecurity(window, rendererUrl);
   try {
     await window.loadURL(rendererUrl);
   } catch (error) {
-    window.destroy();
+    if (!window.isDestroyed()) window.destroy();
     throw error;
   }
-  return { ...target, opened: true, reused: false };
+  return { ...target, opened: window.isVisible(), reused: false };
 }
 
 /** 创建 Zeus 主窗口；preload 会读取 Main 中启动的本地服务配置。 */
@@ -1307,6 +1398,7 @@ function setupMenu(): void {
         openLogsDirectory: () => {
           void openLogsDirectoryFromMenu();
         },
+        reportFault: () => desktopFaultMonitor?.fault('manual_report', BrowserWindow.getFocusedWindow() ?? undefined),
         showMainWindow: () => {
           void requestMainWindow();
         },
@@ -1369,20 +1461,24 @@ function showUpdateOpenFailure(error: unknown): { opened: false } {
   /** 共用错误说明负责脱敏，并保留结果未知时不得自动重试的语义。 */
   const failure = describeUserFacingError(error, appShellSettings.appLanguage);
   console.warn('Zeus 无法打开更新窗口。', failure.details);
+  void homebrewUpdateController?.reportOpenFailure(error).catch((reportError: unknown) => console.warn('Zeus 无法更新检查失败状态。', reportError));
   dialog.showErrorBox(appShellSettings.appLanguage === 'zh-CN' ? '无法检查更新' : 'Unable to Check for Updates', failure.message);
   return { opened: false };
 }
 
 /** 两端原生菜单共用真实更新检查；结果、预取和重启决策留在原生窗口。 */
 async function checkForUpdatesFromMenu(): Promise<void> {
+  await requestMainWindow();
+  if (fatalStartup) throw new Error('Zeus 启动失败，无法检查更新。');
+  await auxiliaryServicesReady;
+  /** 窗口反馈先于账本写入，版本检查仍在命令门禁通过后执行。 */
+  const controller = homebrewUpdateController;
+  if (!controller) throw new Error('Zeus 更新控制器尚未就绪。');
+  await controller.show();
   const envelope = createSystemMainCommandEnvelope('desktop.automatic_update.menu_check', 'desktop-update');
   await activeMainCommandLedger().execute({ envelope, body: null }, 'desktop.automatic_update.menu_check', async (_body, command) => {
-    await requestMainWindow();
-    if (fatalStartup) throw new Error('Zeus 启动失败，无法检查更新。');
-    await auxiliaryServicesReady;
-    if (!homebrewUpdateController) throw new Error('Zeus 更新控制器尚未就绪。');
     await command.markWriteStarted();
-    await homebrewUpdateController.showOrCheck();
+    await controller.showOrCheck({ present: false });
     return { opened: true, externalOperationId: command.externalOperationId };
   });
 }
@@ -1796,7 +1892,17 @@ function setupIpc(): void {
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow) || event.senderFrame !== event.sender.mainFrame) throw new Error('代码交付窗口请求来自不受信任的主窗口。');
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('代码交付窗口请求无效。');
     /** 任务、会话、项目及单仓使用同一入口，身份不能混用。 */
-    const candidate = input as { taskId?: unknown; workspaceId?: unknown; projectId?: unknown; conversationId?: unknown; repositoryId?: unknown; pathPrefix?: unknown };
+    const candidate = input as { taskId?: unknown; workspaceId?: unknown; projectId?: unknown; conversationId?: unknown; repositoryId?: unknown; pathPrefix?: unknown; preload?: unknown };
+    if (candidate.preload !== undefined && typeof candidate.preload !== 'boolean') throw new TypeError('代码交付预热参数无效。');
+    /** 预热沿用打开窗口的身份校验，但不改变当前任务定位。 */
+    const preload = candidate.preload === true;
+    /** 打开耗时包含归属校验和窗口准备，不只统计显示调用。 */
+    const requestedAt = performance.now();
+    /** 先固定请求顺序，再读取异步归属记录。 */
+    const generation = ++taskGitDeliveryPreloadGeneration;
+    /** 真正打开始终执行；过期的后台准备只丢弃结果。 */
+    const open = (target: GitDeliveryWindowTarget) =>
+      preload && generation !== taskGitDeliveryPreloadGeneration ? Promise.resolve({ ...target, opened: false, reused: false }) : openTaskGitDeliveryWindow(requestingWindow, target, preload, requestedAt);
     if (candidate.repositoryId !== undefined) {
       if (
         candidate.taskId !== undefined ||
@@ -1818,29 +1924,41 @@ function setupIpc(): void {
       )
         throw new TypeError('代码交付目录范围无效。');
       /** 真实仓库必须归属当前项目，路径筛选不扩大仓库权限。 */
-      const snapshot = await requireProjectGitWorkbench(event, false, candidate.projectId).loadWorkbench(candidate.projectId);
-      if (!snapshot.repositories.some((repository) => repository.id === candidate.repositoryId)) throw new Error('代码交付仓库不属于当前项目。');
-      return openTaskGitDeliveryWindow(requestingWindow, { projectId: candidate.projectId, repositoryId: candidate.repositoryId, ...(typeof candidate.pathPrefix === 'string' ? { pathPrefix: candidate.pathPrefix } : {}) });
+      await requireProjectGitWorkbench(event, false, candidate.projectId).validateDeliveryScope(candidate.projectId, candidate.repositoryId);
+      return open({ projectId: candidate.projectId, repositoryId: candidate.repositoryId, ...(typeof candidate.pathPrefix === 'string' ? { pathPrefix: candidate.pathPrefix } : {}) });
     }
     if (candidate.pathPrefix !== undefined) throw new TypeError('目录筛选必须绑定仓库。');
     if (candidate.taskId === undefined) {
       if (typeof candidate.projectId !== 'string' || !candidate.projectId.trim() || candidate.workspaceId !== undefined) throw new TypeError('代码交付项目身份无效。');
       if (candidate.conversationId === undefined) {
         /** 项目范围由主进程重新发现，Renderer 不能传入任意本机目录。 */
-        await requireProjectGitWorkbench(event, false, candidate.projectId).loadWorkbench(candidate.projectId);
-        return openTaskGitDeliveryWindow(requestingWindow, { projectId: candidate.projectId });
+        await requireProjectGitWorkbench(event, false, candidate.projectId).validateDeliveryScope(candidate.projectId);
+        return open({ projectId: candidate.projectId });
       }
       if (typeof candidate.conversationId !== 'string' || !candidate.conversationId.trim()) throw new TypeError('代码交付会话身份无效。');
-      return openTaskGitDeliveryWindow(requestingWindow, { projectId: candidate.projectId, conversationId: candidate.conversationId });
+      return open({ projectId: candidate.projectId, conversationId: candidate.conversationId });
     }
     if (typeof candidate.taskId !== 'string' || !candidate.taskId.trim() || candidate.projectId !== undefined || candidate.conversationId !== undefined) throw new TypeError('代码交付任务身份无效。');
     if (candidate.workspaceId !== undefined && candidate.workspaceId !== null && (typeof candidate.workspaceId !== 'string' || !candidate.workspaceId.trim())) throw new TypeError('代码交付工作区身份无效。');
-    if (typeof candidate.workspaceId === 'string') {
+    if (!preload && typeof candidate.workspaceId === 'string') {
       const context = { taskId: candidate.taskId, workspaceId: candidate.workspaceId };
       mainWindowTaskGitContexts.set(requestingWindow.id, context);
       broadcastTaskGitDeliveryCurrentContext(context);
     }
-    return openTaskGitDeliveryWindow(requestingWindow, { taskId: candidate.taskId });
+    return open(typeof candidate.workspaceId === 'string' ? { taskId: candidate.taskId } : await resolveTaskGitDeliveryTarget(candidate.taskId));
+  });
+  /** 受信任页面只上报实际绘制帧，毫秒值写入现有诊断日志。 */
+  ipcMain.on('zeus:task-git-delivery:frame', (event, input: { kind?: unknown; durationMs?: unknown }) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window.isDestroyed() || event.senderFrame !== event.sender.mainFrame || (!windows.has(window) && !taskGitDeliveryTargetByWindowId.has(window.id) && !projectGitDiffWindows.has(window)) || !input) return;
+    if (input.kind === 'window') {
+      const pending = taskGitDeliveryFirstFrames.get(window.id);
+      if (!pending || !window.isVisible()) return;
+      taskGitDeliveryFirstFrames.delete(window.id);
+      traceApplicationStartup('git_delivery_window_first_frame', JSON.stringify({ durationMs: Math.round((performance.now() - pending.startedAt) * 100) / 100, mode: pending.mode }), window.id);
+    } else if (input.kind === 'diff' && typeof input.durationMs === 'number' && Number.isFinite(input.durationMs) && input.durationMs >= 0 && input.durationMs <= 600_000) {
+      traceApplicationStartup('git_diff_click_to_content', JSON.stringify({ durationMs: Math.round(input.durationMs * 100) / 100 }), window.id);
+    }
   });
   /** 仅主窗口或当前任务的交付窗口可以打开任务文件差异。 */
   ipcMain.handle('zeus:task-git-diff:open', async (event, input: unknown) => {
@@ -1865,6 +1983,14 @@ function setupIpc(): void {
     const required = ['projectId', 'repositoryId', 'filePath'] as const;
     for (const key of required) if (typeof candidate[key] !== 'string') throw new TypeError(`仓库差异窗口缺少 ${key}。`);
     requireProjectGitWorkbench(event, false, candidate.projectId as string);
+    /** 会话范围必须与仓库身份一致，服务端继续核验项目归属和真实目录。 */
+    if (
+      candidate.conversationId !== undefined &&
+      (typeof candidate.conversationId !== 'string' ||
+        !candidate.conversationId ||
+        (candidate.repositoryId !== `conversation:${candidate.conversationId}` && !(candidate.repositoryId as string).startsWith(`conversation:${candidate.conversationId}:`)))
+    )
+      throw new TypeError('会话工作树身份不匹配。');
     /** 快照上限沿用 Git 读取的 20 MiB；仅解析补丁，不执行其内容。 */
     let snapshot: GitDiffSummary | undefined;
     if (candidate.diffText !== undefined) {
@@ -1881,6 +2007,7 @@ function setupIpc(): void {
       {
         kind: 'project-git',
         projectId: candidate.projectId as string,
+        conversationId: candidate.conversationId as string | undefined,
         repositoryId: candidate.repositoryId as string,
         path: candidate.filePath as string,
         stage,
@@ -1900,9 +2027,9 @@ function setupIpc(): void {
     if (!snapshot) throw new Error('当前窗口没有差异快照。');
     return snapshot;
   });
-  ipcMain.handle('zeus:project-git:load-workbench', (event, projectId: unknown) => {
-    if (typeof projectId !== 'string') throw new TypeError('项目 Git 工作台请求缺少项目身份。');
-    return requireProjectGitWorkbench(event, false, projectId).loadWorkbench(projectId);
+  ipcMain.handle('zeus:project-git:load-workbench', (event, projectId: unknown, includePatches: unknown = true) => {
+    if (typeof projectId !== 'string' || typeof includePatches !== 'boolean') throw new TypeError('项目 Git 工作台请求缺少项目身份或读取范围无效。');
+    return requireProjectGitWorkbench(event, false, projectId).loadWorkbench(projectId, includePatches);
   });
   ipcMain.handle('zeus:project-git:load-history', (event, input: unknown) => {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('历史请求无效。');
@@ -1947,10 +2074,23 @@ function setupIpc(): void {
   ipcMain.handle('zeus:project-git:load-comparison', (event, input: unknown) => {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('项目 Git 比较请求无效。');
     const candidate = input as Record<string, unknown>;
-    if (typeof candidate.projectId !== 'string' || typeof candidate.repositoryId !== 'string' || typeof candidate.ref !== 'string' || (candidate.mode !== 'current' && candidate.mode !== 'working-tree')) {
+    if (
+      typeof candidate.projectId !== 'string' ||
+      typeof candidate.repositoryId !== 'string' ||
+      typeof candidate.ref !== 'string' ||
+      (candidate.mode !== 'current' && candidate.mode !== 'working-tree' && candidate.mode !== 'staged' && candidate.mode !== 'unstaged')
+    ) {
       throw new TypeError('项目 Git 比较请求身份无效。');
     }
-    return requireProjectGitWorkbench(event, false, candidate.projectId).loadComparison(candidate.projectId, candidate.repositoryId, candidate.ref, candidate.mode);
+    if ((candidate.path !== undefined && typeof candidate.path !== 'string') || (candidate.summaryOnly !== undefined && typeof candidate.summaryOnly !== 'boolean')) throw new TypeError('项目 Git 比较范围无效。');
+    return requireProjectGitWorkbench(event, false, candidate.projectId).loadComparison(
+      candidate.projectId,
+      candidate.repositoryId,
+      candidate.ref,
+      candidate.mode,
+      candidate.path as string | undefined,
+      candidate.summaryOnly as boolean | undefined,
+    );
   });
   ipcMain.handle('zeus:project-git:cancel-action', (event, repositoryId: unknown) => {
     requireProjectGitWorkbench(event, true);
@@ -2034,6 +2174,21 @@ function setupIpc(): void {
         // Electron invoke 只可靠传递 Error.message；普通对象保留外层命令状态、Git 原因和已脱敏日志。
         (error: unknown) => ({ schema: 'zeus-project-git-action-ipc-v1', ok: false, error: userFacingErrorCause(error) }),
       );
+  });
+  /** 隐藏窗口保留接纳请求，接纳成功后允许关闭，失败时恢复原窗口。 */
+  ipcMain.handle('zeus:task-git-delivery:submission-state', (event, state: unknown) => {
+    const requestingWindow = BrowserWindow.fromWebContents(event.sender);
+    /** 只允许创建时绑定的交付窗口改变自身可见性。 */
+    const target = requestingWindow ? taskGitDeliveryTargetByWindowId.get(requestingWindow.id) : undefined;
+    if (!requestingWindow || requestingWindow.isDestroyed() || !target || event.senderFrame !== event.sender.mainFrame) throw new Error('当前窗口不是受信任的代码交付窗口。');
+    if (state !== 'pending' && state !== 'accepted' && state !== 'failed') throw new Error('交付请求状态无效。');
+    if (state === 'pending') {
+      submittingTaskGitDeliveryWindowIds.add(requestingWindow.id);
+      requestingWindow.hide();
+    } else if (submittingTaskGitDeliveryWindowIds.delete(requestingWindow.id) && state === 'failed') {
+      revealTaskGitDeliveryWindow(requestingWindow);
+    }
+    return { state };
   });
   ipcMain.handle('zeus:task-git-delivery:close', (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
@@ -2121,6 +2276,29 @@ function setupIpc(): void {
     hideMenuBarUsageWindow();
     app.quit();
     return { quitting: true };
+  });
+  /** 工作树清单来自实际 Git 登记；只允许主窗口使用项目源码入口。 */
+  ipcMain.handle('zeus:project-source:list-worktrees', async (event, projectId: unknown) => {
+    requireProjectSourceWorkspace(event);
+    if (typeof projectId !== 'string' || !projectId.trim()) throw new TypeError('项目身份无效。');
+    return listProjectSourceWorktrees(await loadProjectIdentity(projectId));
+  });
+  /** 切换只登记目录身份，不产生文件修改或 Git checkout。 */
+  ipcMain.handle('zeus:project-source:select-worktree', async (event, input: { projectId?: unknown; worktreeId?: unknown }) => {
+    requireProjectSourceWorkspace(event);
+    if (typeof input?.projectId !== 'string' || typeof input.worktreeId !== 'string') throw new TypeError('工作树选择无效。');
+    /** 目录授权始终属于发起选择的主窗口。 */
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || owner.isDestroyed() || !windows.has(owner) || event.senderFrame !== event.sender.mainFrame) throw new Error('工作树选择来自不可用的源码窗口。');
+    /** 返回项目目录不依赖其他工作树是否仍可读取。 */
+    const project = await loadProjectIdentity(input.projectId);
+    if (input.worktreeId === 'project') return registerSourceWorkspace(owner, project, await realpath(project.localPath), '');
+    /** 点击时重新确认登记和目录仍存在，不使用 Renderer 提交的路径。 */
+    const choices = await listProjectSourceWorktrees(project);
+    const choice = choices.find((entry) => entry.id === input.worktreeId);
+    if (!choice) throw new Error('工作树已不存在，请刷新后重新选择。');
+    if (owner.isDestroyed()) throw new Error('源码窗口已关闭。');
+    return registerSourceWorkspace(owner, project, choice.localPath, '');
   });
   ipcMain.handle('zeus:project-source:list-directory', (event, input: { projectId?: unknown; relativePath?: unknown }) => {
     const service = requireProjectSourceWorkspace(event);
@@ -2305,6 +2483,7 @@ function setupIpc(): void {
   ipcMain.on('zeus:renderer-bootstrap-ready', (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !isTrustedZeusRendererWindow(requestingWindow) || event.senderFrame !== event.sender.mainFrame) return;
+    desktopFaultMonitor?.ready(requestingWindow);
     // 失败后的迟到通知与重复通知均不能确认 Windows 升级成功。
     if (!rendererBootstrapMonitor.markReady(requestingWindow)) return;
     traceApplicationStartup('renderer_bootstrap_ready');
@@ -2324,7 +2503,16 @@ function setupIpc(): void {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) return;
     const detail = sanitizeRendererRuntimeLogDetail(message);
-    console.error(`Renderer operation failed: ${detail}`);
+    /** 送达迁移沿用现有日志通道，但不能计为运行错误。 */
+    let eventName = 'renderer_runtime_error';
+    try {
+      const diagnostic: unknown = JSON.parse(detail);
+      if (diagnostic && typeof diagnostic === 'object' && 'kind' in diagnostic && diagnostic.kind === 'conversation_delivery') eventName = 'conversation_delivery';
+    } catch {
+      // 普通错误仍按原有文本格式记录。
+    }
+    if (eventName === 'conversation_delivery') console.info(`Renderer delivery: ${detail}`);
+    else console.error(`Renderer operation failed: ${detail}`);
     if (readOnlyValidationDescriptor || dataRootPreparationError !== undefined) return;
     const logDirectory = activeZeusDataLayout().executionHost;
     void mkdir(logDirectory, { recursive: true })
@@ -2333,7 +2521,7 @@ function setupIpc(): void {
           join(logDirectory, 'host.log'),
           `${JSON.stringify({
             timestamp: new Date().toISOString(),
-            event: 'renderer_runtime_error',
+            event: eventName,
             pid: process.pid,
             detail,
           })}\n`,
@@ -2533,17 +2721,20 @@ function setupIpc(): void {
   ipcMain.handle('zeus:automatic-update-indicator:open', async (event, request: MainCommandRequest) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('Automatic update open request came from an untrusted window.');
-    await auxiliaryServicesReady;
-    const controller = homebrewUpdateController;
-    const result = await activeMainCommandLedger()
-      .execute(request, 'desktop.automatic_update.open', async (_body, command) => {
-        if (!controller) throw new Error('Automatic update controller is unavailable.');
+    try {
+      await auxiliaryServicesReady;
+      /** 与菜单共用先显示、后检查的顺序，不让命令持久化阻塞点击反馈。 */
+      const controller = homebrewUpdateController;
+      if (!controller) throw new Error('Automatic update controller is unavailable.');
+      await controller.show();
+      return await activeMainCommandLedger().execute(request, 'desktop.automatic_update.open', async (_body, command) => {
         await command.markWriteStarted();
-        await controller.showOrCheck();
+        await controller.showOrCheck({ present: false });
         return { opened: true, externalOperationId: command.externalOperationId };
-      })
-      .catch(showUpdateOpenFailure);
-    return result;
+      });
+    } catch (error) {
+      return showUpdateOpenFailure(error);
+    }
   });
   ipcMain.handle('zeus:automatic-update-indicator:record-manual-check', async (event, request: MainCommandRequest) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
@@ -2810,11 +3001,17 @@ function setupIpc(): void {
     if (typeof url !== 'string' || !browserHost?.getSettings().enabled) return false;
     return openThirdPartyTaskLogin(requestingWindow, url);
   });
-  ipcMain.handle('zeus:third-party-task:parse-link', async (event, request: MainCommandRequest<string>) => {
+  ipcMain.handle('zeus:third-party-task:parse-link', async (event, request: MainCommandRequest<{ url: string; requestId: string }>) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('第三方任务解析来自不受信任窗口。');
-    return activeMainCommandLedger().execute(request, 'desktop.task_resources.import_third_party', async (url, command) => {
-      const result = typeof url === 'string' && url.trim() ? await extractThirdPartyTaskInfo(url.trim(), await loadZentaoExtractServices(command)) : { kind: 'unsupported' as const, sourceUrl: typeof url === 'string' ? url : '' };
+    return activeMainCommandLedger().execute(request, 'desktop.task_resources.import_third_party', async (input, command) => {
+      const url = input && typeof input === 'object' && typeof input.url === 'string' ? input.url.trim() : '';
+      const requestId = input && typeof input === 'object' && typeof input.requestId === 'string' && /^[a-zA-Z0-9-]{16,80}$/u.test(input.requestId) ? input.requestId : null;
+      const result = url
+        ? await extractThirdPartyTaskInfo(url, await loadZentaoExtractServices(command), (metadata) => {
+            if (requestId && !requestingWindow.isDestroyed()) requestingWindow.webContents.send('zeus:third-party-task:metadata', { requestId, result: metadata });
+          })
+        : { kind: 'unsupported' as const, sourceUrl: url };
       // 无附件的成功解析也要生成可重放回执；附件路径已在首次写入前标记。
       await command.markWriteStarted();
       return result;
@@ -2861,11 +3058,11 @@ function setupIpc(): void {
     return { cleared: true, clearedAt: new Date().toISOString() };
   });
   // 仅主设置窗口可以检查网络，网页子框架不能借此发起任意请求。
-  ipcMain.handle('zeus:network-proxy:check', (event, settings: unknown, address: unknown, checkTarget: unknown) => {
+  ipcMain.handle('zeus:network-proxy:check', (event, address: unknown, checkTarget: unknown) => {
     /** 绑定实际请求窗口和顶层页面，不接受调用方提供的窗口身份。 */
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow) || event.senderFrame !== event.sender.mainFrame) throw new Error('当前窗口不能检查网络代理。');
-    return checkNetworkProxyConnection(settings, address, checkTarget);
+    return checkNetworkProxyConnection(address, checkTarget, session.fromPartition(browserPartition));
   });
   ipcMain.handle('zeus:export-patch', (_event, patch: unknown) =>
     exportPatchToFile({
@@ -2888,6 +3085,28 @@ function setupIpc(): void {
       openPath: (filePath) => shell.openPath(filePath),
     }),
   );
+  /** 故障包只由可信主界面发起；采集不依赖 Core 仍可运行。 */
+  ipcMain.handle('zeus:submit-fault-report', async (event, input: unknown) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !isTrustedZeusRendererWindow(owner) || event.senderFrame !== event.sender.mainFrame || readOnlyValidationDescriptor) throw new Error('Fault reporting is unavailable in this window');
+    const layout = activeZeusDataLayout();
+    return submitFaultReport(input, {
+      directory: join(layout.localLogs, 'fault-reports'),
+      hostLog: join(layout.executionHost, 'host.log'),
+      appVersion: app.getVersion(),
+      ...(app.isPackaged ? { archivePath: app.getAppPath() } : {}),
+      ...(localServerRuntime ? { core: localServerRuntime.config } : {}),
+    });
+  });
+  /** 导出失败报告沿用系统保存窗口，不暴露任意本地文件读取。 */
+  ipcMain.handle('zeus:export-fault-report', async (event, reportId: unknown) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !isTrustedZeusRendererWindow(owner) || event.senderFrame !== event.sender.mainFrame || readOnlyValidationDescriptor) throw new Error('Fault export is unavailable in this window');
+    const target = await dialog.showSaveDialog(owner, { title: nativeText('保存故障报告', 'Save fault report'), defaultPath: 'zeus-fault-report.json', filters: [{ name: 'JSON', extensions: ['json'] }] });
+    if (target.canceled || !target.filePath) return { saved: false };
+    await exportFaultReport(reportId, join(activeZeusDataLayout().localLogs, 'fault-reports'), target.filePath);
+    return { saved: true };
+  });
   ipcMain.handle('zeus:export-runtime-logs', (_event, payload: unknown) =>
     exportRuntimeLogsToFile({
       payload: payload as {
@@ -3292,17 +3511,30 @@ JSON.stringify(references);`,
   }
 }
 
+/** 缩略图与完整预览共用会话附件授权及任务附件真实路径边界。 */
+async function resolveAttachmentPreviewSource(resource: { localPath?: string; uploadRef?: string }): Promise<{ path: string; root: string } | null> {
+  /** 会话资源解析器校验授权凭据或会话附件目录，并返回真实路径。 */
+  const granted = await conversationInputResources?.resolve(resource);
+  if (granted) return { path: granted, root: dirname(granted) };
+  if (typeof resource.localPath !== 'string' || !isInsideTaskAttachmentDirectory(resource.localPath)) return null;
+  /** 任务附件继续限制符号链接解析后的路径，不能借链接读取目录外文件。 */
+  const path = await realpath(resource.localPath);
+  return isInsideTaskAttachmentDirectory(path) ? { path, root: taskAttachmentDirectory() } : null;
+}
+
+/** 读取已授权的任务图片，包括自动创建任务引用的会话附件。 */
 async function loadSavedTaskAttachmentPreview(path: string): Promise<{ previewUrl: string; mimeType: string } | null> {
-  if (typeof path !== 'string' || !isInsideTaskAttachmentDirectory(path)) return null;
-  const mimeType = filePreviewMime(path);
+  /** 两种预览沿用同一附件来源，不要求复制会话图片。 */
+  const source = await resolveAttachmentPreviewSource({ localPath: path });
+  if (!source) return null;
+  const mimeType = filePreviewMime(source.path);
   if (!mimeType.startsWith('image/')) return null;
-  const canonical = await realpath(path);
-  if (!isInsideTaskAttachmentDirectory(canonical) || (await stat(canonical)).size > filePreviewLimits.image) return null;
-  const data = await readFile(canonical);
+  if ((await stat(source.path)).size > filePreviewLimits.image) return null;
+  const data = await readFile(source.path);
   const previewUrl = data.length && filePreviewKind(mimeType) === 'image' ? `data:${mimeType};base64,${data.toString('base64')}` : undefined;
   if (previewUrl) return { previewUrl, mimeType };
   try {
-    const convertedImage = nativeImage.createFromPath(path);
+    const convertedImage = nativeImage.createFromPath(source.path);
     if (convertedImage.isEmpty()) return null;
     const convertedPreviewUrl = buildTaskAttachmentPreviewDataUrl(convertedImage.toPNG(), 'image/png');
     return convertedPreviewUrl ? { previewUrl: convertedPreviewUrl, mimeType: 'image/png' } : null;
@@ -3429,7 +3661,8 @@ async function saveTaskResourcePaths(paths: string[], commandId: string): Promis
   for (const [index, path] of paths.slice(0, maximumTaskResourceCount).entries()) {
     if (typeof path !== 'string' || !isAbsolute(path) || path.includes('\0')) continue;
     try {
-      const canonicalPath = await realpath(path);
+      /** 任务与会话共用 macOS 文件引用解析，随后继续真实路径校验。 */
+      const canonicalPath = await realpath(await resolveTaskClipboardFilePath(path));
       if (seen.has(canonicalPath)) continue;
       seen.add(canonicalPath);
       const sourceStat = await lstat(canonicalPath);
@@ -3607,6 +3840,76 @@ async function initializeApplication(): Promise<void> {
     installReadOnlyValidationIpcFence(ipcMain, readOnlyValidationDescriptor);
     traceApplicationStartup('read_only_validation_verified');
   }
+  if (!readOnlyValidationDescriptor && !desktopFaultMonitor) {
+    /** 崩溃转储先保存在同一数据根，只有用户选择上报才上传。 */
+    const layout = activeZeusDataLayout();
+    const crashDirectory = join(layout.localLogs, 'crashes');
+    await mkdir(crashDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(join(layout.localLogs, 'fault-reports'), { recursive: true, mode: 0o700 });
+    app.setPath('crashDumps', crashDirectory);
+    const runId = randomUUID();
+    crashReporter.start({ uploadToServer: false, compress: true, extra: { zeusRunId: runId } });
+    process.report.directory = crashDirectory;
+    process.report.filename = `main-fatal-${process.pid}.json`;
+    process.report.excludeEnv = true;
+    process.report.reportOnFatalError = true;
+    /** 认证只经私有 IPC 送到本轮守护，不写入活动标记或报告。 */
+    const reports = () => ({
+      directory: join(layout.localLogs, 'fault-reports'),
+      hostLog: join(layout.executionHost, 'host.log'),
+      appVersion: app.getVersion(),
+      ...(app.isPackaged ? { archivePath: app.getAppPath() } : {}),
+      ...(localServerRuntime ? { core: localServerRuntime.config } : {}),
+    });
+    desktopFaultMonitor = startFaultMonitor({
+      runId,
+      mainPid: process.pid,
+      startedAt: new Date().toISOString(),
+      executable: process.execPath,
+      args: process.argv.slice(1),
+      dataRoot: layout.root,
+      helperPath: process.platform === 'win32' ? nativeDesktopHelperPath('zeus-windows-security.exe') : nativeUpdateProgressHelperPath(),
+      crashDirectory,
+      reports: reports(),
+      language: appShellSettings.appLanguage,
+      appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+      windows: () => BrowserWindow.getAllWindows().filter(isTrustedZeusRendererWindow),
+      isReady: (window) => rendererBootstrapMonitor.isReady(window),
+      onUnavailable: () => {
+        void dialog
+          .showMessageBox({
+            type: 'warning',
+            title: nativeText('故障恢复监控不可用', 'Fault recovery monitoring is unavailable'),
+            message: nativeText(
+              'Zeus 无法启动独立故障监控。卡死或崩溃时可能无法自动保存现场，请重新启动应用。',
+              'Zeus could not start its independent fault monitor. Evidence may not be saved automatically if the app freezes or crashes. Restart the application.',
+            ),
+            buttons: [nativeText('关闭', 'Close')],
+            noLink: true,
+          })
+          .catch(() => undefined);
+      },
+      current: () => ({
+        reports: reports(),
+        language: appShellSettings.appLanguage,
+        appearance: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
+        configuration: {
+          webviewDebugEnabled: appShellSettings.webviewDebugEnabled,
+          multiWindowEnabled: appShellSettings.multiWindowEnabled,
+          backgroundModeEnabled: appShellSettings.backgroundModeEnabled,
+          gpuCompositing: app.getGPUFeatureStatus().gpu_compositing ?? 'unknown',
+          ...(localServerRuntime ? { hostAppVersion: localServerRuntime.config.executionHostTransition.hostAppVersion, hostProtocolVersion: localServerRuntime.executionHost.protocolVersion } : {}),
+        },
+        ...(localServerRuntime?.executionHost.mode === 'detached' && localServerRuntime.executionHost.instanceId ? { core: { pid: localServerRuntime.executionHost.pid, instanceId: localServerRuntime.executionHost.instanceId } } : {}),
+      }),
+    });
+    ipcMain.on('zeus:renderer-health', (event, nonce: unknown) => desktopFaultMonitor?.heartbeat(event, nonce));
+    ipcMain.on('zeus:fault-context', (event, context: unknown) => desktopFaultMonitor?.context(event, context));
+    ipcMain.on('zeus:fault-breadcrumb', (event, entry: unknown) => desktopFaultMonitor?.breadcrumb(event, entry));
+    powerMonitor.on('resume', () => desktopFaultMonitor?.resume());
+    app.once('will-quit', () => desktopFaultMonitor?.close());
+    process.on('uncaughtExceptionMonitor', (error) => desktopFaultMonitor?.fault('main_exception', undefined, error.stack ?? error.message));
+  }
   registerFilePreview({
     commandLedger: activeMainCommandLedger,
     openSource: openFileSourceWorkspace,
@@ -3630,10 +3933,10 @@ async function initializeApplication(): Promise<void> {
         return projectGitWorkbench.loadFilePreview(input);
       }
       if (input.kind === 'attachment') {
-        const granted = await conversationInputResources?.resolve(input);
-        const path = granted || (typeof input.localPath === 'string' && isInsideTaskAttachmentDirectory(input.localPath) ? input.localPath : null);
-        if (!path) throw new Error('附件授权无效或文件已经移除。');
-        return { sides: [{ name: basename(path), label: '附件', path, root: granted ? dirname(path) : taskAttachmentDirectory() }] };
+        /** 与任务缩略图使用相同的受信附件来源。 */
+        const source = await resolveAttachmentPreviewSource(input);
+        if (!source) throw new Error('附件授权无效或文件已经移除。');
+        return { sides: [{ name: basename(source.path), label: '附件', ...source }] };
       }
       if (!localServerRuntime) throw new Error('文件服务尚未就绪。');
       const config = await localServerRuntime.refreshConfig();
@@ -3700,6 +4003,15 @@ async function initializeApplication(): Promise<void> {
       productionEdgeExtensionId: process.env.ZEUS_EDGE_EXTENSION_ID,
     });
     browserHost = createBrowserHost({
+      passwords: new BrowserPasswordStore(join(dirname(dataLayout.browserState), 'passwords', 'passwords.enc'), createPlatformSecretStore({ service: activeDesktopKeychainService(), dataRootPath: dataLayout.root })),
+      computer: () => {
+        if (!computerHost) throw new Error('CUA 原生宿主尚未就绪。');
+        return computerHost;
+      },
+      translation: createBrowserTranslationClient(async () => {
+        if (!localServerRuntime) throw new Error('翻译服务尚未就绪。');
+        return localServerRuntime.refreshConfig();
+      }),
       language: () => appShellSettings.appLanguage,
       statePath: dataLayout.browserState,
       preloadPath: join(desktopRoot(), 'dist/preload/browser-page.cjs'),
@@ -3714,7 +4026,9 @@ async function initializeApplication(): Promise<void> {
     });
     for (const window of windows) browserHost.registerWindow(window);
     browserHost.registerIpc();
+    await browserHost.initializeCua();
     computerHost = createComputerHost({
+      browserEndpoint: () => browserHost?.getCuaEndpoint(),
       statePath: dataLayout.computerState,
       hostBundleId: app.isPackaged ? activeDataRootIdentity().bundleId : 'com.github.Electron',
       mainCommandLedger: activeMainCommandLedger,
@@ -3750,8 +4064,9 @@ async function initializeApplication(): Promise<void> {
     // Main 只持有窗口、BrowserHost 与短期连接凭据；独立 Zeus Core 是唯一业务 SQLite 写入者。
     const { startDesktopLocalServer } = await import('./localServerRuntime.js');
     traceApplicationStartup('local_server_module_ready', sanitizeRendererRuntimeLogDetail(`Core 项目根目录：${mainProjectRoot}`));
-    localServerRuntime = await startDesktopLocalServer({
+    localServerStartup = startDesktopLocalServer({
       userDataPath,
+      shutdownSignal: desktopShutdown.signal,
       dataLayout,
       projectRoot: mainProjectRoot,
       dataRootIdentity: zeusDataRootHostIdentity(activeDataRootIdentity()),
@@ -3772,7 +4087,8 @@ async function initializeApplication(): Promise<void> {
       conversationAttachmentGrantSecretPath,
       browserAutomation: nativeAutomationHost,
       readOnlyValidation: readOnlyValidationDescriptor,
-      onRestarted: () => {
+      onRestarted: async (config) => {
+        await initializeNetworkProxy(config);
         // 本地服务异常重启后，依赖旧 WebSocket 的系统通知桥必须重建，避免继续挂在旧端口。
         if (!readOnlyValidationDescriptor) applySystemNotificationBridge();
         for (const window of [...windows, ...taskGitDeliveryWindows.values()]) {
@@ -3782,9 +4098,16 @@ async function initializeApplication(): Promise<void> {
         }
       },
     });
+    localServerRuntime = await localServerStartup;
+    localServerStartup = undefined;
+    if (desktopShutdown.signal.aborted) return;
     traceApplicationStartup('local_server_ready');
-    // 读取宿主实际生效值；后台宿主仍在工作时，保存的新设置留待完整退出后统一启用。
+    // Main 和浏览器连接 Core 固定出口，后续保存设置时无需重启。
     await initializeNetworkProxy(localServerRuntime.config);
+    if (!readOnlyValidationDescriptor) {
+      const stopSuggestionNetworkBridge = startInputSuggestionNetworkBridge(() => localServerRuntime?.config);
+      app.once('will-quit', stopSuggestionNetworkBridge);
+    }
     // 代理已生效后才启用外部浏览器；失败留给该功能自己的调用者。
     externalBrowserReady = browserHost.initializeExternalBrowsers();
     void externalBrowserReady.catch((error) => console.warn('外部浏览器初始化失败。', error));
@@ -3824,8 +4147,12 @@ async function initializeApplication(): Promise<void> {
             testMode: isTestDistribution(),
             allowUntrustedTestUpdate: allowUntrustedReleaseUpdateTest,
             releaseUpdateManifestUrl: allowUntrustedReleaseUpdateTest ? process.env.ZEUS_RELEASE_UPDATE_MANIFEST_URL : undefined,
-            /** 保留 macOS 下载安全检查；打开磁盘映像交给系统，不执行自动替换。 */
+            /** Windows 权限受限时先定位文件，退出 Zeus 后用户仍能找到安装器；macOS 保留 DMG 安全检查。 */
             openDownloadedArtifact: async (path) => {
+              if (process.platform === 'win32') {
+                shell.showItemInFolder(path);
+                return;
+              }
               if (process.platform === 'darwin') await execFile(nativeUpdateProgressHelperPath(), ['--quarantine-download', path], { timeout: 10_000 });
               /** 系统返回空字符串才表示已接受打开请求。 */
               const error = await shell.openPath(path);
@@ -3861,6 +4188,8 @@ async function initializeApplication(): Promise<void> {
             canInstall: assertUpdateCanInstall,
             onInstallReady: requestUpgradeHandoffQuit,
           });
+          // Windows 原生窗口冷启动移到后台；预热失败保留菜单点击时的正常重试。
+          if (process.platform === 'win32') void homebrewUpdateController.warmup().catch((error: unknown) => console.warn('Zeus 更新窗口预热失败。', error));
         }
       } catch (error) {
         releaseUpdateService = undefined;
@@ -3877,11 +4206,18 @@ async function initializeApplication(): Promise<void> {
             controller: homebrewUpdateController,
             checkCompanionUpdate: checkCodexUpdateAutomatically,
             onIndicatorChange: broadcastAutomaticUpdateIndicator,
-            notifyReady: (latestVersion, showProgress) => {
+            notifyReady: (latestVersion, showProgress, manualInstall) => {
               if (isZeusApplicationForeground() || !appShellSettings.desktopNotificationsEnabled || !Notification.isSupported()) return false;
               const notification = new Notification({
                 title: appShellSettings.appLanguage === 'zh-CN' ? `${distributionAppName} 更新已下载` : `${distributionAppName} Update Downloaded`,
-                body: appShellSettings.appLanguage === 'zh-CN' ? `${distributionAppName} ${latestVersion} 已下载。重启后可安装更新。` : `${distributionAppName} ${latestVersion} is downloaded. Restart to install the update.`,
+                body:
+                  appShellSettings.appLanguage === 'zh-CN'
+                    ? manualInstall
+                      ? `${distributionAppName} ${latestVersion} 已下载。打开安装包完成安装。`
+                      : `${distributionAppName} ${latestVersion} 已下载。重启后可安装更新。`
+                    : manualInstall
+                      ? `${distributionAppName} ${latestVersion} is downloaded. Open the installer to install the update.`
+                      : `${distributionAppName} ${latestVersion} is downloaded. Restart to install the update.`,
               });
               notification.on('click', () => void showProgress().catch(showUpdateOpenFailure));
               notification.show();
@@ -3957,6 +4293,7 @@ function isConversationStoreMigrationError(error: unknown): boolean {
 
 function handleFatalStartupError(error: unknown): void {
   fatalStartup = true;
+  desktopFaultMonitor?.fault('startup_failed', mainWindow, error instanceof Error ? (error.stack ?? error.message) : String(error));
   traceApplicationStartup('initialization_failed', sanitizeRendererRuntimeLogDetail(error instanceof Error ? error.message : String(error)));
   // Renderer 已通过被拒绝的启动配置进入唯一“启动失败”页；Main 只记录日志，
   // 不再叠加原生错误弹窗或主动退出造成白屏。
@@ -4010,7 +4347,8 @@ const rendererBootstrapMonitor = createRendererBootstrapMonitor<BrowserWindow>({
   onFailure: (window, error) => {
     // 辅助窗口失败不能把整个应用标为启动失败。
     if (windows.has(window)) void startupCoordinator.fail(error);
-    void showRendererBootstrapFailure(window, error).catch((recoveryError: unknown) => console.error('Zeus 无法显示窗口加载错误。', recoveryError));
+    if (desktopFaultMonitor) desktopFaultMonitor.fault('startup_failed', window, error instanceof Error ? (error.stack ?? error.message) : String(error));
+    else void showRendererBootstrapFailure(window, error).catch((recoveryError: unknown) => console.error('Zeus 无法显示窗口加载错误。', recoveryError));
   },
 });
 
@@ -4036,7 +4374,7 @@ function nativeText(zh: string, en: string): string {
   return appShellSettings.appLanguage === 'en-US' ? en : zh;
 }
 
-/** 未保存检查通过后立即消费本轮关闭许可，避免取消退出或转后台后复用。 */
+/** 未保存检查通过后，普通退出直接关闭后台；重启继续核对活动工作。 */
 async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | 'cancel'> {
   // 取消结果未知时不能借后续普通退出让待命安装器继续安装。
   if (pendingUpgradeHandoff?.cancellationRequested) return cancelRequestedRestart();
@@ -4044,12 +4382,13 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
   taskTableLayoutQuitApproved = false;
   taskTableLayoutCloseApprovedWindowIds.clear();
   pendingTaskTableLayoutWindowCloseIds.clear();
+  // 用户明确选择退出即授权停止工作，不再把退出改成后台运行或状态查询。
+  if (!fullRestartRequested && !upgradeHandoffRequested) return 'final_quit';
   // 只读验收副本不得使用正式数据投影中的历史活动计数阻塞退出。
   if (readOnlyValidationDescriptor) return 'final_quit';
   if (storageRecoveryRestart.isRequested()) return 'final_quit';
   const runtime = localServerRuntime;
   if (!runtime) {
-    if (!fullRestartRequested && !upgradeHandoffRequested) return 'final_quit';
     const confirmed = await confirmRequestedRestart(nativeText('无法读取后台状态。重启可能中断尚未完成的工作。', 'The background service status is unavailable. Restarting may interrupt unfinished work.'));
     return confirmed ? requestedRestartQuitMode() : cancelRequestedRestart();
   }
@@ -4057,13 +4396,6 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
   try {
     status = await runtime.getStatus();
   } catch {
-    if (!fullRestartRequested && !upgradeHandoffRequested) {
-      await showRestartCancelled(
-        nativeText('无法确认后台工作状态，本次退出未完成。Zeus 仍在运行，请检查运行日志后重试。', 'The background work status could not be confirmed. Zeus is still running. Check the runtime logs before trying to quit again.'),
-        true,
-      );
-      return 'cancel';
-    }
     const confirmed = await confirmRequestedRestart(
       nativeText(
         '无法确认哪些工作仍在运行。重启可能中断对话、待回答或待授权的请求，以及正在运行的工具和命令。',
@@ -4107,40 +4439,7 @@ async function resolveDesktopQuitMode(): Promise<DesktopLocalServerCloseMode | '
       return cancelRequestedRestart();
     }
   }
-  const mayContinueInBackground = appShellSettings.backgroundModeEnabled;
-  const options = {
-    type: 'warning' as const,
-    title: nativeText('仍有工作正在运行', 'Work is still running'),
-    message: nativeText(`退出 ${distributionAppName} 时如何处理正在运行的工作？`, `What should happen to active work when you quit ${distributionAppName}?`),
-    detail: nativeText(
-      `正在处理 ${status.activeTurnCount} 个请求，${status.waitingRequestCount} 个请求等待回答或授权，另有 ${status.activeRuntimeCount} 个工具和 ${status.activeCommandRunCount} 个命令正在运行。`,
-      `${status.activeTurnCount} requests are being processed, ${status.waitingRequestCount} are awaiting answers or approvals, and ${status.activeRuntimeCount} other tools and ${status.activeCommandRunCount} commands are running.`,
-    ),
-    buttons: mayContinueInBackground
-      ? [nativeText('关闭窗口并继续后台运行', 'Close windows and keep work running'), nativeText('停止工作并退出', 'Stop work and quit'), nativeText('取消', 'Cancel')]
-      : [nativeText('停止工作并退出', 'Stop work and quit'), nativeText('取消', 'Cancel')],
-    defaultId: mayContinueInBackground ? 2 : 1,
-    cancelId: mayContinueInBackground ? 2 : 1,
-    noLink: true,
-  };
-  const targetWindow = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-  const result = targetWindow ? await dialog.showMessageBox(targetWindow, options) : await dialog.showMessageBox(options);
-  if (mayContinueInBackground && result.response === 0) return 'continue_in_background';
-  const stopResponse = mayContinueInBackground ? 1 : 0;
-  const cancelResponse = mayContinueInBackground ? 2 : 1;
-  if (result.response === cancelResponse) return 'cancel';
-  if (result.response !== stopResponse) return 'cancel';
-  try {
-    await runtime.stopActiveWork();
-    return 'final_quit';
-  } catch (error) {
-    console.error('Zeus 未能记录全部活动工作的中断状态，已取消本次退出。', error);
-    await showRestartCancelled(
-      nativeText('停止工作尚未确认，本次退出未完成。Zeus 仍在运行，请检查运行日志后重试。', 'Stopping active work could not be confirmed. Zeus is still running. Check the runtime logs before trying to quit again.'),
-      true,
-    );
-    return 'cancel';
-  }
+  return 'final_quit';
 }
 
 async function requestedRestartQuitMode(): Promise<'upgrade_handoff' | 'upgrade_shutdown' | 'final_quit' | 'cancel'> {
@@ -4213,11 +4512,11 @@ async function confirmRequestedRestart(detail: string): Promise<boolean> {
   return result.response === 0;
 }
 
-/** 退出或重启未完成时明确告知用户，不能只记录日志后保持后台运行。 */
-async function showRestartCancelled(detail: string, quitting = false): Promise<void> {
+/** 重启未完成时明确告知用户，并保留当前窗口处理失败原因。 */
+async function showRestartCancelled(detail: string): Promise<void> {
   const options = {
     type: 'warning' as const,
-    title: quitting ? nativeText('退出未完成', 'Quit not completed') : nativeText('重启已取消', 'Restart cancelled'),
+    title: nativeText('重启已取消', 'Restart cancelled'),
     message: nativeText(`${distributionAppName} 将保持打开。`, `${distributionAppName} will remain open.`),
     detail,
     buttons: [nativeText('知道了', 'OK')],
@@ -4254,16 +4553,32 @@ app.on(
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Zeus 系统通知资源未能完整关闭。');
     },
     resolveQuitMode: resolveDesktopQuitMode,
-    continueInBackground: continueApplicationInBackground,
+    /** 在关闭 Core 前通知所有桌面窗口暂停重连。 */
+    onQuitStateChanged: (quitting) => {
+      desktopFaultMonitor?.quitting(quitting);
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('zeus:quit-state-changed', quitting);
+      }
+    },
     closeLocalServer: async (mode) => {
+      desktopShutdown.abort();
+      /** 每个清理阶段都保留失败原因，辅助资源超时不能阻止关闭 Core。 */
       const cleanupErrors: unknown[] = [];
-      const attemptCleanup = async (label: string, operation: () => void | Promise<void>): Promise<void> => {
+      /** 默认等待五秒；Core 和原生助手使用各自的退出时限，单位为毫秒。 */
+      const attemptCleanup = async (label: string, operation: () => void | Promise<void>, timeoutMs = 5_000): Promise<void> => {
         try {
-          await operation();
+          await withCloseTimeout(Promise.resolve().then(operation), timeoutMs, `Zeus 退出清理超时：${label}`);
         } catch (error) {
           cleanupErrors.push(Object.assign(new Error(`Zeus 退出清理失败：${label}`), { cause: error }));
         }
       };
+      await attemptCleanup(
+        '后台宿主初始化',
+        async () => {
+          await localServerStartup?.catch(() => undefined);
+        },
+        10_000,
+      );
       await attemptCleanup('附属服务初始化', () => auxiliaryServicesReady);
       await attemptCleanup('输入建议诊断日志', async () => {
         await inputSuggestionUiDiagnostics?.flush();
@@ -4276,17 +4591,16 @@ app.on(
       await attemptCleanup('电源监听器', () => {
         powerMonitor.removeListener('resume', handleAutomaticUpdateResume);
       });
-      await attemptCleanup('更新控制器', async () => {
-        if (process.platform === 'win32') {
-          // Windows 替换安装目录前必须确认原生进度程序已退出。
+      await attemptCleanup(
+        '更新控制器',
+        async () => {
+          if (process.platform !== 'win32' && (mode === 'upgrade_handoff' || mode === 'upgrade_shutdown')) return;
+          // 普通退出在两端都等待原生进度程序实际结束。
           await homebrewUpdateController?.closeAndWait();
           homebrewUpdateController = undefined;
-          return;
-        }
-        if (mode === 'upgrade_handoff' || mode === 'upgrade_shutdown') return;
-        homebrewUpdateController?.close();
-        homebrewUpdateController = undefined;
-      });
+        },
+        15_000,
+      );
       await attemptCleanup('内置浏览器宿主', async () => {
         await browserHost?.close();
         browserHost = undefined;
@@ -4301,10 +4615,15 @@ app.on(
       });
       conversationInputResources = undefined;
       // 即使任一前序 UI/平台资源清理失败，Detached Core 关闭也必须独立尝试。
-      await attemptCleanup('Detached Core', async () => {
-        await localServerRuntime?.close(mode);
-        localServerRuntime = undefined;
-      });
+      await attemptCleanup(
+        'Detached Core',
+        async () => {
+          await localServerRuntime?.close(mode);
+          localServerRuntime = undefined;
+        },
+        45_000,
+      );
+      await attemptCleanup('Main 网络代理连接', closeNetworkProxyRuntime);
       if (process.platform === 'darwin' && !readOnlyValidationDescriptor && (mode === 'final_quit' || mode === 'force_quit') && app.isPackaged) {
         await attemptCleanup('旧 App 备份', async () => {
           await cleanupStaleReleaseBackups(currentAppBundlePath());
@@ -4313,13 +4632,10 @@ app.on(
       if (readOnlyValidationDescriptor && cleanupErrors.length === 0) {
         await attemptCleanup('只读验收副本销毁助手', () => scheduleReadOnlyValidationCleanup(readOnlyValidationDescriptor!));
       }
+      if (cleanupErrors.length === 0) await attemptCleanup('独立故障监控', () => desktopFaultMonitor?.closeAndWait(), 30_000);
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Zeus 退出时一个或多个资源未能完整关闭。');
     },
     onCleanupError: async (error, quitMode): Promise<BeforeQuitCleanupFailureAction> => {
-      if (readOnlyValidationDescriptor) {
-        console.error('只读验收关闭失败；禁止以成功状态退出。', error);
-        return 'force_quit';
-      }
       if (quitMode === 'upgrade_shutdown' || (process.platform === 'win32' && pendingUpgradeHandoff)) {
         console.error('跨协议升级未能完整关闭旧 Zeus Core；保留当前应用，禁止启动新版本。', error);
         await cancelRequestedRestart();
@@ -4328,8 +4644,13 @@ app.on(
         );
         return 'keep_open';
       }
-      // 退出链已经有界等待并完成持久化优先收口；剩余技术错误只进运行日志，禁止再弹模态框卡住应用。
-      console.error('Zeus 退出清理未完整成功，将使用进程退出兜底。', error);
+      // 正常 close 的等待超时后，强制关闭必须绕开原有 Promise，回收同一身份的 Core 进程树。
+      try {
+        if (localServerRuntime) await withCloseTimeout(localServerRuntime.close('force_quit'), 10_000, 'Zeus Core 强制退出超过十秒。');
+      } catch (forceError) {
+        console.error('Zeus Core 强制退出失败。', forceError);
+      }
+      console.error('Zeus 退出清理未完整成功，将结束剩余主进程资源。', error);
       return 'force_quit';
     },
     exitApp: (code) => {
@@ -4339,6 +4660,7 @@ app.on(
         pendingUpgradeHandoff.resolve(true);
         pendingUpgradeHandoff = null;
       }
+      desktopFaultMonitor?.close();
       app.exit(code);
     },
   }),
@@ -4370,20 +4692,14 @@ app.on('did-resign-active', () => {
   ensureMacOSDockIconVisible();
 });
 
-/** Main、内置浏览器和系统网络会话在业务界面开放前使用宿主的同一份代理。 */
+/** Main 与浏览器使用 Core 的固定出口，代理规则只由 Core 实时维护。 */
 async function initializeNetworkProxy(config: { baseUrl: string; apiToken: string }): Promise<void> {
   /** 本机设置读取有界等待，失败时不把手动代理误降级为直连。 */
-  const response = await fetch(`${config.baseUrl}/api/settings/network-proxy`, { headers: { authorization: `Bearer ${config.apiToken}` }, signal: AbortSignal.timeout(10_000) });
-  // 旧宿主交接期间尚不支持代理配置，保持旧宿主的网络行为。
-  if (response.status === 404) return;
-  if (!response.ok) throw new Error('无法读取当前生效的网络代理配置。');
-  /** 只接受与设置保存相同的合法配置。 */
-  const settings = normalizeNetworkProxySettings(await response.json());
-  applyNetworkProxyAtStartup(settings);
-  if (settings.mode === 'default') return;
-  /** 默认保留系统设置，直连与手动模式均显式覆盖所有 Zeus 会话。 */
-  const proxy = chromiumNetworkProxyConfig(settings);
-  await Promise.all([app.setProxy(proxy), session.defaultSession.setProxy(proxy), session.fromPartition(browserPartition).setProxy(proxy)]);
+  const response = await fetch(`${config.baseUrl}/api/settings/network-proxy/runtime`, { headers: { authorization: `Bearer ${config.apiToken}` }, signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error('无法读取当前网络运行地址。');
+  /** Main 重新校验内部端点，不把接口数据直接当成任意外部代理。 */
+  const runtime: { url?: unknown } = await response.json();
+  await applyDesktopNetworkProxy(runtime.url, session.fromPartition(browserPartition));
 }
 
 /** 单次读取完整设置，避免 Main 与 Renderer 在启动时重复查询。 */

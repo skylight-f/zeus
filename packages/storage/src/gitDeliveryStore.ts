@@ -1,15 +1,15 @@
 import { createHash } from 'node:crypto';
-import { userFacingErrorCause, type GitDeliveryAction, type GitDeliveryInput, type GitDeliveryRun, type GitDeliveryStep, type GitDeliveryNotification } from '@zeus/shared';
-import type { ZeusDatabasePort } from './databasePort.js';
+import { userFacingErrorCause, type GitDeliveryAction, type GitDeliveryInput, type GitDeliveryRun, type GitDeliveryStep, type GitDeliveryNotification, type GitDeliveryScope, type NotificationPosition } from '@zeus/shared';
+import type { SqlValue, ZeusDatabasePort } from './databasePort.js';
 import { CommandDeliveryRepository } from './commandDeliveryStore.js';
 
 /** 普通会话的隔离合入事实仅存于 Core，不暴露绝对目录。 */
 export interface GitDeliveryMergeResult {
   /** 独立合入目录。 */
   integrationPath: string;
-  /** 来源分支。 */
+  /** 待交付的当前分支，即 Git 合入的输入分支。 */
   sourceBranch: string;
-  /** 目标分支。 */
+  /** 用户指定的来源分支，即接收交付的合入目标。 */
   targetBranch: string;
   /** 原来源提交。 */
   sourceHeadSha: string;
@@ -85,13 +85,102 @@ export function migrateGitDelivery(db: ZeusDatabasePort): void {
   });
 }
 
+/** 为全局命令步骤扩展动作约束，事务内保留现有步骤身份、顺序及运行事实。 */
+export function migrateGitDeliveryCommands(db: ZeusDatabasePort): void {
+  /** 与旧交付表迁移分开登记，已有数据库只执行一次。 */
+  const migrationId = '20261104_git_delivery_commands';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    db.execute(`CREATE TABLE git_delivery_steps_with_commands (
+      id TEXT PRIMARY KEY, -- 稳定步骤身份
+      run_id TEXT NOT NULL REFERENCES git_delivery_runs(id) ON DELETE CASCADE, -- 所属交付
+      repository_id TEXT, -- 仓库身份，全局命令及任务状态为空
+      repository_name TEXT NOT NULL, -- 仓库名或命令标题快照
+      action TEXT NOT NULL CHECK(action IN ('commit','merge','push','command','task_status')), -- 步骤操作
+      command_definition_id TEXT, -- 接纳时的命令身份，删除定义后仍保留历史
+      state TEXT NOT NULL CHECK(state IN ('pending','running','waiting','attention','unknown','succeeded')), -- 步骤进度
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0), -- 手动重试次数
+      command_id TEXT, -- 最近执行命令的回执身份
+      message TEXT, -- 待处理原因
+      conversation_id TEXT, -- 冲突会话身份
+      integration_id TEXT, -- 任务合入身份
+      result_json TEXT, -- 已执行阶段的固定回执
+      CHECK((action IN ('task_status','command')) = (repository_id IS NULL)),
+      CHECK((action = 'command') = (command_definition_id IS NOT NULL))
+    )`);
+    db.execute(`INSERT INTO git_delivery_steps_with_commands(id,run_id,repository_id,repository_name,action,state,attempt,command_id,message,conversation_id,integration_id,result_json)
+      SELECT id,run_id,repository_id,repository_name,action,state,attempt,command_id,message,conversation_id,integration_id,result_json FROM git_delivery_steps ORDER BY rowid`);
+    db.execute('DROP TABLE git_delivery_steps');
+    db.execute('ALTER TABLE git_delivery_steps_with_commands RENAME TO git_delivery_steps');
+    db.execute('CREATE UNIQUE INDEX git_delivery_steps_repository ON git_delivery_steps(run_id, repository_id, action) WHERE repository_id IS NOT NULL');
+    db.execute("CREATE UNIQUE INDEX git_delivery_steps_status ON git_delivery_steps(run_id) WHERE action = 'task_status'");
+    db.execute("CREATE UNIQUE INDEX git_delivery_steps_command ON git_delivery_steps(run_id, command_definition_id) WHERE action = 'command'");
+    db.execute('INSERT INTO schema_migrations(migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [
+      migrationId,
+      '代码交付的推送后命令步骤',
+      createHash('sha256').update(migrationId).digest('hex'),
+      new Date().toISOString(),
+    ]);
+  });
+}
+
+/** 为会话归档步骤扩展动作约束，事务内保留现有步骤身份、顺序及运行事实。 */
+export function migrateGitDeliveryArchiving(db: ZeusDatabasePort): void {
+  /** 与旧交付表迁移分开登记，已有数据库只执行一次。 */
+  const migrationId = '20261104_git_delivery_archiving';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    db.execute(`CREATE TABLE git_delivery_steps_with_archive (
+      id TEXT PRIMARY KEY, -- 稳定步骤身份
+      run_id TEXT NOT NULL REFERENCES git_delivery_runs(id) ON DELETE CASCADE, -- 所属交付
+      repository_id TEXT, -- 仓库身份，全局命令及任务状态及归档为空
+      repository_name TEXT NOT NULL, -- 仓库名或命令标题快照
+      action TEXT NOT NULL CHECK(action IN ('commit','merge','push','command','task_status','conversation_archive')), -- 步骤操作
+      command_definition_id TEXT, -- 接纳时的命令身份，删除定义后仍保留历史
+      state TEXT NOT NULL CHECK(state IN ('pending','running','waiting','attention','unknown','succeeded')), -- 步骤进度
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0), -- 手动重试次数
+      command_id TEXT, -- 最近执行命令的回执身份
+      message TEXT, -- 待处理原因
+      conversation_id TEXT, -- 冲突会话身份
+      integration_id TEXT, -- 任务合入身份
+      result_json TEXT, -- 已执行阶段的固定回执
+      CHECK((action IN ('task_status','command','conversation_archive')) = (repository_id IS NULL)),
+      CHECK((action = 'command') = (command_definition_id IS NOT NULL))
+    )`);
+    db.execute(`INSERT INTO git_delivery_steps_with_archive(id,run_id,repository_id,repository_name,action,command_definition_id,state,attempt,command_id,message,conversation_id,integration_id,result_json)
+      SELECT id,run_id,repository_id,repository_name,action,command_definition_id,state,attempt,command_id,message,conversation_id,integration_id,result_json FROM git_delivery_steps ORDER BY rowid`);
+    db.execute('DROP TABLE git_delivery_steps');
+    db.execute('ALTER TABLE git_delivery_steps_with_archive RENAME TO git_delivery_steps');
+    db.execute('CREATE UNIQUE INDEX git_delivery_steps_repository ON git_delivery_steps(run_id, repository_id, action) WHERE repository_id IS NOT NULL');
+    db.execute("CREATE UNIQUE INDEX git_delivery_steps_status ON git_delivery_steps(run_id) WHERE action IN ('task_status','conversation_archive')");
+    db.execute("CREATE UNIQUE INDEX git_delivery_steps_command ON git_delivery_steps(run_id, command_definition_id) WHERE action = 'command'");
+    db.execute('INSERT INTO schema_migrations(migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [
+      migrationId,
+      '代码交付成功后的会话归档步骤',
+      createHash('sha256').update(migrationId).digest('hex'),
+      new Date().toISOString(),
+    ]);
+  });
+}
+
+/** 通知修订随状态原子递增，旧通知确认不能清除后续结果。 */
+export function migrateGitDeliveryNotificationRevision(db: ZeusDatabasePort): void {
+  /** 独立登记字段迁移，保留已有运行状态和已读事实。 */
+  const migrationId = '20261110_git_delivery_notification_revision';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    db.execute('ALTER TABLE git_delivery_runs ADD COLUMN notification_revision INTEGER NOT NULL DEFAULT 1 CHECK(notification_revision >= 1) /* 当前通知修订，历史运行从 1 开始 */');
+    db.execute('INSERT INTO schema_migrations(migration_id, description, checksum, applied_at) VALUES (?, ?, ?, ?)', [migrationId, '代码交付通知修订校验', createHash('sha256').update(migrationId).digest('hex'), new Date().toISOString()]);
+  });
+}
+
 /** 运行仓库不执行 Git，只通过已有耐久事务提交进度。 */
 export class GitDeliveryRepository {
   /** 共用应用数据库。 */
   constructor(private readonly db: ZeusDatabasePort) {}
 
   /** 接纳输入与全部步骤在同一事务保存。 */
-  create(id: string, projectId: string, input: GitDeliveryInput, names: Record<string, string>, initialTaskStatus: string | null): GitDeliveryRunRecord {
+  create(id: string, projectId: string, input: GitDeliveryInput, names: Record<string, string>, initialTaskStatus: string | null, taskId?: string | null): GitDeliveryRunRecord {
     /** 创建时间也作为初始进度时间。 */
     const now = new Date().toISOString();
     this.db.commitCriticalFactSync(() => {
@@ -106,24 +195,29 @@ export class GitDeliveryRepository {
         now,
         now,
       ]);
-      if (input.scope.kind === 'task')
+      if (taskId || input.scope.kind === 'task')
         this.db.execute("UPDATE git_delivery_runs SET initial_task_status_event_id=(SELECT id FROM task_events WHERE task_id=? AND event_type='task.management_status.changed' ORDER BY rowid DESC LIMIT 1) WHERE id=?", [
-          input.scope.taskId,
+          taskId ?? (input.scope.kind === 'task' ? input.scope.taskId : null),
           id,
         ]);
       for (const repository of input.repositories) {
         for (const action of ['commit', 'merge', 'push'] as const) if (input.settings[action]) this.addStep(id, repository.repositoryId, names[repository.repositoryId] ?? repository.repositoryId, action);
       }
+      for (const command of input.postPushCommands ?? []) this.addStep(id, null, names[command.commandId] ?? command.commandId, 'command', command.commandId);
       if (input.settings.finalTaskStatus) this.addStep(id, null, '任务状态', 'task_status');
+      if (input.settings.archiveConversation) this.addStep(id, null, '归档会话', 'conversation_archive');
     });
     return this.get(id)!;
   }
 
   /** 顺序由固定动作定义，身份不依赖数组排序。 */
-  private addStep(runId: string, repositoryId: string | null, name: string, action: GitDeliveryAction): void {
+  private addStep(runId: string, repositoryId: string | null, name: string, action: GitDeliveryAction, commandDefinitionId: string | null = null): void {
     /** 稳定哈希避免名称或路径进入命令身份。 */
-    const id = `delivery_step_${createHash('sha256').update(`${runId}\0${repositoryId}\0${action}`).digest('hex').slice(0, 32)}`;
-    this.db.execute('INSERT INTO git_delivery_steps(id, run_id, repository_id, repository_name, action, state) VALUES(?,?,?,?,?,?)', [id, runId, repositoryId, name, action, 'pending']);
+    const id = `delivery_step_${createHash('sha256')
+      .update(`${runId}\0${repositoryId}\0${action}${commandDefinitionId ? `\0${commandDefinitionId}` : ''}`)
+      .digest('hex')
+      .slice(0, 32)}`;
+    this.db.execute('INSERT INTO git_delivery_steps(id, run_id, repository_id, repository_name, action, command_definition_id, state) VALUES(?,?,?,?,?,?,?)', [id, runId, repositoryId, name, action, commandDefinitionId, 'pending']);
   }
 
   /** 读取同一运行的固定输入与实时进度。 */
@@ -142,13 +236,23 @@ export class GitDeliveryRepository {
   /** 列表仅查询指定的真实归属。 */
   list(projectId?: string, scopeId?: string): GitDeliveryRunRecord[] {
     return this.db
-      .select<{ id: string }>('SELECT id FROM git_delivery_runs WHERE (? IS NULL OR project_id = ?) AND (? IS NULL OR scope_id = ?) ORDER BY created_at DESC LIMIT 100', [
+      .select<{ id: string }>('SELECT id FROM git_delivery_runs WHERE (? IS NULL OR project_id = ?) AND (? IS NULL OR scope_id = ?) ORDER BY created_at DESC, rowid DESC LIMIT 100', [
         projectId ?? null,
         projectId ?? null,
         scopeId ?? null,
         scopeId ?? null,
       ])
       .map((row) => this.get(row.id)!);
+  }
+
+  /** 同毫秒接纳的运行按插入顺序确定最后一次，不回退到更早的未完成记录。 */
+  latest(projectId: string, scope: GitDeliveryRun['scope']): GitDeliveryRunRecord | null {
+    const row = this.db.select<{ id: string }>('SELECT id FROM git_delivery_runs WHERE project_id=? AND scope_kind=? AND scope_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1', [
+      projectId,
+      scope.kind,
+      scope.kind === 'task' ? scope.taskId : scope.conversationId,
+    ])[0];
+    return row ? (this.get(row.id) ?? null) : null;
   }
 
   /** 重启恢复不受历史列表数量限制。 */
@@ -160,7 +264,7 @@ export class GitDeliveryRepository {
   private steps(runId: string): GitDeliveryStepRecord[] {
     return this.db
       .select<Omit<GitDeliveryStepRecord, 'result'> & { resultJson: string | null }>(
-        `SELECT id, run_id AS runId, repository_id AS repositoryId, repository_name AS repositoryName, action, state, attempt, command_id AS commandId, message, conversation_id AS conversationId, integration_id AS integrationId, result_json AS resultJson FROM git_delivery_steps WHERE run_id = ? ORDER BY rowid`,
+        `SELECT id, run_id AS runId, repository_id AS repositoryId, repository_name AS repositoryName, action, command_definition_id AS commandDefinitionId, state, attempt, command_id AS commandId, message, conversation_id AS conversationId, integration_id AS integrationId, result_json AS resultJson FROM git_delivery_steps WHERE run_id = ? ORDER BY rowid`,
         [runId],
       )
       .map(({ resultJson, ...row }) => ({ ...row, result: resultJson ? JSON.parse(resultJson) : null }));
@@ -186,7 +290,9 @@ export class GitDeliveryRepository {
 
   /** 状态发生变化才更新通知时间，轮询不重复生成未读。 */
   updateState(id: string, state: GitDeliveryRun['state']): void {
-    this.db.commitCriticalFactSync(() => this.db.execute('UPDATE git_delivery_runs SET state=?, updated_at=?, read_at=NULL WHERE id=? AND state<>?', [state, new Date().toISOString(), id, state]));
+    this.db.commitCriticalFactSync(() =>
+      this.db.execute('UPDATE git_delivery_runs SET state=?, updated_at=?, read_at=NULL, notification_revision=notification_revision+1 WHERE id=? AND state<>?', [state, new Date().toISOString(), id, state]),
+    );
   }
 
   /** 对外投影排除命令恢复快照和工作目录。 */
@@ -197,13 +303,15 @@ export class GitDeliveryRepository {
       scope: run.scope,
       input: run.input,
       state: run.state,
+      stopped: run.steps.some((step) => step.result?.deliveryStopped === true),
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
-      steps: run.steps.map(({ id, repositoryId, repositoryName, action, state, message, conversationId, integrationId, result, commandId }) => ({
+      steps: run.steps.map(({ id, repositoryId, repositoryName, action, commandDefinitionId, state, message, conversationId, integrationId, result, commandId }) => ({
         id,
         repositoryId,
         repositoryName,
         action,
+        commandDefinitionId,
         state,
         message,
         error: state === 'attention' || state === 'unknown' ? this.commandError(commandId) : undefined,
@@ -224,17 +332,42 @@ export class GitDeliveryRepository {
     return evidence?.error ? userFacingErrorCause(evidence.error) : undefined;
   }
 
-  /** 交付通知与进度读取同一权威记录。 */
-  notifications(): GitDeliveryNotification[] {
-    return this.db.select<{ id: string }>("SELECT id FROM git_delivery_runs WHERE state IN ('succeeded','attention') AND read_at IS NULL ORDER BY updated_at DESC, id DESC").map(({ id }) => {
-      /** 通知不复制执行状态。 */
-      const run = this.get(id)!;
-      return { id, projectId: run.projectId, scope: run.scope, title: '代码交付', status: run.state as 'succeeded' | 'attention', occurredAt: run.updatedAt };
-    });
+  /** 摘要按全局边界限量读取，不加载运行输入或步骤；总数独立统计。 */
+  notifications(before?: NotificationPosition): { items: GitDeliveryNotification[]; unreadCount: number } {
+    /** 多读一条供统一列表判断下一页。 */
+    const unreadWhere = "state IN ('succeeded','attention') AND read_at IS NULL";
+    /** 时间相同时继续比较来源和身份，与统一列表排序一致。 */
+    const boundary = before ? " AND (updated_at < ? OR (updated_at = ? AND ('git_delivery' < ? OR ('git_delivery' = ? AND id < ?))))" : '';
+    /** 客户端游标仅通过绑定参数进入查询。 */
+    const params: SqlValue[] = before ? [before.occurredAt, before.occurredAt, before.source, before.source, before.id] : [];
+    /** 入口身份直接来自运行列，不解析完整授权输入。 */
+    const rows = this.db.select<
+      Omit<GitDeliveryNotification, 'scope' | 'title'> & {
+        /** 原任务或会话入口种类。 */
+        scopeKind: GitDeliveryScope['kind'];
+        /** 原任务或会话身份。 */
+        scopeId: string;
+      }
+    >(
+      `SELECT id, project_id AS projectId, scope_kind AS scopeKind, scope_id AS scopeId, state AS status, updated_at AS occurredAt, notification_revision AS revision FROM git_delivery_runs WHERE ${unreadWhere}${boundary} ORDER BY updated_at DESC, id DESC LIMIT 21`,
+      params,
+    );
+    return {
+      items: rows.map(({ scopeKind, scopeId, ...item }) => ({ ...item, title: '代码交付', scope: scopeKind === 'task' ? { kind: 'task', taskId: scopeId } : { kind: 'conversation', conversationId: scopeId } })),
+      unreadCount: this.db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM git_delivery_runs WHERE ${unreadWhere}`)!.count,
+    };
   }
 
-  /** 单条或全部已读都由通知命令事务调用。 */
-  acknowledge(id?: string): void {
-    this.db.execute("UPDATE git_delivery_runs SET read_at=? WHERE state IN ('succeeded','attention') AND read_at IS NULL AND (? IS NULL OR id=?)", [new Date().toISOString(), id ?? null, id ?? null]);
+  /** 单条仅确认用户看到的修订；全部确认由通知命令事务覆盖当前未读。 */
+  acknowledge(target?: { id: string; expectedRevision: number }): { acknowledged: boolean } {
+    if (target) {
+      /** 查询和更新均位于调用方的耐久事务中，过期修订保持未读。 */
+      const current = this.db.get<{ revision: number }>("SELECT notification_revision AS revision FROM git_delivery_runs WHERE id=? AND state IN ('succeeded','attention')", [target.id]);
+      if (current?.revision !== target.expectedRevision) return { acknowledged: false };
+      this.db.execute('UPDATE git_delivery_runs SET read_at=COALESCE(read_at, ?) WHERE id=? AND notification_revision=?', [new Date().toISOString(), target.id, target.expectedRevision]);
+    } else {
+      this.db.execute("UPDATE git_delivery_runs SET read_at=? WHERE state IN ('succeeded','attention') AND read_at IS NULL", [new Date().toISOString()]);
+    }
+    return { acknowledged: true };
   }
 }

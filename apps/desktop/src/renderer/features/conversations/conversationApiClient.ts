@@ -56,6 +56,12 @@ export interface ConversationApiClient {
   saveConversationSystemMessage(projectId: string, conversationId: string, input: ConversationSystemMessageInput): Promise<ConversationSystemMessage>;
   /** 自动建议只提交轮次身份；主动润色才传草稿，模型和历史由服务端读取。 */
   generateInputSuggestion: (input: import('@zeus/shared').InputSuggestionRequest, signal: AbortSignal, diagnosticId?: string) => Promise<import('@zeus/shared').InputSuggestionResult>;
+  /** 只读取 Core 的持久自动建议，断开此请求不会取消生成。 */
+  loadAutomaticInputSuggestion: (projectId: string, conversationId: string, signal: AbortSignal) => Promise<{ suggestion: import('@zeus/shared').AutomaticInputSuggestionState | null }>;
+  /** 当前会话或配置恢复时幂等登记任务，持续读取状态本身不产生用量。 */
+  ensureAutomaticInputSuggestion: (projectId: string, conversationId: string, signal: AbortSignal) => Promise<{ ok: boolean }>;
+  /** 明确取消绑定原轮次，旧窗口不能取消新回复的建议。 */
+  dismissAutomaticInputSuggestion: (projectId: string, conversationId: string, completedTurnId: string, signal: AbortSignal) => Promise<{ ok: boolean }>;
   /** 读取全部用户发言目录，不拉取正文。 */
   loadConversationNavigation: (projectId: string, conversationId: string) => Promise<ConversationNavigationSnapshot>;
   /** 读取旧会话正文，保留已有历史查看行为。 */
@@ -119,7 +125,7 @@ export interface ConversationApiClient {
   loadNativeSubagents: (projectId: string, conversationId: string) => Promise<NativeSubagentListSnapshot>;
   loadNativeSubagentThread: (projectId: string, conversationId: string, threadId: string) => Promise<NativeSubagentThreadSnapshot>;
   loadNativeConversationChoice: (projectId: string, conversationId: string) => Promise<NativeConversationChoice>;
-  archiveNativeConversation: (projectId: string, conversationId: string) => Promise<ConversationHistoryItem>;
+  archiveNativeConversation: (projectId: string, conversationId: string, options?: { confirmWorktreeCleanup?: boolean }) => Promise<ConversationHistoryItem>;
   restoreConversationArchive: (projectId: string, conversationId: string) => Promise<ConversationHistoryItem>;
   loadConversationResourcePreview: (projectId: string, conversationId: string, resourceId: string) => Promise<ConversationResourcePreview>;
   loadTurnChangeFilePreview: (projectId: string, conversationId: string, turnId: string, changeSetId: string, fileId: string) => Promise<ConversationResourcePreview>;
@@ -174,6 +180,9 @@ export interface ConversationApiClient {
 export function createConversationApiClient(transport: LocalApiTransport): ConversationApiClient {
   return {
     generateInputSuggestion: (input, signal, diagnosticId) => transport.request('/api/input-suggestions/generate', { ...jsonRequest('POST', input), signal, traceId: diagnosticId }),
+    loadAutomaticInputSuggestion: (projectId, conversationId, signal) => transport.request(`/api/input-suggestions/automatic?${new URLSearchParams({ projectId, conversationId })}`, { signal }),
+    ensureAutomaticInputSuggestion: (projectId, conversationId, signal) => transport.request('/api/input-suggestions/automatic/ensure', { ...jsonRequest('POST', { projectId, conversationId }), signal }),
+    dismissAutomaticInputSuggestion: (projectId, conversationId, completedTurnId, signal) => transport.request('/api/input-suggestions/automatic/dismiss', { ...jsonRequest('POST', { projectId, conversationId, completedTurnId }), signal }),
     loadLegacyConversation: (projectId, conversationId) => transport.request<ConversationHistoryItem>(`/api/projects/${projectId}/conversations/${conversationId}`),
     sendConversationMessage: (projectId, conversationId, content) =>
       transport.request<SendConversationMessageResult>(`/api/projects/${projectId}/conversations/${conversationId}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
@@ -263,8 +272,8 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
     loadNativeSubagents: (projectId, conversationId) => transport.request<NativeSubagentListSnapshot>(`${conversationPath(projectId, conversationId)}/subagents`),
     loadNativeSubagentThread: (projectId, conversationId, threadId) => transport.request<NativeSubagentThreadSnapshot>(`${conversationPath(projectId, conversationId)}/subagents/${encodeURIComponent(threadId)}`),
     loadNativeConversationChoice: (projectId, conversationId) => transport.request(`${conversationPath(projectId, conversationId)}/choice`),
-    archiveNativeConversation: async (projectId, conversationId) => {
-      const body = await buildConversationCommandRequest({ commandType: conversationClientCommandTypes.archive, conversationId, value: {} });
+    archiveNativeConversation: async (projectId, conversationId, options) => {
+      const body = await buildConversationCommandRequest({ commandType: conversationClientCommandTypes.archive, conversationId, value: options?.confirmWorktreeCleanup === true ? { confirmWorktreeCleanup: true } : {} });
       return transport.request<ConversationHistoryItem>(`${conversationPath(projectId, conversationId)}/archive`, jsonRequest('POST', body));
     },
     restoreConversationArchive: async (projectId, conversationId) => {
@@ -345,7 +354,7 @@ export function createConversationApiClient(transport: LocalApiTransport): Conve
         reconnectIdentity: input.idempotencyKey,
         value,
       });
-      return transport.request<NativeOperationAcceptance>(`${conversationPath(projectId, conversationId)}/messages`, jsonRequest('POST', body));
+      return transport.request<NativeOperationAcceptance>(`${conversationPath(projectId, conversationId)}/messages`, { ...jsonRequest('POST', body), waitForLateReceipt: true });
     },
     forgetNativeMessageCommand: (_projectId, conversationId, idempotencyKey) =>
       forgetConversationDispatchCommandRequest({

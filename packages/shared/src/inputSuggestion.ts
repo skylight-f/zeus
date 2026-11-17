@@ -36,17 +36,17 @@ export interface InputSuggestionModelOption {
 
 /** 自动建议与用户主动润色共用一次有界生成，不提交对话消息。 */
 export interface InputSuggestionRequest {
-  /** 空白输入预测下一句，有草稿时只润色用户表达。 */
-  mode: 'suggest' | 'polish';
-  /** 用户点击可以再次请求；自动触发仍受每轮一次约束。 */
-  trigger: 'automatic' | 'manual';
+  /** 空白输入预测下一句；草稿可主动润色，或在停顿后续写末尾。 */
+  mode: 'suggest' | 'polish' | 'complete';
+  /** 主动请求、完成轮次预测与输入停顿补全分别确定触发时机。 */
+  trigger: 'automatic' | 'manual' | 'typing';
   /** 已建立会话时必须同时传入所属项目和会话。 */
   projectId?: string;
   /** 新会话润色无需先创建会话。 */
   conversationId?: string;
-  /** 自动请求必须绑定刚完成的轮次；主动请求由服务端读取最新状态。 */
+  /** 完成轮次预测必须绑定刚完成的轮次；润色与补全由服务端读取最新状态。 */
   completedTurnId?: string;
-  /** 只有用户主动点击才发送尚未提交的草稿。 */
+  /** 润色及已启用的输入补全携带当前未提交草稿。 */
   draft?: string;
   /** 仅新草稿跟随模型时提供输入框选择；已有会话由服务端读取权威模型。 */
   draftModelRef?: string;
@@ -60,14 +60,74 @@ export interface InputSuggestionResult {
   completedTurnId: string | null;
   /** 实际解析的建议模型；未生成时允许为空。 */
   modelRef: string | null;
-  /** 原生采样已发出后禁止自动补调；缺项保留独立生成原有的临时故障恢复。 */
-  retryable?: false;
+  /** 明确可恢复的材料或输出失败允许重试；false 禁止重试，缺项按临时故障判断。 */
+  retryable?: boolean;
   /** 空值表示无需改写、未生成或生成失败，不属于输入正文。 */
   text: string | null;
   /** 无正文时明确区分未生成、无需改写和故障。 */
   reason: 'disabled' | 'context_unavailable' | 'model_unavailable' | 'effort_unavailable' | 'service_tier_unavailable' | 'no_change' | 'timed_out' | 'failed' | 'cancelled' | null;
   /** 失败时保留有界、脱敏的原因，复用应用统一错误详情入口。 */
   cause?: UserFacingErrorCause;
+}
+
+/** Core 保存的自动建议状态，窗口重建后按所属会话重新读取。 */
+export interface AutomaticInputSuggestionState extends InputSuggestionResult {
+  /** 建议模型、推理深度和速度共同确定的配置身份。 */
+  modelKey: string;
+  /** 待生成、生成中、有结果、需修正配置或明确取消。 */
+  state: 'pending' | 'running' | 'ready' | 'blocked' | 'cancelled';
+  /** 已领取的生成尝试次数，离线等待不计入。 */
+  attemptCount: number;
+  /** 下一次允许生成的 UTC 时刻，已结束时为空。 */
+  nextAttemptAt: string | null;
+  /** 宿主报告离线时保留待办并暂停模型请求。 */
+  waitingForNetwork: boolean;
+}
+
+/** 自动建议和手动输入共用配置身份，不包含未提交草稿或秘密。 */
+export function inputSuggestionModelKey(settings: InputSuggestionSettings | undefined): string {
+  return JSON.stringify([settings?.followConversationModel ? 'conversation' : (settings?.modelRef ?? null), settings?.effort ?? null, settings?.serviceTier ?? null]);
+}
+
+/** 只有明确的临时故障允许自动恢复，配置、权限和鉴权错误保留具体原因。 */
+const transientInputSuggestionErrors = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'ZEUS_EXECUTION_HOST_DRAINING',
+  'ZEUS_CODEX_RPC_TIMEOUT',
+  'ZEUS_CODEX_MODEL_AT_CAPACITY',
+  'serverOverloaded',
+  'ZEUS_MODEL_HTTP_408',
+  'ZEUS_MODEL_HTTP_429',
+  'ZEUS_MODEL_HTTP_500',
+  'ZEUS_MODEL_HTTP_502',
+  'ZEUS_MODEL_HTTP_503',
+  'ZEUS_MODEL_HTTP_504',
+  'ZEUS_MODEL_CATALOG_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECT_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECTION_RESET',
+  'ZEUS_MODEL_CATALOG_NETWORK_FAILED',
+  'ZEUS_MODEL_TEXT_INCOMPLETE',
+]);
+
+/** 自动建议持续退避，最长间隔三十秒；手动操作仍最多重试两次。 */
+export function inputSuggestionRetryDelay(result: Pick<InputSuggestionResult, 'reason' | 'cause' | 'retryable'>, retries: number, trigger: InputSuggestionRequest['trigger'] = 'manual'): number | null {
+  if (result.retryable === false || (trigger !== 'automatic' && retries >= 2)) return null;
+  if (result.retryable !== true) {
+    if (result.reason !== 'timed_out' && result.reason !== 'failed') return null;
+    for (let cause = result.cause; cause; cause = cause.cause) {
+      if (cause.code && !transientInputSuggestionErrors.has(cause.code)) return null;
+    }
+  }
+  return retries === 0 ? 2_000 : Math.min(5_000 * 2 ** Math.min(retries - 1, 3), 30_000);
 }
 
 /** 界面仅报告状态和长度，不通过诊断通路发送草稿或建议正文。 */
@@ -97,7 +157,7 @@ export function normalizeInputSuggestionUiDiagnostic(value: unknown): InputSugge
   const requestId = normalizePerformanceTraceIdentity(record.requestId);
   if (!requestId) return null;
   if (!['ui_started', 'ui_received', 'ui_result_stored', 'ui_discarded', 'ui_failed', 'ui_cancelled'].includes(String(record.event))) return null;
-  if (!['suggest', 'polish'].includes(String(record.mode)) || !['manual', 'automatic'].includes(String(record.trigger))) return null;
+  if (!['suggest', 'polish', 'complete'].includes(String(record.mode)) || !['manual', 'automatic', 'typing'].includes(String(record.trigger))) return null;
   if (typeof record.elapsedMs !== 'number' || !Number.isFinite(record.elapsedMs) || record.elapsedMs < 0) return null;
   return {
     requestId,

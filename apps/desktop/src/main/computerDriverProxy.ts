@@ -11,16 +11,18 @@ import { runWindowsRuntimeHelper, type WindowsRuntimeIdentity } from '@zeus/ai-r
 export type ComputerControlEvent = {
   /** 原生 worker 的真实进程身份，由宿主再次核对。 */
   workerPid: number;
-  /** 实际停止共享或被用户接管的应用身份。 */
+  /** 实际停止共享或发生捕获故障的应用身份。 */
   pid: number;
   /** 仅允许原生输入闸门已处理的暂停原因。 */
-  reason: 'ZEUS_COMPUTER_USER_CONTROL' | 'ZEUS_COMPUTER_SHARING_STOPPED';
+  reason: 'ZEUS_COMPUTER_SHARING_STOPPED' | 'ZEUS_COMPUTER_PERMISSION_REQUIRED' | 'ZEUS_COMPUTER_CAPTURE_UNAVAILABLE';
+  /** 原生错误诊断，长度受限且不携带截图或输入。 */
+  detail?: string;
   /** 只统计其他应用键盘事件，用于实机验收；不包含键盘内容。 */
   otherKeyboardEvents: number;
 };
 
 /** 只转发宿主实际使用的官方 SDK 方法，禁止开放任意原生调用。 */
-export type ComputerDriver = Pick<CuaDriverLike, 'callTool' | 'metadata' | 'startSession' | 'endSession' | 'listApps' | 'listWindows' | 'getAgentCursorState' | 'shutdown' | 'isAvailable'> & {
+export type ComputerDriver = Pick<CuaDriverLike, 'callTool' | 'metadata' | 'listToolsJson' | 'setAgentCursorEnabled' | 'startSession' | 'endSession' | 'listApps' | 'listWindows' | 'getAgentCursorState' | 'shutdown' | 'isAvailable'> & {
   /** SDK 所在后台进程，用于核对原生 worker 父进程。 */
   readonly workerParentPid?: number;
   /** 停止后释放本任务后台进程。 */
@@ -109,11 +111,19 @@ export class ComputerDriverProxy implements ComputerDriver {
         const event: unknown = JSON.parse(line.slice('_ZEUS_COMPUTER_EVENT_ '.length));
         if (!event || typeof event !== 'object') continue;
         /** 白名单投影后再交给宿主，不能附带其他控制字段。 */
-        const { workerPid, pid, reason, token, otherKeyboardEvents } = event as Record<string, unknown>;
+        const { workerPid, pid, reason, detail, token, otherKeyboardEvents } = event as Record<string, unknown>;
         if (!this.eventToken || typeof token !== 'string' || !/^[a-f0-9]{64}$/u.test(token) || !timingSafeEqual(this.eventToken, Buffer.from(token, 'hex'))) continue;
-        if (!Number.isSafeInteger(workerPid) || (workerPid as number) <= 0 || !Number.isSafeInteger(pid) || (pid as number) <= 0 || (reason !== 'ZEUS_COMPUTER_USER_CONTROL' && reason !== 'ZEUS_COMPUTER_SHARING_STOPPED')) continue;
+        if (
+          !Number.isSafeInteger(workerPid) ||
+          (workerPid as number) <= 0 ||
+          !Number.isSafeInteger(pid) ||
+          (pid as number) <= 0 ||
+          (reason !== 'ZEUS_COMPUTER_SHARING_STOPPED' && reason !== 'ZEUS_COMPUTER_PERMISSION_REQUIRED' && reason !== 'ZEUS_COMPUTER_CAPTURE_UNAVAILABLE')
+        )
+          continue;
+        if (detail !== undefined && typeof detail !== 'string') continue;
         if (!Number.isSafeInteger(otherKeyboardEvents) || (otherKeyboardEvents as number) < 0) continue;
-        this.latestControlEvent = { workerPid: workerPid as number, pid: pid as number, reason, otherKeyboardEvents: otherKeyboardEvents as number };
+        this.latestControlEvent = { workerPid: workerPid as number, pid: pid as number, reason, detail: detail?.slice(0, 1000), otherKeyboardEvents: otherKeyboardEvents as number };
         this.onControlEvent?.(this.latestControlEvent);
       } catch {
         /* 非本协议日志或不完整 JSON 不产生产品状态。 */
@@ -143,6 +153,14 @@ export class ComputerDriverProxy implements ComputerDriver {
   /** 获取原生 worker 实际身份。 */
   metadata(...args: Parameters<CuaDriverLike['metadata']>): ReturnType<CuaDriverLike['metadata']> {
     return this.request('metadata', [], args[0]?.signal) as ReturnType<CuaDriverLike['metadata']>;
+  }
+  /** 能力目录直接来自当前加载的 CUA，避免维护另一份页面 API。 */
+  listToolsJson(...args: Parameters<CuaDriverLike['listToolsJson']>): ReturnType<CuaDriverLike['listToolsJson']> {
+    return this.request('listToolsJson', [], args[0]?.signal) as ReturnType<CuaDriverLike['listToolsJson']>;
+  }
+  /** 光标显隐使用 CUA 的会话开关，不影响后台页面操作。 */
+  setAgentCursorEnabled(...args: Parameters<CuaDriverLike['setAgentCursorEnabled']>): ReturnType<CuaDriverLike['setAgentCursorEnabled']> {
+    return this.request('setAgentCursorEnabled', args.slice(0, 1), args[1]?.signal) as ReturnType<CuaDriverLike['setAgentCursorEnabled']>;
   }
   /** 创建官方命名会话。 */
   startSession(...args: Parameters<CuaDriverLike['startSession']>): ReturnType<CuaDriverLike['startSession']> {

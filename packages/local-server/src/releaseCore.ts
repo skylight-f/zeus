@@ -1,8 +1,63 @@
 import { createDistributionContext, upstreamDistribution, type DistributionConfig } from '@zeus/shared';
 import { describeUserFacingError, userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
+import * as http from 'node:http';
+import * as https from 'node:https';
+import { Readable } from 'node:stream';
+import { networkProxyEnvironment } from '@zeus/shared';
+
+/** 独立 Core 的更新请求显式直连，不继承全局模型代理或进程代理环境。 */
+function requestDirectReleaseManifest(address: string, init: RequestInit): Promise<Response> {
+  /** 生产清单为 HTTPS，隔离验收保留本机 HTTP 来源。 */
+  const transport = address.startsWith('https:') ? https : http;
+  /** 单次请求独立持有 Agent，响应关闭或失败时同步释放。 */
+  const agent = new transport.Agent({ keepAlive: false, proxyEnv: networkProxyEnvironment({ mode: 'direct', url: '', bypass: '' }) });
+  return new Promise((resolveResponse, rejectResponse) => {
+    /** 共享清单读取器负责超时及逐跳来源检查，原生请求不自动跳转。 */
+    const pending = transport.request(address, { method: 'GET', agent, headers: Object.fromEntries(new Headers(init.headers)), signal: init.signal ?? undefined }, (incoming) => {
+      incoming.once('close', () => agent.destroy());
+      /** 保留重定向位置与正文类型，重复响应头按原始顺序传递。 */
+      const headers = new Headers();
+      for (let index = 0; index < incoming.rawHeaders.length; index += 2) headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
+      /** HTTP 无正文状态不能传入空流，避免把远端状态误报为解析失败。 */
+      const noBody = [204, 205, 304].includes(incoming.statusCode ?? 0);
+      resolveResponse(new Response(noBody ? null : (Readable.toWeb(incoming) as ReadableStream), { status: incoming.statusCode, headers }));
+      if (noBody) incoming.destroy();
+    });
+    pending.once('error', (error) => {
+      agent.destroy();
+      rejectResponse(error);
+    });
+    pending.end();
+  });
+}
 
 /** Local Server 的发布清单与更新判定规则。 */
 export const currentExecutionHostProtocolVersion = 2;
+
+/** 官方 CDN 中的 Zeus 发布目录，安装包和更新清单共用这一来源。 */
+export const releaseDownloadBaseUrl = 'https://zeus-download.hyphatech.cn/zeus';
+
+/** 两个平台共用 CDN 优先、GitHub 备用的固定清单地址。 */
+export function releaseUpdateManifestUrls(platform: ReleaseUpdatePlatform, distribution: DistributionConfig = upstreamDistribution): string[] {
+  const fileName = platform === 'win32' ? 'zeus-release-manifest-win32.json' : 'zeus-release-manifest.json';
+  const github = `https://github.com/${distribution.repository}/releases/latest/download/${fileName}`;
+  return distribution.repository === upstreamDistribution.repository ? [`${releaseDownloadBaseUrl}/updates/${fileName}`, github] : [github];
+}
+
+/** 备用下载必须保持版本和文件身份一致，不从远端清单接收任意镜像地址。 */
+export function releaseArtifactDownloadUrls(version: string, fileName: string, distribution: DistributionConfig = upstreamDistribution): string[] {
+  if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/u.test(version) || version.length > 128 || !/^[\w.+-]+\.(?:dmg|exe)$/u.test(fileName) || fileName.length > 256) throw new Error('更新安装包版本或文件名无效。');
+  const github = `https://github.com/${distribution.repository}/releases/download/${distribution.releaseTagPrefix}${encodeURIComponent(version)}/${encodeURIComponent(fileName)}`;
+  return distribution.repository === upstreamDistribution.repository ? [`${releaseDownloadBaseUrl}/releases/${encodeURIComponent(version)}/${encodeURIComponent(fileName)}`, github] : [github];
+}
+
+/** 每一次网络重定向都限定在官方 CDN、仓库或 GitHub 资产服务内。 */
+export function isTrustedReleaseResponseUrl(url: URL, distribution: DistributionConfig = upstreamDistribution): boolean {
+  if (url.protocol !== 'https:' || url.port || url.username || url.password) return false;
+  if (distribution.repository === upstreamDistribution.repository && url.hostname === 'zeus-download.hyphatech.cn') return url.pathname.startsWith('/zeus/updates/') || url.pathname.startsWith('/zeus/releases/');
+  if (url.hostname === 'github.com') return url.pathname.startsWith(`/${distribution.repository}/releases/`);
+  return ['objects.githubusercontent.com', 'release-assets.githubusercontent.com'].includes(url.hostname);
+}
 
 export interface ReleaseReadinessInput {
   hasAppleCertificate: boolean;
@@ -241,7 +296,9 @@ export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopb
     throw new Error('Release update manifest fields are invalid.');
   }
   const repository = normalizeRepository(value.repository);
-  const artifacts = value.artifacts.map((candidate) => parseReleaseArtifact(candidate, repository, Boolean(options.allowLoopbackDownloadUrls), platform));
+  /** 安装包地址必须绑定清单版本，不能将另一个版本作为备用文件。 */
+  const version = normalizeVersion(value.version);
+  const artifacts = value.artifacts.map((candidate) => parseReleaseArtifact(candidate, version, Boolean(options.allowLoopbackDownloadUrls), platform, zeusDistribution));
   /** Homebrew 只属于 macOS，不能成为 Windows 清单的必填凭据。 */
   const homebrew = isRecord(value.homebrew) ? value.homebrew : null;
   const homebrewTap = typeof homebrew?.tap === 'string' ? normalizeRepository(homebrew.tap) : '';
@@ -263,7 +320,7 @@ export function parseReleaseUpdateManifest(value: unknown, options: { allowLoopb
     distributionId: zeusDistribution.id,
     platform,
     schemaVersion: 1,
-    version: normalizeVersion(value.version),
+    version,
     channel: value.channel,
     repository,
     releasePageUrl: value.releasePageUrl,
@@ -324,7 +381,7 @@ function parseSemverParts(version: string): number[] {
     .map((part) => (Number.isFinite(part) ? part : 0));
 }
 
-function parseReleaseArtifact(value: unknown, repository: string, allowLoopbackDownloadUrls: boolean, platform: ReleaseUpdatePlatform): ReleaseUpdateArtifact {
+function parseReleaseArtifact(value: unknown, version: string, allowLoopbackDownloadUrls: boolean, platform: ReleaseUpdatePlatform, distribution: DistributionConfig): ReleaseUpdateArtifact {
   if (
     !isRecord(value) ||
     (value.arch !== 'arm64' && value.arch !== 'x64') ||
@@ -337,7 +394,7 @@ function parseReleaseArtifact(value: unknown, repository: string, allowLoopbackD
     !/^[a-f0-9]{64}$/u.test(value.sha256) ||
     (value.sizeBytes !== null && (typeof value.sizeBytes !== 'number' || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes <= 0)) ||
     typeof value.downloadUrl !== 'string' ||
-    (!isTrustedGithubReleaseDownload(value.downloadUrl, repository) && !(allowLoopbackDownloadUrls && isLoopbackHttpUrl(value.downloadUrl)))
+    (!(allowLoopbackDownloadUrls && isLoopbackHttpUrl(value.downloadUrl)) && !releaseArtifactDownloadUrls(version, value.fileName.trim(), distribution).includes(value.downloadUrl))
   ) {
     throw new Error('Release update artifact is invalid.');
   }
@@ -370,26 +427,17 @@ function isTrustedGithubUrl(value: string, repository: string): boolean {
   }
 }
 
-function isTrustedGithubReleaseDownload(value: string, repository: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && url.hostname === 'github.com' && url.pathname.startsWith(`/${repository}/releases/download/`);
-  } catch {
-    return false;
-  }
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** 更新清单只信任 Zeus 官方下载目录；隔离验收可显式使用本机服务。 */
-export function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean, distribution?: DistributionConfig): string {
-  const { zeusReleaseManifestUrl, isZeusReleaseUrl } = createDistributionContext(distribution);
-  const fallback = process.platform === 'win32' ? zeusReleaseManifestUrl.replace('zeus-release-manifest.json', 'zeus-release-manifest-win32.json') : zeusReleaseManifestUrl;
+export function resolveReleaseUpdateManifestUrl(configured: string | undefined, allowUntrustedTest: boolean, distribution?: DistributionConfig, platform: ReleaseUpdatePlatform = process.platform === 'win32' ? 'win32' : 'darwin'): string {
+  const { isZeusReleaseUrl } = createDistributionContext(distribution);
+  const fallback = releaseUpdateManifestUrls(platform, distribution)[0]!;
   const candidate = configured?.trim() || fallback;
   const url = new URL(candidate);
-  if (isZeusReleaseUrl(candidate)) return url.toString();
+  if (isZeusReleaseUrl(candidate) || candidate === releaseUpdateManifestUrls(platform, distribution)[0]) return url.toString();
   if (allowUntrustedTest && url.protocol === 'http:' && url.hostname === '127.0.0.1' && Boolean(url.port)) return url.toString();
   throw new Error('Zeus release update manifest URL is not trusted.');
 }
@@ -400,7 +448,7 @@ export interface ReadReleaseUpdateStatusOptions extends Omit<EvaluateReleaseUpda
   distribution?: DistributionConfig;
   /** 缺省读取当前平台的官方稳定清单。 */
   manifestUrl?: string;
-  /** Electron 使用系统网络，独立 Core 使用 Node 网络。 */
+  /** 桌面可注入独立会话，缺省的 Core 请求也显式直连。 */
   request?: (url: string, init: RequestInit) => Promise<Response>;
   /** 仅显式隔离验收允许本机清单与下载地址。 */
   allowUntrustedTest?: boolean;
@@ -412,9 +460,16 @@ export async function readReleaseUpdateStatus(input: ReadReleaseUpdateStatusOpti
   const checkedAt = input.checkedAt ?? new Date().toISOString();
   try {
     /** 清单地址先通过官方来源限制，再交给平台网络请求。 */
-    const manifestUrl = resolveReleaseUpdateManifestUrl(input.manifestUrl, Boolean(input.allowUntrustedTest), input.distribution);
+    const manifestUrl = resolveReleaseUpdateManifestUrl(input.manifestUrl, Boolean(input.allowUntrustedTest), input.distribution, input.platform);
     /** 重试和格式校验在共享读取函数内完成。 */
-    const manifest = await loadReleaseUpdateManifest(manifestUrl, input.request ?? fetch, Boolean(input.allowUntrustedTest), input.distribution);
+    const sources = releaseUpdateManifestUrls(input.platform ?? (process.platform === 'win32' ? 'win32' : 'darwin'), input.distribution);
+    let manifest: ReleaseUpdateManifest;
+    try {
+      manifest = await loadReleaseUpdateManifest(manifestUrl, input.request ?? requestDirectReleaseManifest, Boolean(input.allowUntrustedTest), input.distribution);
+    } catch (error) {
+      if (manifestUrl !== sources[0] || !sources[1] || !isManifestTransportFailure(error)) throw error;
+      manifest = await loadReleaseUpdateManifest(sources[1], input.request ?? requestDirectReleaseManifest, Boolean(input.allowUntrustedTest), input.distribution);
+    }
     return evaluateReleaseUpdateAvailability({ ...input, manifest, checkedAt });
   } catch (error) {
     return {
@@ -437,34 +492,57 @@ export async function readReleaseUpdateStatus(input: ReadReleaseUpdateStatusOpti
 
 /** 清单只读请求最多两次，每次含响应正文限时十秒，总预算小于调用方三十秒。 */
 async function loadReleaseUpdateManifest(releaseUpdateManifestUrl: string, request: NonNullable<ReadReleaseUpdateStatusOptions['request']>, allowUntrustedTest: boolean, distribution?: DistributionConfig): Promise<ReleaseUpdateManifest> {
+  const attempts = releaseUpdateManifestUrl.startsWith(`${releaseDownloadBaseUrl}/`) ? 1 : 2;
   for (let attempt = 0; ; attempt += 1) {
     try {
       /** 超时同时约束连接、重定向与正文读取。 */
-      const signal = AbortSignal.timeout(10_000);
+      const signal = AbortSignal.timeout(releaseUpdateManifestUrl.startsWith(`${releaseDownloadBaseUrl}/`) ? 5_000 : 10_000);
       /** 网络错误与清单校验错误分开标记，不能把格式错误当作断网重试。 */
-      const response = await request(releaseUpdateManifestUrl, { headers: { accept: 'application/json' }, signal }).catch((cause: unknown) => {
-        throw Object.assign(new Error('无法连接 GitHub 更新服务。', { cause }), { code: signal.aborted ? 'ZEUS_RELEASE_MANIFEST_TIMEOUT' : 'ZEUS_RELEASE_MANIFEST_NETWORK' });
-      });
+      const response = await requestReleaseManifest(releaseUpdateManifestUrl, request, signal, allowUntrustedTest, distribution);
       if (!response.ok) {
         await response.body?.cancel();
-        throw Object.assign(new Error(`GitHub 更新服务返回 HTTP ${response.status}。`), {
+        throw Object.assign(new Error(`更新服务返回 HTTP ${response.status}。`), {
           code: response.status === 408 || response.status === 429 || response.status >= 500 ? 'ZEUS_RELEASE_MANIFEST_HTTP_TRANSIENT' : 'ZEUS_RELEASE_MANIFEST_HTTP_REJECTED',
         });
       }
       /** 正文传输中断可重试；已收到的无效 JSON 或清单不重试。 */
       const body = await response.text().catch((cause: unknown) => {
-        throw Object.assign(new Error('未能完整读取 GitHub 更新清单。', { cause }), { code: signal.aborted ? 'ZEUS_RELEASE_MANIFEST_TIMEOUT' : 'ZEUS_RELEASE_MANIFEST_NETWORK' });
+        throw Object.assign(new Error('未能完整读取更新清单。', { cause }), { code: signal.aborted ? 'ZEUS_RELEASE_MANIFEST_TIMEOUT' : 'ZEUS_RELEASE_MANIFEST_NETWORK' });
       });
       try {
         return parseReleaseUpdateManifest(JSON.parse(body), { allowLoopbackDownloadUrls: allowUntrustedTest, distribution });
       } catch (cause) {
-        throw Object.assign(new Error('GitHub 更新清单校验失败。', { cause }), { code: 'ZEUS_RELEASE_MANIFEST_INVALID' });
+        throw Object.assign(new Error('更新清单校验失败。', { cause }), { code: 'ZEUS_RELEASE_MANIFEST_INVALID' });
       }
     } catch (error) {
       /** 只重试传输中断、限流或服务暂时故障，不重试明确的拒绝与内容错误。 */
       const failure = userFacingErrorCause(error);
-      if (attempt >= 1 || !['ZEUS_RELEASE_MANIFEST_NETWORK', 'ZEUS_RELEASE_MANIFEST_TIMEOUT', 'ZEUS_RELEASE_MANIFEST_HTTP_TRANSIENT'].includes(failure.code ?? '')) throw error;
+      if (attempt + 1 >= attempts || !['ZEUS_RELEASE_MANIFEST_NETWORK', 'ZEUS_RELEASE_MANIFEST_TIMEOUT', 'ZEUS_RELEASE_MANIFEST_HTTP_TRANSIENT'].includes(failure.code ?? '')) throw error;
       await new Promise<void>((resolveRetry) => setTimeout(resolveRetry, 400));
     }
   }
+}
+
+/** 清单损坏和跨域跳转属于校验错误，不属于可以使用备用源的网络故障。 */
+function isManifestTransportFailure(error: unknown): boolean {
+  return ['ZEUS_RELEASE_MANIFEST_NETWORK', 'ZEUS_RELEASE_MANIFEST_TIMEOUT', 'ZEUS_RELEASE_MANIFEST_HTTP_TRANSIENT', 'ZEUS_RELEASE_MANIFEST_HTTP_REJECTED'].includes(userFacingErrorCause(error).code ?? '');
+}
+
+/** 手动处理最多五次重定向，避免运行环境隐藏最终 URL 后失去来源约束。 */
+async function requestReleaseManifest(source: string, request: NonNullable<ReadReleaseUpdateStatusOptions['request']>, signal: AbortSignal, allowUntrustedTest: boolean, distribution?: DistributionConfig): Promise<Response> {
+  let url = new URL(source);
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    const response = await request(url.href, { headers: { accept: 'application/json' }, redirect: 'manual', signal }).catch((cause: unknown) => {
+      throw Object.assign(new Error('无法连接更新服务。', { cause }), { code: signal.aborted ? 'ZEUS_RELEASE_MANIFEST_TIMEOUT' : 'ZEUS_RELEASE_MANIFEST_NETWORK' });
+    });
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get('location');
+    await response.body?.cancel();
+    const target = location ? new URL(location, url) : null;
+    if (redirects === 5 || !target || (!isTrustedReleaseResponseUrl(target, distribution) && !(allowUntrustedTest && isLoopbackHttpUrl(target.href)))) {
+      throw Object.assign(new Error('更新清单重定向离开了官方来源或超过允许次数。'), { code: 'ZEUS_RELEASE_MANIFEST_INVALID' });
+    }
+    url = target;
+  }
+  throw new Error('更新清单重定向未完成。');
 }

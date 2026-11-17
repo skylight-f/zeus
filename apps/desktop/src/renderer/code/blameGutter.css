@@ -1,45 +1,5 @@
-/* GitLens 风格的行尾归属信息：低对比度保留代码阅读优先级，悬停时提高辨识度。 */
-.session-source-blame-toolbar {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 8px;
-  min-block-size: 34px;
-  padding: 4px 12px;
-  border-block-end: 1px solid color-mix(in srgb, var(--session-text-muted, #8b93a1) 18%, transparent);
-  background: var(--session-canvas, #fff);
-  color: var(--session-text-muted, #6b7280);
-  font-size: 11px;
-}
-
-.session-source-blame-action {
-  appearance: none;
-  border: 0;
-  border-radius: 5px;
-  padding: 4px 8px;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font: inherit;
-}
-
-.session-source-blame-action:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--session-text-muted, #6b7280) 12%, transparent);
-  color: var(--session-text, #1f2937);
-}
-
-.session-source-blame-action:focus-visible {
-  outline: 2px solid var(--session-accent, #408bd8);
-  outline-offset: 1px;
-}
-
-.session-source-blame-status {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 让编辑器和控制条在源码滚动容器中垂直分配空间。 */
+/* 当前行归属保留代码阅读优先级，完整详情通过悬停查看。 */
+/* 无额外控制行，代码预览填满源码滚动容器。 */
 .session-source-scroll:has(> .session-source-code-preview) {
   display: flex;
   flex-direction: column;
@@ -52,56 +12,20 @@
 }
 
 .session-source-blame-inline {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  block-size: 1lh;
+  vertical-align: top;
+  font: inherit;
   max-inline-size: min(68vw, 720px);
   margin-inline-start: 2em;
-  overflow: hidden;
   color: var(--session-text-muted, #8b93a1);
-  cursor: help;
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    sans-serif;
-  font-size: 11px;
-  line-height: inherit;
+  /* 提交注释使用普通箭头，避免问号光标干扰代码阅读。 */
+  cursor: default;
   opacity: 0.72;
-  text-overflow: ellipsis;
-  vertical-align: baseline;
-  white-space: nowrap;
 }
 
-.session-source-blame-inline:hover,
-.session-source-blame-inline:focus-visible {
-  color: var(--session-text, #1f2937);
-  opacity: 1;
-}
-
-.session-source-blame-inline:focus-visible {
-  outline: 1px solid var(--session-accent, #408bd8);
-  outline-offset: 2px;
-}
-
-.session-source-blame-error {
-  min-inline-size: 0;
-  flex: 1;
-}
-
-.session-source-blame-error summary {
-  cursor: pointer;
-}
-
-.session-source-blame-error pre {
-  max-block-size: 120px;
-  overflow: auto;
-  margin: 6px 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font: inherit;
-  user-select: text;
-}
-
-/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
+/* 字号只作用于内层文本，行高由外层继承代码行并居中对齐。 */
 .session-source-blame-text {
   min-inline-size: 0;
   overflow: hidden;
@@ -115,11 +39,21 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.session-source-blame-inline:hover,
+.session-source-blame-inline:focus-visible {
+  color: var(--session-text, #1f2937);
+  opacity: 1;
+}
+
+/* 原生正文选区必须覆盖应用外壳的禁选样式，侧栏保持不可复制。 */
 :is(.project-source-code-editor, .session-source-code-preview) .cm-content,
 :is(.project-source-code-editor, .session-source-code-preview) .cm-line {
   -webkit-user-select: text;
   user-select: text;
 }
+
+/* 日期与作者共用自然宽度；只有真实记录才创建侧栏，不为无归属文件预留空白。 */
 .code-author-gutter .cm-gutterElement {
   padding-inline: 8px;
   text-align: left;
@@ -141,4 +75,9 @@
 .code-reading-menu button > span {
   display: inline-block;
   width: 20px;
+}
+
+.session-source-blame-inline:focus-visible {
+  outline: 1px solid var(--session-accent, #408bd8);
+  outline-offset: 2px;
 }
