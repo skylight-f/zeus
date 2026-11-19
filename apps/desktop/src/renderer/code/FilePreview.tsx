@@ -1,3 +1,4 @@
+import { PdfPreview } from './PdfPreview.js';
 import { FileSelectionQuestionContext } from '../session/sideQuestionContext.js';
 import { useWindowDocument } from '../ui/windowDocument.js';
 import { createPortal } from 'react-dom';
@@ -45,6 +46,7 @@ import { useFilePreviewDraft } from './useFilePreviewDraft.js';
 import { useFilePreviewRefresh } from './useFilePreviewRefresh.js';
 import { useGitBlame } from './useGitBlame.js';
 import type { PreparedFilePreview } from './preparedFilePreview.js';
+import { FileFindButton, fileFindShortcut, openFileFindIn } from './fileFind.js';
 
 /** 会话统一选择预览容器：图片可用弹窗，其他文件进入右侧审阅。 */
 export const FilePreviewOpenContext = createContext<((request: FilePreviewRequest, image?: boolean) => void) | null>(null);
@@ -132,8 +134,6 @@ export function FileSourceEditButton(props: { request: FilePreviewRequest; zh: b
 export function FileReviewContent(props: {
   review?: FileReview;
   zh: boolean;
-  /** 工具栏搜索时先显示完整源码，再由源码编辑器打开查找。 */
-  sourceRequest?: number;
   /** 会话源码对比时使用同一资源授权读取前后全文。 */
   previewRequest?: FilePreviewRequest;
   /** 保存比较中的当前版本后，所属源码预览重新读取正文。 */
@@ -150,10 +150,6 @@ export function FileReviewContent(props: {
     // 再次点击同一引用也回到源码，不能停留在上次切换的差异页。
     if (props.review?.location?.line && props.review.location !== initialLocation) setShowDiff(false);
   }, [props.review?.location]);
-  useEffect(() => {
-    // 搜索当前文件必须挂载源码，不能继续停在差异编辑器。
-    if (props.sourceRequest) setShowDiff(false);
-  }, [props.sourceRequest]);
   return (
     <>
       {props.toolbar(
@@ -188,10 +184,10 @@ export function FileReviewContent(props: {
         <Suspense fallback={null}>
           {props.previewRequest ? (
             <FilePreview request={props.previewRequest} revision={JSON.stringify(props.review.diff)} zh={props.zh} onSaved={props.onSaved}>
-              <CodeDiffView file={props.review.diff} unified label={props.zh ? '文件 Git 差异' : 'File Git diff'} />
+              <CodeDiffView file={props.review.diff} unified hideFindButton label={props.zh ? '文件 Git 差异' : 'File Git diff'} />
             </FilePreview>
           ) : (
-            <CodeDiffView file={props.review.diff} unified label={props.zh ? '文件 Git 差异' : 'File Git diff'} />
+            <CodeDiffView file={props.review.diff} unified hideFindButton label={props.zh ? '文件 Git 差异' : 'File Git diff'} />
           )}
         </Suspense>
       ) : (
@@ -215,6 +211,8 @@ export function FilePreview(props: {
   children?: ReactNode | ((toolbar: ReactNode, items: FilePreviewItem[] | null) => ReactNode);
   /** 调用方已有的关闭等操作并入预览工具栏。 */
   actions?: ReactNode;
+  /** 已在源码页时直接定位其文件树。 */
+  onRevealDirectory?: (path: string) => void;
   /** Git 比较已知的变更状态同时用于媒体文件名称。 */
   fileStatus?: string;
   /** 外部已知的修订用于显式刷新当前文件。 */
@@ -223,6 +221,8 @@ export function FilePreview(props: {
   preparedPreview?: PreparedFilePreview;
   /** 在已知全文类型后只挂载一次差异编辑器。 */
   waitForContent?: boolean;
+  /** 独立窗口的文本差异还在准备，媒体可直接显示。 */
+  pendingDiff?: boolean;
   /** 文件保存成功后由所属页面刷新文件列表与统计。 */
   onSaved?: () => void | Promise<void>;
   /** 会话评论使用的稳定文件路径，附件缺省使用预览名称。 */
@@ -242,10 +242,12 @@ export function FilePreview(props: {
         revision={props.revision}
         preparedPreview={props.preparedPreview}
         waitForContent={props.waitForContent}
+        pendingDiff={props.pendingDiff}
         location={props.location}
         zh={props.zh}
         renderHeader={props.renderHeader}
         actions={props.actions}
+        onRevealDirectory={props.onRevealDirectory}
         fileStatus={props.fileStatus}
         commentPath={props.commentPath}
         comments={props.comments}
@@ -268,11 +270,14 @@ function FilePreviewBody(props: {
   preparedPreview?: PreparedFilePreview;
   /** 避免只读补丁随后被整棵可编辑视图替换。 */
   waitForContent?: boolean;
+  /** 文本差异需要补丁，媒体无需等它。 */
+  pendingDiff?: boolean;
   zh: boolean;
   /** 文件标签与正文使用同一份已授权预览。 */
   renderHeader?: (item: FilePreviewItem | null) => ReactNode;
   children?: ReactNode | ((toolbar: ReactNode, items: FilePreviewItem[] | null) => ReactNode);
   /** 嵌入预览的附加操作。 */ actions?: ReactNode;
+  /** 已在源码页时直接定位其文件树。 */ onRevealDirectory?: (path: string) => void;
   /** 文件的实际 Git 变更状态。 */ fileStatus?: string;
   /** 弹窗提供关闭动作，单张图片据此使用纯预览布局。 */ onClose?: () => void;
   /** 会话评论使用的稳定文件路径。 */ commentPath?: string;
@@ -292,6 +297,7 @@ function FilePreviewBody(props: {
     JSON.parse(props.identity) as FilePreviewRequest,
     () => setAttempt((value) => value + 1),
     (cause) => setError(userFacingErrorCause(cause)),
+    { items },
   );
   /** 编码选择仅重载只读预览，不影响源码保存。 */
   const [textEncoding, setTextEncoding] = useReadingState<FilePreviewTextEncoding | ''>('encoding', () => (JSON.parse(props.identity) as FilePreviewRequest).textEncoding ?? '');
@@ -311,8 +317,8 @@ function FilePreviewBody(props: {
   const ownedIds = useRef(new Set<string>());
   /** 可见版本持有独立引用，后台淘汰不会撤销正在使用的授权。 */
   const ownedPreparedReads = useRef(new Map<FilePreviewItem[], () => void>());
-  /** 有补丁的预览先绘制差异，完整正文不能抢占其可读首帧。 */
-  const hasDiff = Boolean(props.children);
+  /** 只按打开文件时是否已有补丁决定读取时机，迟到的补丁不会重启全文读取。 */
+  const [deferRead] = useState(() => Boolean(props.children) && !props.waitForContent);
   useEffect(() => {
     const revision = ++readRevision.current;
     /** 卸载后拒绝迟到结果。 */
@@ -352,14 +358,14 @@ function FilePreviewBody(props: {
     /** 两帧间隔保证补丁至少绘制一次，关闭时取消尚未开始的全文读取。 */
     let firstFrame = 0;
     let secondFrame = 0;
-    if (hasDiff && !props.waitForContent && !prepared) firstFrame = requestAnimationFrame(() => (secondFrame = requestAnimationFrame(load)));
+    if (deferRead && !prepared) firstFrame = requestAnimationFrame(() => (secondFrame = requestAnimationFrame(load)));
     else load();
     return () => {
       active = false;
       cancelAnimationFrame(firstFrame);
       cancelAnimationFrame(secondFrame);
     };
-  }, [props.identity, props.revision, props.zh, attempt, textEncoding, hasDiff, props.preparedPreview, props.waitForContent]);
+  }, [props.identity, props.revision, props.zh, attempt, textEncoding, deferRead, props.preparedPreview]);
   // 内容替换完成或关闭后再释放上一版令牌，后台读取失败仍保留可用预览。
   useEffect(() => {
     const ids = items?.map((item) => item.id).filter(Boolean) ?? [];
@@ -544,8 +550,8 @@ function FilePreviewBody(props: {
           )
         ) : error ? (
           <p role="alert">{simpleImage && typeof error === 'string' ? error : <VisibleApplicationError error={error} language={props.zh ? 'zh-CN' : 'en'} />}</p>
-        ) : !items ? (
-          <p role="status">{props.zh ? '正在读取文件…' : 'Loading file…'}</p>
+        ) : !items || (props.pendingDiff && textOnly) ? (
+          <p role="status">{items ? (props.zh ? '正在读取差异…' : 'Loading diff…') : props.zh ? '正在读取文件…' : 'Loading file…'}</p>
         ) : simpleImage && current?.url ? (
           <PreviewImage url={current.url} name={current.name} previewId={current.id} zh={props.zh} compact onError={() => setError(props.zh ? '图片已损坏或无法解码，请重试。' : 'The image could not be decoded. Please retry.')} />
         ) : (
@@ -557,6 +563,7 @@ function FilePreviewBody(props: {
                   key={`${index}:${item.label}`}
                   item={props.location ? { ...item, review: { ...item.review, location: props.location } } : item}
                   request={attachment}
+                  onRevealDirectory={props.onRevealDirectory}
                   zh={props.zh}
                   fileStatus={props.fileStatus}
                   commentPath={props.commentPath}
@@ -742,6 +749,8 @@ function FilePreviewContent(props: {
   onSaved: () => void;
   /** 会话资源的文件审阅继续使用原业务身份。 */
   request: FilePreviewRequest;
+  /** 已在源码页时直接定位其文件树。 */
+  onRevealDirectory?: (path: string) => void;
   zh: boolean;
   /** 比较视图提供的真实 Git 状态。 */ fileStatus?: string;
   /** 当前用户选择的解码方式。 */ encoding: FilePreviewTextEncoding | '';
@@ -782,6 +791,13 @@ function FilePreviewContent(props: {
   /** 自动识别可切换为已支持语法或纯文本，不改变文件正文。 */
   const [language, setLanguage] = useReadingState('language', () => detectSourceLanguage(item.name, item.content) ?? 'text'); /** 用户选择的源码展示状态。 */
   const [source, setSource] = useReadingState(`source:${item.label}`, Boolean(item.review?.location?.line));
+  /** 二进制正文使用各自支持的文字查找范围。 */
+  const documentFind = Boolean(item.url && (item.kind === 'pdf' || (item.kind === 'spreadsheet' && item.byteLength > 0)));
+  const canFind = item.content !== undefined || documentFind;
+  /** 正文挂载后响应来自预览工具栏的查找。 */
+  const [searchRequest, setSearchRequest] = useState(0);
+  /** 搜索对象只从当前文件的正文或差异中选取。 */
+  const fileRef = useRef<HTMLElement>(null);
   /** Markdown 各版本分别恢复，不使用每次加载都会变化的资源令牌。 */
   const markdownScroll = useReadingScroll(`markdown:${item.label}`);
   /** 本次操作的可见错误。 */
@@ -792,17 +808,22 @@ function FilePreviewContent(props: {
   const onAskInSidebar = useContext(FileSelectionQuestionContext);
   /** 文件阅览在有侧栏时共用选区工具栏，不要求评论可写。 */
   const selectionPreviewVisible = props.comments !== undefined || props.onCommentsChange !== undefined || Boolean(onAskInSidebar);
+  /** 文本效果页切到源码，已显示的差异保持当前视图。 */
+  function openSourceFind(): void {
+    if (item.content !== undefined) setSource(true);
+    setSearchRequest((request) => request + 1);
+  }
   /** 用户动作只发送资源令牌，主进程再次检查所属窗口与文件身份。 */
-  async function action(value: 'quick-look' | 'open' | 'reveal' | 'export') {
+  async function action(value: 'quick-look' | 'open' | 'reveal' | 'export' | 'reveal-directory', directoryPath?: string) {
     setError('');
     try {
-      await window.zeus?.actOnFilePreview(item.id, value);
+      await window.zeus?.actOnFilePreview(item.id, value, directoryPath);
     } catch (cause) {
       setError(userFacingErrorCause(cause));
     }
   }
   return (
-    <article className="file-preview-content">
+    <article ref={fileRef} className="file-preview-content" onKeyDown={(event) => fileFindShortcut(event, canFind ? openSourceFind : undefined, documentFind)}>
       <FileReviewContent
         onSaved={props.onSaved}
         previewRequest={props.request.kind === 'resource' ? { ...props.request, comparison: 'head' } : undefined}
@@ -810,9 +831,24 @@ function FilePreviewContent(props: {
         zh={props.zh}
         toolbar={(reviewActions) => (
           <>
-            <FileWorkspaceToolbar path={displayPath} name={item.name} status={props.fileStatus ?? item.review?.status ?? item.review?.diff?.changeType} zh={props.zh}>
+            <FileWorkspaceToolbar
+              path={props.onRevealDirectory ? displayPath : (item.workspaceRelativePath ?? displayPath)}
+              copyPath={displayPath}
+              name={item.name}
+              status={props.fileStatus ?? item.review?.status ?? item.review?.diff?.changeType}
+              zh={props.zh}
+              onRevealDirectory={props.onRevealDirectory ?? (item.workspaceRelativePath ? (path) => action('reveal-directory', path) : undefined)}
+            >
               {reviewActions}
               {props.toolbar}
+              {canFind ? (
+                <FileFindButton
+                  zh={props.zh}
+                  onFind={() => {
+                    if (!openFileFindIn(fileRef.current)) openSourceFind();
+                  }}
+                />
+              ) : null}
               {item.id ? (
                 <>
                   {(markdown || item.mime === 'image/svg+xml') && item.content !== undefined ? (
@@ -858,6 +894,7 @@ function FilePreviewContent(props: {
               <div className="file-preview-text">
                 {selectionPreviewVisible ? (
                   <CommentableSourceCodePreview
+                    searchRequest={searchRequest}
                     key={readingIdentity}
                     identity={readingIdentity}
                     path={props.commentPath ?? item.name}
@@ -874,6 +911,7 @@ function FilePreviewContent(props: {
                   />
                 ) : (
                   <CodeEditor
+                    searchRequest={searchRequest}
                     path={item.name}
                     label={item.name}
                     language={language}
@@ -892,18 +930,12 @@ function FilePreviewContent(props: {
           </Suspense>
         ) : item.kind === 'spreadsheet' && item.url && item.byteLength > 0 ? (
           <Suspense fallback={<ResourceLoading label={props.zh ? '正在读取 Excel…' : 'Reading workbook…'} />}>
-            <SpreadsheetPreview key={item.url} url={item.url} name={item.name} readingKey={item.label} zh={props.zh} />
+            <SpreadsheetPreview key={item.url} url={item.url} name={item.name} readingKey={item.label} zh={props.zh} searchRequest={searchRequest} />
           </Suspense>
         ) : item.kind === 'image' && item.url ? (
           <PreviewImage url={item.url} name={item.name} previewId={item.id} zh={props.zh} />
         ) : item.kind === 'pdf' && item.url ? (
-          <iframe /* PDF 使用独立协议源隔离；HTML sandbox 会禁用 Chromium 的 PDF 阅读器。 */
-            className="file-preview-pdf"
-            src={item.url}
-            title={item.name}
-            referrerPolicy="no-referrer"
-            onError={() => setError(props.zh ? 'PDF 阅读器加载失败，请使用“打开文件”。' : 'PDF viewer failed. Use Open to view it in a system app.')}
-          />
+          <PdfPreview key={item.id} id={item.id} name={item.name} zh={props.zh} searchRequest={searchRequest} onOpenFind={openSourceFind} />
         ) : item.kind === 'audio' && item.url ? (
           <audio controls preload="metadata" src={item.url} aria-label={item.name} onError={() => setError(props.zh ? '音频无法解码，请使用“打开文件”。' : 'Audio could not be decoded. Use Open to play it in a system app.')} />
         ) : item.kind === 'video' && item.url ? (

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, watch, type FSWatcher } from 'node:fs';
-import { access, lstat, mkdir, open, opendir, readFile, realpath, rename, rmdir, stat, unlink } from 'node:fs/promises';
+import { watch, type FSWatcher } from 'node:fs';
+import { access, lstat, mkdir, open, opendir, readFile, readdir, realpath, rename, rmdir, stat, unlink } from 'node:fs/promises';
 import { assertWindowsPortablePath, publishFile, windowsSecurityRequestAsync } from '@zeus/storage/platform-security';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { detectSourceLanguage } from '@zeus/shared';
@@ -23,6 +23,8 @@ import type {
 const maximumEditableBytes = filePreviewLimits.text;
 const maximumSearchResults = 200;
 const maximumSearchVisits = 50_000;
+/** 每次目录读取最多同时检查这么多条目，限制并行文件系统操作。 */
+const directoryMetadataBatchSize = 16;
 /** 标题栏只读取少量源码摘要。 */
 const maximumContentSearchResults = 60;
 /** 项目搜索展示有界命中列表，达到上限时明确提示结果不完整。 */
@@ -50,12 +52,11 @@ export class ProjectSourceWorkspaceService {
   async listDirectory(projectId: string, relativePath = ''): Promise<ProjectSourceDirectorySnapshot> {
     const root = await this.#projectRoot(projectId);
     const directory = await resolveExistingPath(root, relativePath, 'directory');
-    const names = await opendir(directory.absolutePath);
+    const names = (await readdir(directory.absolutePath)).filter((name) => name !== '.git');
     const entries: ProjectSourceEntry[] = [];
-    for await (const item of names) {
-      if (item.name === '.git') continue;
-      const entryRelativePath = joinRelative(directory.relativePath, item.name);
-      entries.push(await describeEntry(root, entryRelativePath));
+    for (let offset = 0; offset < names.length; offset += directoryMetadataBatchSize) {
+      const batch = names.slice(offset, offset + directoryMetadataBatchSize);
+      entries.push(...(await Promise.all(batch.map((name) => describeEntry(root, joinRelative(directory.relativePath, name))))));
     }
     entries.sort(compareEntries);
     return { relativePath: directory.relativePath, entries };
@@ -285,12 +286,11 @@ export class ProjectSourceWorkspaceService {
     const targetLstat = await lstat(target.absolutePath);
     const targetStat = await stat(target.absolutePath);
     const isSymlink = targetLstat.isSymbolicLink();
-    const basicRevision = revisionFromStat(targetStat.size, targetStat.mtimeMs);
+    const basicRevision = revisionFromStat(targetStat.size, targetStat.mtimeMs, targetStat.ctimeMs, targetStat.ino);
     if (!targetStat.isFile()) return readOnlyDocument(target.relativePath, basicRevision, 'not_regular_file');
-    /** 先识别可预览图片，避免图片被文本大小或空字节检查提前挡住。 */
-    /** 媒体由统一预览按需读取，源码编辑接口不再复制图片正文。 */
+    /** 只读标签用文件属性识别版本，实际媒体由统一预览读取。 */
     const media = filePreviewKind(filePreviewMime(target.relativePath)) !== 'system';
-    if (media || targetStat.size > maximumEditableBytes) return readOnlyDocument(target.relativePath, await revisionFromFile(target.absolutePath, targetStat.size, targetStat.mtimeMs), media ? 'binary' : 'too_large');
+    if (media || targetStat.size > maximumEditableBytes) return readOnlyDocument(target.relativePath, basicRevision, media ? 'binary' : 'too_large');
     const bytes = await readFile(target.absolutePath);
     const revision = revisionFromBytes(bytes, targetStat.mtimeMs);
     if (bytes.byteLength > maximumEditableBytes) return readOnlyDocument(target.relativePath, revision, 'too_large');
@@ -571,14 +571,9 @@ function revisionFromBytes(bytes: Buffer, modifiedAtMs: number): ProjectSourceRe
   return { sha256: createHash('sha256').update(bytes).digest('hex'), byteLength: bytes.byteLength, modifiedAtMs };
 }
 
-function revisionFromStat(byteLength: number, modifiedAtMs: number): ProjectSourceRevision {
-  return { sha256: createHash('sha256').update(`${byteLength}:${modifiedAtMs}`).digest('hex'), byteLength, modifiedAtMs };
-}
-
-async function revisionFromFile(path: string, byteLength: number, modifiedAtMs: number): Promise<ProjectSourceRevision> {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
-  return { sha256: hash.digest('hex'), byteLength, modifiedAtMs };
+/** 为只读标签标识文件替换和内容变化，大小用字节，两个时间用毫秒。 */
+function revisionFromStat(byteLength: number, modifiedAtMs: number, changedAtMs: number, inode: number): ProjectSourceRevision {
+  return { sha256: createHash('sha256').update(`${inode}:${byteLength}:${modifiedAtMs}:${changedAtMs}`).digest('hex'), byteLength, modifiedAtMs };
 }
 
 function readOnlyDocument(relativePath: string, revision: ProjectSourceRevision, reason: NonNullable<ProjectSourceDocument['readOnlyReason']>): ProjectSourceDocument {

@@ -6,6 +6,9 @@ import type {
   CreateProjectSourceEntryInput,
   FilePreviewItem,
   FilePreviewRequest,
+  PdfPreviewCommand,
+  PdfPreviewEvent,
+  FilePreviewWatch,
   MoveProjectSourceEntryInput,
   NetworkProxyCheckTarget,
   NetworkProxyConnectionResult,
@@ -82,6 +85,12 @@ declare global {
     __zeusPerformanceSnapshot?: () => import('./rendererPerformanceObservability.js').RendererPerformanceSnapshot;
     zeus?: {
       appName: 'Zeus';
+      /** 设置当前可见窗口的频谱订阅。 */
+      subscribeConversationAudio?: (active: boolean) => Promise<void>;
+      /** 频谱能量以 base64 编码的 Float32 数据传递。 */
+      onConversationAudioFrame?: (listener: (frame: { hzPerBin: number; rms: number; powers: string }) => void) => () => void;
+      /** 通知桌面权限或原生输入不可用。 */
+      onConversationAudioUnavailable?: (listener: () => void) => () => void;
       getConversationStoreMigrationStatus: () => Promise<{
         phase: 'not_required' | 'preflight' | 'candidate_build' | 'candidate_validation' | 'promotion' | 'promoted_but_validation_failed' | 'completed' | 'failed';
         migrationId: string;
@@ -152,7 +161,7 @@ declare global {
       setTaskGitDeliverySubmissionState: (state: 'pending' | 'accepted' | 'failed') => Promise<{ state: 'pending' | 'accepted' | 'failed' }>;
       /** 所有范围都关闭当前真实交付窗口。 */
       closeTaskGitDeliveryWindow: () => Promise<{ closed: true; taskId?: string; projectId?: string; conversationId?: string }>;
-      getTaskGitDeliveryCurrentContext: () => Promise<{ taskId: string | null; workspaceId: string | null }>;
+      getTaskGitDeliveryCurrentContext: () => Promise<{ taskId: string | null; workspaceId: string | null; opened: boolean }>;
       notifyTaskGitDeliveryCurrentContext: (context: { taskId: string | null; workspaceId: string | null }) => void;
       notifyTaskGitDeliveryChanged: (taskId: string) => void;
       openTaskGitDeliveryConversation: (input: { taskId: string; conversationId: string } | { projectId: string; conversationId: string }) => Promise<{ opened: true }>;
@@ -196,7 +205,7 @@ declare global {
       }) => Promise<
         { schema: 'zeus-project-git-action-ipc-v1'; ok: true; value: import('./apiClient.js').ProjectGitActionResponse } | { schema: 'zeus-project-git-action-ipc-v1'; ok: false; error: import('@zeus/shared').UserFacingErrorCause }
       >;
-      onTaskGitDeliveryCurrentContext: (listener: (context: { taskId: string | null; workspaceId: string | null }) => void) => () => void;
+      onTaskGitDeliveryCurrentContext: (listener: (context: { taskId: string | null; workspaceId: string | null; opened: boolean }) => void) => () => void;
       onTaskGitDeliveryAppearance: (listener: (settings: { language: 'zh-CN' | 'en-US'; appearance: 'light' | 'dark' | 'system' }) => void) => () => void;
       /** 独立仓库差异窗口沿用应用主题，返回取消订阅函数。 */
       onProjectGitDiffAppearance: (listener: (appearance: 'light' | 'dark' | 'system') => void) => () => void;
@@ -227,8 +236,12 @@ declare global {
 
       /** 跨入口共用的受授权文件预览。 */
       loadFilePreview: (input: FilePreviewRequest) => Promise<FilePreviewItem[]>;
+      /** 布局与查找使用当前窗口的已授权 PDF。 */
+      updatePdfPreview: (id: string, command: PdfPreviewCommand) => Promise<void>;
+      /** 原生 PDF 匹配与按键反馈。 */
+      onPdfPreviewEvent: (listener: (event: PdfPreviewEvent) => void) => () => void;
       /** 按原授权监听当前文件；历史快照不会随工作区变化。 */
-      watchFilePreview: (input: FilePreviewRequest) => Promise<string | null>;
+      watchFilePreview: (input: FilePreviewRequest, previewIds?: string[], expectedRevision?: string) => Promise<FilePreviewWatch | null>;
       /** 当前窗口已授权文件的磁盘变更通知。 */
       onFilePreviewChanged: (listener: (id: string) => void) => () => void;
       /** 读取当前授权文件版本的 Git 审阅，不重新传入磁盘路径。 */
@@ -238,7 +251,8 @@ declare global {
       /** 用户主动请求系统查看或导出当前预览版本。 */
       /** 交付菜单共享任务与项目工作区操作。 */
       actOnGitDeliveryFiles: (input: import('@zeus/shared').GitDeliveryFileActionInput) => Promise<{ completed: true }>;
-      actOnFilePreview: (id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit') => Promise<void>;
+      /** 目录定位由主进程验证预览令牌和相对父目录。 */
+      actOnFilePreview: (id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit' | 'reveal-directory', directoryPath?: string) => Promise<void>;
       /** 只复制或另存预览图片的 PNG 像素，不接收本地文件路径。 */
       actOnImagePreview: (dataUrl: string, action: 'copy' | 'export', name: string) => Promise<void>;
       /** 只恢复两端预览中选中的行区块，并返回更新后的预览授权。 */
@@ -366,7 +380,8 @@ declare global {
       checkReleaseUpdate: () => Promise<ReleaseUpdateStatusSnapshot>;
       openAutomaticUpdateIndicator: () => Promise<{ opened: boolean }>;
       recordManualUpdateCheck: () => Promise<{ recorded: boolean }>;
-      onAutomaticUpdateIndicatorChanged: (listener: (state: AutomaticUpdateIndicatorState) => void) => () => void;
+      /** 空值表示当前进程的更新入口已停用。 */
+      onAutomaticUpdateIndicatorChanged: (listener: (state: AutomaticUpdateIndicatorState | null) => void) => () => void;
       listConversationResourceOpenTargets: (request: { projectId: string; conversationId: string; resourceId: string }) => Promise<{ resourceId: string; targets: ConversationResourceOpenTarget[] }>;
       openConversationResource: (request: { projectId: string; conversationId: string; resourceId: string; target: ConversationOpenTarget; location?: ConversationFileLocation }) => Promise<{
         opened: boolean;

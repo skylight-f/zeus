@@ -104,14 +104,10 @@ async function main() {
       return;
     }
   }
-  /** 同一快照决定活跃运行与最近运行，避免重复读取产生矛盾结果。 */
+  /** 同一候选已开始发布时优先恢复原运行，保留成功的构建制品。 */
   const workflowRuns = listReleaseRuns(preflight.headSha).value;
-  /** 尚未交付时优先续等同一候选的活跃运行。 */
-  let workflowRun = workflowRuns.find((run) => run.headSha === preflight.headSha && ['queued', 'in_progress', 'waiting', 'requested'].includes(run.status)) ?? null;
-  /** 最近运行仅参与已有失败 Workflow 的恢复判断。 */
-  const latestWorkflowRun = workflowRuns.find((run) => run.headSha === preflight.headSha) ?? null;
-  const shouldRetryFailedWorkflow = release.exists && !workflowRun && latestWorkflowRun?.status === 'completed' && latestWorkflowRun.conclusion === 'failure';
-  if ((!release.exists && !workflowRun) || shouldRetryFailedWorkflow) {
+  let workflowRun = resumeReleasePublication(workflowRuns, preflight.headSha);
+  if (!release.exists && !workflowRun) {
     const dispatchedAt = Date.now();
     dispatchReleaseWorkflow(tag, preflight.headSha, requireAppleDistribution);
     workflowRun = await waitForDispatchedRun(preflight.headSha, dispatchedAt);
@@ -486,19 +482,63 @@ function readRelease(tag, options = {}) {
 
 /** 一次读取候选运行列表，读取失败时禁止猜测并重复触发发布。 */
 function listReleaseRuns(headSha) {
-  const result = ghJson(
-    ['run', 'list', '--repo', repository, '--workflow', 'Release', '--event', 'workflow_dispatch', '--commit', headSha, '--limit', '20', '--json', 'databaseId,status,conclusion,event,headSha,url,createdAt,workflowName'],
-    true,
-  );
-  if (!result.ok || !Array.isArray(result.value)) throw new Error(`无法确认候选提交是否已有 Release Workflow：${result.error || 'GitHub 返回了无效运行列表'}`);
-  return result;
+  const result = ghJson(['api', '--paginate', '--slurp', `repos/${repository}/actions/workflows/release.yml/runs?event=workflow_dispatch&head_sha=${headSha}&per_page=100`], true);
+  if (!result.ok || !Array.isArray(result.value) || result.value.some((page) => !Array.isArray(page?.workflow_runs))) throw new Error(`无法确认候选提交是否已有 Release Workflow：${result.error || 'GitHub 返回了无效运行列表'}`);
+  return {
+    ...result,
+    value: result.value.flatMap((page) =>
+      page.workflow_runs.map((run) => ({ databaseId: run.id, status: run.status, conclusion: run.conclusion, headSha: run.head_sha, url: run.html_url, createdAt: run.created_at, attempt: run.run_attempt })),
+    ),
+  };
+}
+
+/** 优先复用已经进入分发的运行；打包阶段失败也保留同一候选的成功制品。 */
+function resumeReleasePublication(workflowRuns, headSha) {
+  /** 尚未进入发布的活跃运行仅作后备，已有原始发布制品时不能抢占恢复入口。 */
+  let activeRun = null;
+  /** 公开输入已经验证的打包运行，可以在上传开始前接续失败分支。 */
+  let buildRun = null;
+  /** 必须优先恢复最早进入发布的原始运行。 */
+  let publicationRun = null;
+  for (const workflowRun of [...workflowRuns].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))) {
+    /** 读取该运行的最新 attempt，避免对过时的失败状态重复提交重跑。 */
+    const result = ghJson(['run', 'view', String(workflowRun.databaseId), '--repo', repository, '--json', 'databaseId,headSha,status,conclusion,url,attempt,jobs'], true);
+    if (!result.ok || result.value?.headSha !== headSha || !Array.isArray(result.value.jobs) || !Number.isSafeInteger(result.value.attempt)) throw new Error(`无法确认原发布作业，未重新创建 Workflow：${result.error || workflowRun.url}`);
+    const publicationJobs = result.value.jobs.filter((job) => job.name === 'publish' && job.conclusion !== 'skipped' && Date.parse(job.startedAt) > 0);
+    if (publicationJobs.length) {
+      publicationRun = result.value;
+      break;
+    }
+    if (['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(result.value.status)) activeRun ??= result.value;
+    // 只构建模式会跳过该步骤，不能把它误认为已通过公开发布输入校验的运行。
+    if (result.value.jobs.some((job) => job.name === 'preflight' && Array.isArray(job.steps) && job.steps.some((step) => step.name === '校验公开发布输入、目标占用与必要凭据' && step.conclusion === 'success'))) buildRun ??= result.value;
+  }
+  /** 已有活跃运行时先等待，不能为较早的打包失败再启动并行恢复。 */
+  const recoveryRun = publicationRun ?? activeRun ?? buildRun;
+  if (!recoveryRun || recoveryRun.status !== 'completed' || recoveryRun.conclusion === 'success') return recoveryRun;
+  if (!['failure', 'cancelled', 'timed_out'].includes(recoveryRun.conclusion)) throw new Error(`原发布作业状态未知，未重新打包：${recoveryRun.url}`);
+  /** Astra 发布只复用同一次运行的 macOS 制品。 */
+  if (publicationRun || recoveryRun.jobs.some((job) => job.name === 'package-mac' && job.conclusion === 'success')) {
+    const artifacts = ghJson(['api', `repos/${repository}/actions/runs/${recoveryRun.databaseId}/artifacts?per_page=100`], true);
+    if (!artifacts.ok || !Array.isArray(artifacts.value?.artifacts)) throw new Error(`无法读取原构建制品，未重跑发布：${artifacts.error || recoveryRun.url}`);
+    const name = `${distributionAppName}-macos-${headSha}`;
+    const matches = artifacts.value.artifacts.filter((artifact) => artifact.name === name);
+    if (matches.length !== 1 || matches[0].expired !== false) throw new Error(`原构建制品缺失或已过期，禁止用重建文件替换同版本：${name}；${recoveryRun.url}`);
+  }
+  /** 单个取消作业按实际编号恢复，覆盖未取得 Runner 就结束的情况。 */
+  const retryJobs = recoveryRun.jobs.filter((job) => ['failure', 'cancelled', 'timed_out'].includes(job.conclusion));
+  /** 多个未成功分支由 GitHub 同次恢复，成功作业保持原样。 */
+  const retryArgs = retryJobs.length === 1 && Number.isSafeInteger(retryJobs[0].databaseId) && retryJobs[0].databaseId > 0 ? ['--job', String(retryJobs[0].databaseId)] : ['--failed'];
+  console.log(`恢复原运行的未成功作业，复用已成功的构建和上传：${recoveryRun.url}`);
+  run('gh', ['run', 'rerun', String(recoveryRun.databaseId), '--repo', repository, ...retryArgs]);
+  return { ...recoveryRun, attempt: recoveryRun.attempt + 1 };
 }
 
 function dispatchReleaseWorkflow(tag, commitSha, requireAppleDistribution) {
   run('gh', [
     'workflow',
     'run',
-    'Release',
+    'release.yml',
     '--repo',
     repository,
     '--ref',
@@ -623,7 +663,9 @@ export async function waitForPublishedRelease(workflowRun, input) {
       }
       nextVerificationAtMs = performance.now() + releaseWorkflowHeartbeatIntervalMs;
       if (snapshot.conclusion !== 'success') {
-        throw new Error(`Release Workflow 未成功完成：conclusion=${snapshot.conclusion || 'unknown'} ${result.value.url || workflowRun.url}\n公开回验：${lastVerificationFailure}`);
+        /** GitHub 原始注释区分执行机调度失败与真正开始后的构建错误。 */
+        const failureDetails = readWorkflowFailureDetails(result.value, verificationInput);
+        throw new Error([`Release Workflow 未成功完成：conclusion=${snapshot.conclusion || 'unknown'} ${result.value.url || workflowRun.url}`, failureDetails, `公开回验：${lastVerificationFailure}`].filter(Boolean).join('\n'));
       }
     }
 
@@ -633,6 +675,37 @@ export async function waitForPublishedRelease(workflowRun, input) {
     if (performance.now() >= nextHeartbeatAtMs) nextHeartbeatAtMs = performance.now() + releaseWorkflowHeartbeatIntervalMs;
     await delay(Math.min(releaseWorkflowPollIntervalMs, waitState.remainingMs));
   }
+}
+
+/** 在既有等待预算内读取失败作业的原始注释，诊断读取失败不覆盖原发布结果。 */
+function readWorkflowFailureDetails(workflowRun, input) {
+  /** 每个失败分支保留名称、执行阶段和去重后的平台说明。 */
+  const details = [];
+  /** 成功作业不再额外读取诊断，只核对当前未成功的分支。 */
+  for (const job of workflowRun.jobs ?? []) {
+    if (!['failure', 'cancelled', 'timed_out'].includes(job.conclusion)) continue;
+    details.push(`故障作业：${job.name} (${job.conclusion})${Array.isArray(job.steps) && job.steps.length === 0 ? '；未执行任何步骤' : ''}`);
+    try {
+      if (!Number.isSafeInteger(job.databaseId) || job.databaseId <= 0) throw new Error('作业编号无效。');
+      /** 作业与 Check Run 的关系以 GitHub 返回为准，不假定两者编号相同。 */
+      const metadata = ghJson(['api', `repos/${repository}/actions/jobs/${job.databaseId}`], true, publicVerificationReadOptions(input));
+      if (!metadata.ok) throw new Error(metadata.error);
+      /** 诊断只读取当前官方仓库的检查，不向其他地址转发 GitHub 认证。 */
+      const checkPrefix = `https://api.github.com/repos/${repository}/check-runs/`;
+      /** 从已绑定的作业元数据提取检查编号。 */
+      const checkId = typeof metadata.value?.check_run_url === 'string' && metadata.value.check_run_url.startsWith(checkPrefix) ? metadata.value.check_run_url.slice(checkPrefix.length) : '';
+      if (!/^\d+$/u.test(checkId)) throw new Error('作业没有有效的同仓库检查来源。');
+      /** 注释分页仍受同一个剩余等待时限约束。 */
+      const annotations = ghJson(['api', '--paginate', '--slurp', `repos/${repository}/check-runs/${checkId}/annotations?per_page=100`], true, publicVerificationReadOptions(input));
+      if (!annotations.ok || !Array.isArray(annotations.value) || !annotations.value.every(Array.isArray)) throw new Error(annotations.error || 'GitHub 故障注释格式无效。');
+      /** 重复的容量提示只显示一次，每个作业最多展示八条原始说明。 */
+      const messages = [...new Set(annotations.value.flat().flatMap((entry) => (typeof entry?.message === 'string' && entry.message.trim() ? [`${entry.annotation_level ?? 'notice'}: ${entry.message.trim()}`] : [])))].slice(0, 8);
+      details.push(...messages);
+    } catch (error) {
+      details.push(`故障注释未取得：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return details.join('\n');
 }
 
 /** 达到单调时钟约定的间隔后输出实际等待时长。 */

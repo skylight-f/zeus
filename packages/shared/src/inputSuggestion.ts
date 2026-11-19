@@ -1,9 +1,10 @@
+import { isCodexServiceTierId, type CodexServiceTierId } from './codexServiceTier.js';
 import type { UserFacingErrorCause } from './userFacingError.js';
 import { normalizePerformanceTraceIdentity } from './commandEnvelope.js';
 
 /** 所有会话共用的输入建议偏好，与主会话模型选择分开保存。 */
 export interface InputSuggestionSettings {
-  /** 仅显式启用后才自动生成，避免升级后增加模型用量。 */
+  /** 控制自动预测和输入停顿后的补全。 */
   enabled: boolean;
   /** 专用 Codex 或模型连接的完整身份；跟随模式下保留原选择。 */
   modelRef: string | null;
@@ -11,8 +12,8 @@ export interface InputSuggestionSettings {
   followConversationModel?: boolean;
   /** 空值自动选择模型支持的最低档位，显式选择仅用于输入建议和润色。 */
   effort?: string | null;
-  /** 空值使用标准速度，Fast 仅在所选模型目录明确支持时启用。 */
-  serviceTier?: 'priority' | null;
+  /** 空值使用标准速度，加速档位需由所选模型目录声明。 */
+  serviceTier?: CodexServiceTierId | null;
 }
 
 /** 专用模型选择器只需要稳定身份和可读名称。 */
@@ -23,7 +24,7 @@ export interface InputSuggestionModelOption {
   label: string;
   /** 仅提供模型目录确认支持的档位，不由界面推测。 */
   supportedReasoningEfforts?: string[];
-  /** 沿用现有模型目录的速度能力，缺失时不推断支持 Fast。 */
+  /** 沿用现有模型目录的速度能力，缺失时不推断支持加速档位。 */
   serviceTiers?: Array<{
     /** 目录提供的服务档位身份。 */
     id: string;
@@ -170,8 +171,8 @@ export function normalizeInputSuggestionUiDiagnostic(value: unknown): InputSugge
   };
 }
 
-/** 未配置的新旧用户均保持关闭，不隐式选择付费模型。 */
-export const defaultInputSuggestionSettings: InputSuggestionSettings = { enabled: false, modelRef: null, effort: null, serviceTier: null };
+/** 新安装和沿用旧默认的资料开启自动建议，使用当前会话的模型。 */
+export const defaultInputSuggestionSettings: InputSuggestionSettings = { enabled: true, modelRef: null, followConversationModel: true, effort: null, serviceTier: null };
 
 /** 在设置读取和写入边界核对类型；缺少有效模型时不能启用。 */
 export function normalizeInputSuggestionSettings(value: unknown): InputSuggestionSettings {
@@ -187,7 +188,7 @@ export function normalizeInputSuggestionSettings(value: unknown): InputSuggestio
     enabled: record.enabled === true && (modelRef !== null || followConversationModel),
     modelRef,
     effort,
-    serviceTier: record.serviceTier === 'priority' ? 'priority' : null,
+    serviceTier: isCodexServiceTierId(record.serviceTier) ? record.serviceTier : null,
     ...(followConversationModel ? { followConversationModel: true } : {}),
   };
 }

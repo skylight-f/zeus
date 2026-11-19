@@ -4258,14 +4258,22 @@ a {
 }
 /* 原生单选框覆盖全局文本框样式，保留方向键切换和系统选中状态。 */
 .macos-ai-app .project-git-update-strategies input[type='radio'] {
+  accent-color: var(--zeus-product-accent);
   appearance: auto;
   background: transparent;
   block-size: 16px;
   border: 0;
   box-shadow: none;
   inline-size: 16px;
+  margin: 0;
   min-block-size: 16px;
   padding: 0;
+}
+/* 表单中的合入方式通过单选组标题标明字段。 */
+.macos-ai-app .zeus-form-fields .project-git-update-strategies > legend {
+  margin-block-end: 8px;
+  padding: 0;
+  font-weight: 600;
 }
 .project-git-update-remember {
   margin-inline-end: auto;
@@ -13201,7 +13209,8 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   --task-status-tone-line: color-mix(in srgb, var(--task-status-tone) 28%, var(--zeus-product-line-soft));
 }
 
-.macos-ai-app .task-status-select .zeus-select-trigger {
+/* 禁用时沿用下拉的禁用色，使交付开关关闭后的已选状态仍可辨认。 */
+.macos-ai-app .task-status-select .zeus-select-trigger:where(:not(:disabled)) {
   background: var(--task-status-tone-bg);
   border-color: var(--task-status-tone-line);
   color: var(--task-status-tone-text);
@@ -15912,6 +15921,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   block-size: min(980px, calc(100vh - 28px));
   max-block-size: none;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
+  background: var(--zeus-product-panel);
+}
+
+/* 交付区域共用窗口底色，控件和 Diff 内容继续绘制自己的状态。 */
+.macos-ai-app .task-git-delivery-modal :is(.task-git-merge-header, .task-git-merge-footer, .task-git-review-pane-title) {
+  background: transparent;
 }
 
 body[data-surface='task-git-delivery'] {
@@ -15943,12 +15958,39 @@ body[data-surface='task-git-delivery'] .task-git-merge-portal-root.macos-ai-app[
 }
 
 body[data-surface='task-git-delivery'] .task-git-merge-header {
+  position: relative;
   box-sizing: border-box;
   min-block-size: 52px;
   justify-content: center;
   padding-inline: 84px;
   text-align: center;
   -webkit-app-region: drag;
+}
+
+/* 独立窗口的设置入口靠右，不改变原生标题的居中位置。 */
+.macos-ai-app .git-delivery-settings-host {
+  flex: none;
+  margin-inline-start: auto;
+}
+.macos-ai-app .git-delivery-settings-host:empty {
+  display: none;
+}
+body[data-surface='task-git-delivery'] .task-git-merge-header > .git-delivery-settings-host {
+  position: absolute;
+  inset-inline-end: 16px;
+  inset-block-start: 50%;
+  transform: translateY(-50%);
+}
+.macos-ai-app .git-delivery-settings-host > .zeus-button[data-zeus-primitive='button'] {
+  inline-size: 28px;
+  min-inline-size: 28px;
+  min-block-size: 28px;
+  padding: 4px;
+}
+.macos-ai-app .git-delivery-settings-host > .zeus-button:not(:hover):not(:focus-visible) {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
 }
 
 body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, input, select, textarea) {
@@ -16040,8 +16082,13 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   min-block-size: 0;
 }
 
+/* 分隔条用细线划分区域，拖动与键盘焦点仍使用共享高亮。 */
+.macos-ai-app .task-git-delivery-layout > :is(.git-separator-delivery-height, .git-separator-delivery-actions) {
+  background: transparent;
+}
 .macos-ai-app .task-git-delivery-layout > .git-separator-delivery-height {
   grid-area: separator;
+  border-block-start: 1px solid var(--zeus-control-border);
 }
 
 .macos-ai-app .task-git-delivery-layout > .git-separator-delivery-actions {
@@ -16057,7 +16104,6 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   border-inline-end: 1px solid var(--zeus-control-border);
-  background: var(--zeus-product-panel-muted);
 }
 
 .macos-ai-app .task-git-delivery-file-tree {
@@ -16295,6 +16341,34 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   display: none;
 }
 
+/* 局部错误保留独立行，剩余空间继续显示当前文件正文。 */
+.macos-ai-app .task-git-delivery-diff-main:has(> .task-git-review-error) {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.macos-ai-app .task-git-delivery-diff-main:has(> .task-git-review-error):has(> .file-preview > .project-git-diff-preview) {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+/* 只动画文件行背景和已就绪的正文，避免影响尺寸、焦点与点击。 */
+@media (prefers-reduced-motion: no-preference) {
+  .macos-ai-app .task-git-delivery-file-row {
+    transition: background-color var(--zeus-motion-duration-state) var(--zeus-motion-ease-out);
+  }
+
+  .macos-ai-app .task-git-delivery-diff-main :is(.code-diff-view, .code-diff-editable, .file-preview-pair, .file-preview-single),
+  .macos-ai-app.project-git-diff-window :is(.code-diff-view, .code-diff-editable, .file-preview-pair, .file-preview-single) {
+    animation: zeus-git-delivery-content-enter var(--zeus-motion-duration-object) var(--zeus-motion-ease-out);
+  }
+}
+
+/* 从轻微透明过渡到正常正文，不叠加旧文件的画面。 */
+@keyframes zeus-git-delivery-content-enter {
+  from {
+    opacity: 0.76;
+  }
+}
+
 /* 文件范围是紧凑的分段切换，字号与布局不继承正文，窄侧栏也不拆行。 */
 .macos-ai-app .task-git-delivery-diff-tabs {
   padding: 6px 8px;
@@ -16350,24 +16424,34 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   color: var(--zeus-product-text);
 }
 
-/* 独立动作使用白底分组，组合配置集中在底部的同一块浅色工作区。 */
+/* 执行按钮独占底栏一行，上方表单使用余下高度。 */
 .macos-ai-app .task-git-delivery-actions {
   grid-area: actions;
   min-inline-size: 0;
   min-block-size: 0;
-  overflow: auto;
+  overflow: hidden;
   overflow-wrap: anywhere;
-  overscroll-behavior: contain;
-  align-content: start;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 0;
-  padding: 0 16px;
-  background: var(--zeus-product-panel);
+  padding: 0;
+  background: transparent;
   font-size: 12px;
   line-height: 1.45;
   container-type: inline-size;
   container-name: git-delivery-actions;
+}
+
+/* 交付步骤和错误详情在底栏上方独立滚动。 */
+.macos-ai-app .task-git-delivery-actions-scroll {
+  min-block-size: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-inline: 16px;
 }
 
 .macos-ai-app .task-git-delivery-actions small {
@@ -16377,11 +16461,11 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
 
 /* 长错误及组合动作在交付栏内完整换行，网格宽度由侧栏决定。 */
 .macos-ai-app .task-git-delivery-actions .application-error-inline-summary,
-.macos-ai-app .task-git-delivery-actions .git-delivery-combination-buttons > .zeus-button {
+.macos-ai-app .git-delivery-combination-footer > .zeus-button {
   white-space: normal;
 }
 
-.macos-ai-app .task-git-delivery-actions > .task-git-delivery-action-step {
+.macos-ai-app .task-git-delivery-actions-scroll > .task-git-delivery-action-step {
   gap: 8px;
   padding-block: 12px;
   border-block-end: 1px solid var(--zeus-control-border);
@@ -16401,7 +16485,7 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   font-size: 13px;
 }
 
-/* 组合设置与独立动作都使用原有按钮的键盘、忙碌和禁用状态。 */
+/* 独立动作在各分组标题的同一右边线上。 */
 .macos-ai-app .task-git-delivery-step-heading > .zeus-button {
   flex: none;
   margin-inline-start: auto;
@@ -16456,12 +16540,12 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   gap: 4px;
 }
 
-/* 分支、命令和交付后状态使用同一标签列，多仓目标沿控件列展开。 */
+/* 分支、命令和任务状态共用标签列，选择器占用剩余宽度。 */
 .macos-ai-app .task-git-delivery-field-row {
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr);
+  grid-template-columns: clamp(86px, 36%, 144px) minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 .macos-ai-app .task-git-delivery-field-row > span {
   color: var(--zeus-product-muted);
@@ -16471,36 +16555,31 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
   min-inline-size: 0;
 }
 
-/* 组合选择和附属 AI 选项各占一行，避免与独立执行按钮混排。 */
-.macos-ai-app .task-git-delivery-actions > .git-delivery-workflow {
-  margin-inline: -16px;
-  padding: 12px 16px 16px;
-  border: 0;
-  background: color-mix(in srgb, var(--zeus-product-text) 3%, var(--zeus-product-panel));
+/* 每个收尾开关和对应选择器各占一行。 */
+.git-delivery-follow-up-fields {
+  display: grid;
+  gap: 5px;
+  margin-block-start: 4px;
 }
-.macos-ai-app .git-delivery-workflow > .task-git-delivery-step-heading > .zeus-button[data-zeus-primitive='button'] {
-  inline-size: 28px;
-  min-inline-size: 28px;
-  padding: 4px;
-}
-.macos-ai-app .git-delivery-workflow > .task-git-delivery-step-heading > .zeus-button:not(:hover):not(:focus-visible) {
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
+
+/* 组合区与底栏共用窗口底色，以底栏边界分隔。 */
+.macos-ai-app .task-git-delivery-actions-scroll > .git-delivery-workflow {
+  padding-block-end: 16px;
+  border-block-end: 0;
 }
 .git-delivery-workflow-steps,
 .git-delivery-workflow-options {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px 24px;
+  gap: 10px 20px;
 }
 .git-delivery-workflow-steps {
   padding-block: 2px;
   font-weight: 500;
 }
 .git-delivery-workflow-options {
-  color: var(--zeus-product-muted);
+  color: var(--zeus-product-text);
   font-size: 11px;
   margin-block-end: 2px;
 }
@@ -16624,12 +16703,13 @@ body[data-surface='task-git-delivery'] .task-git-merge-header :where(button, inp
 /* 合入结果并入标题栏，使用中性入口，不再单独铺设提示横幅。 */
 .macos-ai-app .task-git-merge-header.has-results > span {
   flex: 1;
-  min-inline-size: 0;
 }
 
-/* 长标题与分支名在标题栏内省略，保留结果入口与关闭按钮的可用空间。 */
-.macos-ai-app .task-git-merge-header.has-results > span > strong,
-.macos-ai-app .task-git-merge-header.has-results > span > small {
+/* 长标题与分支名在标题栏内省略，给窗口操作留出空间。 */
+.macos-ai-app .task-git-delivery-modal > .task-git-merge-header > span {
+  min-inline-size: 0;
+}
+.macos-ai-app .task-git-delivery-modal > .task-git-merge-header > span > :is(strong, small) {
   min-inline-size: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -23768,17 +23848,16 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
 .git-delivery-combination {
   min-inline-size: 0;
 }
-.git-delivery-combination-buttons {
-  position: sticky;
-  inset-block-end: -16px;
-  z-index: 1;
-  display: flex;
-  gap: 6px;
-  padding-block: 4px 0;
-  background: color-mix(in srgb, var(--zeus-product-text) 3%, var(--zeus-product-panel));
+.git-delivery-combination:empty {
+  display: none;
 }
-.git-delivery-combination-buttons > :first-child {
-  flex: 1;
+/* 底栏与滚动区各有独立边界，最后一项可完全滚到底栏上方。 */
+.git-delivery-combination-footer {
+  border-block-start: 1px solid var(--zeus-control-border);
+  padding: 8px 16px;
+}
+.git-delivery-combination-footer > .zeus-button {
+  inline-size: 100%;
 }
 .git-delivery-run {
   min-inline-size: 0;
@@ -23833,7 +23912,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
 .git-delivery-checkbox input {
   flex: none;
 }
-/* 提交关闭后保留偏好，但明确显示 AI 选项不可用。 */
+/* 禁用时保留原勾选偏好，并降低控件和文字的对比度。 */
 .git-delivery-checkbox[aria-disabled='true'] {
   opacity: 0.6;
 }
@@ -23882,20 +23961,15 @@ html[data-zeus-theme='dark'] body > .macos-ai-app .native-switch-input {
   background: transparent;
   box-shadow: none;
 }
-/* 窄栏压缩标签列并允许组合选项换行，不裁剪命令名称和执行按钮。 */
+/* 窄栏收紧列距，较长的组合选项可换行。 */
 @container git-delivery-actions (max-width: 300px) {
   .macos-ai-app .task-git-delivery-field-row {
-    grid-template-columns: 64px minmax(0, 1fr);
     gap: 8px;
   }
   .git-delivery-workflow-steps,
   .git-delivery-workflow-options {
     column-gap: 16px;
   }
-}
-/* 未勾选推送时保留命令偏好，灰化说明本次组合不会执行这些命令。 */
-.git-delivery-command-selection[data-enabled='false'] {
-  opacity: 0.6;
 }
 .git-delivery-conflict-dialog {
   inline-size: min(1200px, 94vw);

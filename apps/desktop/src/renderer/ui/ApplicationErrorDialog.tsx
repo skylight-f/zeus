@@ -1,7 +1,8 @@
 import { MotionPresence } from './MotionPresence.js';
 import { Collapsible } from './Collapsible.js';
-import { describeUserFacingError, faultReportContext, faultReportDetails, normalizeFaultReportInput, redactUserFacingErrorDetails, type FaultReportInput, type FaultReportReceipt } from '@zeus/shared';
+import { describeUserFacingError, faultReportContext, faultReportDetails, normalizeFaultReportInput, readCommandDeliveryDiagnostic, redactUserFacingErrorDetails, type FaultReportInput, type FaultReportReceipt } from '@zeus/shared';
 import { useEffect, useRef, useState } from 'react';
+import { CheckIcon } from '@phosphor-icons/react/dist/csr/Check';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import { Button } from './Button.js';
 import { ModalPortal } from './ModalPortal.js';
@@ -75,6 +76,11 @@ const copyByLanguage = {
     details: '查看详情',
     hideDetails: '收起详情',
     close: '关闭',
+    report: '上报故障',
+    reporting: '上报中…',
+    reported: '已上报',
+    retryReport: '重试上报',
+    reportTooltip: '发送脱敏错误、环境和运行事件，不含对话正文、源码或截图',
     detailTitle: '错误日志',
     occurredAt: '时间',
     severity: '级别',
@@ -90,6 +96,11 @@ const copyByLanguage = {
     details: 'View Details',
     hideDetails: 'Hide Details',
     close: 'Close',
+    report: 'Report issue',
+    reporting: 'Reporting…',
+    reported: 'Reported',
+    retryReport: 'Retry report',
+    reportTooltip: 'Send redacted errors, environment and runtime events; excludes conversations, source and screenshots',
     detailTitle: 'Error log',
     occurredAt: 'Time',
     severity: 'Level',
@@ -259,10 +270,11 @@ export function reportApplicationError(error: unknown, options: ApplicationError
       operation: operation ?? '',
       stack: diagnosticErrorStack(error) || original,
       context: { ...applicationErrorContext, ...faultReportContext(error) },
+      commandDelivery: readCommandDeliveryDiagnostic(error),
     }),
   };
   /** 重新查看同一故障时保留报告身份和回执，不再次创建 Issue。 */
-  entry.dedupeKey += `\n${JSON.stringify(entry.report.context)}`;
+  entry.dedupeKey += `\n${JSON.stringify(entry.report.context)}\n${entry.report.commandDelivery?.outboxId ?? ''}`;
   const duplicate = queue.find((candidate) => candidate.language === entry.language && candidate.dedupeKey === entry.dedupeKey);
   if (options.showDetails) {
     const visible = duplicate ?? entry;
@@ -326,15 +338,14 @@ async function submitCurrentFault(entry: ApplicationErrorEntry): Promise<void> {
 export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLanguage }) {
   const [, forceRender] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  /** 上报按钮移除后，键盘焦点可回到仍可操作的关闭入口。 */
+  /** 上报动作禁用前，将该按钮上的焦点移至关闭按钮。 */
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const current = queue[0];
   useEffect(() => subscribe(() => forceRender((value) => value + 1)), []);
   useEffect(() => setDetailsOpen(current?.showDetails ?? false), [current?.id, current?.showDetails]);
-  useEffect(() => {
-    if (current?.receipt && document.activeElement === document.body) closeButtonRef.current?.focus();
-  }, [current?.receipt]);
   const copy = copyByLanguage[current?.language ?? props.language];
+  /** 同一按钮依次表达上报、发送、回执和重试。 */
+  const reportLabel = current?.receipt ? copy.reported : current?.reporting ? copy.reporting : current?.reportError ? copy.retryReport : copy.report;
   return (
     <MotionPresence>
       {current ? (
@@ -365,9 +376,9 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
                   <pre data-zeus-selectable="text">{current.details}</pre>
                 </section>
               </Collapsible>
-              {current.receipt || current.reportError ? (
+              {current.reportError ? (
                 <p className="application-error-report-status" role="status" aria-live="polite">
-                  {current.reportError || (current.language === 'zh-CN' ? '已上报' : 'Reported')}
+                  {current.reportError}
                 </p>
               ) : null}
             </div>
@@ -375,26 +386,24 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
               <Button variant="secondary" size="regular" onClick={() => setDetailsOpen((open) => !open)} aria-expanded={detailsOpen} aria-controls="application-error-dialog-details-title">
                 {detailsOpen ? copy.hideDetails : copy.details}
               </Button>
-              {!current.receipt ? (
-                <Button
-                  size="regular"
-                  busy={current.reporting}
-                  onClick={() => submitCurrentFault(current)}
-                  data-icon-tooltip={current.language === 'zh-CN' ? '发送脱敏错误、环境和运行事件，不含对话正文、源码或截图' : 'Send redacted errors, environment and runtime events; excludes conversations, source and screenshots'}
-                >
-                  {current.reporting
-                    ? current.language === 'zh-CN'
-                      ? '上报中…'
-                      : 'Reporting…'
-                    : current.reportError
-                      ? current.language === 'zh-CN'
-                        ? '重试上报'
-                        : 'Retry report'
-                      : current.language === 'zh-CN'
-                        ? '上报故障'
-                        : 'Report issue'}
-                </Button>
-              ) : null}
+              <Button
+                size="regular"
+                className="application-error-report-button"
+                busy={current.reporting}
+                disabled={Boolean(current.receipt)}
+                data-reported={current.receipt ? 'true' : undefined}
+                data-icon-tooltip={current.receipt ? undefined : copy.reportTooltip}
+                onClick={(event) => {
+                  if (event.currentTarget === document.activeElement) closeButtonRef.current?.focus();
+                  void submitCurrentFault(current);
+                }}
+              >
+                {current.receipt ? <CheckIcon weight="bold" aria-hidden="true" /> : null}
+                {reportLabel}
+              </Button>
+              <span className="visually-hidden" role="status">
+                {current.receipt ? copy.reported : ''}
+              </span>
               {current.code === 'ZEUS_CODEX_LOGIN_REQUIRED' || current.code === 'ZEUS_NEW_PROJECT_MODEL_UNAVAILABLE' ? (
                 <Button
                   variant="primary"

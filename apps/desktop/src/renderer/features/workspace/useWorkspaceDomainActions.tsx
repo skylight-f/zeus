@@ -2,6 +2,7 @@ import { transitionConversation } from '../../session/conversationTransition.js'
 import { beginConversationNavigationTrace } from '../../performanceTraceContext.js';
 import { markSideQuestionConversationArchived, restoreSideQuestionWorkspace } from '../../session/useSessionContextWorkspace.js';
 import { useBackgroundInputSuggestions } from '../../session/useBackgroundInputSuggestions.js';
+import { isLocalNetworkOffline } from '../../session/conversationSystemMessages.js';
 import { notifyProjectGitChanged } from '../../git/projectGitWorkbenchState.js';
 import { isZentaoDestinationComplete, type ZentaoTaskDestination } from '../../task/ZentaoSyncModal.js';
 import { modelCatalogGeneration } from '../integrations/modelCatalogEvents.js';
@@ -27,7 +28,17 @@ import {
   type ZeusRealtimeEvent,
 } from '../../apiClient.js';
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { describeUserFacingError, isTaskPriority, type ProjectCodeWorkspacePreference, renderTaskPushLayoutText, temporaryWorkspaceId, type ThirdPartyTaskExtract } from '@zeus/shared';
+import {
+  describeUserFacingError,
+  faultReportContext,
+  isTaskPriority,
+  type ProjectCodeWorkspacePreference,
+  readCommandDeliveryDiagnostic,
+  renderTaskPushLayoutText,
+  temporaryWorkspaceId,
+  type ThirdPartyTaskExtract,
+  userFacingErrorCause,
+} from '@zeus/shared';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation } from '../../session/ProjectConversationTree.js';
 import { focusTaskPushWindow } from '../../ui/windowDocument.js';
 import {
@@ -1620,7 +1631,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     } catch (error) {
       if (nativeConversationChoiceLoadCoordinator.isCurrent(taskId, requestVersion)) {
         const message = errorToLocalUiMessage(error, appShellSettings.appLanguage);
-        setNativeConversationChoiceTaskStates((current) => ({ ...current, [taskId]: failNativeConversationChoiceTaskLoad(current[taskId], message) }));
+        /** 分类发生在错误本地化前，草稿后续打开也能识别此结果。 */
+        const offline = isLocalNetworkOffline(error);
+        setNativeConversationChoiceTaskStates((current) => ({ ...current, [taskId]: failNativeConversationChoiceTaskLoad(current[taskId], message, offline) }));
       }
       throw error;
     }
@@ -1641,7 +1654,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       return merged;
     } catch (error) {
       if (nativeProjectConversationChoiceLoadCoordinator.isCurrent(projectId, requestVersion)) {
-        setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], errorToLocalUiMessage(error, appShellSettings.appLanguage)) }));
+        /** 分类发生在读取失败时，联网后不重新解释旧错误。 */
+        const offline = isLocalNetworkOffline(error);
+        setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], errorToLocalUiMessage(error, appShellSettings.appLanguage), offline) }));
       }
       throw error;
     }
@@ -2039,6 +2054,19 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     }
   }
 
+  /** 保留原始请求身份，展示文字仍由现有错误解释器生成。 */
+  function conversationStartFailure(error: unknown): NativeConversationStartFailure {
+    const cause = userFacingErrorCause(error);
+    return {
+      state: 'failed',
+      message: redactLocalUiErrorMessage(errorToLocalUiMessage(error, appShellSettings.appLanguage)),
+      code: cause.code,
+      cause,
+      traceId: faultReportContext(error).traceId,
+      commandDelivery: readCommandDeliveryDiagnostic(error),
+    };
+  }
+
   async function startNativeConversation(input: SessionWorkspaceStartInput): Promise<boolean | NativeConversationStartPreparation | NativeConversationStartFailure> {
     /** 创建回执只能接续发起时的导航，不能覆盖之后的会话选择。 */
     const selectionRevision = nativeConversationSelectionRevision.current;
@@ -2059,9 +2087,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           },
         };
       } catch (error) {
-        const message = redactLocalUiErrorMessage(errorToLocalUiMessage(error, appShellSettings.appLanguage));
         setNativeConversationChoiceTaskStates((current) => ({ ...current, [input.task.id]: completeNativeConversationChoiceTaskLoad(current[input.task.id]) }));
-        return { state: 'failed', message, code: error instanceof ZeusApiError ? (error.error ?? undefined) : undefined };
+        return conversationStartFailure(error);
       }
     }
     let refreshError: unknown | null = null;
@@ -2105,22 +2132,21 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       });
       refreshError = result.refreshError;
     } catch (error) {
+      if (input.source === 'code_review') {
+        setNativeConversationChoiceTaskStates((current) => ({ ...current, [input.task.id]: completeNativeConversationChoiceTaskLoad(current[input.task.id]) }));
+        return conversationStartFailure(error);
+      }
       if (isDefinitiveNativeConversationStartRejection(error)) {
         const rejectedRequest = nativeConversationStartEnvelopeManager.pending(input.task);
         if (rejectedRequest) nativeConversationStartEnvelopeManager.discardPending(input.task, rejectedRequest);
-      }
-      const message = redactLocalUiErrorMessage(errorToLocalUiMessage(error, appShellSettings.appLanguage));
-      if (input.source === 'code_review') {
-        setNativeConversationChoiceTaskStates((current) => ({ ...current, [input.task.id]: completeNativeConversationChoiceTaskLoad(current[input.task.id]) }));
-        return { state: 'failed', message, code: error instanceof ZeusApiError ? (error.error ?? undefined) : undefined };
       }
       setNativeConversationChoiceTaskStates((current) => ({
         ...current,
         [input.task.id]: completeNativeConversationChoiceTaskLoad(current[input.task.id]),
       }));
-      return { state: 'failed', message, code: error instanceof ZeusApiError ? (error.error ?? undefined) : undefined };
+      return conversationStartFailure(error);
     }
-    if (refreshError) {
+    if (refreshError && !isLocalNetworkOffline(refreshError)) {
       setNativeConversationChoiceTaskStates((current) => ({
         ...current,
         [input.task.id]: failNativeConversationChoiceTaskLoad(current[input.task.id], 'Conversation started. History refresh will retry later.'),
@@ -2179,14 +2205,13 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       });
       refreshError = result.refreshError;
     } catch (error) {
-      const message = redactLocalUiErrorMessage(errorToLocalUiMessage(error, appShellSettings.appLanguage));
       setNativeConversationChoiceProjectStates((current) => ({
         ...current,
         [projectId]: completeNativeConversationChoiceTaskLoad(current[projectId]),
       }));
-      return { state: 'failed', message, code: error instanceof ZeusApiError ? (error.error ?? undefined) : undefined };
+      return conversationStartFailure(error);
     }
-    if (refreshError) {
+    if (refreshError && !isLocalNetworkOffline(refreshError)) {
       setNativeConversationChoiceProjectStates((current) => ({
         ...current,
         [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], 'Conversation started. History refresh will retry later.'),
@@ -2246,7 +2271,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         window.history.replaceState(null, '', '#project-sessions');
       }
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-    }).catch((error: unknown) => recordLocalError('temporary-conversation-start', error));
+    }).catch((error: unknown) => {
+      if (!isLocalNetworkOffline(error)) recordLocalError('temporary-conversation-start', error);
+    });
   };
 
   const selectNewConversationProject = async (projectId: string): Promise<void> => {
@@ -2255,7 +2282,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       try {
         project = await ensureTemporaryWorkspace();
       } catch (error) {
-        recordLocalError('temporary-conversation-start', error);
+        if (!isLocalNetworkOffline(error)) recordLocalError('temporary-conversation-start', error);
         return;
       }
     }

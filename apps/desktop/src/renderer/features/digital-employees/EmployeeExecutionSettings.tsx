@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import type { EmployeeWorkSettings } from '@zeus/shared';
+import { codexServiceTierLabel } from '../../session/serviceTierSelection.js';
 import { ZeusSelect, type ZeusSelectOption } from '../../ZeusSelect.js';
 import { compareModelOptions } from '../../modelOptionPresentation.js';
 import { Button } from '../../ui/Button.js';
@@ -147,7 +148,9 @@ export function EmployeeExecutionSettings(props: {
         {field(
           'serviceTier',
           zh ? '速度' : 'Speed',
-          select('速度', effective.serviceTier ?? '', [{ value: '', label: zh ? '标准' : 'Standard' }, ...(model?.serviceTiers ?? []).map((tier) => ({ value: tier.id, label: tier.name }))], (value) => patch({ serviceTier: value || null })),
+          select('速度', effective.serviceTier ?? '', [{ value: '', label: zh ? '标准' : 'Standard' }, ...(model?.serviceTiers ?? []).map((tier) => ({ value: tier.id, label: codexServiceTierLabel(tier, props.language) }))], (value) =>
+            patch({ serviceTier: value || null }),
+          ),
         )}
         {field(
           'workMode',

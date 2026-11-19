@@ -1,4 +1,4 @@
-import { formatEstimatedCosts } from '@zeus/shared';
+import { formatZeusDateTime, formatEstimatedCosts } from '@zeus/shared';
 import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { calculateUncachedInputTokens, type CodexLocalUsageDay, type CodexLocalUsageGroup, type CodexOfficialUsageSnapshot, type CodexUsageRange, type UsageAnalyticsSnapshot, type UsageProviderAnalytics } from '@zeus/shared';
@@ -909,11 +909,11 @@ function formatWindow(minutes: number | null, language: Language): string {
 }
 
 function formatReset(timestamp: number, language: Language): string {
-  return `${language === 'zh-CN' ? '重置于' : 'Resets'} ${new Intl.DateTimeFormat(language, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp * 1000))}`;
+  return `${language === 'zh-CN' ? '重置于' : 'Resets'} ${formatZeusDateTime(timestamp * 1000, language, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
 }
 
 function formatDateTime(value: string, language: Language): string {
-  return new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  return formatZeusDateTime(value, language, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 function formatUpdatedAt(value: string, language: Language): string {

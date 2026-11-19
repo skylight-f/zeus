@@ -27,6 +27,12 @@ export default defineConfig(({ command }) => ({
               priority: 110,
             },
             {
+              // 查询缓存继承外部存储；把这两个模块留在独立分块，避免业务分块之间的循环依赖打乱初始化顺序。
+              name: 'query-store-runtime',
+              test: /src[\\/]renderer[\\/](?:cachedQuery|externalStore)\.ts$/u,
+              priority: 105,
+            },
+            {
               name: 'react-runtime',
               test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/u,
               priority: 100,

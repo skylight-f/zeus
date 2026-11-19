@@ -7,6 +7,8 @@ export * from './taskDeadline.js';
 export * from './automationNotifications.js';
 /** 自动化表单、配置存储和调度器共用时间转换与校验。 */
 export * from './automationTime.js';
+/** 桌面视图与原生状态提示共用 24 小时时钟。 */
+export * from './dateTimeFormat.js';
 export * from './notifications.js';
 import type { UserFacingErrorCause } from './userFacingError.js';
 /** Zeus 任务状态：只描述真实任务生命周期，不承载任何示例或 mock 业务数据。 */
@@ -14,7 +16,11 @@ export * from './taskPush.js';
 export * from './temporaryWorkspace.js';
 export * from './codexUsage.js';
 export * from './codexMcp.js';
+/** 会话和独立生成入口共用 Codex 加速档位。 */
+export * from './codexServiceTier.js';
 export * from './modelPricing.js';
+export * from './meteredPricing.js';
+export * from './modelPricingProfile.js';
 export * from './commandEnvelope.js';
 export * from './commandGovernance.js';
 export * from './executionHostStopCommand.js';
@@ -165,6 +171,24 @@ export const defaultTaskManagementStatusLabels: Record<'zh-CN' | 'en-US', Record
   'zh-CN': { todo: '待开始', in_development: '开发中', in_testing: '测试中', awaiting_acceptance: '待验收', blocked: '已阻塞', completed: '已完成', cancelled: '已取消' },
   'en-US': { todo: 'To do', in_development: 'In development', in_testing: 'In testing', awaiting_acceptance: 'Awaiting acceptance', blocked: 'Blocked', completed: 'Completed', cancelled: 'Cancelled' },
 };
+
+/** 新建状态在用户命名前使用系统提供的占位名。 */
+export const newTaskManagementStatusLabels = { 'zh-CN': '新状态', 'en-US': 'New status' } as const;
+
+/** 按界面语言显示系统默认名称，用户自定义名称直接显示。 */
+export function formatTaskManagementStatusLabel(status: Pick<TaskManagementStatusDefinition, 'id' | 'label'>, language: 'zh-CN' | 'en-US'): string {
+  /** 状态标识用于区分同名的内置状态和自定义状态。 */
+  const { id } = status;
+  /** 状态标签沿用设置中的首尾空白处理。 */
+  const label = status.label?.trim();
+  if (Object.hasOwn(defaultTaskManagementStatusLabels['en-US'], id) && (!label || label === defaultTaskManagementStatusLabels['zh-CN'][id] || label === defaultTaskManagementStatusLabels['en-US'][id])) {
+    return defaultTaskManagementStatusLabels[language][id] ?? id;
+  }
+  if (id.startsWith('status_') && (label === newTaskManagementStatusLabels['zh-CN'] || label === newTaskManagementStatusLabels['en-US'])) {
+    return newTaskManagementStatusLabels[language];
+  }
+  return label || id;
+}
 
 /** 仅相同标识和颜色可以等价，用户自定义文案与不同颜色仍保留独立含义。 */
 export function taskManagementStatusDefinitionsEquivalent(left: TaskManagementStatusDefinition, right: TaskManagementStatusDefinition): boolean {
@@ -881,6 +905,7 @@ export * from './distribution.js';
 
 export * from './conversationCapabilities.js';
 export * from './faultReport.js';
+export * from './commandDeliveryDiagnostic.js';
 export * from './employeeWorkPlanning.js';
 export * from './employeeIdentity.js';
 export * from './automationActions.js';

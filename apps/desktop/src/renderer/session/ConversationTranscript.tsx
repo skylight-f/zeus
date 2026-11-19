@@ -1931,7 +1931,12 @@ export function SystemMessageNotice(props: { message: ConversationSystemMessageI
     <ConversationNotice label={props.language === 'zh-CN' ? 'Zeus 系统消息' : 'Zeus system message'} role={props.message.recoveredAt ? 'status' : 'alert'}>
       <span>
         <span>{props.language === 'zh-CN' ? 'Zeus 系统消息 · ' : 'Zeus · '}</span>
-        <VisibleApplicationError error={props.message.detail} summary={props.message.summary} title={props.language === 'zh-CN' ? 'Zeus 系统消息' : 'Zeus system message'} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+        <VisibleApplicationError
+          error={{ message: props.message.detail, code: props.message.errorCode, traceId: props.message.traceId, operation: props.message.operation, occurredAt: props.message.occurredAt, commandDelivery: props.message.commandDelivery }}
+          summary={props.message.summary}
+          title={props.language === 'zh-CN' ? 'Zeus 系统消息' : 'Zeus system message'}
+          language={props.language === 'zh-CN' ? 'zh-CN' : 'en'}
+        />
       </span>
       {!props.message.recoveredAt && props.onRetry ? (
         <Button unstyled type="button" disabled={pending || props.busy} onClick={() => retry()}>
@@ -2557,8 +2562,8 @@ function renderTranscriptRow(row: TranscriptRow, options: TranscriptRowRenderOpt
 
 function TranscriptV2ContentBoundary(props: { item: NativeSessionItemBuffer; language: SessionUiLanguage; onLoadContent?: (handle: string) => Promise<void>; children: ReactNode }): ReactNode {
   const handle = typeof props.item.payload.v2ContentHandle === 'string' && props.item.payload.v2ContentHandle ? props.item.payload.v2ContentHandle : null;
-  // 轮次过程展开后，思考正文和普通阶段说明共用全文加载，不再要求第二次展开。
-  const truncated = (props.item.payload.v2ContentKind === 'model_history' || isReasoningProcessText(props.item)) && props.item.payload.v2ContentTruncated === true;
+  // 过程展开后规则与思考正文共用全文加载，长规则不截断为预览或要求第二次展开。
+  const truncated = (props.item.payload.v2ContentKind === 'model_history' || isReasoningProcessText(props.item) || normalizeItemType(props.item.type) === 'contextupdate') && props.item.payload.v2ContentTruncated === true;
   const canLoad = Boolean(handle && props.onLoadContent);
   const loadError = nativeSessionErrorFrom(props.item.payload.v2ContentLoadError);
   const [retrying, setRetrying] = useState(false);
@@ -2637,12 +2642,8 @@ export function transcriptRunStatus(state: NativeSessionState): 'starting' | 'ch
   // 切回会话需要重新订阅和读取权威状态，只有明确的重连状态才说明连接中断。
   if (state.transportState === 'reconnecting') return 'reconnecting';
   if (state.transportState !== 'ready') {
-    // 切回时先展示同轮已缓存的摘要，不等待联网；静态文字不代表模型仍在运行。
-    return ['disconnected', 'connecting', 'hydrating'].includes(state.transportState) &&
-      state.snapshot?.id === state.conversationId &&
-      (state.conversationState === 'active_prework' || state.conversationState === 'active_final_answer') &&
-      state.currentReasoningItem?.turnId === state.activeTurnId &&
-      latestReasoningSummaryText(state.currentReasoningItem)
+    // 活动快照先显示同轮摘要或执行状态，实时事件就绪后再开启扫光。
+    return ['disconnected', 'connecting', 'hydrating'].includes(state.transportState) && state.snapshot?.id === state.conversationId && (state.conversationState === 'active_prework' || state.conversationState === 'active_final_answer')
       ? 'cached_summary'
       : null;
   }
@@ -2666,14 +2667,15 @@ function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonN
     const timer = window.setTimeout(() => setReconnectStatusVisible(true), 10_000);
     return () => window.clearTimeout(timer);
   }, [props.kind]);
-  if (props.kind === 'reconnecting' && !reconnectStatusVisible) return null;
+  /** 短暂恢复时保留最近有效摘要，持续断开后由连接提示接管同一行。 */
+  const reconnectPending = props.kind === 'reconnecting' && !reconnectStatusVisible;
+  if (reconnectPending && !props.summaryText) return null;
   // 整理状态与活动记录沿用同一套用户表述，由当前状态位置统一承载进度。
   const labels = {
     starting: ['正在准备', 'Preparing'],
     checking_plugin: ['正在等待 Plugin Hook 检查', 'Waiting for Plugin Hook checks'],
     executing: ['正在执行', 'Executing'],
-    // 缓存态只展示已有摘要，缺少摘要时不会进入此状态。
-    cached_summary: ['', ''],
+    cached_summary: ['正在执行', 'Executing'],
     compacting: ['正在整理较早对话以继续工作', 'Organizing earlier conversation to continue'],
     waiting_input: ['等待回答，请处理问题表单', 'Waiting for your answer'],
     waiting_approval: ['等待审批，请处理审批事项', 'Waiting for your approval'],
@@ -2686,10 +2688,12 @@ function TranscriptActiveStatus(props: { language: SessionUiLanguage; kind: NonN
         ? `正在连接... (${props.reconnectAttempt}/${props.reconnectAttempts})`
         : `Connecting... (${props.reconnectAttempt}/${props.reconnectAttempts})`
       : labels[props.kind][props.language === 'zh-CN' ? 0 : 1];
+  /** 静态摘要保持原来的位置，扫光只跟随已确认的实时状态。 */
+  const summaryText = props.kind === 'executing' || props.kind === 'cached_summary' || reconnectPending ? props.summaryText : undefined;
   return (
     <p className="session-transcript-thinking" role="status" aria-live="polite">
-      {props.kind === 'reconnecting' ? sessionConnectionSymbol : null}
-      <SessionSweepText className="session-current-status-text" text={(props.kind === 'executing' || props.kind === 'cached_summary') && props.summaryText ? props.summaryText : retryLabel} active={props.kind !== 'cached_summary'} />
+      {props.kind === 'reconnecting' && !reconnectPending ? sessionConnectionSymbol : null}
+      <SessionSweepText className="session-current-status-text" text={summaryText || retryLabel} active={props.kind !== 'cached_summary' && !reconnectPending} />
     </p>
   );
 }
@@ -3202,8 +3206,8 @@ function isTurnProcessRow(row: TranscriptRow, collapseAssistantMessages = false)
   if (isRecoveredRequestUserInputItem(row.item) || (itemRole(row.item) === 'assistant' && classifyAssistantMessage(row.item.payload, row.item.phase) === 'question')) return false;
   // 计划和明确交付资源属于最终产物，必须独立展示，不能折叠进“已处理”过程。
   if (row.item.type === 'plan' || isAssistantDeliverableItem(row.item)) return false;
-  // 思考内容保留独立的次要层级，不能冒充面向用户的进展说明。
-  if (normalizeItemType(row.item.type) === 'reasoning') return true;
+  // 思考与规则更新都归入处理过程，实际类型分别保留。
+  if (normalizeItemType(row.item.type) === 'reasoning' || normalizeItemType(row.item.type) === 'contextupdate') return true;
   // 运行中助手消息从创建起固定在主会话，完成后才将非最终说明收进过程。
   if (itemRole(row.item) === 'assistant' || itemRole(row.item) === 'commentary') return collapseAssistantMessages && !isFinalAnswerItem(row.item);
   // 明确失败需要直接可见，不能因为没有最终答复而藏进过程入口。

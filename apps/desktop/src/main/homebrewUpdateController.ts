@@ -1,9 +1,9 @@
-import { describeUserFacingError, redactUserFacingErrorDetails } from '@zeus/shared';
+import { formatZeusDateTime, describeUserFacingError, redactUserFacingErrorDetails } from '@zeus/shared';
 import type { DesktopReleaseUpdateStatus, ReleaseUpdateService } from './releaseUpdateService.js';
 import { type HomebrewInstalledUpdate, type HomebrewPreparedUpdate, type HomebrewUpdateProgress, type HomebrewUpdateService } from './homebrewUpdateService.js';
 import { createNativeUpdateProgressHost, type NativeUpdateProgressHost, type NativeUpdateProgressState } from './nativeUpdateProgress.js';
 
-/** 已下载待手动安装与可直接重启安装是两个不同状态。 */
+/** 已校验等待安装与已确认需要手动安装是两个不同状态。 */
 export type HomebrewUpdateIndicatorPhase = 'idle' | 'available' | 'manual' | 'downloaded' | 'preparing' | 'retrying' | 'ready' | 'failed';
 
 export interface HomebrewUpdateIndicatorState {
@@ -53,7 +53,7 @@ interface CreateHomebrewUpdateControllerOptions {
   retryDelaysMs?: readonly number[];
 }
 
-/** 窗口状态区分下载完成和自动安装准备完成。 */
+/** 窗口状态区分已校验的安装包、已确认的手动安装和正在安装。 */
 type ControllerPhase = 'idle' | 'checking' | 'available' | 'manual' | 'downloaded' | 'preparing' | 'ready' | 'installing' | 'failed' | 'upToDate';
 
 /** 失败阶段决定提示与可执行动作，不从失败状态推断下载故障。 */
@@ -156,6 +156,8 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
 
   /** 后台检查也保存当前窗口状态，用户中途打开时立即显示真实检查进度。 */
   async function checkForUpdate(present: boolean, updateIndicator: boolean): Promise<DesktopReleaseUpdateStatus | null> {
+    /** 已确认要手动安装时，同一版本复用该决定，无需再次查询安装条件。 */
+    const manualVersion = phase === 'downloaded' ? indicatorState.latestVersion : null;
     phase = 'checking';
     lastFailureStep = 'check';
     await publish(copyFor(options.language(), 'checking', options.currentVersion));
@@ -178,10 +180,9 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         await publishManualUpdate(update);
         return update;
       }
-      // 检查和下载不查询包管理器，安装方式只在用户发起安装后确定。
       if (prepared && samePreparedUpdate(prepared, update)) {
-        // 安装条件只决定已下载更新的后续动作，不阻止下载本身。
-        if (prepared.method === 'direct' && (await options.direct.manualInstallReason(update))) {
+        // Windows 仍复查安装目录是否可写，目录权限可能在两次检查之间恢复。
+        if (prepared.method === 'direct' && (process.platform === 'win32' ? await options.direct.manualInstallReason(update) : update.latestVersion === manualVersion)) {
           await publishManualUpdate(update);
           return update;
         }
@@ -231,7 +232,8 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
         if (!result.accepted) throw new Error(result.reason);
         prepared = { method: 'direct', update: result.update };
         currentUpdate = result.update;
-        if (await options.direct.manualInstallReason(result.update)) {
+        // macOS 的安装管理方式只在用户发起安装后确认，已校验的下载可独立就绪。
+        if (process.platform === 'win32' && (await options.direct.manualInstallReason(result.update))) {
           await publishManualUpdate(result.update);
           return;
         }
@@ -331,12 +333,17 @@ export function createHomebrewUpdateController(options: CreateHomebrewUpdateCont
 
   /** 用户打开安装包前恢复并复验磁盘缓存，重启后不依赖已丢失的内存下载记录。 */
   async function openDownloadedUpdate(): Promise<void> {
+    /** 刷新同一版本后仍执行用户选中的手动安装动作，新版本需要重新选择。 */
+    const manualVersion = phase === 'downloaded' ? indicatorState.latestVersion : null;
     await checkAndPrepareUpdate(false);
     try {
       // 安装条件已恢复时，旧窗口的“打开安装包”动作也进入同一次安全重启安装。
       if (process.platform === 'win32' && phase === 'ready' && prepared?.method === 'direct') {
         await installPreparedUpdate();
         return;
+      }
+      if (process.platform === 'darwin' && phase === 'ready' && prepared?.method === 'direct' && prepared.update.latestVersion === manualVersion) {
+        await publishManualUpdate(prepared.update);
       }
       if (phase !== 'downloaded' || prepared?.method !== 'direct') {
         await showCurrent();
@@ -528,12 +535,13 @@ function indicatorForRetry(language: 'zh-CN' | 'en-US', update: DesktopReleaseUp
   };
 }
 
+/** 已验证安装包可供安装，具体安装方式由用户操作触发。 */
 function indicatorForReady(language: 'zh-CN' | 'en-US', update: DesktopReleaseUpdateStatus): Omit<HomebrewUpdateIndicatorState, 'updatedAt'> {
   return {
     phase: 'ready',
     currentVersion: update.currentVersion,
     latestVersion: update.latestVersion,
-    detail: language === 'zh-CN' ? `Zeus ${update.latestVersion} 已下载并通过校验，等待你决定何时重启。` : `Zeus ${update.latestVersion} is downloaded and verified, waiting for you to choose when to restart.`,
+    detail: language === 'zh-CN' ? `Zeus ${update.latestVersion} 已下载并通过校验。` : `Zeus ${update.latestVersion} is downloaded and verified.`,
     progress: 1,
   };
 }
@@ -598,7 +606,15 @@ function copyFor(language: 'zh-CN' | 'en-US', state: 'checking' | 'available' | 
     return {
       state,
       title: zh ? '更新已下载' : 'Update Downloaded',
-      detail: zh ? `Zeus ${latestVersion} 已下载并通过校验。点击“立即重启”后才会安装并切换到新版。` : `Zeus ${latestVersion} has been downloaded and verified. It will only be installed after you choose Restart Now.`,
+      detail: zh ? `Zeus ${latestVersion} 已下载并通过校验。` : `Zeus ${latestVersion} is downloaded and verified.`,
+    };
+  }
+  // Windows 安装器在旧进程退出以后才会替换文件。
+  if (process.platform === 'win32') {
+    return {
+      state,
+      title: zh ? '正在准备安装' : 'Preparing to Install',
+      detail: zh ? 'Zeus 退出后会自动安装，完成后会重新打开。' : 'The update will install after Zeus closes. Zeus will reopen when installation is complete.',
     };
   }
   return {
@@ -764,7 +780,7 @@ function formatRateNumber(value: number): string {
 }
 
 function formatLocalTime(value: string, language: 'zh-CN' | 'en-US'): string {
-  return new Intl.DateTimeFormat(language, { hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+  return formatZeusDateTime(value, language, { hour: '2-digit', minute: '2-digit' });
 }
 
 /** Release 检查只读取外部事实；临时失败允许两次短间隔重试。 */

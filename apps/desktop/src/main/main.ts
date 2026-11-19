@@ -36,7 +36,7 @@ import { promisify } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { type BeforeQuitCleanupFailureAction, createBeforeQuitCleanupHandler, type DesktopLocalServerCloseMode } from './beforeQuitCleanup.js';
-import { withCloseTimeout } from './executionHostClosePlan.js';
+import { desktopExecutionHostCloseTimeoutMs, withCloseTimeout } from './executionHostClosePlan.js';
 import type { DesktopLocalServerRuntime, ExecutionHostMaintenanceStatus } from './localServerRuntime.js';
 import { createStartupCoordinator } from './startupCoordinator.js';
 import { createRendererBootstrapMonitor } from './rendererBootstrapMonitor.js';
@@ -59,6 +59,7 @@ import { defaultMainWindowSize, findSavedWindowDisplay, minimumMainWindowSize, t
 import { waitForSavedWindowDisplay } from './windowRestoration.js';
 import { createPersistentWindow } from './persistentWindow.js';
 import { activeSystemWindow, registerSystemWindowIpc, systemWindowOpenHandler } from './systemWindows.js';
+import { registerConversationAudio } from './conversationAudio.js';
 import { resolveTestDisplayPlacement } from './testDisplayPlacement.js';
 import {
   buildTaskAttachmentPreviewDataUrl,
@@ -483,11 +484,13 @@ function desktopDisplayName(): string {
   return isTestDistribution() ? testDistributionName : app.isPackaged ? distributionAppName : developmentDistributionName;
 }
 
-function broadcastAutomaticUpdateIndicator(state: HomebrewUpdateIndicatorState): void {
-  automaticUpdateIndicatorState = { ...state };
+/** 退出清理时撤下侧栏入口，并忽略在途检查的后续更新。 */
+function broadcastAutomaticUpdateIndicator(state: HomebrewUpdateIndicatorState | null): void {
+  if (state && desktopShutdown.signal.aborted) return;
+  automaticUpdateIndicatorState = state ? { ...state } : undefined;
   for (const window of windows) {
     if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
-    window.webContents.send('zeus:automatic-update-indicator:changed', automaticUpdateIndicatorState);
+    window.webContents.send('zeus:automatic-update-indicator:changed', automaticUpdateIndicatorState ?? null);
   }
 }
 
@@ -896,8 +899,8 @@ function rendererEntryUrl(surface?: 'menu-bar-usage' | 'task-git-delivery' | 'pr
   return url.toString();
 }
 
-/** 编辑统一导航到现有主窗口的源码页，不创建额外编辑窗口。 */
-async function openFileSourceWorkspace(parent: BrowserWindow, target: { root: string; path: string }, request: FilePreviewRequest): Promise<void> {
+/** 编辑和目录定位共用现有主窗口的源码页。 */
+async function openFileSourceWorkspace(parent: BrowserWindow, target: { root: string; path: string; directoryPath?: string }, request: FilePreviewRequest): Promise<void> {
   /** 优先返回发起操作的主窗口；独立交付窗口回到现有应用主窗口。 */
   const owner = windows.has(parent) ? parent : [...windows].find((candidate) => !candidate.isDestroyed());
   if (!owner || owner.isDestroyed()) throw new Error('主窗口不可用，请先打开 Zeus 主界面。');
@@ -920,9 +923,11 @@ async function openFileSourceWorkspace(parent: BrowserWindow, target: { root: st
   const project = await loadProjectIdentity(projectId);
   /** 路径使用源码页的跨平台相对格式。 */
   const relativePath = relative(target.root, target.path).split(sep).join('/');
-  const workspace = await registerSourceWorkspace(owner, project, target.root, relativePath);
+  if (target.directoryPath && !relativePath.startsWith(`${target.directoryPath}/`)) throw new Error('此目录已不在当前文件路径中。');
+  /** 定位目录只改变文件树选中状态。 */
+  const workspace = await registerSourceWorkspace(owner, project, target.root, target.directoryPath ? '' : relativePath);
   if (owner.isDestroyed()) throw new Error('主窗口已关闭。');
-  owner.webContents.send('zeus:file-preview:source-open-workspace', workspace);
+  owner.webContents.send('zeus:file-preview:source-open-workspace', { ...workspace, directoryPath: target.directoryPath });
   owner.show();
   owner.focus();
 }
@@ -1037,12 +1042,16 @@ async function openProjectGitDiffWindow(
     appCloseLayerActivityByWindow.delete(window.id);
   });
   configureWindowSecurity(window, rendererUrl);
-  window.once('ready-to-show', () => {
+  /** 首帧或页面加载完成即可显示差异窗口，文件读取由窗口自身负责。 */
+  const revealDiffWindow = () => {
+    if (window.isDestroyed() || window.isVisible()) return;
     reveal();
     window.focus();
-  });
+  };
+  window.once('ready-to-show', revealDiffWindow);
   try {
     await window.loadURL(rendererUrl);
+    revealDiffWindow();
   } catch (error) {
     if (!window.isDestroyed()) window.destroy();
     throw error;
@@ -1062,8 +1071,13 @@ function normalizeTaskGitDeliveryContext(value: unknown): TaskGitDeliveryCurrent
 function broadcastTaskGitDeliveryCurrentContext(context: TaskGitDeliveryCurrentContext): void {
   currentTaskGitDeliveryContext = context;
   for (const window of taskGitDeliveryWindows.values()) {
-    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('zeus:task-git-delivery:current-context', context);
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('zeus:task-git-delivery:current-context', taskGitDeliveryWindowContext(window));
   }
+}
+
+/** 预热窗口只有收到正式打开请求后，才可以读取并初始化本次任务的提交范围。 */
+function taskGitDeliveryWindowContext(window: BrowserWindow): TaskGitDeliveryCurrentContext & { opened: boolean } {
+  return { ...currentTaskGitDeliveryContext, opened: preloadedTaskGitDeliveryWindow?.window !== window };
 }
 
 /** 无记录时在主窗口所在屏幕内居中打开交付窗口。 */
@@ -1087,10 +1101,12 @@ function initialTaskGitDeliveryWindowBounds(parent: BrowserWindow): Electron.Rec
 /** 显示交付窗口，并在后台打开模式下也请求实际绘制回执。 */
 function revealTaskGitDeliveryWindow(window: BrowserWindow): void {
   if (window.isDestroyed()) return;
+  window.webContents.send('zeus:task-git-delivery:current-context', taskGitDeliveryWindowContext(window));
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
-  app.focus({ steal: true });
+  // Windows 的 app.focus 会把焦点从交付窗口转向首个可见窗口。
+  if (process.platform !== 'win32') app.focus({ steal: true });
   window.webContents.send('zeus:task-git-delivery:request-frame');
 }
 
@@ -1222,7 +1238,7 @@ async function openTaskGitDeliveryWindow(parent: BrowserWindow, target: GitDeliv
   window.once('ready-to-show', () => {
     // 预热不显示、不抢焦点；用户已经点击时仍完成原生展示流程。
     if (!preload || preloadedTaskGitDeliveryWindow?.window !== window) reveal(() => revealTaskGitDeliveryWindow(window));
-    window.webContents.send('zeus:task-git-delivery:current-context', currentTaskGitDeliveryContext);
+    else window.webContents.send('zeus:task-git-delivery:current-context', taskGitDeliveryWindowContext(window));
   });
   configureWindowSecurity(window, rendererUrl);
   try {
@@ -1380,9 +1396,7 @@ function setupMenu(): void {
         openSettings: () => {
           void openSettingsFromMenu();
         },
-        checkForUpdates: () => {
-          void checkForUpdatesFromMenu().catch(showUpdateOpenFailure);
-        },
+        checkForUpdates: desktopShutdown.signal.aborted ? undefined : () => void checkForUpdatesFromMenu().catch(showUpdateOpenFailure),
         recoverUpdate:
           process.platform === 'win32'
             ? () => {
@@ -1458,6 +1472,7 @@ async function openSettingsFromMenuBarUsage(category: 'usage' | 'runtime'): Prom
 
 /** 菜单与工作区共用系统错误提示，更新窗口未能打开时仍能看到失败原因。 */
 function showUpdateOpenFailure(error: unknown): { opened: false } {
+  if (desktopShutdown.signal.aborted) return { opened: false };
   /** 共用错误说明负责脱敏，并保留结果未知时不得自动重试的语义。 */
   const failure = describeUserFacingError(error, appShellSettings.appLanguage);
   console.warn('Zeus 无法打开更新窗口。', failure.details);
@@ -1468,16 +1483,24 @@ function showUpdateOpenFailure(error: unknown): { opened: false } {
 
 /** 两端原生菜单共用真实更新检查；结果、预取和重启决策留在原生窗口。 */
 async function checkForUpdatesFromMenu(): Promise<void> {
+  if (desktopShutdown.signal.aborted) return;
   await requestMainWindow();
   if (fatalStartup) throw new Error('Zeus 启动失败，无法检查更新。');
-  await auxiliaryServicesReady;
+  await openAutomaticUpdateWindow('desktop.automatic_update.menu_check', { envelope: createSystemMainCommandEnvelope('desktop.automatic_update.menu_check', 'desktop-update'), body: null });
+}
+
+/** 菜单与侧栏共用更新窗口，并在退出开始后停止接收打开和检查请求。 */
+async function openAutomaticUpdateWindow(commandType: 'desktop.automatic_update.menu_check' | 'desktop.automatic_update.open', request: MainCommandRequest): Promise<{ opened: boolean }> {
+  if (!desktopShutdown.signal.aborted) await auxiliaryServicesReady;
+  if (desktopShutdown.signal.aborted) return { opened: false };
   /** 窗口反馈先于账本写入，版本检查仍在命令门禁通过后执行。 */
   const controller = homebrewUpdateController;
-  if (!controller) throw new Error('Zeus 更新控制器尚未就绪。');
+  if (!controller) throw new Error(nativeText('Zeus 更新控制器尚未就绪。', 'The Zeus update controller is unavailable.'));
   await controller.show();
-  const envelope = createSystemMainCommandEnvelope('desktop.automatic_update.menu_check', 'desktop-update');
-  await activeMainCommandLedger().execute({ envelope, body: null }, 'desktop.automatic_update.menu_check', async (_body, command) => {
+  if (desktopShutdown.signal.aborted) return { opened: false };
+  return activeMainCommandLedger().execute(request, commandType, async (_body, command) => {
     await command.markWriteStarted();
+    if (desktopShutdown.signal.aborted) return { opened: false };
     await controller.showOrCheck({ present: false });
     return { opened: true, externalOperationId: command.externalOperationId };
   });
@@ -1725,6 +1748,11 @@ function sanitizeRendererRuntimeLogDetail(message: unknown): string {
 
 function setupIpc(): void {
   registerSystemWindowIpc();
+  registerConversationAudio(nativeDesktopHelperPath('ZeusConversationAudio'), (event) => {
+    /** 仅允许支持会话的窗口主框架订阅频谱。 */
+    const window = BrowserWindow.fromWebContents(event.sender);
+    return Boolean(window && windows.has(window) && event.senderFrame === event.sender.mainFrame && !readOnlyValidationDescriptor);
+  });
   /** 明暗设置或系统外观变化时，同步差异窗口底色和菜单栏原生玻璃。 */
   nativeTheme.on('updated', () => {
     if (menuBarUsageWindow && !menuBarUsageWindow.isDestroyed()) updateMenuBarPopoverAppearance(menuBarUsageWindow);
@@ -2201,7 +2229,7 @@ function setupIpc(): void {
   ipcMain.handle('zeus:task-git-delivery:get-current-context', (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !taskGitDeliveryTargetByWindowId.has(requestingWindow.id) || event.senderFrame !== event.sender.mainFrame) throw new Error('当前会话上下文请求来自不受信任的代码交付窗口。');
-    return currentTaskGitDeliveryContext;
+    return taskGitDeliveryWindowContext(requestingWindow);
   });
   ipcMain.on('zeus:task-git-delivery:current-context-changed', (event, value: unknown) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
@@ -2715,26 +2743,14 @@ function setupIpc(): void {
   ipcMain.handle('zeus:automatic-update-indicator:get', async (event) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('Automatic update status request came from an untrusted window.');
-    await auxiliaryServicesReady;
+    if (!desktopShutdown.signal.aborted) await auxiliaryServicesReady;
+    if (desktopShutdown.signal.aborted) return null;
     return automaticUpdateIndicatorState ?? homebrewUpdateController?.getIndicatorState() ?? null;
   });
   ipcMain.handle('zeus:automatic-update-indicator:open', async (event, request: MainCommandRequest) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
     if (!requestingWindow || requestingWindow.isDestroyed() || !windows.has(requestingWindow)) throw new Error('Automatic update open request came from an untrusted window.');
-    try {
-      await auxiliaryServicesReady;
-      /** 与菜单共用先显示、后检查的顺序，不让命令持久化阻塞点击反馈。 */
-      const controller = homebrewUpdateController;
-      if (!controller) throw new Error('Automatic update controller is unavailable.');
-      await controller.show();
-      return await activeMainCommandLedger().execute(request, 'desktop.automatic_update.open', async (_body, command) => {
-        await command.markWriteStarted();
-        await controller.showOrCheck({ present: false });
-        return { opened: true, externalOperationId: command.externalOperationId };
-      });
-    } catch (error) {
-      return showUpdateOpenFailure(error);
-    }
+    return openAutomaticUpdateWindow('desktop.automatic_update.open', request).catch(showUpdateOpenFailure);
   });
   ipcMain.handle('zeus:automatic-update-indicator:record-manual-check', async (event, request: MainCommandRequest) => {
     const requestingWindow = BrowserWindow.fromWebContents(event.sender);
@@ -3173,7 +3189,7 @@ function parseTelegramAllowedUserIds(raw: string | undefined): number[] {
     .filter((item) => Number.isSafeInteger(item));
 }
 
-/** 校验跨 Renderer 边界的费用明细，限制数量和序列化体积，避免异常数据撑爆独立窗口。 */
+/** 仅允许菜单栏用量窗口调用专用接口。 */
 function requireMenuBarUsageWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow {
   const requestingWindow = BrowserWindow.fromWebContents(event.sender);
   if (!requestingWindow || requestingWindow.isDestroyed() || requestingWindow !== menuBarUsageWindow) {
@@ -3245,7 +3261,9 @@ async function createMenuBarUsageWindow(): Promise<BrowserWindow> {
   window.on('closed', () => {
     cancelMenuBarUsageWindowBlurHide();
     appCloseLayerActivityByWindow.delete(window.id);
-    if (menuBarUsageWindow === window) menuBarUsageWindow = undefined;
+    if (menuBarUsageWindow === window) {
+      menuBarUsageWindow = undefined;
+    }
     updateTrayTooltip();
   });
   window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
@@ -3272,6 +3290,8 @@ async function toggleMenuBarUsageWindow(): Promise<void> {
   app.focus({ steal: true });
   showMenuBarPopover(window, menuBarTrayTooltip());
   window.show();
+  // Windows 的 app.focus 会转向首个窗口；仅 macOS 需要先激活应用，再聚焦当前浮窗。
+  if (process.platform === 'darwin') app.focus({ steal: true });
   window.focus();
   console.info('Zeus menu bar native popover', JSON.stringify({ bounds: window.getBounds() }));
 }
@@ -4207,7 +4227,7 @@ async function initializeApplication(): Promise<void> {
             checkCompanionUpdate: checkCodexUpdateAutomatically,
             onIndicatorChange: broadcastAutomaticUpdateIndicator,
             notifyReady: (latestVersion, showProgress, manualInstall) => {
-              if (isZeusApplicationForeground() || !appShellSettings.desktopNotificationsEnabled || !Notification.isSupported()) return false;
+              if (desktopShutdown.signal.aborted || isZeusApplicationForeground() || !appShellSettings.desktopNotificationsEnabled || !Notification.isSupported()) return false;
               const notification = new Notification({
                 title: appShellSettings.appLanguage === 'zh-CN' ? `${distributionAppName} 更新已下载` : `${distributionAppName} Update Downloaded`,
                 body:
@@ -4219,7 +4239,9 @@ async function initializeApplication(): Promise<void> {
                       ? `${distributionAppName} ${latestVersion} is downloaded. Open the installer to install the update.`
                       : `${distributionAppName} ${latestVersion} is downloaded. Restart to install the update.`,
               });
-              notification.on('click', () => void showProgress().catch(showUpdateOpenFailure));
+              notification.on('click', () => {
+                if (!desktopShutdown.signal.aborted) void showProgress().catch(showUpdateOpenFailure);
+              });
               notification.show();
               return true;
             },
@@ -4512,14 +4534,14 @@ async function confirmRequestedRestart(detail: string): Promise<boolean> {
   return result.response === 0;
 }
 
-/** 重启未完成时明确告知用户，并保留当前窗口处理失败原因。 */
-async function showRestartCancelled(detail: string): Promise<void> {
+/** 对话框正文显示结果与下一步，标题栏使用应用名。 */
+async function showRestartCancelled(detail: string, message = nativeText('重启已取消', 'Restart cancelled')): Promise<void> {
   const options = {
     type: 'warning' as const,
-    title: nativeText('重启已取消', 'Restart cancelled'),
-    message: nativeText(`${distributionAppName} 将保持打开。`, `${distributionAppName} will remain open.`),
+    title: desktopDisplayName(),
+    message,
     detail,
-    buttons: [nativeText('知道了', 'OK')],
+    buttons: [nativeText('关闭', 'Close')],
     defaultId: 0,
     cancelId: 0,
     noLink: true,
@@ -4555,6 +4577,8 @@ app.on(
     resolveQuitMode: resolveDesktopQuitMode,
     /** 在关闭 Core 前通知所有桌面窗口暂停重连。 */
     onQuitStateChanged: (quitting) => {
+      // 清理失败会保留窗口，但当前进程已经不能检查更新。
+      if (!quitting && desktopShutdown.signal.aborted) setupMenu();
       desktopFaultMonitor?.quitting(quitting);
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('zeus:quit-state-changed', quitting);
@@ -4562,6 +4586,7 @@ app.on(
     },
     closeLocalServer: async (mode) => {
       desktopShutdown.abort();
+      broadcastAutomaticUpdateIndicator(null);
       /** 每个清理阶段都保留失败原因，辅助资源超时不能阻止关闭 Core。 */
       const cleanupErrors: unknown[] = [];
       /** 默认等待五秒；Core 和原生助手使用各自的退出时限，单位为毫秒。 */
@@ -4572,6 +4597,19 @@ app.on(
           cleanupErrors.push(Object.assign(new Error(`Zeus 退出清理失败：${label}`), { cause: error }));
         }
       };
+      /** Windows 安装器等待旧 Zeus 退出，准备窗口覆盖这段等待。 */
+      const keepUpdateProgress = process.platform === 'win32' && mode === 'upgrade_shutdown';
+      /** 安装器替换文件前必须确认原生进度助手已退出。 */
+      const closeUpdateController = () =>
+        attemptCleanup(
+          '更新控制器',
+          async () => {
+            if (process.platform !== 'win32' && (mode === 'upgrade_handoff' || mode === 'upgrade_shutdown')) return;
+            await homebrewUpdateController?.closeAndWait();
+            homebrewUpdateController = undefined;
+          },
+          15_000,
+        );
       await attemptCleanup(
         '后台宿主初始化',
         async () => {
@@ -4591,16 +4629,7 @@ app.on(
       await attemptCleanup('电源监听器', () => {
         powerMonitor.removeListener('resume', handleAutomaticUpdateResume);
       });
-      await attemptCleanup(
-        '更新控制器',
-        async () => {
-          if (process.platform !== 'win32' && (mode === 'upgrade_handoff' || mode === 'upgrade_shutdown')) return;
-          // 普通退出在两端都等待原生进度程序实际结束。
-          await homebrewUpdateController?.closeAndWait();
-          homebrewUpdateController = undefined;
-        },
-        15_000,
-      );
+      if (!keepUpdateProgress) await closeUpdateController();
       await attemptCleanup('内置浏览器宿主', async () => {
         await browserHost?.close();
         browserHost = undefined;
@@ -4621,7 +4650,7 @@ app.on(
           await localServerRuntime?.close(mode);
           localServerRuntime = undefined;
         },
-        45_000,
+        desktopExecutionHostCloseTimeoutMs,
       );
       await attemptCleanup('Main 网络代理连接', closeNetworkProxyRuntime);
       if (process.platform === 'darwin' && !readOnlyValidationDescriptor && (mode === 'final_quit' || mode === 'force_quit') && app.isPackaged) {
@@ -4633,15 +4662,14 @@ app.on(
         await attemptCleanup('只读验收副本销毁助手', () => scheduleReadOnlyValidationCleanup(readOnlyValidationDescriptor!));
       }
       if (cleanupErrors.length === 0) await attemptCleanup('独立故障监控', () => desktopFaultMonitor?.closeAndWait(), 30_000);
+      if (keepUpdateProgress) await closeUpdateController();
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Zeus 退出时一个或多个资源未能完整关闭。');
     },
     onCleanupError: async (error, quitMode): Promise<BeforeQuitCleanupFailureAction> => {
       if (quitMode === 'upgrade_shutdown' || (process.platform === 'win32' && pendingUpgradeHandoff)) {
         console.error('跨协议升级未能完整关闭旧 Zeus Core；保留当前应用，禁止启动新版本。', error);
         await cancelRequestedRestart();
-        await showRestartCancelled(
-          nativeText('后台资源未能完整关闭，更新安装已取消。请保留当前窗口并检查运行日志。', 'Background resources could not be fully closed. Update installation was cancelled. Keep this window open and check the runtime logs.'),
-        );
+        await showRestartCancelled(nativeText('请退出 Zeus，重新打开后再试。', 'Quit and reopen Zeus, then try again.'), nativeText('更新未完成', 'Update incomplete'));
         return 'keep_open';
       }
       // 正常 close 的等待超时后，强制关闭必须绕开原有 Promise，回收同一身份的 Core 进程树。

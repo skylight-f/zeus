@@ -1,6 +1,6 @@
-import { activeSystemWindow } from './systemWindows.js';
+import { activeSystemWindow, ownedSystemWindow } from './systemWindows.js';
 import { openRegularFileNoFollow } from '@zeus/storage/platform-security';
-import { BrowserWindow, clipboard, dialog, ipcMain, nativeImage, protocol, shell } from 'electron';
+import { BrowserWindow, clipboard, dialog, ipcMain, nativeImage, protocol, shell, webFrameMain, WebContentsView } from 'electron';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, createReadStream, createWriteStream, watch, type FSWatcher } from 'node:fs';
@@ -17,15 +17,64 @@ import {
   type FilePreviewIntent,
   type FilePreviewItem,
   type FilePreviewRequest,
+  type PdfPreviewCommand,
+  type PdfPreviewEvent,
   type FilePreviewSource,
   type FilePreviewRevertInput,
   type FilePreviewSaveInput,
+  type FilePreviewWatch,
+  filePreviewRevision,
   type FileReview,
   type GitDeliveryFileActionInput,
 } from '@zeus/shared';
 import { ProjectSourceWorkspaceService } from './projectSourceWorkspace.js';
 import type { MainCommandLedger, MainCommandRequest } from './mainCommandLedger.js';
 import { executeProjectGitAction, getFilePreviewBlame, getFileReview, getGitStatus, withGitRepositoryOperation } from '@zeus/git-core';
+
+/** Chromium 内置 PDF 阅读器的受信页面，页面来源不经过文件内容或渲染层。 */
+const chromiumPdfViewerUrl = 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html';
+
+/** PDF 控件自身完成解析后才允许查找，外层 HTML 导航会先结束。 */
+async function loadPdfDocument(contents: Electron.WebContents, url: string): Promise<void> {
+  /** 固定时间上限涵盖格式错误和阅读器启动失败，单位为毫秒。 */
+  const timeoutMs = 25_000;
+  let detach = (): void => {};
+  const documentReady = new Promise<void>((resolve, reject) => {
+    const onClosed = (): void => reject(new Error('PDF 预览已关闭。'));
+    const deadline = setTimeout(() => reject(new Error('PDF 阅读器加载超时。')), timeoutMs);
+    const onFrame = (_event: Electron.Event, _main: boolean, processId: number, routingId: number): void => {
+      const frame = webFrameMain.fromId(processId, routingId);
+      if (frame?.url !== chromiumPdfViewerUrl) return;
+      contents.removeListener('did-frame-finish-load', onFrame);
+      // 在 Chromium 阅读器自身的受信页面等待文档解析完成。文件内容不会进入脚本。
+      void frame
+        .executeJavaScript(
+          `(async () => {
+        await customElements.whenDefined('pdf-viewer');
+        const viewer = document.querySelector('pdf-viewer');
+        while (viewer?.loadState_ === 'loading') await new Promise(resolve => setTimeout(resolve, 24));
+        return viewer?.loadState_ === 'success';
+      })()`,
+        )
+        .then((loaded: unknown) => {
+          if (loaded === true) resolve();
+          else reject(new Error('PDF 无法解析。'));
+        }, reject);
+    };
+    detach = (): void => {
+      clearTimeout(deadline);
+      contents.removeListener('did-frame-finish-load', onFrame);
+      contents.removeListener('destroyed', onClosed);
+    };
+    contents.on('did-frame-finish-load', onFrame);
+    contents.once('destroyed', onClosed);
+  });
+  try {
+    await Promise.all([contents.loadURL(url), documentReady]);
+  } finally {
+    detach();
+  }
+}
 
 /** 只读媒体协议必须在 Electron 就绪前登记；不允许任意 file URL。 */
 protocol.registerSchemesAsPrivileged([
@@ -79,7 +128,7 @@ async function authorizedPath(source: FilePreviewSource): Promise<string> {
 async function fileIdentity(path: string): Promise<string> {
   /** 文件身份信息。 */
   const info = await stat(path);
-  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+  return filePreviewRevision(info);
 }
 
 /** Git 二进制直接流入临时文件，不经字符串或主进程大缓冲区。 */
@@ -127,7 +176,7 @@ export function registerFilePreview(services: {
   /** 文件写入沿用主进程命令回执，结果未知时禁止自动重放。 */
   commandLedger(): MainCommandLedger;
   /** 只有宿主固定的当前工作区路径能进入源码编辑页。 */
-  openSource(window: BrowserWindow, target: { root: string; path: string }, request: FilePreviewRequest): Promise<void>;
+  openSource(window: BrowserWindow, target: { root: string; path: string; directoryPath?: string }, request: FilePreviewRequest): Promise<void>;
 }): void {
   /** 随机令牌只授予单个文件，绝不包含本地服务密钥。 */
   const grants = new Map<string, PreviewGrant>();
@@ -137,6 +186,9 @@ export function registerFilePreview(services: {
   const owners = new Set<number>();
   /** 系统快速预览随页内资源关闭。 */
   const quickLooks = new Map<number, { id: string; owner: number; window: BrowserWindow }>();
+
+  /** 每份 PDF 令牌在指定窗口持有独立的 Chromium 查找会话。 */
+  const pdfViews = new Map<string, { window: BrowserWindow; view: WebContentsView; ready: Promise<void>; close(): void; findRequest: number; nativeRequest: number }>();
 
   /** 撤销令牌并删除本服务创建的历史副本。 */
   async function release(ids: string[], owner: number): Promise<void> {
@@ -150,6 +202,7 @@ export function registerFilePreview(services: {
       const grant = grants.get(id);
       if (!grant || grant.owner !== owner) continue;
       grants.delete(id);
+      pdfViews.get(id)?.close();
       for (const [windowId, preview] of quickLooks) {
         if (preview.owner !== owner || preview.id !== id) continue;
         // 多个系统预览各自释放，不能关闭另一窗口正在查看的文件。
@@ -170,17 +223,33 @@ export function registerFilePreview(services: {
     });
   }
 
-  ipcMain.handle('zeus:file-preview:watch', async (event, input: FilePreviewRequest) => {
+  ipcMain.handle('zeus:file-preview:watch', async (event, input: FilePreviewRequest, previewIds?: unknown, expectedRevision?: unknown): Promise<FilePreviewWatch | null> => {
     const window = services.requireWindow(event);
     retainOwner(window);
-    /** 路径只能由现有业务授权解析，不能接受渲染层提交的磁盘路径。 */
-    const intent = await services.resolve(input, window);
+    /** 已读取的文件从当前窗口的预览令牌取得路径和版本，省去再次解析业务授权。 */
+    const versions: PreviewGrant[] = [];
+    if (previewIds !== undefined) {
+      if (!Array.isArray(previewIds) || previewIds.length > 2) throw new Error('无效的预览监听范围。');
+      for (const previewId of previewIds) {
+        const grant = typeof previewId === 'string' ? grants.get(previewId) : undefined;
+        if (!grant || grant.owner !== window.id) return null;
+        if (!grant.temporary) versions.push(grant);
+      }
+    }
+    /** 独立源码面板从服务直接取得正文，没有桌面预览令牌。 */
+    const paths =
+      Array.isArray(previewIds) && previewIds.length
+        ? versions.map((grant) => grant.path)
+        : await Promise.all(
+            (await services.resolve(input, window)).sides
+              .slice(0, 2)
+              .filter((source) => !source.blob && !source.sha256 && !source.missing && !source.reason && !source.submodule)
+              .map(authorizedPath),
+          );
     const id = randomUUID();
     const watchers: FSWatcher[] = [];
     try {
-      for (const source of intent.sides.slice(0, 2)) {
-        if (source.blob || source.sha256 || source.missing || source.reason || source.submodule) continue;
-        const path = await authorizedPath(source);
+      for (const path of new Set(paths)) {
         /** 监听父目录，文件被删除后重建或原子替换时仍能收到通知。 */
         const watcher = watch(dirname(path), (_kind, name) => {
           if ((!name || name.toString() === basename(path)) && !window.isDestroyed()) window.webContents.send('zeus:file-preview:changed', id);
@@ -191,10 +260,14 @@ export function registerFilePreview(services: {
         });
         watchers.push(watcher);
       }
-      if (window.isDestroyed()) throw new Error('文件预览窗口已关闭。');
       if (!watchers.length) return null;
+      /** 监听装好后确认原版本仍可用，补上首读到监听之间的空档。 */
+      const checked = await Promise.allSettled(versions.map(currentPath));
+      /** 源码面板提供的版本只用于判断是否需要重读，路径仍从业务授权得到。 */
+      const previousVersionChanged = previewIds === undefined && (typeof expectedRevision !== 'string' || (await fileIdentity(paths[0]!).catch(() => null)) !== expectedRevision);
+      if (window.isDestroyed()) throw new Error('文件预览窗口已关闭。');
       watches.set(id, { owner: window.id, watchers });
-      return id;
+      return { id, changed: previousVersionChanged || checked.some((result) => result.status === 'rejected') };
     } catch (error) {
       for (const watcher of watchers) watcher.close();
       throw error;
@@ -436,13 +509,16 @@ export function registerFilePreview(services: {
                   : '请用系统应用打开此格式。';
           // 提交归属由现有版本令牌接口另读，正文返回不等待 Git 历史遍历。
           if ((await fileIdentity(previewPath)) !== identity) throw new Error('读取期间文件发生变化，请刷新。');
-          if (source.edit && item.kind === 'text') {
+          if (source.edit) {
             try {
-              // 先核对当前文件存在且仍在工作区内，历史不存在的一侧不伪造编辑目标。
-              await authorizedPath({ ...source.edit, name: source.name, label: source.label });
-              item.canEdit = true;
+              /** 工作区实际根目录用于路径校验和显示。 */
+              const root = await realpath(source.edit.root);
+              /** 编辑和定位都指向工作区中的当前文件。 */
+              const workspacePath = await authorizedPath({ ...source.edit, root, name: source.name, label: source.label });
+              item.workspaceRelativePath = relative(root, workspacePath).split(sep).join('/');
+              if (item.kind === 'text') item.canEdit = true;
             } catch {
-              item.canEdit = false;
+              if (item.kind === 'text') item.canEdit = false;
             }
           }
           item.id = randomUUID();
@@ -497,6 +573,97 @@ export function registerFilePreview(services: {
     }
     return items;
   }
+
+  /** 将 Chromium 的 PDF 阅读和匹配限制在当前文件授权内。 */
+  ipcMain.handle('zeus:file-preview:pdf', async (event, id: string, command: PdfPreviewCommand): Promise<void> => {
+    const owner = services.requireWindow(event);
+    const grant = grants.get(id);
+    if (grant?.owner !== owner.id || grant.item.kind !== 'pdf' || !grant.item.url) return;
+    let preview = pdfViews.get(id);
+    if (command.action === 'close') {
+      preview?.close();
+      return;
+    }
+    if (command.action === 'layout') {
+      /** 系统子窗只接受来自同一个主窗口的预览。 */
+      const target = command.target ? ownedSystemWindow(owner, command.target) : owner;
+      if (!target) return;
+      if (preview && preview.window !== target) {
+        preview.close();
+        preview = undefined;
+      }
+      if (!preview && command.bounds) {
+        const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true } });
+        const contents = view.webContents;
+        /** 子视图关闭时释放文档进程，并取消宿主关闭回调。 */
+        const close = (): void => {
+          pdfViews.delete(id);
+          target.removeListener('closed', close);
+          if (!target.isDestroyed()) target.contentView.removeChildView(view);
+          if (!contents.isDestroyed()) contents.close();
+        };
+        /** 系统窗 React 门户在原窗口执行，事件发回同一个桥。 */
+        const notify = (notice: PdfPreviewEvent): void => {
+          if (!owner.isDestroyed()) owner.webContents.send('zeus:file-preview:pdf-event', notice);
+        };
+        contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+        contents.on('will-navigate', (navigation) => navigation.preventDefault());
+        contents.on('before-input-event', (keyEvent, input) => {
+          if (input.type !== 'keyDown' || input.isComposing) return;
+          if (input.key.toLowerCase() === 'f' && (input.meta || input.control) && !input.alt && !input.shift) {
+            keyEvent.preventDefault();
+            notify({ id, action: 'open-find' });
+          } else if (input.key === 'Escape') notify({ id, action: 'close-find' });
+          else if (pdfViews.get(id)?.nativeRequest && (input.key === 'F3' || (input.key.toLowerCase() === 'g' && (input.meta || input.control)))) {
+            keyEvent.preventDefault();
+            notify({ id, action: 'navigate', backwards: input.shift });
+          }
+        });
+        contents.on('found-in-page', (_event, result) => {
+          const current = pdfViews.get(id);
+          if (result.finalUpdate && current?.view === view && current.nativeRequest === result.requestId) {
+            notify({ id, action: 'match', request: current.findRequest, active: result.activeMatchOrdinal, count: result.matches });
+          }
+        });
+        target.contentView.addChildView(view);
+        target.once('closed', close);
+        const ready = loadPdfDocument(contents, grant.item.url).catch((cause: unknown) => {
+          if (pdfViews.get(id)?.view === view) close();
+          throw cause;
+        });
+        preview = { window: target, view, ready, close, findRequest: 0, nativeRequest: 0 };
+        pdfViews.set(id, preview);
+      }
+      if (!preview) return;
+      const bounds = command.bounds;
+      if (bounds) {
+        const valid = [bounds.x, bounds.y, bounds.width, bounds.height].every((value) => Number.isInteger(value) && value >= 0);
+        if (!valid || !bounds.width || !bounds.height) return;
+        const { width, height } = target.getContentBounds();
+        preview.view.setBounds({ x: Math.min(bounds.x, width), y: Math.min(bounds.y, height), width: Math.max(0, Math.min(bounds.width, width - bounds.x)), height: Math.max(0, Math.min(bounds.height, height - bounds.y)) });
+      }
+      preview.view.setVisible(Boolean(bounds));
+      await preview.ready;
+      return;
+    }
+    if (!preview) return;
+    const contents = preview.view.webContents;
+    if (command.action === 'clear') {
+      preview.findRequest += 1;
+      preview.nativeRequest = 0;
+      contents.stopFindInPage('clearSelection');
+    } else if (command.action === 'focus') {
+      if (preview.window.isFocused()) contents.focus();
+    } else if (command.action === 'find') {
+      if (typeof command.query !== 'string' || !command.query || command.query.length > 4096) return;
+      preview.findRequest = command.request;
+      preview.nativeRequest = 0;
+      await preview.ready;
+      if (preview !== pdfViews.get(id) || preview.findRequest !== command.request || contents.isDestroyed()) return;
+      if (command.restart) contents.stopFindInPage('clearSelection');
+      preview.nativeRequest = contents.findInPage(command.query, { forward: command.forward, findNext: command.restart, matchCase: command.matchCase });
+    }
+  });
 
   ipcMain.handle('zeus:file-preview:load', (event, input: FilePreviewRequest) => loadPreview(input, services.requireWindow(event)));
 
@@ -711,7 +878,8 @@ export function registerFilePreview(services: {
     }
   });
 
-  ipcMain.handle('zeus:file-preview:action', async (event, id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit') => {
+  /** 目录定位只接受现有预览授权及其文件的相对父目录。 */
+  ipcMain.handle('zeus:file-preview:action', async (event, id: string, action: 'quick-look' | 'open' | 'reveal' | 'export' | 'edit' | 'reveal-directory', directoryPath?: unknown) => {
     /** 发起操作的受信窗口。 */
     const window = services.requireWindow(event);
     /** 读取期间切换焦点不改变原来发起操作的预览窗口。 */
@@ -719,11 +887,16 @@ export function registerFilePreview(services: {
     /** 当前窗口持有的资源授权。 */
     const grant = grants.get(id);
     if (!grant || grant.owner !== window.id) throw new Error('预览授权已失效。');
-    if (action === 'edit') {
-      if (!grant.item.canEdit || !grant.source.edit) throw new Error('此文件没有可编辑的工作区版本。');
-      /** 编辑读取最新工作区文件，历史副本只负责提供受信的目标身份。 */
-      const path = await authorizedPath({ ...grant.source.edit, name: grant.item.name, label: grant.item.label });
-      await services.openSource(window, { root: await realpath(grant.source.edit.root), path }, grant.request);
+    if (action === 'edit' || action === 'reveal-directory') {
+      if (!grant.source.edit || (action === 'edit' && !grant.item.canEdit)) throw new Error('此文件没有可编辑的工作区版本。');
+      /** 主进程接收完整的相对父目录，拒绝同级目录及路径前缀误匹配。 */
+      const folder = action === 'reveal-directory' && typeof directoryPath === 'string' ? directoryPath : undefined;
+      if (action === 'reveal-directory' && (!folder || !grant.item.workspaceRelativePath?.startsWith(`${folder}/`))) throw new Error('此目录不属于当前文件路径。');
+      /** 工作区授权根与目标文件使用同一次解析。 */
+      const root = await realpath(grant.source.edit.root);
+      /** 编辑和定位都使用仍在原工作区内的当前文件。 */
+      const path = await authorizedPath({ ...grant.source.edit, root, name: grant.item.name, label: grant.item.label });
+      await services.openSource(window, { root, path, directoryPath: folder }, grant.request);
       return;
     }
     /** 本次读取的准确文件路径。 */

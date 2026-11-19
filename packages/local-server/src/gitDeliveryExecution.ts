@@ -15,6 +15,7 @@ import {
   deliveryWorkspacesForConversationBranch,
   resolveGitDeliveryRootWorkspace,
   gitConflictPreservationInstructions,
+  isCodexServiceTierId,
   type CommandScopeKind,
   type GitDeliveryInput,
   type GitDeliverySelection,
@@ -189,7 +190,7 @@ export function parseGitDeliveryInput(value: unknown): GitDeliveryInput {
       generation.modelRef.length > 2000 ||
       typeof generation.effort !== 'string' ||
       generation.effort.length > 100 ||
-      (generation.serviceTier !== null && generation.serviceTier !== 'priority'))
+      (generation.serviceTier !== null && !isCodexServiceTierId(generation.serviceTier)))
   )
     throw deliveryError('AI 提交信息模型设置无效。', undefined, 400);
   if (!input.settings.commit && !input.settings.merge && !input.settings.push) throw deliveryError('至少选择一个 Git 操作。', undefined, 400);

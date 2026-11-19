@@ -1,9 +1,11 @@
 import {
+  formatZeusDateTime,
   asyncMessageQuestions,
   compareConversationWorkStartedDesc,
   defaultTaskBranchPrefix,
   defaultTaskManagementStatusConfig,
   extractThirdPartyTaskLink,
+  formatTaskManagementStatusLabel,
   isTaskStatusFilter,
   normalizeInputSuggestionSettings,
   normalizeTaskBranchPrefix,
@@ -360,6 +362,8 @@ export interface NativeConversationChoiceTaskLoadState {
   status: Exclude<NativeConversationChoiceLoadState, 'empty'>;
   choicesKnown: boolean;
   error: string | null;
+  /** 读取时已确认本机离线，供新会话跳过故障提示。 */
+  offline?: boolean;
 }
 
 export function beginNativeConversationChoiceTaskLoad(previous: NativeConversationChoiceTaskLoadState | undefined): NativeConversationChoiceTaskLoadState {
@@ -371,8 +375,9 @@ export function completeNativeConversationChoiceTaskLoad(previous?: NativeConver
   return { status: 'ready', choicesKnown: true, error: null };
 }
 
-export function failNativeConversationChoiceTaskLoad(previous: NativeConversationChoiceTaskLoadState | undefined, error: string): NativeConversationChoiceTaskLoadState {
-  return { status: 'error', choicesKnown: previous?.choicesKnown ?? false, error };
+/** 保留可读列表和读取失败原因，草稿能识别离线结果。 */
+export function failNativeConversationChoiceTaskLoad(previous: NativeConversationChoiceTaskLoadState | undefined, error: string, offline = false): NativeConversationChoiceTaskLoadState {
+  return { status: 'error', choicesKnown: previous?.choicesKnown ?? false, error, offline };
 }
 
 export interface NativeConversationChoiceLoadCoordinator {
@@ -879,43 +884,24 @@ export function upsertProjectConversationChoiceSnapshot(snapshot: NativeProjectC
   return { projectId: metadata.projectId, choices, items: choices };
 }
 export const workModeValues = ['plan', 'develop', 'review', 'debug'] as const;
-export const taskManagementStatusLabels: Record<AppLanguage, Record<string, string>> = {
-  'zh-CN': {
-    '': '全部',
-    todo: '待开始',
-    in_development: '开发中',
-    in_testing: '测试中',
-    awaiting_acceptance: '待验收',
-    blocked: '已阻塞',
-    completed: '已完成',
-    cancelled: '已取消',
-  },
-  'en-US': {
-    '': 'All',
-    todo: 'To do',
-    in_development: 'In development',
-    in_testing: 'In testing',
-    awaiting_acceptance: 'Awaiting acceptance',
-    blocked: 'Blocked',
-    completed: 'Completed',
-    cancelled: 'Cancelled',
-  },
-};
 
 /** 所有项目使用同一份任务状态配置。 */
 export function resolveTaskManagementStatusConfig(settings: AppShellSettings): TaskManagementStatusConfig {
   return normalizeTaskManagementStatusConfig(settings.taskManagementStatusTemplate, defaultTaskManagementStatusConfig);
 }
 
+/** 从全局状态配置查找定义，再按当前界面语言生成名称。 */
 export function formatConfiguredTaskManagementStatus(status: TaskManagementStatusDefinition | string, config: TaskManagementStatusConfig, language: AppLanguage): string {
+  /** 任务传入状态标识，菜单也可直接传入现有定义。 */
   const definition = typeof status === 'string' ? config.statuses.find((candidate) => candidate.id === status) : status;
   if (!definition) return typeof status === 'string' ? status : status.id;
-  return definition.label?.trim() || taskManagementStatusLabels[language][definition.id] || definition.id;
+  return formatTaskManagementStatusLabel(definition, language);
 }
 
+/** 集中生成列表筛选与任务状态菜单的显示名称。 */
 export function buildConfiguredTaskManagementStatusLabels(config: TaskManagementStatusConfig, language: AppLanguage): Record<TaskManagementStatus | '', string> {
   return {
-    '': taskManagementStatusLabels[language][''],
+    '': language === 'zh-CN' ? '全部' : 'All',
     ...Object.fromEntries(config.statuses.map((status) => [status.id, formatConfiguredTaskManagementStatus(status, config, language)])),
   };
 }
@@ -1124,7 +1110,7 @@ export function formatDataPortabilityStatus(status: DataPortabilityStatusState, 
 export function formatArchivedConversationDate(value: string, appLanguage: AppLanguage): string {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return value;
-  return new Intl.DateTimeFormat(appLanguage, { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp);
+  return formatZeusDateTime(timestamp, appLanguage, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 /** Runtime 日志导出状态只存结构化事实，渲染时按当前语言输出，避免英文界面残留中文状态。 */

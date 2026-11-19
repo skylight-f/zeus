@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ConversationSnapshotV2Error, type ConversationSnapshotV2ExecutionContext, type ConversationSnapshotV2Repository, conversationSnapshotV2StructureGeneration } from '@zeus/storage';
-import { userFacingErrorCause, type ConversationTranscriptPlacementRequest } from '@zeus/shared';
+import { userFacingErrorCause, type ConversationTranscriptPlacementRequest, type TurnChangeSet } from '@zeus/shared';
 
 interface ConversationOwnershipRecord {
   id: string;
@@ -13,6 +13,8 @@ interface ConversationSnapshotV2ApiOptions {
   projectExists: (projectId: string) => boolean;
   getConversation: (conversationId: string) => ConversationOwnershipRecord | undefined;
   readExecutionContext?: (conversationId: string) => Promise<ConversationSnapshotV2ExecutionContext>;
+  /** 会话首屏仅需要已完成轮次的文件卡片摘要。 */
+  readTurnChangeSummary?: (conversationId: string, turnId: string) => TurnChangeSet | null;
   readQueueState: (conversationId: string) => unknown;
   readSubmissionReceipt: (conversationId: string, submissionId: string) => unknown;
 }
@@ -43,7 +45,8 @@ interface ContentQuery {
   byteLimit?: string;
 }
 
-type ProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'waiting' | 'warning';
+/** 过程分页支持按实际规则更新分类读取。 */
+type ProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'context_update' | 'waiting' | 'warning';
 
 /** 注册 Snapshot V2 与所有重内容按需读取入口；V1 路由继续由主 server 保持兼容。 */
 export function registerConversationSnapshotV2Api(options: ConversationSnapshotV2ApiOptions): void {
@@ -98,7 +101,19 @@ export function registerConversationSnapshotV2Api(options: ConversationSnapshotV
       });
       // 此处不能加入异步等待或写事务，确保消息与结构共享同一事件进度，并支持只读资料。
       const history = repository.listModelHistoryTailPage({ conversationId: request.params.conversationId, entryLimit: 48, byteLimit: 96 * 1024 });
-      return { snapshot, history, systemMessages: repository.systemMessages.list(request.params.conversationId) };
+      /** 仅准备首屏已声明存在文件变更的轮次。 */
+      const changeSets = snapshot.recentClosedTurns.flatMap((turn) => {
+        if (!turn.changeSetAvailable) return [];
+        try {
+          const summary = options.readTurnChangeSummary?.(request.params.conversationId, turn.id);
+          return summary ? [summary] : [];
+        } catch (error) {
+          // 单个变更集读取失败时，保留正文与其他卡片，前台已有读取入口可重试。
+          request.log.warn({ err: error, conversationId: request.params.conversationId, turnId: turn.id }, 'Conversation turn change summary unavailable');
+          return [];
+        }
+      });
+      return { snapshot, history, changeSets, systemMessages: repository.systemMessages.list(request.params.conversationId) };
     } catch (error) {
       return sendSnapshotV2Error(reply, error);
     }
@@ -248,7 +263,7 @@ export function registerConversationSnapshotV2Api(options: ConversationSnapshotV
     if (!hasConversationAccess(options, request.params)) return conversationNotFound(reply);
     markV2Response(reply);
     try {
-      return repository.listResourcePage(pageInput(request.params.conversationId, request.query));
+      return repository.listResourcePage({ ...pageInput(request.params.conversationId, request.query), direction: pageDirection(request.query.direction) });
     } catch (error) {
       return sendSnapshotV2Error(reply, error);
     }
@@ -349,7 +364,7 @@ function hasConversationAccess(options: ConversationSnapshotV2ApiOptions, params
 }
 
 function parseProcessKind(value: string): ProcessKind {
-  if (['reasoning', 'tool', 'command', 'retry', 'context_compaction', 'waiting', 'warning'].includes(value)) return value as ProcessKind;
+  if (['reasoning', 'tool', 'command', 'retry', 'context_compaction', 'context_update', 'waiting', 'warning'].includes(value)) return value as ProcessKind;
   throw new ConversationSnapshotV2Error('ZEUS_CONVERSATION_SNAPSHOT_V2_INVALID_ARGUMENT', '过程类型无效。', 400);
 }
 

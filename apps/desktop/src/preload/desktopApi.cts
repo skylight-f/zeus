@@ -375,6 +375,16 @@ export function createDesktopApi(transport: DesktopTransport) {
     hideMenuBarUsage: () => transport.invoke('zeus:menu-bar-usage:hide'),
     /** 将内容高度交给主进程校验，菜单栏浮窗宽度保持不变。 */
     resizeMenuBarUsage: (height: number) => transport.invoke('zeus:menu-bar-usage:resize', height),
+    ...(transport.kind === 'electron-ipc'
+      ? {
+          /** 可见刻度订阅只影响本窗口的采集生命周期。 */
+          subscribeConversationAudio: (active: boolean) => transport.invoke('zeus:conversation-audio:subscribe', active),
+          /** 输入仅包含频谱能量和音量，不包含音频样本。 */
+          onConversationAudioFrame: (listener: (frame: { hzPerBin: number; rms: number; powers: string }) => void) => transport.subscribe('zeus:conversation-audio:frame', listener),
+          /** 采集不可用时刻度恢复静态样式。 */
+          onConversationAudioUnavailable: (listener: () => void) => transport.subscribe('zeus:conversation-audio:unavailable', listener),
+        }
+      : {}),
     /** 在鼠标屏幕锚点旁显示独立透明费用明细窗口。 */
     showMenuBarUsageCostDetail: (input: unknown) => transport.invoke('zeus:menu-bar-usage:cost-detail-show', input),
     /** 指针离开触发器或明细窗口时延迟关闭。 */
@@ -420,8 +430,12 @@ export function createDesktopApi(transport: DesktopTransport) {
 
     // 预览只传递业务身份，资源地址与系统操作均由主进程授权。
     loadFilePreview: (input: unknown) => transport.invoke('zeus:file-preview:load', input),
+    /** PDF 独立视图的布局、查找和释放只接受预览令牌。 */
+    updatePdfPreview: (id: string, command: unknown) => transport.invoke('zeus:file-preview:pdf', id, command),
+    /** 原生 PDF 阅读器回传匹配结果和快捷键。 */
+    onPdfPreviewEvent: (listener: (event: unknown) => void) => transport.subscribe('zeus:file-preview:pdf-event', listener),
     /** 按原业务身份监听当前文件，返回独立的可释放令牌。 */
-    watchFilePreview: (input: unknown) => transport.invoke('zeus:file-preview:watch', input),
+    watchFilePreview: (input: unknown, previewIds?: string[], expectedRevision?: string) => transport.invoke('zeus:file-preview:watch', input, previewIds, expectedRevision),
     /** 文件变更只发布订阅令牌，不向渲染层开放路径。 */
     onFilePreviewChanged: (listener: (id: string) => void) => transport.subscribe('zeus:file-preview:changed', listener),
     /** 已授权正文先显示，Git 审阅按当前窗口令牌独立补载。 */
@@ -441,8 +455,8 @@ export function createDesktopApi(transport: DesktopTransport) {
         input.requests[0]?.kind === 'task-git' ? input.requests[0].workspaceId : input.requests[0]?.kind === 'project-git' ? input.requests[0].repositoryId : 'delivery',
         input,
       ),
-    /** 转交文件预览中的用户操作。 */
-    actOnFilePreview: (id: string, action: string) => transport.invoke('zeus:file-preview:action', id, action),
+    /** 转交预览操作；定位时附上文件的相对父目录。 */
+    actOnFilePreview: (id: string, action: string, directoryPath?: string) => transport.invoke('zeus:file-preview:action', id, action, directoryPath),
     /** 将预览图片像素交给系统剪贴板或原生保存对话框。 */
     actOnImagePreview: (dataUrl: string, action: 'copy' | 'export', name: string) => transport.invoke('zeus:image-preview:action', dataUrl, action, name),
     /** 读取文件预览对应版本的来源。 */

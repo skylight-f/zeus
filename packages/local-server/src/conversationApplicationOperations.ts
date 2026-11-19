@@ -19,7 +19,16 @@ import { TaskWorkPlanningRepository } from '@zeus/storage';
 import { asyncMessageQuestions, formatAsyncQuestionAnswer, validateCanonicalRequestUserInputAnswers, type AsyncQuestionAnswer } from '@zeus/shared';
 import { userFacingErrorCause, type UserFacingErrorCause } from '@zeus/shared';
 import type { ConversationSourceContextReader } from './conversationSourceContext.js';
-import { type AiRuntimeSession, type CopilotRuntimeManager, createAiRuntimeSessionManager, modelConnectionCredentialSlotId, modelRef, piRuntimeWorkerProtocolVersion, runWithCodexRpcRetryContext } from '@zeus/ai-runtime';
+import {
+  type AiRuntimeSession,
+  type CopilotRuntimeManager,
+  createAiRuntimeSessionManager,
+  isGptReasoningModelId,
+  modelConnectionCredentialSlotId,
+  modelRef,
+  piRuntimeWorkerProtocolVersion,
+  runWithCodexRpcRetryContext,
+} from '@zeus/ai-runtime';
 import { getGitBranchHead, getGitRepositoryContext, readTaskIntegrationConflictPaths, type ProjectGitAction } from '@zeus/git-core';
 import {
   parseCanonicalRequestUserInputQuestions,
@@ -77,7 +86,7 @@ import { nativePendingRequestProjection } from './codexNativeConversationPolicy.
 import { isProviderStopPendingTurn } from './codexProviderStopRecoveryApplication.js';
 import type { ZeusSkillService } from './zeusSkillService.js';
 import { resolveConversationAttachmentGrant } from './conversationAttachmentGrant.js';
-import { type ConversationCapabilitiesSnapshot, ConversationCapabilityQueryApplication } from './conversationCapabilityQueryApplication.js';
+import { type ConversationCapabilitiesSnapshot, type ConversationCapabilityModel, ConversationCapabilityQueryApplication, resolveModelCapability } from './conversationCapabilityQueryApplication.js';
 import { ConversationChoiceQueryApplication } from './conversationChoiceQueryApplication.js';
 import { ConversationExecutionCoordinator, type ConversationExecutionRoute } from './conversationExecutionCoordinator.js';
 import type { NativeConversationSkillInput } from './codexNativeConversationContracts.js';
@@ -139,7 +148,6 @@ export type ConversationApplicationOperationDependencies = Record<string, any> &
   resolveConversationCapabilities(project: ZeusProjectRecord, selectedModelRef?: string | null): ReturnType<ConversationCapabilityQueryApplication['buildConversationCapabilities']>;
   /** 任务推送使用已冻结的模型身份复验能力。 */
   resolveTaskPushExecutionCapabilities(project: ZeusProjectRecord, selectedModelRef: string): Promise<ConversationCapabilitiesSnapshot>;
-  resolveModelCapability<T extends { id: string; model: string }>(models: readonly T[], identity: string | null | undefined): T | null;
   normalizeTaskPushAttachments(task: ZeusTaskRecord, projectLocalPath: string): { attachments: NativeConversationAttachment[]; allowedRoots: string[]; promptAttachments: TaskPushPromptAttachment[] };
   normalizeTaskPushSupplementalAttachments(value: unknown, projectLocalPath: string): { attachments: NativeConversationAttachment[]; allowedRoots: string[]; promptAttachments: TaskPushSupplementalAttachment[] };
   mergeTaskPushAttachmentInputs(...inputs: Array<{ attachments: NativeConversationAttachment[]; allowedRoots: string[] }>): { attachments: NativeConversationAttachment[]; allowedRoots: string[] };
@@ -242,6 +250,12 @@ export function isNativeApiRecord(value: unknown): value is Record<string, unkno
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** 已失效的 GPT 家族预设档位按当前模型默认档位处理。 */
+function requestedEffortForModel(model: ConversationCapabilityModel, requested: string | null): string | null {
+  if (model.agentKind === 'pi' && isGptReasoningModelId(model.model) && (model.supportedReasoningEfforts.length === 0 || (requested === 'minimal' && !model.supportedReasoningEfforts.includes(requested)))) return null;
+  return requested;
+}
+
 export function createConversationApplicationOperations(dependencies: ConversationApplicationOperationDependencies) {
   /** 初始来源及后续引用使用同一个核实和原文快照入口。 */
   const conversationSources = dependencies.conversationSources;
@@ -304,7 +318,6 @@ export function createConversationApplicationOperations(dependencies: Conversati
     recordTaskEvent,
     redactSensitiveText,
     resolveConversationCapabilities,
-    resolveModelCapability,
     resolveNonCodexLiveSession,
     resolveSelectedTaskPushContext,
     resolveTaskEnvironmentWritableRoots,
@@ -1570,20 +1583,32 @@ export function createConversationApplicationOperations(dependencies: Conversati
       ) {
         throw Object.assign(nativeApiError('ZEUS_CONVERSATION_RETRY_NOT_READY', '该轮次已改变，或仍有消息尚未确认，请先检查处理状态。'), { statusCode: 409 });
       }
-      /** 原提交拥有模型和权限；恢复不读取用户编辑中的下轮设置。 */
+      /** 失败轮次关联的原提交决定续接配置。 */
       const previous = turn.clientSubmissionId ? conversationSubmissions.getById(turn.clientSubmissionId) : undefined;
-      /** 持久设置不完整时停止恢复，不能猜测更宽的权限。 */
-      const persistedContext = previous ? parseJsonObject(previous.inputJson).context : null;
-      /** 冻结上下文已经是对象，不再次按 JSON 字符串解析。 */
+      if (!previous || previous.conversationId !== conversation.id) throw nativeApiError('ZEUS_CONVERSATION_RETRY_CONTEXT_MISSING', '无法确认原请求的模型和权限，请检查会话。');
+      /** 已关联的执行快照是本轮实际配置，快照缺失或归属不符时停止续接。 */
+      const frozenSnapshot = previous.executionSnapshotId ? conversationExecution.getExecutionSnapshot(previous.executionSnapshotId) : undefined;
+      if (previous.executionSnapshotId && frozenSnapshot?.conversationId !== conversation.id) throw nativeApiError('ZEUS_CONVERSATION_RETRY_CONTEXT_MISSING', '无法确认原请求的模型和权限，请检查会话。');
+      /** 仅未关联执行快照的历史提交使用其持久配置。 */
+      const persistedContext = frozenSnapshot ? null : parseJsonObject(previous.inputJson).context;
+      /** 历史输入只接受结构化会话上下文。 */
       const context = isNativeApiRecord(persistedContext) ? persistedContext : {};
-      if (typeof context.model !== 'string' || !context.model || !['read-only', 'auto', 'auto-review', 'full-access'].includes(String(context.permissionMode))) {
+      /** 使用原提供方模型 ID 和已保存的权限、协作模式。 */
+      const model = frozenSnapshot ? frozenSnapshot.modelId : context.model;
+      const permissionMode = parseConversationPermissionMode(frozenSnapshot ? frozenSnapshot.permissionMode : context.permissionMode);
+      const collaborationMode = frozenSnapshot ? parseConversationCollaborationMode(frozenSnapshot.collaborationMode) : (parseConversationCollaborationMode(context.workMode) ?? 'default');
+      if (typeof model !== 'string' || !model.trim() || !permissionMode || !collaborationMode) {
         throw nativeApiError('ZEUS_CONVERSATION_RETRY_CONTEXT_MISSING', '无法确认原请求的模型和权限，请检查会话。');
       }
-      /** 原执行快照拥有容量，恢复不能继承用户新选的下一轮容量。 */
-      const frozenSnapshot = previous?.executionSnapshotId ? conversationExecution.getExecutionSnapshot(previous.executionSnapshotId) : undefined;
-      /** 旧提交没有执行快照时只读取其持久上下文，不回退到当前会话设置。 */
-      const frozenCapacity = frozenSnapshot ? parseJsonObject(frozenSnapshot.contextCapacityJson).contextCapacityTokens : context.contextCapacityTokens;
-      assertContextCapacity(frozenCapacity ?? null);
+      /** 托管模型以运行时标识来源，自定义 API 模型使用原连接 ID。 */
+      const sourceId = frozenSnapshot ? (frozenSnapshot.connectionId ?? frozenSnapshot.runtimeKind) : context.modelSourceId;
+      /** 无容量覆盖时保留模型默认值，容量单位为 Token。 */
+      const contextCapacityTokens = (frozenSnapshot ? parseJsonObject(frozenSnapshot.contextCapacityJson).contextCapacityTokens : context.contextCapacityTokens) ?? null;
+      assertContextCapacity(contextCapacityTokens);
+      /** 历史提交曾使用 effort 或 thinkingLevel 保存推理档位。 */
+      const effort = frozenSnapshot ? frozenSnapshot.effort : typeof context.effort === 'string' ? context.effort : context.thinkingLevel;
+      /** 空服务层级也是快照值，历史提交保留是否显式选择的区别。 */
+      const serviceTier = frozenSnapshot ? { present: true as const, value: frozenSnapshot.serviceTier } : readServiceTierOverride(context);
       /** 新提交只携带服务端生成的续接意图，不复制原用户消息和附件。 */
       const restored = await acceptNativeConversationMessage(
         conversation,
@@ -1592,20 +1617,19 @@ export function createConversationApplicationOperations(dependencies: Conversati
           clientUserMessageId: idempotencyKey,
           displayText: '已请求继续上次中断的操作',
           delivery: 'queue',
-          contextCapacityTokens: (frozenCapacity as number | null | undefined) ?? null,
-          // Codex 原生目录使用模型本名，只有独立模型连接使用带来源的身份。
-          model: typeof context.modelSourceId === 'string' && context.modelSourceId !== 'codex' ? modelRef(context.modelSourceId, context.model) : context.model,
-          effort: typeof context.effort === 'string' ? context.effort : typeof context.thinkingLevel === 'string' ? context.thinkingLevel : undefined,
-          ...(Object.prototype.hasOwnProperty.call(context, 'serviceTier') ? { serviceTier: context.serviceTier as string | null } : {}),
-          permissionMode: context.permissionMode as ConversationPermissionMode,
-          collaborationMode: context.workMode === 'plan' ? 'plan' : 'default',
+          contextCapacityTokens,
+          model: typeof sourceId === 'string' && (frozenSnapshot || sourceId !== 'codex') ? modelRef(sourceId, model) : model,
+          effort: typeof effort === 'string' ? effort : undefined,
+          ...(serviceTier.present ? { serviceTier: serviceTier.value } : {}),
+          permissionMode,
+          collaborationMode,
         },
         idempotencyKey,
         input.operationIdentity,
         input.providerWriteLifecycle,
         undefined,
         true,
-        previous?.id,
+        { submissionId: previous.id, frozenEffort: frozenSnapshot?.effort },
       );
       return { statusCode: 202, body: restored };
     }
@@ -1809,7 +1833,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       connectionId: prepared.route.connectionId,
       credentialSlotId: prepared.route.credentialSlotId,
       endpointIdentity: prepared.route.endpointIdentity,
-      protocolFamily: prepared.route.protocolFamily as 'codex_app_server' | 'openai_responses' | 'openai_completions' | 'anthropic_messages',
+      protocolFamily: prepared.route.protocolFamily as 'codex_app_server' | 'openai_responses' | 'openai_completions' | 'openai_images' | 'anthropic_messages',
       modelId: prepared.route.modelId,
       effort: prepared.route.effort,
       serviceTier: prepared.route.serviceTier,
@@ -1881,8 +1905,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
     reservedSubmissionId?: string,
     /** 仅服务端已校验的恢复或操作结果可以设置内部来源。 */
     internalOperation: boolean | 'automation_completion' = false,
-    /** 原提交身份只在服务端恢复分支传入。 */
-    resumeSubmissionId?: string,
+    /** 续接关联原提交；快照中空档位表示沿用原先未指定的推理档位。 */
+    retry?: { submissionId: string; frozenEffort?: string | null },
   ) {
     if (body.contextCapacityTokens !== undefined) assertContextCapacity(body.contextCapacityTokens);
     const project = projects.getById(conversation.projectId);
@@ -2027,13 +2051,14 @@ export function createConversationApplicationOperations(dependencies: Conversati
       const capability = resolveModelCapability(capabilities.models, model);
       if (!capability) throw nativeApiError('ZEUS_INVALID_CONVERSATION_SETTINGS', 'Selected Codex model is not available in the current app-server generation.');
       if (capability.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', capability.availabilityReason || '所选模型当前不可运行。');
-      if (requestedEffort && !capability.supportedReasoningEfforts.some((effort) => effort === requestedEffort)) {
+      const effort = requestedEffortForModel(capability, requestedEffort);
+      if (effort && !capability.supportedReasoningEfforts.includes(effort)) {
         throw nativeApiError('ZEUS_INVALID_CONVERSATION_SETTINGS', 'Selected reasoning effort is not supported by the selected Codex model.');
       }
       selectedModel = capability.model;
       selectedModelSourceId = capability.sourceId ?? null;
       selectedAgentKind = capability.agentKind ?? 'codex';
-      selectedEffort = requestedEffort ?? capability.defaultReasoningEffort ?? capability.supportedReasoningEfforts[0] ?? null;
+      selectedEffort = retry?.frozenEffort === null ? null : (effort ?? capability.defaultReasoningEffort ?? capability.supportedReasoningEfforts[0] ?? null);
       selectedServiceTier = normalizeServiceTierForCapability(requestedServiceTier, capability);
       selectedContextWindow = capability.contextWindow;
     }
@@ -2249,7 +2274,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
       }
       return codexNativeCoordinator.submitMessage({
         ...(internalOperation ? { internalOperation: true } : {}),
-        ...(resumeSubmissionId ? { resumeSubmissionId } : {}),
+        ...(retry ? { resumeSubmissionId: retry.submissionId } : {}),
         conversationId: conversation.id,
         ...(reservedSubmissionId ? { submissionId: reservedSubmissionId } : {}),
         content: providerContent,
@@ -2849,8 +2874,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
     if (selectedModel.available === false) throw nativeApiError('ZEUS_MODEL_NOT_READY', selectedModel.availabilityReason || '所选模型当前不可运行。');
     const selectedAgentKind = selectedModel.agentKind;
     if (body.agentKind !== undefined && body.agentKind !== selectedAgentKind) throw nativeApiError('ZEUS_INVALID_AGENT_KIND', 'The requested agent does not match the selected model.');
-    const requestedEffort = typeof body.effort === 'string' && body.effort.trim() ? body.effort.trim() : null;
-    if (requestedEffort && !selectedModel.supportedReasoningEfforts.some((effort) => effort === requestedEffort)) {
+    const requestedEffort = requestedEffortForModel(selectedModel, typeof body.effort === 'string' && body.effort.trim() ? body.effort.trim() : null);
+    if (requestedEffort && !selectedModel.supportedReasoningEfforts.includes(requestedEffort)) {
       throw nativeApiError('ZEUS_INVALID_CONVERSATION_SETTINGS', 'Selected reasoning effort is not supported by the selected Codex model.');
     }
     const requestedServiceTier = readServiceTierOverride(body);
@@ -2932,7 +2957,7 @@ export function createConversationApplicationOperations(dependencies: Conversati
         ? await sdkCoordinator(selectedAgentKind).startConversation({
             conversationId: reservation.conversationId,
             // 首发先持久接纳，沿用队列入口在回执之后准备运行时。
-            holdDispatch: true,
+            deferInitialDispatch: true,
             contextCapacityTokens: reservation.contextCapacityTokens,
             submissionId: reservation.submissionId,
             projectId: project.id,
@@ -3284,7 +3309,8 @@ export function createConversationApplicationOperations(dependencies: Conversati
         ...(plan.taskPushLayout ? { taskPushLayout: plan.taskPushLayout } : {}),
         ...((plan.skills ?? (plan.skill ? [plan.skill] : undefined)) ? { skills: plan.skills ?? [plan.skill!] } : {}),
         ...(plan.computerUseRequested ? { computerUseRequested: true } : {}),
-        ...(plan.holdDispatch || plan.deferInitialDispatch ? { holdDispatch: true } : {}),
+        ...(plan.holdDispatch ? { holdDispatch: true } : {}),
+        ...(plan.deferInitialDispatch ? { deferInitialDispatch: true } : {}),
         ...(plan.operationContext ? { operationContext: plan.operationContext } : {}),
         ...(plan.internalOperation ? { internalOperation: true } : {}),
         permissionMode: plan.permissionMode,

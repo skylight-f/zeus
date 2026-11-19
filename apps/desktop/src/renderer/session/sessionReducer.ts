@@ -93,6 +93,8 @@ export type NativeSessionAction =
       clientUserMessageId: string;
       durableClientUserMessageId: string;
       draft: string;
+      /** 原始正文可以为空，并与排队卡片的展示摘要独立。 */
+      composerDraft?: string;
       attachments: NativeConversationAttachment[];
       submittedAttachments: NativeConversationAttachment[];
       browserSubmission: ZeusBrowserPreparedSubmission | null;
@@ -1794,6 +1796,7 @@ function addOptimisticUserItem(state: NativeSessionState, action: Extract<Native
     payload: {
       attachments: action.submittedAttachments,
       delivery: action.delivery,
+      ...(action.composerDraft !== undefined ? { composerDraft: action.composerDraft } : {}),
       ...(queuedForActiveTurn ? { queuedForActiveTurn: true } : {}),
       ...(action.questionAnswer ? { questionAnswer: action.questionAnswer } : {}),
       ...(action.queuedUntilHydrated ? { queuedUntilHydrated: true } : {}),

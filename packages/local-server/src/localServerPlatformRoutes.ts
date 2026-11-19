@@ -60,7 +60,7 @@ import {
 } from '@zeus/git-core';
 import { normalizeProjectConfig, type ProjectConfigSnapshot, type UpdateProjectConfigBody } from './projectCore.js';
 import { getSecretPresenceLabel } from './securityCore.js';
-import { temporaryWorkspaceId, type TaskAttachmentReference, type TaskPushParentAttachmentOption } from '@zeus/shared';
+import { isCodexServiceTierId, temporaryWorkspaceId, type TaskAttachmentReference, type TaskPushParentAttachmentOption } from '@zeus/shared';
 import {
   AutomationRunRepository,
   AutomationTaskRepository,
@@ -1047,7 +1047,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         (body.taskId !== undefined && (typeof body.taskId !== 'string' || !body.taskId.trim() || body.taskId.length > 200 || body.selection === undefined)) ||
         (body.modelRef !== undefined && (typeof body.modelRef !== 'string' || !body.modelRef.trim() || body.modelRef.length > 2000)) ||
         (body.effort !== undefined && (typeof body.effort !== 'string' || body.effort.length > 100)) ||
-        (body.serviceTier !== undefined && body.serviceTier !== null && body.serviceTier !== 'priority')
+        (body.serviceTier !== undefined && body.serviceTier !== null && !isCodexServiceTierId(body.serviceTier))
       ) {
         return reply.code(400).send({ error: 'ZEUS_GIT_COMMIT_MESSAGE_INPUT_INVALID', message: '已暂存改动内容无效或过大，请缩小提交范围。' });
       }
@@ -1133,7 +1133,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
           ...(selection ? { scope: 'selection' as const } : {}),
           ...(typeof body.modelRef === 'string' ? { modelRef: body.modelRef } : {}),
           ...(typeof body.effort === 'string' ? { effort: body.effort } : {}),
-          ...(body.serviceTier === null || body.serviceTier === 'priority' ? { serviceTier: body.serviceTier === 'priority' ? ('priority' as const) : null } : {}),
+          ...(body.serviceTier === null || isCodexServiceTierId(body.serviceTier) ? { serviceTier: body.serviceTier } : {}),
         };
         const run = async () => {
           if (input.modelRef?.startsWith('codex:')) {
@@ -1580,6 +1580,8 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
     repository: conversationSnapshotV2,
     projectExists: (projectId) => Boolean(projects.getById(projectId)),
     getConversation: (conversationId) => conversations.getRecordById(conversationId),
+    /** 首屏沿用变更集的只读摘要视图。 */
+    readTurnChangeSummary: (conversationId, turnId) => turnChangeSetService.getByTurn(conversationId, turnId, 'summary'),
     readSubmissionReceipt: (conversationId, submissionId) => {
       const submission = conversationSubmissions.getById(submissionId);
       if (!submission || submission.conversationId !== conversationId) return null;
@@ -2081,11 +2083,13 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
         requireNativeQueueConversation(params);
         return conversationQueueCoreMutations.delete({ conversationId: params.conversationId, submissionId: params.submissionId });
       },
-      queueSendNow: async ({ params, operationIdentity, providerWriteLifecycle }) => {
+      /** 从同一入口把指定轮次交给当前会话的 Provider。 */
+      queueSendNow: async ({ params, expectedTurnId, operationIdentity, providerWriteLifecycle }) => {
         const conversation = requireNativeQueueConversation(params);
         const operation = await (conversation.agentKind === 'copilot' ? copilotNativeCoordinator : conversation.agentKind === 'pi' ? piNativeCoordinator : codexNativeCoordinator).sendQueuedNow({
           conversationId: conversation.id,
           submissionId: params.submissionId,
+          expectedTurnId,
           providerWriteLifecycle,
         });
         const updatedConversation = conversations.getById(conversation.id);
@@ -4428,6 +4432,7 @@ export async function registerLocalServerPlatformRoutes(dependencies: LocalServe
   // 被动查看用量只能读取现有运行时或持久缓存，不得为了展示统计而启动外部 Codex。
   server.get('/api/codex/usage-summary', async () => codexUsageService.readSummary());
 
+  /** 等待用量汇总完成再追加刷新状态，避免展开 Promise 时丢失供应商与统计字段。 */
   server.get('/api/usage-overview', async () => ({ ...(await usageOverviewService.read()), refreshingSources: usageRefreshingSources() }));
 
   /** 显式显示或刷新才检查官方数据，普通读取始终无网络及持久化副作用。 */

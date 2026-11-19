@@ -1114,8 +1114,14 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     }
     /** 原提交由服务端恢复入口绑定，不从提示词或时间猜测归属。 */
     const resumeSubmission = input.internalOperation && input.resumeSubmissionId ? options.submissions.getById(input.resumeSubmissionId) : undefined;
-    if (input.internalOperation && (!resumeSubmission || resumeSubmission.conversationId !== conversation.id)) throw coordinatorError('ZEUS_CONVERSATION_RETRY_CONTEXT_MISSING', '无法确认原请求的冻结设置，请检查会话。');
-    const previousContext = resumeSubmission ? contextFromSubmission(resumeSubmission) : contextWithLatestNextTurnSettings(conversation.id, contexts.get(conversation.id) ?? contextFromConversation(conversation));
+    /** 原执行快照在 Codex 派发配置中同样优先于历史提交上下文。 */
+    const frozenRetry = resumeSubmission?.executionSnapshotId ? options.execution.getExecutionSnapshot(resumeSubmission.executionSnapshotId) : undefined;
+    if (input.internalOperation && (!resumeSubmission || resumeSubmission.conversationId !== conversation.id || (resumeSubmission.executionSnapshotId && frozenRetry?.conversationId !== conversation.id))) {
+      throw coordinatorError('ZEUS_CONVERSATION_RETRY_CONTEXT_MISSING', '无法确认原请求的冻结设置，请检查会话。');
+    }
+    const previousContext = resumeSubmission
+      ? contextFromPersistedSubmission(resumeSubmission, conversation, frozenRetry)
+      : contextWithLatestNextTurnSettings(conversation.id, contexts.get(conversation.id) ?? contextFromConversation(conversation));
     const context: ConversationDispatchContext = resumeSubmission
       ? { ...previousContext }
       : {
@@ -1844,11 +1850,15 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       throw coordinatorError('ZEUS_PLAN_CONTROL_SUBMISSION_IMMUTABLE', 'Plan control submissions cannot steer an active turn.');
     }
     const state = runStates.get(conversation.id) ?? inferRunState(conversation);
-    if (state.type !== 'active' && state.type !== 'waiting') throw coordinatorError('ZEUS_NATIVE_TURN_NOT_ACTIVE', 'send-now requires a current active Codex native turn.');
+    // 等待入队期间轮次可能结束或切换，原消息继续留在队列。
+    if ((state.type !== 'active' && state.type !== 'waiting') || (input.expectedTurnId && state.turnId !== input.expectedTurnId)) {
+      throw Object.assign(coordinatorError('ZEUS_NATIVE_TURN_NOT_ACTIVE', '原轮次已结束，消息仍按队列处理。'), { statusCode: 409 });
+    }
     if (submission.status !== 'queued') throw coordinatorError('ZEUS_NATIVE_SUBMISSION_NOT_QUEUED', 'Submission is not queued.');
     const queueHead = options.submissions.listQueueByConversation(input.conversationId)[0];
     if (!queueHead || queueHead.id !== submission.id) {
-      throw coordinatorError('ZEUS_NATIVE_QUEUE_HEAD_REQUIRED', '只能立即发送当前队首，不能绕过更早的提交。');
+      // 队列顺序冲突发生在写入前，直接返回原卡片可显示的原因。
+      throw Object.assign(coordinatorError('ZEUS_NATIVE_QUEUE_HEAD_REQUIRED', '只能立即发送当前队首，不能绕过更早的提交。'), { statusCode: 409 });
     }
     const turnId = state.turnId;
     if (turnHasCompletedOutput(conversation.id, turnId)) {
@@ -3038,7 +3048,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     });
   }
 
-  const { reconcilePersistedTerminalTurnSubmissions, reconcileProviderTurnsSinceCheckpoint, projectedProviderThreadSnapshot, reconcileConversationSnapshot } = createCodexProviderHistoryProjection({
+  const { reconcilePersistedTerminalTurnSubmissions, reconcileProviderTurnsSinceCheckpoint, reconcileRolloutInstructions, projectedProviderThreadSnapshot, reconcileConversationSnapshot } = createCodexProviderHistoryProjection({
     failedTurnResults,
     hasExactProviderUserMessage,
     isSteeringSubmission,
@@ -3260,6 +3270,9 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       return;
     }
     await remoteControlConversationSync.synchronizeOpenConversation(input);
+    /** 即使轮次水位未变，规则上下文仍可能在当前轮次追加。 */
+    const conversation = options.conversations.getById(input.conversationId);
+    if (conversation?.providerThreadId) await providerEvents.enqueueBarrier(() => reconcileRolloutInstructions(conversation));
   }
 
   async function synchronizeConversations(input: { conversationIds: readonly string[] }): Promise<void> {
@@ -3412,6 +3425,11 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       const status = isRecord(eventParams.status) ? eventParams.status : {};
       const activeFlags = Array.isArray(status.activeFlags) ? status.activeFlags.filter((flag): flag is string => typeof flag === 'string') : [];
       interactionRecovery.scheduleProviderThreadStatusReconciliation(eventThreadId, event.generationId, status.type === 'active' && activeFlags.includes('waitingOnUserInput'));
+    }
+    if (eventThreadId && ['turn/started', 'turn/completed', 'item/started', 'item/completed', 'thread/status/changed'].includes(event.method)) {
+      /** 只在语义边界补读完整规则记录，不把每片文字增量变成磁盘扫描。 */
+      const conversation = options.conversations.getByProviderThreadId(eventThreadId);
+      if (conversation) await reconcileRolloutInstructions(conversation);
     }
   }
 

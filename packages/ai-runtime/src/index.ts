@@ -21,6 +21,7 @@ export * from './codexAppServerProtocol.js';
 export * from './codexRuntimeGenerationManager.js';
 export * from './codexMcpConfiguration.js';
 export * from './codexModelBudgetSnapshot.js';
+export { readCodexModelCatalogCache } from './codexModelCatalogCache.js';
 export * from './agentRuntimeContracts.js';
 export * from './agentRuntimeRegistry.js';
 export * from './agentCapabilityCatalog.js';

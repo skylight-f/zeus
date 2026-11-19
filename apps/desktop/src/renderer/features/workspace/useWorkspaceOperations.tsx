@@ -227,8 +227,8 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     visibleTasks,
     workspaceScrollRef,
   } = state;
-  // 返回新会话只重新聚焦输入框；未发送草稿随工作区保留，由发送成功负责清理。
-  const [newConversationDrafts] = useState<NewConversationDraftStore>(() => new Map());
+  /** 工作区保留未提交的输入，以及切走后需要恢复的首发草稿。 */
+  const [newConversationDrafts] = useState<NewConversationDraftStore>(() => ({ active: new Map(), failed: new Map() }));
   /** 新建会话与项目预读共用目录请求，回调保持稳定以免输入时反复触发加载。 */
   const loadNewConversationCapabilities = useCallback(
     (projectId: string, force = false) => {
@@ -1965,7 +1965,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
           selectedNativeConversation && selectedNativeConversation.transportKind !== 'codex_native'
             ? nativeLegacyMessageLoadState
             : props.nativeConversationClient
-              ? nativeSessionChoiceTaskState?.status === 'ready'
+              ? nativeSessionChoiceTaskState?.status === 'ready' || nativeSessionChoiceTaskState?.offline
                 ? 'empty'
                 : (nativeSessionChoiceTaskState?.status ?? 'loading')
               : 'empty'
@@ -1989,7 +1989,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
             handleMainNavigate('settings');
           },
           onSelectNewConversationProject: selectNewConversationProject,
-          onLoadNewConversationProjectGit: props.nativeConversationClient ? (projectId) => props.nativeConversationClient!.loadProjectGitWorkbench(projectId, false) : undefined,
+          newConversationProjectGitClient: props.nativeConversationClient,
           onExecuteNewConversationProjectGit: props.nativeConversationClient ? executeNewConversationProjectGit : undefined,
           onChooseStartAttachments: props.onChooseConversationResources ? chooseNativeConversationAttachments : undefined,
           onSelectTask: (task) => {
@@ -2012,6 +2012,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
       <TaskDetailPaneContent
         key={taskDetailPaneTask.id}
         zentaoClient={props.commandClient}
+        deliverableClient={props.commandClient}
         onZentaoTaskUpdated={mergeTaskRecord}
         language={appShellSettings.appLanguage}
         task={taskDetailPaneTask}

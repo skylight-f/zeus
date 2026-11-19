@@ -13,6 +13,7 @@ import { conversationStartClientCommandTypes, forgetConversationStartCommandRequ
 import type { CodexConversationCapabilities, CodexTaskPushCapabilities, NativeConversationChoice, NativeSessionState, SessionConversationOwner, StartTaskModelPushRequest } from '../../session/sessionTypes.js';
 import { buildPersistedSessionViewCache, initialSessionHotCache, refreshSessionHotState, rememberSessionHotState, type SessionHotCache } from '../../session/sessionHotCache.js';
 import { useConversationPreload } from '../../session/useConversationPreload.js';
+import { isLocalNetworkOffline } from '../../session/conversationSystemMessages.js';
 import { type TaskModelPushForm, type TaskModelPushModalStatus } from '../../task/TaskModelPushModal.js';
 import { projectTaskModelPushConversationChoices } from '../../task/TaskModelPushPendingWorkspace.js';
 import { useConversationFeatureController } from '../conversations/useConversationFeatureController.js';
@@ -701,13 +702,16 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   >('idle');
   useEffect(() => {
     let active = true;
+    /** 更新广播优先于初次读取，避免延迟返回的旧状态恢复失效入口。 */
+    let receivedIndicatorUpdate = false;
     const bridge = globalThis.window.zeus;
     void loadAutomaticUpdateIndicatorFromMain({ zeus: bridge })
       .then((state) => {
-        if (active) setAutomaticUpdateIndicator(state);
+        if (active && !receivedIndicatorUpdate) setAutomaticUpdateIndicator(state);
       })
       .catch(() => undefined);
     const unsubscribe = bridge?.onAutomaticUpdateIndicatorChanged?.((state) => {
+      receivedIndicatorUpdate = true;
       if (active) setAutomaticUpdateIndicator(state);
     });
     return () => {
@@ -1290,6 +1294,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     selectedConversationId: selectedNativeConversation?.id,
     onCached: persistPreloadedConversation,
   });
+  /** 鼠标和键盘预先经过的行共享现有后台队列。 */
+  const prioritizeConversation = useCallback((id: string): void => observeConversationPreload(undefined, id), [observeConversationPreload]);
   useEffect(() => {
     const flush = (): void => {
       if (sessionViewCachePersistTimerRef.current !== null) window.clearTimeout(sessionViewCachePersistTimerRef.current);
@@ -1388,14 +1394,18 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
         },
         (error) => {
           if (cancelled) return;
+          /** 同次后台请求失败时，项目和任务草稿共享离线判断。 */
+          const offline = isLocalNetworkOffline(error);
           const message = errorToLocalUiMessage(error, errorLanguageRef.current);
           if (nativeProjectConversationChoiceLoadCoordinator.isCurrent(projectId, projectRequestVersion)) {
-            setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], message) }));
+            setNativeConversationChoiceProjectStates((current) => ({ ...current, [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], message, offline) }));
           }
           setNativeConversationChoiceTaskStates((current) => ({
             ...current,
             ...Object.fromEntries(
-              taskLoads.filter(({ taskId, requestVersion }) => nativeConversationChoiceLoadCoordinator.isCurrent(taskId, requestVersion)).map(({ taskId }) => [taskId, failNativeConversationChoiceTaskLoad(current[taskId], message)]),
+              taskLoads
+                .filter(({ taskId, requestVersion }) => nativeConversationChoiceLoadCoordinator.isCurrent(taskId, requestVersion))
+                .map(({ taskId }) => [taskId, failNativeConversationChoiceTaskLoad(current[taskId], message, offline)]),
             ),
           }));
         },
@@ -1598,6 +1608,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     nativeConversationGroups,
     nativeConversationHotCacheRef,
     observeConversationPreload,
+    prioritizeConversation,
     nativeConversationStartState,
     setNativeConversationStartState,
     nativeConversationRuntimeStates,

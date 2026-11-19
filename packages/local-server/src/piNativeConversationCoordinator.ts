@@ -18,6 +18,7 @@ import {
   createPiRuntimeWorkerDriver,
   isPiToolImageReference,
   modelConnectionRequestEndpoint,
+  modelProtocolApi,
   modelRef,
   type ModelProtocolFamily,
   parseModelRef,
@@ -40,6 +41,9 @@ import {
   sumEstimatedCosts,
   type ModelPricingCatalog,
   type UsageRequestPriceSnapshot,
+  parseModelPricingProfile,
+  readMeteredUsage,
+  type ModelPricingProfile,
   type NativeTokenUsageSnapshot,
   asyncMessageQuestions,
   parseCanonicalRequestUserInputQuestions,
@@ -88,7 +92,7 @@ import { createZeusToolBroker, isZeusNativeToolMutation, type ZeusToolAuditEvent
 import { searchPiWorkspace } from './piWorkspaceSearch.js';
 import { effectiveToolPermission, resolveConversationToolPath } from './conversationToolPolicy.js';
 import type { ConversationToolProcesses } from './conversationToolProcesses.js';
-import type { NativeAcceptedOperation, RespondPlanImplementationRequestInput } from './codexNativeConversationContracts.js';
+import type { NativeAcceptedOperation, RespondPlanImplementationRequestInput, SendQueuedNowInput } from './codexNativeConversationContracts.js';
 import type { createConversationApplicationOperations } from './conversationApplicationOperations.js';
 import type { createPiGoalApplication } from './piGoalApplication.js';
 import { parseJsonRecord } from './codexNativeConversationPolicy.js';
@@ -129,9 +133,15 @@ interface PiRunContext {
   modelRequestCount: number;
   /** 已落账的请求快照，用稳定身份防止事件重放重复记账。 */
   priceRequests: UsageRequestPriceSnapshot[];
+  /** 实际发送边界捕获的价目和用量口径。 */
+  pendingRequestPrice?: RequestPriceCapture & { startedAt: string };
   pendingModelRequest: {
     /** 请求开始时捕获费率，流式输出期间刷新价格不影响本次请求。 */
     pricingCatalog: ModelPricingCatalog | null;
+    /** 回执字段映射与费率一同在请求开始时捕获。 */
+    pricingUsageProfile?: ModelPricingProfile['usage'];
+    /** 价目未同步时也保留源身份，历史补算可核对来源。 */
+    pricingSource?: string;
     /** 时段判定沿用请求开始时间。 */
     startedAt: string;
     boundaryStarted: boolean;
@@ -146,6 +156,14 @@ interface PiRunContext {
   currentStageId: string | null;
   /** 工具调用身份到所属展示阶段的映射。 */
   stageIdByToolCallId: Map<string, string>;
+}
+
+/** 发出请求时可确认的费率来源、独立价格账号与用量映射。 */
+interface RequestPriceCapture {
+  pricingCatalog: ModelPricingCatalog | null;
+  pricingUsageProfile?: ModelPricingProfile['usage'];
+  pricingSource?: string;
+  pricingAccountScope?: string;
 }
 
 export interface CreatePiNativeConversationCoordinatorOptions {
@@ -240,6 +258,9 @@ export interface StartPiConversationInput {
   /** 本轮完整的显式 Skill 选择。 */
   skills?: NativeConversationSkillInput[];
   computerUseRequested?: boolean;
+  /** 仅等待创建回执返回，队列随后可直接派发。 */
+  deferInitialDispatch?: boolean;
+  /** 工作目录尚未准备完成，后续准备流程负责解除派发限制。 */
   holdDispatch?: boolean;
   operationContext?: Record<string, unknown>;
   internalOperation?: boolean;
@@ -275,11 +296,16 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   }
 
   /** 每次真实模型响应开始时锁定目录；缺价刷新在后台进行。 */
-  function captureRequestPrice(run: PiRunContext): ModelPricingCatalog | null {
+  function captureRequestPrice(run: PiRunContext): RequestPriceCapture {
     const connection = options.modelConnections.listMetadata().find((candidate) => candidate.id === run.sourceId);
-    if (!connection) return null;
+    if (!connection) return { pricingCatalog: null };
     void options.modelConnections.pricing.refreshForModel(connection, run.modelId).catch(() => undefined);
-    return options.modelConnections.pricing.read(connection);
+    return {
+      pricingCatalog: options.modelConnections.pricing.read(connection),
+      pricingUsageProfile: connection.pricingProfile ? parseModelPricingProfile(connection.pricingProfile).usage : undefined,
+      pricingSource: options.modelConnections.pricing.source(connection) ?? undefined,
+      pricingAccountScope: connection.pricingCredentialId,
+    };
   }
 
   const contexts = new Map<string, PiConversationContext>();
@@ -401,13 +427,13 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   });
 
   /** 将模型配置投影为运行诊断使用的协议、实际认证方式与端点。 */
-  function adapterRouteForModel(model: AgentModelIdentity): { api: 'anthropic-messages' | 'openai-completions' | 'openai-responses' | 'copilot-sdk'; authenticationScheme: 'bearer' | 'x_api_key' | 'github_oauth'; endpoint: string | null } {
+  function adapterRouteForModel(model: AgentModelIdentity): { api: ReturnType<typeof modelProtocolApi> | 'copilot-sdk'; authenticationScheme: 'bearer' | 'x_api_key' | 'github_oauth'; endpoint: string | null } {
     if (runtimeKind === 'copilot') return { api: 'copilot-sdk', authenticationScheme: 'github_oauth', endpoint: 'copilot://managed-account' };
     const connection = model.sourceId ? options.modelConnections.listMetadata().find((candidate) => candidate.id === model.sourceId) : undefined;
     const configuredModel = connection?.models.find((candidate) => candidate.id === model.modelId);
     const protocolFamily = configuredModel?.protocolFamily ?? 'openai_completions';
     return {
-      api: protocolFamily === 'anthropic_messages' ? 'anthropic-messages' : protocolFamily === 'openai_responses' ? 'openai-responses' : 'openai-completions',
+      api: modelProtocolApi(protocolFamily),
       authenticationScheme: configuredModel?.authenticationScheme ?? 'bearer',
       endpoint: connection ? modelConnectionRequestEndpoint(connection.baseUrl, protocolFamily) : null,
     };
@@ -417,9 +443,9 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   function projectionProtocolFamily(run: PiRunContext, segment: { executionSnapshotId: string | null }): ModelProtocolFamily | 'copilot_sdk' {
     if (runtimeKind === 'copilot') return 'copilot_sdk';
     const frozenProtocol = segment.executionSnapshotId ? options.execution.getExecutionSnapshot(segment.executionSnapshotId)?.protocolFamily : null;
-    if (frozenProtocol === 'anthropic_messages' || frozenProtocol === 'openai_responses' || frozenProtocol === 'openai_completions') return frozenProtocol;
+    if (frozenProtocol === 'anthropic_messages' || frozenProtocol === 'openai_responses' || frozenProtocol === 'openai_completions' || frozenProtocol === 'openai_images') return frozenProtocol;
     const api = adapterRouteForModel({ sourceId: run.sourceId, modelId: run.modelId, displayName: run.modelId }).api;
-    return api === 'anthropic-messages' ? 'anthropic_messages' : api === 'openai-responses' ? 'openai_responses' : 'openai_completions';
+    return api === 'anthropic-messages' ? 'anthropic_messages' : api === 'openai-responses' ? 'openai_responses' : api === 'openai-images' ? 'openai_images' : 'openai_completions';
   }
 
   /** 发布已持久化的 Pi 处理过程，并保持实时事件与 Snapshot 投影字段一致。 */
@@ -489,6 +515,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     return { ...context, permissionMode: 'full-access' };
   }
 
+  /** 首发区分回执后的自动派发与等待工作目录准备，避免队列被永久挂起。 */
   async function startConversation(input: StartPiConversationInput) {
     await options.transcripts.waitUntilReady(input.conversationId);
     const existingConversation = options.conversations.getById(input.conversationId);
@@ -500,7 +527,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     }
     options.validateContextCapacity(existingConversation?.contextCapacityTokens ?? input.contextCapacityTokens ?? null, input.model.sourceId, input.model.modelId, runtimeKind);
     if (existingConversation?.archived) throw piError('ZEUS_NATIVE_QUEUE_PROVIDER_ARCHIVED', '会话已归档，请先恢复会话再继续。');
-    if (existingConversation && !input.holdDispatch) {
+    if (existingConversation && !input.holdDispatch && !input.deferInitialDispatch) {
       /** 切换模型后首次派发也先恢复原任务目录，再准备工具和模型请求。 */
       const executionContext = await options.ensureExecutionContext({ conversationId: existingConversation.id, mode: 'dispatch' });
       if (!executionContext) throw piError('ZEUS_NATIVE_CONVERSATION_WORKTREE_UNAVAILABLE', '会话工作目录尚未准备完成。');
@@ -520,7 +547,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       input.browserComments,
       input.conversationContext,
     );
-    if (input.holdDispatch) {
+    if (input.holdDispatch || input.deferInitialDispatch) {
       if (!existingConversation) {
         (input.createRecord ?? options.conversations.create.bind(options.conversations))({
           contextCapacityTokens: input.contextCapacityTokens ?? null,
@@ -581,7 +608,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
             agentKind: runtimeKind,
             thinkingLevel: input.thinkingLevel,
             permissionMode: input.permissionMode,
-            holdDispatch: true,
+            ...(input.holdDispatch ? { holdDispatch: true } : {}),
             ...(allowedResourceRoots.length ? { allowedAttachmentRoots: allowedResourceRoots } : {}),
             ...(writableRoots.length ? { writableRoots } : {}),
             ...(input.operationContext ? { operationContext: input.operationContext } : {}),
@@ -590,7 +617,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         },
         createdAt,
       });
-      projectLocallyAcceptedUserMessage({ conversations: options.conversations, submission, broadcast: options.publish });
+      projectLocallyAcceptedUserMessage({ conversations: options.conversations, submission, broadcast: options.publish, requestQueueDispatch: false });
       await input.segmentLifecycle?.prepare(submission);
       await options.db.save();
       await input.providerWriteLifecycle?.markPrepared(input.submissionId);
@@ -1816,6 +1843,10 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
     if (!event.nativeRunId) return;
     const run = runs.get(event.nativeRunId);
     if (!run) return;
+    if (event.type === 'pricing_request_started') {
+      run.pendingRequestPrice = { ...captureRequestPrice(run), startedAt: event.createdAt };
+      return;
+    }
     await options.transcripts.waitUntilReady(run.conversationId);
     const payload = asRecord(event.payload);
     if (event.type === 'auto_retry_start' || event.type === 'auto_retry_end') {
@@ -1856,7 +1887,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       const message = asRecord(payload.message);
       if (message.role === 'assistant') {
         run.pendingModelRequest = {
-          pricingCatalog: captureRequestPrice(run),
+          ...captureRequestPrice(run),
           startedAt: event.createdAt,
           boundaryStarted: true,
           providerRequestId: typeof message.responseId === 'string' ? message.responseId : typeof message.id === 'string' ? message.id : null,
@@ -1872,7 +1903,7 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
       const messageEvent = asRecord(payload.assistantMessageEvent);
       if (message.role === 'assistant') {
         const pending = run.pendingModelRequest ?? {
-          pricingCatalog: captureRequestPrice(run),
+          ...captureRequestPrice(run),
           startedAt: event.createdAt,
           boundaryStarted: false,
           providerRequestId: typeof message.responseId === 'string' ? message.responseId : typeof message.id === 'string' ? message.id : null,
@@ -1965,13 +1996,22 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
         addUsage(run.usage, requestUsage);
       }
       /** 缺少请求开始事件时不套用结束后才获取的费率。 */
-      const catalog = pendingModelRequest?.pricingCatalog ?? null;
+      const requestPrice = run.pendingRequestPrice;
+      run.pendingRequestPrice = undefined;
+      const captured = requestPrice ? requestPrice.pricingCatalog : pendingModelRequest?.pricingCatalog;
+      const startedAt = requestPrice?.startedAt;
+      const catalog = captured && !startedAt ? { ...captured, prices: captured.prices.filter((price) => !price.metered) } : (captured ?? null);
+      const meteredUsage = readMeteredUsage(failed && !requestUsage ? undefined : message.usage, (requestPrice ?? pendingModelRequest)?.pricingUsageProfile, !failed && Boolean(startedAt), Boolean(requestUsage));
       const requestEstimate =
         recordedRequest?.estimate ??
-        (requestUsage || catalog?.prices.some((price) => price.model === run.modelId && price.perRequest !== null)
-          ? estimateModelPrice(run.modelId, requestUsage ?? emptyTokenUsageBreakdown(), catalog, pendingModelRequest?.startedAt ?? event.createdAt)
+        (requestUsage || catalog?.prices.some((price) => price.model === run.modelId && (price.perRequest !== null || price.metered))
+          ? estimateModelPrice(run.modelId, requestUsage ?? emptyTokenUsageBreakdown(), catalog, startedAt ?? pendingModelRequest?.startedAt ?? event.createdAt, meteredUsage)
           : unavailablePriceEstimate(run.modelId, 0));
-      if (!recordedRequest) run.priceRequests.push({ id: requestId, occurredAt: event.createdAt, usage: requestUsage ?? emptyTokenUsageBreakdown(), estimate: requestEstimate });
+      if (!recordedRequest) {
+        const pricingSource = (requestPrice ?? pendingModelRequest)?.pricingSource;
+        if (pricingSource && !requestEstimate.rateSnapshot.sourceUrls.length) requestEstimate.rateSnapshot.sourceUrls = [pricingSource];
+        run.priceRequests.push({ id: requestId, occurredAt: event.createdAt, startedAt, pricingAccountScope: requestPrice?.pricingAccountScope, meteredUsage, usage: requestUsage ?? emptyTokenUsageBreakdown(), estimate: requestEstimate });
+      }
       options.usageLedger.upsert({
         providerId: managedProviderId(run.sourceId),
         accountScopeId: run.sourceId,
@@ -3153,16 +3193,21 @@ export function createPiNativeConversationCoordinator(options: CreatePiNativeCon
   }
 
   /** Pi 的队首引导沿用原提交身份，不误发到 Codex。 */
-  async function sendQueuedNow(input: { conversationId: string; submissionId: string; providerWriteLifecycle?: { markPrepared(submissionId: string): Promise<void>; markRpcStarted(submissionId: string): void } }) {
+  async function sendQueuedNow(input: SendQueuedNowInput) {
     /** 同一队首、同一活动轮次和同一模型配置才允许引导。 */
     const conversation = requirePiConversation(input.conversationId);
     /** 统一队列保存的原提交。 */
     const submission = options.submissions.getById(input.submissionId);
     if (!submission || submission.conversationId !== conversation.id || submission.status !== 'queued') throw piError('ZEUS_NATIVE_SUBMISSION_NOT_QUEUED', '这条消息已不在队列中。');
-    if (options.submissions.listQueueByConversation(conversation.id)[0]?.id !== submission.id) throw piError('ZEUS_NATIVE_QUEUE_HEAD_REQUIRED', '只能立即发送当前队首，不能绕过更早的提交。');
+    if (options.submissions.listQueueByConversation(conversation.id)[0]?.id !== submission.id) {
+      // 队列顺序冲突发生在写入前，直接返回原卡片可显示的原因。
+      throw Object.assign(piError('ZEUS_NATIVE_QUEUE_HEAD_REQUIRED', '只能立即发送当前队首，不能绕过更早的提交。'), { statusCode: 409 });
+    }
     /** 当前正在运行的 Pi 轮次。 */
     const run = [...runs.values()].find((entry) => entry.conversationId === conversation.id);
-    if (!run) throw piError('ZEUS_PI_RUN_NOT_ACTIVE', '当前没有可以引导的 Pi 轮次。');
+    if (!run || (input.expectedTurnId && run.providerTurnId !== input.expectedTurnId)) {
+      throw Object.assign(piError('ZEUS_PI_RUN_NOT_ACTIVE', '原轮次已结束，消息仍按队列处理。'), { statusCode: 409 });
+    }
     /** 带资源输入保持原记录，任务推送布局由独立轮次处理。 */
     const persisted = asRecord(JSON.parse(submission.inputJson));
     if (persisted.taskPushLayout) throw piError('ZEUS_PI_STEER_RESOURCES_UNSUPPORTED', '任务推送需要独立执行轮次，已保留在队列中。');

@@ -10,7 +10,7 @@ import { XIcon } from '@phosphor-icons/react/dist/csr/X';
 import { GitBranchIcon } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { TrashIcon } from '@phosphor-icons/react/dist/csr/Trash';
 import { retainInputFocus } from '../ui/retainInputFocus.js';
-import { type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { type ClipboardEvent as ReactClipboardEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { isTaskPriority, type TaskAttachmentField, type TaskAttachmentReference, type TaskManagementStatusDefinition } from '@zeus/shared';
 import { type ProjectRecord, type TaskEventRecord, type TaskManagementStatus, type TaskPriority, type TaskRecord, type TaskType, type UpdateTaskRelationshipsRequest, type UpdateTaskRequest, ZeusApiError } from '../apiClient.js';
 import { Button } from '../ui/Button.js';
@@ -21,6 +21,7 @@ import { clipboardNeedsResourceRead, clipboardTextAfterResources, dataTransferFi
 import type { PendingResourceCardItem } from '../ui/PendingResourceCards.js';
 import { ZeusSelect } from '../ZeusSelect.js';
 import { TaskAttachmentPreviewList } from './TaskAttachmentPreviewList.js';
+import { TaskManagementStatusSelect } from './TaskManagementStatusSelect.js';
 import {
   mergeTaskAttachments,
   parseTaskAttachments,
@@ -37,6 +38,7 @@ import type { DashboardClient } from '../dashboardClient.js';
 import { readTaskZentaoLink, ZentaoPushModal } from './ZentaoSyncModal.js';
 import { ZentaoEffortModal } from './ZentaoEffortModal.js';
 import { useZentaoInstances } from './useZentaoInstances.js';
+import { TaskDetailDeliverables } from './TaskDetailDeliverables.js';
 import './task-detail.css';
 
 export interface TaskDetailPaneCopy {
@@ -81,6 +83,8 @@ export interface TaskDetailPaneCopy {
 export interface TaskDetailPaneContentProps {
   /** 各种详情呈现方式共用同一禅道客户端。 */
   zentaoClient?: DashboardClient;
+  /** 限定当前任务的交付物列表和正文接口。 */
+  deliverableClient?: DashboardClient;
   /** 同步后合并完整任务到现有共享缓存。 */
   onZentaoTaskUpdated?: (task: TaskRecord) => void;
   /** 可选择的项目来自当前工作区快照。 */
@@ -616,6 +620,8 @@ function TaskImmediateSelect<T extends string>(props: {
 
   /** 加载动效与保存保护分开，静默保存时保留下拉箭头。 */
   const showSaveSpinner = saveState.kind === 'saving' && props.showSaveSpinner !== false;
+  /** 状态字段复用任务状态外观，行内类型和优先级共用通用下拉。 */
+  const Select = props.colorized ? TaskManagementStatusSelect<T> : ZeusSelect<T>;
 
   useEffect(() => {
     if (saveState.kind === 'saving' || saveState.kind === 'error' || saveState.kind === 'conflict') return;
@@ -665,15 +671,13 @@ function TaskImmediateSelect<T extends string>(props: {
       aria-busy={saveState.kind === 'saving' || undefined}
       aria-describedby={saveState.kind === 'error' || saveState.kind === 'conflict' ? statusId : undefined}
     >
-      <ZeusSelect
+      <Select
         size="compact"
         ariaLabel={props.ariaLabel}
         value={displayValue}
         options={props.options}
         triggerIcon={props.triggerIcon}
         triggerClassName={props.colorized ? undefined : 'task-detail-property-trigger'}
-        className={props.colorized ? 'task-status-select task-status-custom' : undefined}
-        style={props.colorized ? ({ '--task-status-tone': props.options.find((option) => option.value === displayValue)?.color ?? '#6b7280' } as CSSProperties) : undefined}
         onChange={(value) => {
           const expectedUpdatedAt = props.task.updatedAt ?? '';
           if (value === props.value) return;
@@ -1348,6 +1352,7 @@ export function TaskDetailPaneContent(props: TaskDetailPaneContentProps) {
           <section className="task-detail-requirements" aria-label={zh ? '任务说明' : 'Requirements'}>
             {taskOverview}
           </section>
+          {props.deliverableClient ? <TaskDetailDeliverables key={props.task.id} taskId={props.task.id} client={props.deliverableClient} language={props.language} revision={props.events[0]?.id ?? props.task.updatedAt} /> : null}
           <section className="task-detail-block" aria-label={props.copy.conversationsTitle} aria-busy={props.conversationsLoading}>
             <h2 className="task-detail-section-heading">{props.copy.conversationsTitle}</h2>
             {props.conversationsError ? (
