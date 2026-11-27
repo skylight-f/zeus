@@ -2475,7 +2475,7 @@ function ComposerMarkdownQa() {
               {
                 id: 'qa-model',
                 model: 'GPT-6-Astra',
-                sourceName: 'OpenAI',
+                sourceName: 'Codex',
                 displayName: 'GPT-6-Astra',
                 supportedReasoningEfforts: ['xhigh', 'max'],
                 defaultReasoningEffort: 'max',

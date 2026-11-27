@@ -1,10 +1,3 @@
-import { terminateProjectTerminalSessions } from '../runtime/projectTerminalCleanup.js';
-import type { AttentionItem } from '@zeus/shared';
-import type { CSSProperties } from 'react';
-import { AttentionSidebar, AttentionToggle } from '../attention/AttentionSidebar.js';
-import type { AttentionNavigation } from '../attention/attentionContext.js';
-import { AttentionWorkspaceShell } from '../attention/AttentionWorkspaceShell.js';
-import { useAttention } from '../attention/useAttention.js';
 import { ProjectSourceWorktreeSelect } from '../../code/ProjectSourceWorktreeSelect.js';
 import { ProjectTerminalPanel } from '../runtime/ProjectTerminalPanel.js';
 import { WorkspaceSearch } from '../../code/WorkspaceSearch.js';
@@ -13,7 +6,7 @@ import type { ProjectGitWorkbenchSnapshot } from '../git/gitContracts.js';
 import type { ProjectSourceWorkspaceHandle } from '../../code/ProjectSourceWorkspace.js';
 import { isMacOSPlatform, platformShortcutLabel } from '../../platform.js';
 import { toolPages } from '../../tooling/index.js';
-import { compareConversationWorkStartedDesc, faultReportContext, temporaryWorkspaceId, type CommandRun, type CommandRunNotification } from '@zeus/shared';
+import { compareConversationWorkStartedDesc, faultReportContext, temporaryWorkspaceId, type CommandRun } from '@zeus/shared';
 import { MotionPresence } from '../../ui/MotionPresence.js';
 import { SettingsSaveStatus, useSettingsAutosave, type SettingsSaveState } from '../../settings/useSettingsAutosave.js';
 import { FileTextIcon } from '@phosphor-icons/react/dist/csr/FileText';
@@ -59,6 +52,7 @@ import { defaultTaskTableEnumSortOrders, normalizeTaskTableEnumSortOrders } from
 import { ZeusSelect } from '../../ZeusSelect.js';
 import { Button } from '../../ui/Button.js';
 import { ModalPortal } from '../../ui/ModalPortal.js';
+import { GitDeliveryCommandRunContext } from '../../git/GitDeliveryProgress.js';
 import { taskAgentRunStatusLabels } from '../../task/TaskRunStatusChip.js';
 import { WorkspaceDrawer } from '../../ui/WorkspaceDrawer.js';
 import { formatRuntimeAdapterDetectionFacts, InlineRecoveryPrompt, ProjectCreateDialog, ProjectStartGuide, ProjectWorkspaceNavigation, SidebarNav } from './WorkspaceChrome.js';
@@ -97,6 +91,8 @@ const ModelSetupDialog = lazy(() => import('../../settings/ModelSetup.js').then(
 /** 账户设置与接入对话框复用同一按需模块。 */
 const CodexAccountSettings = lazy(() => import('../../settings/ModelSetup.js').then((module) => ({ default: module.CodexAccountSettings })));
 /** Copilot 设置按需载入，避免常驻工作面启动账号查询。 */
+/** 模型供应商页复用原生账号区块。 */
+const AntigravityAccountSettings = lazy(() => import('../../settings/AntigravityAccountSettings.js').then((module) => ({ default: module.AntigravityAccountSettings })));
 const CopilotAccountSettings = lazy(() => import('../../settings/CopilotAccountSettings.js').then((module) => ({ default: module.CopilotAccountSettings })));
 /** GlobalAgentSettingsPane 仅在对应页面打开时加载。 */
 const GlobalAgentSettingsPane = lazy(() => import('../../settings/GlobalAgentSettingsPane.js').then((module) => ({ default: module.GlobalAgentSettingsPane })));
@@ -120,6 +116,8 @@ const MemorySettingsPane = lazy(() => import('../memory/MemorySettingsPane.js').
 const ImRobotSettingsPane = lazy(() => import('../telegram/ImRobotSettingsPane.js').then((module) => ({ default: module.ImRobotSettingsPane })));
 /** CommandCenterPanel 仅在对应页面打开时加载。 */
 const CommandCenterPanel = lazy(() => import('../../CommandCenterPanel.js').then((module) => ({ default: module.CommandCenterPanel })));
+/** 通知、项目入口和交付记录共用同一项目命令弹窗。 */
+const ProjectCommandDialog = lazy(() => import('../../CommandCenterPanel.js').then((module) => ({ default: module.ProjectCommandDialog })));
 /** DigitalEmployeeTemplatesSettings 仅在对应页面打开时加载。 */
 const DigitalEmployeeTemplatesSettings = lazy(() => import('../digital-employees/DigitalEmployeeTemplatesSettings.js').then((module) => ({ default: module.DigitalEmployeeTemplatesSettings })));
 /** CodexConfigImportSettings 仅在对应页面打开时加载。 */
@@ -134,18 +132,6 @@ const ProjectSourceWorkspace = lazy(() => import('../../code/ProjectSourceWorksp
 
 /** 工作区统一保留按需加载边界，模块就绪前不显示瞬时文字占位。 */
 export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions: WorkspaceDomainActions; operations: WorkspaceOperations }) {
-  const [attentionOpen, setAttentionOpen] = useState(false);
-  const [attentionWidth, setAttentionWidth] = useState(() => {
-    try {
-      const width = Number(window.localStorage.getItem('zeus.attention.width'));
-      return width >= 300 && width <= 520 ? width : 360;
-    } catch {
-      return 360;
-    }
-  });
-  const [attentionNavigation, setAttentionNavigation] = useState<AttentionNavigation | null>(null);
-  const attentionContext = useMemo(() => ({ open: attentionOpen, navigation: attentionNavigation }), [attentionOpen, attentionNavigation]);
-  const attention = useAttention(input.state.props.commandClient ?? null);
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
   const [pendingGlobalTask, setPendingGlobalTask] = useState<{ taskId: string; projectId: string; presentation?: 'full_page' } | null>(null);
   /** 全局和项目搜索共同保留目标行列，等待源码工作区就绪后打开。 */
@@ -159,12 +145,12 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   useEffect(() => {
     if (state.taskCreateForm.zentao && !zentaoInstances.some((instance) => instance.id === state.taskCreateForm.zentao?.instanceId)) state.setTaskCreateForm((current) => ({ ...current, zentao: undefined }));
   }, [zentaoInstances, state.taskCreateForm.zentao?.instanceId, state.setTaskCreateForm]);
-  /** 命令通知复用原命令弹窗，不切换底层页面或丢弃未保存内容。 */
-  const [notificationCommand, setNotificationCommand] = useState<CommandRunNotification | null>(null);
+  /** 通知和交付时间线打开同一命令详情，底层会话保留原位置。 */
+  const [commandRunTarget, setCommandRunTarget] = useState<Pick<CommandRun, 'id' | 'projectId'> | null>(null);
   /** 详情组件回传真实可见身份，加载失败或关闭不会提前已读。 */
   const [visibleNotificationCommandRun, setVisibleNotificationCommandRun] = useState<CommandRun | null>(null);
   /** 项目以当前目录为准，删除后不继续展示可操作详情。 */
-  const notificationCommandProject = state.snapshot.projects.find((project) => project.id === notificationCommand?.projectId);
+  const commandRunProject = state.snapshot.projects.find((project) => project.id === commandRunTarget?.projectId);
   /** 进入会话后通知状态仍驻留，等待准确正文可见再确认已读。 */
   const notifications = useNotifications({
     client: state.props.commandClient ?? null,
@@ -191,12 +177,12 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       openSearchedTask(task.id, task.projectId);
     },
     visibleCommandRun: visibleNotificationCommandRun,
-    commandContentVisible: state.zeusWindowForeground && Boolean(notificationCommand && notificationCommandProject),
+    commandContentVisible: state.zeusWindowForeground && Boolean(commandRunTarget && commandRunProject),
     /** 只叠加原详情弹窗，同一已打开执行保留真实可见回执。 */
     onOpenCommand: async (item) => {
       if (!state.props.commandClient) throw new Error('命令服务尚未连接。');
       if (!state.snapshot.projects.some((project) => project.id === item.projectId)) throw new Error('命令所属项目不可用。');
-      setNotificationCommand(item);
+      setCommandRunTarget(item);
     },
   });
   useEffect(
@@ -527,6 +513,18 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     updateTaskBoardSettings,
     workspaceDrawerPortalStyle,
   } = operations;
+  /** 任务完成后从已保存的状态更新侧栏和归档目录。 */
+  async function completeSidebarTask(taskId: string): Promise<void> {
+    const result = await updateTaskManagementStatus(taskId, activeTaskManagementStatusConfig.roles.completedStatusId, { feedbackInConversationRow: true });
+    if (result?.kind === 'conflict') {
+      throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '任务已在其他位置更新，请核对当前状态后重试。' : 'The task changed elsewhere. Review its current status and try again.');
+    }
+    if (result?.kind === 'updated') {
+      void refreshArchivedConversations();
+      await refreshNativeConversationChoices(taskId).catch(() => undefined);
+    }
+  }
+
   /** 任务详情各展示形态统一用任务编码作为顶栏身份，避免重复展示泛化标题。 */
   const taskDetailPresentationLabel = taskDetailPaneTask
     ? `${taskWorkspaceCopy.taskCodeLabel ?? (appShellSettings.appLanguage === 'zh-CN' ? '任务编码' : 'Task code')} ${taskDetailPaneTask.taskCode?.trim() || taskDetailPaneTask.id}`
@@ -543,24 +541,6 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     }
     openProjectSection(project, section, codeMode);
   };
-  async function openAttentionItem(item: AttentionItem): Promise<void> {
-    const project = snapshot.projects.find((candidate) => candidate.id === item.projectId);
-    if (!project) throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '项目已不可用，请刷新待办。' : 'The project is unavailable. Refresh attention.');
-    if (item.target.kind === 'conversation') {
-      if (!props.nativeConversationClient) throw new Error('Conversation service unavailable');
-      const conversation = await props.nativeConversationClient.loadNativeConversationChoice(item.projectId, item.target.conversationId);
-      if (!(await selectNativeConversation(conversation, 'page', 'interactive'))) return;
-      setAttentionNavigation({ projectId: item.projectId, target: item.target, nonce: Date.now() });
-    } else {
-      const target = item.target;
-      const onNavigated = () => {
-        if (target.kind === 'task_decision') setPendingGlobalTask({ taskId: target.taskId, projectId: item.projectId, presentation: 'full_page' });
-        setAttentionNavigation({ projectId: item.projectId, target, nonce: Date.now() });
-      };
-      if (target.kind === 'task_decision') openProjectSection(project, 'tasks', projectCodeWorkspaceMode, onNavigated);
-      else handleMainNavigate(target.kind === 'digital_team' ? 'digital-teams' : 'automations', onNavigated);
-    }
-  }
   /** 编辑器懒加载完成后才消费全局源码搜索，避免首次打开丢失文件定位。 */
   const [sourceReady, setSourceReady] = useState(false);
   /** 离开保护与文件定位始终引用当前唯一的源码编辑器。 */
@@ -757,6 +737,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const sessionCodexParityVisible = upstreamMainLayout
     ? activeProjectSection === 'sessions' && activeNavTarget !== 'settings' && activeNavTarget !== 'skills' && activeNavTarget !== 'digital-employees' && activeNavTarget !== 'digital-teams' && activeNavTarget !== 'automations'
     : projectSessionSourceListVisible;
+  /** 经典会话页的来源列表、会话和右栏共用顶栏高度。 */
+  const sessionTopbar = upstreamMainLayout && sessionCodexParityVisible;
 
   /** 项目工具与源码工作区共用应用语言。 */
   const codeWorkspaceZh = appShellSettings.appLanguage === 'zh-CN';
@@ -764,7 +746,7 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
   const activeSourceTarget = sourceWorkspaceTarget?.ownerProjectId === selectedProject?.id && activeProjectSection === 'code' && (activeNavTarget === 'projects' || activeNavTarget === 'conversations') ? sourceWorkspaceTarget : null;
   /** 工具只绑定当前选中的真实项目，临时会话不提供项目操作。 */
   const projectToolsVisible = Boolean(selectedProject && selectedProject.id !== temporaryWorkspaceId);
-  /** 搜索由右上角和平台快捷键共同控制，项目范围在弹窗内选择。 */
+  /** 搜索入口和平台快捷键共用弹窗状态，项目范围在弹窗内选择。 */
   const [searchOpen, setSearchOpen] = useState(false);
   /** 所有项目源码搜索结果共用文件导航与未保存保护。 */
   function openSourceMatch(project: ProjectRecord, match: ProjectSourceContentMatch): void {
@@ -899,17 +881,37 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
     openProjectSection(project, 'tasks');
   }
 
-  return (
-    <AttentionWorkspaceShell
-      value={attentionContext}
+  /** 搜索提示与读屏名称共用平台快捷键。 */
+  const workspaceSearchLabel = platformShortcutLabel(codeWorkspaceZh ? '搜索（⇧⌘F）' : 'Search (⇧⌘F)');
+  /** 会话顶栏与其他页面的右上角共用同一个搜索入口。 */
+  const workspaceSearchTrigger = (
+    <Button
+      unstyled
+      type="button"
+      className={`project-workspace-search-trigger${searchOpen ? ' is-active' : ''}`}
+      onClick={() => setSearchOpen(true)}
+      aria-label={workspaceSearchLabel}
+      data-icon-tooltip={workspaceSearchLabel}
+      aria-keyshortcuts={`${isMacOSPlatform() ? 'Meta' : 'Control'}+Shift+F`}
+      data-project-tool="search"
+      aria-haspopup="dialog"
+      aria-expanded={searchOpen}
+    >
+      <MagnifyingGlass aria-hidden="true" />
+    </Button>
+  );
+
+  /** 会话与停靠侧栏中的命令详情共用工作台弹窗。 */
+  const workspace = (
+    <main
       className={`zeus-shell ai-native-shell macos-ai-app codex-thread-workbench workspace-product-shell theme-${appShellSettings.appearance}${upstreamMainLayout ? ' main-layout-upstream' : ' main-layout-current'}${activeNavTarget === 'settings' ? ' settings-dedicated-shell' : ''}${activeNavTarget === 'skills' ? ' skills-dedicated-shell' : ''}${activeNavTarget === 'digital-teams' ? ' digital-teams-dedicated-shell' : ''}${activeNavTarget === 'automations' ? ' automations-dedicated-shell' : ''}${sessionCodexParityVisible ? ' session-codex-parity-v1' : ''}${projectSessionSourceListVisible ? ' project-session-source-list-shell' : ''}${projectWorkspaceNavigationVisible ? ' project-navigation-rail-shell' : ''}`}
       data-theme={appShellSettings.appearance}
       data-language={appShellSettings.appLanguage}
       data-main-layout={appShellSettings.mainLayout}
+      data-session-topbar={sessionTopbar || undefined}
       data-project-tools-visible="true"
       data-project-sidebar-resizing={projectSidebarResizing ? 'true' : 'false'}
-      data-attention-open={attentionOpen || undefined}
-      style={{ ...projectSidebarShellStyle, '--zeus-attention-width': `${attentionWidth}px` } as CSSProperties}
+      style={projectSidebarShellStyle}
       lang={uiCopy.documentLang}
       aria-label={uiCopy.shellAriaLabel}
       onPointerDown={handleWindowDragPointerDown}
@@ -933,38 +935,24 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       />
       <MotionPresence>
         {commandsProject && props.commandClient ? (
-          <ModalPortal role="dialog" aria-label={`${commandsProject.name} · ${codeWorkspaceZh ? '命令' : 'Commands'}`} rootClassName="project-command-portal" onDismiss={() => setProjectCommandsProjectId(null)}>
-            <section className="project-command-dialog zeus-solid-form-surface" data-modal-surface="dialog">
-              <Suspense fallback={null}>
-                <CommandCenterPanel key={commandsProject.id} mode="project" project={commandsProject} client={props.commandClient} language={appShellSettings.appLanguage} onClose={() => setProjectCommandsProjectId(null)} />
-              </Suspense>
-            </section>
-          </ModalPortal>
+          <Suspense fallback={null}>
+            <ProjectCommandDialog key={commandsProject.id} project={commandsProject} client={props.commandClient} language={appShellSettings.appLanguage} onClose={() => setProjectCommandsProjectId(null)} />
+          </Suspense>
         ) : null}
       </MotionPresence>
       <MotionPresence>
-        {notificationCommand && notificationCommandProject && props.commandClient ? (
-          <ModalPortal
-            role="dialog"
-            aria-label={`${notificationCommandProject.name} · ${appShellSettings.appLanguage === 'zh-CN' ? '命令' : 'Commands'}`}
-            rootClassName="project-command-portal"
-            onDismiss={() => setNotificationCommand(null)}
-          >
-            <section className="project-command-dialog zeus-solid-form-surface" data-modal-surface="dialog">
-              <Suspense fallback={null}>
-                <CommandCenterPanel
-                  key={notificationCommand.id}
-                  mode="project"
-                  project={notificationCommandProject}
-                  client={props.commandClient}
-                  language={appShellSettings.appLanguage}
-                  initialRunId={notificationCommand.id}
-                  onRunDetailVisible={setVisibleNotificationCommandRun}
-                  onClose={() => setNotificationCommand(null)}
-                />
-              </Suspense>
-            </section>
-          </ModalPortal>
+        {commandRunTarget && commandRunProject && props.commandClient ? (
+          <Suspense fallback={null}>
+            <ProjectCommandDialog
+              key={commandRunTarget.id}
+              project={commandRunProject}
+              client={props.commandClient}
+              language={appShellSettings.appLanguage}
+              initialRunId={commandRunTarget.id}
+              onRunDetailVisible={setVisibleNotificationCommandRun}
+              onClose={() => setCommandRunTarget(null)}
+            />
+          </Suspense>
         ) : null}
       </MotionPresence>
       <Suspense fallback={null}>
@@ -1124,23 +1112,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       </MotionPresence>
       {!upstreamMainLayout && projectWorkspaceNavigationVisible && selectedProject ? (
         <ProjectWorkspaceNavigation
-          attentionAction={<AttentionToggle open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} />}
-          notificationCenter={<NotificationCenter model={notifications} language={appShellSettings.appLanguage} />}
-          pinnedProjectIds={appShellSettings.pinnedProjectIds}
-          onTogglePinnedProject={togglePinnedProject}
-          onRevealProjectInFinder={revealProjectInFinder}
-          onRenameProject={renameProjectDisplayName}
-          onPrepareProjectDelete={setPendingProjectDeleteId}
-          onConfirmProjectDelete={deleteProject}
           project={selectedProject}
           projects={orderedProjects}
-          onCloseProject={async (project) => {
-            await terminateProjectTerminalSessions(props.commandClient ?? null, project.id);
-          }}
-          tasks={snapshot.tasks}
-          onOpenTask={(task) => openSearchedTask(task.id, task.projectId)}
-          onOpenConversation={(conversation) => void selectNativeConversation(conversation)}
-          onOpenSourceMatch={openSourceMatch}
           onSelectProject={(project) => openProjectView(project, project.id === temporaryWorkspaceId ? 'sessions' : activeProjectSection, 'source')}
           canCreateProject={projectCreationReady && !creatingProjectBusy}
           createProjectBusy={creatingProjectBusy}
@@ -1159,8 +1132,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
       {!upstreamMainLayout && projectWorkspaceNavigationVisible ? <div className="project-workspace-status-bar" data-workspace-tool-slot="bottom" aria-hidden="true" /> : null}
       {activeNavTarget !== 'settings' && (upstreamMainLayout || !selectedProject || projectSessionSourceListVisible) ? (
         <SidebarNav
-          onOpenTaskDetail={openSearchedTask}
           notificationCenter={<NotificationCenter model={notifications} language={appShellSettings.appLanguage} />}
+          headerSearch={sessionTopbar ? workspaceSearchTrigger : undefined}
           mainLayout={appShellSettings.mainLayout}
           activeNavTarget={activeNavTarget}
           activeProjectId={activeProjectId}
@@ -1182,7 +1155,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           onCreateConversation={() => prepareNewConversationDraft()}
           onSelectConversation={(conversation) => selectNativeConversation(conversation)}
           onPrepareConversation={state.prioritizeConversation}
-          onArchiveConversation={archiveConversation}
+          onArchiveConversation={props.nativeConversationClient ? archiveConversation : undefined}
+          onCompleteTask={props.onUpdateTaskManagementStatus ? completeSidebarTask : undefined}
           onRenameConversation={props.nativeConversationClient ? renameConversation : undefined}
           onNavigate={handleMainNavigate}
           onOpenAutomaticUpdate={() => openAutomaticUpdateIndicatorInMain({ zeus: globalThis.window.zeus })}
@@ -1235,10 +1209,11 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
             <section className="workspace-view workspace-view-project-code project-code-workspace" aria-label={codeWorkspaceZh ? '项目源码' : 'Project source'}>
               <div className="project-code-mode-host">
                 <div className="project-code-mode-pane">
-                  <Suspense fallback={null}>
+                  <Suspense key={activeSourceTarget?.project.localPath ?? selectedProject.localPath} fallback={null}>
                     <ProjectSourceWorkspace
                       key={activeSourceTarget?.project.id ?? selectedProject.id}
                       ref={setSourceRef}
+                      ownerProjectId={selectedProject.id}
                       project={activeSourceTarget?.project ?? selectedProject}
                       language={appShellSettings.appLanguage}
                       preference={
@@ -1466,7 +1441,8 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                         onClose={() => setZentaoImportOpen(false)}
                       />
                     </>
-                  ) : taskDetailPaneTask || sessionDrawerTarget ? null : (
+                  ) : sessionDrawerTarget ? null : (
+                    // 任务详情抽屉打开时保留会话正文和滚动位置，供关闭后继续阅读。
                     renderNativeConversationWorkspace((taskId) => void openTaskDetailPane(taskId))
                   )}
 
@@ -2240,12 +2216,14 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
                         <header className="settings-page-heading">
                           <span>
                             <h2 className="settings-page-title">{settingsWorkspaceCopy.categories.models}</h2>
-                            <p>{appShellSettings.appLanguage === 'zh-CN' ? '管理模型服务与可用模型。' : 'Manage model providers and available models.'}</p>
                           </span>
                           <SettingsSaveStatus status={modelSaveState} language={appShellSettings.appLanguage} />
                         </header>
-                        <CodexAccountSettings controller={modelSetup} />
-                        <CopilotAccountSettings client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} />
+                        <section className="model-provider-accounts" aria-label={appShellSettings.appLanguage === 'zh-CN' ? '订阅账号' : 'Subscription accounts'}>
+                          <CodexAccountSettings controller={modelSetup} />
+                          <CopilotAccountSettings client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} />
+                          <AntigravityAccountSettings client={props.nativeConversationClient ?? null} language={appShellSettings.appLanguage} />
+                        </section>
                         <ModelConnectionsSettingsPane language={appShellSettings.appLanguage} client={props.nativeConversationClient ?? null} onSaveStateChange={setModelSaveState} />
                       </>
                     ) : null}
@@ -2517,40 +2495,13 @@ export function WorkspaceView(input: { state: WorkspaceQueryState; domainActions
           </Suspense>
         </ProjectToolsWorkspace>
       </section>
-      <nav className="project-workspace-tool-rail project-workspace-search-rail" aria-label={codeWorkspaceZh ? '全局搜索' : 'Global search'}>
-        <Button
-          unstyled
-          type="button"
-          className={searchOpen ? 'is-active' : ''}
-          onClick={() => setSearchOpen(true)}
-          aria-label={platformShortcutLabel(codeWorkspaceZh ? '搜索（⇧⌘F）' : 'Search (⇧⌘F)')}
-          data-icon-tooltip={platformShortcutLabel(codeWorkspaceZh ? '搜索（⇧⌘F）' : 'Search (⇧⌘F)')}
-          aria-keyshortcuts={`${isMacOSPlatform() ? 'Meta' : 'Control'}+Shift+F`}
-          data-project-tool="search"
-          aria-haspopup="dialog"
-          aria-expanded={searchOpen}
-        >
-          <MagnifyingGlass aria-hidden="true" />
-        </Button>
-      </nav>
+      {sessionTopbar ? null : (
+        <nav className="project-workspace-tool-rail project-workspace-search-rail" aria-label={codeWorkspaceZh ? '全局搜索' : 'Global search'}>
+          {workspaceSearchTrigger}
+        </nav>
+      )}
       {projectToolRail}
-      {upstreamMainLayout || !projectWorkspaceNavigationVisible ? <AttentionToggle standalone open={attentionOpen} state={attention} language={appShellSettings.appLanguage} onClick={() => setAttentionOpen((value) => !value)} /> : null}
-      <AttentionSidebar
-        open={attentionOpen}
-        width={attentionWidth}
-        language={appShellSettings.appLanguage}
-        state={attention}
-        onClose={() => setAttentionOpen(false)}
-        onOpen={openAttentionItem}
-        onWidthChange={(width) => {
-          setAttentionWidth(width);
-          try {
-            window.localStorage.setItem('zeus.attention.width', String(width));
-          } catch {
-            /* 存储不可用时保留本次窗口宽度。 */
-          }
-        }}
-      />
-    </AttentionWorkspaceShell>
+    </main>
   );
+  return <GitDeliveryCommandRunContext.Provider value={props.commandClient ? setCommandRunTarget : null}>{workspace}</GitDeliveryCommandRunContext.Provider>;
 }

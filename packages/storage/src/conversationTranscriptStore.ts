@@ -16,6 +16,22 @@ const conversationTranscriptInitializationBatchLimit = 512;
 /** 旧数据初始化按固定来源顺序保存独立扫描游标。 */
 const conversationTranscriptInitializationDomains = ['model_history', 'provider_item', 'process', 'expert_execution', 'request', 'resource'] as const;
 
+/** 内部提交的用户输入仅供模型使用。同一提交的助手输出仍进入时间线。 */
+export const modelHistoryVisibleInTranscriptSql = `(conversation_model_history.role <> 'user' OR NOT EXISTS (
+  SELECT 1 FROM conversation_submissions AS internal_submission
+  WHERE internal_submission.conversation_id = conversation_model_history.conversation_id
+    AND internal_submission.id = conversation_model_history.submission_id
+    AND CASE WHEN json_valid(internal_submission.input_json) THEN json_type(internal_submission.input_json, '$.internalOperation') END = 'true'
+))`;
+
+/** 排序时也过滤升级前已暂存的内部输入，保持采集断点的偏移量有效。 */
+const reconstructionFactVisibleInTranscriptSql = `(fact.source_domain <> 'model_history' OR NOT EXISTS (
+  SELECT 1 FROM conversation_model_history
+  WHERE conversation_model_history.conversation_id = fact.conversation_id
+    AND conversation_model_history.id = fact.source_id
+    AND NOT ${modelHistoryVisibleInTranscriptSql}
+))`;
+
 /** 旧数据初始化支持的来源种类。 */
 type ConversationTranscriptInitializationDomain = (typeof conversationTranscriptInitializationDomains)[number];
 
@@ -528,8 +544,6 @@ export class ConversationTranscriptRepository {
       this.assertInitializationComplete(conversationId);
       this.db.execute('DELETE FROM conversation_transcript_initialization_facts WHERE conversation_id = ?', [conversationId]);
       this.db.execute("UPDATE conversation_transcript_state SET initialization_state = 'ready', initialization_cursor_json = NULL WHERE conversation_id = ?", [conversationId]);
-      // 完整就绪后在同一持久事务内通知最终代次，保留本地初始化完成事件。
-      this.writePlacementChange(conversationId, this.revision(conversationId));
       return true;
     }
     this.registerSourceBatch(batch.facts, true);
@@ -551,7 +565,8 @@ export class ConversationTranscriptRepository {
         LEFT JOIN conversation_transcript_aliases AS alias ON alias.conversation_id = fact.conversation_id
           AND alias.source_domain = fact.source_domain AND alias.source_scope = fact.source_scope AND alias.source_id = fact.source_id AND alias.facet = fact.facet
         LEFT JOIN conversation_transcript_entries AS entry ON entry.conversation_id = alias.conversation_id AND entry.id = alias.entry_id
-        WHERE fact.conversation_id = ? AND (alias.entry_id IS NULL OR entry.id IS NULL OR alias.entry_id <> fact.preferred_entry_id) LIMIT 1`,
+        WHERE fact.conversation_id = ? AND ${reconstructionFactVisibleInTranscriptSql}
+          AND (alias.entry_id IS NULL OR entry.id IS NULL OR alias.entry_id <> fact.preferred_entry_id) LIMIT 1`,
       [conversationId],
     );
     if (missing) throw transcriptError('ZEUS_CONVERSATION_TRANSCRIPT_INCOMPLETE', `来源尚未完成位置登记：${missing.source_id}`);
@@ -1172,43 +1187,28 @@ export class ConversationTranscriptRepository {
     const rows = this.db.select<{ fact_json: string }>('SELECT fact_json FROM conversation_transcript_initialization_facts WHERE conversation_id = ? AND preferred_entry_id = ?', [fact.conversationId, fact.preferredEntryId]);
     /** 一个显示身份的全部来源只保留短元数据。 */
     const sources = rows.map((row) => JSON.parse(row.fact_json) as ReconstructionFact);
-    if (!sources.length) return;
     if (sources.every((source) => source.relationsNormalized)) return;
     /** 明确关系相互矛盾时保留事实并拒绝本批。 */
-    const normalizeSources = (group: ReconstructionFact[], preferredEntryId: string): void => {
-      const uniqueRelation = (field: 'turnId' | 'openingInputId' | 'displayStageId'): string | null => {
-        const values = [...new Set(group.map((source) => source[field]).filter((value): value is string => Boolean(value)))];
-        if (values.length > 1) throw transcriptError('ZEUS_CONVERSATION_TRANSCRIPT_RELATION_CONFLICT', `同一显示身份的 ${field} 证据冲突：${preferredEntryId}`);
-        return values[0] ?? null;
-      };
-      /** 有明确普通输入来源时统一为普通输入，不让 Provider 回显变成正文。 */
-      const kind = group.some((source) => source.kind === 'ordinary_input') ? 'ordinary_input' : group[0]!.kind;
-      /** 同一显示身份只在首次出现处入序，各自原来源序号保持不变。 */
-      const firstSeenAt = group.reduce((earliest, source) => (source.firstSeenAt < earliest ? source.firstSeenAt : earliest), group[0]!.firstSeenAt);
-      /** 所有别名共用明确关系，未知关系留给有序摄取时的原输入/阶段规则。 */
-      const relation = {
-        preferredEntryId,
-        turnId: uniqueRelation('turnId'),
-        openingInputId: uniqueRelation('openingInputId'),
-        displayStageId: uniqueRelation('displayStageId'),
-        kind,
-        firstSeenAt,
-        startsStage: group.some((source) => source.startsStage),
-        relationsNormalized: true,
-      };
-      for (const source of group) this.stageReconstructionFact({ ...source, ...relation });
+    const uniqueRelation = (field: 'turnId' | 'openingInputId' | 'displayStageId'): string | null => {
+      const values = [...new Set(sources.map((source) => source[field]).filter((value): value is string => Boolean(value)))];
+      if (values.length > 1) throw transcriptError('ZEUS_CONVERSATION_TRANSCRIPT_RELATION_CONFLICT', `同一显示身份的 ${field} 证据冲突：${fact.preferredEntryId}`);
+      return values[0] ?? null;
     };
-    const turnIds = [...new Set(sources.map((source) => source.turnId).filter((turnId): turnId is string => Boolean(turnId)))];
-    const providerIdentity = sources.every((source) => (source.originalPreferredEntryId ?? source.preferredEntryId).startsWith('provider:'));
-    if (providerIdentity && turnIds.length > 1 && sources.every((source) => Boolean(source.turnId))) {
-      /** 旧来源可能跨 turn 复用 Provider 短 ID；只在确有冲突时追加 turn 作用域，保持既有单一身份不变。 */
-      for (const turnId of turnIds) {
-        const group = sources.filter((source) => source.turnId === turnId);
-        normalizeSources(group, `provider:${stableIdentity([fact.preferredEntryId, turnId])}`);
-      }
-      return;
-    }
-    normalizeSources(sources, fact.preferredEntryId);
+    /** 有明确普通输入来源时统一为普通输入，不让 Provider 回显变成正文。 */
+    const kind = sources.some((source) => source.kind === 'ordinary_input') ? 'ordinary_input' : fact.kind;
+    /** 同一显示身份只在首次出现处入序，各自原来源序号保持不变。 */
+    const firstSeenAt = sources.reduce((earliest, source) => (source.firstSeenAt < earliest ? source.firstSeenAt : earliest), fact.firstSeenAt);
+    /** 所有别名共用明确关系，未知关系留给有序摄取时的原输入/阶段规则。 */
+    const relation = {
+      turnId: uniqueRelation('turnId'),
+      openingInputId: uniqueRelation('openingInputId'),
+      displayStageId: uniqueRelation('displayStageId'),
+      kind,
+      firstSeenAt,
+      startsStage: sources.some((source) => source.startsStage),
+      relationsNormalized: true,
+    };
+    for (const source of sources) this.stageReconstructionFact({ ...source, ...relation });
   }
 
   /** 每种来源只推进自身顺序，跨来源确定性合并当前候选而非混用序号。 */
@@ -1222,7 +1222,8 @@ export class ConversationTranscriptRepository {
       /** 持久来源游标使用原序号和完整作用域，重复时间不影响续做。 */
       const after = previousCursors[domain];
       const rows = this.db.select<{ fact_json: string }>(
-        `SELECT fact_json FROM conversation_transcript_initialization_facts WHERE conversation_id = ? AND source_domain = ?
+        `SELECT fact_json FROM conversation_transcript_initialization_facts AS fact WHERE conversation_id = ? AND source_domain = ?
+          AND ${reconstructionFactVisibleInTranscriptSql}
           ${after ? 'AND (source_order, source_scope, source_id, facet) > (?, ?, ?, ?)' : ''}
           ORDER BY source_order, source_scope, source_id, facet LIMIT ?`,
         [conversationId, domain, ...(after ?? []), limit],
@@ -1287,7 +1288,7 @@ export class ConversationTranscriptRepository {
       const providerItemId =
         stringValue(content.providerItemId) ??
         stringValue(row.tool_pair_id) ??
-        (content.agentKind === 'pi' || content.agentKind === 'copilot' ? stringValue(content.stageId) : null) ??
+        (content.agentKind === 'pi' || content.agentKind === 'copilot' || content.agentKind === 'antigravity' ? stringValue(content.stageId) : null) ??
         stringValue(reasoning.itemId) ??
         stringValue(reasoning.providerItemId) ??
         row.expert_execution_id;

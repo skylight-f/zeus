@@ -77,11 +77,14 @@ export interface GitDeliveryInput {
     /** 使用模型目录中已选的加速档位，空值表示标准速度。 */
     serviceTier: CodexServiceTierId | null;
   };
-  /** 任务入口支持已有的合入方式。 */
+  /** 本次交付在准备和完成合入时使用的方式。 */
   mode: 'merge' | 'squash';
   /** 本次冻结的仓库与文件；全目录入口不得因文件树取消勾选而漏掉仓库。 */
   repositories: GitDeliverySelection[];
 }
+
+/** 新交付默认把任务改动合成一个提交。 */
+export const defaultGitDeliveryMergeMode: GitDeliveryInput['mode'] = 'squash';
 
 /** AI 是合入的条件处理，任务状态是全局最后一步。 */
 export type GitDeliveryAction = 'commit' | 'merge' | 'push' | 'command' | 'task_status' | 'conversation_archive';
@@ -96,6 +99,8 @@ export interface GitDeliveryStep {
   repositoryId: string | null;
   /** 命令步骤绑定定义身份，其他步骤为空或缺项。 */
   commandDefinitionId?: string | null;
+  /** 已持久接纳的命令执行身份，用于打开该次执行的记录。 */
+  commandRunId?: string;
   /** 可读仓库名；命令步骤使用命令标题。 */
   repositoryName: string;
   /** 固定操作类型。 */
@@ -104,6 +109,10 @@ export interface GitDeliveryStep {
   state: GitDeliveryStepState;
   /** 真实错误或待处理原因。 */
   message: string | null;
+  /** AI 生成提交说明失败，尚未进入本次 Git 提交。 */
+  commitMessageFailed?: boolean;
+  /** 此步骤是用户终止交付时保留的进度断点。 */
+  stopped?: boolean;
   /** 原命令回执中的脱敏失败详情，不被后续结果核对提示覆盖。 */
   error?: UserFacingErrorCause;
   /** 终态清理需要用户再次确认，保留服务端实际数量。 */

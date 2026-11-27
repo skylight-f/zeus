@@ -228,6 +228,8 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ],
     ['上次操作的结果尚未确认，Zeus 已暂停继续执行，避免重复操作。请检查实际处理状态。', 'The previous action’s result is unconfirmed. Zeus paused further execution to avoid duplicate actions. Check the actual processing state.'],
   ],
+  [['Secret-like provider field rejected: snapshot.reportedTokenFields'], ['本轮用量保存失败。你的对话已保留。', 'Usage for this turn could not be saved. Your conversation was kept.']],
+  [['ZEUS_CONVERSATION_EVENT_PERSIST_FAILED'], ['本轮记录保存失败。', 'This turn could not be saved.']],
   [
     ['ZEUS_PROJECT_CONVERSATION_START_PERSIST_FAILED', 'ZEUS_NATIVE_CONVERSATION_START_PERSIST_FAILED', 'ZEUS_CONVERSATION_COMMAND_PERSIST_FAILED', 'ZEUS_CONVERSATION_COMMAND_STORAGE_UNAVAILABLE'],
     ['Zeus 无法记录这次操作，已停止继续执行。请查看本机存储错误详情。', 'Zeus could not record this action and stopped further execution. See the local storage error details.'],
@@ -282,12 +284,24 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['所选范围是整个磁盘，无法作为项目扫描。请选择实际存放项目的文件夹。', 'The selected location covers the entire filesystem and cannot be scanned as a project. Select the folder that contains your project.'],
   ],
   [['源码文件不存在。'], ['找不到要打开的源码文件，它可能已被移动或删除。请刷新文件列表，确认文件位置。', 'The source file could not be found. It may have been moved or deleted. Refresh the file list and check its location.']],
+  [
+    ['ZEUS_CONVERSATION_RESOURCE_PATH_UNAVAILABLE', 'The conversation file or its folder is unavailable.'],
+    ['无法访问这个会话文件。请检查文件和所在工作目录。', 'Cannot access this conversation file. Check the file and its working folder.'],
+  ],
+  [
+    ['ZEUS_WORKING_DIRECTORY_UNAVAILABLE', 'The conversation working directory is unavailable or has changed.'],
+    ['当前会话的工作目录已变化或无法访问，请确认目录后重试。', 'The working directory changed or cannot be accessed. Check its location and try again.'],
+  ],
+  [['The selected editor is not installed.'], ['所选编辑器已不可用，请选择其他应用。', 'The selected editor is unavailable. Choose another app.']],
   [['源码必须位于项目根目录内。'], ['这个文件不在当前项目内，无法从此入口打开。请切换到对应项目。', 'This file is outside the current project and cannot be opened here. Switch to its project.']],
   [
     ['预览授权已失效。', '文件已变化，请刷新预览。', '读取期间文件发生变化，请刷新。'],
     ['文件预览已过期，或文件内容已经变化。请刷新预览或重新打开文件。', 'The preview expired or the file changed. Refresh the preview or reopen the file.'],
   ],
-  [['文件超出授权目录。'], ['这个文件不在允许预览的文件夹内。请从对应项目或附件重新打开。', 'This file is outside the folder allowed for this preview. Reopen it from its project or attachment.']],
+  [
+    ['文件超出授权目录。', 'ZEUS_CONVERSATION_RESOURCE_PATH_FORBIDDEN', 'Conversation file resource is outside its authorized root.', 'Conversation file resource resolves outside its authorized root.'],
+    ['这个文件不在允许预览的文件夹内。请从对应项目或附件重新打开。', 'This file is outside the folder allowed for this preview. Reopen it from its project or attachment.'],
+  ],
   [['目标不是普通文件。'], ['所选内容不是可预览的普通文件。请选择文件，或使用系统打开。', 'The selected item is not a regular file that can be previewed. Select a file or open it with the system.']],
   // 文件预览自身的明确提示也支持语言切换，沿用现有系统预览和刷新入口。
   [
@@ -502,10 +516,6 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['任务所需的独立工作目录不可用。请检查目录是否存在及访问权限。', 'The task’s separate working folder is unavailable. Check that it exists and that access is allowed.'],
   ],
   [['ZEUS_TASK_RUNTIME_CLEANUP_BUSY'], ['正在停止此任务的运行程序，暂时不能更改任务状态。请等待停止完成。', 'Programs running for this task are being stopped. Wait for them to stop before changing the task status.']],
-  [
-    ['ZEUS_PROJECT_TERMINAL_CLEANUP_FAILED'],
-    ['项目终端尚未确认全部退出，因此项目标签已保留。请查看详情后重试。', 'The project tab was kept open because its terminals have not all been confirmed stopped. Review the details and try again.'],
-  ],
   [['ZEUS_TASK_INTEGRATION_NOT_MERGED'], ['任务分支还没有合入来源分支，请先完成合入再推送。', 'The task branch has not been merged into its source branch. Merge it before pushing.']],
   [['ZEUS_TASK_PUSH_ATTACHMENT_UNAVAILABLE'], ['部分附件无法读取，因此没有创建对话。请检查或移除这些附件。', 'Some attachments cannot be read, so the conversation was not created. Check or remove those attachments.']],
   [['ZEUS_TASK_WORK_DELIVERABLE_CORRUPT'], ['交付物内容未通过完整性检查，暂时不能使用。请查看详情并重新生成交付物。', 'The deliverable failed its integrity check and cannot be used. See the details and generate it again.']],
@@ -574,6 +584,7 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
   ],
   [['ZEUS_AUTOMATION_CONFIG_LOCAL_TIME_INVALID'], ['请按“小时:分钟”填写时间，例如 09:30。', 'Enter the time as hours:minutes, for example 09:30.']],
   [['ZEUS_AUTOMATION_CONFIG_ONCE_AT_INVALID'], ['请填写有效的一次性执行时间。', 'Enter a valid run time for this one-time automation.']],
+  [['ZEUS_AUTOMATION_CONFIG_WEEKDAYS_INVALID'], ['请至少选择一个有效的每周执行日。', 'Select at least one valid day for this weekly automation.']],
   [['ZEUS_AUTOMATION_CONFIG_TIMEZONE_INVALID'], ['时区名称无效，请选择有效时区，例如 Asia/Shanghai。', 'The time zone is invalid. Select a valid time zone, such as Asia/Shanghai.']],
   [['ZEUS_AUTOMATION_CONFIG_ORIGINAL_CONVERSATION_REQUIRED'], ['请先选择自动化要继续使用的对话。', 'Select the conversation that this automation should continue.']],
   [['ZEUS_AUTOMATION_CONFIG_ORIGINAL_CONVERSATION_UNAVAILABLE'], ['原对话不存在或不属于所选项目。请重新选择对话。', 'The original conversation no longer exists or belongs to another project. Select a conversation again.']],
@@ -590,6 +601,7 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
   [['ZEUS_AUTOMATION_TRIGGER_INACTIVE'], ['这个自动化已暂停，请先启用后再运行。', 'This automation is paused. Enable it before running it.']],
   [['ZEUS_AUTOMATION_BUDGET_RUNS_EXHAUSTED'], ['已达到自动化每日运行次数上限。请等待下一天，或调整次数上限。', 'The automation reached its daily run limit. Wait until the next day or adjust the limit.']],
   [['ZEUS_AUTOMATION_DISPATCH_INTERACTION_REQUIRED'], ['自动化需要你的回答或授权，已暂停等待。请在对应对话中处理。', 'The automation needs your answer or approval and is paused. Handle the request in its conversation.']],
+  [['ZEUS_AUTOMATION_EVENT_TASK_REQUIRED'], ['该规则只能由携带任务的事件触发。', 'This rule runs only when an event supplies a task.']],
   [['ZEUS_AUTOMATION_QUEUE_DISCARDED'], ['已有工作阻止本次运行，已按你设置的策略跳过这次触发。', 'Existing work prevented this run. This trigger was skipped according to your configured policy.']],
   [['ZEUS_AUTOMATION_QUEUE_EVICTED'], ['等待运行的任务已满，已按设置移除最早的一项。', 'The waiting queue is full. The oldest waiting run was removed according to your settings.']],
   [['ZEUS_AUTOMATION_TRIGGER_CAUSAL_CYCLE'], ['这次自动化会重复触发同一项目中的自身，Zeus 已停止它以避免无限循环。', 'This automation would trigger itself again in the same project. Zeus stopped it to prevent an endless loop.']],
@@ -769,6 +781,8 @@ const explanations: ReadonlyArray<readonly [codes: readonly string[], explanatio
     ['contextWindowExceeded', 'context_length_exceeded'],
     ['对话内容超过了模型可处理的长度，无法继续这次请求。请缩短输入或选择容量更大的模型。', 'The conversation exceeds the model’s length limit. Shorten the input or choose a model with a larger context window.', 'choose_model'],
   ],
+  [['ZEUS_CODEX_INPUT_TOO_LONG'], ['本次输入超过了 Codex 的长度上限。请减少输入内容。', 'This input exceeds the Codex length limit. Reduce the amount of input.']],
+  [['ZEUS_CODEX_CYBER_POLICY'], ['Codex 安全策略已阻止这次请求。', 'Codex security policy blocked this request.']],
   [
     ['httpConnectionFailed', 'responseStreamConnectionFailed'],
     ['未能连接 AI 服务。请检查网络和连接设置后重试。', 'Could not connect to the AI service. Check the network and connection settings, then retry.', 'model_settings'],
@@ -1245,6 +1259,42 @@ function describeUncataloguedError(chain: readonly UserFacingErrorCause[], langu
   const code = candidates.find(({ item }) => Boolean(item.code))?.item.code;
   if (code) return language === 'zh-CN' ? `操作失败（错误代码：${code}）。` : `The action failed (error code: ${code}).`;
   return language === 'zh-CN' ? '发生了未知错误。' : 'An unknown error occurred.';
+}
+
+/** 仅收录已有明确来源的连接错误码，普通 API 超时或身份不明的拒绝连接由原场景处理。 */
+const externalConnectionErrorCodes = new Set([
+  'ERR_PROXY_CONNECTION_FAILED',
+  'ERR_TUNNEL_CONNECTION_FAILED',
+  'ZEUS_RELEASE_MANIFEST_NETWORK',
+  'ZEUS_RELEASE_MANIFEST_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECT_TIMEOUT',
+  'ZEUS_MODEL_CATALOG_CONNECTION_REFUSED',
+  'ZEUS_MODEL_CATALOG_CONNECTION_RESET',
+  'ZEUS_MODEL_CATALOG_HOST_NOT_FOUND',
+  'ZEUS_MODEL_CATALOG_NETWORK_FAILED',
+  'ZEUS_MODEL_CATALOG_TIMEOUT',
+  'httpConnectionFailed',
+  'responseStreamConnectionFailed',
+  'responseStreamDisconnected',
+]);
+
+/** 按错误链识别本机离线或已知连接失败；未经确认的连接失败仍使用原操作说明。 */
+export function userFacingNetworkIssue(error: unknown, offline = false): 'offline' | 'connection' | null {
+  /** Provider 历史和实时失败都已经投影出结构化分类。 */
+  let connectionFailed = Boolean(error && typeof error === 'object' && 'category' in error && error.category === 'network');
+  for (let cause: UserFacingErrorCause | undefined = userFacingErrorCause(error); cause; cause = cause.cause) {
+    const message = unwrapZeusErrorMessage(cause.message);
+    if (cause.code === 'ERR_INTERNET_DISCONNECTED' || cause.code === 'ENETDOWN' || /^net::ERR_INTERNET_DISCONNECTED(?:\s|:|$)/u.test(message)) return 'offline';
+    if (offline && (cause.code === 'ENETUNREACH' || (!cause.code && message === 'Failed to fetch'))) return 'offline';
+    const identity = cause.code ?? /^net::([A-Z_]+)(?:\s|:|$)/u.exec(message)?.[1] ?? message;
+    if (externalConnectionErrorCodes.has(identity)) connectionFailed = true;
+  }
+  return connectionFailed ? 'connection' : null;
+}
+
+/** 在已确认本机网络异常并影响操作时使用的提示。 */
+export function offlineNetworkNotice(language: UserFacingErrorLanguage): string {
+  return language === 'zh-CN' ? '您的网络环境太差了，村里没通网就一边儿歇着吧～' : 'You’re offline. Retry when you’re back online.';
 }
 
 /** 优先解释已知原因；页面可提供未知错误简述，避免把原始诊断当作首屏摘要。 */

@@ -1,11 +1,11 @@
 /// <reference types="vite/client" />
-import { ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer } from 'electron';
 import { installIconTooltips } from './iconTooltip.js';
 import { installMarkdownListInput } from './markdownListInput.js';
 import { selectionCommentIcons } from './selectionCommentIcons.js';
 import selectionCommentStyles from '../renderer/session/selectionComment.css?inline';
 import { createBrowserPageTranslation, translationSourceElement, sourceText, isTranslationNode } from './browserTranslation.js';
-import type { BrowserTranslationSegment } from '@zeus/shared';
+import { browserAnnotationOverlayRootId as overlayRootId, type BrowserTranslationSegment } from '@zeus/shared';
 import { installBrowserPasswordAutofill } from './browserPasswordAutofill.js';
 
 function invokeBrowserPageCommand(commandType: string, body: unknown, channel = 'zeus:browser-page:save-comment'): Promise<unknown> {
@@ -25,8 +25,16 @@ function invokeBrowserPageCommand(commandType: string, body: unknown, channel = 
   return ipcRenderer.invoke(channel, Object.freeze({ envelope, body }));
 }
 
-/** 各 frame 独立识别自己的登录框。 */
-installBrowserPasswordAutofill((documentId) => invokeBrowserPageCommand('desktop.browser.autofill', { documentId }, 'zeus:browser-page:show-passwords'));
+/** 密码弹层复用沙箱 preload，只在宿主创建的本地文档中安装选择接口。 */
+const isPasswordPicker = process.isMainFrame && location.protocol === 'data:' && process.argv.includes('--zeus-browser-password-picker');
+if (isPasswordPicker) {
+  contextBridge.exposeInMainWorld('zeusPasswordPicker', {
+    /** 回传候选序号，关闭弹层时回传空选择。 */
+    choose: (index: number | null) => ipcRenderer.send('zeus:browser-password-picker:choose', index),
+  });
+} else {
+  installBrowserPasswordAutofill((documentId) => invokeBrowserPageCommand('desktop.browser.autofill', { documentId }, 'zeus:browser-page:show-passwords'));
+}
 
 type Rect = { x: number; y: number; width: number; height: number };
 type DesignChange = { kind: 'text' | 'style'; selector?: string; property?: string; previous: string; next: string };
@@ -81,7 +89,6 @@ type SpeechRecognitionLike = {
 };
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
-const overlayRootId = 'zeus-browser-annotation-root';
 const state = {
   enabled: false,
   comments: [] as BrowserComment[],
@@ -137,29 +144,14 @@ function install(): void {
     ${selectionCommentStyles}
     :host { all: initial; color-scheme: light dark; }
     * { box-sizing: border-box; }
-    .outline { position: fixed; pointer-events: none; border: 2px solid #7638f5; border-radius: 4px; background: rgb(118 56 245 / 14%); display: none; }
-    .region { border-style: dashed; border-radius: 8px; background: rgb(118 56 245 / 12%); }
+    .outline { position: fixed; pointer-events: none; border: 2px solid #6155d8; border-radius: 4px; background: rgb(97 85 216 / 14%); display: none; }
+    .region { border-style: dashed; border-radius: 8px; background: rgb(97 85 216 / 12%); }
     .markers { position: fixed; inset: 0; pointer-events: none; }
-    .marker { position: fixed; width: 23px; height: 23px; border: 2px solid white; border-radius: 999px; background: #7638f5; color: white; display: grid; place-items: center; font: 650 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); pointer-events: auto; cursor: pointer; transition: transform 120ms ease, box-shadow 120ms ease; }
-    .marker:hover,.marker[data-focus="true"] { transform: scale(1.12); box-shadow: 0 4px 16px rgb(118 56 245 / 38%); }
-    .editor-pin { position: fixed; width: 26px; height: 26px; border: 2px solid white; border-radius: 999px; background: #7638f5; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); display: none; pointer-events: none; transform: translate(-50%, -50%); }
-    .editor-pin::after { position: absolute; left: 2px; bottom: -3px; width: 8px; height: 8px; border: 2px solid white; border-top: 0; border-right: 0; border-radius: 0 0 0 6px; background: #7638f5; content: ""; transform: rotate(-18deg); }
-    .editor { position: fixed; width: min(296px, calc(100vw - 24px)); padding: 4px 5px; border: 1px solid rgb(23 23 23 / 10%); border-radius: 999px; background: light-dark(#fff, #202124); color: light-dark(#202124, #f1f1f3); box-shadow: 0 8px 28px rgb(15 23 42 / 18%); backdrop-filter: blur(20px); pointer-events: auto; font: 14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-    .editor[data-expanded="true"] { width: min(360px, calc(100vw - 24px)); border-radius: 20px; }
-    /* 与会话评论共用紧凑尺寸和品牌确认色，多行时收紧圆角。 */
-    .editor[hidden] { display: none; }
-    .editor-row { align-items: center; display: flex; gap: 3px; min-height: 36px; }
-    .editor textarea { flex: 1 1 auto; width: 100%; min-width: 0; min-height: 28px; max-height: 112px; resize: none; overflow-y: auto; border: 0; padding: 4px 5px; background: transparent; color: inherit; font: inherit; outline: none; }
-    .editor textarea::placeholder { color: #8b8b8b; }
-    .editor button { appearance: none; align-items: center; background: transparent; border: 0; border-radius: 999px; color: #737373; cursor: pointer; display: inline-flex; flex: 0 0 auto; height: 30px; justify-content: center; padding: 0; width: 30px; }
-    .editor button:hover { background: rgb(0 0 0 / 6%); color: #202124; }
-    .editor button svg { height: 18px; width: 18px; }
-    .editor button.editor-save { background: #7638f5; color: white; }
-    .editor button.editor-save:hover { background: color-mix(in srgb, #7638f5 90%, black); }
-    .editor button[hidden] { display: none; }
-    .editor button[data-listening="true"] { background: rgb(118 56 245 / 12%); color: #7638f5; }
-    .editor button:focus-visible,.editor input:focus-visible,.editor textarea:focus-visible { outline: 2px solid #7638f5; outline-offset: 2px; }
-    .editor textarea:focus-visible { outline: 0; }
+    .marker { position: fixed; pointer-events: auto; }
+    .editor-pin { position: fixed; width: 26px; height: 26px; border: 2px solid white; border-radius: 999px; background: #6155d8; box-shadow: 0 3px 12px rgb(15 23 42 / 24%); display: none; pointer-events: none; transform: translate(-50%, -50%); }
+    .editor-pin::after { position: absolute; left: 2px; bottom: -3px; width: 8px; height: 8px; border: 2px solid white; border-top: 0; border-right: 0; border-radius: 0 0 0 6px; background: #6155d8; content: ""; transform: rotate(-18deg); }
+    .editor { pointer-events: auto; }
+    .editor button[data-listening="true"] { background: rgb(97 85 216 / 12%); color: #6155d8; }
   `;
   shadow.append(style);
   hoverOutline = document.createElement('div');
@@ -899,7 +891,7 @@ function handleBrowserPageCommand(_event: unknown, message: unknown): void {
   }
 }
 
-if (process.isMainFrame) {
+if (process.isMainFrame && !isPasswordPicker) {
   window.addEventListener('pagehide', () => pageTranslation.stop(), { once: true });
   ipcRenderer.on('zeus-browser-page:command', handleBrowserPageCommand);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, { once: true });

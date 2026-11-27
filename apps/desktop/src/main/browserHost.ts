@@ -1,4 +1,5 @@
 import { browserCredentialPromptHtml } from './browserCredentialPrompt.js';
+import { showBrowserPasswordPicker } from './browserPasswordPicker.js';
 import {
   BrowserWindow,
   clipboard,
@@ -8,10 +9,13 @@ import {
   MenuItem,
   MessageChannelMain,
   nativeImage,
+  type DownloadItem,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
+  type NativeImage,
   type Rectangle,
   session,
+  shell,
   type Session,
   type WebContents,
   type WebFrameMain,
@@ -19,10 +23,11 @@ import {
 } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { publishFile } from '@zeus/storage/platform-security';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, open, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { defaultBrowserTranslationService, isFreeBrowserTranslationService, serializeBrowserComments, validBrowserTranslationSegments } from '@zeus/shared';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { defaultBrowserTranslationService, isFreeBrowserTranslationService, parseModelRef, serializeBrowserComments, validBrowserTranslationSegments } from '@zeus/shared';
+import { normalizeModelConnectionIcon } from '@zeus/ai-runtime';
 import type { createBrowserTranslationClient } from './browserTranslationClient.js';
 import type {
   ZeusBrowserApprovalDecision,
@@ -31,6 +36,7 @@ import type {
   ZeusBrowserComment,
   ZeusBrowserConversationSnapshot,
   ZeusBrowserDesignChange,
+  ZeusBrowserDownload,
   ZeusBrowserEvent,
   ZeusBrowserPageAnchor,
   ZeusBrowserPreparedSubmission,
@@ -43,6 +49,7 @@ import {
   browserFrozenContractEntry,
   browserFrozenContractVersion,
   browserFrozenUnsupportedSurfaceKinds,
+  isConversationBrowserFileAllowed,
   type BrowserAutomationContentItem,
   type BrowserAutomationPort,
   type BrowserAutomationToolCall,
@@ -55,19 +62,23 @@ import { BrowserPasswordStore, browserPasswordOrigin } from './browserPasswords.
 import { BrowserCuaHost } from './browserCuaHost.js';
 import type { BrowserCuaSurface } from './browserCuaBridge.js';
 import type { ComputerHost } from './computerHost.js';
-import type { BrowserPasswordFrameRequest } from '../preload/browserPasswordFrame.js';
+import type { BrowserPasswordAnchor, BrowserPasswordFrameProbe, BrowserPasswordFrameRequest } from '../preload/browserPasswordFrame.js';
 
-/** 仅保存长期设置与书签；标签、活动页和分组随本次应用运行结束。 */
+/** 保存浏览器偏好、书签和近期下载；标签随本次应用运行结束。 */
 interface PersistedBrowserState {
   version: 1;
   settings: ZeusBrowserSettings;
   managementBookmarks?: ManagedBrowserBookmark[];
   managementAudit?: ManagedBrowserAuditEntry[];
+  /** 旧资料可能没有历史下载。 */
+  downloads?: BrowserDownload[];
 }
 
 interface LiveBrowserTab {
   /** 已填密码只用于清理工具返回和网页日志，关闭标签后释放。 */
   passwordValues?: Set<string>;
+  /** 各标签只允许一个填充选择，隐藏或离开页面时取消。 */
+  passwordPicker?: AbortController;
   snapshot: ZeusBrowserTabSnapshot;
   view?: WebContentsView;
   ownerWindowId?: number;
@@ -116,12 +127,11 @@ interface PendingApproval {
   timer: ReturnType<typeof setTimeout>;
 }
 
-interface BrowserDownload {
+/** 保留文件落盘路径和原始会话归属，界面只传下载身份。 */
+interface BrowserDownload extends ZeusBrowserDownload {
   conversationId: string;
   tabId: string;
-  fileName: string;
   path?: string;
-  state: 'started' | 'completed' | 'failed';
   createdAt: string;
 }
 
@@ -250,7 +260,10 @@ export class BrowserHost implements BrowserAutomationPort {
   private readonly pendingOpenRequests = new Set<string>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly grantedWebPermissions = new Set<string>();
+  /** 本机下载记录包含已结束的项目。 */
   private readonly downloads: BrowserDownload[] = [];
+  /** 仅当前进程的活动传输可暂停、继续或取消。 */
+  private readonly downloadItems = new Map<string, DownloadItem>();
   private readonly advancedHandles = new Map<string, AdvancedBrowserHandle>();
   private readonly advancedTabClaims = new Map<string, AdvancedTabClaim>();
   private readonly sessionNames = new Map<string, string>();
@@ -344,6 +357,9 @@ export class BrowserHost implements BrowserAutomationPort {
       const window = this.requireRendererWindow(event);
       const value = asRecord(input);
       const english = value.language === 'en-US';
+      /** 只解码实际出现在模型目录中的图标，一家供应商的菜单项复用同一个 NativeImage。 */
+      const providerIconData = value.providerIcons && typeof value.providerIcons === 'object' && !Array.isArray(value.providerIcons) ? asRecord(value.providerIcons) : {};
+      const providerIcons = new Map<string, NativeImage | undefined>();
       /** 菜单状态来自当前标签，不能由渲染器伪造网址或导航能力。 */
       const tab = this.requireConversationTab(requireNonEmptyString(value.conversationId, 'conversationId'), requireNonEmptyString(value.tabId, 'tabId'));
       /** 等待目录期间页面可能关闭或导航，菜单只能用于原来的页面。 */
@@ -377,7 +393,24 @@ export class BrowserHost implements BrowserAutomationPort {
           }
           /** 目录身份与翻译命令共用完整 modelRef。 */
           const catalog = result.value;
-          for (const model of catalog.items) services.append(new MenuItem({ label: model.label, type: 'checkbox', checked: selectedId === model.id, click: () => resolveSelection({ action: 'translation_service', serviceId: model.id }) }));
+          for (const model of catalog.items) {
+            const sourceId = parseModelRef(model.id)?.sourceId;
+            if (sourceId && !providerIcons.has(sourceId)) {
+              const dataURL = normalizeModelConnectionIcon(providerIconData[sourceId]);
+              const icon = nativeImage.createEmpty();
+              if (dataURL) icon.addRepresentation({ scaleFactor: 2, dataURL });
+              providerIcons.set(sourceId, icon.isEmpty() ? undefined : icon);
+            }
+            services.append(
+              new MenuItem({
+                label: model.label,
+                icon: sourceId ? providerIcons.get(sourceId) : undefined,
+                type: 'checkbox',
+                checked: selectedId === model.id,
+                click: () => resolveSelection({ action: 'translation_service', serviceId: model.id }),
+              }),
+            );
+          }
           if (catalog.codexLoginRequired) services.append(new MenuItem({ label: english ? 'Sign in to Codex' : '登录 Codex', click: () => resolveSelection('translation_login') }));
           if (!catalog.items.length && !catalog.codexLoginRequired) services.append(new MenuItem({ label: catalog.warning || (english ? 'No available models' : '暂无可用模型'), enabled: false }));
         }
@@ -454,6 +487,7 @@ export class BrowserHost implements BrowserAutomationPort {
       if (active) this.activeTabByConversation.set(target, active);
       this.activeTabByConversation.delete(source);
       for (const download of this.downloads) if (download.conversationId === source) download.conversationId = target;
+      this.schedulePersist();
       this.emitSnapshot(source);
       this.emitSnapshot(target);
       return this.snapshotFor(target);
@@ -561,6 +595,18 @@ export class BrowserHost implements BrowserAutomationPort {
       this.requireRendererWindow(event);
       return this.options.passwords.list();
     });
+    /** 仅前台 Zeus 主界面的显式查看返回所选账号的密码。 */
+    ipcMain.handle('zeus:browser:reveal-password', async (event, origin: unknown, id: unknown) => {
+      const window = this.requireRendererWindow(event);
+      this.assertWritableBrowserCapability();
+      if (event.sender !== window.webContents || event.senderFrame !== event.sender.mainFrame || !window.isFocused()) {
+        throw new Error(this.text('请在前台设置窗口查看密码。', 'Open the settings window to view the password.'));
+      }
+      const credential = await this.options.passwords.credential(requireNonEmptyString(origin, 'origin'), requireNonEmptyString(id, 'id'));
+      if (!credential) throw new Error(this.text('该账号已不存在，请重新打开密码设置。', 'This account no longer exists. Reopen password settings.'));
+      if (window.isDestroyed() || !window.isFocused() || event.senderFrame !== event.sender.mainFrame) throw new Error(this.text('请在前台设置窗口查看密码。', 'Open the settings window to view the password.'));
+      return credential.password;
+    });
     ipcMain.handle('zeus:browser:prepare-password-import', async (event) => {
       const window = this.requireRendererWindow(event);
       this.assertWritableBrowserCapability();
@@ -616,7 +662,7 @@ export class BrowserHost implements BrowserAutomationPort {
         if (!(await this.options.passwords.list(origin)).length) return;
         await this.options.mainCommandLedger().execute(request, 'desktop.browser.autofill', async (_input, command) => {
           if (generation !== tab.documentGeneration || browserPasswordFrameOrigin(event.sender, frame) !== origin) return { completed: false };
-          await this.showPasswordMenu(window, tab, frame, () => command.markWriteStarted(), documentId);
+          await this.showPasswordPicker(window, tab, frame, () => command.markWriteStarted(), documentId);
           return { completed: true };
         });
       } catch (error) {
@@ -686,7 +732,12 @@ export class BrowserHost implements BrowserAutomationPort {
       if (!tab?.translation || event.senderFrame !== event.sender.mainFrame || value.runId !== tab.translation.id || !['working', 'ready', 'error'].includes(String(value.state)) || !tab.snapshot.translation) return;
       tab.snapshot = {
         ...tab.snapshot,
-        translation: { state: value.state as 'working' | 'ready' | 'error', serviceLabel: tab.snapshot.translation.serviceLabel, ...(typeof value.message === 'string' ? { message: value.message.slice(0, 500) } : {}) },
+        translation: {
+          state: value.state as 'working' | 'ready' | 'error',
+          serviceLabel: tab.snapshot.translation.serviceLabel,
+          modelSourceId: tab.snapshot.translation.modelSourceId,
+          ...(typeof value.message === 'string' ? { message: value.message.slice(0, 500) } : {}),
+        },
       };
       this.emitSnapshot(tab.snapshot.conversationId);
     });
@@ -790,7 +841,7 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     if (input.tool === 'open') {
       const url = normalizeBrowserUrl(requireNonEmptyString(args.url, 'url'));
-      this.assertAgentUrlAllowed(url);
+      this.assertAgentUrlAllowed(url, input.localFileScope);
       const window = this.preferredWindow(input.conversationId);
       const snapshot = await this.openConversationResource(window, { conversationId: input.conversationId, url });
       if (url !== 'about:blank' && snapshot.activeTabId) {
@@ -800,11 +851,23 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     if (input.tool === 'clipboard') return this.invokeClipboardTool(input);
     if (input.tool === 'downloads') {
-      return toolJson(this.downloads.filter((download) => download.conversationId === input.conversationId).slice(-50));
+      return toolJson(
+        this.downloads
+          .filter((download) => download.conversationId === input.conversationId)
+          .slice(-50)
+          .map(({ conversationId, tabId, fileName, path, state, canResume, createdAt }) => ({
+            conversationId,
+            tabId,
+            fileName,
+            ...(path ? { path } : {}),
+            state: legacyDownloadState(state, canResume),
+            createdAt,
+          })),
+      );
     }
     if (input.tool === 'select_tab') {
       const selected = this.requireConversationTab(input.conversationId, requireNonEmptyString(args.tabId, 'tabId'));
-      this.assertAgentUrlAllowed(selected.snapshot.url);
+      this.assertAgentUrlAllowed(selected.snapshot.url, input.localFileScope);
       const window = this.preferredWindow(input.conversationId);
       await this.activateTab(window, input.conversationId, selected.snapshot.id);
       this.emitOpenRequested(input.conversationId);
@@ -819,27 +882,27 @@ export class BrowserHost implements BrowserAutomationPort {
     const tab = await this.resolveToolTab(input.conversationId, optionalString(args.tabId));
     if (input.tool === 'navigate') {
       const url = normalizeBrowserUrl(requireNonEmptyString(args.url, 'url'));
-      this.assertAgentUrlAllowed(url);
+      this.assertAgentUrlAllowed(url, input.localFileScope);
       await this.ensureView(tab).webContents.loadURL(url);
       await this.waitForTabReady(tab, 30_000);
       this.emitOpenRequested(input.conversationId);
       return toolJson({ tabId: tab.snapshot.id, url });
     }
 
-    this.assertAgentUrlAllowed(tab.snapshot.url);
+    this.assertAgentUrlAllowed(tab.snapshot.url, input.localFileScope);
     this.emitOpenRequested(input.conversationId);
     if (['snapshot', 'element', 'click', 'type', 'press', 'scroll', 'screenshot', 'invoke'].includes(input.tool)) {
-      return this.cua.invoke({ ...input, arguments: { ...input.arguments, tabId: tab.snapshot.id } }, this.cuaSurface(tab));
+      return this.cua.invoke({ ...input, arguments: { ...input.arguments, tabId: tab.snapshot.id } }, this.cuaSurface(tab, input.localFileScope));
     }
     switch (input.tool) {
       case 'history': {
         const action = requireNonEmptyString(args.action, 'action');
-        const result = await this.invokeHistoryTool(tab, action);
+        const result = await this.invokeHistoryTool(tab, action, input.localFileScope);
         if (action !== 'stop') await this.waitForTabReady(tab, 30_000);
         return result;
       }
       case 'wait':
-        if (args.query !== undefined) return this.cua.wait({ ...input, arguments: { ...args, tabId: tab.snapshot.id } }, this.cuaSurface(tab));
+        if (args.query !== undefined) return this.cua.wait({ ...input, arguments: { ...args, tabId: tab.snapshot.id } }, this.cuaSurface(tab, input.localFileScope));
         return this.invokeWaitTool(tab, args);
       case 'developer':
         return this.invokeDeveloperTool(input, tab);
@@ -882,7 +945,7 @@ export class BrowserHost implements BrowserAutomationPort {
   }
 
   /** 实时读取宿主拥有的页面、窗口及布局，页面脚本不能提供这些身份。 */
-  private cuaSurface(tab: LiveBrowserTab): BrowserCuaSurface {
+  private cuaSurface(tab: LiveBrowserTab, localFileScope: BrowserAutomationToolCall['localFileScope']): BrowserCuaSurface {
     const contents = this.ensureView(tab).webContents;
     const conversationId = tab.snapshot.conversationId;
     const window = (): BrowserWindow => {
@@ -898,7 +961,7 @@ export class BrowserHost implements BrowserAutomationPort {
       bounds: () => tab.view!.getBounds(),
       visible: () => this.visibleTabByWindow.get(window().id) === tab.snapshot.id && window().isVisible() && !window().isMinimized(),
       pendingDialog: () => this.activeJsDialogs.get(tab.snapshot.id)?.parameters,
-      allowUrl: (url) => this.assertAgentUrlAllowed(normalizeBrowserUrl(url)),
+      allowUrl: (url) => this.assertAgentUrlAllowed(normalizeBrowserUrl(url), localFileScope),
     };
   }
 
@@ -925,6 +988,10 @@ export class BrowserHost implements BrowserAutomationPort {
       }
       for (const audit of parsed.managementAudit ?? []) {
         if (audit && typeof audit.id === 'string') this.managementAudit.push(audit);
+      }
+      for (const download of Array.isArray(parsed.downloads) ? parsed.downloads : []) {
+        if (!download || typeof download.id !== 'string' || typeof download.conversationId !== 'string' || typeof download.fileName !== 'string') continue;
+        this.downloads.push({ ...download, state: ['downloading', 'paused'].includes(download.state) ? 'interrupted' : download.state, canResume: false });
       }
     } catch {
       // 首次启动或损坏的本机浏览器元数据都回退到空状态；Chromium profile 不在此文件中。
@@ -965,42 +1032,82 @@ export class BrowserHost implements BrowserAutomationPort {
     this.browserSession.on('will-download', (_event, item, webContents) => {
       const tab = this.tabFromWebContents(webContents);
       if (!tab) return;
+      if (this.options.readOnlyValidation) {
+        item.cancel();
+        return;
+      }
+      /** Chromium 建议的名称只用于当前下载目录下的文件名。 */
       const fileName = basename(item.getFilename());
       const download: BrowserDownload = {
+        id: randomUUID(),
         conversationId: tab.snapshot.conversationId,
         tabId: tab.snapshot.id,
-        fileName,
-        state: 'started',
+        fileName: !fileName || fileName === '.' || fileName === '..' ? 'download' : fileName,
+        state: 'downloading',
+        receivedBytes: 0,
+        totalBytes: item.getTotalBytes() || null,
+        canResume: false,
         createdAt: this.now(),
       };
       this.downloads.push(download);
-      if (!this.settings.askWhereToSave) {
-        const target = join(this.settings.downloadDirectory, fileName);
+      this.downloadItems.set(download.id, item);
+      if (this.settings.askWhereToSave) {
+        item.setSaveDialogOptions({
+          title: this.text('保存下载文件', 'Save browser download'),
+          defaultPath: join(this.settings.downloadDirectory, download.fileName),
+        });
+      } else {
+        const target = this.availableDownloadPath(download.fileName);
         item.setSavePath(target);
         download.path = target;
-      } else {
-        item.pause();
-        void dialog
-          .showSaveDialog(this.preferredWindow(tab.snapshot.conversationId), {
-            title: this.text('保存下载文件', 'Save browser download'),
-            defaultPath: join(this.settings.downloadDirectory, fileName),
-          })
-          .then((result) => {
-            if (result.canceled || !result.filePath) {
-              item.cancel();
-              return;
-            }
-            download.path = result.filePath;
-            item.setSavePath(result.filePath);
-            item.resume();
-          });
       }
       this.emitDownload(download);
+      this.schedulePersist();
+      /** 进度快照最多每 250 毫秒推送一次，状态变化立即推送。 */
+      let lastProgressAt = Date.now();
+      item.on('updated', (_downloadEvent, state) => {
+        const previousState = download.state;
+        download.state = state === 'interrupted' ? 'interrupted' : item.isPaused() ? 'paused' : 'downloading';
+        this.readDownloadProgress(download, item);
+        const now = Date.now();
+        if (download.state === previousState && now - lastProgressAt < 250) return;
+        lastProgressAt = now;
+        this.emitSnapshot(download.conversationId);
+      });
       item.once('done', (_downloadEvent, state) => {
-        download.state = state === 'completed' ? 'completed' : 'failed';
+        this.readDownloadProgress(download, item);
+        this.downloadItems.delete(download.id);
+        download.state = state === 'completed' || state === 'cancelled' ? state : 'failed';
+        download.canResume = false;
         this.emitDownload(download);
+        this.schedulePersist();
       });
     });
+  }
+
+  /** 为自动保存避开已有文件和仍在传输的同名下载。 */
+  private availableDownloadPath(fileName: string): string {
+    const extension = extname(fileName);
+    const stem = basename(fileName, extension);
+    const directory = this.settings.downloadDirectory;
+    const activePaths = new Set(this.downloads.filter((download) => this.downloadItems.has(download.id)).map((download) => download.path));
+    let candidate = join(directory, fileName);
+    for (let copy = 1; existsSync(candidate) || activePaths.has(candidate); copy += 1) {
+      candidate = join(directory, `${stem} (${copy})${extension}`);
+    }
+    return candidate;
+  }
+
+  /** 保存进度单位为字节，并读取系统保存对话框实际选定的路径。 */
+  private readDownloadProgress(download: BrowserDownload, item: DownloadItem): void {
+    download.receivedBytes = item.getReceivedBytes();
+    download.totalBytes = item.getTotalBytes() || null;
+    download.canResume = item.canResume();
+    const path = item.getSavePath();
+    if (path) {
+      download.path = path;
+      download.fileName = basename(path);
+    }
   }
 
   private requireRendererWindow(event: IpcMainInvokeEvent): BrowserWindow {
@@ -1143,6 +1250,7 @@ export class BrowserHost implements BrowserAutomationPort {
   private detachTab(tabId: string): void {
     void this.cua.hideTabCursor(tabId).catch((error) => console.warn('CUA browser visibility cleanup failed', error));
     const tab = this.tabs.get(tabId);
+    tab?.passwordPicker?.abort();
     if (!tab?.view || tab.ownerWindowId === undefined) return;
     const window = this.windows.get(tab.ownerWindowId);
     if (window && !window.isDestroyed()) {
@@ -1204,6 +1312,7 @@ export class BrowserHost implements BrowserAutomationPort {
     };
     view.webContents.on('did-start-loading', update);
     view.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+      tab.passwordPicker?.abort();
       if (!isMainFrame || isInPlace) return;
       void this.cua.hideTabCursor(tab.snapshot.id).catch((error) => console.warn('CUA browser navigation cursor cleanup failed', error));
       this.stopTranslation(tab);
@@ -1274,56 +1383,88 @@ export class BrowserHost implements BrowserAutomationPort {
     return view;
   }
 
-  /** 显式选择和焦点触发共用原生菜单，始终填回同一个 frame 文档。 */
-  private async showPasswordMenu(window: BrowserWindow, tab: LiveBrowserTab, frame: WebFrameMain, beforeFill?: () => Promise<void>, requestedDocumentId?: string): Promise<void> {
+  /** 工具栏和登录框共用填充弹层，选择后仍填回原 frame 文档。 */
+  private async showPasswordPicker(window: BrowserWindow, tab: LiveBrowserTab, frame: WebFrameMain, beforeFill?: () => Promise<void>, requestedDocumentId?: string): Promise<void> {
     this.assertWritableBrowserCapability();
-    const contents = this.ensureView(tab).webContents;
+    if (tab.passwordPicker) return;
+    const view = this.ensureView(tab);
+    const contents = view.webContents;
     const origin = browserPasswordFrameOrigin(contents, frame);
     const quiet = requestedDocumentId !== undefined;
     if (!origin) {
       if (quiet) return;
       throw new Error(this.text('当前页面不支持密码填充。', 'Password filling is unavailable on this page.'));
     }
+    /** 读取候选、显示弹层和填充期间共用同一次页面身份。 */
+    const controller = new AbortController();
+    tab.passwordPicker = controller;
+    /** 手动按键可取消尚在读取的自动候选或填充，并继续交给网页。 */
+    const cancelOnKeyDown = (_event: unknown, input: { type: string }): void => {
+      if (input.type === 'keyDown') controller.abort();
+    };
+    if (quiet) contents.on('before-input-event', cancelOnKeyDown);
     const generation = tab.documentGeneration;
-    /** 异步查询或等待选择期间，切页、换标签或关闭窗口都使请求失效。 */
     const isCurrent = (): boolean =>
-      this.settings.enabled && !window.isDestroyed() && this.visibleTabByWindow.get(window.id) === tab.snapshot.id && tab.documentGeneration === generation && browserPasswordFrameOrigin(contents, frame) === origin;
-    const accounts = await this.options.passwords.list(origin);
-    if (!isCurrent()) return;
-    if (!accounts.length && quiet) return;
-    let documentId: unknown;
-    if (accounts.length) {
-      const reply = (await requestBrowserPasswordFrame(frame, { action: 'probe', origin })) as { documentId?: unknown } | null;
-      documentId = reply?.documentId;
-      if (!isCurrent() || (quiet && documentId !== requestedDocumentId)) return;
-      if (typeof documentId !== 'string') {
+      !controller.signal.aborted &&
+      this.settings.enabled &&
+      !window.isDestroyed() &&
+      this.visibleTabByWindow.get(window.id) === tab.snapshot.id &&
+      tab.documentGeneration === generation &&
+      browserPasswordFrameOrigin(contents, frame) === origin;
+    try {
+      const accounts = await this.options.passwords.list(origin);
+      if (!isCurrent() || (!accounts.length && quiet)) return;
+      const probe = accounts.length ? ((await requestBrowserPasswordFrame(frame, { action: 'probe', origin })) as BrowserPasswordFrameProbe | null) : null;
+      if (!isCurrent() || (quiet && probe?.documentId !== requestedDocumentId)) return;
+      if (accounts.length && (typeof probe?.documentId !== 'string' || (!probe.username && !probe.password))) {
         if (quiet) return;
         throw new Error(this.text('自动填充尚未就绪，或页面没有可填充的登录框。', 'Autofill is not ready, or no supported sign-in field was found.'));
       }
+      /** 自动建议只在登录框有可见位置时打开。 */
+      const anchor = probe?.anchor && (await browserPasswordViewportAnchor(frame, probe.anchor));
+      if (!isCurrent() || (quiet && !anchor)) return;
+      /** 标题来自真实字段组合，分步登录时只描述当前可填的一项。 */
+      const title = !probe
+        ? this.text('填充已保存的密码', 'Fill saved password')
+        : probe.username && probe.password
+          ? this.text('填充用户名和密码', 'Fill username and password')
+          : probe.username
+            ? this.text('填充用户名', 'Fill username')
+            : this.text('填充密码', 'Fill password');
+      const index = await showBrowserPasswordPicker({
+        parent: window,
+        view,
+        anchor,
+        automatic: quiet,
+        preloadPath: this.options.preloadPath,
+        origin,
+        title,
+        labels: accounts.map((account) => (account.username || this.text('无用户名', 'No username')).slice(0, 240)),
+        emptyLabel: this.text('此站点没有已保存的密码', 'No saved passwords for this site'),
+        closeLabel: this.text('关闭', 'Close'),
+        language: this.options.language?.() ?? 'zh-CN',
+        signal: controller.signal,
+      });
+      const selected = index === null ? undefined : accounts[index];
+      if (!selected || typeof probe?.documentId !== 'string' || !isCurrent()) return;
+      const credential = await this.options.passwords.credential(origin, selected.id);
+      if (!isCurrent()) return;
+      if (!credential) throw new Error(this.text('该账号已删除，请重新选择。', 'This account was deleted. Select an account again.'));
+      await beforeFill?.();
+      if (!isCurrent()) return;
+      const { id, username, password } = credential;
+      (tab.passwordValues ??= new Set()).add(password);
+      const status = await requestBrowserPasswordFrame(frame, { action: 'fill', origin, documentId: probe.documentId, selection: { id, username, password } });
+      if (!isCurrent() || status === 'filled') return;
+      if (status === 'unavailable') throw new Error(this.text('自动填充组件尚未就绪，请在页面加载后重试。', 'Autofill is not ready. Try again after the page loads.'));
+      if (status === 'page_changed') throw new Error(this.text('页面已变化，请重新选择账号。', 'The page changed. Select an account again.'));
+      throw new Error(
+        status === 'multiple_forms' ? this.text('页面有多个登录表单，请先点击要填充的登录框。', 'Focus the sign-in field in the form you want to fill.') : this.text('未找到可填充的登录框。', 'No supported sign-in field was found.'),
+      );
+    } finally {
+      if (quiet) contents.off('before-input-event', cancelOnKeyDown);
+      tab.passwordPicker = undefined;
     }
-    const selected = await new Promise<string | null>((resolveSelection) => {
-      const menu = new Menu();
-      if (accounts.length && origin !== contents.mainFrame.origin) menu.append(new MenuItem({ label: origin, enabled: false }));
-      for (const account of accounts) menu.append(new MenuItem({ label: (account.username || this.text('无用户名', 'No username')).replace(/&/gu, '&&').slice(0, 240), click: () => resolveSelection(account.id) }));
-      if (!accounts.length) menu.append(new MenuItem({ label: this.text('此站点没有已保存的密码', 'No saved passwords for this site'), enabled: false }));
-      menu.popup({ window, callback: () => resolveSelection(null) });
-    });
-    if (!selected || typeof documentId !== 'string' || !isCurrent()) return;
-    const credential = await this.options.passwords.credential(origin, selected);
-    if (!isCurrent()) return;
-    if (!credential) throw new Error(this.text('该账号已删除，请重新选择。', 'This account was deleted. Select an account again.'));
-    await beforeFill?.();
-    if (!isCurrent()) return;
-    const { id, username, password } = credential;
-    (tab.passwordValues ??= new Set()).add(password);
-    const status = await requestBrowserPasswordFrame(frame, { action: 'fill', origin, documentId, selection: { id, username, password } });
-    if (!isCurrent()) return;
-    if (status === 'filled') return;
-    if (status === 'unavailable') throw new Error(this.text('自动填充组件尚未就绪，请在页面加载后重试。', 'Autofill is not ready. Try again after the page loads.'));
-    if (status === 'page_changed') throw new Error(this.text('页面已变化，请重新选择账号。', 'The page changed. Select an account again.'));
-    throw new Error(
-      status === 'multiple_forms' ? this.text('页面有多个登录表单，请先点击要填充的登录框。', 'Focus the sign-in field in the form you want to fill.') : this.text('未找到可填充的登录框。', 'No supported sign-in field was found.'),
-    );
   }
 
   /** 已填密码从所有浏览器工具文字结果及网页控制台中移除。 */
@@ -1353,8 +1494,11 @@ export class BrowserHost implements BrowserAutomationPort {
     const view = this.ensureView(tab);
     if (!command || typeof command !== 'object' || typeof command.action !== 'string') throw new TypeError('Browser command is invalid.');
     switch (command.action) {
+      case 'download':
+        await this.runDownloadCommand(conversationId, command);
+        break;
       case 'autofill':
-        await this.showPasswordMenu(window, tab, view.webContents.focusedFrame ?? view.webContents.mainFrame);
+        await this.showPasswordPicker(window, tab, view.webContents.focusedFrame ?? view.webContents.mainFrame);
         break;
       case 'navigate':
         await loadUserFacingBrowserUrl(view.webContents, normalizeBrowserUrl(command.url));
@@ -1466,6 +1610,35 @@ export class BrowserHost implements BrowserAutomationPort {
     }
   }
 
+  /** 下载动作按会话及下载身份查找，渲染端不能提交文件路径。 */
+  private async runDownloadCommand(conversationId: string, command: Extract<ZeusBrowserCommand, { action: 'download' }>): Promise<void> {
+    this.assertWritableBrowserCapability();
+    const download = this.downloads.find((candidate) => candidate.id === command.downloadId && candidate.conversationId === conversationId);
+    if (!download) throw new Error(this.text('此下载记录已不存在。', 'This download is no longer available.'));
+    const item = this.downloadItems.get(download.id);
+    switch (command.operation) {
+      case 'pause':
+        if (download.state === 'downloading') item?.pause();
+        return;
+      case 'resume':
+        if (item?.canResume()) item.resume();
+        return;
+      case 'cancel':
+        item?.cancel();
+        return;
+      case 'reveal': {
+        const path = download.path;
+        if (download.state !== 'completed' || typeof path !== 'string' || !isAbsolute(path) || !(await stat(path).catch(() => null))?.isFile()) {
+          throw new Error(this.text('下载文件已移动或删除。', 'The downloaded file was moved or deleted.'));
+        }
+        shell.showItemInFolder(path);
+        return;
+      }
+      default:
+        throw new TypeError('Browser download operation is invalid.');
+    }
+  }
+
   /** 选择服务先保存设置；当前是已加载网页时立即用新服务重新翻译。 */
   private async selectTranslationService(tab: LiveBrowserTab, serviceId: string): Promise<void> {
     this.assertWritableBrowserCapability();
@@ -1523,7 +1696,7 @@ export class BrowserHost implements BrowserAutomationPort {
         label = selected.label;
       }
       if (run.controller.signal.aborted || tab.translation !== run) return;
-      tab.snapshot = { ...tab.snapshot, translation: { state: 'working', serviceLabel: label } };
+      tab.snapshot = { ...tab.snapshot, translation: { state: 'working', serviceLabel: label, modelSourceId: isFreeBrowserTranslationService(serviceId) ? undefined : parseModelRef(serviceId)?.sourceId } };
       tab.view!.webContents.send('zeus-browser-page:command', { type: 'start_translation', runId: run.id, serviceId });
       this.emitSnapshot(tab.snapshot.conversationId);
     } catch (error) {
@@ -1705,6 +1878,18 @@ export class BrowserHost implements BrowserAutomationPort {
       conversationId,
       tabs,
       activeTabId,
+      downloads: this.downloads
+        .filter((download) => download.conversationId === conversationId)
+        .slice(-50)
+        .reverse()
+        .map(({ id, fileName, receivedBytes, totalBytes, state, canResume }) => ({
+          id,
+          fileName,
+          receivedBytes,
+          totalBytes,
+          state,
+          canResume,
+        })),
       pendingApprovals: [...this.pendingApprovals.values()].map(({ request }) => request).filter((request) => request.conversationId === conversationId),
       openRequested: this.pendingOpenRequests.has(conversationId),
     };
@@ -1724,10 +1909,11 @@ export class BrowserHost implements BrowserAutomationPort {
       type: 'download',
       conversationId: download.conversationId,
       tabId: download.tabId,
-      state: download.state,
+      state: legacyDownloadState(download.state, download.canResume),
       fileName: download.fileName,
       ...(download.path ? { path: download.path } : {}),
     });
+    this.emitSnapshot(download.conversationId);
   }
 
   private emitError(tab: LiveBrowserTab, error: unknown): void {
@@ -1763,10 +1949,12 @@ export class BrowserHost implements BrowserAutomationPort {
     return this.requireConversationTab(conversationId, snapshot.activeTabId!);
   }
 
-  /** 网页操作直接执行，仅保留本地文件访问边界。 */
-  private assertAgentUrlAllowed(targetUrl: string): void {
+  /** 网页直接访问，本地文件沿用会话工作区和 HTML 产物的文件权限。 */
+  private assertAgentUrlAllowed(targetUrl: string, localFileScope: BrowserAutomationToolCall['localFileScope']): void {
     const url = new URL(targetUrl);
-    if (url.protocol === 'file:') throw new Error('Agent automation cannot navigate to local file URLs. Open the file manually in the built-in browser.');
+    if (url.protocol === 'file:' && !isConversationBrowserFileAllowed(url, localFileScope)) {
+      throw new Error(this.text('本地文件不存在或不在当前会话可访问的范围内。', 'The local file is missing or outside this conversation’s file scope.'));
+    }
   }
 
   /** 仅处理网页自身申请的设备等权限，不接收 AI 操作授权。 */
@@ -1804,6 +1992,7 @@ export class BrowserHost implements BrowserAutomationPort {
   private async invokeHistoryTool(
     tab: LiveBrowserTab,
     action: string,
+    localFileScope: BrowserAutomationToolCall['localFileScope'],
   ): Promise<{
     contentItems: BrowserAutomationContentItem[];
     success: boolean;
@@ -1813,8 +2002,8 @@ export class BrowserHost implements BrowserAutomationPort {
     const targetOffset = action === 'back' ? -1 : action === 'forward' ? 1 : 0;
     if (targetOffset !== 0) {
       const target = history.getAllEntries()[history.getActiveIndex() + targetOffset];
-      if (target?.url && safeOrigin(target.url) !== safeOrigin(tab.snapshot.url)) {
-        this.assertAgentUrlAllowed(target.url);
+      if (target?.url) {
+        this.assertAgentUrlAllowed(target.url, localFileScope);
       }
     }
     if (action === 'back' && history.canGoBack()) history.goBack();
@@ -2069,7 +2258,7 @@ export class BrowserHost implements BrowserAutomationPort {
       }
       case 'Tabs.new': {
         const url = optionalString(args.url) ? normalizeBrowserUrl(requireNonEmptyString(args.url, 'url')) : 'about:blank';
-        if (url !== 'about:blank') this.assertAgentUrlAllowed(url);
+        this.assertAgentUrlAllowed(url, input.localFileScope);
         const snapshot = await this.openConversationResource(this.preferredWindow(input.conversationId), { conversationId: input.conversationId, url });
         const tab = this.requireConversationTab(input.conversationId, snapshot.activeTabId!);
         if (url !== 'about:blank') await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
@@ -2117,14 +2306,14 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     if (path === 'Tab.goto') {
       const url = normalizeBrowserUrl(requireNonEmptyString(args.url, 'url'));
-      this.assertAgentUrlAllowed(url);
+      this.assertAgentUrlAllowed(url, input.localFileScope);
       await this.ensureView(tab).webContents.loadURL(url);
       await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
       return toolJson({ url: tab.snapshot.url, documentGeneration: tab.documentGeneration });
     }
     if (path === 'Tab.back' || path === 'Tab.forward' || path === 'Tab.reload') {
       const action = path === 'Tab.back' ? 'back' : path === 'Tab.forward' ? 'forward' : 'reload';
-      const result = await this.invokeHistoryTool(tab, action);
+      const result = await this.invokeHistoryTool(tab, action, input.localFileScope);
       await this.waitForTabReady(tab, boundedInteger(args.timeoutMs, 30_000, 0, 30_000));
       return result;
     }
@@ -2556,7 +2745,7 @@ export class BrowserHost implements BrowserAutomationPort {
       const submitSelector = this.browserAuthSelector(input, submit.selector);
       if (submitSelector && submit.action === 'click') await this.ensureView(tab).webContents.executeJavaScript(`document.querySelector(${JSON.stringify(submitSelector)})?.click()`, true);
       else if (submitSelector && submit.action === 'press_enter') {
-        const submitted = await this.cua.invoke({ ...input, tool: 'press', arguments: { tabId: tab.snapshot.id, key: 'Enter' } }, this.cuaSurface(tab));
+        const submitted = await this.cua.invoke({ ...input, tool: 'press', arguments: { tabId: tab.snapshot.id, key: 'Enter' } }, this.cuaSurface(tab, input.localFileScope));
         if (!submitted.success) return toolJson({ status: 'submission_unconfirmed', details: submitted.contentItems });
       }
       return toolJson({ status: 'submitted', ...(secure.selectedOption ? { selected_option: secure.selectedOption } : {}) });
@@ -2804,7 +2993,7 @@ export class BrowserHost implements BrowserAutomationPort {
       const changes = asRecord(values[1]);
       if (typeof changes.url === 'string') {
         const url = normalizeBrowserUrl(changes.url);
-        this.assertAgentUrlAllowed(url);
+        this.assertAgentUrlAllowed(url, input.localFileScope);
         await this.ensureView(tab).webContents.loadURL(url);
         await this.waitForTabReady(tab, 30_000);
       }
@@ -2952,14 +3141,14 @@ export class BrowserHost implements BrowserAutomationPort {
       let tab: LiveBrowserTab | undefined;
       try {
         const url = normalizeBrowserUrl(requestedUrl);
-        this.assertAgentUrlAllowed(url);
+        this.assertAgentUrlAllowed(url, input.localFileScope);
         const snapshot = await this.openTab(window, { conversationId: input.conversationId, url });
         tab = this.requireConversationTab(input.conversationId, snapshot.activeTabId!);
         await this.waitForTabReady(tab, timeoutMs);
         /** 快照导出只保存 CUA 观察正文；失败结果不能伪装成页面内容。 */
         let content: string;
         if (contentType === 'domSnapshot') {
-          const observed = await this.cua.invoke({ ...input, tool: 'snapshot', arguments: { tabId: tab.snapshot.id, maxElements: 300 } }, this.cuaSurface(tab));
+          const observed = await this.cua.invoke({ ...input, tool: 'snapshot', arguments: { tabId: tab.snapshot.id, maxElements: 300 } }, this.cuaSurface(tab, input.localFileScope));
           if (!observed.success) throw new Error('CUA 无法读取当前页面。');
           content = observed.contentItems
             .filter((item) => item.type === 'inputText')
@@ -3029,7 +3218,8 @@ export class BrowserHost implements BrowserAutomationPort {
     }
     this.pendingApprovals.clear();
     this.grantedWebPermissions.clear();
-    this.downloads.length = 0;
+    // 清除历史时仍允许用户管理正在写入文件的下载。
+    this.downloads.splice(0, this.downloads.length, ...this.downloads.filter((download) => this.downloadItems.has(download.id)));
     for (const tab of this.tabs.values()) {
       if (tab.view && !tab.view.webContents.isDestroyed()) {
         await tab.view.webContents.loadURL('about:blank');
@@ -3077,13 +3267,14 @@ export class BrowserHost implements BrowserAutomationPort {
     return operation;
   }
 
-  /** 写入长期偏好，不保存下次启动会重新打开的标签数据。 */
+  /** 写入偏好和近期记录，重启后不自动打开网页或继续传输。 */
   private async writePersistedState(): Promise<void> {
     const value: PersistedBrowserState = {
       version: 1,
       settings: this.settings,
       managementBookmarks: [...this.managementBookmarks.values()],
       managementAudit: this.managementAudit.slice(-500),
+      downloads: this.downloads.slice(-500),
     };
     const directoryPath = dirname(this.statePath);
     await mkdir(directoryPath, { recursive: true, mode: 0o700 });
@@ -3109,6 +3300,12 @@ export class BrowserHost implements BrowserAutomationPort {
 
 export function createBrowserHost(options: CreateBrowserHostOptions): BrowserHost {
   return new BrowserHost(options);
+}
+
+/** 浏览器工具与原下载事件沿用已有的三种状态。 */
+function legacyDownloadState(state: ZeusBrowserDownload['state'], canResume: boolean): 'started' | 'completed' | 'failed' {
+  if (state === 'completed') return 'completed';
+  return state === 'failed' || state === 'cancelled' || (state === 'interrupted' && !canResume) ? 'failed' : 'started';
 }
 
 /**
@@ -3307,6 +3504,22 @@ function browserPasswordFrameOrigin(contents: WebContents, frame: WebFrameMain |
   } catch {
     return undefined;
   }
+}
+
+/** 将原登录框的坐标逐层换算到网页顶层，填充目标仍由原 frame 决定。 */
+async function browserPasswordViewportAnchor(frame: WebFrameMain, anchor: BrowserPasswordAnchor): Promise<BrowserPasswordAnchor | undefined> {
+  for (let parent = frame.parent; parent; parent = frame.parent) {
+    /** 主进程和 window.frames 按同一子树顺序定位嵌入元素，避免按 URL 猜测重复的 iframe。 */
+    const children = parent.frames;
+    const childIndex = children.findIndex((child) => child.frameTreeNodeId === frame.frameTreeNodeId);
+    if (childIndex < 0) return undefined;
+    const projected = (await requestBrowserPasswordFrame(parent, { action: 'anchor', childIndex, childCount: children.length, anchor })) as BrowserPasswordAnchor | undefined;
+    if (!projected || ![projected.x, projected.y, projected.width, projected.height].every(Number.isFinite) || projected.width <= 0 || projected.height <= 0) return undefined;
+    if (parent.isDestroyed() || parent.detached || parent.frames[childIndex]?.frameTreeNodeId !== frame.frameTreeNodeId) return undefined;
+    frame = parent;
+    anchor = projected;
+  }
+  return anchor;
 }
 
 /** 单次消息端口把命令定位到目标 preload，并在 frame 离开或失去响应时结束等待。 */

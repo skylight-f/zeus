@@ -18,6 +18,7 @@ import '../styles.css';
 import '../ui/primitives.css';
 import '../agentdesk-theme.css';
 import { Button } from '../ui/Button.js';
+import { SystemWindowTitleBar } from '../ui/SystemWindowPortal.js';
 
 interface SideBySideDiffProps {
   /** 已知工作区状态优先于补丁类型，避免未跟踪文件被显示为已暂存新增。 */
@@ -145,9 +146,11 @@ export function ProjectGitDiffWindow(props: {
     };
   }, [props.client, props.source, zh, savedRevision]);
 
+  /** 系统任务切换和可见标题显示同一个差异范围。 */
+  const windowTitle = selectedPath && selectedPath !== title ? `${title} · ${selectedPath}` : title;
   useEffect(() => {
-    document.title = selectedPath ? `${title} · ${selectedPath}` : title;
-  }, [selectedPath, title]);
+    document.title = windowTitle;
+  }, [windowTitle]);
 
   const selectedDiff = useMemo(() => (diff && selectedPath ? selectFileDiff(diff, selectedPath) : diff), [diff, selectedPath]);
   /** 固定路径的授权正文和 Git 补丁从同一首帧独立开始，保存回执已带新正文。 */
@@ -170,6 +173,7 @@ export function ProjectGitDiffWindow(props: {
 
   return (
     <main className={`macos-ai-app zeus-shell theme-${appearance} project-git-diff-window`} aria-label={zh ? 'Git 差异窗口' : 'Git diff window'}>
+      <SystemWindowTitleBar title={windowTitle} />
       {error != null ? (
         <div className="project-git-diff-window-error">
           <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} action={{ label: zh ? '重试' : 'Retry', onClick: () => setSavedRevision((value) => value + 1) }} />
@@ -188,7 +192,7 @@ export function ProjectGitDiffWindow(props: {
               <div>
                 {props.source.path && !diff.fileDiffs.some((file) => file.newPath === props.source.path || file.oldPath === props.source.path) ? (
                   <Button unstyled type="button" data-file-path={props.source.path} className={props.source.path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(props.source.path)}>
-                    <FileTypeIcon name={props.source.path} />
+                    <FileTypeIcon path={props.source.path} />
                     <span data-file-status={fileStatuses[props.source.path]}>{props.source.path}</span>
                   </Button>
                 ) : null}
@@ -196,7 +200,7 @@ export function ProjectGitDiffWindow(props: {
                   const path = file.newPath || file.oldPath;
                   return (
                     <Button unstyled key={`${file.oldPath}:${file.newPath}`} type="button" data-file-path={path} className={path === selectedPath ? 'is-current' : ''} onClick={() => setSelectedPath(path)}>
-                      <FileTypeIcon name={path} kind={file.isSubmodule ? 'submodule' : undefined} />
+                      <FileTypeIcon path={path} kind={file.isSubmodule ? 'submodule' : undefined} />
                       <span data-icon-tooltip={path} data-file-status={fileStatuses[path] ?? file.changeType}>
                         {path}
                       </span>
@@ -256,7 +260,7 @@ function TextSideBySideDiff(props: SideBySideDiffProps & { /** 共享文件操�
   return (
     <section className={`project-git-diff-preview${props.fill ? ' is-fill' : ''}`} aria-label={props.zh ? '文件差异' : 'File diff'}>
       <header>
-        <FileTypeIcon name={file.newPath || file.oldPath} />
+        <FileTypeIcon path={file.newPath || file.oldPath} kind={file.isSubmodule ? 'submodule' : undefined} />
         <strong tabIndex={0} data-file-path={file.newPath || file.oldPath} data-icon-tooltip={props.title ?? (file.newPath || file.oldPath)} data-file-status={props.fileStatus ?? file.changeType}>
           {props.title ?? (file.newPath || file.oldPath)}
         </strong>

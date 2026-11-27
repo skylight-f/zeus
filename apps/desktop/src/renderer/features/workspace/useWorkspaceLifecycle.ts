@@ -1,10 +1,11 @@
-import { PROJECT_WORKSPACE_ENTRIES } from './workspaceSupport.js';
 import { useEffect } from 'react';
+import { temporaryWorkspaceId } from '@zeus/shared';
 import { isMacOSPlatform } from '../../platform.js';
 import { conversationGitDeliveryTarget } from '../../git/conversationGitDeliveryTarget.js';
 import { isDurableNativeConversationAcceptance } from '../../session/SessionWorkspace.js';
 import { clearPendingConflictAiStart, listPendingConflictAiStarts } from '../../task/TaskGitMergeModal.js';
 import { ZeusApiError } from '../../apiClient.js';
+import { commandDefinitionsQuery } from '../command-center/commandDefinitionsQuery.js';
 import { errorToLocalUiMessage, redactLocalUiErrorMessage } from './WorkspaceChrome.js';
 import { completeNativeConversationChoiceTaskLoad, executionHostSupportsConversationSource, failNativeConversationChoiceTaskLoad, isDefinitiveNativeConversationStartRejection } from './workspaceSupport.js';
 import type { WorkspaceQueryState } from './useWorkspaceQueryState.js';
@@ -15,6 +16,7 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
   const {
     activeNavTarget,
     activeProjectSection,
+    activeProjectId,
     activeProjectIdRef,
     archivedConversationLoadState,
     codexConfigImportLoading,
@@ -47,7 +49,7 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
     zeusWindowForeground,
   } = state;
   const { acknowledgeNativeConversationAttention, nativeConversationAttentionRetryRevision, openTaskConflictAiConversation, openTaskGitDelivery, recordLocalError, refreshArchivedConversations } = domainActions;
-  const { openProjectSection, refreshCodexConfigImport, requestWorkspaceLeave } = operations;
+  const { openProjectSection, openProjectCommands, toggleProjectGit, refreshCodexConfigImport, requestWorkspaceLeave } = operations;
   useEffect(() => {
     if (activeNavTarget !== 'settings' || settingsCategory !== 'runtime' || codexConfigImportPreview || codexConfigImportLoading || !props.onInspectCodexConfigImport) return;
     void refreshCodexConfigImport();
@@ -201,6 +203,19 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
     window.addEventListener('keydown', onCodeDeliveryShortcut);
     return () => window.removeEventListener('keydown', onCodeDeliveryShortcut);
   }, [openTaskGitDelivery, recordLocalError, selectedNativeConversation, sessionDrawerReady, activeNavTarget, activeProjectSection]);
+  /** 空闲时预读当前项目的命令定义，弹窗可直接复用缓存值或在途请求。 */
+  useEffect(() => {
+    /** 命令定义与弹窗使用同一客户端和项目范围。 */
+    const client = props.commandClient;
+    if (!client || !activeProjectId || activeProjectId === temporaryWorkspaceId) return;
+    /** 项目切换时取消尚未开始的预读。 */
+    const idle = window.requestIdleCallback(() => {
+      void commandDefinitionsQuery(client, 'project', activeProjectId)
+        .load()
+        .catch(() => undefined);
+    });
+    return () => window.cancelIdleCallback(idle);
+  }, [activeProjectId, props.commandClient]);
   useEffect(() => {
     /** 保留原有快捷键，源码整页、Git 侧栏与命令弹窗共用鼠标入口语义。 */
     function onProjectWorkspaceShortcut(event: globalThis.KeyboardEvent): void {
@@ -209,12 +224,15 @@ export function useWorkspaceLifecycle(state: WorkspaceQueryState, domainActions:
       if (!['1', '2', '3', '4'].includes(event.key) || !selectedProject || document.querySelector('[aria-modal="true"]:not([aria-hidden="true"])')) return;
       event.preventDefault();
       event.stopPropagation();
-      const entry = PROJECT_WORKSPACE_ENTRIES.find((item) => item.shortcutKey === event.key);
-      if (entry) openProjectSection(selectedProject, entry.section, entry.codeMode);
+      if (event.key === '4') {
+        if (props.commandClient) openProjectCommands(selectedProject.id);
+      } else if (event.key === '2') toggleProjectGit();
+      else openProjectSection(selectedProject, event.key === '1' ? 'tasks' : 'code', 'source');
     }
+    // 在 xterm 处理输入前消费工作区快捷键，Windows 的 Ctrl 数字键也不会进入 Shell。
     window.addEventListener('keydown', onProjectWorkspaceShortcut, true);
     return () => window.removeEventListener('keydown', onProjectWorkspaceShortcut, true);
-  }, [activeNavTarget, selectedProject, sourceWorkspaceDirty, taskTableLayoutDirty, openProjectSection]);
+  }, [activeNavTarget, selectedProject, sourceWorkspaceDirty, taskTableLayoutDirty, openProjectSection, openProjectCommands, toggleProjectGit, props.commandClient]);
   useEffect(() => {
     const bridge = window.zeus;
     if (bridge?.getRequestingWindowForeground && bridge.onRequestingWindowForegroundChanged) {

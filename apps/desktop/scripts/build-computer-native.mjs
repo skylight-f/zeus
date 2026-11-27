@@ -20,7 +20,6 @@ const computerNativeCargoArguments = [
   'build',
   '--release',
   '--locked',
-  ...(process.platform === 'darwin' ? ['--config', 'profile.release.strip="none"'] : []),
   '-p',
   'cua-driver',
   '-p',

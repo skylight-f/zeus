@@ -1,11 +1,10 @@
-import { lazy, Suspense, useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import type { GlobalAgentSettingsSnapshot } from '@zeus/shared';
 import type { SettingsApiClient } from '../features/settings/settingsApiClient.js';
+import { CodeEditor } from '../code/CodeEditor.js';
 import { FileFindButton, fileFindShortcut, openFileFindIn } from '../code/fileFind.js';
 import { Button } from '../ui/Button.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
-
-const CodeEditor = lazy(() => import('../code/CodeEditor.js').then((module) => ({ default: module.CodeEditor })));
 
 /** 工作区离开确认调用当前编辑器的保存或放弃。 */
 export interface GlobalAgentSettingsHandle {
@@ -151,46 +150,46 @@ export function GlobalAgentSettingsPane(props: {
           </Button>
         </div>
       </header>
-      <div className="global-agent-settings-info">
-        {snapshot ? <code className="global-agent-settings-path">{snapshot.path}</code> : null}
-        <p>{zh ? '保存后，新会话将读取更新后的规则。已有会话可能仍使用原规则。' : 'New conversations will read the saved rules. Existing conversations may still use the previous rules.'}</p>
-        {snapshot && !snapshot.exists ? <p>{zh ? '文件尚未创建，点击保存后创建。内容可以为空。' : 'The file will be created when you save. Empty content is allowed.'}</p> : null}
-        <span role="status" aria-live="polite">
-          {busy === 'loading'
-            ? zh
-              ? '正在读取…'
-              : 'Loading…'
-            : busy === 'saving'
+      <section className="settings-card" aria-label={zh ? '全局规则文件' : 'Global rules file'}>
+        <div className="global-agent-settings-info">
+          {snapshot ? <code className="global-agent-settings-path">{snapshot.path}</code> : null}
+          <p>{zh ? '保存后，新会话将读取更新后的规则。已有会话可能仍使用原规则。' : 'New conversations will read the saved rules. Existing conversations may still use the previous rules.'}</p>
+          {snapshot && !snapshot.exists ? <p>{zh ? '文件尚未创建，点击保存后创建。内容可以为空。' : 'The file will be created when you save. Empty content is allowed.'}</p> : null}
+          <span role="status" aria-live="polite">
+            {busy === 'loading'
               ? zh
-                ? '正在保存…'
-                : 'Saving…'
-              : error
+                ? '正在读取…'
+                : 'Loading…'
+              : busy === 'saving'
                 ? zh
-                  ? '操作失败，内容已保留'
-                  : 'Failed. Your content is retained.'
-                : dirty
+                  ? '正在保存…'
+                  : 'Saving…'
+                : error
                   ? zh
-                    ? '未保存'
-                    : 'Unsaved'
-                  : saved
+                    ? '操作失败，内容已保留'
+                    : 'Failed. Your content is retained.'
+                  : dirty
                     ? zh
-                      ? '已保存'
-                      : 'Saved'
-                    : snapshot?.exists
+                      ? '未保存'
+                      : 'Unsaved'
+                    : saved
                       ? zh
-                        ? '已读取'
-                        : 'Loaded'
-                      : null}
-        </span>
-        {error ? (
-          <p role="alert">
-            <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
-          </p>
-        ) : null}
-      </div>
-      {snapshot ? (
-        <div className="global-agent-settings-editor">
-          <Suspense fallback={<p role="status">{zh ? '正在打开编辑器…' : 'Opening editor…'}</p>}>
+                        ? '已保存'
+                        : 'Saved'
+                      : snapshot?.exists
+                        ? zh
+                          ? '已读取'
+                          : 'Loaded'
+                        : null}
+          </span>
+          {error ? (
+            <p role="alert">
+              <VisibleApplicationError error={error} language={zh ? 'zh-CN' : 'en'} />
+            </p>
+          ) : null}
+        </div>
+        {snapshot ? (
+          <div className="global-agent-settings-editor">
             <CodeEditor
               locale={zh ? 'zh-CN' : 'en-US'}
               path={snapshot.path}
@@ -203,9 +202,9 @@ export function GlobalAgentSettingsPane(props: {
                 return save();
               }}
             />
-          </Suspense>
-        </div>
-      ) : null}
+          </div>
+        ) : null}
+      </section>
     </section>
   );
 }

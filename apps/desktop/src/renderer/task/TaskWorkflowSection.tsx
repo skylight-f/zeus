@@ -1,15 +1,16 @@
 import { TextFilePreview } from '../code/TextFilePreview.js';
 import { FileFindButton, fileFindShortcut, openFileFindIn } from '../code/fileFind.js';
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { CachedQuery } from '../cachedQuery.js';
 import { ResourceLoading } from '../ui/ResourceLoading.js';
 import type { CodexTaskPushCapabilities, CodexTaskPushModelCapability } from '../session/sessionTypes.js';
+import { resolveModelCapability } from '../session/modelSelection.js';
 import type { TaskApiClient } from '../features/tasks/taskApiClient.js';
 import type { CreateTaskStageRequest, TaskRecord, TaskStageDeliverableRecord, TaskStageRecord, TaskWorkflowSnapshot, UpdateTaskStageRequest } from '../features/tasks/taskContracts.js';
 import { Button } from '../ui/Button.js';
 import { formatVisibleApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
-import { compareModelOptions } from '../modelOptionPresentation.js';
+import { compareModelOptions, modelProviderOption, modelProviderOptionForRef } from '../modelOptionPresentation.js';
 import { codexCapabilitiesChangedEvent, modelCatalogGeneration } from '../features/integrations/modelCatalogEvents.js';
 
 export type TaskWorkflowClient = Pick<
@@ -69,13 +70,32 @@ export function TaskWorkflowSection(props: TaskWorkflowSectionProps) {
   const deliverableCacheRef = useRef<{ client: TaskWorkflowClient; taskId: string; sha256: string; content: string } | null>(null);
   const [operationError, setError] = useState<string | null>(null);
   const error = operationError ?? (workflowSnapshot.error ? visibleError(workflowSnapshot.error, zh) : null);
+  /** 目录通知使用当前任务的读取函数，父组件重绘不取消同一任务的请求。 */
+  const loadEditorCapabilities = useEffectEvent(() => props.loadCapabilities());
 
   useEffect(() => {
-    /** 配置或登录变化后，下一次模型操作重新读取当前目录。 */
-    const invalidate = () => setCapabilities(null);
-    window.addEventListener(codexCapabilitiesChangedEvent, invalidate);
-    return () => window.removeEventListener(codexCapabilitiesChangedEvent, invalidate);
-  }, []);
+    let active = true;
+    /** 编辑中的列表原地刷新，阶段已选模型和其他表单值继续由工作流记录持有。 */
+    const refresh = () => {
+      if (!editingStageId) {
+        setCapabilities(null);
+        return;
+      }
+      const generation = modelCatalogGeneration();
+      void loadEditorCapabilities()
+        .then((loaded) => {
+          if (active && currentQueryRef.current === workflowQuery && generation === modelCatalogGeneration()) setCapabilities(loaded);
+        })
+        .catch((caught: unknown) => {
+          if (active && currentQueryRef.current === workflowQuery && generation === modelCatalogGeneration()) setError(visibleError(caught, zh));
+        });
+    };
+    window.addEventListener(codexCapabilitiesChangedEvent, refresh);
+    return () => {
+      active = false;
+      window.removeEventListener(codexCapabilitiesChangedEvent, refresh);
+    };
+  }, [editingStageId, workflowQuery, zh]);
 
   useEffect(() => {
     deliverableRequestRef.current += 1;
@@ -327,7 +347,9 @@ function TaskStageItem(props: {
   const [promptDraft, setPromptDraft] = useState(stage.prompt);
   useEffect(() => setPromptDraft(stage.prompt), [stage.id, stage.prompt]);
   const editable = !props.terminalReadOnly && (stage.status === 'pending' || stage.status === 'ready') && stage.attempts.length === 0;
-  const selectedModel = props.models.find((model) => model.id === stage.modelRef);
+  const selectedModel = resolveModelCapability(props.models, stage.modelRef);
+  /** 阶段保留已保存的模型引用，能查到目录时优先使用实际连接图标。 */
+  const selectedModelProvider = selectedModel ? modelProviderOption(selectedModel) : modelProviderOptionForRef(stage.modelRef);
   const latestAttempt = stage.attempts.at(-1);
   const currentDeliverable = [...stage.deliverables].reverse().find((deliverable) => deliverable.status === 'submitted' || deliverable.status === 'accepted');
   const canStart = !props.terminalReadOnly && Boolean(stage.modelRef) && (stage.status === 'ready' || stage.status === 'changes_requested' || stage.status === 'failed');
@@ -336,8 +358,10 @@ function TaskStageItem(props: {
   const modelOptions = props.models
     .filter((model) => model.available !== false)
     .sort(compareModelOptions)
-    .map((model) => ({ value: model.id, label: model.displayName ? `${model.displayName} · ${model.sourceName ?? model.agentKind ?? ''}` : model.id }));
-  if (stage.modelRef && !modelOptions.some((option) => option.value === stage.modelRef)) modelOptions.unshift({ value: stage.modelRef, label: `${stage.modelRef} · ${zh ? '当前配置' : 'Current'}` });
+    .map((model) => ({ value: model.id, label: model.displayName ? `${model.displayName} · ${model.sourceName ?? model.agentKind ?? ''}` : model.id, ...modelProviderOption(model) }));
+  if (stage.modelRef && !modelOptions.some((option) => option.value === stage.modelRef)) {
+    modelOptions.unshift({ value: stage.modelRef, label: `${stage.modelRef} · ${zh ? '当前配置' : 'Current'}`, ...selectedModelProvider });
+  }
   const effortOptions = selectedModel?.supportedReasoningEfforts.map((effort) => ({ value: effort, label: effort })) ?? [];
 
   return (
@@ -367,7 +391,7 @@ function TaskStageItem(props: {
                   const model = props.models.find((candidate) => candidate.id === modelRef);
                   return props.onUpdate({
                     modelRef,
-                    agentKind: model?.agentKind === 'copilot' ? 'copilot' : model?.agentKind === 'pi' ? 'pi' : 'codex',
+                    agentKind: model?.agentKind ?? stage.agentKind,
                     effort: model?.defaultReasoningEffort ?? model?.supportedReasoningEfforts[0] ?? null,
                     serviceTier: null,
                   });
@@ -435,7 +459,14 @@ function TaskStageItem(props: {
           </div>
         ) : (
           <div className="task-workflow-stage-meta">
-            <span>{stage.modelRef || (zh ? '尚未选择模型' : 'No model selected')}</span>
+            {stage.modelRef ? (
+              <span className="model-provider-labelled">
+                {selectedModelProvider.icon}
+                {stage.modelRef}
+              </span>
+            ) : (
+              <span>{zh ? '尚未选择模型' : 'No model selected'}</span>
+            )}
             <span>{stage.effort || (zh ? '默认强度' : 'Default effort')}</span>
             <span>{stage.advanceMode === 'manual' ? (zh ? '人工验收' : 'Manual') : zh ? '自动推进' : 'Auto'}</span>
           </div>
@@ -559,7 +590,7 @@ function createDefaultStage(
     kind,
     title,
     description,
-    agentKind: model?.agentKind === 'copilot' ? 'copilot' : model?.agentKind === 'pi' ? 'pi' : 'codex',
+    agentKind: model?.agentKind ?? 'codex',
     modelRef: model?.id ?? '',
     effort: model?.defaultReasoningEffort ?? model?.supportedReasoningEfforts[0] ?? null,
     serviceTier: null,

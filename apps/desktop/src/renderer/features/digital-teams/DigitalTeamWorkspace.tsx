@@ -1,4 +1,3 @@
-import { useAttentionWorkspace } from '../attention/attentionContext.js';
 import { WorkflowPrimitiveFields } from './WorkflowPrimitiveFields.js';
 import { WorkflowWaitResponse } from './WorkflowWaitResponse.js';
 import {
@@ -31,7 +30,7 @@ import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { TrashIcon as Trash } from '@phosphor-icons/react/dist/csr/Trash';
 import type { DashboardClient } from '../../dashboardClient.js';
 import { ZeusSelect } from '../../ZeusSelect.js';
-import { VisibleApplicationError, formatVisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
+import { VisibleApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { Button } from '../../ui/Button.js';
 import { ResourceLoading } from '../../ui/ResourceLoading.js';
 import { FormDialog } from '../../ui/FormDialog.js';
@@ -118,8 +117,6 @@ export interface DigitalTeamWorkspaceProps {
 
 /** 提供模板编辑、真实角色库和只读运行投影。 */
 export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
-  const { navigation: attentionNavigation } = useAttentionWorkspace();
-  const attentionHandled = useRef<number | null>(null);
   /** 页面交互保持中文产品语义，英文环境提供对应文案。 */
   const zh = props.language === 'zh-CN';
   /** DashboardClient 完成组合后才开放真实操作。 */
@@ -188,31 +185,6 @@ export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
   const compactInspector = useCompactInspector();
   /** 项目切换代次防止迟到读取覆盖当前页面。 */
   const loadRevisionRef = useRef(0);
-  useEffect(() => {
-    const target = attentionNavigation?.target;
-    if (!api || !attentionNavigation || target?.kind !== 'digital_team' || attentionHandled.current === attentionNavigation.nonce || dirty) return;
-    if (projectId !== attentionNavigation.projectId) {
-      setProjectId(attentionNavigation.projectId);
-      return;
-    }
-    if (loading) return;
-    let active = true;
-    void api
-      .loadDigitalTeamRun(target.runId)
-      .then((projection) => {
-        if (!active) return;
-        attentionHandled.current = attentionNavigation.nonce;
-        setSelectedRun(projection);
-        setSelectedNodeId(target.nodeId ?? null);
-        setView('runs');
-      })
-      .catch((cause) => {
-        if (active) setError(formatVisibleApplicationError(cause, zh ? 'zh-CN' : 'en'));
-      });
-    return () => {
-      active = false;
-    };
-  }, [api, attentionNavigation, projectId, loading, dirty, zh]);
   /** 当前操作改变运行时使此前后台读取失效，不让旧列表覆盖新接纳。 */
   const runReadEpochRef = useRef(0);
   /** 卸载后的旧写入回执不再改当前页面状态。 */
@@ -1130,7 +1102,7 @@ export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
                     </div>
                   ) : null}
                 </div>
-                <Button size="compact" variant="primary" busy={busy} disabled={!draft.name.trim() || Boolean(draft.sourceIssues?.length) || !templateNeedsSave} onClick={() => saveTemplate()}>
+                <Button size="compact" variant="primary" busyLabel={zh ? '保存中…' : 'Saving…'} disabled={busy || !draft.name.trim() || Boolean(draft.sourceIssues?.length) || !templateNeedsSave} onClick={() => saveTemplate()}>
                   {zh ? '保存' : 'Save'}
                 </Button>
                 {dirty ? (
@@ -1141,6 +1113,7 @@ export function DigitalTeamWorkspace(props: DigitalTeamWorkspaceProps) {
                 <Button
                   size="compact"
                   variant="primary"
+                  busyLabel={props.task ? (zh ? '启动中…' : 'Starting…') : undefined}
                   disabled={!draft.name.trim() || validationIssues.length > 0 || loading || busy || (props.task ? runs.some((run) => !terminalRunStatuses.has(run.status)) : !props.onCreateTask || !projectId)}
                   onClick={() => {
                     if (props.task) return createRun();

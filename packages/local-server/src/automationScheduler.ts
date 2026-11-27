@@ -11,7 +11,7 @@ import type {
   ConversationSubmissionRepository,
   ZeusProjectRecord,
 } from '@zeus/storage';
-import { automationEventStatusId, localParts, parseAutomationOnceAt, zonedLocalToUtc, type AutomationDispatchTarget, type AutomationExecutionReference, type AutomationExecutionState } from '@zeus/shared';
+import { automationEventStatusId, localParts, parseAutomationOnceAt, parseAutomationWeekdays, zonedLocalToUtc, type AutomationDispatchTarget, type AutomationExecutionReference, type AutomationExecutionState } from '@zeus/shared';
 
 export interface AutomationDispatchResult {
   conversationId: string;
@@ -88,8 +88,18 @@ export function createAutomationScheduler(options: AutomationSchedulerOptions): 
       recovered = true;
     }
     const now = options.now();
+    /** 在接纳和派发前检查活动规则，包括没有缓存时间的旧每周排程。 */
+    const activeTasks = options.tasks.list().filter((task) => task.status === 'active');
+    for (const task of activeTasks) {
+      if (task.triggerKind !== 'weekly') continue;
+      try {
+        parseAutomationWeekdays(task.triggerConfig.weekdays);
+      } catch (error) {
+        pauseInvalidSchedule(task, error);
+      }
+    }
     acceptDue(now);
-    acceptEvents();
+    acceptEvents(activeTasks);
     options.runs.cancelDeletedQueuedRuns();
     reconcileRunning();
     /** 未完成逐目标派发的原运行优先恢复，不能让排队运行越过它。 */
@@ -102,8 +112,9 @@ export function createAutomationScheduler(options: AutomationSchedulerOptions): 
   }
 
   /** 按原事件的前后状态与来源接纳，不从处理时的任务状态重新推断。 */
-  function acceptEvents(): void {
-    for (const task of options.tasks.list().filter((entry) => entry.status === 'active' && entry.triggerKind === 'event')) {
+  function acceptEvents(activeTasks: AutomationTaskRecord[]): void {
+    for (const task of activeTasks) {
+      if (task.triggerKind !== 'event') continue;
       /** 条件来源固定到实际作者修订，状态、游标等后续更新时间不能替代。 */
       const revision = options.tasks.getRevision(task.currentRevisionId);
       if (!revision) continue;
@@ -230,6 +241,8 @@ export function createAutomationScheduler(options: AutomationSchedulerOptions): 
   }
 
   function markOutcomeUnknown(run: AutomationRunRecord, message: string): void {
+    /** 已记为未知的运行只等待新结果，避免重复通知或再次暂停规则。 */
+    if (run.status === 'outcome_unknown') return;
     // 结果未知时暂停后续调度，避免旧操作仍在执行而新队列继续产生副作用。
     if (options.tasks.getById(run.automationId)) options.tasks.setStatus(run.automationId, 'paused');
     options.runs.setTerminal(run.id, 'outcome_unknown', 'ZEUS_AUTOMATION_DISPATCH_OUTCOME_UNKNOWN', message);
@@ -256,7 +269,7 @@ export function createAutomationScheduler(options: AutomationSchedulerOptions): 
   }
 
   function reconcileRunning(): void {
-    for (const candidate of options.runs.listInFlight()) {
+    for (const candidate of options.runs.listInFlight(true)) {
       /** 删除不撤销既有接纳事实；遗留派发也在每轮对账中收口。 */
       const deletedDispatch = candidate.status === 'dispatching' && !options.tasks.getById(candidate.automationId);
       const run = deletedDispatch ? reconcileDeletedDispatch(candidate) : candidate;
@@ -276,7 +289,7 @@ export function createAutomationScheduler(options: AutomationSchedulerOptions): 
         else settle(run, 'blocked', 'ZEUS_AUTOMATION_NO_ELIGIBLE_TASK', '全部目标均无可领取任务，本次没有执行工作。');
         continue;
       }
-      if ((run.status === 'running' || run.status === 'awaiting_review' || deletedDispatch) && run.executionReferences.length > 0) {
+      if ((run.status === 'running' || run.status === 'awaiting_review' || run.status === 'outcome_unknown' || deletedDispatch) && run.executionReferences.length > 0) {
         const states = run.executionReferences.map((reference) => options.readExecution?.(reference));
         if (states.some((state) => !state)) {
           markOutcomeUnknown(run, '运行关联的工作或流程已不可用，请核对实际交付记录。');
@@ -532,7 +545,8 @@ export function computeNextRun(task: AutomationTaskRecord, from: Date): string |
   const parts = localParts(from, task.timezone);
   const [hour, minute] = parseLocalTime(task.triggerConfig.localTime ?? '09:00');
   if (task.triggerKind === 'daily' || task.triggerKind === 'weekly') {
-    const allowed = task.triggerKind === 'weekly' ? new Set(task.triggerConfig.weekdays ?? [1]) : null;
+    /** 周日对应 0，未配置执行日的规则无法生成计划。 */
+    const allowed = task.triggerKind === 'weekly' ? new Set(parseAutomationWeekdays(task.triggerConfig.weekdays)) : null;
     for (let dayOffset = 0; dayOffset <= 8; dayOffset += 1) {
       const localDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + dayOffset, hour, minute));
       if (allowed && !allowed.has(localDate.getUTCDay())) continue;

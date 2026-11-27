@@ -1,0 +1,1021 @@
+@import '../ui/brand.css';
+
+:root:has(.menu-bar-usage-root),
+body:has(.menu-bar-usage-root),
+#root:has(.menu-bar-usage-root) {
+  inline-size: 100%;
+  block-size: 100%;
+  min-block-size: 0;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.menu-bar-usage-root {
+  --usage-bg: rgb(251 251 252 / 97%);
+  --usage-panel: rgb(255 255 255 / 76%);
+  --usage-panel-strong: rgb(255 255 255 / 94%);
+  --usage-text: #202126;
+  --usage-muted: #747780;
+  --usage-faint: #9699a2;
+  --usage-line: rgb(20 22 28 / 9%);
+  --usage-edge: rgb(20 22 28 / 14%);
+  --usage-accent: var(--zeus-brand-primary);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 10%, white);
+  --usage-danger: #b64949;
+  box-sizing: border-box;
+  inline-size: 100%;
+  block-size: 100%;
+  /* 缩小浮窗外侧留白，让固定宽度更多用于内容。 */
+  padding: 12px 10px;
+  color: var(--usage-text);
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif;
+  font-size: 13px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+}
+
+.menu-bar-usage-root[data-appearance='dark'] {
+  --usage-bg: rgb(35 35 38 / 97%);
+  --usage-panel: rgb(255 255 255 / 5%);
+  --usage-panel-strong: rgb(255 255 255 / 9%);
+  --usage-text: #f3f3f5;
+  --usage-muted: #a7a8b0;
+  --usage-faint: #858690;
+  --usage-line: rgb(255 255 255 / 10%);
+  --usage-edge: rgb(255 255 255 / 15%);
+  --usage-accent: var(--zeus-brand-primary);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 18%, transparent);
+  --usage-danger: #ff9393;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  .menu-bar-usage-root[data-appearance='system'] {
+    --usage-bg: rgb(35 35 38 / 97%);
+    --usage-panel: rgb(255 255 255 / 5%);
+    --usage-panel-strong: rgb(255 255 255 / 9%);
+    --usage-text: #f3f3f5;
+    --usage-muted: #a7a8b0;
+    --usage-faint: #858690;
+    --usage-line: rgb(255 255 255 / 10%);
+    --usage-edge: rgb(255 255 255 / 15%);
+    --usage-accent: var(--zeus-brand-primary);
+    --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 18%, transparent);
+    --usage-danger: #ff9393;
+    color-scheme: dark;
+  }
+}
+
+.menu-bar-usage-root *,
+.menu-bar-usage-root *::before,
+.menu-bar-usage-root *::after {
+  box-sizing: border-box;
+}
+
+.menu-bar-usage-surface {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+}
+
+.menu-bar-usage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-block-size: 28px;
+  margin-block-end: 8px;
+}
+
+.menu-bar-usage-identity {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-inline-size: 0;
+}
+
+.menu-bar-usage-identity strong {
+  font-size: 14px;
+  font-weight: 730;
+}
+
+.menu-bar-usage-freshness {
+  overflow: hidden;
+  color: var(--usage-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 复用启动页品牌资源，小尺寸保持完整轮廓，不再叠加字母底框。 */
+.menu-bar-usage-mark {
+  inline-size: 24px;
+  block-size: 24px;
+  flex: 0 0 24px;
+  background: url('../../../assets/icon.png') center / contain no-repeat;
+}
+
+/* 时间与刷新按钮作为一组，长文案省略但保留完整悬浮提示。 */
+.menu-bar-usage-refresh-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-inline-size: 0;
+  margin-inline-start: 12px;
+}
+
+.menu-bar-usage-freshness {
+  min-inline-size: 0;
+  text-align: end;
+}
+
+.menu-bar-usage-refresh {
+  display: grid;
+  inline-size: 28px;
+  block-size: 26px;
+  flex: 0 0 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--usage-radius-control, 8px);
+  background: transparent;
+  color: var(--usage-muted);
+}
+
+.menu-bar-usage-tabs {
+  display: flex;
+  gap: 4px;
+  min-inline-size: 0;
+  margin-block-end: 8px;
+  padding: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.menu-bar-usage-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.menu-bar-usage-tabs button {
+  min-block-size: 28px;
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: var(--usage-radius-tab);
+  background: transparent;
+  color: var(--usage-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.menu-bar-usage-tabs button[aria-selected='true'] {
+  background: var(--usage-accent-soft);
+  color: var(--zeus-brand-text);
+}
+
+.menu-bar-usage-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-block-size: 30px;
+  margin: 0 0 8px;
+  padding: 5px 9px;
+  border-radius: var(--usage-radius-control, 8px);
+  background: var(--usage-panel-strong);
+  color: var(--usage-danger);
+  font-size: 10.5px;
+}
+
+.menu-bar-usage-status-stack {
+  min-block-size: 0;
+}
+
+.menu-bar-usage-notice[data-tone='warning'] {
+  color: var(--usage-muted);
+  line-height: 1.4;
+}
+
+.menu-bar-usage-status-stack .menu-bar-usage-notice + .menu-bar-usage-notice {
+  margin-block-start: -2px;
+}
+
+.menu-bar-usage-notice button {
+  min-block-size: 24px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+}
+
+.menu-bar-usage-content {
+  min-block-size: 0;
+  padding: 0;
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+.menu-bar-usage-content::-webkit-scrollbar {
+  display: none;
+}
+
+.menu-bar-usage-empty {
+  display: grid;
+  min-block-size: 190px;
+  place-content: center;
+  gap: 5px;
+  padding: 24px;
+  text-align: center;
+}
+
+.menu-bar-usage-empty strong {
+  font-size: 14px;
+}
+
+.menu-bar-usage-empty span {
+  color: var(--usage-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.menu-bar-usage-load-failure {
+  display: grid;
+  min-block-size: 190px;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+}
+
+.menu-bar-usage-load-failure strong {
+  color: var(--usage-danger);
+  font-size: 14px;
+}
+
+.menu-bar-usage-load-failure span {
+  color: var(--usage-muted);
+  font-size: 11px;
+}
+
+.menu-bar-usage-load-failure button {
+  min-block-size: 28px;
+  margin-block-start: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-control, 8px);
+  background: var(--usage-panel-strong);
+  color: var(--usage-text);
+  font: inherit;
+  font-weight: 650;
+}
+
+.menu-bar-usage-provider-list {
+  display: grid;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-panel);
+}
+
+/* 手柄与详情按钮分开，拖动排序不会误打开详情。 */
+.menu-bar-usage-provider-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-block: 2px;
+  border-radius: 6px;
+}
+
+.menu-bar-usage-provider-row .menu-bar-usage-provider-open {
+  flex: 1;
+}
+
+.menu-bar-usage-drag-handle {
+  display: grid;
+  flex: 0 0 24px;
+  min-block-size: 36px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--usage-muted);
+  cursor: grab;
+}
+
+.menu-bar-usage-provider-row[data-dragging='true'] {
+  opacity: 0.5;
+}
+
+/* 落点线表示最终插入位置，拖拽过程中不重排内容。 */
+.menu-bar-usage-provider-row[data-drop]::after {
+  position: absolute;
+  inset-inline: 2px;
+  block-size: 2px;
+  background: var(--usage-accent);
+  content: '';
+  pointer-events: none;
+}
+
+.menu-bar-usage-provider-row[data-drop='before']::after {
+  inset-block-start: 0;
+}
+
+.menu-bar-usage-provider-row[data-drop='after']::after {
+  inset-block-end: 0;
+}
+
+/* 排序播报只对辅助阅读工具可见，不挤占浮窗空间。 */
+.menu-bar-usage-sr-only {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* 列表悬停底色内缩并圆角，避免贴边整块铺色和粗选中竖条。 */
+.menu-bar-usage-provider-open {
+  margin: 0;
+  min-inline-size: 0;
+  border-radius: 6px;
+  display: grid;
+  /* 移除字母头像后，供应商名称直接占据首列。 */
+  grid-template-columns: minmax(0, 1fr) auto 14px;
+  align-items: center;
+  gap: 9px;
+  min-block-size: 65px;
+  padding: 9px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--usage-text);
+  font: inherit;
+  text-align: start;
+}
+
+/* 独立用量窗口也使用强调色悬停，避免白块跳变。 */
+.menu-bar-usage-provider-open:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--zeus-brand-hover);
+}
+
+.menu-bar-usage-provider-copy,
+.menu-bar-usage-provider-value {
+  display: grid;
+  min-inline-size: 0;
+  gap: 2px;
+}
+
+.menu-bar-usage-provider-copy strong,
+.menu-bar-usage-provider-copy small,
+.menu-bar-usage-provider-value strong,
+.menu-bar-usage-provider-value small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-provider-copy strong {
+  font-size: 12px;
+}
+
+.menu-bar-usage-provider-copy small,
+.menu-bar-usage-provider-value small {
+  color: var(--usage-muted);
+  font-size: 11px;
+}
+
+.menu-bar-usage-provider-value {
+  max-inline-size: 102px;
+  text-align: end;
+}
+
+.menu-bar-usage-provider-value strong {
+  font-size: 13px;
+}
+
+.menu-bar-usage-root svg {
+  inline-size: 14px;
+  block-size: 14px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.menu-bar-usage-detail {
+  display: grid;
+  gap: 8px;
+  padding-block-end: 10px;
+}
+
+.menu-bar-usage-account-card {
+  display: grid;
+  min-block-size: 108px;
+  gap: 8px;
+  padding: 10px 2px;
+  border: 0;
+  border-radius: var(--usage-radius-card, 12px);
+  background: color-mix(in srgb, var(--usage-accent-soft) 82%, var(--usage-panel-strong));
+}
+
+.menu-bar-usage-account-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 86px;
+  align-items: start;
+  gap: 14px;
+}
+
+/* 各额度独立排列，保留余额和重置时间；内容超高时复用浮窗滚动区域。 */
+.menu-bar-usage-account-quotas {
+  display: grid;
+  min-inline-size: 0;
+  gap: 10px;
+}
+
+.menu-bar-usage-account-quota,
+.menu-bar-usage-account-today {
+  display: grid;
+  min-inline-size: 0;
+}
+
+.menu-bar-usage-account-quota {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+}
+
+.menu-bar-usage-account-quota > small:first-child,
+.menu-bar-usage-account-today small,
+.menu-bar-usage-account-source,
+.menu-bar-usage-account-quota time,
+.menu-bar-usage-account-quota[data-empty='true'] > small:last-child {
+  overflow: hidden;
+  color: var(--usage-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-account-quota > strong,
+.menu-bar-usage-account-today strong {
+  overflow: hidden;
+  font-size: 17px;
+  font-weight: 730;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-account-quota[data-empty='true'] > strong {
+  margin-block: 2px;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.menu-bar-usage-account-today {
+  align-content: start;
+  gap: 4px;
+}
+
+.menu-bar-usage-progress {
+  display: block;
+  block-size: 4px;
+  margin-block-start: 1px;
+  overflow: hidden;
+  border-radius: var(--usage-radius-pill, 999px);
+  background: color-mix(in srgb, var(--usage-accent) 12%, transparent);
+}
+
+.menu-bar-usage-progress i {
+  display: block;
+  block-size: 100%;
+  border-radius: inherit;
+  background: var(--usage-accent);
+}
+
+.menu-bar-usage-account-source {
+  align-self: end;
+}
+
+/* 重置日期和数据来源必须完整可读，英文较长时允许换行。 */
+.menu-bar-usage-account-quota time,
+.menu-bar-usage-account-source {
+  white-space: normal;
+  line-height: 1.4;
+}
+
+.menu-bar-usage-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding: 10px 0;
+  border: 0;
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-panel);
+}
+
+.menu-bar-usage-metrics > div {
+  display: grid;
+  align-content: start;
+  min-inline-size: 0;
+  gap: 3px;
+  padding-inline: 2px;
+}
+
+.menu-bar-usage-root dt,
+.menu-bar-usage-root dd {
+  margin: 0;
+}
+
+.menu-bar-usage-metrics dt {
+  overflow-wrap: anywhere;
+  color: var(--usage-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.menu-bar-usage-metrics dd {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 明细留在浮窗顶层，不改变本地三列指标卡片的高度。 */
+.menu-bar-usage-cost-detail-trigger {
+  display: inline-grid;
+  place-items: center;
+  inline-size: 15px;
+  block-size: 15px;
+  margin-inline-start: 4px;
+  padding: 0;
+  border: 1px solid var(--usage-edge);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--usage-muted);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.menu-bar-usage-cost-detail:popover-open {
+  position: fixed;
+  inline-size: min(360px, calc(100vw - 24px));
+  max-block-size: min(320px, calc(100vh - 24px));
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--usage-edge);
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-bg);
+  color: var(--usage-text);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 16%);
+  font: inherit;
+}
+
+.menu-bar-usage-cost-detail > strong {
+  display: block;
+  margin-block-end: 8px;
+}
+
+.menu-bar-usage-cost-detail table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  text-align: start;
+}
+
+.menu-bar-usage-cost-detail :is(th, td) {
+  padding: 6px 4px;
+  border-block-start: 1px solid var(--usage-line);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.menu-bar-usage-cost-detail thead th {
+  color: var(--usage-muted);
+  font-weight: 600;
+}
+
+.menu-bar-usage-bars {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 8px 2px;
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-panel);
+}
+
+.menu-bar-usage-bars figcaption {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.menu-bar-usage-bars figcaption > span {
+  overflow: hidden;
+  color: var(--usage-muted);
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-chart-source-picker {
+  display: inline-flex;
+  align-items: center;
+  min-inline-size: 0;
+}
+
+.menu-bar-usage-chart-source-picker select {
+  max-inline-size: 100%;
+  min-block-size: 24px;
+  padding: 2px 18px 2px 4px;
+  border: 1px solid var(--usage-line);
+  border-radius: 6px;
+  background: var(--usage-panel-strong);
+  color: var(--usage-text);
+  font: inherit;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.menu-bar-usage-bars figcaption dl {
+  display: grid;
+  grid-template-columns: repeat(2, auto);
+  gap: 10px;
+  margin: 0;
+  text-align: end;
+}
+
+.menu-bar-usage-bars figcaption dl > div {
+  display: grid;
+  gap: 1px;
+}
+
+.menu-bar-usage-bars figcaption dt {
+  color: var(--usage-muted);
+  font-size: 10px;
+}
+
+.menu-bar-usage-bars figcaption dd {
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.menu-bar-usage-bars-plot {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  /* 柱高与两行标签分开，新增每日数值不压缩柱形。 */
+  block-size: 100px;
+  gap: 4px;
+}
+
+.menu-bar-usage-bars-plot > span {
+  display: grid;
+  block-size: 100%;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 2px;
+  text-align: center;
+}
+
+.menu-bar-usage-bar-slot {
+  display: grid;
+  min-block-size: 0;
+  align-items: end;
+}
+
+.menu-bar-usage-bar-slot i {
+  display: block;
+  inline-size: min(14px, 100%);
+  justify-self: center;
+  border-radius: 3px 3px 1px 1px;
+  background: var(--usage-accent);
+  opacity: 0.78;
+}
+
+.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
+  background: var(--usage-muted);
+  opacity: 0.42;
+}
+
+.menu-bar-usage-bar-slot em {
+  align-self: end;
+  color: var(--usage-faint);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.menu-bar-usage-bars-plot small {
+  overflow: hidden;
+  color: var(--usage-muted);
+  font-size: 10px;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+/* 每日数值直接可读；空白日期继续显示破折号，零消耗显示 0。 */
+.menu-bar-usage-bar-value {
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 1.4;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.menu-bar-usage-chart-empty {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 2px;
+  border-radius: var(--usage-radius-card, 12px);
+  background: var(--usage-panel);
+  color: var(--usage-muted);
+  font-size: 11px;
+}
+
+.menu-bar-usage-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  margin-block-start: 8px;
+  padding: 0;
+}
+
+.menu-bar-usage-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-block-size: 30px;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: var(--usage-radius-control, 8px);
+  color: var(--usage-text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 630;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-actions .menu-bar-usage-primary-action {
+  min-inline-size: 0;
+}
+
+.menu-bar-usage-actions button:hover:not(:disabled):not([aria-disabled='true']) {
+  filter: brightness(0.96);
+}
+
+.menu-bar-usage-root button:focus-visible {
+  outline: 2px solid var(--usage-accent);
+  outline-offset: 2px;
+}
+
+.menu-bar-usage-skeleton {
+  display: grid;
+  gap: 9px;
+}
+
+.menu-bar-usage-skeleton span {
+  min-block-size: 52px;
+  border-radius: var(--usage-radius-card, 12px);
+  background: linear-gradient(90deg, var(--usage-panel) 20%, var(--usage-panel-strong) 50%, var(--usage-panel) 80%);
+  background-size: 200% 100%;
+  animation: menu-bar-usage-shimmer 1.2s linear infinite;
+}
+
+.menu-bar-usage-skeleton span:first-child {
+  min-block-size: 92px;
+}
+
+@keyframes menu-bar-usage-pulse {
+  to {
+    opacity: 0.35;
+  }
+}
+
+/* 仅旋转圆环，按钮背景和点击区域保持固定。 */
+@keyframes menu-bar-usage-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes menu-bar-usage-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-bar-usage-root * {
+    animation: none !important;
+  }
+}
+
+/* 底层为原生 Liquid Glass，不叠加实色或整窗 opacity。 */
+.menu-bar-usage-root {
+  --usage-bg: transparent;
+  --usage-panel: rgb(255 255 255 / 52%);
+  --usage-panel-strong: rgb(255 255 255 / 68%);
+  --usage-text: #29292c;
+  --usage-muted: #515156;
+  --usage-faint: #88888d;
+  --usage-line: rgb(0 0 0 / 7%);
+  --usage-edge: rgb(0 0 0 / 22%);
+  --usage-accent: var(--zeus-brand-primary);
+  --usage-accent-strong: var(--zeus-brand-text);
+  --usage-accent-secondary: var(--zeus-brand-highlight);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
+  --usage-accent-border: color-mix(in srgb, var(--zeus-brand-primary) 34%, transparent);
+  --usage-progress-track: color-mix(in srgb, var(--zeus-brand-primary) 10%, transparent);
+  --usage-warning: #a25c00;
+  --usage-danger: #ff453a;
+  --usage-radius-control: 8px;
+  --usage-radius-card: 8px;
+  --usage-radius-pill: 999px;
+  --usage-radius-tab: 8px;
+  position: relative;
+  isolation: isolate;
+  padding: 14px;
+  background: transparent;
+  color: var(--usage-text);
+}
+/* 原生 NSPopover 在网页外绘制箭头，网页只保留内容内边距。 */
+.menu-bar-usage-root::before,
+.menu-bar-usage-root::after {
+  content: none;
+}
+.menu-bar-usage-root[data-appearance='dark'] {
+  --usage-bg: transparent;
+  --usage-panel: rgb(255 255 255 / 8%);
+  --usage-panel-strong: rgb(255 255 255 / 10%);
+  --usage-text: #f2f2f7;
+  --usage-muted: #c6c6cb;
+  --usage-faint: #929297;
+  --usage-line: rgb(255 255 255 / 10%);
+  --usage-edge: rgb(255 255 255 / 20%);
+  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
+  --usage-warning: #ffb340;
+}
+@media (prefers-color-scheme: dark) {
+  .menu-bar-usage-root[data-appearance='system'] {
+    --usage-bg: transparent;
+    --usage-panel: rgb(255 255 255 / 8%);
+    --usage-panel-strong: rgb(255 255 255 / 10%);
+    --usage-text: #f2f2f7;
+    --usage-muted: #c6c6cb;
+    --usage-faint: #929297;
+    --usage-line: rgb(255 255 255 / 10%);
+    --usage-edge: rgb(255 255 255 / 20%);
+    --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
+    --usage-warning: #ffb340;
+  }
+}
+.menu-bar-usage-surface {
+  background: transparent;
+}
+.menu-bar-usage-header {
+  min-block-size: 30px;
+  padding: 0;
+}
+.menu-bar-usage-identity strong {
+  color: var(--usage-text);
+  letter-spacing: -0.015em;
+}
+.menu-bar-usage-tabs {
+  gap: 4px;
+  padding-inline: 0;
+}
+.menu-bar-usage-tabs button {
+  min-block-size: 30px;
+  padding-inline: 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+.menu-bar-usage-tabs button[aria-selected='true'] {
+  border-color: var(--usage-accent-border);
+  background: var(--usage-accent-soft);
+  color: var(--usage-accent-strong);
+}
+.menu-bar-usage-root button:hover:not(:disabled) {
+  background: var(--usage-accent-soft);
+}
+.menu-bar-usage-root button:focus-visible {
+  outline: 2px solid var(--usage-accent);
+  outline-offset: 2px;
+}
+.menu-bar-usage-root button:active:not(:disabled) {
+  background: var(--usage-accent-border);
+}
+.menu-bar-usage-root button:disabled {
+  cursor: not-allowed;
+}
+.menu-bar-usage-root button[aria-busy='true'] {
+  cursor: progress;
+}
+.menu-bar-usage-freshness[data-stale='true'] {
+  color: var(--usage-warning);
+}
+.menu-bar-usage-provider-list,
+.menu-bar-usage-metrics,
+.menu-bar-usage-bars,
+.menu-bar-usage-chart-empty {
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-card);
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+.menu-bar-usage-account-card {
+  padding: 10px;
+  border: 1px solid var(--usage-accent-border);
+  border-radius: var(--usage-radius-card);
+  background: var(--usage-accent-soft);
+  box-shadow: none;
+}
+.menu-bar-usage-account-body {
+  gap: 10px;
+}
+.menu-bar-usage-metrics {
+  padding: 10px 8px;
+}
+.menu-bar-usage-bars {
+  padding: 10px 8px;
+}
+.menu-bar-usage-progress {
+  background: var(--usage-progress-track);
+}
+.menu-bar-usage-progress i {
+  background: linear-gradient(90deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
+}
+.menu-bar-usage-bar-slot i {
+  background: linear-gradient(180deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
+}
+.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
+  background: var(--usage-faint);
+}
+.menu-bar-usage-actions {
+  gap: 8px;
+  padding: 0;
+  background: transparent;
+}
+.menu-bar-usage-actions button,
+.menu-bar-usage-actions .menu-bar-usage-primary-action {
+  min-block-size: 32px;
+  padding-inline: 8px;
+  border: 1px solid var(--usage-line);
+  border-radius: 8px;
+  background: var(--usage-panel);
+  color: var(--usage-muted);
+  box-shadow: none;
+}
+.menu-bar-usage-spinner {
+  inline-size: 14px;
+  block-size: 14px;
+  border: 1.5px solid var(--usage-accent-soft);
+  border-block-start-color: var(--usage-accent);
+  border-inline-end-color: var(--usage-accent);
+  border-radius: 50%;
+  animation: menu-bar-usage-spin 800ms linear infinite;
+}
+
+.menu-bar-usage-range {
+  display: flex;
+  gap: 4px;
+  margin-block: 8px;
+}
+.menu-bar-usage-range button {
+  flex: 1;
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.menu-bar-usage-range button[aria-pressed='true'] {
+  background: rgb(118 56 245 / 12%);
+  color: #7638f5;
+}
+.menu-bar-usage-cost-detail td small,
+.menu-bar-usage-cost-detail th small {
+  display: block;
+  margin-block-start: 4px;
+  font-size: 10px;
+}

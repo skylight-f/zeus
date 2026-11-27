@@ -150,8 +150,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setPatchExportStatus,
     projectGitOpen,
     setProjectGitOpen,
-    setProjectCodeWorkspaceMode,
-    setVisitedCodeWorkspaceModes,
     setProjectConfig,
     setProjectConfigForm,
     setProjectDetail,
@@ -1444,9 +1442,7 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     }
   }
 
-  /** 任务入口上下文只在数字团队页面使用，不改变任务和项目归属。 */
-
-  function handleMainNavigate(target: WorkspaceViewId, onNavigated?: () => void): void {
+  function handleMainNavigate(target: WorkspaceViewId): void {
     const navigate = () => {
       setDigitalTeamTask(undefined);
       setDigitalTeamEntrySelection(undefined);
@@ -1456,7 +1452,6 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         window.history.replaceState(null, '', `#${target}`);
       }
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      if (typeof onNavigated === 'function') onNavigated();
     };
     if (target === activeNavTarget) {
       navigate();
@@ -1474,53 +1469,39 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     setProjectGitOpen(!projectGitOpen);
   }
 
-  function openProjectSection(
-    project: ProjectRecord,
-    section: ProjectWorkspaceSection,
-    codeMode: ProjectCodeWorkspaceMode = 'source',
-    onNavigated?: (() => void) | FilePreviewSourceWorkspace | null,
-    explicitSourceTarget: FilePreviewSourceWorkspace | null = null,
-  ): void {
-    const sourceTarget = typeof onNavigated === 'object' ? onNavigated : explicitSourceTarget;
-    if (section === 'git' || (section === 'code' && codeMode === 'git')) {
+  /** 源码仍整页导航；Git 只打开侧栏，跨项目时沿用离开保护。 */
+  function openProjectSection(project: ProjectRecord, section: ProjectWorkspaceSection, codeMode: ProjectCodeWorkspaceMode = 'source', sourceTarget: FilePreviewSourceWorkspace | null = null): void {
+    if (section === 'code' && codeMode === 'git') {
       if (project.id === temporaryWorkspaceId) return;
+      /** 同项目保留底层页面；跨项目更新身份前保护原草稿。 */
       const openGit = () => {
         activeProjectIdRef.current = project.id;
         setProjectDetail(project);
         setProjectGitOpen(true);
-        if (typeof onNavigated === 'function') onNavigated();
       };
       if (project.id === activeProjectId) openGit();
       else requestWorkspaceLeave(openGit);
       return;
     }
-    if (section === 'code' && codeMode === 'commands') {
-      setProjectCommandsProjectId(project.id);
-      return;
-    }
+    /** 统一导航状态和地址，不把命令弹窗作为页面模式。 */
     const navigate = () => {
       activeProjectIdRef.current = project.id;
       setProjectDetail(project);
       setConversationDraftOpen(false);
       setActiveNavTarget(section === 'sessions' ? 'conversations' : 'projects');
       setActiveProjectSection(section);
-      if (section === 'code') {
-        setProjectGitOpen(false);
-        setProjectCodeWorkspaceMode(codeMode);
-        setVisitedCodeWorkspaceModes((current) => new Set(current).add(codeMode));
-      }
       setSourceWorkspaceTarget(section === 'code' ? sourceTarget : null);
       if (sourceTarget) {
         // 原生源码页接管显示后关闭当前审阅层，避免旧弹层遮挡编辑器。
         setTaskGitReviewState(null);
         setTaskGitMergeTaskId(null);
       }
+      if (section === 'code') setProjectGitOpen(false);
       setProjectCommandsProjectId(null);
       // 项目设置直接进入数字员工，不再自动打开旧项目配置抽屉。
       setProjectPanel(undefined);
       if (typeof window !== 'undefined') window.history.replaceState(null, '', section === 'code' ? `#project-code-${codeMode}` : `#project-${section}`);
       workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      if (typeof onNavigated === 'function') onNavigated();
     };
     if (
       project.id === activeProjectId &&
@@ -2008,11 +1989,14 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
 
   function renderTaskDetailPaneContent(): ReactNode {
     if (!taskDetailPaneTask) return null;
+    /** 状态标识来自当前任务配置，工作和会话入口共用终态限制。 */
+    const taskStatus = resolveTaskManagementStatus(taskDetailPaneTask);
     return (
       <TaskDetailPaneContent
         key={taskDetailPaneTask.id}
         zentaoClient={props.commandClient}
         deliverableClient={props.commandClient}
+        subscribeTaskWork={props.onSubscribeRealtimeEvents}
         onZentaoTaskUpdated={mergeTaskRecord}
         language={appShellSettings.appLanguage}
         task={taskDetailPaneTask}
@@ -2026,12 +2010,14 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
         priorityOptions={taskWorkspaceCopy.taskCreatePriorityOptions}
         busy={updatingTaskBusy}
         pushState={state.taskModelPushTaskId === taskDetailPaneTask.id && (state.taskModelPushEntry === 'checking' || state.taskModelPushEntry === 'error') ? state.taskModelPushEntry : undefined}
-        pushDisabled={taskDetailPaneTask.managementStatus === activeTaskManagementStatusConfig.roles.completedStatusId || taskDetailPaneTask.managementStatus === activeTaskManagementStatusConfig.roles.cancelledStatusId}
+        terminalReadOnly={
+          Boolean(state.optimisticTerminalTaskStatuses[taskDetailPaneTask.id]) || taskStatus === activeTaskManagementStatusConfig.roles.completedStatusId || taskStatus === activeTaskManagementStatusConfig.roles.cancelledStatusId
+        }
         onPushNewConversation={(taskId) => void domainActions.openTaskModelPush(taskId)}
         conversations={state.nativeConversationChoicesByTask[taskDetailPaneTask.id]?.choices ?? []}
         conversationsLoading={state.nativeConversationChoiceTaskStates[taskDetailPaneTask.id]?.status === 'loading'}
         conversationsError={state.nativeConversationChoiceTaskStates[taskDetailPaneTask.id]?.error}
-        onOpenConversation={(taskId, conversationId) => void domainActions.openTaskConversation(taskId, conversationId)}
+        onOpenConversation={domainActions.openTaskConversation}
         onReloadConversations={(taskId) => void domainActions.refreshNativeConversationChoices(taskId).catch((error: unknown) => recordLocalError('task-conversation-refresh', error))}
         onOpenCodeDelivery={(taskId) => openTaskGitDelivery(taskId)}
         onUpdateTaskContent={updateTaskContent}
@@ -2099,9 +2085,9 @@ export function useWorkspaceOperations(state: WorkspaceQueryState, domainActions
     loadTaskTemplates,
     moveTaskBoardTask,
     openProjectSection,
+    openProjectCommands,
     toggleProjectGit,
     closeProjectGit,
-    openProjectCommands,
     projectDrawerVisualProps,
     projectSidebarMaximumWidth,
     projectSidebarShellStyle,

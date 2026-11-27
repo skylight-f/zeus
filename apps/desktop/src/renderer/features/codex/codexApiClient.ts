@@ -1,3 +1,4 @@
+import type { AntigravityAccountCatalog } from '@zeus/ai-runtime';
 import { codexCapabilitiesChangedEvent } from '../integrations/modelCatalogEvents.js';
 import type {
   AgentCatalogSnapshot,
@@ -29,6 +30,9 @@ import { buildCodexPublicCommandRequest, codexPublicClientCommandTypes, codexPub
 import { buildConversationStartCommandRequest, conversationStartClientCommandTypes } from '../conversations/conversationStartCommandClient.js';
 import { buildWorkspaceGitCommandRequest, workspaceGitClientCommandTypes } from '../git/workspaceGitCommandClient.js';
 import { type LocalApiTransport, ZeusApiError } from '../../transport/localApiTransport.js';
+
+/** Zeus 只接收 agy 公开的连接状态和模型目录。 */
+export type { AntigravityAccountCatalog } from '@zeus/ai-runtime';
 
 /** Copilot 账号身份只取自托管 SDK 当前登录状态。 */
 export interface CopilotAccountStatus {
@@ -91,6 +95,18 @@ export interface CodexRuntimeUpdateProgress {
 }
 
 export interface CodexApiClient {
+  /** 读取 agy 已观察到的 Google 账号状态。 */
+  loadAntigravityAccount: () => Promise<AntigravityAccountCatalog>;
+  /** 用户主动验证时读取一次 Google 的验证链接。 */
+  loadAntigravityVerification: () => Promise<{ url: string | null }>;
+  /** 从 agy 刷新登录和可选模型。 */
+  refreshAntigravityAccount: () => Promise<AntigravityAccountCatalog>;
+  /** 发起官方个人 Google 账号授权。 */
+  startAntigravityLogin: () => Promise<AntigravityAccountCatalog>;
+  /** 停止当前尚未完成的授权。 */
+  cancelAntigravityLogin: () => Promise<AntigravityAccountCatalog>;
+  /** 退出当前 Zeus 的 Antigravity 账号接入。 */
+  logoutAntigravityAccount: () => Promise<AntigravityAccountCatalog>;
   /** 只读已缓存的 Copilot 登录和模型状态。 */
   loadCopilotAccount: () => Promise<CopilotAccountCatalog>;
   /** 主动从 Copilot SDK 刷新账号和模型目录。 */
@@ -191,9 +207,7 @@ export interface CodexApiClient {
   installSkill: (source: SkillInstallSource, projectId?: string) => Promise<SkillInstallResult>;
   removeSkill: (skillId: string, projectId?: string) => Promise<{ removed: true; skillId: string; name: string }>;
   loadPlugins: (projectId?: string) => Promise<import('./codexContracts.js').PluginDescriptor[]>;
-  loadMcpConfiguration: () => Promise<import('./codexContracts.js').McpConfigurationCatalog>;
   loadPluginRuntimeStatus: () => Promise<{ available: boolean; dangerouslyBypassHookTrust: boolean }>;
-  loadCodexMcpServers: () => Promise<import('./codexContracts.js').CodexMcpCatalog>;
   installPlugin: (input: { scope: import('./codexContracts.js').PluginScope; projectId?: string | null; source: import('./codexContracts.js').PluginInstallSource }) => Promise<import('./codexContracts.js').PluginDescriptor>;
   updatePlugin: (pluginId: string) => Promise<import('./codexContracts.js').PluginDescriptor>;
   setPluginEnabled: (pluginId: string, enabled: boolean, expectedRevision?: number) => Promise<import('./codexContracts.js').PluginDescriptor>;
@@ -228,6 +242,12 @@ export function createCodexApiClient(transport: LocalApiTransport): CodexApiClie
   };
 
   return {
+    loadAntigravityAccount: () => transport.request<AntigravityAccountCatalog>('/api/antigravity/account'),
+    loadAntigravityVerification: () => transport.request<{ url: string | null }>('/api/antigravity/account/verification'),
+    refreshAntigravityAccount: () => transport.request<AntigravityAccountCatalog>('/api/antigravity/account/refresh', { method: 'POST', body: '{}' }),
+    startAntigravityLogin: () => transport.request<AntigravityAccountCatalog>('/api/antigravity/account/login', { method: 'POST', body: '{}' }),
+    cancelAntigravityLogin: () => transport.request<AntigravityAccountCatalog>('/api/antigravity/account/cancel', { method: 'POST', body: '{}' }),
+    logoutAntigravityAccount: () => transport.request<AntigravityAccountCatalog>('/api/antigravity/account/logout', { method: 'POST', body: '{}' }),
     loadCopilotAccount: () => transport.request<CopilotAccountCatalog>('/api/copilot/account'),
     refreshCopilotAccount: () => transport.request<CopilotAccountCatalog>('/api/copilot/account/refresh', { method: 'POST', body: '{}' }),
     startCopilotLogin: () => transport.request<{ loginId: string; step: CopilotLoginStep }>('/api/copilot/account/login', { method: 'POST', body: '{}' }),
@@ -517,9 +537,7 @@ export function createCodexApiClient(transport: LocalApiTransport): CodexApiClie
       const result = await transport.request<{ plugins: import('./codexContracts.js').PluginDescriptor[] }>(`/api/plugins${suffix}`);
       return result.plugins;
     },
-    loadMcpConfiguration: () => transport.request<import('./codexContracts.js').McpConfigurationCatalog>('/api/mcp-configuration'),
     loadPluginRuntimeStatus: () => transport.request<{ available: boolean; dangerouslyBypassHookTrust: boolean }>('/api/plugin-runtime-status'),
-    loadCodexMcpServers: () => transport.request<import('./codexContracts.js').CodexMcpCatalog>('/api/codex/mcp-servers'),
     installPlugin: (input) => transport.request<import('./codexContracts.js').PluginDescriptor>('/api/plugins/install', { method: 'POST', body: JSON.stringify({ ...input, projectId: input.projectId ?? null }) }),
     updatePlugin: (pluginId) => transport.request<import('./codexContracts.js').PluginDescriptor>(`/api/plugins/${encodeURIComponent(pluginId)}/update`, { method: 'POST' }),
     setPluginEnabled: (pluginId, enabled, expectedRevision) =>

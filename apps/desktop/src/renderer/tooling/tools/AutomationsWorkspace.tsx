@@ -2,7 +2,7 @@ import { MotionPresence } from '../toolPageHost.js';
 import { formatVisibleApplicationError } from '../toolPageHost.js';
 import { temporaryWorkspaceId } from '../toolPageHost.js';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { ClockTimeInput, formatAutomationOnceInput, formatZeusDateTime, parseAutomationOnceInput } from '../toolPageHost.js';
+import { ClockTimeInput, automationEventTaskMissing, formatAutomationOnceInput, formatZeusDateTime, hasValidAutomationWeekdays, parseAutomationOnceInput } from '../toolPageHost.js';
 import { ArrowClockwiseIcon as Refresh } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { ClockCountdownIcon as Clock } from '@phosphor-icons/react/dist/csr/ClockCountdown';
 import { PauseIcon as Pause } from '@phosphor-icons/react/dist/csr/Pause';
@@ -21,6 +21,21 @@ type Draft = Omit<AutomationTaskInput, 'pluginIds'> & { onceAtText: string; plug
 const allProjectsValue = '__all_projects__';
 /** 无项目选项只改变用户目标范围，运行时目录由服务端托管。 */
 const noProjectValue = '__no_project__';
+/** 选项按周一至周日显示，值沿用排程的星期编号。 */
+const weekdayOptions = [
+  { value: '1', zh: '周一', en: 'Mon' },
+  { value: '2', zh: '周二', en: 'Tue' },
+  { value: '3', zh: '周三', en: 'Wed' },
+  { value: '4', zh: '周四', en: 'Thu' },
+  { value: '5', zh: '周五', en: 'Fri' },
+  { value: '6', zh: '周六', en: 'Sat' },
+  { value: '0', zh: '周日', en: 'Sun' },
+];
+
+/** 每周排程需要有效执行日，表单提交与旧规则恢复使用同一口径。 */
+function weeklyScheduleNeedsDays(rule: Pick<Draft, 'triggerKind' | 'triggerConfig'>): boolean {
+  return rule.triggerKind === 'weekly' && !hasValidAutomationWeekdays(rule.triggerConfig?.weekdays);
+}
 
 /** 自动化仅管理规则；通知中心负责查看运行结果。 */
 export function AutomationsWorkspace(props: { client: DashboardClient | null; projects: ProjectRecord[]; language: 'zh-CN' | 'en-US' }) {
@@ -52,8 +67,8 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(props.projects));
   /** 一次性输入按规则时区解析，未改动的已保存时间保留原精度。 */
   const onceAt = draft.triggerKind === 'once' ? resolveDraftOnceAt(draft) : null;
-  /** 表单和提交入口共用校验，空时间不能创建已启用的规则。 */
-  const triggerValid = draft.triggerKind !== 'once' || onceAt !== null;
+  /** 表单和提交入口共用校验，单次需要执行时间，每周需要执行日。 */
+  const triggerValid = (draft.triggerKind !== 'once' || onceAt !== null) && !weeklyScheduleNeedsDays(draft);
   const [fullAccessAcknowledged, setFullAccessAcknowledged] = useState(false);
   /** 删除前保留任务，只有确认成功才关闭弹窗。 */
   const [pendingDelete, setPendingDelete] = useState<AutomationTaskRecord | null>(null);
@@ -289,11 +304,12 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
                       {projectNames(task.projectIds, props.projects, zh)} · {zh ? '统一执行默认' : 'Shared execution defaults'}
                     </small>
                     {task.migrationIssue ? <small className="automation-warning">{task.migrationIssue}</small> : null}
+                    {weeklyScheduleNeedsDays(task) ? <small className="automation-warning">{zh ? '请补选执行日后继续。' : 'Select run days before resuming.'}</small> : null}
                   </span>
                   <span className="automation-row-schedule">{scheduleLabel(task, zh)}</span>
                 </Button>
                 <div className="automation-row-actions">
-                  {task.status === 'active' ? (
+                  {task.status === 'active' && !automationEventTaskMissing(task.action) ? (
                     <Button
                       className="automation-icon-action"
                       data-icon-tooltip={zh ? '立即运行' : 'Run now'}
@@ -310,7 +326,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
                     data-icon-tooltip={task.status === 'active' ? (zh ? '暂停' : 'Pause') : zh ? '继续' : 'Resume'}
                     aria-label={`${task.status === 'active' ? (zh ? '暂停' : 'Pause') : zh ? '继续' : 'Resume'} ${task.name}`}
                     busy={busyId === `status:${task.id}`}
-                    disabled={Boolean(busyId)}
+                    disabled={Boolean(busyId) || (task.status === 'paused' && weeklyScheduleNeedsDays(task))}
                     onClick={() => mutate(`status:${task.id}`, () => props.client!.setAutomationStatus(task.id, task.status === 'active' ? 'paused' : 'active'))}
                   >
                     {task.status === 'active' ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
@@ -341,6 +357,7 @@ export function AutomationsWorkspace(props: { client: DashboardClient | null; pr
             zh={zh}
             busy={Boolean(busyId)}
             submitLabel={editingId === 'new' ? (zh ? '创建并启用' : 'Create and enable') : zh ? '保存更改' : 'Save changes'}
+            submitBusyLabel={editingId === 'new' ? undefined : zh ? '保存中…' : 'Saving…'}
             submitDisabled={!draft.name.trim() || !draft.prompt.trim() || !actionValid || !triggerValid || (draft.permissionMode === 'full-access' && !fullAccessAcknowledged)}
             onClose={() => setEditingId(null)}
             onSubmit={(event) => submit(event)}
@@ -655,13 +672,52 @@ function TriggerFields(props: { draft: Draft; setDraft(value: Draft): void; trig
       </div>
     );
   }
-  if (draft.triggerKind === 'daily' || draft.triggerKind === 'weekly')
-    return (
+  if (draft.triggerKind === 'daily' || draft.triggerKind === 'weekly') {
+    /** 每日和每周沿用同一当地时间输入。 */
+    const localTime = (
       <label>
         <span>{props.zh ? '当地时间' : 'Local time'}</span>
         <ClockTimeInput value={draft.triggerConfig?.localTime ?? '09:00'} onChange={(event) => props.setDraft({ ...draft, triggerConfig: { ...draft.triggerConfig, localTime: event.currentTarget.value } })} />
       </label>
     );
+    if (draft.triggerKind === 'daily') return localTime;
+    /** 仅回显有效的已保存执行日，缺失或无效的旧配置留空供用户补选。 */
+    const weekdays = draft.triggerConfig?.weekdays;
+    const selected = hasValidAutomationWeekdays(weekdays) ? weekdays.map(String) : [];
+    const options = weekdayOptions.map(({ value, zh, en }) => ({ value, label: props.zh ? zh : en }));
+    const label = props.zh ? '执行日' : 'Run days';
+    return (
+      <div className="automation-form-grid">
+        <label>
+          <span>{label}</span>
+          <ZeusSelect
+            size="regular"
+            ariaLabel={label}
+            value=""
+            selectedValues={selected}
+            options={options}
+            searchable={false}
+            triggerLabel={
+              selected.length
+                ? options
+                    .filter((option) => selected.includes(option.value))
+                    .map((option) => option.label)
+                    .join(props.zh ? '、' : ', ')
+                : props.zh
+                  ? '选择星期'
+                  : 'Select days'
+            }
+            onChange={(value) => {
+              /** 重新点击已选日期会移除该日，最后一项取消后必须重新选择才能保存。 */
+              const next = selected.includes(value) ? selected.filter((day) => day !== value) : [...selected, value];
+              props.setDraft({ ...draft, triggerConfig: { ...draft.triggerConfig, weekdays: next.map(Number) } });
+            }}
+          />
+        </label>
+        {localTime}
+      </div>
+    );
+  }
   if (draft.triggerKind === 'rrule')
     return (
       <label>
@@ -808,6 +864,7 @@ function formatDate(value: string): string {
 /** 复用列表排程文案，区分已暂停与自定义规则已无后继时间。 */
 function scheduleLabel(task: AutomationTaskRecord, zh: boolean): string {
   if (task.status === 'paused') return zh ? '已暂停' : 'Paused';
+  if (automationEventTaskMissing(task.action)) return zh ? '仅事件触发' : 'Event only';
   if (task.triggerKind === 'manual') return zh ? '手动触发' : 'Manual';
   if (task.triggerKind === 'rrule' && !task.nextRunAt) return zh ? '无后续计划' : 'No upcoming schedule';
   return task.nextRunAt ? formatDate(task.nextRunAt) : zh ? '等待计算' : 'Awaiting schedule';

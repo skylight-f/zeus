@@ -3,6 +3,7 @@ import { type HTMLAttributes, type KeyboardEvent, type RefObject, useCallback, u
 import { useHoverIntent } from '../ui/useHoverIntent.js';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { ArrowUpIcon as ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
+import { ModelBrainIcon } from './ModelBrainIcon.js';
 import { BrowserCommentPreview } from './BrowserCommentPreview.js';
 import { PaperclipIcon as Paperclip } from '@phosphor-icons/react/dist/csr/Paperclip';
 import { SquareIcon as Square } from '@phosphor-icons/react/dist/csr/Square';
@@ -32,7 +33,7 @@ import { useConversationInputResources } from './useConversationInputResources.j
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
 import { browserProjectModelPreferenceStorage, readProjectModelPreferences } from './projectModelPreferences.js';
 import { contextCapacitySelectionAllowed } from './contextCapacitySelection.js';
-import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
+import { presentModelOptions } from '../modelOptionPresentation.js';
 import { systemMessageScope, recordSystemMessage, recoverSystemMessage, useConversationSystemMessages, handledMessageDeliveryErrors } from './conversationSystemMessages.js';
 import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import type { ComposerInputHandle } from './MarkdownComposerEditor.js';
@@ -46,7 +47,7 @@ export interface ComposerRuntimeSettings {
   /** 下一轮选择的上下文容量。 */
   contextCapacityTokens?: number | null;
   model: string;
-  agentKind?: 'codex' | 'pi' | 'copilot';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
   effort?: string;
   serviceTier?: string | null;
   permissionMode: NativePermissionMode;
@@ -114,7 +115,6 @@ const labels = {
     goalInput: '目标内容',
     goalPlaceholder: '说明要达成什么、如何验证，以及何时停止',
     exitGoal: '退出目标输入',
-    normalDraftPreserved: '普通消息草稿已保留',
     recoveredInputBlocked: '连接中断后恢复的问题暂时无法回答。你可以停止当前处理。',
   },
   'en-US': {
@@ -137,7 +137,6 @@ const labels = {
     goalInput: 'Goal objective',
     goalPlaceholder: 'Describe the outcome, validation, and stopping condition',
     exitGoal: 'Exit goal input',
-    normalDraftPreserved: 'Message draft preserved',
     recoveredInputBlocked: 'This question cannot be answered after the connection was interrupted. You can stop the current work.',
   },
 } as const;
@@ -163,8 +162,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const editorValue = editorDraft.key === editorScopeKey ? editorDraft.text : props.state.draft;
   /** 所有本地输入更新都捕获当前会话身份。 */
   const setEditorValue = useCallback((text: string) => setEditorDraft({ key: editorScopeKey, text }), [editorScopeKey]);
-  const [goalInputOpen, setGoalInputOpen] = useState(false);
-  const [goalDraft, setGoalDraft] = useState('');
+  /** 目标输入只在打开它的会话中生效。 */
+  const [goalInputScope, setGoalInputScope] = useState<string | null>(null);
   const [goalSubmitting, setGoalSubmitting] = useState(false);
   /** 输入区只记录系统消息，正文区域负责按持久位置展示。 */
   const systemScope = systemMessageScope(props.state.projectId ?? props.projectId ?? '', props.state.conversationId);
@@ -187,17 +186,23 @@ export function ConversationComposer(props: ConversationComposerProps) {
   const busy = Boolean(props.state.busyOperation);
   const writable = props.readOnly !== true && props.state.conversationState !== 'legacy_readonly';
   const inputWritable = writable && props.inputBlocked !== true;
-  const hasDraft = editorValue.trim().length > 0 || props.state.attachments.length > 0 || Boolean(props.state.browserSubmission) || props.state.contextDraft.responseAnnotations.length > 0 || props.state.contextDraft.codeComments.length > 0;
-  const goalInputActive = goalInputOpen && !props.goal;
-  const goalCount = [...goalDraft.trim()].length;
+  /** 文件、图片和长文本附件可以单独发送。 */
+  const hasAttachments = props.state.attachments.length > 0;
+  /** 网页提交和批注为本轮提供明确上下文。 */
+  const hasContextDraft = Boolean(props.state.browserSubmission) || props.state.contextDraft.responseAnnotations.length > 0 || props.state.contextDraft.codeComments.length > 0;
+  /** 正文、附件或上下文均可组成待发送草稿。 */
+  const hasDraft = editorValue.trim().length > 0 || hasAttachments || hasContextDraft;
+  const goalInputActive = goalInputScope === editorScopeKey && !props.goal;
+  /** 使用当前草稿的字符数判断能否创建目标。 */
+  const goalCount = goalInputActive ? [...editorValue.trim()].length : 0;
   const goalDraftValid = goalCount > 0 && goalCount <= 4_000;
   const goalOperationBusy = goalSubmitting || props.goalBusy === true;
   const modelPresentation = useMemo(() => presentModelOptions(props.capabilities?.models ?? [], selectedModel, props.language, { preserveMissingSelection: true }), [props.capabilities?.models, props.language, selectedModel]);
   const effectiveModel = settingsLoading && !selectedModel ? '' : modelPresentation.selectedId || selectedModel;
   const selectedCapability = resolveModelCapability(modelPresentation.models, effectiveModel);
-  // 能力清单或持久设置更新时 React effect 还未提交也不能发送旧模型的推理强度。
-  const effectiveEffort = selectedCapability?.supportedReasoningEfforts.includes(selectedEffort) ? selectedEffort : (selectedCapability?.defaultReasoningEffort ?? selectedCapability?.supportedReasoningEfforts[0] ?? '');
-  const providerLabel = modelSourceDisplayName(selectedCapability?.sourceName) || (selectedCapability?.agentKind === 'copilot' ? 'GitHub Copilot' : selectedCapability?.agentKind === 'pi' ? 'Pi' : 'OpenAI');
+  const providerLabel =
+    selectedCapability?.sourceName?.trim() ||
+    (selectedCapability?.agentKind === 'antigravity' ? 'Google Antigravity' : selectedCapability?.agentKind === 'copilot' ? 'GitHub Copilot' : selectedCapability?.agentKind === 'pi' ? 'Pi' : 'Codex');
   const inputLabel = copy.input(providerLabel);
   const settingsWritable = !settingsLoading && props.readOnly !== true && props.inputBlocked !== true && Boolean(selectedCapability);
   const modelSelectionWritable = !settingsLoading && props.readOnly !== true && props.inputBlocked !== true && modelPresentation.options.length > 0;
@@ -234,19 +239,19 @@ export function ConversationComposer(props: ConversationComposerProps) {
     if (serviceTierSelectionValue(nextServiceTier) !== serviceTierSelectionValue(selectedServiceTier)) setSelectedServiceTier(nextServiceTier);
   }, [props.capabilities, props.runtimeSettings, props.state.snapshot?.nextTurnSettings, props.state.providerSettings?.effort, props.state.providerSettings?.model, selectedEffort, selectedModel, selectedServiceTier, settingsLoading]);
 
-  /** 自动预测可以在输入期间生成，空输入且无待处理交互时才展示。 */
+  /** 正文为空且没有网页提交或批注时，普通附件可以与自动建议共存。 */
   const suggestion = useInputSuggestion({
     state: props.state,
     conversationModelRef: effectiveModel,
     draft: editorValue,
     // 待处理问题由后台读取权威状态；这里仅报告即时输入限制，避免落后的会话投影漏掉完成事件。
-    automaticEligible: inputWritable && !hasDraft && editorValue.length === 0 && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
+    automaticEligible: inputWritable && !hasContextDraft && editorValue.length === 0 && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
     settings: props.inputSuggestionSettings,
     generate: props.onGenerateInputSuggestion,
     eligible: inputWritable && !busy && !goalInputActive && !goalOperationBusy && !isComposing && !inputResources.processing,
   });
-  /** 只有空输入中的可见灰字可直接发送；已有正文优先，附件和评论仍随消息提交。 */
-  const sendableSuggestion = editorValue.length === 0 ? suggestion.text : null;
+  /** 有附件时，发送按钮使用当前草稿，灰字由用户先采纳。 */
+  const sendableSuggestion = editorValue.length === 0 && !hasAttachments ? suggestion.text : null;
   /** 按钮启用与真正发送共用当前可提交的内容，生成中和空结果不计入。 */
   const hasSendableContent = hasDraft || Boolean(sendableSuggestion?.trim());
   /** 主会话运行中也允许把已生成的建议加入原有发送队列。 */
@@ -259,8 +264,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
 
   useEffect(() => {
     if (!props.goal) return;
-    setGoalInputOpen(false);
-    setGoalDraft('');
+    setGoalInputScope(null);
   }, [props.goal]);
 
   /** 发送按钮明确允许采纳灰字；输入框 Enter 沿用原有草稿发送行为。 */
@@ -281,7 +285,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             contextCapacityTokens: selectedCapacity,
             model: effectiveModel,
             agentKind: selectedCapability?.agentKind,
-            ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+            ...(selectedEffort ? { effort: selectedEffort } : {}),
             ...serviceTierWireOverride(selectedServiceTier),
             permissionMode: props.permissionMode,
             collaborationMode: props.collaborationMode,
@@ -291,6 +295,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             ...(structured.computerUseRequested ? { computerUseRequested: true } : {}),
             displayText: structured.displayText,
             promptText: structured.promptText,
+            ...(structured.composerTokens?.length ? { composerTokens: structured.composerTokens } : {}),
           }
         : undefined;
     setInputResourceError(null);
@@ -304,19 +309,36 @@ export function ConversationComposer(props: ConversationComposerProps) {
       });
   }
 
-  function enterGoalInput(initialObjective?: string): void {
-    if (initialObjective !== undefined) setGoalDraft(initialObjective);
-    setGoalInputOpen(true);
-    requestAnimationFrame(() => textareaRef.current?.focus());
+  /** 普通消息和目标共用会话草稿，输入法组词期间只更新本地文本。 */
+  function changeDraft(value: string): void {
+    if (value !== editorValue) suggestion.beginEditing();
+    setEditorValue(value);
+    if (!composingRef.current) props.onDraftChange(value);
   }
 
-  function exitGoalInput(): void {
+  /** 两种编辑器的输入法均延迟保存，直到组词结束。 */
+  function startDraftComposition(): void {
+    suggestion.beginEditing();
+    composingRef.current = true;
+    setIsComposing(true);
+  }
+
+  /** 组词结束或离开编辑器时，保存输入框中的实际文字。 */
+  function finishDraftComposition(value: string): void {
+    composingRef.current = false;
+    setIsComposing(false);
+    changeDraft(value);
+  }
+
+  /** 切换后把焦点交给当前会话的输入框。 */
+  function changeGoalInput(open: boolean): void {
     if (goalSubmitting) return;
-    setGoalInputOpen(false);
+    setGoalInputScope(open ? editorScopeKey : null);
     requestAnimationFrame(() => textareaRef.current?.focus());
   }
 
-  async function setGoalObjective(objective: string, clearMessageDraft = false): Promise<void> {
+  /** 服务端确认后消费已提交的正文，失败时保留草稿。 */
+  async function setGoalObjective(objective: string): Promise<void> {
     const normalized = objective.trim();
     if (!props.onSetGoal || !normalized || [...normalized].length > 4_000 || goalOperationBusy) return;
     if (structuredSelectionRef.current.expertMentions.length > 0) {
@@ -327,9 +349,9 @@ export function ConversationComposer(props: ConversationComposerProps) {
     try {
       const saved = await props.onSetGoal(normalized);
       if (saved === false) return;
-      if (clearMessageDraft) props.onDraftChange('');
-      setGoalInputOpen(false);
-      setGoalDraft('');
+      setEditorValue('');
+      props.onDraftChange('');
+      setGoalInputScope(null);
     } finally {
       setGoalSubmitting(false);
     }
@@ -338,9 +360,9 @@ export function ConversationComposer(props: ConversationComposerProps) {
   async function runGoalCommand(command: string): Promise<void> {
     const argument = command.slice('/goal'.length).trim();
     if (!argument) {
-      props.onDraftChange('');
+      changeDraft('');
       if (props.goal) props.onOpenGoal?.();
-      else enterGoalInput();
+      else changeGoalInput(true);
       return;
     }
     if (props.goal && argument === 'pause' && props.onPauseGoal) {
@@ -357,13 +379,13 @@ export function ConversationComposer(props: ConversationComposerProps) {
       return;
     }
     if (!props.goal && ['pause', 'resume', 'clear'].includes(argument)) return;
-    await setGoalObjective(argument, true);
+    await setGoalObjective(argument);
   }
 
   /** 普通输入与 Markdown 输入共用发送条件和附件快捷键。 */
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement | HTMLDivElement>): void {
     // 输入法和命令菜单优先，建议的生成、采用和取消共用统一入口。
-    if (!isComposing && !composingRef.current && suggestion.handleKeyDown(event, textareaRef.current)) return;
+    if (!goalInputActive && !isComposing && !composingRef.current && suggestion.handleKeyDown(event, textareaRef.current)) return;
     if (!goalInputActive) inputResources.handlePasteShortcut(event);
     const intent = resolveComposerKeyIntent({
       key: event.key,
@@ -375,14 +397,14 @@ export function ConversationComposer(props: ConversationComposerProps) {
     if (intent === 'submit') {
       event.preventDefault();
       if (goalInputActive) {
-        if (inputWritable && goalDraftValid && !busy && !goalOperationBusy) void setGoalObjective(goalDraft);
+        if (inputWritable && goalDraftValid && !busy && !goalOperationBusy) void setGoalObjective(editorValue);
         return;
       }
       if (editorValue.trim() === '/plan' && !props.state.browserSubmission && props.onRuntimeSettingsChange) {
         props.onDraftChange('');
         props.onRuntimeSettingsChange({
           model: effectiveModel,
-          effort: effectiveEffort,
+          effort: selectedEffort,
           ...serviceTierWireOverride(selectedServiceTier),
           permissionMode: props.permissionMode,
           collaborationMode: props.collaborationMode === 'plan' ? 'default' : 'plan',
@@ -403,7 +425,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
     if (intent === 'escape' && goalInputActive) {
       event.preventDefault();
       event.stopPropagation();
-      exitGoalInput();
+      changeGoalInput(false);
       return;
     }
     // Escape 由 SessionWorkspace capture 统一处理，保证 approval/RUI 层优先于 interrupt。
@@ -435,9 +457,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
           <div className="session-goal-compose-context">
             <Target aria-hidden="true" weight="regular" />
             <strong>{copy.createGoal}</strong>
-            {hasDraft ? <small>{copy.normalDraftPreserved}</small> : null}
             <span className={goalCount > 4_000 ? 'session-goal-compose-count is-invalid' : 'session-goal-compose-count'}>{goalCount} / 4000</span>
-            <Button unstyled type="button" aria-label={copy.exitGoal} onClick={exitGoalInput} disabled={goalOperationBusy}>
+            <Button unstyled type="button" aria-label={copy.exitGoal} onClick={() => changeGoalInput(false)} disabled={goalOperationBusy}>
               <X aria-hidden="true" weight="bold" />
             </Button>
           </div>
@@ -457,13 +478,14 @@ export function ConversationComposer(props: ConversationComposerProps) {
             aria-label={copy.goalInput}
             aria-keyshortcuts="Enter Shift+Enter Escape Meta+A Control+A"
             placeholder={copy.goalPlaceholder}
-            value={goalDraft}
+            value={editorValue}
             disabled={!inputWritable || busy || goalOperationBusy}
-            onChange={(event) => {
-              setGoalDraft(event.currentTarget.value);
+            onChange={(event) => changeDraft(event.currentTarget.value)}
+            onCompositionStart={startDraftComposition}
+            onCompositionEnd={(event) => finishDraftComposition(event.currentTarget.value)}
+            onBlur={(event) => {
+              if (composingRef.current) finishDraftComposition(event.currentTarget.value);
             }}
-            onCompositionStart={() => setIsComposing(true)}
-            onCompositionEnd={() => setIsComposing(false)}
             onKeyDown={handleKeyDown}
           />
         ) : (
@@ -479,11 +501,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
             ) : null}
             <StructuredComposerInput
               value={editorValue}
-              onValueChange={(nextValue) => {
-                if (nextValue !== editorValue) suggestion.beginEditing();
-                setEditorValue(nextValue);
-                if (!composingRef.current) return props.onDraftChange(nextValue);
-              }}
+              onValueChange={changeDraft}
               onSelectionChange={(selection) => {
                 structuredSelectionRef.current = selection;
               }}
@@ -511,26 +529,13 @@ export function ConversationComposer(props: ConversationComposerProps) {
               }
               onGoalMode={() => {
                 if (props.goal) return props.onOpenGoal?.();
-                else enterGoalInput();
+                changeGoalInput(true);
               }}
               onOpenComputerSettings={props.onOpenComputerSettings}
-              onCompositionStart={() => {
-                suggestion.beginEditing();
-                composingRef.current = true;
-                setIsComposing(true);
-              }}
-              onCompositionEnd={(nextValue) => {
-                composingRef.current = false;
-                setIsComposing(false);
-                setEditorValue(nextValue);
-                return props.onDraftChange(nextValue);
-              }}
+              onCompositionStart={startDraftComposition}
+              onCompositionEnd={finishDraftComposition}
               onBlur={(nextValue) => {
-                if (!composingRef.current) return;
-                composingRef.current = false;
-                setIsComposing(false);
-                setEditorValue(nextValue);
-                return props.onDraftChange(nextValue);
+                if (composingRef.current) finishDraftComposition(nextValue);
               }}
               onPaste={(event) => {
                 suggestion.beginEditing();
@@ -558,7 +563,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               onChange={(permissionMode) =>
                 props.onRuntimeSettingsChange?.({
                   model: effectiveModel,
-                  effort: effectiveEffort,
+                  effort: selectedEffort,
                   ...serviceTierWireOverride(selectedServiceTier),
                   permissionMode,
                   collaborationMode: props.collaborationMode,
@@ -573,7 +578,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
               onChange={(collaborationMode) =>
                 props.onRuntimeSettingsChange?.({
                   model: effectiveModel,
-                  effort: effectiveEffort,
+                  effort: selectedEffort,
                   ...serviceTierWireOverride(selectedServiceTier),
                   permissionMode: props.permissionMode,
                   collaborationMode,
@@ -593,10 +598,9 @@ export function ConversationComposer(props: ConversationComposerProps) {
                   data-status={props.goal?.status}
                   onClick={() => {
                     if (props.goal) return props.onOpenGoal?.();
-                    else if (goalInputActive) exitGoalInput();
-                    else if (structuredSelectionRef.current.expertMentions.length > 0) {
+                    if (!goalInputActive && structuredSelectionRef.current.expertMentions.length > 0) {
                       setInputResourceError(new Error(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.'));
-                    } else enterGoalInput();
+                    } else changeGoalInput(!goalInputActive);
                   }}
                   disabled={props.readOnly === true || props.inputBlocked === true || goalOperationBusy || (props.goal ? !props.onOpenGoal : !props.onSetGoal)}
                 >
@@ -618,7 +622,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                   return props.onRuntimeSettingsChange?.({
                     contextCapacityTokens: selectedCapacity,
                     model: effectiveModel,
-                    effort: effectiveEffort,
+                    effort: selectedEffort,
                     ...serviceTierWireOverride(selection),
                     permissionMode: props.permissionMode,
                     collaborationMode: props.collaborationMode,
@@ -629,6 +633,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
                 label={copy.model}
                 triggerLabel={`${copy.model}：${selectedModelLabel}`}
                 displayLabel={selectedModelLabel}
+                // 当前选择暂时没有目录选项时，用通用图标保留模型入口。
+                triggerIcon={<ModelBrainIcon />}
                 className="session-composer-model-dropdown"
                 value={effectiveModel}
                 options={modelOptions}
@@ -680,8 +686,8 @@ export function ConversationComposer(props: ConversationComposerProps) {
               {effortOptions.length > 0 ? (
                 <ComposerDropdown
                   label={copy.effort}
-                  triggerLabel={`${copy.effort}：${effectiveEffort}`}
-                  value={effectiveEffort}
+                  triggerLabel={`${copy.effort}：${selectedEffort || '…'}`}
+                  value={selectedEffort}
                   options={effortOptions}
                   disabled={!settingsWritable}
                   onChange={(effort) => {
@@ -705,7 +711,7 @@ export function ConversationComposer(props: ConversationComposerProps) {
                   type="button"
                   className="session-send-button"
                   aria-label={goalInputActive ? copy.createGoal : sendableSuggestion ? copy.sendSuggestion : copy.send}
-                  onClick={() => (goalInputActive ? setGoalObjective(goalDraft) : submit('queue', true))}
+                  onClick={() => (goalInputActive ? setGoalObjective(editorValue) : submit('queue', true))}
                   disabled={!inputWritable || !settingsWritable || busy || goalOperationBusy || inputResources.processing || (goalInputActive ? !goalDraftValid : !hasSendableContent)}
                   aria-busy={busy || goalOperationBusy || inputResources.processing || undefined}
                 >
@@ -897,6 +903,7 @@ export function resolveComposerKeyIntent(input: { key: string; shiftKey: boolean
 
 /** 判断当前轮次是否仍可接纳引导，实时订阅状态不改变轮次的可操作性。 */
 export function canSteerActiveTurn(state: NativeSessionState): boolean {
+  if (state.snapshot?.agent?.kind === 'antigravity') return false;
   const active = state.conversationState === 'active_prework' || state.conversationState === 'active_final_answer';
   if (!active || !state.activeTurnId || state.startedTurnId !== state.activeTurnId) return false;
   // 正式正文或正式计划完成后，用户看到的这一轮已经交付；Provider 的后台收尾不能继续开放“引导”。
@@ -908,15 +915,8 @@ export function canSteerActiveTurn(state: NativeSessionState): boolean {
     const messageKind = classifyAssistantMessage(item.payload, item.phase);
     if ((type === 'agentmessage' || type === 'assistantmessage' || type === 'assistant' || type === 'message') && messageKind === 'final') return true;
     if (type !== 'plan') return false;
-    return item.payload.formalPlan === true || state.planImplementationRequests.some((request) => planRequestMatchesItem(request, item, state));
+    return item.payload.formalPlan === true || state.planImplementationRequests.some((request) => request.planItemId === item.localItemId || request.planItemId === item.itemId || request.planItemId === item.providerItemId);
   });
-}
-
-function planRequestMatchesItem(request: NativeSessionState['planImplementationRequests'][number], item: NativeSessionState['items'][string], state: NativeSessionState): boolean {
-  if (request.planItemId === item.localItemId || request.planItemId === item.itemId) return true;
-  if (!item.providerItemId || request.planItemId !== item.providerItemId) return false;
-  if (request.turnId === item.turnId) return true;
-  return Object.values(state.turnsByProviderId).some((turn) => (turn.id === request.turnId || turn.providerTurnId === request.turnId) && (turn.id === item.turnId || turn.providerTurnId === item.turnId));
 }
 
 function resolveComposerModel(capabilities: CodexConversationCapabilities | null | undefined, providerModel: string | undefined): string {

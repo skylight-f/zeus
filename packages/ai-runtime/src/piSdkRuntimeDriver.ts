@@ -1,5 +1,6 @@
-import { assertContextCapacitySupported, type PortableHistoryEntry } from '@zeus/shared';
+import { assertContextCapacitySupported, type PortableHistoryEntry, redactUserFacingErrorDetails } from '@zeus/shared';
 import { createModelConnectionDeadline, modelResponseRetryPolicy } from './modelResponseRetry.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -8,10 +9,23 @@ import { lazyStream } from '@earendil-works/pi-ai/api/lazy';
 import { anthropicMessagesApi } from '@earendil-works/pi-ai/api/anthropic-messages.lazy';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
 import { openAIResponsesApi } from '@earendil-works/pi-ai/api/openai-responses.lazy';
-import { type AgentSession, type AgentSessionEvent, createAgentSession, defineTool, estimateTokens, ModelRuntime, SessionManager, SettingsManager, type ToolDefinition, VERSION } from '@earendil-works/pi-coding-agent';
+import {
+  type AgentSession,
+  type AgentSessionEvent,
+  createAgentSession,
+  type CreateAgentSessionOptions,
+  defineTool,
+  estimateTokens,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+  type ToolDefinition,
+  VERSION,
+} from '@earendil-works/pi-coding-agent';
 import { type TSchema, Type } from 'typebox';
 import type {
   AcceptedAgentRun,
+  AgentCompactionRequestObservation,
   AgentDescriptor,
   AgentModelIdentity,
   AgentProviderPayloadDiagnostic,
@@ -156,13 +170,15 @@ export interface CreatePiSdkRuntimeDriverOptions {
   loadConnections: () => Promise<PiRuntimeConnection[]>;
   toolBroker: PiZeusToolBroker;
   nativeTools?: PiZeusToolDefinitionSpec[];
-  /** Worker 隔离时在最终请求体生成后、Provider 网络写入前等待 Core 的持久接纳回执。 */
+  /** 持久接纳后，把最终请求体的脱敏诊断交给 Core。 */
   beforeProviderWrite?: (input: { sessionId: string; model: AgentModelIdentity; diagnostic: AgentProviderPayloadDiagnostic }) => Promise<void>;
   now?: () => string;
   runtimeInstanceId?: string;
 }
 
 export interface PiSdkRuntimeDriver extends AgentRuntimeDriver {
+  /** 隔离 Worker 用反向 RPC 完成接纳，直连用输入里的同步事务回调。 */
+  startRun(input: StartAgentRunInput, acceptInCore?: (acceptance: AcceptedAgentRun) => Promise<void>): Promise<AcceptedAgentRun>;
   invalidateModelRuntime(): void | Promise<void>;
   /** 独立且无工具的权限审查，不进入用户会话，也不重试原操作。 */
   reviewPermission(input: PiPermissionReviewInput): Promise<PiPermissionReviewResult>;
@@ -214,6 +230,10 @@ interface PiSessionEntry {
   identity: AgentSessionIdentity;
   cwd: string;
   session: AgentSession;
+  /** 同一原生会话重绑模型运行时所需的历史、工具和资源。 */
+  sessionOptions: CreateAgentSessionOptions;
+  /** 创建当前 SDK 会话时使用的模型连接修订。 */
+  modelRuntimeRevision: number;
   resourceLoader: PiHeadlessResourceLoader;
   applicationContextFingerprint: string | null;
   activeSkill: AgentRunSkillActivation | null;
@@ -221,15 +241,37 @@ interface PiSessionEntry {
   skillCatalogFingerprint: string;
   applicationContextUpdating: boolean;
   activeRunId: string | null;
+  /** Pi 回报启动后，该轮首次请求必须等待持久接纳。 */
+  providerWriteAllowed?: Promise<void>;
   pendingFailure: PiTerminalFailure | null;
   sequence: number;
   unsubscribe: () => void;
 }
 
+/** 模型目录、凭据及其配置修订来自同一次加载。 */
+interface LoadedPiModelRuntime {
+  runtime: ModelRuntime;
+  connections: PiRuntimeConnection[];
+  revision: number;
+}
+
+/** 同一摘要请求从放行到结算复用请求身份。 */
+type PiCompactionRequestObserver = (state: AgentCompactionRequestObservation['state'], usage?: unknown) => Promise<void>;
+
 interface PiTerminalFailure {
   code: string;
   message: string;
   providerStatus: string;
+}
+
+/** 新输入只能在原生会话空闲、上一轮已释放身份时创建独立轮次。 */
+function requireIdlePiSession(entry: PiSessionEntry): void {
+  if (entry.activeRunId || !entry.session.isIdle || entry.applicationContextUpdating) throw runtimeError('ZEUS_PI_RUN_IN_PROGRESS', 'Pi 会话正在执行或准备资源，请等当前操作结束后再发送。');
+}
+
+/** 原生排队只适用于目标轮次仍在处理的会话。 */
+function requireActivePiRun(entry: PiSessionEntry, nativeRunId: string | null): asserts nativeRunId is string {
+  if (!nativeRunId || entry.activeRunId !== nativeRunId || !entry.session.isStreaming) throw runtimeError('ZEUS_PI_RUN_NOT_ACTIVE', 'Pi 排队输入的目标轮次已结束。');
 }
 
 const piPreflightTimeoutMs = 5 * 60_000;
@@ -265,11 +307,17 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
   const sessions = new Map<string, PiSessionEntry>();
   const listeners = new Set<(event: AgentRuntimeEvent) => void>();
   const payloadObservers = new Map<string, NonNullable<StartAgentRunInput['providerPayloadObserved']>>();
-  let modelRuntimePromise: Promise<{ runtime: ModelRuntime; connections: PiRuntimeConnection[] }> | null = null;
+  /** SDK 摘要拥有独立路由 ID，通过异步调用上下文归属到实际发起它的轮次。 */
+  const turnScope = new AsyncLocalStorage<{ entry: PiSessionEntry; nativeRunId: string; notify: StartAgentRunInput['compactionRequestObserved'] }>();
+  /** 连接修订只在设置变更或恢复时前进，常规探测不触发会话重绑。 */
+  let modelRuntimeRevision = 0;
+  let modelRuntimePromise: Promise<LoadedPiModelRuntime> | null = null;
   let closed = false;
 
-  async function loadModelRuntime(force = false): Promise<{ runtime: ModelRuntime; connections: PiRuntimeConnection[] }> {
+  async function loadModelRuntime(force = false): Promise<LoadedPiModelRuntime> {
     if (!force && modelRuntimePromise) return modelRuntimePromise;
+    /** 保留发起加载时的修订，异步读取期间发生的配置更新仍需下一轮刷新。 */
+    const revision = modelRuntimeRevision;
     modelRuntimePromise = (async () => {
       const connections = await options.loadConnections();
       // 认证只由 Zeus 注入，不读取用户独立安装的 Pi 全局认证文件。
@@ -288,10 +336,10 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
             auth: { apiKey: envApiKeyAuth(`${connection.name} API Key`, []) },
             models: connectionModels.map((model) => toPiModel(model, providerId, connection.baseUrl)),
             api: {
-              'openai-completions': withModelTransport(openAICompletionsApi(), authenticationSchemes, observePayload, projectToolImages),
-              'openai-responses': withModelTransport(openAIResponsesApi(), authenticationSchemes, observePayload, projectToolImages),
-              'openai-images': withModelTransport(openAiImageGenerationApi, authenticationSchemes, observePayload, projectToolImages, false),
-              'anthropic-messages': withModelTransport(anthropicMessagesApi(), authenticationSchemes, observePayload, projectToolImages),
+              'openai-completions': withModelTransport(openAICompletionsApi(), authenticationSchemes, observePayload, projectToolImages, observeCompactionRequest),
+              'openai-responses': withModelTransport(openAIResponsesApi(), authenticationSchemes, observePayload, projectToolImages, observeCompactionRequest),
+              'openai-images': withModelTransport(openAiImageGenerationApi, authenticationSchemes, observePayload, projectToolImages, observeCompactionRequest, false),
+              'anthropic-messages': withModelTransport(anthropicMessagesApi(), authenticationSchemes, observePayload, projectToolImages, observeCompactionRequest),
             },
           }),
         );
@@ -299,7 +347,7 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       }
       // 注册 Provider 会异步刷新目录；批量注册结束后等待最终认证快照，恢复会话才能按原模型选取。
       await runtime.refresh({ allowNetwork: false });
-      return { runtime, connections };
+      return { runtime, connections, revision };
     })();
     return modelRuntimePromise;
   }
@@ -362,6 +410,9 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
 
   async function observePayload(sessionId: string | undefined, model: Model<Api>, payload: unknown): Promise<void> {
     if (!sessionId) return;
+    /** 直连与 Worker 从同一个请求体回调等待接纳。 */
+    const entry = sessions.get(sessionId);
+    if (entry?.providerWriteAllowed) await entry.providerWriteAllowed;
     const diagnostic = buildProviderCacheDiagnostic(model, payload);
     if (options.beforeProviderWrite) {
       await options.beforeProviderWrite({
@@ -372,14 +423,28 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     }
     payloadObservers.get(sessionId)?.(diagnostic);
     /** 发送前记录计费时点，请求正文不进入事件。 */
-    const entry = sessions.get(sessionId);
     if (entry?.activeRunId) publishSyntheticEvent(entry, entry.activeRunId, 'pricing_request_started', {});
+  }
+
+  /** 每次在当前用户轮次中发起的 SDK 自动摘要请求各有一份 Core 回执。 */
+  function observeCompactionRequest(model: Model<Api>): PiCompactionRequestObserver | undefined {
+    const scope = turnScope.getStore();
+    if (!scope?.notify || scope.entry.activeRunId !== scope.nativeRunId || !scope.entry.session.isCompacting) return;
+    const { entry, nativeRunId, notify } = scope;
+    const identity = {
+      requestId: `pi_compaction_${randomUUID()}`,
+      nativeRunId,
+      model: { sourceId: sourceIdFromPiProvider(model.provider), modelId: model.id, displayName: model.name },
+    };
+    return async (state, usage) => {
+      await notify(state === 'started' ? { ...identity, state } : { ...identity, state, usage }, entry.identity);
+    };
   }
 
   async function createSession(input: OpenAgentSessionInput | (ResumeAgentSessionInput & { cwd: string }), sessionManager: SessionManager): Promise<PiSessionEntry> {
     assertOpen();
     await Promise.all([mkdir(options.agentDirectory, { recursive: true, mode: 0o700 }), mkdir(options.sessionDirectory, { recursive: true, mode: 0o700 })]);
-    const { runtime } = await loadModelRuntime();
+    const { runtime, revision } = await loadModelRuntime();
     const requestedModel = 'model' in input ? input.model : undefined;
     const model = requestedModel ? resolveModel(runtime, requestedModel) : undefined;
     const settingsManager = SettingsManager.inMemory(
@@ -411,7 +476,8 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     await resourceLoader.reload();
     if ('metadata' in input) seedPortableContext(sessionManager, input.metadata);
     let entryRef: PiSessionEntry | null = null;
-    const { session } = await createAgentSession({
+    /** 重绑时复用原会话管理器和工具注册，保持原生历史和宿主资源关联。 */
+    const sessionOptions: CreateAgentSessionOptions = {
       cwd: input.cwd,
       agentDir: options.agentDirectory,
       modelRuntime: runtime,
@@ -421,7 +487,8 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       resourceLoader,
       sessionManager,
       settingsManager,
-    });
+    };
+    const { session } = await createAgentSession(sessionOptions);
     const identity: AgentSessionIdentity = {
       agentKind: 'pi',
       nativeSessionId: session.sessionId,
@@ -432,6 +499,8 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       identity,
       cwd: input.cwd,
       session,
+      sessionOptions,
+      modelRuntimeRevision: revision,
       resourceLoader,
       applicationContextFingerprint: null,
       activeSkill: null,
@@ -446,6 +515,30 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     entry.unsubscribe = session.subscribe((event) => publishPiEvent(entry, event));
     sessions.set(identity.nativeSessionId, entry);
     return entry;
+  }
+
+  /** 空闲会话沿原会话管理器重绑最新目录和凭据。 */
+  async function refreshSessionModelRuntime(entry: PiSessionEntry, loaded: LoadedPiModelRuntime, model: Model<Api> | undefined): Promise<void> {
+    if (entry.modelRuntimeRevision === loaded.revision) return;
+    requireIdlePiSession(entry);
+    entry.applicationContextUpdating = true;
+    try {
+      /** SDK 从同一个历史管理器恢复，原生 ID 与路径必须保持一致。 */
+      const sessionOptions = { ...entry.sessionOptions, modelRuntime: loaded.runtime, model };
+      const { session } = await createAgentSession(sessionOptions);
+      if (session.sessionId !== entry.identity.nativeSessionId || (session.sessionFile ?? null) !== entry.identity.nativeSessionPath) {
+        session.dispose();
+        throw runtimeError('ZEUS_PI_SESSION_IDENTITY_MISMATCH', 'Pi 模型更新后会话身份不一致。');
+      }
+      entry.unsubscribe();
+      entry.session.dispose();
+      entry.session = session;
+      entry.sessionOptions = sessionOptions;
+      entry.modelRuntimeRevision = loaded.revision;
+      entry.unsubscribe = session.subscribe((event) => publishPiEvent(entry, event));
+    } finally {
+      entry.applicationContextUpdating = false;
+    }
   }
 
   function publishPiEvent(entry: PiSessionEntry, event: AgentSessionEvent): void {
@@ -471,28 +564,27 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       sequence: (entry.sequence += 1),
       type: terminalFailure ? 'runtime_error' : event.type,
       payload: terminalFailure ?? event,
+      // SDK 将结构化工具活动和技能读取先交付给同一会话订阅，正常结束时确认采集范围。
+      ...(event.type === 'agent_settled' && !terminalFailure ? { resourceCaptureComplete: true } : {}),
       createdAt: now(),
     };
     for (const listener of listeners) listener(envelope);
   }
 
-  async function start(entry: PiSessionEntry, input: StartAgentRunInput, mode: 'prompt' | 'steer' | 'follow_up'): Promise<AcceptedAgentRun> {
-    if (mode === 'steer' && !entry.activeRunId) throw runtimeError('ZEUS_PI_RUN_NOT_ACTIVE', 'Pi 插话需要一个正在执行的轮次。');
-    const selectedSkills = (input.resourceSnapshot?.skills ?? input.skills ?? (input.skill ? [input.skill] : [])).map(normalizeSkillActivation);
-    // 资源读取失败发生在接纳前，不留下没有请求实际运行的活动轮次。
-    const explicitSkills = await Promise.all(selectedSkills.map(async (skill) => `本轮显式 Skill ${JSON.stringify({ name: skill.name, path: skill.path })}：\n${await readFile(skill.path, 'utf8')}`));
-    const selectedSkill = selectedSkills[0];
+  /** 只有新轮可以应用资源和模型设置，并在持久接纳后发出请求。 */
+  async function start(entry: PiSessionEntry, input: StartAgentRunInput, acceptInCore?: (acceptance: AcceptedAgentRun) => Promise<void>): Promise<AcceptedAgentRun> {
+    requireIdlePiSession(entry);
+    /** 资源或上下文无效时，会话仍可接收下一次有效提交。 */
+    const { userContent, images, selectedSkill } = await preparePiInput(input, appendUntrustedContext(input.content, input.untrustedContext));
     /** 始终从注册目录取真实容量，不能用上轮会话副本反算预留。 */
-    const { runtime: budgetRuntime } = await loadModelRuntime();
+    const loaded = await loadModelRuntime();
+    const { runtime: budgetRuntime, connections } = loaded;
     const canonicalModel = input.model ? resolveModel(budgetRuntime, input.model) : entry.session.model ? budgetRuntime.getModel(entry.session.model.provider, entry.session.model.id) : undefined;
     assertContextCapacitySupported(input.contextCapacityTokens ?? null, canonicalModel?.contextWindow);
-    if (mode === 'prompt') await applyRunResources(entry, input.applicationContext, selectedSkill, input.resourceSnapshot?.skillCatalog ?? input.skillCatalog);
-    if (input.model) {
-      if (!entry.session.isIdle) throw runtimeError('ZEUS_PI_MODEL_CHANGE_IN_PROGRESS', 'Pi 模型只能在会话空闲时切换。');
-      const { runtime } = await loadModelRuntime();
-      await entry.session.setModel(resolveModel(runtime, input.model));
-    }
-    if (mode === 'prompt' && canonicalModel) {
+    await refreshSessionModelRuntime(entry, loaded, canonicalModel);
+    await applyRunResources(entry, input.applicationContext, selectedSkill, input.resourceSnapshot?.skillCatalog ?? input.skillCatalog);
+    requireIdlePiSession(entry);
+    if (canonicalModel) {
       // 资源重载后应用当前会话副本；默认重新采用目录模型，清除先前的窗口覆盖。
       const contextWindow = input.contextCapacityTokens ?? canonicalModel.contextWindow;
       await entry.session.setModel({ ...canonicalModel, contextWindow });
@@ -501,15 +593,16 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       }
     }
     await applySessionThinkingLevel(entry, input.thinkingLevel, loadModelRuntime);
-    const nativeRunId = mode === 'steer' ? entry.activeRunId! : `pi_run_${randomUUID()}`;
+    requireIdlePiSession(entry);
+    /** 同一次 Pi 运行的流事件、工具请求和终态共用这个 ID。 */
+    const nativeRunId = `pi_run_${randomUUID()}`;
     entry.activeRunId = nativeRunId;
     entry.pendingFailure = null;
-    const acceptedAt = now();
-    const images = input.images?.map((image): { type: 'image'; data: string; mimeType: string } => ({ type: 'image', data: image.data, mimeType: image.mimeType }));
+    /** 容量证据来自本轮实际使用的会话模型。 */
     const acceptance: AcceptedAgentRun = {
       nativeRunId,
-      acceptedAt,
-      ...(mode === 'prompt' && canonicalModel
+      acceptedAt: now(),
+      ...(canonicalModel
         ? {
             contextCapacity: {
               contextCapacityTokens: input.contextCapacityTokens ?? null,
@@ -521,103 +614,92 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
         : {}),
     };
     if (input.providerPayloadObserved) payloadObservers.set(entry.identity.nativeSessionId, input.providerPayloadObserved);
-    let resolvePreflight: (() => void) | null = null;
-    let rejectPreflight: ((error: unknown) => void) | null = null;
-    let preflightSettled = false;
-    let preflightTimeout: ReturnType<typeof setTimeout> | null = null;
-    const preflight =
-      mode === 'prompt' && (input.preflightResult || input.durableTransactionSync)
-        ? new Promise<void>((resolveResult, rejectResult) => {
-            resolvePreflight = resolveResult;
-            rejectPreflight = rejectResult;
-          })
-        : null;
-    const clearPreflightTimeout = () => {
-      if (preflightTimeout === null) return;
-      clearTimeout(preflightTimeout);
-      preflightTimeout = null;
-    };
-    const rejectPendingPreflight = (error: unknown): boolean => {
-      if (!preflight || preflightSettled) return false;
-      preflightSettled = true;
-      clearPreflightTimeout();
-      rejectPreflight?.(error);
-      return true;
-    };
-    const promptOptions =
-      images?.length || preflight
-        ? {
-            ...(images?.length ? { images } : {}),
-            ...(preflight
-              ? {
-                  preflightResult: (accepted: boolean) => {
-                    if (preflightSettled) return;
-                    try {
-                      input.preflightResult?.(accepted);
-                      if (!accepted) throw runtimeError('ZEUS_PI_PREFLIGHT_REJECTED', 'Pi 预检拒绝了本轮请求。');
-                      input.durableTransactionSync?.(acceptance);
-                      input.providerWriteMayStart?.();
-                      preflightSettled = true;
-                      clearPreflightTimeout();
-                      resolvePreflight?.();
-                    } catch (error) {
-                      rejectPendingPreflight(error);
-                      throw error;
-                    }
-                  },
-                }
-              : {}),
-          }
-        : undefined;
-    const contextualContent = mode === 'prompt' ? appendUntrustedContext(input.content, input.untrustedContext) : input.content;
-    const userContent = [
-      ...explicitSkills,
-      ...(input.workMode === 'plan'
-        ? [
-            '本轮处于 Zeus 计划模式：可以调查、读取、沟通，并运行不会修改受版本控制文件的检查或构建；不得编辑受版本控制文件、执行方案或产生实施型副作用。先从代码、文档和运行现场查明可发现事实；只有仍会实质改变方案且无法查明的选择才使用 request_user_input 询问。方案达到可直接实施的程度后，只调用一次 submit_plan 保存完整正式计划；不得调用 update_plan，也不得在提交计划后自行开始实施。',
-          ]
-        : []),
-      contextualContent,
-    ].join('\n\n');
-    const operation = mode === 'steer' ? entry.session.steer(userContent, images) : mode === 'follow_up' ? entry.session.followUp(userContent, images) : entry.session.prompt(userContent, promptOptions);
-    if (preflight && !preflightSettled) {
-      // prompt() 返回的是整轮异步 Promise，不代表认证、压缩和扩展预处理已经完成。
-      // 只在有限等待后判定 SDK 破坏预检契约，避免迟到回调反向写入已失败的持久状态。
-      preflightTimeout = setTimeout(() => {
-        const timeoutError = runtimeError('ZEUS_PI_PREFLIGHT_TIMEOUT', 'Pi 未在 5 分钟内返回本轮预检结果。');
-        if (!rejectPendingPreflight(timeoutError)) return;
-        void entry.session
-          .abort()
-          .catch(() => undefined)
-          .finally(() => {
-            if (entry.activeRunId === nativeRunId) entry.activeRunId = null;
-          });
-      }, piPreflightTimeoutMs);
-      preflightTimeout.unref();
-    }
+    /** SDK 回报 started 后，接纳失败与运行失败由写前回执区分。 */
+    let sdkStarted = false;
+    let resolvePreflight!: () => void;
+    let rejectPreflight!: (error: unknown) => void;
+    /** SDK 的启动回调只结算预检，事务在 Promise 后续阶段执行。 */
+    const preflight = new Promise<void>((resolveResult, rejectResult) => {
+      resolvePreflight = resolveResult;
+      rejectPreflight = rejectResult;
+    });
+    /** SDK 已标记会话忙碌，事务异常必须经过正常的取消与收尾。 */
+    const providerWriteAllowed = preflight.then(async () => {
+      input.preflightResult?.(true);
+      if (acceptInCore) await acceptInCore(acceptance);
+      else {
+        input.durableTransactionSync?.(acceptance);
+        input.providerWriteMayStart?.();
+      }
+    });
+    /** 超时结束本次等待，迟到的 started 仍会装上已拒绝的写前门。 */
+    const preflightTimeout = setTimeout(() => {
+      rejectPreflight(runtimeError('ZEUS_PI_PREFLIGHT_TIMEOUT', 'Pi 未在 5 分钟内返回本轮预检结果。'));
+      if (entry.activeRunId === nativeRunId) void entry.session.abort().catch(() => undefined);
+    }, piPreflightTimeoutMs);
+    preflightTimeout.unref();
+    /** prompt 的 Promise 覆盖整轮，预检完成后它仍负责清理轮次状态。 */
+    const operation = turnScope
+      .run({ entry, nativeRunId, notify: input.compactionRequestObserved }, () =>
+        entry.session.prompt(userContent, {
+          ...(images?.length ? { images } : {}),
+          preflightResult: (disposition) => {
+            clearTimeout(preflightTimeout);
+            if (disposition === 'started') {
+              sdkStarted = true;
+              entry.providerWriteAllowed = providerWriteAllowed;
+              resolvePreflight();
+            } else {
+              // 排队或已处理的输入可能产生效果，按异常回执处理以免自动重发。
+              rejectPreflight(runtimeError('ZEUS_PI_INPUT_DISPOSITION_UNEXPECTED', `Pi 返回 ${disposition}，本次提交没有启动新轮次。`));
+            }
+          },
+        }),
+      )
+      .finally(() => {
+        clearTimeout(preflightTimeout);
+        if (entry.providerWriteAllowed === providerWriteAllowed) entry.providerWriteAllowed = undefined;
+        if (payloadObservers.get(entry.identity.nativeSessionId) === input.providerPayloadObserved) payloadObservers.delete(entry.identity.nativeSessionId);
+        if (entry.activeRunId === nativeRunId) {
+          entry.activeRunId = null;
+          entry.pendingFailure = null;
+        }
+      });
     void operation.then(
       () => {
-        if (payloadObservers.get(entry.identity.nativeSessionId) === input.providerPayloadObserved) payloadObservers.delete(entry.identity.nativeSessionId);
-        if (!preflight || preflightSettled) return;
-        rejectPendingPreflight(runtimeError('ZEUS_PI_PREFLIGHT_CALLBACK_MISSING', 'Pi 已结束本轮，但没有返回预检结果。'));
-        if (entry.activeRunId === nativeRunId) entry.activeRunId = null;
+        if (!sdkStarted) rejectPreflight(runtimeError('ZEUS_PI_PREFLIGHT_CALLBACK_MISSING', 'Pi 已结束本轮，但没有返回预检结果。'));
       },
       (error: unknown) => {
-        if (payloadObservers.get(entry.identity.nativeSessionId) === input.providerPayloadObserved) payloadObservers.delete(entry.identity.nativeSessionId);
-        rejectPendingPreflight(error);
-        const payload = {
-          message: error instanceof Error ? error.message : String(error),
-          code: readErrorCode(error),
-        };
-        // 等协调器登记已接受轮次后再投递错误，避免同步失败事件被忽略。
-        queueMicrotask(() => {
-          publishSyntheticEvent(entry, nativeRunId, 'runtime_error', payload);
-          if (entry.activeRunId === nativeRunId) entry.activeRunId = null;
-        });
+        if (!sdkStarted) {
+          rejectPreflight(piPreflightRejection(error, connections));
+          return;
+        }
+        // 接纳成功的错误由 Core 关联到已登记的轮次，接纳失败由调用回执返回。
+        void providerWriteAllowed.then(
+          () => queueMicrotask(() => publishSyntheticEvent(entry, nativeRunId, 'runtime_error', { message: error instanceof Error ? error.message : String(error), code: readErrorCode(error) })),
+          () => undefined,
+        );
       },
     );
-    if (preflight) await preflight;
+    try {
+      await providerWriteAllowed;
+    } catch (error) {
+      if (sdkStarted && entry.activeRunId === nativeRunId) await entry.session.abort().catch(() => undefined);
+      throw error;
+    }
     return acceptance;
+  }
+
+  /** 原生排队沿用活动轮次，独立的下一轮由 Core 队列派发。 */
+  async function queueInput(entry: PiSessionEntry, input: StartAgentRunInput, nativeRunId: string | null, mode: 'steer' | 'follow_up'): Promise<AcceptedAgentRun> {
+    requireActivePiRun(entry, nativeRunId);
+    /** 显式 Skill 读取可能跨越轮次结束，交给 SDK 前再核对一次。 */
+    const { userContent, images } = await preparePiInput(input, input.content);
+    requireActivePiRun(entry, nativeRunId);
+    /** queued 只确认活动轮次收到了新输入。 */
+    const disposition = await (mode === 'steer' ? entry.session.steer(userContent, images) : entry.session.followUp(userContent, images));
+    if (disposition !== 'queued') throw runtimeError('ZEUS_PI_INPUT_DISPOSITION_UNEXPECTED', 'Pi 已处理输入，未将它加入队列。');
+    return { nativeRunId, acceptedAt: now() };
   }
 
   function publishSyntheticEvent(entry: PiSessionEntry, nativeRunId: string | null, type: string, payload: unknown): void {
@@ -690,7 +772,7 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
           exact: false,
           source: null,
           checkedAt: probe.checkedAt,
-          reason: 'Pi SDK 0.83.0 没有对完整待发请求进行精确预检计数的公共端口；运行后的 usage 不能替代预检。',
+          reason: `Pi SDK ${VERSION} 没有对完整待发请求进行精确预检计数的公共端口；运行后的 usage 不能替代预检。`,
         },
         capabilities: Object.fromEntries(['session', 'streaming', 'steer', 'follow_up', 'interrupt', 'approval', 'user_input', 'model_catalog', 'usage', 'compaction'].map((id) => [id, { ...evidence }])),
       };
@@ -707,18 +789,22 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
       if (entry.identity.nativeSessionId !== input.nativeSessionId) throw runtimeError('ZEUS_PI_SESSION_IDENTITY_MISMATCH', 'Pi 会话文件与持久化会话 ID 不一致。');
       return entry.identity;
     },
-    async startRun(input: StartAgentRunInput): Promise<AcceptedAgentRun> {
-      return start(requireSession(input.session), input, 'prompt');
+    /** 独立轮次统一通过预检和持久接纳。 */
+    async startRun(input: StartAgentRunInput, acceptInCore?: (acceptance: AcceptedAgentRun) => Promise<void>): Promise<AcceptedAgentRun> {
+      return start(requireSession(input.session), input, acceptInCore);
     },
+    /** 插话必须属于调用方指定的活动轮次。 */
     async steerRun(input: SteerAgentRunInput): Promise<AcceptedAgentRun> {
-      return start(requireSession(input.session), input, 'steer');
+      return queueInput(requireSession(input.session), input, input.nativeRunId, 'steer');
     },
+    /** Pi 的追加队列在活动轮次内继续处理输入。 */
     async followUp(input: FollowUpAgentRunInput): Promise<AcceptedAgentRun> {
-      return start(requireSession(input.session), input, 'follow_up');
+      const entry = requireSession(input.session);
+      return queueInput(entry, input, entry.activeRunId, 'follow_up');
     },
     async compactSession(input: CompactAgentSessionInput): Promise<CompactAgentSessionResult> {
       const entry = requireSession(input.session);
-      if (!entry.session.isIdle) throw runtimeError('ZEUS_PI_COMPACTION_SESSION_BUSY', 'Pi 会话正在执行，不能开始上下文压缩。');
+      if (!entry.session.isIdle || entry.applicationContextUpdating) throw runtimeError('ZEUS_PI_COMPACTION_SESSION_BUSY', 'Pi 会话正在执行，不能开始上下文压缩。');
       await applySessionThinkingLevel(entry, input.thinkingLevel, loadModelRuntime);
       const result = await entry.session.compact(input.customInstructions);
       return {
@@ -731,7 +817,7 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     async importPortableHistory(input: PiPortableHistoryImportInput): Promise<PiPortableHistoryImportResult> {
       assertOpen();
       const entry = requireSession(input.session);
-      if (!entry.session.isIdle || entry.activeRunId) throw runtimeError('ZEUS_PI_HISTORY_IMPORT_SESSION_BUSY', 'Pi 会话正在执行，不能导入既有历史。');
+      if (!entry.session.isIdle || entry.activeRunId || entry.applicationContextUpdating) throw runtimeError('ZEUS_PI_HISTORY_IMPORT_SESSION_BUSY', 'Pi 会话正在执行，不能导入既有历史。');
       if (input.entries.length === 0) throw runtimeError('ZEUS_PI_HISTORY_IMPORT_EMPTY', 'Pi 历史导入缺少可导入条目。');
       await applySessionThinkingLevel(entry, input.thinkingLevel, loadModelRuntime);
       const batches = splitPortableHistoryBatches(input.entries, portableHistoryBatchCharacters(input.batchTokens));
@@ -774,9 +860,11 @@ export function createPiSdkRuntimeDriver(options: CreatePiSdkRuntimeDriverOption
     },
     async recover(): Promise<void> {
       assertOpen();
-      await loadModelRuntime(true);
+      this.invalidateModelRuntime();
+      await loadModelRuntime();
     },
     invalidateModelRuntime(): void {
+      modelRuntimeRevision += 1;
       modelRuntimePromise = null;
     },
     async reviewPermission(input): Promise<PiPermissionReviewResult> {
@@ -1233,7 +1321,10 @@ export function toPiModel(model: ConfiguredModelDefinition, providerId: string, 
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
     ...(anthropicMessages
-      ? {}
+      ? {
+          // 保留全量历史请求，使缓存诊断与发给供应商的消息继续一致。
+          compat: { supportsMessageThreads: false },
+        }
       : openAIResponses
         ? {
             compat: {
@@ -1266,6 +1357,7 @@ function withModelTransport(
   authenticationSchemes: ReadonlyMap<string, ModelAuthenticationScheme>,
   observePayload: (sessionId: string | undefined, model: Model<Api>, payload: unknown) => Promise<void>,
   projectContext: (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) => Promise<TranscriptContext>,
+  observeCompactionRequest: (model: Model<Api>) => PiCompactionRequestObserver | undefined,
   responseStartsStream = true,
 ): ProviderStreams {
   /** 只对网络建链计时；确认旧流结束后才允许恢复，不限制连接建立后的生成。 */
@@ -1279,7 +1371,15 @@ function withModelTransport(
     /** 外部停止优先，不能因超时改写为自动重试。 */
     const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     /** 复用认证和写前接纳入口，只增加真实连接边界的计时。 */
-    const transportOptions = optionsFor(model, { ...options, signal: combined });
+    const transportOptions = applyModelAuthentication({ ...options, signal: combined }, authenticationSchemes.get(model.id) ?? 'bearer') ?? {};
+    const compaction = observeCompactionRequest(model);
+    let compactionStarted = false;
+    /** 回执写入异常保留在已持久登记的请求上，避免 SDK 重发已得到结果的请求。 */
+    async function finishCompaction(state: 'completed' | 'failed' | 'aborted', usage?: unknown): Promise<void> {
+      if (!compaction || !compactionStarted) return;
+      compactionStarted = false;
+      await compaction(state, usage).catch(() => undefined);
+    }
     /** 保留调用方和 Core 的原有请求体回调。 */
     const onPayload = transportOptions.onPayload;
     /** 响应头先结束建链计时，再执行调用方的回调。 */
@@ -1287,9 +1387,19 @@ function withModelTransport(
     transportOptions.onPayload = async (payload, observedModel) => {
       /** 持久接纳和请求体准备属于写前阶段，不能消耗网络建链时间。 */
       const replacement = await onPayload?.(payload, observedModel);
+      const serialized = replacement === undefined ? payload : replacement;
+      if (compaction) {
+        if (!compactionStarted) {
+          signal?.throwIfAborted();
+          await compaction('started');
+          compactionStarted = true;
+        }
+      } else {
+        await observePayload(transportOptions.sessionId, observedModel, serialized);
+      }
       stopDeadline();
       if (responseStartsStream) stopDeadline = createModelConnectionDeadline(() => deadline.abort());
-      return replacement;
+      return serialized;
     };
     transportOptions.onResponse = async (response, observedModel) => {
       stopDeadline();
@@ -1301,6 +1411,11 @@ function withModelTransport(
           for await (const event of lazyStream(model, () => setup(transportOptions))) {
             // 复用连接或非 HTTP 传输可能没有响应头回调，流开始同样明确结束建链。
             if (event.type === 'start') stopDeadline();
+            if (compactionStarted && (event.type === 'done' || event.type === 'error')) {
+              stopDeadline();
+              if (event.type === 'done') await finishCompaction('completed', event.message.usage);
+              else await finishCompaction(signal?.aborted || (!deadline.signal.aborted && event.reason === 'aborted') ? 'aborted' : 'failed', event.error.usage);
+            }
             if (event.type === 'error' && signal?.aborted) yield { ...event, reason: 'aborted' as const, error: { ...event.error, stopReason: 'aborted' as const } };
             else if (event.type === 'error' && deadline.signal.aborted)
               yield { ...event, reason: 'error' as const, error: { ...event.error, stopReason: 'error' as const, errorMessage: 'Model connection establishment timeout after 60000ms' } };
@@ -1308,23 +1423,11 @@ function withModelTransport(
           }
         } finally {
           stopDeadline();
+          if (compactionStarted) await finishCompaction(signal?.aborted ? 'aborted' : 'failed');
         }
       },
     }));
   }
-  const optionsFor = (model: Model<Api>, options: StreamOptions | undefined): StreamOptions => {
-    const authenticated = applyModelAuthentication(options, authenticationSchemes.get(model.id) ?? 'bearer') ?? {};
-    const originalOnPayload = authenticated.onPayload;
-    return {
-      ...authenticated,
-      onPayload: async (payload, observedModel) => {
-        const replacement = await originalOnPayload?.(payload, observedModel);
-        const serialized = replacement === undefined ? payload : replacement;
-        await observePayload(authenticated.sessionId, observedModel, serialized);
-        return serialized;
-      },
-    };
-  };
   return {
     stream(model, context, options) {
       return projectStream(model, async (transportOptions) => streams.stream(model, await projectContext(model, context, transportOptions), transportOptions), options);
@@ -1432,6 +1535,27 @@ async function applyRunResources(entry: PiSessionEntry, input: StartAgentRunInpu
   } finally {
     entry.applicationContextUpdating = false;
   }
+}
+
+/** 新轮与排队输入使用相同的显式 Skill、工作模式和图片格式。 */
+async function preparePiInput(input: StartAgentRunInput, content: string) {
+  /** 首个显式 Skill 也是新轮资源加载时选中的 Skill。 */
+  const selectedSkills = (input.resourceSnapshot?.skills ?? input.skills ?? (input.skill ? [input.skill] : [])).map(normalizeSkillActivation);
+  /** 在原生会话处理输入前，读取用户本次指定的 Skill 正文。 */
+  const explicitSkills = await Promise.all(selectedSkills.map(async (skill) => `本轮显式 Skill ${JSON.stringify({ name: skill.name, path: skill.path })}：\n${await readFile(skill.path, 'utf8')}`));
+  /** 计划模式约束随每条输入交给模型，包括当前轮次内的插话。 */
+  const userContent = [
+    ...explicitSkills,
+    ...(input.workMode === 'plan'
+      ? [
+          '本轮处于 Zeus 计划模式：可以调查、读取、沟通，并运行不会修改受版本控制文件的检查或构建；不得编辑受版本控制文件、执行方案或产生实施型副作用。先从代码、文档和运行现场查明可发现事实；只有仍会实质改变方案且无法查明的选择才使用 request_user_input 询问。方案达到可直接实施的程度后，只调用一次 submit_plan 保存完整正式计划；不得调用 update_plan，也不得在提交计划后自行开始实施。',
+        ]
+      : []),
+    content,
+  ].join('\n\n');
+  /** SDK 只接收图片内容及其 MIME 类型。 */
+  const images = input.images?.map((image): { type: 'image'; data: string; mimeType: string } => ({ type: 'image', data: image.data, mimeType: image.mimeType }));
+  return { userContent, images, selectedSkill: selectedSkills[0] };
 }
 
 function normalizeSkillActivation(input: AgentRunSkillActivation): AgentRunSkillActivation {
@@ -1588,6 +1712,19 @@ function nullableUsageNumber(value: unknown): number | null {
 
 function readErrorCode(error: unknown): string | null {
   return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string' ? error.code : null;
+}
+
+/** Core 用固定错误码收口投递，详情只保留脱敏后的预检原因。 */
+function piPreflightRejection(error: unknown, connections: readonly PiRuntimeConnection[]): Error & { code: string } {
+  /** 仅读取原因正文，避免把堆栈和异常对象带入回执。 */
+  const reason = error instanceof Error ? error.message : typeof error === 'string' ? error : asUnknownRecord(error).message;
+  let message = typeof reason === 'string' ? reason : '';
+  for (const connection of connections) {
+    /** 配置凭据可以是自定义格式，需要精确移除。 */
+    const credential = connection.apiKey?.trim();
+    if (credential) message = message.split(credential).join('[REDACTED]');
+  }
+  return runtimeError('ZEUS_PI_PREFLIGHT_REJECTED', redactUserFacingErrorDetails(message) || 'Pi 预检拒绝了本轮请求。');
 }
 
 function runtimeError(code: string, message: string): Error & { code: string } {

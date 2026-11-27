@@ -77,6 +77,8 @@ export interface GitApiClient {
   ) => Promise<{ message: string; model: string; truncated?: boolean }>;
   loadGitDiff: () => Promise<GitDiffSummary>;
   loadProjectGitWorkbench: (projectId: string, includePatches?: boolean) => Promise<ProjectGitWorkbenchSnapshot>;
+  /** 普通项目的新对话分支选择使用桌面查询。 */
+  loadProjectGitBranches?: ProjectGitWorkbenchBridge['loadBranches'];
   loadConversationGitHistory: (projectId: string, repositoryId: string, offset: number, ref?: string) => Promise<{ commits: NonNullable<GitStatusSummary['recentCommits']>; hasMore: boolean }>;
   loadProjectGitCommit: (projectId: string, repositoryId: string, commitHash: string) => Promise<ProjectGitCommitDetail>;
   /** 按来源分支和目标远端读取本地推送预览。 */
@@ -103,9 +105,17 @@ export interface GitApiClient {
 }
 
 export function createGitApiClient(transport: LocalApiTransport, bridge: () => ProjectGitWorkbenchBridge | undefined, conversationId?: string): GitApiClient {
+  /** 会话工作树有独立仓库身份，不借用普通项目的来源读取。 */
+  const loadProjectGitBranches = conversationId ? undefined : bridge()?.loadBranches;
+  /** 会话操作只能使用当前会话的仓库身份。 */
   const scopedRepositoryId = (repositoryId: string): string => {
     if (conversationId && repositoryId !== `conversation:${conversationId}` && !repositoryId.startsWith(`conversation:${conversationId}:`)) throw new Error('会话工作树身份不匹配，请重新打开代码交付。');
-    return encodeURIComponent(repositoryId);
+    return repositoryId;
+  };
+  /** 会话子仓 ID 的长度随相对路径增长，使用查询参数传递完整身份。 */
+  const workbenchRepositoryPath = (projectId: string, operation: string, repositoryId: string, query: Record<string, string> = {}): string => {
+    const parameters = new URLSearchParams({ repositoryId: scopedRepositoryId(repositoryId), ...query });
+    return `${projectGitPath(projectId)}/workbench/repositories/${operation}?${parameters}`;
   };
   const projectOperation = async (projectId: string, operation: string, commandType: Parameters<typeof buildGitCommandRequest>[0]['commandType'], input: object) => {
     const body = await buildGitCommandRequest({
@@ -118,6 +128,7 @@ export function createGitApiClient(transport: LocalApiTransport, bridge: () => P
     return transport.request<ExecutedGitOperationResult>(`${projectGitPath(projectId)}/${operation}`, jsonRequest('POST', body));
   };
   return {
+    ...(loadProjectGitBranches ? { loadProjectGitBranches } : {}),
     loadGitEnvironmentStatus: (projectId, scope, signal) => {
       const query = new URLSearchParams();
       for (const [key, value] of Object.entries(scope)) if (value) query.set(key, value);
@@ -174,33 +185,30 @@ export function createGitApiClient(transport: LocalApiTransport, bridge: () => P
       if (conversationId) snapshot.repositories.forEach((repository) => scopedRepositoryId(repository.id));
       return snapshot;
     },
-    loadConversationGitHistory: async (projectId, repositoryId, offset, ref) =>
-      transport.request(`${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/history?offset=${offset}${ref ? `&ref=${encodeURIComponent(ref)}` : ''}`),
+    loadConversationGitHistory: async (projectId, repositoryId, offset, ref) => transport.request(workbenchRepositoryPath(projectId, 'history', repositoryId, { offset: String(offset), ...(ref ? { ref } : {}) })),
     loadProjectGitCommit: async (projectId, repositoryId, commitHash) =>
-      bridge()?.loadCommit(projectId, repositoryId, commitHash) ??
-      transport.request<ProjectGitCommitDetail>(`${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/commits/${encodeURIComponent(commitHash)}`),
+      bridge()?.loadCommit(projectId, repositoryId, commitHash) ?? transport.request<ProjectGitCommitDetail>(workbenchRepositoryPath(projectId, `commits/${encodeURIComponent(commitHash)}`, repositoryId)),
     /** 桌面与会话工作树分别沿用各自可信仓库身份。 */
     loadProjectGitPushPreview: async (projectId, repositoryId, input) =>
       bridge()?.loadPushPreview(projectId, repositoryId, input) ??
       transport.request<ProjectGitPushPreview>(
-        `${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/push-preview?${new URLSearchParams({ sourceBranch: input.sourceBranch, remote: input.remote, targetBranch: input.targetBranch, offset: String(input.offset ?? 0) })}`,
+        workbenchRepositoryPath(projectId, 'push-preview', repositoryId, { sourceBranch: input.sourceBranch, remote: input.remote, targetBranch: input.targetBranch, offset: String(input.offset ?? 0) }),
       ),
     loadProjectGitComparisonDiff: async (projectId, repositoryId, ref, mode, path, summaryOnly = false) =>
       bridge()?.loadComparison(projectId, repositoryId, ref, mode, path, summaryOnly) ??
-      transport.request<GitDiffSummary>(
-        `${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/compare?ref=${encodeURIComponent(ref)}&mode=${mode}&summaryOnly=${summaryOnly}${path !== undefined ? `&path=${encodeURIComponent(path)}` : ''}`,
-      ),
+      transport.request<GitDiffSummary>(workbenchRepositoryPath(projectId, 'compare', repositoryId, { ref, mode, summaryOnly: String(summaryOnly), ...(path === undefined ? {} : { path }) })),
     executeProjectGitAction: async (projectId, repositoryId, input) => {
-      scopedRepositoryId(repositoryId);
       const nativeBridge = bridge();
-      if (nativeBridge) return nativeBridge.execute(projectId, repositoryId, input);
+      if (nativeBridge) return nativeBridge.execute(projectId, scopedRepositoryId(repositoryId), input);
+      /** 先校验会话范围，再为同一仓库构造命令身份。 */
+      const path = workbenchRepositoryPath(projectId, 'actions', repositoryId);
       const body = await buildWorkspaceGitCommandRequest({
         commandType: workspaceGitClientCommandTypes.workbenchAction,
         scopeKind: 'git_repository',
         scopeId: repositoryId,
         value: input,
       });
-      return transport.request<ProjectGitActionResponse>(`${projectGitPath(projectId)}/workbench/repositories/${scopedRepositoryId(repositoryId)}/actions`, jsonRequest('POST', body));
+      return transport.request<ProjectGitActionResponse>(path, jsonRequest('POST', body));
     },
     loadProjectGitDiff: (projectId) => transport.request<GitDiffSummary>(`${projectGitPath(projectId)}/diff`),
     createProjectGitSnapshot: async (projectId, taskId) => {

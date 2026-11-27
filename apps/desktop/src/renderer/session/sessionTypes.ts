@@ -20,6 +20,7 @@ import type {
   ZeusBrowserComment,
   ZeusBrowserPreparedSubmission,
 } from '@zeus/shared';
+import type { ConversationListingScope } from '@zeus/storage';
 
 export type { ConversationResource, ConversationResourcePreview, TurnChangeSet, TurnChangeSetOperationResult } from '@zeus/shared';
 
@@ -118,6 +119,8 @@ export interface NativeTurnSnapshot {
   providerTurnId: string | null;
   submissionId: string | null;
   status: string;
+  /** 轮次已交接操作任务，摘要沿用任务进度语义。 */
+  operationHandoff?: true;
   error?: NativeTurnFailureSnapshot | null;
   plan?: NativeTurnPlanSnapshot | null;
   startedAt: string | null;
@@ -163,11 +166,22 @@ export interface NativeItemSnapshot {
 
 export type NativeSubagentStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'interrupted' | 'failed' | 'unknown';
 
+/** 排队、执行和等待处理都需要保留子会话进度入口。 */
+export const activeNativeSubagentStatuses: ReadonlySet<NativeSubagentStatus> = new Set(['pending', 'running', 'waiting']);
+
 export interface NativeSubagentSummary {
   /** 服务端核实的操作代理，原生子线程不推断此字段。 */
   operation?: 'browser' | 'computer';
+  /** 派发前暂停的状态及其已记录错误。 */
+  startupBlock?: { error: { code: string; message: string } | null };
+  /** Provider 尚未确认接纳结果，停止前需要核对。 */
+  dispatchUnconfirmed?: true;
   id: string;
   parentThreadId: string | null;
+  /** 实际派发子任务的父轮次。 */
+  parentTurnId?: string;
+  /** 已确认的操作交接轮次，供历史时间线归类。 */
+  operationHandoffTurnIds?: string[];
   title: string;
   nickname: string | null;
   role: string | null;
@@ -946,6 +960,8 @@ export interface NativeConversationMessage {
 }
 
 export interface NativeConversationChoice {
+  /** 服务端保存的列表范围，本地创建回执可能尚未包含此字段。 */
+  listingScope?: ConversationListingScope;
   /** 侧栏所属主会话的稳定身份，由服务端从已核验的来源关系投影。 */
   sourceConversationId?: string | null;
   /** 自动冲突会话所属的原交付会话；普通会话为空。 */
@@ -992,8 +1008,12 @@ export interface NativeConversationChoice {
   pendingRequestKind: 'approval' | 'user_input' | null;
   /** 服务端基于队列、轮次和请求元数据计算的列表状态，避免列表刷新读取完整会话。 */
   listRuntimeState?: 'connecting' | 'reconnecting' | 'paused' | 'queued' | 'ready' | 'streaming' | 'pending_approval' | 'pending_user_input' | 'error' | 'legacy_readonly';
+  /** 操作子会话仍在排队或执行，主会话的侧栏保持运行状态。 */
+  operationAgentRunning?: boolean;
   /** 与列表状态同源的任务运行状态，避免客户端从不完整元数据重复猜测。 */
   taskRunStatus?: 'not_started' | 'connecting' | 'reconnecting' | 'running' | 'waiting_user' | 'waiting_approval' | 'paused' | 'idle' | 'failed' | 'legacy_readonly';
+  /** 已下发或已保存的侧栏模型身份。 */
+  displayModel?: NativeModelIdentity;
   /** 异步待回复独立于运行状态；后台会话和历史未载入时仍显示提醒。 */
   hasPendingAsyncQuestion?: boolean;
   resumable: boolean;
@@ -1006,7 +1026,7 @@ export interface NativeConversationChoice {
 }
 
 export interface NativeAgentIdentity {
-  kind: 'codex' | 'pi' | 'copilot' | 'claude' | null;
+  kind: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude' | null;
   transport: 'app_server' | 'rpc' | 'sdk' | null;
   supportStatus: 'unavailable' | 'framework_only' | 'experimental' | 'verified';
   capabilitySnapshotId: string | null;
@@ -1023,7 +1043,7 @@ export interface NativeSessionIdentity {
 }
 
 export interface AgentCatalogItem {
-  kind: 'codex' | 'pi' | 'copilot' | 'claude';
+  kind: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
   displayName: string;
   transport: 'app_server' | 'rpc' | 'sdk';
   supportStatus: 'unavailable' | 'framework_only' | 'experimental' | 'verified';
@@ -1070,7 +1090,7 @@ export interface CodexTaskPushModelCapability {
   id: string;
   model: string;
   displayName?: string;
-  agentKind?: 'codex' | 'pi' | 'copilot';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
   sourceId?: string;
   sourceName?: string;
   available?: boolean;
@@ -1451,7 +1471,7 @@ export interface TaskIntegrationConflictFile {
 
 export interface TaskIntegrationConflictAiSession {
   path: string;
-  agentKind: 'codex' | 'pi' | 'copilot';
+  agentKind: 'codex' | 'pi' | 'copilot' | 'antigravity';
   modelSourceId: string | null;
   modelId: string;
   conversationId: string;
@@ -1482,7 +1502,7 @@ export interface NativeTurnSettingsSelection {
   /** 下一轮选择的上下文容量。 */
   contextCapacityTokens?: number | null;
   model: string;
-  agentKind?: 'codex' | 'pi' | 'copilot';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
   effort?: string;
   serviceTier?: string | null;
   permissionMode: NativePermissionMode;
@@ -1493,6 +1513,8 @@ export interface NativeTurnSettingsSelection {
   computerUseRequested?: boolean;
   displayText?: string;
   promptText?: string;
+  /** 本地排队编辑所需的引用位置。 */
+  composerTokens?: import('./StructuredComposerInput.js').StructuredToken[];
 }
 
 export interface PluginSkillReference {
@@ -1503,7 +1525,7 @@ export interface PluginSkillReference {
 export interface StartTaskModelPushRequest {
   /** 上下文窗口容量；空值使用默认。 */
   contextCapacityTokens?: number | null;
-  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
   mode: 'create';
   source: 'task_push';
   stageId?: string;
@@ -1563,7 +1585,7 @@ export type StartNativeConversationRequest =
       effort?: string;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
       goalObjective?: string;
       pluginReferences?: PluginSkillReference[];
       expertMentions?: Array<{ employeeId: string }>;
@@ -1578,7 +1600,7 @@ export type StartNativeConversationRequest =
       collaborationMode: NativeCollaborationMode;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
     }
   | {
       mode: 'reference_legacy';
@@ -1589,7 +1611,7 @@ export type StartNativeConversationRequest =
       collaborationMode: NativeCollaborationMode;
       idempotencyKey: string;
       clientUserMessageId: string;
-      agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
     };
 
 export interface StartProjectConversationRequest {
@@ -1607,7 +1629,7 @@ export interface StartProjectConversationRequest {
   inheritConversationId?: string;
   worktree?: ConversationWorktreeOptions;
   workspaceMode?: 'direct' | 'worktree';
-  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
   mode: 'create';
   content: string;
   attachments: NativeConversationAttachment[];
@@ -1633,7 +1655,7 @@ export interface SendNativeMessageRequest {
   contextCapacityTokens?: number | null;
   /** 绑定原始异步问题，沿用现有提交及确认链路。 */
   questionAnswer?: AsyncQuestionAnswer;
-  agentKind?: 'codex' | 'pi' | 'copilot' | 'claude';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
   content: string;
   displayText?: string;
   composerDraft?: string;
@@ -1725,6 +1747,8 @@ type NativeTurnEventPayload = NativeEventIdentity & {
   startedAt?: string;
   completedAt?: string;
   hasUnreadAttention?: boolean;
+  /** 无交接正文时也由轮次终态标记操作交接。 */
+  operationHandoff?: true;
   /** 轮次终态携带结算后的权威队列，与失败状态同时接管界面。 */
   queue?: NativeQueueSnapshot;
 };

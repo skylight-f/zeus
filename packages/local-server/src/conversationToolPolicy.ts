@@ -1,6 +1,6 @@
 import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
-import type { ConversationCollaborationMode, ConversationPermissionMode } from '@zeus/storage';
+import type { ConversationPermissionMode } from '@zeus/storage';
 
 /** 后续输入只能沿用更严格的权限；相同目录边界下人工审批比自动审批更严格。 */
 export function restrictToolPermission(permission: ConversationPermissionMode, ceiling: ConversationPermissionMode): ConversationPermissionMode {
@@ -98,8 +98,4 @@ export function resolveConversationToolPath(input: { cwd: string; path: string; 
   if (writableRoots.some((root) => toolPathInside(path, canonicalToolPath(root)))) return { path, requiresApproval: false };
   if (!input.write && [...systemReadableRoots, ...input.readableRoots, ...writableRoots].some((root) => toolPathInside(path, canonicalToolPath(root)))) return { path, requiresApproval: false };
   return { path, requiresApproval: true };
-}
-
-export function effectiveToolPermission(permission: ConversationPermissionMode, mode: ConversationCollaborationMode): ConversationPermissionMode {
-  return mode === 'plan' ? 'read-only' : permission;
 }

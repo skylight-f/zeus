@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isManagedAgentKind } from '@zeus/ai-runtime';
 import {
   type AutomationActionConfig,
   type AutomationExecutionReference,
@@ -36,7 +37,7 @@ import {
 } from '@zeus/storage';
 import type { FastifyInstance } from 'fastify';
 import { commandCenterCommandTypes, commandCenterInputSha256 } from './commandCenterCommandApplication.js';
-import type { ConversationCapabilityQueryApplication } from './conversationCapabilityQueryApplication.js';
+import { resolveModelCapability, type ConversationCapabilityModel, type ConversationCapabilityQueryApplication } from './conversationCapabilityQueryApplication.js';
 import { conversationWorkExecutionState } from './conversationWorkExecutionState.js';
 import type { TaskStageApplication } from './taskStageApplication.js';
 import type { CreateUserTaskInput } from './workManagementCoreCommandRoutes.js';
@@ -61,6 +62,8 @@ interface DigitalEmployeeOrchestratorOptions {
     executionId: string | null;
     source: string;
     sourceRef: string;
+    /** 已有任务的本次自动化指令，由项目流程入口判断是否能接纳。 */
+    automationInstruction?: string;
     context?: { permissionMode: 'read-only' | 'auto' | 'auto-review' | 'full-access' };
     /** 异步流程预检结束后，在接纳事务内复核自动化控制状态。 */
     assertCanAccept?: () => void;
@@ -112,6 +115,8 @@ export interface DigitalEmployeeOrchestrator {
     taskId: string;
     employeeId: string;
     sourceRef: string;
+    /** 已有任务使用冻结指令作为本次执行输入。 */
+    automationInstruction?: string;
     bypassWorkflow?: boolean;
     permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
     /** 每个新接纳分支在写入前调用，原回执重放不受影响。 */
@@ -192,6 +197,8 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     source: DigitalEmployeeExecutionSource;
     sourceRef: string;
     eventIdentity?: string;
+    /** 从本次运行的冻结修订取指令，新建任务已通过需求正文提供。 */
+    automationInstruction?: string;
     /** 调研工作不进入项目研发流程。 */
     bypassWorkflow?: boolean;
     /** 自动化权限只能收紧员工和任务的既有授权。 */
@@ -210,6 +217,7 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
         executionId: null,
         source: input.source,
         sourceRef: input.sourceRef,
+        ...(input.automationInstruction ? { automationInstruction: input.automationInstruction } : {}),
         ...(input.permissionMode ? { context: { permissionMode: input.permissionMode } } : {}),
         assertCanAccept: input.assertCanAccept,
       });
@@ -225,6 +233,7 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
         taskId: input.task.id,
         employeeId: input.employee.id,
         sourceRef: input.sourceRef,
+        automationInstruction: input.automationInstruction,
         permissionMode: input.permissionMode,
         assertCanAccept: input.assertCanAccept,
       });
@@ -237,7 +246,14 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
       return null;
     }
     const sourceRef = input.source === 'task_pool' ? input.sourceRef : `${input.employee.id}:${input.sourceRef}`;
-    const created = await options.taskWorkManagement.createAutomatedWorkItem({ taskId: input.task.id, employeeId: input.employee.id, sourceRef, permissionMode: input.permissionMode, assertCanAccept: input.assertCanAccept });
+    const created = await options.taskWorkManagement.createAutomatedWorkItem({
+      taskId: input.task.id,
+      employeeId: input.employee.id,
+      sourceRef,
+      automationInstruction: input.automationInstruction,
+      permissionMode: input.permissionMode,
+      assertCanAccept: input.assertCanAccept,
+    });
     if (input.automation && input.eventIdentity) options.automations.recordEventReceipt({ automationId: input.automation.id, eventIdentity: input.eventIdentity, executionId: null, createdAt: now().toISOString() });
     options.taskEvents.create({
       taskId: input.task.id,
@@ -298,12 +314,14 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
     if (skillSelection.invalidIds.length > 0) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_SKILL_INVALID', '数字员工执行快照包含无效的 Skill 身份。', false);
     const nativeSkillId = skillSelection.nativeSkillIds[0] ?? null;
     const capability = await options.conversationCapabilities.readTaskPush(project.id, task.id);
-    const models = Array.isArray(capability.models) ? capability.models.filter(isCapabilityModel).filter((candidate) => candidate.agentKind === snapshot.agentKind) : [];
+    const models = Array.isArray(capability.models) ? capability.models.filter(isCapabilityModel) : [];
+    /** 历史员工配置的裸模型名仍用原供应商范围消歧。 */
+    const compatibleModels = models.filter((candidate) => candidate.agentKind === snapshot.agentKind);
     const preferredModel = typeof capability.preferredModel === 'string' ? capability.preferredModel : null;
     const configuredModel = snapshot.model?.trim() || null;
     const model = configuredModel
-      ? (models.find((candidate) => candidate.id === configuredModel || candidate.model === configuredModel) ?? null)
-      : ((preferredModel ? models.find((candidate) => candidate.id === preferredModel || candidate.model === preferredModel) : null) ?? models.find((candidate) => candidate.available) ?? null);
+      ? (models.find((candidate) => candidate.id === configuredModel) ?? resolveModelCapability(compatibleModels, configuredModel))
+      : (resolveModelCapability(models, preferredModel) ?? compatibleModels.find((candidate) => candidate.available) ?? null);
     if (!model || model.available === false) {
       throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_MODEL_UNAVAILABLE', snapshot.model ? `数字员工配置的模型当前不可用：${snapshot.model}` : '当前项目没有可供数字员工运行的模型。', false);
     }
@@ -884,7 +902,16 @@ export function createDigitalEmployeeOrchestrator(options: DigitalEmployeeOrches
       if (!task || task.projectId !== input.projectId) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_TASK_UNAVAILABLE', '自动化目标任务已不可用。', false);
       const employee = options.employees.ensureProjectEmployee(input.projectId, input.employeeId);
       if (!employee.enabled) throw orchestratorError('ZEUS_DIGITAL_EMPLOYEE_DISABLED', '自动化选择的员工未启用。', false);
-      return queueExecution({ employee, task, source: 'automation', sourceRef: input.sourceRef, bypassWorkflow: input.bypassWorkflow, permissionMode: input.permissionMode, assertCanAccept: input.assertCanAccept });
+      return queueExecution({
+        employee,
+        task,
+        source: 'automation',
+        sourceRef: input.sourceRef,
+        automationInstruction: input.automationInstruction,
+        bypassWorkflow: input.bypassWorkflow,
+        permissionMode: input.permissionMode,
+        assertCanAccept: input.assertCanAccept,
+      });
     },
     kick: () => {
       if (timer) clearTimeout(timer);
@@ -1010,8 +1037,8 @@ function deliveryStageLabel(stage: 'commit' | 'push' | 'merge'): string {
   return '合入';
 }
 
-function isCapabilityModel(value: unknown): value is { id: string; model: string; agentKind: 'codex' | 'pi' | 'copilot'; available: boolean } {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.model === 'string' && (value.agentKind === 'codex' || value.agentKind === 'pi' || value.agentKind === 'copilot') && typeof value.available === 'boolean';
+function isCapabilityModel(value: unknown): value is Pick<ConversationCapabilityModel, 'id' | 'model' | 'sourceId' | 'agentKind' | 'available'> {
+  return isRecord(value) && typeof value.id === 'string' && typeof value.model === 'string' && (value.agentKind === 'codex' || isManagedAgentKind(value.agentKind)) && typeof value.available === 'boolean';
 }
 
 function isRepositoryCapability(value: unknown): value is { id: string; name: string; suggestedBranchName: string; sourceRefs: Array<{ ref: string; kind: string; current: boolean }> } {

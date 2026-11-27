@@ -4,9 +4,9 @@ import console from 'node:console';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createInitialSessionState, sessionReducer } from '../apps/desktop/src/renderer/session/sessionReducer.ts';
-import { ConversationCapabilityQueryApplication } from '../packages/local-server/src/conversationCapabilityQueryApplication.ts';
-import { createCodexRuntimeGenerationManager } from '../packages/ai-runtime/src/codexRuntimeGenerationManager.ts';
+import { createInitialSessionState, sessionReducer } from '../apps/desktop/dist/renderer/session/sessionReducer.js';
+import { ConversationCapabilityQueryApplication } from '../packages/local-server/dist/conversationCapabilityQueryApplication.js';
+import { createCodexRuntimeGenerationManager } from '../packages/ai-runtime/dist/codexRuntimeGenerationManager.js';
 
 /** 只核对内存消息状态，不访问生产队列或模型。 */
 function checkMessageProjection() {

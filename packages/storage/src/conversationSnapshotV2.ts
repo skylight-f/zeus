@@ -9,6 +9,7 @@ import {
   type ConversationInformation,
   conversationNavigationExcerpt,
   conversationQuestionNavigationExcerpt,
+  redactConversationPreviewText as redactSensitivePreview,
   type ConversationNavigationEntry,
   type ConversationNavigationSnapshot,
   type ConversationProcessGroup,
@@ -29,14 +30,14 @@ import {
 } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
 import { type ArtifactRef, type ArtifactStore, artifactStoreGeneration } from './artifactStore.js';
-import { conversationSchemaGeneration, type ConversationSessionMetricsSnapshot, readConversationSessionMetrics } from './conversationExecutionStore.js';
-import { ConversationTranscriptRepository, providerFacet } from './conversationTranscriptStore.js';
+import { conversationResourceCapturePrefix, conversationSchemaGeneration, type ConversationSessionMetricsSnapshot, modelHistoryContentWithToolProjectionSql, readConversationSessionMetrics } from './conversationExecutionStore.js';
+import { ConversationTranscriptRepository, modelHistoryVisibleInTranscriptSql, providerFacet } from './conversationTranscriptStore.js';
 import { createHash } from 'node:crypto';
 import { inputSuggestionUserTurnSql } from './inputSuggestionStore.js';
 import { ConversationSystemMessageRepository } from './conversationSystemMessageStore.js';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { conversationImageAttachmentRef, CodexUsageLedgerRepository } from './conversationStore.js';
+import { conversationDialogueWhitespaceSql, conversationImageAttachmentRef, CodexUsageLedgerRepository } from './conversationStore.js';
 
 export { conversationSnapshotV2StructureGeneration };
 
@@ -93,6 +94,27 @@ function conversationNavigationPlacement(row: ConversationNavigationPlacementRow
   };
 }
 
+/** 用户正文优先采用已保存的显示文本，执行输入可能包含额外的上下文。 */
+const modelHistoryUserDisplayTextSql = `COALESCE(NULLIF(json_extract(content_json, '$.displayText'), ''), NULLIF(json_extract(content_json, '$.taskPushLayout.displayText'), ''))`;
+
+/** 旧任务推送的布局只写入提交时，历史与引用都从同一提交补回显示文本。 */
+const modelHistoryTaskPushSubmissionSql = `FROM conversation_submissions AS submission
+   WHERE conversation_model_history.role = 'user'
+     AND submission.id = conversation_model_history.submission_id
+     AND submission.conversation_id = conversation_model_history.conversation_id
+     AND json_valid(conversation_model_history.content_json)
+     AND json_type(conversation_model_history.content_json, '$') = 'object'
+     AND json_type(conversation_model_history.content_json, '$.taskPushLayout') IS NULL
+     AND json_valid(submission.input_json)
+     AND json_type(submission.input_json, '$.taskPushLayout') = 'object'`;
+
+/** 旧任务推送的显示正文优先于保存的执行输入。 */
+const modelHistoryTaskPushDisplayTextSql = `COALESCE(
+       NULLIF(json_extract(conversation_model_history.content_json, '$.displayText'), ''),
+       NULLIF(json_extract(submission.input_json, '$.displayText'), ''),
+       NULLIF(json_extract(submission.input_json, '$.taskPushLayout.displayText'), ''),
+       json_extract(conversation_model_history.content_json, '$.text'))`;
+
 // 模型历史持久化的是结构化 JSON；普通会话正文只读取其中的可见文本，绝不能把内部 tool_call 包装层当作消息正文。
 // 用户消息的附件、任务布局、回答评论和网页评论是正文展示所需结构，保留原 JSON 交给 Renderer 还原；工具调用没有 text 字段，
 // 继续保留原 JSON 预览供结构分类，Renderer 会按 toolPairId/type 将其从消息流排除。
@@ -101,28 +123,16 @@ function conversationNavigationPlacement(row: ConversationNavigationPlacementRow
 // 展示短文案必须先替换 text，再截断 JSON；否则首屏会读到执行原文，全文到达后才切换摘要。
 const modelHistoryVisibleContentSql = `COALESCE(
   (SELECT json_patch(conversation_model_history.content_json, json_object(
-     'text', COALESCE(
-       NULLIF(json_extract(conversation_model_history.content_json, '$.displayText'), ''),
-       NULLIF(json_extract(submission.input_json, '$.displayText'), ''),
-       NULLIF(json_extract(submission.input_json, '$.taskPushLayout.displayText'), ''),
-       json_extract(conversation_model_history.content_json, '$.text')),
+     'text', ${modelHistoryTaskPushDisplayTextSql},
      'taskPushLayout', json_extract(submission.input_json, '$.taskPushLayout'),
      'attachments', COALESCE(json_extract(conversation_model_history.content_json, '$.attachments'), json_extract(submission.input_json, '$.attachments'), json('[]'))
    ))
-   FROM conversation_submissions AS submission
-   WHERE conversation_model_history.role = 'user'
-     AND submission.id = conversation_model_history.submission_id
-     AND submission.conversation_id = conversation_model_history.conversation_id
-     AND json_valid(conversation_model_history.content_json)
-     AND json_type(conversation_model_history.content_json, '$') = 'object'
-     AND json_type(conversation_model_history.content_json, '$.taskPushLayout') IS NULL
-     AND json_valid(submission.input_json)
-     AND json_type(submission.input_json, '$.taskPushLayout') = 'object'),
+   ${modelHistoryTaskPushSubmissionSql}),
   CASE
   WHEN conversation_model_history.role = 'user'
    AND json_valid(content_json)
-   AND COALESCE(NULLIF(json_extract(content_json, '$.displayText'), ''), NULLIF(json_extract(content_json, '$.taskPushLayout.displayText'), '')) IS NOT NULL
-    THEN json_set(content_json, '$.text', COALESCE(NULLIF(json_extract(content_json, '$.displayText'), ''), NULLIF(json_extract(content_json, '$.taskPushLayout.displayText'), '')))
+   AND ${modelHistoryUserDisplayTextSql} IS NOT NULL
+    THEN json_set(content_json, '$.text', ${modelHistoryUserDisplayTextSql})
   WHEN conversation_model_history.role = 'user'
    AND json_valid(content_json)
    AND (
@@ -134,7 +144,7 @@ const modelHistoryVisibleContentSql = `COALESCE(
     THEN content_json
   WHEN json_valid(content_json) AND json_type(content_json, '$.text') = 'text'
     THEN json_extract(content_json, '$.text')
-  ELSE content_json
+  ELSE ${modelHistoryContentWithToolProjectionSql('conversation_model_history')}
 END)`;
 const modelHistoryUserProviderItemSql = `(SELECT message.provider_item_id
   FROM conversation_submissions AS submission
@@ -187,12 +197,33 @@ const modelHistoryReasoningSummarySql = `CASE
 END`;
 /** 对话列表、引用正文和正文句柄共用的可见对话边界，排除工具配对与思考摘要。 */
 const modelHistoryDialogueSql = `role IN ('user', 'assistant') AND tool_pair_id IS NULL AND COALESCE(${modelHistoryReasoningSummarySql}, 0) = 0`;
+
+/** 可用性与实际发送共用正文投影，列表查询无需组装附件和任务布局。 */
+const confirmedDialogueRowsSql = `FROM (
+  SELECT role, sequence, CASE WHEN json_valid(content_json) THEN
+    CASE json_type(content_json)
+      WHEN 'text' THEN json_extract(content_json, '$')
+      WHEN 'object' THEN COALESCE(
+        CASE WHEN role = 'user' THEN COALESCE(
+          (SELECT ${modelHistoryTaskPushDisplayTextSql} ${modelHistoryTaskPushSubmissionSql}),
+          ${modelHistoryUserDisplayTextSql}
+        ) END,
+        CASE WHEN json_type(content_json, '$.text') = 'text' THEN json_extract(content_json, '$.text') END
+      )
+    END
+    ELSE content_json
+  END AS text
+  FROM conversation_model_history
+  WHERE conversation_id = ? AND ${modelHistoryDialogueSql} AND ${modelHistoryVisibleInTranscriptSql}
+)
+WHERE trim(text, ${conversationDialogueWhitespaceSql}) <> ''`;
 // 历史元数据按 Provider 消息身份取回；正文和时间只参与已有消息身份映射，不用于猜测问题。
 const modelHistoryAssistantMetadataSql = `COALESCE(
   CASE WHEN json_valid(content_json) THEN json_extract(content_json, '$.assistantMessage') ELSE NULL END,
   (SELECT json_object(
       'phase', COALESCE(json_extract(item.payload_projection_json, '$.phase'), item.phase),
       'delivery', json_extract(item.payload_projection_json, '$.delivery'),
+      'operationHandoff', json(CASE WHEN json_extract(item.payload_projection_json, '$.operationHandoff') = 1 THEN 'true' ELSE 'null' END),
       'questions', json_extract(item.payload_projection_json, '$.questions'))
      FROM conversation_provider_item_states AS item
     WHERE item.conversation_id = conversation_model_history.conversation_id
@@ -208,12 +239,23 @@ const modelHistoryAssistantMetadataSql = `COALESCE(
       AND message.role = 'assistant' AND json_valid(message.metadata_json)
     LIMIT 1)
 )`;
-// SQL 只根据明确的异步交付字段排除完成锚点；完整分类统一在 mapModelHistoryRows 中执行。
+// 异步问题和操作交接不能占用最终正文锚点；完整分类在 mapModelHistoryRows 中执行。
 const modelHistoryAssistantPhaseSql = `CASE
   WHEN json_valid(reasoning_source_json) AND json_extract(reasoning_source_json, '$.itemType') = 'plan' THEN 'plan'
-  WHEN json_extract(${modelHistoryAssistantMetadataSql}, '$.delivery') = 'async' THEN 'prework'
+  WHEN json_extract(${modelHistoryAssistantMetadataSql}, '$.delivery') = 'async'
+    OR json_extract(${modelHistoryAssistantMetadataSql}, '$.operationHandoff') = 1 THEN 'prework'
   ELSE json_extract(${modelHistoryAssistantMetadataSql}, '$.phase')
 END`;
+/** 轮次最终正文的筛选条件，与普通会话的完成输出共用。 */
+const modelHistoryCompletionOutputSql = `role = 'assistant' AND tool_pair_id IS NULL
+  AND (
+    ${modelHistoryAssistantPhaseSql} IN ('final_answer', 'finalAnswer', 'plan')
+    OR (${modelHistoryAssistantPhaseSql} IS NULL AND ${modelHistoryReasoningSummarySql} = 0)
+  )
+  AND (NOT json_valid(content_json) OR COALESCE(json_extract(content_json, '$.type'), '') <> 'tool_call')`;
+/** 命名使用已保存的非空正文，过程消息和可读思考摘要不消耗完整回复机会。 */
+const modelHistoryCompletedReplySql = `${modelHistoryCompletionOutputSql}
+  AND ${modelHistoryReasoningSummarySql} = 0 AND length(trim(${modelHistoryVisibleContentSql}, char(9, 10, 13, 32, 12288))) > 0`;
 // 答复关联复用提交账本，历史分页与重启无需另建答复队列。
 const modelHistoryQuestionAnswerSql = `(SELECT json_extract(submission.input_json, '$.questionAnswer')
   FROM conversation_submissions AS submission
@@ -958,6 +1000,7 @@ export class ConversationSnapshotV2Repository {
       LEFT JOIN conversation_transcript_entries AS transcript_entry
         ON transcript_entry.conversation_id = transcript_alias.conversation_id AND transcript_entry.id = transcript_alias.entry_id
       WHERE conversation_model_history.conversation_id = ?
+        AND ${modelHistoryVisibleInTranscriptSql}
         AND conversation_model_history.role IN ('user', 'assistant') AND tool_pair_id IS NULL
         AND (NOT json_valid(content_json) OR COALESCE(json_extract(content_json, '$.type'), '') <> 'tool_call')
         -- 来源记录也用于普通答复；沿用正文分类，只排除可读思考摘要。
@@ -987,12 +1030,8 @@ export class ConversationSnapshotV2Repository {
       const questionAnswer = row.question_answer_json ? this.questionAnswer(conversationId, row.question_answer_json) : null;
       /** 已回答卡片预览展示用户选择，不以助手最终答复覆盖。 */
       const questionExcerpt = questionAnswer ? conversationQuestionNavigationExcerpt({ questions: questionAnswer.questions }, { answers: questionAnswer.answers }) : null;
-      /** Provider 消息短 ID 只在所属 turn 内稳定；跨轮复用时必须保留两条独立发言。 */
-      const identity = row.client_user_message_id
-        ? `client:${row.client_user_message_id}`
-        : row.provider_item_id
-          ? `provider:${encodeURIComponent(row.provider_turn_id ?? row.turn_id)}:${encodeURIComponent(row.provider_item_id)}`
-          : `history:${row.id}`;
+      /** 客户端身份能连接发送前后两份投影，缺失时使用模型身份或历史身份。 */
+      const identity = row.client_user_message_id ? `client:${row.client_user_message_id}` : row.provider_item_id ? `provider:${row.provider_item_id}` : `history:${row.id}`;
       if (!entries.has(identity))
         entries.set(identity, {
           id: row.id,
@@ -1119,6 +1158,33 @@ export class ConversationSnapshotV2Repository {
     /** 所有正文及内容句柄仍绑定调用方指定的同一会话。 */
     const conversationId = requiredIdentity(conversationIdValue, 'conversationId');
     return this.latestTurnsByStatus(conversationId, ['completed', 'interrupted', 'failed'], 3).map((turn) => this.toTurnSummary(conversationId, turn));
+  }
+
+  /** 实时读取指定的成功回合；恢复时读取最近一次保存了用户消息和完整回复的成功回合。 */
+  readCompletedReply(conversationId: string, turnIdentity?: string): { turnId: string; question: string; answer: string } | null {
+    /** 既接收本地轮次身份，也接收 Provider 事件携带的轮次身份。 */
+    const turnId = turnIdentity ? this.resolveTurnId(conversationId, turnIdentity) : null;
+    if (turnIdentity && !turnId) return null;
+    /** 仅在恢复时从多轮历史中选择最近一次可用答复。 */
+    const turn = this.db.get<{ id: string }>(
+      `SELECT turn.id FROM conversation_turns AS turn
+       WHERE turn.conversation_id = ? AND turn.status = 'completed'
+         ${turnId ? 'AND turn.id = ?' : ''}
+         AND EXISTS (
+           SELECT 1 FROM conversation_model_history
+           WHERE conversation_id = turn.conversation_id AND turn_id = turn.id AND role = 'user'
+         )
+         AND EXISTS (
+           SELECT 1 FROM conversation_model_history
+           WHERE conversation_id = turn.conversation_id AND turn_id = turn.id AND ${modelHistoryCompletedReplySql}
+         )
+       ORDER BY turn.created_at DESC, turn.id DESC LIMIT 1`,
+      turnId ? [conversationId, turnId] : [conversationId],
+    );
+    if (!turn) return null;
+    /** 复用界面采用的正文投影，保留同一回合中的用户问题与最终回复。 */
+    const answer = this.completionOutput(conversationId, turn.id, true)?.content.preview;
+    return answer?.trim() ? { turnId: turn.id, question: this.openingUserMessage(conversationId, turn.id)?.content.preview ?? '', answer } : null;
   }
 
   /** 自动预测只把真实用户轮次视为新回复，内部压缩不替换完成锚点。 */
@@ -1330,7 +1396,20 @@ export class ConversationSnapshotV2Repository {
     const items = this.db
       .select<{ kind: string; detail_json: string }>(`SELECT kind, detail_json FROM conversation_process_items WHERE conversation_id = ? AND kind IN ('tool', 'command') ORDER BY process_sequence`, [conversationId])
       .map((row) => conversationProcessPresentation(row.kind, parseJsonRecordOrNull(row.detail_json)));
-    return { cost: conversationCostBreakdown(requests), resources: conversationUsedResources(items, selectedSkills) };
+    /** 活动轮次和未保留采集证据的历史都不能确认空清单。 */
+    const capture = this.db.get<{ complete: number }>(
+      `WITH observed_turns AS (
+         SELECT id AS turn_id FROM conversation_turns WHERE conversation_id = ? AND provider_turn_id IS NOT NULL
+         UNION
+         SELECT turn_id FROM conversation_model_history WHERE conversation_id = ? AND role = 'assistant'
+       )
+       SELECT COUNT(*) > 0 AND COUNT(*) = COUNT(capture.id) AS complete
+       FROM observed_turns
+       LEFT JOIN conversation_timeline_events AS capture
+         ON capture.id = ? || observed_turns.turn_id AND capture.conversation_id = ? AND capture.event_kind = 'resource_usage_captured'`,
+      [conversationId, conversationId, conversationResourceCapturePrefix, conversationId],
+    );
+    return { cost: conversationCostBreakdown(requests), resources: conversationUsedResources(items, selectedSkills, capture?.complete === 1) };
   }
 
   /** 有界核对当前已加载显示身份的位置和显式删除状态。 */
@@ -1454,6 +1533,7 @@ export class ConversationSnapshotV2Repository {
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
         WHERE conversation_id = ? AND sequence ${context.direction === 'tail' ? '<' : '>'} ? AND sequence <= ?${dialogueWhere}
+          AND ${modelHistoryVisibleInTranscriptSql}
           ${input.assistantOutputOnly ? `AND ${modelHistoryDialogueSql} AND role = 'assistant'` : ''}
         ORDER BY sequence ${context.direction === 'tail' ? 'DESC' : 'ASC'}
         LIMIT ?`,
@@ -1485,7 +1565,7 @@ export class ConversationSnapshotV2Repository {
     const context = this.sequencePageContext({ ...input, conversationId }, 'model_history', `turn:${turnId}${input.dialogueOnly ? (input.includeReasoningSummaries ? ':dialogue-with-summary' : ':dialogue') : ''}`, {
       table: 'conversation_model_history',
       column: 'sequence',
-      extraWhere: ` AND turn_id = ?${dialogueWhere}`,
+      extraWhere: ` AND turn_id = ? AND ${modelHistoryVisibleInTranscriptSql}${dialogueWhere}`,
       extraParams: [turnId],
     });
     const rows = this.db.select<ModelHistoryProjectionRow>(
@@ -1514,7 +1594,7 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND turn_id = ?${dialogueWhere}
+        WHERE conversation_id = ? AND turn_id = ? AND ${modelHistoryVisibleInTranscriptSql}${dialogueWhere}
           AND sequence ${context.direction === 'tail' ? '<' : '>'} ? AND sequence <= ?
         ORDER BY sequence ${context.direction === 'tail' ? 'DESC' : 'ASC'}
         LIMIT ?`,
@@ -1554,7 +1634,7 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND sequence < ? AND sequence <= ?
+        WHERE conversation_id = ? AND sequence < ? AND sequence <= ? AND ${modelHistoryVisibleInTranscriptSql}
         ORDER BY sequence DESC
         LIMIT ?`,
       [previewCharacterLimit, conversationId, beforeSequence, throughSequence, limits.entryLimit + 1],
@@ -1636,7 +1716,7 @@ export class ConversationSnapshotV2Repository {
               substr(detail_json, 1, ?) AS detail_preview,
               length(CAST(detail_json AS BLOB)) AS detail_bytes,
               length(detail_json) AS detail_characters,
-              CASE WHEN kind = 'waiting' THEN detail_json
+              CASE WHEN kind IN ('waiting', 'warning') THEN detail_json
                    /* 原生工具和 Pi 共用有界身份字段，长结果截断也不能丢失操作来源与终态。 */
                    WHEN kind IN ('tool', 'command') THEN
                      json_object('provider', json_extract(detail_json, '$.provider'), 'itemType', json_extract(detail_json, '$.itemType'), 'payload', json_object(
@@ -1683,8 +1763,13 @@ export class ConversationSnapshotV2Repository {
         sourceEventId: row.source_event_id,
         startedAt: row.started_at,
         completedAt: row.completed_at,
-        // 工具元数据单独有界读取，预览截断也不丢类型、参数和目标；敏感文本沿用同一脱敏规则。
-        presentation: row.kind === 'waiting' ? recoveredRequestUserInputPresentation(row.presentation_json) : parseJsonRecordOrNull(row.presentation_json ? redactSensitivePreview(row.presentation_json).text : null),
+        // 独立投影保留工具身份和脱敏诊断，即使正文预览被截断也能查看错误原因。
+        presentation:
+          row.kind === 'waiting'
+            ? recoveredRequestUserInputPresentation(row.presentation_json)
+            : row.kind === 'warning'
+              ? { payload: conversationProcessPresentation(row.kind, parseJsonRecordOrNull(row.presentation_json), row.completed_at ?? row.started_at).payload }
+              : parseJsonRecordOrNull(row.presentation_json ? redactSensitivePreview(row.presentation_json).text : null),
         detail: boundedProjection(
           row.detail_preview,
           row.detail_bytes,
@@ -2035,6 +2120,16 @@ export class ConversationSnapshotV2Repository {
     return row ? redactSensitivePreview(row.content).text : null;
   }
 
+  /** 读取已确认的可见正文，任务推送在生成发送快照前执行脱敏。 */
+  readConfirmedDialogue(conversationId: string): Array<{ role: 'user' | 'assistant'; text: string }> {
+    return this.db.select(`SELECT role, text ${confirmedDialogueRowsSql} ORDER BY sequence`, [requiredIdentity(conversationId, 'conversationId')]);
+  }
+
+  /** 列出历史选项时只核对对话存在性，正文等到用户选择发送再读取。 */
+  hasConfirmedDialogue(conversationId: string): boolean {
+    return Boolean(this.db.get(`SELECT 1 ${confirmedDialogueRowsSql} LIMIT 1`, [requiredIdentity(conversationId, 'conversationId')]));
+  }
+
   /** 正文分页保持句柄身份、修订与脱敏校验；对话调用方可收紧内容类型。 */
   readContentPage(input: {
     conversationId: string;
@@ -2348,7 +2443,7 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND turn_id = ? AND role = 'user'
+        WHERE conversation_id = ? AND turn_id = ? AND role = 'user' AND ${modelHistoryVisibleInTranscriptSql}
         ORDER BY sequence
         LIMIT 1`,
       [previewCharacterLimit, conversationId, turnId],
@@ -2356,7 +2451,8 @@ export class ConversationSnapshotV2Repository {
     return row ? (this.mapModelHistoryRows(conversationId, [row])[0] ?? null) : null;
   }
 
-  private completionOutput(conversationId: string, turnId: string): ConversationModelHistoryPageItem | null {
+  /** 读取轮次的最后一条完成输出，命名可限定为非空正文。 */
+  private completionOutput(conversationId: string, turnId: string, requireReply = false): ConversationModelHistoryPageItem | null {
     const row = this.db.get<ModelHistoryProjectionRow>(
       `SELECT id, sequence, turn_id, submission_id,
               (SELECT client_message_id FROM conversation_submissions WHERE id = conversation_model_history.submission_id) AS client_user_message_id,
@@ -2374,15 +2470,10 @@ export class ConversationSnapshotV2Repository {
               length(CAST(${modelHistoryVisibleContentSql} AS BLOB)) AS content_bytes,
               length(${modelHistoryVisibleContentSql})               AS content_characters
          FROM conversation_model_history
-        WHERE conversation_id = ? AND turn_id = ? AND role = 'assistant' AND tool_pair_id IS NULL
-          AND (
-            ${modelHistoryAssistantPhaseSql} IN ('final_answer', 'finalAnswer', 'plan')
-            OR (${modelHistoryAssistantPhaseSql} IS NULL AND ${modelHistoryReasoningSummarySql} = 0)
-          )
-          AND (NOT json_valid(content_json) OR COALESCE(json_extract(content_json, '$.type'), '') <> 'tool_call')
+        WHERE conversation_id = ? AND turn_id = ? AND ${requireReply ? modelHistoryCompletedReplySql : modelHistoryCompletionOutputSql}
         ORDER BY sequence DESC
         LIMIT 1`,
-      [previewCharacterLimit, conversationId, turnId],
+      [requireReply ? 3_000 : previewCharacterLimit, conversationId, turnId],
     );
     return row ? (this.mapModelHistoryRows(conversationId, [row])[0] ?? null) : null;
   }
@@ -2633,7 +2724,7 @@ export class ConversationSnapshotV2Repository {
                 confirmed_at AS revision,
                 0 AS transitioning
            FROM conversation_model_history
-          WHERE conversation_id = ? AND sequence = ?${dialogueOnly ? ` AND ${modelHistoryDialogueSql}` : ''}`,
+          WHERE conversation_id = ? AND sequence = ? AND ${modelHistoryVisibleInTranscriptSql}${dialogueOnly ? ` AND ${modelHistoryDialogueSql}` : ''}`,
         [sliceStart, sliceCharacters, payload.conversationId, numericIdentity(payload.identity)],
       );
     }
@@ -3565,28 +3656,6 @@ function parseJsonRecordOrNull(value: string | null): Record<string, unknown> | 
   } catch {
     return null;
   }
-}
-
-function redactSensitivePreview(value: string): { text: string; redacted: boolean } {
-  const patterns: Array<[RegExp, string]> = [
-    [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/gu, '[REDACTED_PRIVATE_KEY]'],
-    [/\bBearer\s+[A-Za-z0-9._~+/-]{12,}={0,2}/giu, 'Bearer [REDACTED_TOKEN]'],
-    [/\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b/gu, '[REDACTED_TOKEN]'],
-  ];
-  let text = value;
-  let redacted = false;
-  for (const [pattern, replacement] of patterns) {
-    text = text.replace(pattern, () => {
-      redacted = true;
-      return replacement;
-    });
-  }
-  text = text.replace(/(?:"?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret)"?\s*[:=]\s*"?)[^"'\s,}]{8,}/giu, (match) => {
-    redacted = true;
-    const separator = Math.max(match.lastIndexOf(':'), match.lastIndexOf('='));
-    return `${match.slice(0, separator + 1)}[REDACTED_SECRET]`;
-  });
-  return { text, redacted };
 }
 
 function takeCodePointPrefixByBytes(value: string, byteLimit: number): { text: string; codePoints: number } {

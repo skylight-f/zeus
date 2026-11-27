@@ -3,7 +3,6 @@ import { jsonRequest, type LocalApiTransport } from '../../transport/localApiTra
 import type { AutomationRunRecord, AutomationTaskInput, AutomationTaskRecord } from './automationContracts.js';
 
 export interface AutomationApiClient {
-  loadAutomationRun(runId: string): Promise<AutomationRunRecord>;
   loadAutomations(): Promise<AutomationTaskRecord[]>;
   createAutomation(input: AutomationTaskInput): Promise<AutomationTaskRecord>;
   updateAutomation(automationId: string, expectedRevision: number, input: Partial<AutomationTaskInput>): Promise<AutomationTaskRecord>;
@@ -19,7 +18,6 @@ export interface AutomationApiClient {
 
 export function createAutomationApiClient(transport: LocalApiTransport): AutomationApiClient {
   return {
-    loadAutomationRun: (runId) => transport.request(`/api/automation-runs/${encodeURIComponent(runId)}`),
     loadAutomations: async () => (await transport.request<{ items: AutomationTaskRecord[] }>('/api/automations')).items,
     createAutomation: (input) => automationRequest(transport, '/api/automations', 'POST', input),
     updateAutomation: (automationId, expectedRevision, input) => automationRequest(transport, `/api/automations/${encodeURIComponent(automationId)}`, 'PATCH', { ...input, expectedRevision }),

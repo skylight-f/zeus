@@ -140,11 +140,11 @@ try {
     const malformedDraft = structuredClone(ordinaryDraft);
     (malformedDraft.nodes[0] as DigitalTeamEmployeeNode).data.acceptanceCriteria = ['有效标准', 7] as never;
     assert(validateDigitalTeamWorkflowDefinition(normalizeDigitalTeamWorkflowDefinition(malformedDraft)).length > 0, '非字符串标准必须继续被校验拒绝。');
-    /** 新模板保留模型与推理覆盖，清理已经移除的速度、工作模式和技能偏好。 */
+    /** 历史节点曾保存独立模型偏好，新模板不再复制这些执行默认值。 */
     const oldNodeSettings = { modelOverride: 'legacy-node-model', reasoningEffort: 'high', serviceTier: 'fast', workMode: 'plan' as const, skillIds: ['legacy-skill'], permissionMode: 'read-only' as const };
     /** 使用真实保存入口验证界面隐藏后不会继续保存无入口的配置。 */
     const settingsDefinition = definition([{ ...employeeNode('settings', employee.id, '读取项目默认'), data: { ...employeeNode('settings', employee.id, '读取项目默认').data, settings: oldNodeSettings } }], []);
-    /** 保存结果保留模型、推理与当前权限约束。 */
+    /** 保存结果只保留当前权限约束。 */
     const settingsTemplate = templates.create({ name: '统一运行默认', description: '', definition: settingsDefinition });
     assert(settingsTemplate.ready && JSON.stringify((settingsTemplate.definition.nodes[0] as DigitalTeamEmployeeNode).data.settings) === JSON.stringify(oldNodeSettings), '节点保存必须完整保留执行覆盖。');
     /** 冻结运行原样读取；模板归一化不能倒改已经接纳的工作。 */
@@ -2034,17 +2034,20 @@ async function verifyUnifiedAutomation(database: ZeusDatabasePort, projectId: st
     await reviewScheduler.close();
     assert(automationRuns.getById(first.id)?.status === (kind === 'employee_work' ? 'awaiting_review' : 'running'), '独立工作与项目任务必须保留不同验收边界。');
     assert(automationRuns.getById(first.id)?.completedAt === null && automationRuns.listInFlight().some((entry) => entry.id === first.id), '待验收仍继续对账，不能写成成功终态。');
-    /** 收件箱已由通知中心接管；下方按持久排队状态与实际派发次数核对。 */
+    assert(
+      automationRuns.listInbox().some((entry) => entry.id === third.id),
+      '排队运行必须出现在收件箱。',
+    );
     assert(
       dispatches === (kind === 'employee_work' ? 1 : 0) && automationRuns.getById(third.id)?.status === 'queued',
       `只能释放下一份独立工作：${kind} 接纳 ${dispatches} 次，第二份 ${automationRuns.getById(second.id)?.status} ${automationRuns.getById(second.id)?.errorMessage}，第三份 ${automationRuns.getById(third.id)?.status}。`,
     );
     if (kind === 'employee_work') {
-      /** 已读状态由独立通知仓库负责，本段只核对执行和验收边界。 */
+      automationRuns.acknowledge(first.id);
       /** 重启不会重复派发、重复标未读或误报成功。 */
       const restarted = createAutomationScheduler(reviewOptions);
       await restarted.close();
-      assert(dispatches === 1 && automationRuns.getById(first.id)?.status === 'awaiting_review' && automationRuns.getById(second.id)?.status === 'running', '待验收重启必须保留验收状态和实际执行占位。');
+      assert(dispatches === 1 && !automationRuns.getById(first.id)?.unread && automationRuns.getById(second.id)?.status === 'running', '待验收重启必须保留已读状态和实际执行占位。');
       reviewed = true;
       /** 人工验收后才完成原运行，不越过正在执行的第二份工作。 */
       const acceptedReview = createAutomationScheduler(reviewOptions);

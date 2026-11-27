@@ -1,4 +1,3 @@
-import type { SourceLanguageRequest, SourceLanguageResult } from '@zeus/shared';
 import type {
   ConversationFileLocation,
   ConversationOpenTarget,
@@ -14,8 +13,6 @@ import type {
   NetworkProxyConnectionResult,
   ProjectSourceContentSearchOptions,
   ProjectSourceContentSearchResult,
-  ProjectSourceTextSearchInput,
-  ProjectSourceTextSearchResult,
   ProjectSourceDirectorySnapshot,
   ProjectSourceDocument,
   ProjectSourceEntry,
@@ -30,6 +27,7 @@ import type {
   ZeusBrowserCommand,
   ZeusBrowserConversationSnapshot,
   ZeusBrowserEvent,
+  ZeusBrowserNativePage,
   ZeusBrowserPreparedSubmission,
   ZeusBrowserSettings,
   ZeusBrowserPasswordAccount,
@@ -74,6 +72,8 @@ type MenuBarUsageDetailBridgeBase = {
   appearance: 'light' | 'dark' | 'system';
   anchor: { x: number; y: number };
   pinned: boolean;
+  /** 所有模型行共享同一个供应商图标，不按条目重复传输图片。 */
+  provider?: import('@zeus/shared').UsageModelProviderAppearance;
 };
 
 /** 费用或模型速率明细使用可判别联合，Renderer 不猜测条目结构。 */
@@ -119,6 +119,8 @@ declare global {
       exitExecutionHostMaintenance: () => Promise<void>;
       restartAfterStartupFailure: () => Promise<void>;
       exitAfterStartupFailure: () => Promise<void>;
+      /** 交给独立监控打开本轮启动现场。 */
+      openStartupFaultReport: (detail: string) => Promise<void>;
       /** 启动耗时与主页可交互状态上报。 */
       reportStartupSpan: (input: { stage: string; durationMs: number }) => void;
       reportHomeInteractive: () => void;
@@ -153,8 +155,8 @@ declare global {
           | { taskId?: never; workspaceId?: never; projectId: string; conversationId?: never; repositoryId: string; pathPrefix?: string }
         ) & { /** 只准备当前范围，不显示窗口。 */ preload?: boolean },
       ) => Promise<{ opened: boolean; reused: boolean; taskId?: string; projectId?: string; conversationId?: string }>;
-      /** 真实绘制帧只上报类型与耗时，不传文件正文。 */
-      reportGitDeliveryFrame: (input: { kind: 'window' | 'diff'; durationMs?: number }) => void;
+      /** 绘制回执包含阶段、动效偏好或差异绘制耗时（毫秒）。 */
+      reportGitDeliveryFrame: (input: { kind: 'surface' | 'window' | 'diff'; durationMs?: number; reduceMotion?: boolean }) => void;
       /** 原生展示预热窗口后请求一次实际绘制回执。 */
       onGitDeliveryFrameRequested: (listener: () => void) => () => void;
       /** 提交期间立即隐藏窗口，失败时恢复并保留原有输入。 */
@@ -183,6 +185,8 @@ declare global {
       /** 按调用窗口身份读取展示快照，不接受其他窗口或本机路径。 */
       loadProjectGitDiffSnapshot: () => Promise<{ filePath: string; diff: import('./apiClient.js').GitDiffSummary }>;
       loadProjectGitWorkbench: (projectId: string, includePatches?: boolean) => Promise<import('./apiClient.js').ProjectGitWorkbenchSnapshot>;
+      /** 读取项目当前分支或本机候选引用。 */
+      loadProjectGitBranches: (projectId: string, includeReferences: boolean) => Promise<import('@zeus/git-core').ProjectGitBranchSelection>;
       /** 只读获取当前项目的耐久 Git 操作历史页。 */
       loadProjectGitOperations: (input: { projectId: string; cursor?: string }) => Promise<import('./apiClient.js').ProjectGitOperationPage>;
       loadProjectGitHistory: (input: { projectId: string; repositoryId: string; offset: number; ref?: string }) => Promise<{ commits: import('./apiClient.js').ProjectGitRepositorySnapshot['recentCommits']; hasMore: boolean }>;
@@ -198,13 +202,7 @@ declare global {
         summaryOnly?: boolean;
       }) => Promise<import('./apiClient.js').GitDiffSummary>;
       cancelProjectGitAction: (repositoryId: string) => Promise<{ cancelled: boolean }>;
-      executeProjectGitAction: (input: {
-        projectId: string;
-        repositoryId: string;
-        action: import('./apiClient.js').ProjectGitAction;
-      }) => Promise<
-        { schema: 'zeus-project-git-action-ipc-v1'; ok: true; value: import('./apiClient.js').ProjectGitActionResponse } | { schema: 'zeus-project-git-action-ipc-v1'; ok: false; error: import('@zeus/shared').UserFacingErrorCause }
-      >;
+      executeProjectGitAction: (input: { projectId: string; repositoryId: string; action: import('./apiClient.js').ProjectGitAction }) => Promise<import('./apiClient.js').ProjectGitActionResponse>;
       onTaskGitDeliveryCurrentContext: (listener: (context: { taskId: string | null; workspaceId: string | null; opened: boolean }) => void) => () => void;
       onTaskGitDeliveryAppearance: (listener: (settings: { language: 'zh-CN' | 'en-US'; appearance: 'light' | 'dark' | 'system' }) => void) => () => void;
       /** 独立仓库差异窗口沿用应用主题，返回取消订阅函数。 */
@@ -220,17 +218,34 @@ declare global {
       onRequestingWindowForegroundChanged: (listener: (foreground: boolean) => void) => () => void;
       hideMenuBarUsage: () => Promise<{ hidden: true }>;
       updateMenuBarUsageTray: (image: { dataUrl: string; darkDataUrl: string; tooltip: string }) => Promise<void>;
+      /** 菜单栏浮窗仅随内容调整高度，原生宽度保持 360px。 */
+      resizeMenuBarUsage: (height: number) => Promise<{ width: number; height: number }>;
+      /** 在指定屏幕锚点旁打开或更新独立透明费用明细窗口。 */
+      showMenuBarUsageCostDetail: (payload: MenuBarUsageCostDetailBridgePayload) => Promise<{ shown: true }>;
+      /** 未固定时延迟关闭费用明细，允许指针跨越原生窗口间距。 */
+      scheduleHideMenuBarUsageCostDetail: () => Promise<{ scheduled: true }>;
+      /** 指针进入触发器或明细窗口时取消延迟关闭。 */
+      cancelHideMenuBarUsageCostDetail: () => Promise<{ cancelled: true }>;
+      /** 立即关闭独立费用明细窗口。 */
+      hideMenuBarUsageCostDetail: () => Promise<{ hidden: true }>;
+      /** 独立费用 Renderer 读取首次展示数据。 */
+      getMenuBarUsageCostDetail: () => Promise<MenuBarUsageCostDetailBridgePayload | null>;
+      /** 独立费用 Renderer 按真实内容请求原生尺寸和位置。 */
+      resizeMenuBarUsageCostDetail: (width: number, height: number) => Promise<{ x: number; y: number; width: number; height: number }>;
+      /** 两个相关 Renderer 同步当前明细或关闭状态。 */
+      onMenuBarUsageCostDetailChanged: (listener: (payload: MenuBarUsageCostDetailBridgePayload | null) => void) => () => void;
       onMenuBarUsageSettingsChanged: (listener: (settings: { language: 'zh-CN' | 'en-US'; appearance: 'light' | 'dark' | 'system' }) => void) => () => void;
       showMainWindowFromMenuBarUsage: () => Promise<{ shown: boolean }>;
       openMenuBarUsageSettings: (category: 'usage' | 'runtime') => Promise<{ opened: boolean; category: 'usage' | 'runtime' }>;
       quitFromMenuBarUsage: () => Promise<{ quitting: true }>;
       /** 只读取项目已有的 worktree，切换结果复用源码工作区身份。 */
       listProjectSourceWorktrees: (projectId: string) => Promise<import('@zeus/shared').ProjectSourceWorktree[]>;
+      /** 查询本窗口已有工作树身份中确认消失的根目录。 */
+      findMissingProjectSourceWorktrees: (projectId: string, sourceIds: string[]) => Promise<string[]>;
       selectProjectSourceWorktree: (input: { projectId: string; worktreeId: string }) => Promise<import('@zeus/shared').FilePreviewSourceWorkspace>;
       listProjectSourceDirectory: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDirectorySnapshot>;
       searchProjectSourceEntries: (input: { projectId: string; query: string }) => Promise<ProjectSourceSearchResult>;
       searchProjectSourceContent: (input: { projectId: string; query: string } & ProjectSourceContentSearchOptions) => Promise<ProjectSourceContentSearchResult>;
-      searchProjectSourceText: (input: ProjectSourceTextSearchInput) => Promise<ProjectSourceTextSearchResult>;
       loadProjectSourceBlame: (input: { projectId: string; relativePath: string; ref?: string; expectedSha256?: string }) => Promise<GitFileBlame>;
       loadConversationSourceBlame: (input: { projectId: string; conversationId: string; resourceId: string; expectedSha256: string }) => Promise<GitFileBlame>;
 
@@ -263,9 +278,9 @@ declare global {
       loadFilePreviewBlame: (id: string) => Promise<GitFileBlame | null>;
       /** 在原生源码页打开主进程校验后的目标，沿用草稿离开保护。 */
       onFilePreviewSourceWorkspaceRequested: (listener: (workspace: import('@zeus/shared').FilePreviewSourceWorkspace) => void) => () => void;
-      requestProjectSourceLanguage: (input: SourceLanguageRequest) => Promise<SourceLanguageResult>;
-      releaseProjectSourceLanguage: (projectId: string) => Promise<void>;
       readProjectSourceFile: (input: { projectId: string; relativePath: string }) => Promise<ProjectSourceDocument>;
+      /** 返回该文件的 HEAD 正文；空字符串是有效基线，null 表示无法比较。 */
+      readProjectSourceGitBaseline: (input: { projectId: string; relativePath: string }) => Promise<string | null>;
       /** 项目内的草稿效果预览与相对资源读取。 */
       prepareProjectSourcePreview: (input: import('@zeus/shared').ProjectSourcePreviewRequest) => Promise<import('@zeus/shared').ProjectSourcePreviewGrant>;
       /** 资源授权绑定当前窗口，不保留已关闭页面。 */
@@ -383,6 +398,10 @@ declare global {
       /** 空值表示当前进程的更新入口已停用。 */
       onAutomaticUpdateIndicatorChanged: (listener: (state: AutomaticUpdateIndicatorState | null) => void) => () => void;
       listConversationResourceOpenTargets: (request: { projectId: string; conversationId: string; resourceId: string }) => Promise<{ resourceId: string; targets: ConversationResourceOpenTarget[] }>;
+      /** 本机编辑器及系统文件管理器。 */
+      listWorkingDirectoryOpenTargets: () => Promise<ConversationResourceOpenTarget[]>;
+      /** cwd 表示界面正在显示的目录，主进程按会话身份核对后打开。 */
+      openWorkingDirectory: (request: { projectId: string; conversationId: string; cwd: string; target: ConversationOpenTarget }) => Promise<void>;
       openConversationResource: (request: { projectId: string; conversationId: string; resourceId: string; target: ConversationOpenTarget; location?: ConversationFileLocation }) => Promise<{
         opened: boolean;
         resourceId: string;
@@ -450,6 +469,8 @@ declare global {
         language: 'zh-CN' | 'en-US';
         canSplit: boolean;
         expanded: boolean;
+        /** 以供应商连接 ID 索引的 2 倍 PNG，由应用 Renderer 绘制。 */
+        providerIcons?: Record<string, string>;
       }) => Promise<
         | 'new_tab'
         | 'close_tab'
@@ -477,6 +498,8 @@ declare global {
         | null
       >;
       getBrowserSnapshot: (conversationId: string) => Promise<ZeusBrowserConversationSnapshot>;
+      /** 打开 Chromium 原生管理页或官方商店。 */
+      openNativeBrowserPage?: (page: ZeusBrowserNativePage) => Promise<boolean>;
       openBrowserTab: (input: { conversationId: string; url?: string }) => Promise<ZeusBrowserConversationSnapshot>;
       /** 首发受理后迁移草稿网页，仅将本次提交的批注标记为已发送。 */
       adoptBrowserDraft: (input: { sourceConversationId: string; conversationId: string; commentIds: string[] }) => Promise<ZeusBrowserConversationSnapshot>;
@@ -500,6 +523,8 @@ declare global {
       getBrowserSettings: () => Promise<ZeusBrowserSettings>;
       /** 密码管理只接收元数据、冲突来源与统计回执。 */
       listBrowserPasswords: () => Promise<ZeusBrowserPasswordAccount[]>;
+      /** 获取用户在密码设置中主动展开的单条密码。 */
+      revealBrowserPassword: (origin: string, id: string) => Promise<string>;
       prepareBrowserPasswordImport: () => Promise<ZeusBrowserPasswordImportPreview | null>;
       cancelBrowserPasswordImport: (token: string) => Promise<void>;
       commitBrowserPasswordImport: (input: { token: string; choices: Record<string, number> }) => Promise<ZeusBrowserPasswordImportResult>;

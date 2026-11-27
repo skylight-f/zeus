@@ -1,4 +1,14 @@
-export type AgentKind = 'codex' | 'pi' | 'copilot' | 'claude';
+import type { TokenUsageBreakdown } from '@zeus/shared';
+
+export type AgentKind = 'codex' | 'pi' | 'copilot' | 'antigravity' | 'claude';
+
+/** 会话由 Zeus 的托管运行时编排持久派发。 */
+export type ManagedAgentKind = Extract<AgentKind, 'pi' | 'copilot' | 'antigravity'>;
+
+/** 将托管 Provider 和 app-server/legacy Provider 的路由分开。 */
+export function isManagedAgentKind(kind: unknown): kind is ManagedAgentKind {
+  return kind === 'pi' || kind === 'copilot' || kind === 'antigravity';
+}
 
 export type AgentTransportKind = 'app_server' | 'rpc' | 'sdk';
 
@@ -133,6 +143,13 @@ export interface AgentRunResourceSnapshot {
   readableRoots: string[];
 }
 
+/** 摘要的单次供应商请求及其原生轮次归属。 */
+export type AgentCompactionRequestObservation = {
+  requestId: string;
+  nativeRunId: string;
+  model: AgentModelIdentity;
+} & ({ state: 'started' } | { state: 'completed' | 'failed' | 'aborted'; usage: unknown });
+
 export interface StartAgentRunInput {
   /** 产品会话已冻结的原生上下文容量，必须透传到隔离 Worker。 */
   contextCapacityTokens?: number | null;
@@ -153,9 +170,11 @@ export interface StartAgentRunInput {
   skillCatalog?: AgentRunSkillActivation[];
   /** 产品工作模式，计划模式同时约束宿主工具。 */
   workMode?: 'default' | 'plan';
+  /** 本轮采用的用户权限，ACP 以此选择自己的只读模式。 */
+  permissionMode?: 'read-only' | 'auto' | 'auto-review' | 'full-access';
   /** 仅用于 Zeus 内部 Command/Worker/RPC/回执性能关联，不进入 Provider 正文。 */
   traceIdentity?: string | null;
-  /** Pi 在进入 agent run 前同步返回预检结论；false 表示请求不会写给模型。 */
+  /** Pi 在进入 agent run 前返回预检结论，决策只针对当前用户消息。 */
   preflightResult?: (accepted: boolean) => void;
   /** 只在预检成功时同步执行，回调抛错必须阻止 agent run。 */
   durableTransactionSync?: (acceptance: AcceptedAgentRun) => void;
@@ -163,6 +182,8 @@ export interface StartAgentRunInput {
   providerWriteMayStart?: () => void;
   /** Provider 适配器完成最终请求体序列化后的脱敏缓存证据。 */
   providerPayloadObserved?: (diagnostic: AgentProviderPayloadDiagnostic) => void;
+  /** 等 Core 独立登记 SDK 摘要请求，并在收到供应商结果时记录用量。 */
+  compactionRequestObserved?: (observation: AgentCompactionRequestObservation, session: AgentSessionIdentity) => Promise<void> | void;
 }
 
 export interface AgentProviderPayloadFingerprint {
@@ -255,6 +276,16 @@ export interface AgentSessionSnapshot {
   raw: unknown;
 }
 
+/** 供应商只上报整轮用量时，保留实际观察到的字段和完整性。 */
+export interface AgentTurnUsage {
+  /** 共享账本使用的 Token 计数。 */
+  usage: TokenUsageBreakdown;
+  /** 已确认的分类，缺失项无需对用户显示为零。 */
+  fields: (keyof TokenUsageBreakdown)[];
+  /** 输入与输出均有完整统计时为真。 */
+  complete: boolean;
+}
+
 export interface AgentRuntimeEvent {
   agentKind: AgentKind;
   runtimeInstanceId: string;
@@ -263,6 +294,10 @@ export interface AgentRuntimeEvent {
   sequence: number;
   type: string;
   payload: unknown;
+  /** 轮次终态携带的已归一化用量，独立于工具和上下文事件。 */
+  turnUsage?: AgentTurnUsage;
+  /** 结构化工具与技能事件已完整交付时由正常终态声明。 */
+  resourceCaptureComplete?: true;
   createdAt: string;
 }
 
@@ -306,6 +341,8 @@ export interface AgentRuntimeHealthSnapshot {
  */
 export interface AgentRuntimeDriver {
   readonly kind: AgentKind;
+  /** 只提供轮次用量的供应商不会使用请求级计价和测速。 */
+  readonly usageGranularity?: 'turn';
 
   probe(): Promise<AgentRuntimeProbe>;
 

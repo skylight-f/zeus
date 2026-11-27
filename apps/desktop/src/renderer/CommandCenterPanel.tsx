@@ -1,6 +1,6 @@
 import { XIcon as X } from '@phosphor-icons/react/dist/csr/X';
-import { MotionPresence } from './ui/MotionPresence.js';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { MotionPresence, usePresenceOpen } from './ui/MotionPresence.js';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { commandDefinitionsQuery, invalidateCommandDefinitions } from './features/command-center/commandDefinitionsQuery.js';
 import { createPortal } from 'react-dom';
 import { ClockCounterClockwiseIcon as ClockCounterClockwise } from '@phosphor-icons/react/dist/csr/ClockCounterClockwise';
@@ -9,7 +9,6 @@ import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/C
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
 import { DownloadSimpleIcon as DownloadSimple } from '@phosphor-icons/react/dist/csr/DownloadSimple';
-import { FolderSimpleIcon as FolderSimple } from '@phosphor-icons/react/dist/csr/FolderSimple';
 import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
 import { PlayIcon as Play } from '@phosphor-icons/react/dist/csr/Play';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
@@ -20,6 +19,7 @@ import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/c
 import { formatZeusDateTime, commandNeedsHighRiskConfirmation, commandShells, type CommandShell, type CommandRiskFlags } from '@zeus/shared';
 import { ZeusSelect } from './ZeusSelect.js';
 import { projectTerminalOutput } from '@zeus/shared';
+import { FileTypeIcon } from './code/FileTypeIcon.js';
 import {
   isLikelyLocalServerConnectionError,
   ZeusApiError,
@@ -38,7 +38,7 @@ import {
 import { Button } from './ui/Button.js';
 import { ModalPortal } from './ui/ModalPortal.js';
 import { MenuSurface } from './ui/MenuSurface.js';
-import { VisibleApplicationError } from './ui/ApplicationErrorDialog.js';
+import { type ApplicationErrorLanguage, VisibleApplicationError } from './ui/ApplicationErrorDialog.js';
 import './commandCenter.css';
 import { Form } from './ui/Form.js';
 
@@ -53,6 +53,17 @@ export interface CommandCenterPanelProps {
   project?: ProjectRecord;
   client: DashboardClient;
   language: 'zh-CN' | 'en-US';
+}
+
+/** 工作台与独立交付窗口共用项目命令弹窗，可直接选择原执行记录。 */
+export function ProjectCommandDialog(props: Omit<CommandCenterPanelProps, 'mode'> & { project: ProjectRecord; onClose: () => void }) {
+  return (
+    <ModalPortal role="dialog" aria-label={`${props.project.name} · ${props.language === 'zh-CN' ? '命令' : 'Commands'}`} rootClassName="project-command-portal" onDismiss={props.onClose}>
+      <section className="project-command-dialog zeus-solid-form-surface" data-modal-surface="dialog">
+        <CommandCenterPanel {...props} mode="project" />
+      </section>
+    </ModalPortal>
+  );
 }
 
 interface CommandDraft {
@@ -106,6 +117,20 @@ const COMMAND_RUN_LOG_ARTIFACT_PATHS = new Set(['logs/terminal.raw.log', 'logs/t
 const COMMAND_RUN_FILE_MENU_WIDTH_PX = 280;
 
 type CommandRunSyncState = 'syncing' | 'live' | 'stale';
+
+/** 本次打开的命令历史及其已读分页区间。 */
+interface CommandRunHistoryState {
+  /** 用于标题和查找执行历史的命令定义或历史快照。 */
+  command: CommandDefinition;
+  /** 已读执行；从具体记录打开时先包含该记录。 */
+  runs: CommandRun[];
+  /** undefined 表示首页未读成功，null 表示已读到底。 */
+  nextCursor: string | null | undefined;
+  /** 当前请求身份，同时把滚动和点击合并成一次读取。 */
+  request: symbol | null;
+  /** 当前页的读取错误，保留游标供重试。 */
+  error: unknown;
+}
 
 function CommandRunDurationValue(props: { run: CommandRun; zh: boolean }) {
   const shouldTick = props.run.status === 'running' && Boolean(props.run.startedAt) && !props.run.endedAt;
@@ -441,6 +466,10 @@ async function writeCommandRunClipboard(content: string): Promise<boolean> {
 
 export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const zh = props.language === 'zh-CN';
+  /** 共用错误组件使用 en 读取英文文案。 */
+  const errorLanguage: ApplicationErrorLanguage = zh ? 'zh-CN' : 'en';
+  /** 历史只读取当前项目的执行。 */
+  const projectId = props.project?.id;
   /** 已读目录立即展示；不同项目和客户端的在途结果互不回填。 */
   const definitionsQuery = useMemo(() => commandDefinitionsQuery(props.client, props.mode, props.project?.id), [props.client, props.mode, props.project?.id]);
   const definitionsSnapshot = useSyncExternalStore(definitionsQuery.subscribe, definitionsQuery.getSnapshot);
@@ -448,7 +477,6 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const loading = definitionsSnapshot.loading;
   const currentDefinitionsQuery = useRef(definitionsQuery);
   currentDefinitionsQuery.current = definitionsQuery;
-  const [runs, setRuns] = useState<CommandRun[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -458,17 +486,20 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
   const [runningCommand, setRunningCommand] = useState<CommandDefinition | null>(null);
   const [runParameters, setRunParameters] = useState<Record<string, string | number | boolean>>({});
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
-  const [historyCommand, setHistoryCommand] = useState<CommandDefinition | null>(null);
+  /** 历史状态为 null 时弹窗关闭。 */
+  const [history, setHistory] = useState<CommandRunHistoryState | null>(null);
+  /** 请求和执行回执之间共用最新历史状态，避免 React 渲染前重复翻页。 */
+  const currentHistory = useRef<CommandRunHistoryState | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<CommandRunDetail | null>(null);
   const [runSyncState, setRunSyncState] = useState<CommandRunSyncState>('syncing');
   const runLogCursorRef = useRef<{ runId: string | null; nextSeq: number }>({ runId: null, nextSeq: 0 });
-  const historyCommandIdRef = useRef<string | null>(null);
+  /** 通知和交付入口按原执行 ID 打开一次，关闭后轮询不得重新打开。 */
+  const initialRunToOpen = useRef<string | null>(props.initialRunId ?? null);
 
   const canMaintain = props.mode === 'global' || Boolean(props.project);
-  const historyRuns = useMemo(() => (historyCommand ? runs.filter((run) => run.commandId === historyCommand.id) : []), [historyCommand, runs]);
-  const activeHistoryRuns = useMemo(() => historyRuns.filter((run) => run.status === 'running'), [historyRuns]);
-  const selectedRun = runs.find((run) => run.id === selectedRunId);
+  /** 当前选中的执行决定详情是否需要实时更新。 */
+  const selectedRun = history?.runs.find((run) => run.id === selectedRunId);
   const selectedRunIsActive = selectedRun?.status === 'running';
   const selectedRuntimeSessionId = selectedRun?.runtimeSessionId ?? null;
   const projectedRunLogContent = useMemo(() => {
@@ -485,32 +516,79 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
     void definitionsQuery.load().catch(() => undefined);
   }, [definitionsQuery]);
 
+  /** 同步更新请求判定依据和用于渲染的历史状态。 */
+  const commitHistory = useCallback(function commitHistory(next: CommandRunHistoryState | null): void {
+    currentHistory.current = next;
+    setHistory(next);
+  }, []);
+
+  /** 首次读取、翻页和失败重试都使用当前历史的游标。 */
+  const loadHistoryPage = useCallback(
+    async function loadHistoryPage(): Promise<void> {
+      /** 每次请求固定使用开始时的项目、命令和游标。 */
+      const current = currentHistory.current;
+      if (!projectId || !current || current.request || current.nextCursor === null || currentDefinitionsQuery.current !== definitionsQuery) return;
+      /** 关闭或重新打开命令后，旧响应不能提交。 */
+      const request = Symbol();
+      commitHistory({ ...current, request, error: null });
+      try {
+        /** 服务端按命令筛选后返回一页和下页游标。 */
+        const page = await props.client.loadCommandRunHistory(projectId, current.command.id, current.nextCursor);
+        /** 读取期间执行详情或停止回执可能已经更新了记录。 */
+        const pending = currentHistory.current;
+        if (pending?.request !== request || currentDefinitionsQuery.current !== definitionsQuery) return;
+        /** 保持已读顺序并追加较早的记录，合并直接打开的同一条执行。 */
+        const byId = new Map(pending.runs.map((run) => [run.id, run]));
+        for (const run of page.items) {
+          /** 详情中的较新状态优先于历史页中的快照。 */
+          const known = byId.get(run.id);
+          if (!known || known.updatedAt < run.updatedAt) byId.set(run.id, run);
+        }
+        commitHistory({ ...pending, runs: [...byId.values()], nextCursor: page.nextCursor, request: null });
+        if (current.nextCursor === undefined) setSelectedRunId((selected) => selected ?? page.items[0]?.id ?? null);
+      } catch (loadError) {
+        /** 出错时保留已读记录和发生失败的游标。 */
+        const pending = currentHistory.current;
+        if (pending?.request === request && currentDefinitionsQuery.current === definitionsQuery) commitHistory({ ...pending, request: null, error: loadError });
+      }
+    },
+    [commitHistory, definitionsQuery, props.client, projectId],
+  );
+
+  /** 进入历史时先呈现已知执行，再读取当前命令的第一页。 */
+  const showRunHistory = useCallback(
+    function showRunHistory(command: CommandDefinition, run?: CommandRun): void {
+      initialRunToOpen.current = null;
+      commitHistory({ command, runs: run ? [run] : [], nextCursor: undefined, request: null, error: null });
+      setSelectedRunId(run?.id ?? null);
+      void loadHistoryPage();
+    },
+    [commitHistory, loadHistoryPage],
+  );
+
+  /** 把单条执行的详情或停止回执写回列表，保留已经加载的分页。 */
+  const updateHistoryRun = useCallback(
+    function updateHistoryRun(run: CommandRun): void {
+      /** 翻页响应会继续使用本次更新后的历史状态。 */
+      const current = currentHistory.current;
+      /** 仅更新本次打开已显示的执行。 */
+      const known = current?.runs.find((item) => item.id === run.id);
+      if (!current || !known || known.updatedAt > run.updatedAt || commandRunStateMatches(known, run)) return;
+      commitHistory({ ...current, runs: current.runs.map((item) => (item.id === run.id ? run : item)) });
+    },
+    [commitHistory],
+  );
+
+  /** 项目或直达入口切换时，旧历史和旧请求一并失效。 */
   useEffect(() => {
-    historyCommandIdRef.current = null;
-    setHistoryCommand(null);
-    setSelectedRunId(props.initialRunId ?? null);
-    if (props.mode !== 'project' || !props.project) {
-      setRuns([]);
-      return;
-    }
-    let active = true;
-    void props.client
-      .loadCommandRuns(props.project.id)
-      .then((items) => {
-        if (active)
-          setRuns((current) => {
-            /** 最近列表与详情可并行返回，不能覆盖通知加载的较早执行。 */
-            const requestedRun = current.find((run) => run.id === props.initialRunId);
-            return requestedRun && !items.some((run) => run.id === requestedRun.id) ? [requestedRun, ...items] : items;
-          });
-      })
-      .catch((loadError) => {
-        if (active) setError(loadError);
-      });
+    initialRunToOpen.current = props.initialRunId ?? null;
+    commitHistory(null);
+    setSelectedRunId(initialRunToOpen.current);
     return () => {
-      active = false;
+      initialRunToOpen.current = null;
+      currentHistory.current = null;
     };
-  }, [props.client, props.mode, props.project?.id, props.initialRunId]);
+  }, [commitHistory, definitionsQuery, props.initialRunId]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -577,19 +655,12 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         }
         runLogCursorRef.current = { runId: selectedRunId, nextSeq: detail.nextSeq };
         setRunDetail((current) => mergeCommandRunDetail(current, detail, skippedHistoricalLogs));
-        if (props.initialRunId === detail.run.id && historyCommandIdRef.current === null) {
+        if (initialRunToOpen.current === detail.run.id) {
           // 已删除的命令也能通过执行时快照查看原结果。
-          historyCommandIdRef.current = detail.run.commandSnapshot.id;
-          setHistoryCommand(detail.run.commandSnapshot);
+          showRunHistory(detail.run.commandSnapshot, detail.run);
+        } else {
+          updateHistoryRun(detail.run);
         }
-        setRuns((current) => {
-          const index = current.findIndex((run) => run.id === detail.run.id);
-          if (index < 0) return [detail.run, ...current];
-          if (commandRunStateMatches(current[index]!, detail.run)) return current;
-          const next = [...current];
-          next[index] = detail.run;
-          return next;
-        });
         setRunSyncState('live');
       } catch (loadError) {
         if (active) {
@@ -626,58 +697,45 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       if (pollTimer) window.clearInterval(pollTimer);
       unsubscribe?.();
     };
-  }, [props.client, props.initialRunId, selectedRunId, selectedRunIsActive, selectedRuntimeSessionId]);
+  }, [props.client, props.initialRunId, selectedRunId, selectedRunIsActive, selectedRuntimeSessionId, showRunHistory, updateHistoryRun]);
 
+  /** 只在原命令历史窗口已经打开时回传可见详情。 */
+  const historyCommandId = history?.command.id;
   // 详情完成渲染后才回传可见身份，关闭或切换时立即撤销回执。
   useEffect(() => {
-    if (!historyCommand || !runDetail || runDetail.run.id !== selectedRunId) return;
+    if (!historyCommandId || !runDetail || runDetail.run.id !== selectedRunId) return;
     props.onRunDetailVisible?.(runDetail.run);
     return () => props.onRunDetailVisible?.(null);
-  }, [historyCommand?.id, runDetail?.run, selectedRunId, props.onRunDetailVisible]);
+  }, [historyCommandId, runDetail?.run, selectedRunId, props.onRunDetailVisible]);
 
   async function reloadCommands(): Promise<void> {
     await definitionsQuery.load(true);
   }
 
-  async function reloadRuns(selectRunId?: string): Promise<void> {
-    if (!props.project) return;
-    const items = await props.client.loadCommandRuns(props.project.id);
-    if (currentDefinitionsQuery.current !== definitionsQuery) return;
-    setRuns(items);
-    if (selectRunId) setSelectedRunId(selectRunId);
-  }
-
-  async function openRunHistory(command: CommandDefinition, selectRunId?: string): Promise<void> {
+  /** 从命令目录或新执行回执进入历史，清理上一次查看的详情。 */
+  function openRunHistory(command: CommandDefinition, run?: CommandRun): void {
     if (!props.project || currentDefinitionsQuery.current !== definitionsQuery) return;
-    historyCommandIdRef.current = command.id;
-    setHistoryCommand(command);
     setError(null);
     setRunDetail(null);
     setRunSyncState('syncing');
     runLogCursorRef.current = { runId: null, nextSeq: 0 };
-    const currentCommandRuns = runs.filter((run) => run.commandId === command.id);
-    setSelectedRunId(selectRunId ?? currentCommandRuns[0]?.id ?? null);
-    try {
-      const items = await props.client.loadCommandRuns(props.project.id);
-      if (historyCommandIdRef.current !== command.id || currentDefinitionsQuery.current !== definitionsQuery) return;
-      const commandRuns = items.filter((run) => run.commandId === command.id);
-      setRuns(items);
-      setSelectedRunId(selectRunId ?? commandRuns[0]?.id ?? null);
-    } catch (loadError) {
-      if (historyCommandIdRef.current === command.id && currentDefinitionsQuery.current === definitionsQuery) setError(loadError);
-    }
+    showRunHistory(command, run);
   }
 
+  /** 关闭历史即撤销本次读取的回写资格。 */
   function closeRunHistory(): void {
-    historyCommandIdRef.current = null;
-    setHistoryCommand(null);
+    initialRunToOpen.current = null;
+    commitHistory(null);
+    setError(null);
     setSelectedRunId(null);
     setRunDetail(null);
     setRunSyncState('syncing');
   }
 
   function selectHistoryRun(runId: string): void {
+    if (runId === selectedRunId) return;
     setSelectedRunId(runId);
+    setError(null);
     setRunSyncState('syncing');
     setRunDetail((current) => (current?.run.id === runId ? current : null));
   }
@@ -836,24 +894,26 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
       const command = runningCommand;
       if (currentDefinitionsQuery.current !== definitionsQuery) return;
       setRunningCommand(null);
-      /** 运行已受理，日志目录读取在新打开的历史面板内继续。 */
-      void openRunHistory(command, run.id);
+      openRunHistory(command, run);
       setNotice(zh ? `已启动 ${command.title}。` : `${command.title} started.`);
     } catch (runError) {
       if (currentDefinitionsQuery.current !== definitionsQuery) return;
       setError(runError);
-      void reloadRuns().catch(() => undefined);
     } finally {
       if (currentDefinitionsQuery.current === definitionsQuery) setBusy(false);
     }
   }
 
+  /** 停止回执只更新这一条执行，已加载的历史页和当前选择继续保留。 */
   async function stopRun(run: CommandRun): Promise<void> {
     setBusy(true);
     setError(null);
     try {
-      await props.client.stopCommandRun(run.id);
-      await reloadRuns(run.id);
+      /** 停止接口返回这条执行的最新状态。 */
+      const stopped = await props.client.stopCommandRun(run.id);
+      if (currentDefinitionsQuery.current !== definitionsQuery) return;
+      updateHistoryRun(stopped);
+      setRunDetail((current) => (current?.run.id === stopped.id && current.run.updatedAt <= stopped.updatedAt ? { ...current, run: stopped } : current));
     } catch (stopError) {
       if (currentDefinitionsQuery.current === definitionsQuery) setError(stopError);
     } finally {
@@ -863,6 +923,8 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
 
   /** 项目已由工作区导航标明，页面标题只说明当前操作。 */
   const heading = props.mode === 'global' ? (zh ? '全局命令' : 'Global commands') : zh ? '命令' : 'Commands';
+  /** 等待回执或读取历史的错误在当前弹窗内显示。 */
+  const panelError = (editing || runningCommand || history ? null : error) ?? definitionsSnapshot.error;
 
   return (
     <div className="command-center-workspace">
@@ -888,9 +950,9 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         <div className="command-center-live" role="status" aria-live="polite">
           {notice ? <span>{notice}</span> : null}
         </div>
-        {error || definitionsSnapshot.error ? (
+        {panelError ? (
           <p className="command-center-empty" role="alert">
-            <VisibleApplicationError error={error ?? definitionsSnapshot.error} language={zh ? 'zh-CN' : 'en'} />
+            <VisibleApplicationError error={panelError} language={errorLanguage} />
           </p>
         ) : null}
 
@@ -979,7 +1041,8 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
             <CommandDefinitionModal
               draft={draft}
               busy={busy}
-              language={props.language}
+              error={error}
+              language={errorLanguage}
               title={editing === 'new' ? (zh ? '新建命令' : 'New command') : zh ? '编辑命令' : 'Edit command'}
               onChange={setDraft}
               onClose={() => setEditing(null)}
@@ -1001,7 +1064,8 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
               project={props.project}
               values={runParameters}
               busy={busy}
-              language={props.language}
+              error={error}
+              language={errorLanguage}
               onValuesChange={setRunParameters}
               onClose={() => setRunningCommand(null)}
               onSubmit={(event) => submitRun(event)}
@@ -1010,20 +1074,20 @@ export function CommandCenterPanel(props: CommandCenterPanelProps) {
         </MotionPresence>
 
         <MotionPresence>
-          {historyCommand && props.project ? (
+          {history && props.project ? (
             <CommandRunHistoryModal
-              command={historyCommand}
+              history={history}
               project={props.project}
-              runs={historyRuns}
-              activeRunCount={activeHistoryRuns.length}
               selectedRunId={selectedRunId}
               runDetail={runDetail}
               syncState={runSyncState}
               projectedRunLogContent={projectedRunLogContent}
               client={props.client}
               busy={busy}
-              language={props.language}
+              error={editing || runningCommand ? null : error}
+              language={errorLanguage}
               onClose={closeRunHistory}
+              onLoadPage={loadHistoryPage}
               onSelectRun={selectHistoryRun}
               onStopRun={(run) => stopRun(run)}
             />
@@ -1069,53 +1133,120 @@ function CommandDefinitionDetails(props: { command: CommandDefinition; zh: boole
 }
 
 /** 历史列表与终端分别滚动，运行说明随终端展示。 */
+/** 显示单个命令的执行列表和选中的详情。 */
 function CommandRunHistoryModal(props: {
-  command: CommandDefinition;
+  history: CommandRunHistoryState;
   project: ProjectRecord;
-  runs: CommandRun[];
-  activeRunCount: number;
   selectedRunId: string | null;
   runDetail: CommandRunDetail | null;
   syncState: CommandRunSyncState;
   projectedRunLogContent: string;
   client: DashboardClient;
   busy: boolean;
-  language: 'zh-CN' | 'en-US';
+  /** 读取执行详情或请求停止失败时在执行窗口内展示原错误。 */
+  error: unknown;
+  language: ApplicationErrorLanguage;
   onClose: () => void;
+  /** 读取尚未加载的页面，失败时重读同一个游标。 */
+  onLoadPage: () => void;
   onSelectRun: (runId: string) => void;
   onStopRun: (run: CommandRun) => void;
 }) {
   /** 文案跟随当前界面语言。 */
   const zh = props.language === 'zh-CN';
+  /** 执行列表和分页提示由同一个命令历史驱动。 */
+  const { command, runs, nextCursor, request, error: historyError } = props.history;
+  /** 统计列表中已读取的运行中记录。 */
+  const activeRunCount = runs.filter((run) => run.status === 'running').length;
+  /** 关闭动画期间停止观察旧列表。 */
+  const open = usePresenceOpen();
+  /** 分页只观察历史列表，详情和终端日志可独立滚动。 */
+  const listRef = useRef<HTMLUListElement>(null);
+  /** 靠近列表末尾时读取较早的记录。 */
+  const pageEndRef = useRef<HTMLLIElement>(null);
+  /** 首次读取失败后可将焦点留在稳定的弹窗控件上。 */
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open || !nextCursor || request || historyError || !listRef.current || !pageEndRef.current || typeof IntersectionObserver === 'undefined') return;
+    /** 同时覆盖宽窗口的纵向列表和窄窗口的横向列表，提前 160 像素读取。 */
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) props.onLoadPage();
+      },
+      { root: listRef.current, rootMargin: '160px' },
+    );
+    observer.observe(pageEndRef.current);
+    return () => observer.disconnect();
+  }, [historyError, nextCursor, open, props.onLoadPage, request]);
+
+  /** 键盘翻页后从已读区末尾继续导航，按钮消失时焦点仍留在弹窗内。 */
+  function loadPageFromButton(event: ReactMouseEvent<HTMLButtonElement>): void {
+    if (request) return;
+    if (event.currentTarget.matches(':focus-visible')) {
+      /** 首次读取失败时没有历史项，焦点返回关闭按钮。 */
+      const lastRunButton = pageEndRef.current?.previousElementSibling?.querySelector('button');
+      (lastRunButton ?? closeRef.current)?.focus({ preventScroll: true });
+    }
+    props.onLoadPage();
+  }
+
+  /** 可用鼠标或键盘翻页，失败后保留同一个入口重试。 */
+  const pageControls = (
+    <>
+      {historyError ? (
+        <p className="command-modal-error" role="alert">
+          <VisibleApplicationError error={historyError} language={props.language} />
+        </p>
+      ) : null}
+      <Button size="compact" data-busy-behavior="background" aria-disabled={request !== null || undefined} aria-busy={request !== null || undefined} onClick={loadPageFromButton}>
+        {request ? (zh ? '正在读取…' : 'Loading…') : historyError ? (zh ? '重试读取' : 'Retry loading') : zh ? '加载更多' : 'Load more'}
+      </Button>
+    </>
+  );
   /** 运行中的命令保留真实连接状态。 */
   const activeRunSyncState = props.runDetail?.run.status === 'running' ? props.syncState : 'live';
   /** 未确认实时状态时禁止停止，避免提交结果不明确的操作。 */
   const stopUnavailable = activeRunSyncState !== 'live';
   /** 当前记录的状态在详情标题旁展示，避免重复占用统计卡片。 */
   const selectedStatus = props.runDetail ? commandRunStatusPresentation(props.runDetail.run, props.runDetail.run.id, props.syncState, zh) : null;
+  /** 执行详情和停止错误显示在详情区。 */
+  const visibleError = props.error ? (
+    <p className="command-modal-error" role="alert">
+      <VisibleApplicationError error={props.error} language={props.language} />
+    </p>
+  ) : null;
   return (
     <ModalPortal rootClassName="command-modal-portal-root" backdropClassName="command-modal-backdrop" dismissDisabled={props.busy} onDismiss={props.onClose} role="dialog" aria-labelledby="command-history-modal-title">
       <div className="command-modal command-history-modal zeus-solid-form-surface" data-modal-surface="dialog">
         <header className="command-modal-header">
           <span>
-            <h3 id="command-history-modal-title">{zh ? `${props.command.title} · 执行历史` : `${props.command.title} · Run history`}</h3>
+            <h3 id="command-history-modal-title">{zh ? `${command.title} · 执行历史` : `${command.title} · Run history`}</h3>
             <p>
-              {props.project.name} · <code>{props.command.name}</code>
-              {props.activeRunCount > 0 ? ` · ${zh ? `${props.activeRunCount} 条运行中` : `${props.activeRunCount} running`}` : ''}
+              {props.project.name} · <code>{command.name}</code>
+              {activeRunCount > 0 ? ` · ${zh ? `${activeRunCount} 条运行中` : `${activeRunCount} running`}` : ''}
             </p>
           </span>
-          <Button unstyled type="button" aria-label={zh ? '关闭执行历史' : 'Close run history'} onClick={props.onClose} disabled={props.busy}>
+          <Button ref={closeRef} unstyled type="button" aria-label={zh ? '关闭执行历史' : 'Close run history'} onClick={props.onClose} disabled={props.busy}>
             ×
           </Button>
         </header>
         <div className="command-history-modal-body">
-          {props.runs.length === 0 ? (
-            <p className="command-center-empty">{zh ? '此命令在当前项目中尚无执行记录。' : 'This command has no run history in the current project.'}</p>
+          {runs.length === 0 ? (
+            historyError ? (
+              <div className="command-center-empty command-run-pagination">{pageControls}</div>
+            ) : nextCursor === undefined ? (
+              <p className="command-center-empty" role="status">
+                {zh ? '正在读取执行记录…' : 'Loading run records…'}
+              </p>
+            ) : (
+              <p className="command-center-empty">{zh ? '此命令在当前项目中尚无执行记录。' : 'This command has no run history in the current project.'}</p>
+            )
           ) : (
             <div className="command-run-layout">
               <aside className="command-run-sidebar">
-                <ul className="command-run-list" aria-label={zh ? '执行记录' : 'Run records'}>
-                  {props.runs.map((run) => {
+                <ul ref={listRef} className="command-run-list" aria-label={zh ? '执行记录' : 'Run records'} aria-busy={request !== null || undefined} tabIndex={0}>
+                  {runs.map((run) => {
                     /** 历史记录同步展示运行状态与连接状态。 */
                     const status = commandRunStatusPresentation(run, props.selectedRunId, props.syncState, zh);
                     return (
@@ -1132,6 +1263,11 @@ function CommandRunHistoryModal(props: {
                       </li>
                     );
                   })}
+                  {nextCursor !== null ? (
+                    <li ref={pageEndRef}>
+                      <div className="command-run-pagination">{pageControls}</div>
+                    </li>
+                  ) : null}
                 </ul>
               </aside>
               {props.runDetail ? (
@@ -1157,6 +1293,7 @@ function CommandRunHistoryModal(props: {
                       ) : null}
                     </div>
                   </header>
+                  {visibleError}
                   {activeRunSyncState === 'stale' ? (
                     <p className="command-run-sync-warning" role="status" aria-live="polite">
                       <WarningCircle aria-hidden="true" />
@@ -1195,7 +1332,21 @@ function CommandRunHistoryModal(props: {
                   />
                 </section>
               ) : (
-                <p className="command-center-empty">{zh ? '选择一条记录查看执行详情。' : 'Select a run to view its details.'}</p>
+                (visibleError ?? (
+                  <p className="command-center-empty" role="status">
+                    {props.syncState === 'stale'
+                      ? zh
+                        ? '连接中断，执行状态待确认。'
+                        : 'Connection lost. Run status is unconfirmed.'
+                      : props.selectedRunId
+                        ? zh
+                          ? '正在读取执行详情…'
+                          : 'Loading run details…'
+                        : zh
+                          ? '选择一条记录查看执行详情。'
+                          : 'Select a run to view its details.'}
+                  </p>
+                ))
               )}
             </div>
           )}
@@ -1209,7 +1360,9 @@ function CommandDefinitionModal(props: {
   draft: CommandDraft;
   title: string;
   busy: boolean;
-  language: 'zh-CN' | 'en-US';
+  /** 保存失败时在编辑内容旁显示错误。 */
+  error: unknown;
+  language: ApplicationErrorLanguage;
   onChange: (draft: CommandDraft) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -1234,6 +1387,11 @@ function CommandDefinitionModal(props: {
           </Button>
         </header>
         <div className="command-modal-body" inert={props.busy} aria-busy={props.busy || undefined}>
+          {props.error ? (
+            <p className="command-modal-error" role="alert">
+              <VisibleApplicationError error={props.error} language={props.language} />
+            </p>
+          ) : null}
           <div className="command-editor-grid">
             <label>
               {zh ? '名称' : 'Name'}
@@ -1361,7 +1519,7 @@ function CommandDefinitionModal(props: {
           <Button onClick={props.onClose} disabled={props.busy}>
             {zh ? '取消' : 'Cancel'}
           </Button>
-          <Button type="submit" variant="primary" busy={props.busy}>
+          <Button type="submit" variant="primary" busy={props.busy} busyLabel={zh ? '保存中…' : 'Saving…'}>
             {zh ? '保存命令' : 'Save command'}
           </Button>
         </footer>
@@ -1433,7 +1591,9 @@ function CommandRunModal(props: {
   project: ProjectRecord;
   values: Record<string, string | number | boolean>;
   busy: boolean;
-  language: 'zh-CN' | 'en-US';
+  /** 启动失败时在确认参数的同一界面显示错误。 */
+  error: unknown;
+  language: ApplicationErrorLanguage;
   onValuesChange: (values: Record<string, string | number | boolean>) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -1470,8 +1630,13 @@ function CommandRunModal(props: {
           </Button>
         </header>
         <div className="command-modal-body command-run-body" inert={props.busy} aria-busy={props.busy || undefined}>
+          {props.error ? (
+            <p className="command-modal-error" role="alert">
+              <VisibleApplicationError error={props.error} language={props.language} />
+            </p>
+          ) : null}
           <div className="command-run-context">
-            <FolderSimple aria-hidden="true" />
+            <FileTypeIcon path={props.project.localPath} kind="directory" />
             <span data-icon-tooltip={props.project.localPath} aria-label={`${zh ? '项目目录' : 'Project directory'} ${props.project.localPath}`}>
               {props.project.localPath}
             </span>
@@ -1541,7 +1706,7 @@ function CommandRunModal(props: {
           <Button onClick={props.onClose} disabled={props.busy}>
             {zh ? '取消' : 'Cancel'}
           </Button>
-          <Button autoFocus={requiredParameters.length === 0} type="submit" variant={highRisk ? 'danger' : 'primary'} busy={props.busy}>
+          <Button autoFocus={requiredParameters.length === 0} type="submit" variant={highRisk ? 'danger' : 'primary'} busy={props.busy} busyLabel={zh ? '启动中…' : 'Starting…'}>
             <Play aria-hidden="true" />
             {zh ? '运行' : 'Run'}
           </Button>

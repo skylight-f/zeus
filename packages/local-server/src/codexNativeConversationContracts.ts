@@ -54,6 +54,8 @@ export interface CreateCodexNativeConversationCoordinatorOptions {
   goals: ConversationGoalRepository;
   /** 双执行链交接目标时记录唯一控制来源。 */
   goalControls?: import('@zeus/storage').ConversationRuntimeRepository;
+  /** 操作任务交接的正文保留在历史中，等待实际结果后再提醒。 */
+  isOperationHandoff?(conversationId: string, turnId: string): boolean;
   receipts: ProviderEventReceiptRepository;
   syncCheckpoints: ConversationProviderSyncCheckpointRepository;
   settings: SettingRepository;
@@ -83,14 +85,21 @@ export interface CreateCodexNativeConversationCoordinatorOptions {
   generatedImageRoot?: string;
   /** 当前身份的产物目录，供实时与历史答复共用图片归档。 */
   artifactsDirectory?: string;
+  /** 独立产物目录，用于登记完成答复里的 HTML 预览。 */
+  htmlArtifactsDirectory?: string;
   getProjectRoot: (projectId: string) => string | null;
-  ensureExecutionContext: (input: { conversationId: string; mode: 'reconcile' | 'submit' | 'dispatch' | 'recover_queue' | 'restore' }) => Promise<{
+  ensureExecutionContext: (input: {
+    conversationId: string;
+    mode: 'reconcile' | 'submit' | 'dispatch' | 'recover_queue' | 'restore';
+    /** 恢复命令在工作树发生实际修改前记回执。 */
+    beforeWorkspaceWrite?: () => void;
+  }) => Promise<{
     projectLocalPath: string;
     writableRoots?: string[];
     executionWorkspaceMode?: 'direct' | 'worktree';
   } | null>;
   /** 实际目标发送或恢复前校验冻结预算；不按旧模型替代新路由。 */
-  validateContextCapacity(budget: number | null, sourceId: string | null, modelId: string, runtime: 'codex' | 'pi' | 'copilot'): void;
+  validateContextCapacity(budget: number | null, sourceId: string | null, modelId: string, runtime: 'codex' | 'pi' | 'copilot' | 'antigravity'): void;
   compileDispatchContext: ProviderDispatchContextCompiler;
   preflightCodexModelBudget: (input: { modelId: string; modelSourceId: string | null; providerGenerationId: string | null }) => void;
 }
@@ -468,8 +477,6 @@ export interface SteerNativeMessageInput {
   browserComments?: Record<string, unknown>[];
   browserCommentContent?: string;
   conversationContext?: Record<string, unknown>;
-  /** 当前即时补充消息的完整显式 Skill 选择；由派发前冻结目录重写路径。 */
-  skills?: NativeConversationSkillInput[];
   expectedTurnId: string;
   idempotencyKey: string;
   clientUserMessageId: string;
@@ -537,6 +544,8 @@ export interface RestoreArchivedConversationInput {
   conversationId: string;
   /** 第一次实际外部动作前记录父命令写出标记。 */
   beforeExternalWrite?: () => void;
+  /** 任务状态命令在独立的会话归档状态提交前记回执。 */
+  beforeLocalRestore?: () => void;
 }
 
 /** 归档使用执行证据门禁，实际 Provider 调用前才记录写出。 */

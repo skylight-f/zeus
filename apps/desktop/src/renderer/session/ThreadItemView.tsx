@@ -4,8 +4,7 @@ import { BrowserCommentPreview } from './BrowserCommentPreview.js';
 import type { ConversationTurnUsage, ZeusBrowserComment } from '@zeus/shared';
 import { formatRuntimeCosts, formatTokenCount } from './tokenUsageFormat.js';
 import { AnimatedSize } from '../ui/AnimatedSize.js';
-import { describeUserFacingError } from '@zeus/shared';
-import { type FormEvent, type KeyboardEvent, memo, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type KeyboardEvent, memo, type ReactNode, useContext, useEffect, useRef, useState } from 'react';
 import { useReadingState } from '../ui/readingState.js';
 import { ArrowBendUpRightIcon as ArrowBendUpRight } from '@phosphor-icons/react/dist/csr/ArrowBendUpRight';
 import { ClockIcon as Clock } from '@phosphor-icons/react/dist/csr/Clock';
@@ -33,7 +32,6 @@ import { ResourceLoading } from '../ui/ResourceLoading.js';
 import { pendingResourceDisplayName } from '../ui/pendingResourcePolicy.js';
 import { McpAppFrame, type McpAppToolCall, type McpAppToolResult } from './McpAppFrame.js';
 import { AnsweredRequestHistory, type AnsweredRequestHistoryProps } from './AnsweredRequestHistory.js';
-import { modelSourceDisplayName } from '../modelOptionPresentation.js';
 import { ConversationComposerAttachments } from './ConversationComposerAttachments.js';
 import { SessionSweepText } from './SessionSweepText.js';
 import { Button } from '../ui/Button.js';
@@ -51,8 +49,8 @@ const STREAM_STRUCTURED_IDLE_FLUSH_MS = 180;
 const copy = {
   'zh-CN': {
     user: '你',
-    assistant: 'OpenAI',
-    commentary: 'OpenAI',
+    assistant: 'Codex',
+    commentary: 'Codex',
     notice: '速度提示',
     tool: '工具调用',
     file: '文件变更',
@@ -98,8 +96,8 @@ const copy = {
   },
   'en-US': {
     user: 'You',
-    assistant: 'OpenAI',
-    commentary: 'OpenAI',
+    assistant: 'Codex',
+    commentary: 'Codex',
     notice: 'Speed notice',
     tool: 'Tool call',
     file: 'File change',
@@ -274,9 +272,12 @@ function TaskPushMessageContent(
               </section>
             );
           })}
-          {block.conversationPaths.length > 0 ? (
+          {block.conversationHistory?.length || block.conversationPaths.length > 0 ? (
             <section className="session-task-push-field">
-              <strong>{block.contextKind === 'current' ? '当前任务历史会话信息：' : '会话文件路径：'}</strong>
+              <strong>{props.language === 'zh-CN' ? '历史会话' : 'Conversation history'}</strong>
+              {block.conversationHistory?.map((conversation) => (
+                <p key={conversation.id}>{conversation.title}</p>
+              ))}
               {block.conversationPaths.map((path) => (
                 <code key={path}>{path}</code>
               ))}
@@ -349,7 +350,7 @@ function TaskPushMessageContent(
 }
 
 /** 按实际交付阶段显示提示；历史加载不显示状态，内部入队不等同于用户需要等待。 */
-function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof copy)[SessionUiLanguage], language: SessionUiLanguage, waitingInQueue = false): string | null {
+function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof copy)[SessionUiLanguage], waitingInQueue = false): string | null {
   // 接纳或终态已由权威记录确认，不再展示发送途中的提示。
   if (item.providerItemId || item.status === 'active' || item.status === 'completed' || item.status === 'resolved') return null;
   const delivery = primitiveText(item.payload.delivery);
@@ -365,9 +366,8 @@ function optimisticDeliveryStatus(item: NativeSessionItemBuffer, labels: (typeof
     if (pausedReason === 'provider_archived') return labels.providerArchived;
     if (pausedReason === 'provider_stop_pending') return labels.providerStopPending;
     if (pausedReason === 'preflight_failed') {
-      // 优先展示服务端持久化的真实失败原因，避免笼统状态掩盖下一步。
-      const deliveryError = isRecord(item.payload.deliveryError) ? describeUserFacingError(item.payload.deliveryError, language).message : '';
-      return deliveryError || labels.preflightFailed;
+      // 失败原因由同一消息下方的发送状态提示承载（含错误详情），底栏只说明消息尚未发出。
+      return labels.preflightFailed;
     }
     return labels.deliveryPaused;
   }
@@ -471,6 +471,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
   const [queuedActionError, setQueuedActionError] = useState<unknown>(null);
   const [submittingEdit, setSubmittingEdit] = useState(false);
   const [retryingExpert, setRetryingExpert] = useState(false);
+  /** 当前 Markdown 渲染组件报告的正文就绪状态。 */
   const [markdownSettled, setMarkdownSettled] = useState(false);
   const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const articleRef = useRef<HTMLElement | null>(null);
@@ -562,7 +563,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       : label;
   const showVisibleRoleLabel = Boolean(subagentInput || expertActor) || (role !== 'user' && role !== 'assistant' && role !== 'commentary' && role !== 'error');
   // 任务首发消息已经是工作面的稳定内容，内部创建进度只在底部统一呈现。
-  const optimisticStatus = props.item.optimistic && !taskPushLayout ? optimisticDeliveryStatus(props.item, labels, props.language, props.waitingInQueue) : null;
+  const optimisticStatus = props.item.optimistic && !taskPushLayout ? optimisticDeliveryStatus(props.item, labels, props.waitingInQueue) : null;
   /** 排队操作沿用父级传入的权限，不从外观或本地状态推断可发送性。 */
   const showQueuedActions = Boolean(props.waitingInQueue && props.queuedSubmissionId && (props.onSteerQueuedSubmission || props.onDeleteQueuedSubmission));
   /** 状态与操作共同决定底栏；已确认未发送可只有操作，未知送达可只有状态。 */
@@ -587,11 +588,6 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
     if (!needsAuthoritativeAttachmentResources || !props.onLoadResources) return;
     void Promise.resolve(props.onLoadResources(props.item.turnId)).catch(() => undefined);
   }, [needsAuthoritativeAttachmentResources, props.item.turnId, props.onLoadResources]);
-
-  // 本地消息交给 Provider 后沿用显示身份，不能只因原生条目编号变化就重置正文。
-  useEffect(() => setMarkdownSettled(false), [itemText, props.item.key, props.item.status]);
-
-  const handleMarkdownSettled = useCallback(() => setMarkdownSettled(true), []);
 
   async function submitEditedMessage(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -723,7 +719,7 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
             onOpenResource={props.onOpenResource}
             onLoadResourcePreview={props.onLoadResourcePreview}
             onVisibleContentChange={props.onVisibleContentChange}
-            onRenderSettled={handleMarkdownSettled}
+            onRenderSettledChange={setMarkdownSettled}
           />
         </div>
       ) : role === 'user' && taskPushLayout ? (
@@ -776,13 +772,14 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
           text={visibleText}
           streamId={`thread-item:${props.item.key}`}
           phase={markdownPhase}
+          showMedia={role === 'assistant'}
           animateArrival={props.animateEntrance}
           language={props.language}
           resources={props.item.resources}
           onOpenResource={props.onOpenResource}
           onLoadResourcePreview={props.onLoadResourcePreview}
           onVisibleContentChange={props.onVisibleContentChange}
-          onRenderSettled={handleMarkdownSettled}
+          onRenderSettledChange={setMarkdownSettled}
         />
       ) : null}
       {!command && !mcpApp && !recoveredRequestUserInput ? <TypedItemFacts item={props.item} role={role} language={props.language} /> : null}
@@ -792,7 +789,13 @@ export const ThreadItemView = memo(function ThreadItemView(props: ThreadItemView
       ) : null}
       {role !== 'error' && !showUserMessageAttachmentGroup ? <ConversationPendingAttachmentImages attachments={pendingImageAttachments} language={props.language} onVisibleContentChange={props.onVisibleContentChange} /> : null}
       {role !== 'error' && !showUserMessageAttachmentGroup && role !== 'image' ? (
-        <ConversationResourceCards resources={unplacedResources} language={props.language} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
+        <ConversationResourceCards
+          resources={unplacedResources}
+          language={props.language}
+          showVideos={role === 'assistant' && markdownPhase === 'final'}
+          onOpenResource={props.onOpenResource}
+          onLoadResourcePreview={props.onLoadResourcePreview}
+        />
       ) : null}
       {role !== 'error' && !showUserMessageAttachmentGroup && !taskPushLayout ? <ItemImages item={props.item} label={labels.conversationImage} /> : null}
       {remoteDeviceInput ? (
@@ -996,12 +999,18 @@ function structuredMessageTokens(text: string): StructuredMessageToken[] {
   return tokens;
 }
 
-function visibleThreadItemError(item: NativeSessionItemBuffer): unknown {
+/** 行内摘要和详情共用同一份错误，旧条目沿用自身记录的时间。 */
+export function visibleThreadItemError(item: NativeSessionItemBuffer): unknown {
+  /** 已投影的错误带发生时间，旧错误沿用进入时间线的时间。 */
+  const occurredAt = item.timelineAt ?? item.updatedAt;
+  /** 消息投递和运行失败都能附带结构化诊断。 */
   const nested = [item.payload.deliveryError, item.payload.error].find((value) => typeof value === 'string' || isRecord(value));
-  if (nested) return nested;
+  if (isRecord(nested)) return { ...nested, occurredAt: nested.occurredAt ?? occurredAt };
+  /** 具体原因优先于条目的展示标题。 */
   const code = primitiveText(item.payload.code ?? item.payload.errorCode);
-  const message = item.text.trim() || primitiveText(item.payload.message) || 'Unknown error.';
-  return code ? { code, message } : message;
+  /** 旧错误可能只有一段文字，仍沿用该文字作为诊断。 */
+  const message = primitiveText(nested) ?? primitiveText(item.payload.message) ?? item.text.trim();
+  return { code, message, occurredAt, cause: item.payload.cause };
 }
 
 export function transcriptItemText(item: NativeSessionItemBuffer, language: SessionUiLanguage = 'zh-CN'): string {
@@ -1193,13 +1202,14 @@ function roleLabel(role: ThreadItemRole, labels: (typeof copy)[SessionUiLanguage
 
 function providerRoleLabel(item: NativeSessionItemBuffer, role: ThreadItemRole, fallback?: string): string | null {
   if (role !== 'assistant' && role !== 'commentary') return null;
-  const sourceName = modelSourceDisplayName(primitiveText(item.payload.modelSourceName));
+  const sourceName = primitiveText(item.payload.modelSourceName);
   if (sourceName) return sourceName;
   const agentKind = primitiveText(item.payload.agentKind);
   if (agentKind === 'pi') return 'Pi';
   if (agentKind === 'copilot') return 'GitHub Copilot';
+  if (agentKind === 'antigravity') return 'Google Antigravity';
   if (agentKind === 'claude') return 'Claude';
-  if (agentKind === 'codex') return 'OpenAI';
+  if (agentKind === 'codex') return 'Codex';
   return fallback?.trim() || null;
 }
 
@@ -1394,7 +1404,9 @@ function MessageTurnUsage(props: { language: SessionUiLanguage; usage: Conversat
   /** 金额复用运行详情的两位小数和原币符号，不引入汇率。 */
   const cost = props.usage.costs.length ? formatRuntimeCosts(props.usage.costs, props.language) : null;
   /** 共享提示支持换行，按账本口径分别列出本轮输入与输出。 */
-  const tokenLabel = `${zh ? '本轮消耗' : 'Turn usage'} ${tokens.exact} Token${props.usage.usageComplete ? '' : partial}\n${zh ? '输入' : 'Input'} ${formatTokenCount(props.usage.inputTokens, props.language).exact} Token\n${zh ? '输出' : 'Output'} ${formatTokenCount(props.usage.outputTokens, props.language).exact} Token`;
+  const reportedCount = (field: 'inputTokens' | 'outputTokens') =>
+    props.usage.reportedTokenFields && !props.usage.reportedTokenFields.includes(field) ? (zh ? '未上报' : 'Not reported') : `${formatTokenCount(props.usage[field], props.language).exact} Token`;
+  const tokenLabel = `${zh ? '本轮消耗' : 'Turn usage'} ${tokens.exact} Token${props.usage.usageComplete ? '' : partial}\n${zh ? '输入' : 'Input'} ${reportedCount('inputTokens')}\n${zh ? '输出' : 'Output'} ${reportedCount('outputTokens')}`;
   /** 缺少拆分依据时明确显示暂无明细，与真实零费用区分。 */
   const unavailableBreakdown = zh ? '暂无明细' : 'Breakdown unavailable';
   /** 输入费用包含缓存读取与写入，沿用账本逐请求价格快照。 */

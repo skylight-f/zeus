@@ -7,7 +7,6 @@ import { type CodexAppServerEvent, type CodexCommandApprovalDecision, type Codex
 import { commandEnvelopeSchemaGeneration, parseCommandEnvelope, type CommandEnvelope, type TokenUsageBreakdown } from '@zeus/shared';
 import { currentDatabasePerformanceTraceId } from '@zeus/storage';
 import type {
-  CodexMcpServerStartupState,
   CommandDeliveryRepository,
   ConversationCollaborationMode,
   ConversationItemPhase,
@@ -76,6 +75,34 @@ export interface FileApprovalTargetAudit {
   paths: string[];
 }
 
+/** 将持久请求投影为交互卡字段，沿用各入口的 JSON 解析规则。 */
+export function projectPendingRequestFields(request: ZeusConversationServerRequestRecord, parseRecord: (json: string) => Record<string, unknown>, transcripts?: ConversationTranscriptRepository) {
+  return {
+    id: request.id,
+    conversationId: request.conversationId,
+    turnId: request.turnId,
+    itemId: request.itemId,
+    generationId: request.transportGenerationId,
+    type: request.requestKind === 'request_user_input' ? 'userInput' : request.requestKind === 'mcp' ? 'MCP' : request.requestKind,
+    status: request.status,
+    payload: parseRecord(request.payloadJson),
+    response: request.responseJson ? parseRecord(request.responseJson) : null,
+    containsSecret: request.containsSecret,
+    expiresAt: request.expiresAt,
+    autoResolutionState: request.autoResolutionState,
+    createdAt: request.createdAt,
+    resolvedAt: request.resolvedAt,
+    transcript: transcripts?.envelopeForSource({
+      conversationId: request.conversationId,
+      sourceDomain: 'request',
+      sourceScope: request.turnId ?? request.transportGenerationId,
+      sourceId: request.id,
+      facet: 'request_answer',
+    }),
+  };
+}
+
+/** 在持久请求投影上补充文件审批的目标核查。 */
 export function nativePendingRequestProjection(
   request: ZeusConversationServerRequestRecord,
   authority?: {
@@ -85,35 +112,12 @@ export function nativePendingRequestProjection(
     transcripts: ConversationTranscriptRepository;
   },
 ): Record<string, unknown> {
-  const payload = parseJsonRecord(request.payloadJson);
-  return {
-    id: request.id,
-    conversationId: request.conversationId,
-    turnId: request.turnId,
-    itemId: request.itemId,
-    generationId: request.transportGenerationId,
-    type: request.requestKind === 'request_user_input' ? 'userInput' : request.requestKind === 'mcp' ? 'MCP' : request.requestKind,
-    status: request.status,
-    payload,
-    response: request.responseJson ? parseJsonRecord(request.responseJson) : null,
-    containsSecret: request.containsSecret,
-    expiresAt: request.expiresAt,
-    autoResolutionState: request.autoResolutionState,
-    createdAt: request.createdAt,
-    resolvedAt: request.resolvedAt,
-    transcript: authority?.transcripts.envelopeForSource({
-      conversationId: request.conversationId,
-      sourceDomain: 'request',
-      sourceScope: request.turnId ?? request.transportGenerationId,
-      sourceId: request.id,
-      facet: 'request_answer',
-    }),
-    ...(request.requestKind === 'file' && authority
-      ? {
-          fileApproval: inspectFileApprovalTargets(payload, authority.conversation, authority.projectRoot, authority.providerItems),
-        }
-      : {}),
-  };
+  const projection = projectPendingRequestFields(request, parseJsonRecord, authority?.transcripts);
+  // ACP 文件请求保存本次操作的实际路径和可用决定，回看与实时卡沿用同一授权依据。
+  if (request.requestKind === 'file' && authority && !(authority.conversation.agentKind === 'antigravity' && projection.payload.agentKind === 'antigravity')) {
+    return { ...projection, fileApproval: inspectFileApprovalTargets(projection.payload, authority.conversation, authority.projectRoot, authority.providerItems) };
+  }
+  return projection;
 }
 
 export function buildInteractionRecoveryContinuation(request: ZeusConversationServerRequestRecord, response: RespondNativeRequestInput['response'], privacyNote?: string): string {
@@ -266,7 +270,9 @@ export function providerTurnFailure(params: Record<string, unknown>, providerTur
   const providerStatus = providerTurnStatus(params);
   const message =
     typeof providerError?.message === 'string' && providerError.message.trim() ? providerError.message : providerStatus === 'failed' ? 'Codex provider turn failed.' : `Codex provider emitted unsupported terminal status: ${providerStatus}.`;
-  return Object.assign(coordinatorError('ZEUS_CODEX_TURN_FAILED', message), { providerTurnId, providerStatus });
+  /** 使用 Codex 结构化安全拒绝原因，原始消息仍用于诊断。 */
+  const code = providerError?.codexErrorInfo === 'cyberPolicy' ? 'ZEUS_CODEX_CYBER_POLICY' : 'ZEUS_CODEX_TURN_FAILED';
+  return Object.assign(coordinatorError(code, message), { providerTurnId, providerStatus });
 }
 
 /** 仅识别 Provider 明确报告的回复流提前断开，其他失败不得进入连接恢复重试。 */
@@ -303,7 +309,9 @@ export function failedTurnErrorFromRecord(turn: ZeusConversationTurnRecord): Err
     // Corrupt historical error details must not upgrade a failed turn to success.
   }
   const message = typeof persisted.message === 'string' && persisted.message ? persisted.message : 'Codex provider turn failed.';
-  return Object.assign(coordinatorError('ZEUS_CODEX_TURN_FAILED', message), { providerTurnId: turn.providerTurnId });
+  /** 历史回合也可从已保存的 Codex 原因识别安全拒绝。 */
+  const code = isRecord(persisted.providerError) && persisted.providerError.codexErrorInfo === 'cyberPolicy' ? 'ZEUS_CODEX_CYBER_POLICY' : 'ZEUS_CODEX_TURN_FAILED';
+  return Object.assign(coordinatorError(code, message), { providerTurnId: turn.providerTurnId });
 }
 
 export function findSnapshotTurn(snapshot: CodexThreadSnapshot, submission: ZeusConversationSubmissionRecord): Record<string, unknown> | null {
@@ -562,12 +570,6 @@ export function isAdvertisedCommandDecision(payload: Record<string, unknown>, de
 
 export function hasAuditableFileApprovalTarget(payload: Record<string, unknown>, conversation: ZeusConversationWithMessagesRecord, context: ConversationDispatchContext, providerItems: ConversationProviderItemRepository): boolean {
   return inspectFileApprovalTargets(payload, conversation, context.projectLocalPath, providerItems).status === 'auditable';
-}
-
-/** 人工文件审批可以覆盖明确展示的项目外目标；缺失路径时仍必须保守拒绝。 */
-export function hasReviewableFileApprovalTarget(payload: Record<string, unknown>, conversation: ZeusConversationWithMessagesRecord, context: ConversationDispatchContext, providerItems: ConversationProviderItemRepository): boolean {
-  const audit = inspectFileApprovalTargets(payload, conversation, context.projectLocalPath, providerItems);
-  return audit.status !== 'unavailable' && audit.paths.length > 0;
 }
 
 export function inspectFileApprovalTargets(payload: Record<string, unknown>, conversation: ZeusConversationRecord, projectRoot: string | null, providerItems: ConversationProviderItemRepository): FileApprovalTargetAudit {
@@ -1255,34 +1257,6 @@ export function tokenUsageBreakdown(value: Record<string, unknown>): TokenUsageB
 export function requireSafeInteger(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', `Invalid ${label}.`);
   return value;
-}
-
-export function normalizeMcpStartupStatusMap(value: Record<string, unknown>): Record<string, CodexMcpServerStartupState> {
-  return Object.fromEntries(
-    Object.entries(value).map(([serverId, state]) => {
-      if (typeof state === 'string') return [serverId, state];
-      if (isRecord(state) && typeof state.status === 'string' && (state.error === undefined || state.error === null || typeof state.error === 'string')) {
-        return [serverId, { status: state.status, ...(state.error === undefined ? {} : { error: state.error as string | null }) } satisfies CodexMcpServerStartupState];
-      }
-      throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', `Invalid MCP startup status for ${serverId}.`);
-    }),
-  );
-}
-
-export function normalizeSingleMcpStartupStatus(params: Record<string, unknown>): { serverId: string; state: CodexMcpServerStartupState } {
-  const serverId = requireString(params.name, 'MCP server name');
-  const status = requireString(params.status, `MCP startup status for ${serverId}`);
-  if (params.error !== undefined && params.error !== null && typeof params.error !== 'string') {
-    throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', `Invalid MCP startup error for ${serverId}.`);
-  }
-  if (params.failureReason !== undefined && params.failureReason !== null && typeof params.failureReason !== 'string') {
-    throw coordinatorError('ZEUS_NATIVE_PROVIDER_EVENT_INVALID', `Invalid MCP startup failure reason for ${serverId}.`);
-  }
-  const error = typeof params.error === 'string' ? params.error : typeof params.failureReason === 'string' ? params.failureReason : params.error === null || params.failureReason === null ? null : undefined;
-  return {
-    serverId,
-    state: { status, ...(error === undefined ? {} : { error }) },
-  };
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

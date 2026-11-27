@@ -30,10 +30,11 @@ export interface GitDiffHunk {
 }
 
 export interface GitFileDiff {
+  /** Git 模式明确标记的子模块引用。 */
+  isSubmodule?: boolean;
   oldPath: string;
   newPath: string;
   changeType: GitDiffFileChangeType;
-  isSubmodule?: boolean;
   addedLines: number;
   deletedLines: number;
   hunks: GitDiffHunk[];
@@ -154,6 +155,10 @@ export interface ProjectGitWorkbenchSnapshot {
   projectId: string;
   projectName: string;
   refreshedAt: string;
+  /** 工作树已回收，仓库列表只用于查看保存的提交。 */
+  committedOnly?: true;
+  /** Git 元数据已失效、未纳入当前只读快照的仓库相对路径。 */
+  unavailableRepositories?: string[];
   repositories: ProjectGitRepositoryWorkbenchItem[];
 }
 

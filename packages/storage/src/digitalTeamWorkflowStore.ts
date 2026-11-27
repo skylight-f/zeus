@@ -209,7 +209,6 @@ export function migrateDigitalTeamWorkflowSchema(db: ZeusDatabasePort): void {
   if (!db.select<{ name: string }>('PRAGMA table_info(digital_team_workflow_runs)').some((column) => column.name === 'runtime_state_json'))
     db.execute("ALTER TABLE digital_team_workflow_runs ADD COLUMN runtime_state_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(runtime_state_json))");
   migrateWorkflowPrimitiveAttempts(db);
-  db.execute('CREATE TABLE IF NOT EXISTS digital_team_project_workflows (project_id TEXT PRIMARY KEY REFERENCES projects(id), template_id TEXT NOT NULL REFERENCES digital_team_workflow_templates(id), updated_at TEXT NOT NULL)');
 }
 
 /** 扩展原尝试账本的节点和状态约束，保留全部身份、关联与历史数据。 */
@@ -603,11 +602,6 @@ export class DigitalTeamWorkflowRunRepository {
   /** 读取需要恢复或人工核对的运行。 */
   listRecoverable(limit = 100): DigitalTeamWorkflowRunRecord[] {
     return this.db.select<DigitalTeamWorkflowRunRow>("SELECT * FROM digital_team_workflow_runs WHERE status NOT IN ('completed','failed','cancelled') ORDER BY updated_at, id LIMIT ?", [boundedLimit(limit)]).map(mapRun);
-  }
-
-  /** 人工等待不与历史列表共用页数上限。 */
-  listAttention(): DigitalTeamWorkflowRunRecord[] {
-    return this.db.select<DigitalTeamWorkflowRunRow>("SELECT * FROM digital_team_workflow_runs WHERE status IN ('awaiting_plan_approval','awaiting_final_approval','outcome_unknown','failed') ORDER BY updated_at, id").map(mapRun);
   }
 
   /** 预检和接纳共享同一员工解析，项目覆盖由权威绑定提供。 */

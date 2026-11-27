@@ -111,7 +111,14 @@ export function adaptConversationSnapshotV2(input: ConversationSnapshotV2Bootstr
       state: snapshot.conversation.providerState,
     },
     agent: choice.agent ?? {
-      kind: snapshot.conversation.agentKind === 'codex' || snapshot.conversation.agentKind === 'pi' || snapshot.conversation.agentKind === 'copilot' || snapshot.conversation.agentKind === 'claude' ? snapshot.conversation.agentKind : null,
+      kind:
+        snapshot.conversation.agentKind === 'codex' ||
+        snapshot.conversation.agentKind === 'pi' ||
+        snapshot.conversation.agentKind === 'copilot' ||
+        snapshot.conversation.agentKind === 'antigravity' ||
+        snapshot.conversation.agentKind === 'claude'
+          ? snapshot.conversation.agentKind
+          : null,
       transport: null,
       supportStatus: 'unavailable',
       capabilitySnapshotId: null,
@@ -219,11 +226,11 @@ function activeTurnItems(items: readonly NativeConversationActiveItemV2[], provi
 /** 历史与活动尾部按同一 Provider 身份和时间线合并，活动投影补齐尚未确认的过程状态。 */
 function mergeActiveTurnItems(history: readonly NativeItemSnapshot[], active: readonly NativeItemSnapshot[]): NativeItemSnapshot[] {
   // 历史项携带稳定客户端身份、问题结构与答复关联；活动预览截断也不能丢失这些信息。
-  const historicalItems = new Map(history.filter((item) => item.providerItemId).map((item) => [`${encodeURIComponent(item.turnId)}:${encodeURIComponent(item.providerItemId!)}`, item]));
+  const historicalItems = new Map(history.filter((item) => item.providerItemId).map((item) => [item.providerItemId!, item]));
   return mergeItemsByProviderIdentity(
     history,
     active.map((item) => {
-      const historical = item.providerItemId ? historicalItems.get(`${encodeURIComponent(item.turnId)}:${encodeURIComponent(item.providerItemId)}`) : undefined;
+      const historical = historicalItems.get(item.providerItemId ?? '');
       return historical ? { ...item, payload: { ...historical.payload, ...item.payload } } : item;
     }),
   );
@@ -292,7 +299,7 @@ export function mergeConversationContentV2(snapshot: NativeConversationSnapshot,
     const content = parseProjection(text, false);
     const processDetail = item.payload.v2ContentKind === 'process_detail';
     // 全文恢复后再次使用共享转换，短预览不能永久覆盖完整命令和结果。
-    const presentation = processDetail ? conversationProcessPresentation(String(item.payload.processKind), content) : null;
+    const presentation = processDetail ? conversationProcessPresentation(String(item.payload.processKind), content, item.completedAt ?? item.startedAt ?? undefined) : null;
     // 思考全文没有可读内容时保持为空，不能重新沿用预览阶段的通用标题。
     /** 完整读取复用首屏的用户上下文投影，评论无正文时不显示 JSON。 */
     const userPresentation = processDetail ? {} : historicalUserPresentation(content, item.type === 'userMessage');
@@ -442,7 +449,7 @@ export function mergeConversationProcessV2(snapshot: NativeConversationSnapshot,
     (page.kind !== 'process' && page.kind !== 'commands')
   )
     throw new Error('会话 V2 过程页与当前快照不匹配。');
-  const items = mergeItemsByProviderIdentity(snapshot.items, processItems(page.items, turnPageProviderIdentityMap(snapshot.turns, turnId, page.items)));
+  const items = mergeItemsByProviderIdentity(snapshot.items, processItems(page.items, providerTurnIdentityMap(snapshot.turns)));
   return {
     ...snapshot,
     items,
@@ -461,7 +468,7 @@ export function mergeConversationTurnHistoryV2(snapshot: NativeConversationSnaps
   if (!snapshot.snapshotV2 || !snapshot.v2Paging || page.schemaVersion !== 2 || page.structureGeneration !== snapshot.snapshotV2.structureGeneration || page.conversationId !== snapshot.id || page.kind !== 'model_history') {
     throw new Error('会话 V2 轮次正文页与当前快照不匹配。');
   }
-  const items = mergeItemsByProviderIdentity(snapshot.items, historyItems(page.items, turnPageProviderIdentityMap(snapshot.turns, turnId, page.items)));
+  const items = mergeItemsByProviderIdentity(snapshot.items, historyItems(page.items, providerTurnIdentityMap(snapshot.turns)));
   return {
     ...snapshot,
     items,
@@ -635,7 +642,11 @@ function processItems(items: NativeConversationProcessV2Item[], providerTurnByLo
   return items.map((item) => {
     const detail = parseProjection(item.detail.preview, item.detail.truncated);
     // 分页元数据独立于正文预览，长命令或结果截断时仍保留活动类型和目标。
-    const presentation = conversationProcessPresentation(item.kind, { ...item.presentation, ...recordValue(detail), ...(item.sourceEventId?.startsWith('pi:') ? { provider: 'pi' } : {}) });
+    const presentation = conversationProcessPresentation(
+      item.kind,
+      item.kind === 'warning' && item.presentation ? item.presentation : { ...item.presentation, ...recordValue(detail), ...(item.sourceEventId?.startsWith('pi:') ? { provider: 'pi' } : {}) },
+      item.completedAt ?? item.startedAt,
+    );
     const type = presentation.type;
     const text = processProjectionText(item, detail);
     return {
@@ -681,19 +692,6 @@ function processItems(items: NativeConversationProcessV2Item[], providerTurnByLo
  */
 function providerTurnIdentityMap(turns: readonly NativeTurnSnapshot[]): ReadonlyMap<string, string> {
   return new Map(turns.map((turn) => [turn.id, turn.providerTurnId ?? turn.id]));
-}
-
-/**
- * 实时 turn.started 可能先于下一份结构快照到达。此时按轮次分页已经通过
- * Provider 身份成功读取，但页内仍携带存储层本地 turnId；请求身份就是该页
- * 唯一轮次的临时权威映射，不能让过程条目因此逃出当前状态组。
- */
-function turnPageProviderIdentityMap(turns: readonly NativeTurnSnapshot[], requestedTurnIdentity: string, items: ReadonlyArray<{ turnId: string }>): ReadonlyMap<string, string> {
-  const identities = new Map(providerTurnIdentityMap(turns));
-  for (const item of items) {
-    if (!identities.has(item.turnId)) identities.set(item.turnId, requestedTurnIdentity);
-  }
-  return identities;
 }
 
 function startsWithToolCallProjection(preview: string): boolean {

@@ -19,7 +19,7 @@ import { migrateArtifactStoreSchema } from './artifactStore.js';
 import { migrateCommandDeliverySchema } from './commandDeliveryStore.js';
 import { CONVERSATION_HOT_QUERY_INDEX_CHECKSUM_SOURCE, CONVERSATION_HOT_QUERY_INDEX_MIGRATION_ID, conversationHotQueryIndexes } from './conversationHotQueryIndexes.js';
 import { migrateAcceptedConversationTurnReferences, migrateConfirmedUserMessageHistory, migrateUnifiedConversationStoreSchema } from './conversationExecutionStore.js';
-import { migrateConversationLegacyCutoverSchema } from './conversationLegacyCutover.js';
+import { hasLegacyConversationItems, migrateConversationLegacyCutoverSchema } from './conversationLegacyCutover.js';
 import { migrateCompletedProviderPlansToConversationHistory, migrateConversationProviderItemStoreSchema } from './conversationProviderItemStore.js';
 import { migrateConversationSyncEventStoreSchema, migrateConversationSyncProtocolV2 } from './conversationSyncEventStore.js';
 import { DatabasePerformanceCollector, type DatabasePerformanceSnapshot } from './databasePerformance.js';
@@ -40,7 +40,7 @@ import { migrateLongTermMemorySchema } from './longTermMemoryStore.js';
 import { migratePluginStoreSchema } from './pluginStore.js';
 import { migrateTaskEventFileProjectionSchema } from './taskEventFileProjectionStore.js';
 import { migrateInputSuggestionSchema } from './inputSuggestionStore.js';
-import { migrateTaskStageCopilotSchema, migrateTaskStageSchema } from './taskStageStore.js';
+import { migrateTaskStageAntigravitySchema, migrateTaskStageCopilotSchema, migrateTaskStageSchema } from './taskStageStore.js';
 import { migrateTaskWorkReviewSchema } from './taskWorkReviewStore.js';
 import { migrateTaskWorkDeploymentSchema } from './taskWorkDeploymentStore.js';
 import { migrateTaskWorkPlanningSchema } from './taskWorkPlanningStore.js';
@@ -1017,6 +1017,8 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
       zeusDb.execute(`UPDATE conversation_legacy_write_fence SET current_writer_open = 1 WHERE singleton = 1`);
     }
     migrateCoreSchema(zeusDb);
+    migrateRetiredEmptyStorageTables(zeusDb);
+    migrateRetiredWorkflowStorage(zeusDb);
     migrateTaskReminders(zeusDb);
     migrateGitDelivery(zeusDb);
     migrateGitDeliveryCommands(zeusDb);
@@ -1038,6 +1040,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateCodexUsageLedgerSchema(zeusDb);
     migrateConversationStageSchema(zeusDb);
     migrateConversationTitleSourceSchema(zeusDb);
+    migrateConversationTitleGenerationAttempt(zeusDb);
     migrateRemoteConversationTurnSchema(zeusDb);
     migrateTaskGitWorkspaceSchema(zeusDb);
     migrateMultiRepositoryTaskSchema(zeusDb);
@@ -1055,6 +1058,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateTaskWorkWorkspaceBindingSchema(zeusDb);
     migrateTaskWorkPlanningSchema(zeusDb);
     migrateTaskStageCopilotSchema(zeusDb);
+    migrateTaskStageAntigravitySchema(zeusDb);
     migrateTaskWorkReviewSchema(zeusDb);
     migrateTaskWorkDeploymentSchema(zeusDb);
     migrateDigitalTeamWorkflowSchema(zeusDb);
@@ -1066,7 +1070,7 @@ export async function createZeusDatabase(filePath: string, options: CreateZeusDa
     migrateInputSuggestionSchema(zeusDb);
     migrateConversationExpertSchema(zeusDb);
     migrateConversationRuntimeSchema(zeusDb);
-    migrateConversationLegacyCutoverSchema(zeusDb);
+    if (hasLegacyConversationItems(zeusDb)) migrateConversationLegacyCutoverSchema(zeusDb);
     migrateConversationProviderItemStoreSchema(zeusDb);
     migrateCompletedProviderPlansToConversationHistory(zeusDb);
     migrateConfirmedUserMessageHistory(zeusDb);
@@ -1405,13 +1409,8 @@ function migrateCoreSchema(db: ZeusDatabase): void {
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
       local_path TEXT NOT NULL,
-      git_root TEXT,
-      project_type TEXT,
-      primary_language TEXT,
       description TEXT,
       note TEXT,
-      default_model TEXT,
-      default_work_mode TEXT,
       default_template_id TEXT,
       archived INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -1448,7 +1447,6 @@ function migrateCoreSchema(db: ZeusDatabase): void {
       tags_json TEXT NOT NULL,
       template_id TEXT,
       model TEXT,
-      work_dir TEXT,
       allow_code_changes INTEGER NOT NULL DEFAULT 0,
       allow_tests INTEGER NOT NULL DEFAULT 0,
       allow_git_commit INTEGER NOT NULL DEFAULT 0,
@@ -1643,16 +1641,6 @@ function migrateCoreSchema(db: ZeusDatabase): void {
   `);
 
   db.execute(`
-    CREATE TABLE IF NOT EXISTS event_log (
-      id TEXT PRIMARY KEY,
-      event_type TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      source TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-
-  db.execute(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
@@ -1732,6 +1720,64 @@ function migrateCoreSchema(db: ZeusDatabase): void {
     migrationId: '20260613_0001_core_schema',
     description: '初始化 Zeus 核心表、索引和内置任务模板定义',
     checksumSource: 'projects,tasks,task_events,runtime_sessions,runtime_logs,terminal_events,conversations,conversation_messages,git_snapshots,git_changes,audit_logs,event_log,settings,task_templates,indexes,built_in_templates',
+  });
+}
+
+/** 已停用的日志和冷证据索引没有生产读取方。只移除空表，保留仍含旧数据的安装。 */
+function migrateRetiredEmptyStorageTables(db: ZeusDatabase): void {
+  /** 迁移账本保留原创建历史，为退役登记独立记录。 */
+  const migrationId = '20261120_retire_empty_storage_tables';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  /** 冷证据锚点引用来源表，应在同一事务中先移除锚点。 */
+  const retiredGroups = [['event_log'], ['cold_evidence_anchors', 'cold_evidence_sources']] as const;
+  db.transaction(() => {
+    let complete = true;
+    for (const group of retiredGroups) {
+      const present = group.filter((table) => db.get("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [table]));
+      if (present.some((table) => db.get(`SELECT 1 FROM ${table} LIMIT 1`))) {
+        complete = false;
+        continue;
+      }
+      for (const table of present) db.execute(`DROP TABLE ${table}`);
+    }
+    if (complete) {
+      recordSchemaMigration(db, {
+        migrationId,
+        description: '移除已停用的空事件日志和冷证据索引表',
+        checksumSource: retiredGroups.flat().join(','),
+      });
+    }
+  });
+}
+
+/** 移除无消费的发件箱和预留流程表，并清掉无业务值的旧项目、任务列。 */
+function migrateRetiredWorkflowStorage(db: ZeusDatabase): void {
+  /** 已有业务值的旧列仍保留，避免丢失其他安装上的早期项目配置。 */
+  const projectColumns = ['git_root', 'project_type', 'primary_language', 'default_model', 'default_work_mode'] as const;
+  /** 独立标记这一批退役，兼容已完成空日志清理的库。 */
+  const migrationId = '20261121_retire_unused_workflow_storage';
+  if (db.get('SELECT 1 FROM schema_migrations WHERE migration_id = ?', [migrationId])) return;
+  db.transaction(() => {
+    db.execute('DROP TABLE IF EXISTS automation_notification_outbox');
+    db.execute('DROP TABLE IF EXISTS digital_team_project_workflows');
+    let complete = true;
+    for (const [table, columns] of [
+      ['projects', projectColumns],
+      ['tasks', ['work_dir']],
+    ] as const) {
+      const present = new Set(db.select<{ name: string }>(`PRAGMA table_info(${table})`).map((column) => column.name));
+      for (const column of columns) {
+        if (!present.has(column)) continue;
+        if (db.get(`SELECT 1 FROM ${table} WHERE ${column} IS NOT NULL LIMIT 1`)) complete = false;
+        else db.execute(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+      }
+    }
+    if (complete)
+      recordSchemaMigration(db, {
+        migrationId,
+        description: '移除未消费自动化发件箱、预留项目流程表和空的旧配置列',
+        checksumSource: ['automation_notification_outbox', 'digital_team_project_workflows', ...projectColumns, 'work_dir'].join(','),
+      });
   });
 }
 
@@ -2152,16 +2198,6 @@ function migrateCodexNativeConversationSchema(db: ZeusDatabase): void {
   db.execute(`CREATE INDEX IF NOT EXISTS idx_conversation_turn_active ON conversation_turns(conversation_id, status, created_at, id)`);
 
   db.execute(`
-    CREATE TABLE IF NOT EXISTS conversation_items (
-      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-      provider_thread_id TEXT NOT NULL, provider_turn_id TEXT NOT NULL, provider_item_id TEXT NOT NULL,
-      item_type TEXT NOT NULL, status TEXT NOT NULL, phase TEXT NOT NULL, text_content TEXT NOT NULL,
-      payload_json TEXT NOT NULL, started_at TEXT, completed_at TEXT, updated_at TEXT NOT NULL
-    )
-  `);
-  db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_item_provider ON conversation_items(provider_thread_id, provider_item_id)`);
-
-  db.execute(`
     CREATE TABLE IF NOT EXISTS conversation_resources (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
       turn_id TEXT NOT NULL, item_id TEXT NOT NULL, source_index INTEGER NOT NULL,
@@ -2507,6 +2543,21 @@ function migrateConversationTitleSourceSchema(db: ZeusDatabase): void {
   });
 }
 
+/** 记录已使用的命名机会，旧版已落库标题仍可识别。 */
+function migrateConversationTitleGenerationAttempt(db: ZeusDatabase): void {
+  /** 每个数据库只需追加命名字段一次。 */
+  const migrationId = '20261119_conversation_title_generation_attempt';
+  if (db.get(`SELECT migration_id FROM schema_migrations WHERE migration_id = ?`, [migrationId])) return;
+  db.transaction(() => {
+    db.execute(`ALTER TABLE conversations ADD COLUMN title_generation_attempt /* 已使用的最新命名机会：summary 摘要，reply 完整回复，NULL 表示未记录。 */ TEXT CHECK (title_generation_attempt IN ('summary', 'reply'))`);
+    recordSchemaMigration(db, {
+      migrationId,
+      description: '保存摘要和完整回复的命名机会，避免重启后重复请求',
+      checksumSource: 'conversations:title_generation_attempt:summary,reply',
+    });
+  });
+}
+
 function migrateConversationStageSchema(db: ZeusDatabase): void {
   const migrationId = '20260807_0001_conversation_stage_updated_at';
   const alreadyMigrated = db.get<{ migration_id: string }>(`SELECT migration_id FROM schema_migrations WHERE migration_id = ?`, [migrationId]);
@@ -2535,6 +2586,8 @@ function migrateConversationStageSchema(db: ZeusDatabase): void {
 function migrateAgentRuntimeSchema(db: ZeusDatabase): void {
   const migrationId = '20260803_0001_agent_runtime_framework';
   const needsIdentityBackfill = !db.get<{ migration_id: string }>(`SELECT migration_id FROM schema_migrations WHERE migration_id = ?`, [migrationId]);
+  /** 只兼容已有旧表，升级和新库启动不重建退役结构。 */
+  const legacyItemsPresent = hasLegacyConversationItems(db);
   for (const statement of [
     `ALTER TABLE conversations ADD COLUMN agent_kind TEXT`,
     `ALTER TABLE conversations ADD COLUMN agent_transport TEXT`,
@@ -2545,8 +2598,7 @@ function migrateAgentRuntimeSchema(db: ZeusDatabase): void {
     `ALTER TABLE conversations ADD COLUMN capability_snapshot_id TEXT`,
     `ALTER TABLE conversation_turns ADD COLUMN agent_kind TEXT`,
     `ALTER TABLE conversation_turns ADD COLUMN native_run_id TEXT`,
-    `ALTER TABLE conversation_items ADD COLUMN agent_kind TEXT`,
-    `ALTER TABLE conversation_items ADD COLUMN native_item_id TEXT`,
+    ...(legacyItemsPresent ? ['ALTER TABLE conversation_items ADD COLUMN agent_kind TEXT', 'ALTER TABLE conversation_items ADD COLUMN native_item_id TEXT'] : []),
   ]) {
     try {
       db.execute(statement);
@@ -2572,7 +2624,8 @@ function migrateAgentRuntimeSchema(db: ZeusDatabase): void {
   db.execute(`CREATE INDEX IF NOT EXISTS idx_agent_capability_snapshots_agent_checked ON agent_capability_snapshots(agent_kind, checked_at DESC)`);
   db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_agent_native_session ON conversations(agent_kind, native_session_id) WHERE agent_kind IS NOT NULL AND native_session_id IS NOT NULL`);
   db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_turn_agent_native_run ON conversation_turns(agent_kind, provider_thread_id, native_run_id) WHERE agent_kind IS NOT NULL AND native_run_id IS NOT NULL`);
-  db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_item_agent_native_item ON conversation_items(agent_kind, provider_thread_id, native_item_id) WHERE agent_kind IS NOT NULL AND native_item_id IS NOT NULL`);
+  if (legacyItemsPresent)
+    db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_item_agent_native_item ON conversation_items(agent_kind, provider_thread_id, native_item_id) WHERE agent_kind IS NOT NULL AND native_item_id IS NOT NULL`);
 
   if (needsIdentityBackfill) {
     // 只执行一次历史回填；字段已经完整的记录不再进入 UPDATE，避免启动时反复重写大体量会话正文页。
@@ -2589,7 +2642,8 @@ function migrateAgentRuntimeSchema(db: ZeusDatabase): void {
       native_run_id = COALESCE(native_run_id, provider_turn_id)
       WHERE conversation_id IN (SELECT id FROM conversations WHERE agent_kind = 'codex')
         AND (agent_kind IS NULL OR native_run_id IS NULL)`);
-    db.execute(`UPDATE conversation_items SET
+    if (legacyItemsPresent)
+      db.execute(`UPDATE conversation_items SET
       agent_kind = COALESCE(agent_kind, 'codex'),
       native_item_id = COALESCE(native_item_id, provider_item_id)
       WHERE conversation_id IN (SELECT id FROM conversations WHERE agent_kind = 'codex')
@@ -2719,7 +2773,7 @@ function migrateMcpServerIdentifierFalsePositiveCleanup(db: ZeusDatabase): void 
 
   const falsePositive = 'Secret-like provider field rejected: snapshot.openai-api-key-local-confirmation';
   db.transaction(() => {
-    db.execute(`DELETE FROM conversation_items WHERE item_type = 'error' AND provider_item_id LIKE 'native-provider-event-error-%' AND text_content = ?`, [falsePositive]);
+    if (hasLegacyConversationItems(db)) db.execute(`DELETE FROM conversation_items WHERE item_type = 'error' AND provider_item_id LIKE 'native-provider-event-error-%' AND text_content = ?`, [falsePositive]);
 
     const providerErrors = db.get<{
       value_json: string;
@@ -2756,7 +2810,7 @@ function migrateContextCompactionItemClassification(db: ZeusDatabase): void {
     return;
 
   db.transaction(() => {
-    const candidates = db.select<{ id: string; payload_json: string }>(`SELECT id, payload_json FROM conversation_items WHERE item_type = 'error'`);
+    const candidates = hasLegacyConversationItems(db) ? db.select<{ id: string; payload_json: string }>(`SELECT id, payload_json FROM conversation_items WHERE item_type = 'error'`) : [];
     for (const candidate of candidates) {
       try {
         const payload = JSON.parse(candidate.payload_json) as unknown;
@@ -2786,7 +2840,7 @@ function migrateImageGenerationItemClassification(db: ZeusDatabase): void {
     return;
 
   db.transaction(() => {
-    const candidates = db.select<{ id: string; payload_json: string }>(`SELECT id, payload_json FROM conversation_items WHERE item_type = 'error'`);
+    const candidates = hasLegacyConversationItems(db) ? db.select<{ id: string; payload_json: string }>(`SELECT id, payload_json FROM conversation_items WHERE item_type = 'error'`) : [];
     for (const candidate of candidates) {
       try {
         const payload = JSON.parse(candidate.payload_json) as unknown;

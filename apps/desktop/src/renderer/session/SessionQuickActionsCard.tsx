@@ -10,10 +10,8 @@ import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/C
 import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { DesktopIcon as Desktop } from '@phosphor-icons/react/dist/csr/Desktop';
-import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
 import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
-import { FileImageIcon as FileImage } from '@phosphor-icons/react/dist/csr/FileImage';
 import { FolderIcon as Folder } from '@phosphor-icons/react/dist/csr/Folder';
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { GithubLogoIcon as GithubLogo } from '@phosphor-icons/react/dist/csr/GithubLogo';
@@ -29,6 +27,7 @@ import { conversationAttachmentIdentity } from './ConversationComposerAttachment
 import { isImageResource, isPendingImageAttachment, ResourceIcon } from './ConversationResources.js';
 import { SessionCodeReviewDialog, type SessionCodeReviewSelection } from './SessionCodeReviewDialog.js';
 import { SessionComputerPreview } from './SessionComputerPreview.js';
+import { SessionWorkingDirectoryLauncher } from './SessionWorkingDirectoryLauncher.js';
 import type { CodexConversationCapabilities, ConversationResource, ConversationResourcePreview, NativeConversationAttachment, NativeConversationChoice, NativeSessionState } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { VisibleApplicationError, reportApplicationError } from '../ui/ApplicationErrorDialog.js';
@@ -96,6 +95,28 @@ const DEFAULT_VISIBLE_SOURCE_COUNT = 3;
 /** 只保留最近 32 个范围的显示结果，打开时仍重新读取真实 Git 状态。 */
 const environmentStatusCache = new WeakMap<DashboardClient, Map<string, GitEnvironmentStatus>>();
 
+/** 分支引用一致时提供单键复制，存在差异时按仓库展示。 */
+function SessionBranchCard(props: { kind: 'source' | 'target'; zh: boolean; branches?: GitEnvironmentStatus['sourceBranches']; branch: string | null; emptyLabel: string }) {
+  /** 会话环境以创建工作树时的分支为来源，以工作分支为目标。 */
+  const label = props.kind === 'source' ? (props.zh ? '来源分支' : 'Source branch') : props.zh ? '目标分支' : 'Target branch';
+  /** 同名判断以首仓真实分支为起点。 */
+  const firstBranch = props.branches?.[0]?.branch;
+  /** 多仓只有分支全部已知且一致时才复制单个名称。 */
+  const copyableBranch = props.branches?.length ? (firstBranch && props.branches.every((entry) => entry.branch === firstBranch) ? firstBranch : null) : props.branch;
+  /** 多仓异名时优先显示分支名，完整的仓库映射可悬停查看。 */
+  const value = copyableBranch ?? (props.branches?.some((entry) => entry.branch) ? props.branches.map((entry) => `${entry.branch ?? (props.zh ? '未记录' : 'Not recorded')} (${entry.repositoryRelativePath})`).join(' · ') : props.emptyLabel);
+  return (
+    <div className="session-quick-actions-row is-static session-quick-actions-branch">
+      <GitBranch aria-hidden="true" weight="regular" />
+      <span className="session-quick-actions-copy">
+        <small>{label}</small>
+        <strong title={value}>{value}</strong>
+      </span>
+      {copyableBranch ? <RuntimeCopyButton text={copyableBranch} label={props.zh ? `复制${label}` : `Copy ${label.toLowerCase()}`} copiedLabel={props.zh ? `${label}已复制` : `${label} copied`} /> : null}
+    </div>
+  );
+}
+
 export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const zh = props.language === 'zh-CN';
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -137,10 +158,41 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const executionContext = props.state.snapshot?.executionContext;
   /** 执行上下文保留只读审查、冲突处理等精确范围；Git 聚合摘要只补充尚未加载的目录。 */
   const cwd = executionContext?.cwd ?? summary?.cwd ?? props.conversation.executionPath ?? (directWorkspace ? props.gitContext?.project.localPath : null) ?? null;
-  /** 任一目录模式有多个仓库时，不把首仓分支冒充整个工作区分支。 */
-  const branch = (summary?.repositoryCount ?? 0) > 1 ? (zh ? '多个仓库' : 'Multiple repositories') : (summary?.branch ?? executionContext?.branch ?? props.conversation.workspace?.branchName ?? null);
-  /** 来源分支保持一行，完整仓库与分支仍可悬停读取，补载不移动操作按钮。 */
-  const sourceBranches = summary?.sourceBranches?.map((source) => `${source.repositoryRelativePath}: ${source.branch ?? (zh ? '未记录' : 'Not recorded')}`).join(' · ') || summary?.sourceBranch;
+  /** 工作目录保持单行，缺少路径时在原位置显示读取状态。 */
+  const workingDirectoryLabel = cwd
+    ? zh
+      ? '工作目录'
+      : 'Working directory'
+    : workspaceState === 'idle' || workspaceState === 'loading'
+      ? zh
+        ? '正在读取工作目录…'
+        : 'Loading working directory…'
+      : zh
+        ? '工作目录不可用'
+        : 'Working directory unavailable';
+  /** 有摘要入口时，确定仓库范围后再使用单仓分支。 */
+  const workingBranch = summary?.repositoryCount === 1 ? summary.branch : !gitClient ? (executionContext?.branch ?? props.conversation.workspace?.branchName ?? null) : null;
+  /** 独立工作树提前预留来源卡，直接使用目录时只有已记录的来源才显示。 */
+  const showSourceBranch = useTaskWorkspaces || props.conversation.workspaceMode === 'worktree' || Boolean(summary?.sourceBranch || summary?.sourceBranches?.length);
+  /** 分支读取和补齐期间保留卡片位置。 */
+  const branchLoading = Boolean(gitClient && (workspaceState === 'idle' || workspaceState === 'loading'));
+  /** 没有工作分支时显示实际的 Git 状态。 */
+  const missingWorkingBranch =
+    workspaceState === 'error'
+      ? zh
+        ? 'Git 状态读取失败'
+        : 'Failed to read Git status'
+      : branchLoading
+        ? zh
+          ? '正在读取分支…'
+          : 'Loading branch…'
+        : summary?.repositoryCount === 0
+          ? zh
+            ? '非 Git 目录'
+            : 'Not a Git repository'
+          : zh
+            ? '分支不可用'
+            : 'Branch unavailable';
   const conversationReady = !useTaskWorkspaces && (Boolean(summary?.repositoryCount) || executionContext?.isGitRepository === true);
   const sources = useMemo(() => collectSources(props.state), [props.state.attachments, props.state.items]);
   const visibleSources = showAllSources ? sources : sources.slice(0, DEFAULT_VISIBLE_SOURCE_COUNT);
@@ -202,8 +254,8 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
   const deliveryScopeId = deliveryTarget.taskId ?? deliveryTarget.conversationId ?? null;
   /** 只在卡片可见时订阅交付事件，不增加 Git 文件变化订阅。 */
   const { runs: deliveryRuns, error: deliveryProgressError, refresh: refreshDelivery } = useGitDeliveryRuns(gitClient, props.conversation.projectId, deliveryScopeId, cardVisible);
-  /** 最后一次成功后不回显旧失败，环境卡片和交付窗口使用同一条记录。 */
-  const deliveryRun = deliveryRuns[0]?.state === 'succeeded' ? undefined : deliveryRuns[0];
+  /** 环境卡片只显示当前仍需展示的交付。 */
+  const deliveryRun = deliveryRuns[0];
   /** 浮动快捷面板退场不延长数据订阅；常驻模式继续保持原组件身份。 */
   const { ref: cardRef, present: cardPresent } = useMotionPresence<HTMLDivElement>(cardMounted);
   const popoverOpen = cardVisible && !persistent;
@@ -294,13 +346,15 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
     if (!open) return;
     const closeFromOutside = (event: PointerEvent): void => {
       if (rootRef.current?.contains(event.target as Node) || cardRef.current?.contains(event.target as Node)) return;
+      // 应用选择器浮层挂在应用壳上，选中应用前保留环境卡。
+      if (event.target instanceof Element && event.target.closest('.session-working-directory-apps-popover')) return;
       if (docked) return;
       setOpen(false);
     };
     const closeFromKeyboard = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return;
-      // 原生屏幕控制详情先处理 Esc，保留下面的环境信息卡。
-      if (cardRef.current?.querySelector('.session-computer-preview-info:popover-open')) return;
+      // 子面板优先处理 Esc，收起后焦点留在环境信息卡。
+      if (cardRef.current?.querySelector('.session-computer-preview-info:popover-open, .session-working-directory-apps[data-open="true"]')) return;
       event.preventDefault();
       event.stopPropagation();
       setOpen(false);
@@ -457,47 +511,34 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                 </header>
 
                 <div className="session-quick-actions-list">
-                  <div className="session-quick-actions-row is-static session-quick-actions-metadata" data-icon-tooltip={cwd ?? undefined}>
-                    <Folder aria-hidden="true" weight="regular" />
+                  <div className="session-quick-actions-row is-static" data-icon-tooltip={cwd ?? undefined}>
+                    {cwd ? <FileTypeIcon path={cwd} kind="directory" size={17} /> : <Folder aria-hidden="true" weight="regular" />}
                     <span className="session-quick-actions-copy">
-                      <strong>{zh ? '工作目录' : 'Working directory'}</strong>
-                      <small>{cwd ?? (workspaceState === 'idle' || workspaceState === 'loading' ? (zh ? '正在读取…' : 'Loading…') : zh ? '执行目录不可用' : 'Execution directory unavailable')}</small>
+                      <strong>{workingDirectoryLabel}</strong>
                     </span>
                     {cwd ? <RuntimeCopyButton text={cwd} label={zh ? '复制工作目录' : 'Copy working directory'} copiedLabel={zh ? '工作目录已复制' : 'Working directory copied'} /> : null}
                   </div>
+                  {cwd && window.zeus?.openWorkingDirectory ? (
+                    <SessionWorkingDirectoryLauncher
+                      key={JSON.stringify([props.conversation.projectId, props.conversation.id, cwd])}
+                      projectId={props.conversation.projectId}
+                      conversationId={props.conversation.id}
+                      cwd={cwd}
+                      visible={cardVisible}
+                      zh={zh}
+                    />
+                  ) : null}
 
-                  <div className="session-quick-actions-row is-static session-quick-actions-metadata" data-icon-tooltip={branch ?? undefined}>
-                    <GitBranch aria-hidden="true" weight="regular" />
-                    <span className="session-quick-actions-copy">
-                      <strong>
-                        {workspaceState === 'error'
-                          ? zh
-                            ? 'Git 状态读取失败'
-                            : 'Failed to read Git status'
-                          : (branch ??
-                            (workspaceState === 'idle' || workspaceState === 'loading'
-                              ? zh
-                                ? '正在读取分支…'
-                                : 'Loading branch…'
-                              : summary?.repositoryCount === 0
-                                ? zh
-                                  ? '非 Git 目录'
-                                  : 'Not a Git repository'
-                                : zh
-                                  ? '分支不可用'
-                                  : 'Branch unavailable'))}
-                      </strong>
-                      {sourceBranches ? (
-                        <small title={sourceBranches}>
-                          {zh ? '来源分支 ' : 'Source branch '}
-                          {sourceBranches}
-                        </small>
-                      ) : null}
-                    </span>
-                    {branch && !(directWorkspace && (summary?.repositoryCount ?? 0) > 1) ? (
-                      <RuntimeCopyButton text={branch} label={zh ? '复制工作分支' : 'Copy working branch'} copiedLabel={zh ? '工作分支已复制' : 'Working branch copied'} />
-                    ) : null}
-                  </div>
+                  {showSourceBranch ? (
+                    <SessionBranchCard
+                      kind="source"
+                      zh={zh}
+                      branches={summary?.sourceBranches}
+                      branch={summary?.sourceBranch ?? null}
+                      emptyLabel={branchLoading ? (zh ? '正在读取分支…' : 'Loading branch…') : zh ? '未记录' : 'Not recorded'}
+                    />
+                  ) : null}
+                  <SessionBranchCard kind="target" zh={zh} branches={summary?.workingBranches} branch={workingBranch} emptyLabel={missingWorkingBranch} />
 
                   {subagentCount > 0 && props.onOpenSubagents ? (
                     <Button unstyled type="button" className="session-quick-actions-row" onClick={(event) => openSubagents(event.currentTarget)}>
@@ -600,7 +641,7 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                     </Button>
                     {deliveryRun ? (
                       <div className="session-quick-actions-delivery-progress">
-                        <GitDeliveryProgress run={deliveryRun} zh={zh} />
+                        <GitDeliveryProgress run={deliveryRun} zh={zh} showErrorSummaries />
                         {gitClient ? <GitDeliveryRunActions client={gitClient} run={deliveryRun} zh={zh} onUpdated={() => refreshDelivery()} /> : null}
                       </div>
                     ) : null}
@@ -644,8 +685,6 @@ export function SessionQuickActionsCard(props: SessionQuickActionsCardProps) {
                     </Button>
                   ) : null}
                 </section>
-
-                {workspaceState === 'error' ? <p role="status">{zh ? '显示最近一次读取的目录与分支。' : 'Shows the most recently loaded folder and branch.'}</p> : null}
               </Collapsible>
             </section>
             <SessionComputerPreview key={props.conversation.id} conversationId={props.conversation.id} language={props.language} active={cardVisible} onStopOperationAgent={props.onStopOperationAgent} />
@@ -729,15 +768,12 @@ function SessionQuickActionSourceVisual(props: { source: SourceRow; onLoadResour
   );
 }
 
+/** 来源列表使用登记资源或原始附件的文件名。 */
 function SourceFallbackIcon(props: { source: SourceRow }) {
   if (props.source.resource) return <ResourceIcon resource={props.source.resource} />;
-  if (props.source.attachment && isPendingImageAttachment(props.source.attachment)) return <FileImage weight="regular" />;
-  if (props.source.attachment?.kind === 'directory') return <Folder weight="regular" />;
-  if (props.source.attachment?.kind === 'pasted_text') return <FileCode weight="regular" />;
-  if (props.source.attachment) {
-    return <FileTypeIcon name={props.source.attachment.name} />;
-  }
-  return <File weight="regular" />;
+  /** 未持久化的来源只有原始附件信息。 */
+  const attachment = props.source.attachment;
+  return <FileTypeIcon path={attachment?.kind === 'pasted_text' ? 'pasted.txt' : (attachment?.name ?? '')} kind={attachment?.kind === 'directory' ? 'directory' : undefined} />;
 }
 
 function isImageSource(source: SourceRow): boolean {

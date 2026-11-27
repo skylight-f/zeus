@@ -19,7 +19,6 @@ export * from './managedProcess.js';
 export * from './windowsNativeRuntime.js';
 export * from './codexAppServerProtocol.js';
 export * from './codexRuntimeGenerationManager.js';
-export * from './codexMcpConfiguration.js';
 export * from './codexModelBudgetSnapshot.js';
 export { readCodexModelCatalogCache } from './codexModelCatalogCache.js';
 export * from './agentRuntimeContracts.js';
@@ -1385,3 +1384,5 @@ function requireRuntimeSession(sessions: Map<string, AiRuntimeSession>, sessionI
   if (!session) throw new Error(`AI Runtime session not found: ${sessionId}`);
   return session;
 }
+
+export * from './antigravityRuntimeDriver.js';

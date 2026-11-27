@@ -52,7 +52,7 @@ export class WorkArtifactRepository {
   /** 所有关系仍保存到同一 Core 数据库。 */
   constructor(private readonly db: ZeusDatabasePort) {}
 
-  /** 旧返工尚未派发时，从唯一正式审查事件补齐交接；已开始的工作上下文永不改写。 */
+  /** 仅在首次派发前恢复返工来源并转为分页交接，以保留已派发轮次的原请求摘要。 */
   restorePreparedReworkHandoff(runId: string): boolean {
     return this.db.transaction(() => {
       /** 恢复只处理原工作项仍指向的未执行轮次，不能借历史事件扩大已有会话权限。 */
@@ -64,8 +64,10 @@ export class WorkArtifactRepository {
       if (!run) return false;
       /** 团队返工读取准确冻结尝试链，普通返工仅读取原审查事件。 */
       const snapshot = JSON.parse(run.entrypoint_snapshot_json) as Record<string, unknown>;
-      if (typeof snapshot.reworkDeliverableId === 'string' && Array.isArray(snapshot.upstreamDeliverableIds) && snapshot.upstreamDeliverableIds.includes(snapshot.reworkDeliverableId)) return false;
-      if (snapshot.digitalTeamPurpose) {
+      const sourceLinked = typeof snapshot.reworkDeliverableId === 'string' && Array.isArray(snapshot.upstreamDeliverableIds) && snapshot.upstreamDeliverableIds.includes(snapshot.reworkDeliverableId);
+      const legacyReview = snapshot.reworkReason;
+      if (sourceLinked && typeof legacyReview !== 'string') return false;
+      if (!sourceLinked && snapshot.digitalTeamPurpose) {
         /** 同节点紧邻的失效尝试是唯一前次来源，正式成果还须对应其准确工作身份。 */
         const prior = this.db.select<{ deliverable_id: string | null; owned_id: string | null }>(
           `SELECT previous.deliverable_id,deliverable.id AS owned_id FROM digital_team_node_attempts current
@@ -81,24 +83,27 @@ export class WorkArtifactRepository {
         if (Array.isArray(snapshot.upstreamDeliverableIds) && snapshot.upstreamDeliverableIds.includes(deliverableId)) return false;
         snapshot.reworkDeliverableId = deliverableId;
         snapshot.upstreamDeliverableIds = [...new Set([...(Array.isArray(snapshot.upstreamDeliverableIds) ? snapshot.upstreamDeliverableIds.filter((id): id is string => typeof id === 'string') : []), deliverableId])];
-        this.db.execute('UPDATE task_work_runs SET entrypoint_snapshot_json=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?', [JSON.stringify(snapshot), new Date().toISOString(), runId, run.revision]);
-        return true;
-      }
-      if (typeof snapshot.reworkReason !== 'string') return false;
-      /** 事件、前次运行及正式成果必须准确属于同一工作项，缺失或多份来源保持阻塞。 */
-      const sources = this.db.select<{ deliverable_id: string }>(
-        `SELECT deliverable.id AS deliverable_id FROM task_events event
+      } else if (!sourceLinked) {
+        if (typeof legacyReview !== 'string' && typeof snapshot.reworkReview !== 'string') return false;
+        /** 事件、前次运行及正式成果必须准确属于同一工作项，缺失或多份来源保持阻塞。 */
+        const sources = this.db.select<{ deliverable_id: string }>(
+          `SELECT deliverable.id AS deliverable_id FROM task_events event
          JOIN task_work_runs previous ON previous.id=json_extract(event.payload_json,'$.previousRunId') AND previous.work_item_id=? AND previous.task_id=? AND previous.project_id=? AND previous.attempt=? AND previous.status='failed' AND previous.error_code='ZEUS_TASK_WORK_CHANGES_REQUESTED'
          JOIN task_work_deliverables deliverable ON deliverable.id=json_extract(event.payload_json,'$.deliverableId') AND deliverable.run_id=previous.id AND deliverable.work_item_id=previous.work_item_id AND deliverable.task_id=previous.task_id AND deliverable.project_id=previous.project_id AND deliverable.status='changes_requested'
          WHERE event.task_id=? AND event.event_type='task.work_deliverable.changes_requested' AND json_extract(event.payload_json,'$.runId')=? AND json_extract(event.payload_json,'$.workItemId')=?`,
-        [run.work_item_id, run.task_id, run.project_id, run.attempt - 1, run.task_id, runId, run.work_item_id],
-      );
-      if (sources.length !== 1) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REWORK_HANDOFF_UNRESOLVED', '旧返工的前次成果来源无法唯一核对，请通过正常审查建立新返工。');
-      /** 只追加此次被要求修改的准确成果，其余冻结交接范围保持原样。 */
-      const deliverableId = sources[0]!.deliverable_id;
-      if (snapshot.reworkDeliverableId && snapshot.reworkDeliverableId !== deliverableId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REWORK_HANDOFF_UNRESOLVED', '旧返工的正式成果来源存在冲突，请核对原审查记录。');
-      snapshot.reworkDeliverableId = deliverableId;
-      snapshot.upstreamDeliverableIds = [...new Set([...(Array.isArray(snapshot.upstreamDeliverableIds) ? snapshot.upstreamDeliverableIds.filter((id): id is string => typeof id === 'string') : []), deliverableId])];
+          [run.work_item_id, run.task_id, run.project_id, run.attempt - 1, run.task_id, runId, run.work_item_id],
+        );
+        if (sources.length !== 1) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REWORK_HANDOFF_UNRESOLVED', '旧返工的前次成果来源无法唯一核对，请通过正常审查建立新返工。');
+        /** 只追加此次被要求修改的准确成果，其余冻结交接范围保持原样。 */
+        const deliverableId = sources[0]!.deliverable_id;
+        if (snapshot.reworkDeliverableId && snapshot.reworkDeliverableId !== deliverableId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_REWORK_HANDOFF_UNRESOLVED', '旧返工的正式成果来源存在冲突，请核对原审查记录。');
+        snapshot.reworkDeliverableId = deliverableId;
+        snapshot.upstreamDeliverableIds = [...new Set([...(Array.isArray(snapshot.upstreamDeliverableIds) ? snapshot.upstreamDeliverableIds.filter((id): id is string => typeof id === 'string') : []), deliverableId])];
+      }
+      if (typeof legacyReview === 'string') {
+        snapshot.reworkReview = legacyReview;
+        delete snapshot.reworkReason;
+      }
       this.db.execute('UPDATE task_work_runs SET entrypoint_snapshot_json=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?', [JSON.stringify(snapshot), new Date().toISOString(), runId, run.revision]);
       return true;
     });
@@ -146,6 +151,11 @@ export class WorkArtifactRepository {
     this.db.execute('UPDATE work_artifact_publications SET exported_root=?,export_error=?,updated_at=? WHERE deliverable_id=?', [root, error, new Date().toISOString(), deliverableId]);
   }
 
+  /** 持久记录待导出状态，调度器重启后仍可领取。 */
+  markExportPending(deliverableId: string): void {
+    this.exported(deliverableId, null, null);
+  }
+
   /** 目录中的已知哈希限制 Core 的覆盖权限。 */
   location(taskId: string): { root: string; ownedFiles: Record<string, string>; legacySources: Record<string, string> } | undefined {
     /** 旧位置属于稳定任务 ID，不从目录名称猜测。 */
@@ -190,7 +200,7 @@ export class WorkArtifactRepository {
     return Boolean(run?.source_ref && this.repairHandoff(run.task_id, run.source_ref, deliverableId));
   }
 
-  /** 按当前项目目录和任务编码核对完整导出位置，目录变化后沿用原重试间隔。 */
+  /** 首次待导出立即可领取，失败和位置变化沿用原重试间隔。 */
   pendingTaskIds(limit: number, eligibleBefore: string, managedRoot: string): string[] {
     return this.db
       .select<{ task_id: string }>(
@@ -198,9 +208,11 @@ export class WorkArtifactRepository {
          JOIN tasks task ON task.id=publication.task_id
          LEFT JOIN projects project ON project.id=task.project_id AND project.deleted_at IS NULL
          LEFT JOIN work_task_doc_locations location ON location.task_id=task.id
-         WHERE publication.updated_at<=? AND (
-           publication.exported_root IS NULL OR publication.export_error IS NOT NULL OR location.root IS NULL OR
-           location.root <> (rtrim(COALESCE(NULLIF(project.local_path,''),?),?) || ? || COALESCE(NULLIF(task.task_code,''),task.id))
+         WHERE (publication.exported_root IS NULL AND publication.export_error IS NULL) OR (
+           publication.updated_at<=? AND (
+             publication.export_error IS NOT NULL OR location.root IS NULL OR
+             location.root <> (rtrim(COALESCE(NULLIF(project.local_path,''),?),?) || ? || COALESCE(NULLIF(task.task_code,''),task.id))
+           )
          )
          GROUP BY publication.task_id ORDER BY MIN(publication.updated_at),publication.task_id LIMIT ?`,
         [eligibleBefore, resolve(managedRoot), sep, sep + 'docs' + sep, limit],

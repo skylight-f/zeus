@@ -6,6 +6,7 @@ import {
   buildAiRuntimePrompt,
   modelRef,
   parseModelRef,
+  type AntigravityModel,
   type CodexAccountSnapshot,
   type CodexCapabilitiesSnapshot,
   type CodexTransportState,
@@ -13,6 +14,7 @@ import {
   type SelectableConnectionModel,
 } from '@zeus/ai-runtime';
 import { buildTaskBranchName, buildTaskBranchPrefix, type GitRepositoryContext } from '@zeus/git-core';
+import { mapWithConcurrency } from './localServerPlatformSupport.js';
 import { readProjectRepositoryDiscovery } from './projectRepositoryDiscovery.js';
 import type {
   ConversationRepository,
@@ -27,6 +29,7 @@ import type {
   ZeusConversationWithMessagesRecord,
   ZeusProjectRecord,
   ZeusProjectRepositoryRecord,
+  ZeusTaskEnvironmentRecord,
   ZeusTaskRecord,
 } from '@zeus/storage';
 
@@ -77,6 +80,8 @@ interface ConversationCapabilityQueryPorts {
     readAccount(): { authenticated: boolean } | null;
     readModels(): CopilotModelInfo[];
   };
+  /** 项目会话只展示当前 Google 账号实际返回的模型。 */
+  readAntigravityModels?: () => AntigravityModel[];
   git: TaskPushGitReadPort;
   taskContext: {
     read(project: ZeusProjectRecord, task: ZeusTaskRecord): TaskPushContextProjection;
@@ -96,7 +101,7 @@ export interface ConversationCapabilityModel {
   id: string;
   model: string;
   displayName?: string;
-  agentKind: 'codex' | 'pi' | 'copilot';
+  agentKind: 'codex' | 'pi' | 'copilot' | 'antigravity';
   sourceId: string;
   sourceName: string;
   available: boolean;
@@ -162,9 +167,12 @@ export class ConversationCapabilityQueryApplication {
   async readDigitalEmployee(): Promise<DigitalEmployeeCapabilitiesSnapshot> {
     const transport = this.ports.provider.getState();
     const codexCapabilities = this.ports.codexNativeEnabled() && transport.type === 'ready' ? transport.capabilities : null;
-    const models = mapConversationCapabilityModels(codexCapabilities, await this.ports.modelCatalog.listSelectableModels(), this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : []).map(
-      (model) => ({ ...model, contextCapacity: this.ports.readContextCapacitySupport?.(model) }),
-    );
+    const models = mapConversationCapabilityModels(
+      codexCapabilities,
+      await this.ports.modelCatalog.listSelectableModels(),
+      this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : [],
+      this.ports.readAntigravityModels?.(),
+    ).map((model) => ({ ...model, contextCapacity: this.ports.readContextCapacitySupport?.(model) }));
     const preferred = this.ports.readDefaultModel();
     const snapshot = {
       preferredModel: preferred ? (resolveModelCapability(models, preferred)?.id ?? preferred) : (models.find((model) => model.available !== false)?.id ?? null),
@@ -174,6 +182,18 @@ export class ConversationCapabilityQueryApplication {
       models,
     };
     return models.length > 0 ? snapshot : { ...snapshot, available: false, availabilityReason: '当前没有已就绪的 Provider 模型；GET 不会为了读取能力而启动 Provider。' };
+  }
+
+  /** 返工和重试只读取原环境及其仓库与会话状态，不重新查询模型或 Git 引用。 */
+  readTaskEnvironmentAvailability(projectId: string, taskId: string, environmentId: string): 'available' | 'busy' | 'closed' | 'invalid' {
+    /** 原运行只能继续使用同项目、同任务的环境。 */
+    const environment = this.ports.environments.listByTask(taskId).find((candidate) => candidate.id === environmentId && candidate.projectId === projectId);
+    if (!environment) return 'invalid';
+    /** 合入或放弃任一仓库，会使原环境不能整体继续使用。 */
+    const { workspaces, activeConversationIds, closed } = this.readEnvironmentMembers(environment);
+    if (closed) return 'closed';
+    if (!workspaces.length) return 'invalid';
+    return activeConversationIds.length ? 'busy' : 'available';
   }
 
   /** 读取一次推送确认所需的模型、上下文和工作区快照；是否附带账号由调用入口决定。 */
@@ -199,10 +219,9 @@ export class ConversationCapabilityQueryApplication {
     const primaryRepository = repositoryCapabilities[0];
     const existingEnvironments = this.ports.environments.listByTask(task.id).flatMap((environment) => {
       if (environment.state === 'reclaimed') return [];
-      const members = this.ports.workspaces.listByEnvironment(environment.id).filter((workspace) => workspace.kind === 'task');
+      const { workspaces, activeConversationIds, closed: hasClosedWorkspace } = this.readEnvironmentMembers(environment);
+      const members = workspaces.filter((workspace) => workspace.kind === 'task');
       if (members.length === 0) return [];
-      const hasClosedWorkspace = members.some((workspace) => workspace.state === 'merged' || workspace.state === 'discarded');
-      const activeConversationIds = this.activeWritableEnvironmentConversationIds(environment.id);
       const hasActiveConversation = activeConversationIds.length > 0;
       return [
         {
@@ -268,14 +287,15 @@ export class ConversationCapabilityQueryApplication {
     codexCapabilities: CodexCapabilitiesSnapshot | null,
     codexAccount: CodexAccountSnapshot | UnavailableCodexAccount,
     preloadedConnectionCatalog?: SelectableConnectionModel[],
+    antigravityModels: AntigravityModel[] = [],
   ): Promise<ConversationCapabilitiesSnapshot> {
     const connectionCatalog = preloadedConnectionCatalog ?? (await this.ports.modelCatalog.listSelectableModels());
     // 项目不再维护模型白名单；供应商中启用的模型全局可用，真实能力以运行探针结果为准。
-    const models = mapConversationCapabilityModels(codexCapabilities, connectionCatalog, this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : []).map((model) => ({
+    const models = mapConversationCapabilityModels(codexCapabilities, connectionCatalog, this.ports.copilotCatalog.readAccount()?.authenticated ? this.ports.copilotCatalog.readModels() : [], antigravityModels).map((model) => ({
       ...model,
       contextCapacity: this.ports.readContextCapacitySupport?.(model),
     }));
-    if (models.length === 0) throw queryError('ZEUS_MODEL_UNAVAILABLE', '当前项目没有可用的 Codex 或 Pi 模型。');
+    if (models.length === 0) throw queryError('ZEUS_MODEL_UNAVAILABLE', '当前项目没有可用模型。');
     const defaultModel = this.ports.readDefaultModel();
     // 新项目沿用 Zeus 全局默认模型；会话/推送模型由各入口的“记住上次选择”覆盖。
     const preferredModel = defaultModel ? (resolveModelCapability(models, defaultModel)?.id ?? defaultModel) : (models.find((candidate) => candidate.available !== false)?.id ?? null);
@@ -308,7 +328,7 @@ export class ConversationCapabilityQueryApplication {
     ]);
     try {
       /** 账号故障只影响 Codex，独立供应商仍使用自己的目录与可用性证据。 */
-      const snapshot = await this.buildConversationCapabilities(project, codexCapabilities, codexAccount, connectionCatalog);
+      const snapshot = await this.buildConversationCapabilities(project, codexCapabilities, codexAccount, connectionCatalog, this.ports.readAntigravityModels?.());
       if (codexAccountReadFailed) {
         return {
           ...snapshot,
@@ -411,6 +431,17 @@ export class ConversationCapabilityQueryApplication {
     return [...new Set([...nestedRepositories, ...sharedPaths].map((localPath) => relative(repositoryPath, localPath).split(sep).join('/')).filter((path) => Boolean(path) && path !== '.'))];
   }
 
+  /** 与实际继续环境的校验一致，关闭状态检查所有仓库成员。 */
+  private readEnvironmentMembers(environment: ZeusTaskEnvironmentRecord) {
+    /** 仓库状态与会话占用分别决定关闭和暂时占用。 */
+    const workspaces = this.ports.workspaces.listByEnvironment(environment.id);
+    return {
+      workspaces,
+      closed: environment.state === 'reclaimed' || workspaces.some((workspace) => workspace.state === 'merged' || workspace.state === 'discarded'),
+      activeConversationIds: this.activeWritableEnvironmentConversationIds(environment.id),
+    };
+  }
+
   private activeWritableEnvironmentConversationIds(environmentId: string): string[] {
     return this.ports.conversations
       .listByEnvironment(environmentId)
@@ -444,7 +475,12 @@ export class ConversationCapabilityQueryApplication {
   }
 }
 
-function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSnapshot | null, connectionCatalog: SelectableConnectionModel[], copilotCatalog: CopilotModelInfo[]): ConversationCapabilityModel[] {
+function mapConversationCapabilityModels(
+  codexCapabilities: CodexCapabilitiesSnapshot | null,
+  connectionCatalog: SelectableConnectionModel[],
+  copilotCatalog: CopilotModelInfo[],
+  antigravityCatalog: AntigravityModel[] = [],
+): ConversationCapabilityModel[] {
   const codexModels: ConversationCapabilityModel[] = (codexCapabilities?.models ?? []).map((model) => ({
     id: model.id,
     model: model.model,
@@ -452,7 +488,7 @@ function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSna
     agentKind: 'codex',
     supports1MContext: false,
     sourceId: 'codex',
-    sourceName: 'OpenAI',
+    sourceName: 'Codex',
     available: true,
     availabilityReason: 'Codex app-server 已报告该模型。',
     supportedReasoningEfforts: [...model.supportedReasoningEfforts],
@@ -505,8 +541,27 @@ function mapConversationCapabilityModels(codexCapabilities: CodexCapabilitiesSna
     protocolFamily: 'copilot_sdk',
     authenticationScheme: 'github_oauth',
   }));
+  /** ACP 目录保留 Google 分配的模型 ID 和名称。 */
+  const antigravityModels: ConversationCapabilityModel[] = antigravityCatalog.map((model) => ({
+    id: modelRef('antigravity', model.id),
+    model: model.id,
+    displayName: model.name,
+    agentKind: 'antigravity',
+    sourceId: 'antigravity',
+    sourceName: 'Google Antigravity',
+    available: true,
+    availabilityReason: 'Antigravity CLI 已返回该模型。',
+    supportedReasoningEfforts: model.supportedReasoningEfforts ?? [],
+    defaultReasoningEffort: model.defaultReasoningEffort ?? null,
+    serviceTiers: [],
+    supports1MContext: false,
+    contextWindow: null,
+    runtimeAdapter: 'antigravity_acp',
+    protocolFamily: 'antigravity_acp',
+    authenticationScheme: 'google_oauth',
+  }));
   const piTools = new Set(readPiBuiltinToolCatalog().map((tool) => tool.name));
-  return [...codexModels, ...connectionModels, ...copilotModels].map((model) => ({ ...model, features: conversationFeatureCatalog(model, piTools, codexCapabilities) }));
+  return [...codexModels, ...connectionModels, ...copilotModels, ...antigravityModels].map((model) => ({ ...model, features: conversationFeatureCatalog(model, piTools, codexCapabilities) }));
 }
 
 /** 执行内核、模型接口和会话工具分别提供事实，不能把看图能力当成生图能力。 */
@@ -514,6 +569,25 @@ function conversationFeatureCatalog(model: ConversationCapabilityModel, piTools:
   const available = (reason: string): ConversationFeatureAvailability => ({ state: 'available', reason });
   const unknown = (reason: string): ConversationFeatureAvailability => ({ state: 'unknown', reason });
   const unavailable = (reason: string): ConversationFeatureAvailability => ({ state: 'unsupported', reason });
+  if (model.agentKind === 'antigravity') {
+    /** agy 自己提供工具和上下文，Zeus 展示 ACP 实际请求的权限。 */
+    const localOnly = unavailable('此功能在 Antigravity 会话中不可用。');
+    return {
+      skills: localOnly,
+      imageInput: unknown('是否支持图片以 Antigravity 会话为准。'),
+      imageGeneration: localOnly,
+      questions: available('通过 Antigravity 原生提问收集本轮回答。'),
+      plan: unknown('是否支持计划模式以 Antigravity 会话公布的模式为准。'),
+      processes: localOnly,
+      steering: localOnly,
+      goals: localOnly,
+      subagents: localOnly,
+      autoReview: unknown('优先使用当前 Antigravity 会话公布的 Auto 审查，需确认时转人工。'),
+      mcp: localOnly,
+      search: localOnly,
+      browser: localOnly,
+    };
+  }
   const nativeKernel = model.runtimeAdapter !== 'pi_sdk' && model.agentKind === 'codex';
   const tools = (name: string): ConversationFeatureAvailability =>
     model.tools === 'unsupported'
@@ -588,27 +662,6 @@ export function resolveModelCapability<T extends { id: string; model: string; so
 
 function positiveIntegerOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.trunc(value) : null;
-}
-
-async function mapWithConcurrency<Input, Output>(items: Input[], operation: (item: Input, index: number) => Promise<Output>, concurrency = 4): Promise<Output[]> {
-  const results = new Array<Output>(items.length);
-  let nextIndex = 0;
-  let firstError: unknown;
-  const worker = async (): Promise<void> => {
-    while (!firstError) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= items.length) return;
-      try {
-        results[index] = await operation(items[index]!, index);
-      } catch (error) {
-        firstError ??= error;
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, () => worker()));
-  if (firstError) throw firstError;
-  return results;
 }
 
 function isPathInsideRoot(candidate: string, root: string): boolean {

@@ -4,6 +4,7 @@ import { markSideQuestionConversationArchived, restoreSideQuestionWorkspace } fr
 import { useBackgroundInputSuggestions } from '../../session/useBackgroundInputSuggestions.js';
 import { isLocalNetworkOffline } from '../../session/conversationSystemMessages.js';
 import { notifyProjectGitChanged } from '../../git/projectGitWorkbenchState.js';
+import { forgetRemovedSourceWorktree } from '../../code/projectSourceTreeCache.js';
 import { isZentaoDestinationComplete, type ZentaoTaskDestination } from '../../task/ZentaoSyncModal.js';
 import { modelCatalogGeneration } from '../integrations/modelCatalogEvents.js';
 import type { ProjectRecord } from '../../apiClient.js';
@@ -38,6 +39,7 @@ import {
   temporaryWorkspaceId,
   type ThirdPartyTaskExtract,
   userFacingErrorCause,
+  userFacingNetworkIssue,
 } from '@zeus/shared';
 import { type ConversationTreeRuntimeState, conversationTreeRuntimeStateFromConversation } from '../../session/ProjectConversationTree.js';
 import { focusTaskPushWindow } from '../../ui/windowDocument.js';
@@ -50,6 +52,7 @@ import {
   preloadCodexConversationCapabilities,
   type ProjectSessionWorkspaceStartInput,
   readCachedCodexConversationCapabilities,
+  refreshCodexConversationCapabilities,
   type SessionWorkspaceActions,
   type SessionWorkspaceStartInput,
   startNativeConversationWithDurableAcceptance,
@@ -75,7 +78,7 @@ import {
   resolveTaskModelPushEntry,
   resolveTaskModelPushInitialForm,
   selectTaskModelPushModel,
-  selectedTaskPushCurrentConversationPaths,
+  selectedTaskPushConversationHistory,
   selectedTaskPushParentContexts,
   selectedTaskPushRelatedContexts,
   type TaskModelPushForm,
@@ -87,10 +90,12 @@ import {
   acceptTaskModelPushPendingState,
   attachTaskModelPushChoice,
   createTaskModelPushPendingState,
+  editTaskModelPushDeferredMessage,
   enqueueTaskModelPushMessage,
   failTaskModelPushPendingState,
   identifyTaskModelPushPendingOperation,
   retryTaskModelPushPendingState,
+  taskModelPushDeferredMessageRequest,
   taskModelPushHasRealChoice,
   type TaskModelPushPendingState,
   updateTaskModelPushAttachments,
@@ -100,7 +105,7 @@ import {
 } from '../../task/TaskModelPushPendingWorkspace.js';
 import { parseTaskAttachments, type TaskResourceAuthorizationResult, type TaskResourcePayload } from '../../task/taskAttachments.js';
 import { normalizeTaskTableEnumSortOrders, resolveTaskManagementStatus } from '../../task/taskWorkspaceModel.js';
-import { modelSetupRequestedEvent } from '../../ui/ApplicationErrorDialog.js';
+import { modelSetupRequestedEvent, reportApplicationError } from '../../ui/ApplicationErrorDialog.js';
 import { reportStorageReadOnlyFault } from '../../storageRecoveryError.js';
 import { readSkillWorkflowDefault, workflowSkillSelectionRequest } from '../skills/skillWorkflowPreferences.js';
 import { createSessionOperationId } from '../../sessionOperationIdentity.js';
@@ -154,6 +159,11 @@ function resolveTaskModelPushCapability(capabilities: CodexTaskPushCapabilities,
   if (selected) return selected;
   const preferred = resolveModelCapability(capabilities.models, capabilities.preferredModel);
   return preferred && preferred.model === requestedIdentity.trim() ? preferred : null;
+}
+
+/** 按会话列表范围识别仅在协作详情中读取的内部会话。 */
+function isInternalConversationChoice(conversation: NativeConversationChoice): boolean {
+  return conversation.listingScope === 'subagent_internal' || conversation.listingScope === 'expert_internal';
 }
 
 export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
@@ -506,7 +516,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       void client
         .loadNativeConversationChoice(projectId, conversationId)
         .then((metadata) => {
-          if (metadata.id !== conversationId || metadata.projectId !== projectId) return;
+          if (metadata.id !== conversationId || metadata.projectId !== projectId || isInternalConversationChoice(metadata)) return;
           if (metadata.taskId) {
             const taskId = metadata.taskId;
             // 使更早发出的批量快照失效，避免旧状态覆盖实时轻量投影。
@@ -595,15 +605,19 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     };
     const unsubscribe = subscribeRealtimeEvents(
       (event) => {
+        if (event.type === 'git.worktree.removed' && typeof event.payload.worktreePath === 'string') {
+          forgetRemovedSourceWorktree(event.payload.worktreePath);
+          return;
+        }
         observeInputSuggestion(event);
         observeConversationPreload(event);
         // 原生用户发送及旧运行时首条消息刷新完整统计；普通会话状态变化不进入此路径。
         if (props.nativeConversationClient && (event.type === 'conversation.submission.accepted' || event.type === 'runtime.session.created')) {
           void reloadProjects().catch((error: unknown) => recordRealtimeSynchronizationError('project-activity-refresh', error));
         }
-        if (event.type === 'codex.models.changed') {
+        if (event.type === 'codex.models.changed' || event.type === 'antigravity.models.changed') {
           // 当前连接发布新目录后，所有模型选择器共用一次能力变更通知。
-          if (event.payload.succeeded === true) window.dispatchEvent(new Event(codexCapabilitiesChangedEvent));
+          if (event.type === 'antigravity.models.changed' || event.payload.succeeded === true) window.dispatchEvent(new Event(codexCapabilitiesChangedEvent));
           return;
         }
         if (event.type === 'codex.update.checked') {
@@ -646,7 +660,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           setStorageRecoveryFault((current) => (current?.phase === 'running' ? { ...fault, phase: 'running' } : fault));
           return;
         }
-        if (event.type === 'codex.usage.changed') setCodexUsageRevision((current) => current + 1);
+        // 带会话身份的用量更新包括非 Codex 记账失败及补写。
+        if (event.type === 'codex.usage.changed' || (event.type === 'usage.changed' && typeof event.payload.conversationId === 'string')) setCodexUsageRevision((current) => current + 1);
         if (typeof event.payload.projectId === 'string' && isProjectConversationAttentionState(event.payload.conversationAttentionState)) {
           const projectId = event.payload.projectId;
           const attentionState = event.payload.conversationAttentionState;
@@ -677,7 +692,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
                 },
           );
         }
-        if (shouldRefreshNativeConversationListForRealtimeEvent(event)) {
+        if (typeof event.payload.projectId === 'string' && typeof event.payload.operationOwnerConversationId === 'string') {
+          refreshNativeConversationList(event.payload.projectId, event.payload.operationOwnerConversationId);
+        } else if (shouldRefreshNativeConversationListForRealtimeEvent(event)) {
           refreshNativeConversationList(event.payload.projectId as string, event.payload.conversationId as string);
         }
         if (event.type === 'conversation.thread.archived' && typeof event.payload.conversationId === 'string') {
@@ -806,7 +823,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           setTaskModelPushCapabilities((current) => (current?.taskId === taskModelPushTaskId && current.projectId === projectId ? { ...current, models: capabilities.models, preferredModel: capabilities.preferredModel } : current));
         })
         .catch((error: unknown) => {
-          if (!disposed && sequence === requestSequence) recordLocalError('task-model-catalog-refresh', error);
+          if (!disposed && sequence === requestSequence) recordLocalError('task-model-catalog-refresh', error, true);
         });
     };
     window.addEventListener(codexCapabilitiesChangedEvent, refresh);
@@ -837,10 +854,18 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     setSelectedTaskIds((ids) => ids.filter((id) => visibleTaskIdSet.has(id)));
   }, [visibleTasks]);
 
-  function recordLocalError(action: string, error: unknown): void {
+  /** 网络分类保留原始错误链，后台刷新失败只记入诊断。 */
+  function recordLocalError(action: string, error: unknown, background = false): void {
+    /** 通知和原有错误摘要使用工作区语言。 */
+    const language = appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en';
+    if (userFacingNetworkIssue(error, window.navigator.onLine === false)) {
+      reportApplicationError(error, { language, background });
+      if (!background) setActionState('failed');
+      return;
+    }
     // 只记录真实捕获到的前端操作失败，并在渲染前脱敏，避免把 token / API key 明文带到界面。
     // 由 localError 的统一出口弹窗，格式化阶段不再重复上报。
-    const explanation = describeUserFacingError(error, appShellSettings.appLanguage === 'zh-CN' ? 'zh-CN' : 'en');
+    const explanation = describeUserFacingError(error, language);
     setLocalError({
       action,
       code: error instanceof ZeusApiError ? (error.error ?? undefined) : undefined,
@@ -1033,7 +1058,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       refreshNativeConversationChoices(taskId)
         .then(() => undefined)
         .catch((error: unknown) => {
-          if (taskDetailTargetRef.current === taskId && activeProjectIdRef.current === projectId) recordLocalError('task-conversation-refresh', error);
+          if (taskDetailTargetRef.current === taskId && activeProjectIdRef.current === projectId) recordLocalError('task-conversation-refresh', error, true);
         }),
     );
     pending.push(refreshOpenTaskEvents(taskId));
@@ -1289,9 +1314,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         setProjectDetail(selectedCreatedProject);
         activeProjectIdRef.current = selectedCreatedProject.id;
         setConversationDraftOpen(false);
-        const defaultSection = appShellSettings.mainLayout === 'current' ? 'sessions' : 'tasks';
-        setActiveNavTarget(defaultSection === 'sessions' ? 'conversations' : 'projects');
-        setActiveProjectSection(defaultSection);
+        setActiveNavTarget('projects');
+        setActiveProjectSection('tasks');
       }
     } catch (error) {
       setProjectCreateError(errorToLocalUiMessage(error, appShellSettings.appLanguage));
@@ -1800,8 +1824,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         (await props.nativeConversationClient?.loadNativeConversationChoice(conversation.projectId, conversation.sourceConversationId));
       if (selectionRevision !== nativeConversationSelectionRevision.current) return;
       if (!source || source.id === conversation.id || source.projectId !== conversation.projectId || source.taskId !== conversation.taskId) throw new Error('侧边栏会话的来源无法读取。');
-      /** 已归档的父会话不恢复交互侧栏，子会话仍可独立阅读。 */
-      if (!source.archived) {
+      /** 只有可进入普通会话页的未归档来源才恢复交互侧栏。 */
+      if (!source.archived && !isInternalConversationChoice(source)) {
         sideQuestion = conversation;
         conversation = source;
       }
@@ -1896,6 +1920,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   }
 
   async function selectNativeConversation(conversation: NativeConversationChoice, navigation: 'page' | 'preserve' = 'page', presentation?: 'history' | 'interactive'): Promise<boolean> {
+    if (isInternalConversationChoice(conversation)) return false;
     if (navigation === 'preserve') {
       await applyNativeConversationSelection(conversation, navigation, presentation);
       return true;
@@ -1904,10 +1929,10 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   }
 
   /** 从抽屉或任务入口进入同一会话的完整页面，保留现有的实时呈现方式。 */
-  async function openNativeConversationPage(conversation: NativeConversationChoice): Promise<void> {
+  async function openNativeConversationPage(conversation: NativeConversationChoice): Promise<boolean> {
     /** 已打开的会话不因切换展示容器退回历史模式。 */
     const presentation = state.selectedNativeConversation?.projectId === conversation.projectId && state.selectedNativeConversation.id === conversation.id ? state.selectedNativeConversationPresentation : undefined;
-    if (!(await selectNativeConversation(conversation, 'page', presentation))) return;
+    if (!(await selectNativeConversation(conversation, 'page', presentation))) return false;
     setTaskDetailPaneTaskId(undefined);
     setSessionDrawerTarget(undefined);
     setConversationDrawer(undefined);
@@ -1915,13 +1940,16 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       window.history.replaceState(null, '', '#project-sessions');
     }
     workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    return true;
   }
 
   /** 任务入口沿用统一的完整会话页跳转。 */
-  async function openTaskConversation(taskId: string, conversationId: string): Promise<void> {
-    /** 仅打开该任务实际存在的会话。 */
-    const conversation = nativeConversationChoicesByTask[taskId]?.choices.find((candidate) => candidate.id === conversationId);
-    if (conversation) await openNativeConversationPage(conversation);
+  async function openTaskConversation(taskId: string, conversationId: string): Promise<boolean> {
+    /** 工作待办可能先于关联会话列表刷新，按原会话身份补读当前任务。 */
+    const conversation =
+      nativeConversationChoicesByTask[taskId]?.choices.find((candidate) => candidate.id === conversationId) ?? (await refreshNativeConversationChoices(taskId))?.choices.find((candidate) => candidate.id === conversationId);
+    if (!conversation) throw new Error(appShellSettings.appLanguage === 'zh-CN' ? '原会话已不可用。' : 'The original conversation is unavailable.');
+    return openNativeConversationPage(conversation);
   }
 
   async function openTaskConflictAiConversation(taskId: string, conversationId: string): Promise<void> {
@@ -1976,7 +2004,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   taskGitDeliveryChangedRef.current = (taskId) => {
     // 独立交付窗口、服务端通知和返回内嵌交付页共用同一快照失效入口。
     setTaskGitDeliveryRevision((current) => current + 1);
-    void Promise.all([refreshNativeConversationChoices(taskId), refreshOpenTaskEvents(taskId)]).catch((error: unknown) => recordLocalError('task-git-delivery-projection-refresh', error));
+    void Promise.all([refreshNativeConversationChoices(taskId), refreshOpenTaskEvents(taskId)]).catch((error: unknown) => recordLocalError('task-git-delivery-projection-refresh', error, true));
   };
   taskGitDeliveryConversationRef.current = ({ taskId, conversationId }) => {
     void openTaskConflictAiConversation(taskId, conversationId);
@@ -1987,7 +2015,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     void client
       .loadNativeConversationChoice(projectId, conversationId)
       .then(async (conversation) => {
-        if (conversation.projectId !== projectId || conversation.id !== conversationId) return;
+        if (conversation.projectId !== projectId || conversation.id !== conversationId || isInternalConversationChoice(conversation)) return;
         const project = snapshot.projects.find((candidate) => candidate.id === projectId);
         if (!project) return;
         if (conversation.taskId) {
@@ -2151,7 +2179,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         ...current,
         [input.task.id]: failNativeConversationChoiceTaskLoad(current[input.task.id], 'Conversation started. History refresh will retry later.'),
       }));
-      recordLocalError('native-conversation-choice-refresh', refreshError);
+      recordLocalError('native-conversation-choice-refresh', refreshError, true);
     }
     return true;
   }
@@ -2216,7 +2244,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         ...current,
         [projectId]: failNativeConversationChoiceTaskLoad(current[projectId], 'Conversation started. History refresh will retry later.'),
       }));
-      recordLocalError('project-conversation-choice-refresh', refreshError);
+      recordLocalError('project-conversation-choice-refresh', refreshError, true);
     }
     return true;
   }
@@ -2362,9 +2390,18 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
   async function updateTaskManagementStatus(
     taskId: string,
     status: TaskManagementStatus,
-    options: { expectedUpdatedAt?: string; reopenConversationId?: string; /** 本次批量操作已经取得清理确认。 */ confirmWorktreeCleanup?: boolean } = {},
+    options: {
+      expectedUpdatedAt?: string;
+      reopenConversationId?: string;
+      /** 本次批量操作已经取得清理确认。 */
+      confirmWorktreeCleanup?: boolean;
+      /** 会话行保留到归档回执，并在原处显示等待和失败。 */
+      feedbackInConversationRow?: boolean;
+    } = {},
   ): Promise<TaskEditResult | undefined> {
-    const currentTask = (taskDetail?.id === taskId ? taskDetail : undefined) ?? snapshot.tasks.find((task) => task.id === taskId);
+    /** 会话和列表的状态下拉以目录快照为准，详情编辑以传入的版本为准。 */
+    const snapshotTask = snapshot.tasks.find((task) => task.id === taskId);
+    const currentTask = (options.expectedUpdatedAt === undefined ? snapshotTask : undefined) ?? (taskDetail?.id === taskId ? taskDetail : undefined) ?? snapshotTask;
     // 前一次写入未结束时，改回原状态也必须排队，不能当作无变化丢弃。
     if (!props.onUpdateTaskManagementStatus || !currentTask || (resolveTaskManagementStatus(currentTask) === status && !options.reopenConversationId && !taskMutationQueuesRef.current.has(taskId))) return;
     /** 每次选择持有独立身份，较早的请求结束不能清除较晚选择的加载反馈。 */
@@ -2374,18 +2411,36 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     const projectStatusConfig = resolveTaskManagementStatusConfig(appShellSettings);
     const statusLabel = formatConfiguredTaskManagementStatus(status, projectStatusConfig, appShellSettings.appLanguage);
     const terminalStatus = status === projectStatusConfig.roles.completedStatusId || status === projectStatusConfig.roles.cancelledStatusId;
-    const clearOptimisticTerminalStatus = (): void =>
+    /** 只有使用乐观状态的入口负责清理该状态。 */
+    const clearOptimisticTerminalStatus = (): void => {
+      if (options.feedbackInConversationRow) return;
       setOptimisticTerminalTaskStatuses((current) => {
         if (!(taskId in current)) return current;
         const next = { ...current };
         delete next[taskId];
         return next;
       });
-    if (terminalStatus) setOptimisticTerminalTaskStatuses((current) => (current[taskId] === status ? current : { ...current, [taskId]: status }));
+    };
+    if (terminalStatus && !options.feedbackInConversationRow) setOptimisticTerminalTaskStatuses((current) => (current[taskId] === status ? current : { ...current, [taskId]: status }));
     return enqueueTaskMutation<TaskEditResult | undefined>(taskId, async () => {
-      const expectedUpdatedAt = resolveTaskMutationVersion(taskId, options.expectedUpdatedAt ?? currentTask.updatedAt ?? '');
+      /** 保存和终态清理确认使用提交前核对的同一任务版本。 */
+      let expectedUpdatedAt = resolveTaskMutationVersion(taskId, options.expectedUpdatedAt ?? currentTask.updatedAt ?? '');
       setActionState('updating-task');
       try {
+        /** 状态下拉直接提交，先补齐后台启动可能已更新的执行状态版本。 */
+        if (options.expectedUpdatedAt === undefined && props.onLoadTask) {
+          /** Core 已保存的最新任务和版本。 */
+          const latest = await props.onLoadTask(taskId);
+          if (latest.updatedAt && latest.updatedAt !== expectedUpdatedAt) {
+            mergeTaskRecord(latest);
+            if (latest.projectId !== currentTask.projectId || latest.status === currentTask.status || resolveTaskManagementStatus(latest) !== resolveTaskManagementStatus(currentTask)) {
+              clearOptimisticTerminalStatus();
+              setActionState('idle');
+              return { kind: 'conflict', latest };
+            }
+            expectedUpdatedAt = latest.updatedAt;
+          }
+        }
         let nextSnapshot: WorkspaceSnapshot;
         try {
           nextSnapshot = await updateManagementStatus(taskId, status, expectedUpdatedAt, options.confirmWorktreeCleanup, options.reopenConversationId);
@@ -2414,6 +2469,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
         setActionState('idle');
         return { kind: 'updated', task: updatedTask };
       } catch (error) {
+        if (options.feedbackInConversationRow) setActionState('idle');
         if (error instanceof ZeusApiError && error.error === 'ZEUS_TASK_EDIT_CONFLICT') {
           const latest = await loadLatestTaskAfterConflict(taskId);
           if (latest) {
@@ -2423,7 +2479,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           }
         }
         clearOptimisticTerminalStatus();
-        recordLocalError('task-management-status-update', error);
+        if (!options.feedbackInConversationRow) recordLocalError('task-management-status-update', error);
         throw error;
       }
     }).finally(() => {
@@ -2537,7 +2593,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     let taskCapabilitiesResolved = false;
     void preloadCodexConversationCapabilities(client, task.projectId)
       .then((runtimeCapabilities) => {
-        if (!runtimeCapabilities || taskCapabilitiesResolved || !isTaskModelPushRequestCurrent(request, origin)) return;
+        if (!runtimeCapabilities || taskCapabilitiesResolved || catalogGeneration !== modelCatalogGeneration() || !isTaskModelPushRequestCurrent(request, origin)) return;
         setTaskModelPushRuntimeCapabilities(runtimeCapabilities);
         setTaskModelPushForm((current) => {
           if (current.stageId) return current;
@@ -2552,8 +2608,11 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     const rawCapabilities = await client.loadCodexTaskPushCapabilities(task.projectId, task.id);
     taskCapabilitiesResolved = true;
     if (!isTaskModelPushRequestCurrent(request, origin)) return;
-    const capabilities = normalizeTaskModelPushCapabilities(rawCapabilities);
-    cacheCodexConversationCapabilities(client, capabilities, catalogGeneration);
+    /** 仓库查询可能比账号恢复慢，仅在目录已更新时补读模型和首选项。 */
+    const updatedCatalog = catalogGeneration !== modelCatalogGeneration() ? await refreshCodexConversationCapabilities(client, task.projectId) : null;
+    if (!isTaskModelPushRequestCurrent(request, origin)) return;
+    const capabilities = normalizeTaskModelPushCapabilities(updatedCatalog ? { ...rawCapabilities, models: updatedCatalog.models, preferredModel: updatedCatalog.preferredModel } : rawCapabilities);
+    if (!updatedCatalog) cacheCodexConversationCapabilities(client, capabilities, catalogGeneration);
     setTaskModelPushRuntimeCapabilities(capabilities);
     /** 首次加载只根据同一份完整快照选择下一工作面，不再发起独立模型预检。 */
     const destination = resolveTaskModelPushEntry(capabilities, capabilities.hasConfiguredProvider);
@@ -2726,6 +2785,8 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     if (taskModelPushDispatchingTaskIdsRef.current.has(task.id)) return;
     capabilities = normalizeTaskModelPushCapabilities(capabilities);
     const previousPending = taskModelPushPendingByTaskRef.current[task.id];
+    /** 只有从明确拒绝的原推送重新确认时，才把原输入交给新请求。 */
+    const recovery = previousPending?.contextRefreshRequired && previousPending.request.idempotencyKey === taskModelPushEntryRef.current?.recoveryRequestId && !taskModelPushHasRealChoice(previousPending) ? previousPending : undefined;
     let prepared: { pending: TrackedTaskModelPushState } | null = null;
     try {
       const selectedModel = resolveTaskModelPushCapability(capabilities, form.model);
@@ -2799,22 +2860,25 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
               clientUserMessageId: createSessionOperationId(),
             };
       const targetProject = snapshot.projects.find((project) => project.id === task.projectId);
-      const currentConversationPaths = selectedTaskPushCurrentConversationPaths(capabilities.currentConversationOptions, form.currentConversationIds);
+      const currentConversationHistory = selectedTaskPushConversationHistory(capabilities.currentConversationOptions, form.currentConversationIds);
       const parentContexts = selectedTaskPushParentContexts(capabilities.parentContextOptions, form.parentContextSelections);
       const relatedContexts = selectedTaskPushRelatedContexts(capabilities.relatedContextOptions, form.relatedContextSelections);
       const supplementalAttachments = taskPushSupplementalLayoutAttachments(form.supplementalAttachments);
-      const layout = buildTaskModelPushLayout(task, form.supplementalInfo, capabilities.currentAttachmentOptions, currentConversationPaths, parentContexts, relatedContexts, supplementalAttachments);
+      const layout = buildTaskModelPushLayout(task, form.supplementalInfo, capabilities.currentAttachmentOptions, currentConversationHistory, parentContexts, relatedContexts, supplementalAttachments);
       const pending: TrackedTaskModelPushState = {
-        ...createTaskModelPushPendingState({
-          task,
-          projectName: targetProject?.name ?? task.projectId,
-          request,
-          form: normalizedForm,
-          prompt: renderTaskPushLayoutText(layout),
-          layout,
-          currentAttachmentOptions: capabilities.currentAttachmentOptions,
-          capabilities,
-        }),
+        ...createTaskModelPushPendingState(
+          {
+            task,
+            projectName: targetProject?.name ?? task.projectId,
+            request,
+            form: normalizedForm,
+            prompt: renderTaskPushLayoutText(layout),
+            layout,
+            currentAttachmentOptions: capabilities.currentAttachmentOptions,
+            capabilities,
+          },
+          recovery,
+        ),
         origin: taskModelPushNavigationRef.current,
       };
 
@@ -2933,12 +2997,12 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
       setTaskModelPushAnnouncement(appShellSettings.appLanguage === 'zh-CN' ? `${pending.task.title}：会话已创建。` : `${pending.task.title}: Conversation created.`);
       // 真实会话只接管内部读写身份，绝不根据完成时的页面状态再次导航或滚动。
       await flushTaskModelPushDeferredMessages(attached);
-      void refreshNativeConversationChoices(pending.task.id).catch((error: unknown) => recordLocalError('task-model-push-history-refresh', error));
+      void refreshNativeConversationChoices(pending.task.id).catch((error: unknown) => recordLocalError('task-model-push-history-refresh', error, true));
       if (props.onLoadTask) {
         void props
           .onLoadTask(pending.task.id)
           .then(mergeTaskRecord)
-          .catch((error: unknown) => recordLocalError('task-model-push-task-refresh', error));
+          .catch((error: unknown) => recordLocalError('task-model-push-task-refresh', error, true));
       }
     } catch (error) {
       if (error instanceof ZeusApiError && error.error === 'ZEUS_CODEX_LOGIN_REQUIRED') {
@@ -3054,19 +3118,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           };
         });
         try {
-          const acceptance = await client.sendNativeMessage(current.task.projectId, current.choice.id, {
-            content: message.content,
-            attachments: message.attachments,
-            delivery: message.delivery,
-            ...(message.settings?.model ? { model: message.settings.model } : {}),
-            ...(message.settings?.agentKind ? { agentKind: message.settings.agentKind } : {}),
-            ...(message.settings?.effort ? { effort: message.settings.effort } : {}),
-            ...(message.settings && Object.prototype.hasOwnProperty.call(message.settings, 'serviceTier') ? { serviceTier: message.settings.serviceTier } : {}),
-            ...(message.settings?.permissionMode ? { permissionMode: message.settings.permissionMode } : {}),
-            collaborationMode: message.settings?.collaborationMode ?? (current.form.workMode === 'plan' ? 'plan' : 'default'),
-            idempotencyKey: message.idempotencyKey,
-            clientUserMessageId: message.clientUserMessageId,
-          });
+          const acceptance = await client.sendNativeMessage(current.task.projectId, current.choice.id, taskModelPushDeferredMessageRequest(current, message));
           if (acceptance.operation.status !== 'accepted') throw new Error('Deferred task-push message was not durably accepted.');
           updateTaskModelPushPendingByTask((states) => {
             const active = states[pending.task.id];
@@ -3095,18 +3147,14 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     }
   }
 
+  /** 重读上下文时保留待发消息，等新首发准备完成后再接管。 */
   async function refreshChangedTaskModelPushParentContext(pending: TrackedTaskModelPushState): Promise<void> {
     const client = props.nativeConversationClient;
     taskModelPushDispatchingTaskIdsRef.current.delete(pending.task.id);
     taskModelPushEnvelopeRef.current.delete(pending.task.id);
-    updateTaskModelPushPendingByTask((current) => {
-      const active = current[pending.task.id];
-      if (active?.request.idempotencyKey !== pending.request.idempotencyKey) return current;
-      const next = { ...current };
-      delete next[pending.task.id];
-      return next;
-    });
-    taskModelPushEntryRef.current = null;
+    /** 刷新回执只属于当前工作面及原失败请求。 */
+    const origin = taskModelPushNavigationRef.current;
+    taskModelPushEntryRef.current = { taskId: pending.task.id, origin, pending: false, recoveryRequestId: pending.request.idempotencyKey };
     setTaskModelPushEntry('confirmation');
     setTaskModelPushTaskId(pending.task.id);
     setTaskModelPushCapabilities(null);
@@ -3121,7 +3169,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
     taskModelPushCapabilityRequestRef.current = requestVersion;
     try {
       const capabilities = normalizeTaskModelPushCapabilities(await client.loadCodexTaskPushCapabilities(pending.task.projectId, pending.task.id));
-      if (taskModelPushCapabilityRequestRef.current !== requestVersion) return;
+      if (!isTaskModelPushRequestCurrent(requestVersion, origin)) return;
       const availableCurrentConversationIds = new Set(capabilities.currentConversationOptions.filter((conversation) => conversation.available).map((conversation) => conversation.id));
       const currentConversationIds = pending.form.currentConversationIds.filter((id) => availableCurrentConversationIds.has(id));
       const parentContextSelections = Object.fromEntries(
@@ -3169,7 +3217,7 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
           : 'Task context was refreshed. Model, workspace, supplemental information, attachments for this push, and still-valid selections were preserved. Review and confirm again.',
       );
     } catch (error) {
-      if (taskModelPushCapabilityRequestRef.current !== requestVersion) return;
+      if (!isTaskModelPushRequestCurrent(requestVersion, origin)) return;
       setTaskModelPushStatus('error');
       setTaskModelPushError(redactLocalUiErrorMessage(errorToLocalUiMessage(error, appShellSettings.appLanguage)));
     }
@@ -3245,7 +3293,9 @@ export function useWorkspaceDomainActions(state: WorkspaceQueryState) {
 
   /** 待建会话消息的正文与附件一起替换，取消编辑不触碰原草稿。 */
   function editTaskModelPushPendingMessage(taskId: string, messageId: string, content: string, attachments: NativeConversationAttachment[]): void {
-    mutateTaskModelPushPending(taskId, (pending) => updateTaskModelPushDeferredMessages(pending, (messages) => messages.map((message) => (message.id === messageId ? { ...message, content, attachments } : message))));
+    mutateTaskModelPushPending(taskId, (pending) =>
+      updateTaskModelPushDeferredMessages(pending, (messages) => messages.map((message) => (message.id === messageId ? editTaskModelPushDeferredMessage(message, content, attachments) : message))),
+    );
   }
 
   function deleteTaskModelPushPendingMessage(taskId: string, messageId: string): void {

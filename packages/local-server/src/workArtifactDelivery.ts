@@ -23,6 +23,8 @@ import {
 const maximumArtifactBytes = 12 * 1024 * 1024;
 /** 单次模型读取仅返回有界正文，余文通过偏移继续。 */
 const maximumReadCharacters = 16_384;
+/** 返工意见是本次运行的冻结文本视图，路径独立于前次成果文件。 */
+export const reworkReviewPath = '返工意见.md';
 
 /** Core 发布使用数据库身份及准确会话工作区，不接受模型指定根目录。 */
 export interface WorkArtifactDeliveryOptions {
@@ -51,7 +53,7 @@ export class WorkArtifactDelivery {
   /** 不引入独立调度器或执行状态。 */
   constructor(private readonly options: WorkArtifactDeliveryOptions) {}
 
-  /** 派发前恢复唯一可证的旧返工来源，不修改已有会话或已执行轮次。 */
+  /** 派发前恢复旧返工的准确来源与分页意见。 */
   restorePreparedReworkHandoff(runId: string): boolean {
     return this.options.publications.restorePreparedReworkHandoff(runId);
   }
@@ -112,31 +114,52 @@ export class WorkArtifactDelivery {
 
   /** 将既有正式正文和显式附件冻结为同一交接清单，重复调用不会替换它。 */
   freeze(deliverable: TaskWorkDeliverableRecord): ReturnType<WorkArtifactRepository['freeze']> {
+    return this.prepareFreeze(deliverable)();
+  }
+
+  /** 先验证正文和附件的字节与归属，再写入冻结清单所需的数据库记录。 */
+  prepareFreeze(deliverable: Pick<TaskWorkDeliverableRecord, 'id' | 'taskId' | 'projectId' | 'workItemId' | 'runId' | 'artifactSha256' | 'contentSha256'>): () => ReturnType<WorkArtifactRepository['freeze']> {
     const existing = this.options.publications.get(deliverable.id);
-    if (existing) return existing;
+    if (existing) return () => existing;
     /** 正式关系必须与准确工作运行完全一致。 */
     const run = this.options.runs.getById(deliverable.runId);
     if (!run || run.taskId !== deliverable.taskId || run.projectId !== deliverable.projectId || run.workItemId !== deliverable.workItemId) throw scopeError('成果与工作运行归属不一致。');
     /** 既有正文由 ArtifactStore 再核对 owner 和摘要，不能信任外部引用字段。 */
     const body = this.options.artifacts.readAuthorizedSync({ sha256: deliverable.artifactSha256, owner: { kind: 'task_work_deliverable', id: deliverable.id }, maximumContentBytes: maximumArtifactBytes });
     if (body.ref.contentSha256 !== deliverable.contentSha256) throw scopeError('正式成果正文摘要不一致。');
-    const files: WorkArtifactFile[] = [{ path: '交接.md', ref: body.ref }];
-    for (const file of this.options.publications.submissions(run.id)) {
-      /** 先核对原运行 owner，再附加正式成果 owner，避免跨工作引用扩大授权。 */
+    const attachments = this.options.publications.submissions(run.id).map((file) => {
       this.options.artifacts.readAuthorizedSync({ sha256: file.ref.sha256, owner: { kind: 'task_work_submission', id: run.id }, maximumContentBytes: maximumArtifactBytes });
-      const ref = this.options.artifacts.attachOwner({
-        sha256: file.ref.sha256,
-        owner: { kind: 'task_work_deliverable', id: deliverable.id, generationId: taskWorkDeliverableArtifactGeneration, projectId: run.projectId, conversationId: run.conversationId },
-      });
-      this.options.artifacts.hold({ sha256: ref.sha256, owner: { kind: 'task_work_deliverable', id: deliverable.id }, ownerClass: 'active_task', reason: `task-work-deliverable:${run.taskId}` });
-      files.push({ path: safeRelativePath(file.path), ref });
-    }
-    return this.options.publications.freeze({ deliverableId: deliverable.id, taskId: deliverable.taskId, runId: deliverable.runId, files });
+      return { path: safeRelativePath(file.path), ref: file.ref };
+    });
+    /** 成果归属与留存记录可随验收状态一起提交。 */
+    return () => {
+      const files: WorkArtifactFile[] = [{ path: '交接.md', ref: body.ref }];
+      for (const file of attachments) {
+        const ref = this.options.artifacts.attachOwner({
+          sha256: file.ref.sha256,
+          owner: { kind: 'task_work_deliverable', id: deliverable.id, generationId: taskWorkDeliverableArtifactGeneration, projectId: run.projectId, conversationId: run.conversationId },
+        });
+        this.options.artifacts.hold({ sha256: ref.sha256, owner: { kind: 'task_work_deliverable', id: deliverable.id }, ownerClass: 'active_task', reason: `task-work-deliverable:${run.taskId}` });
+        files.push({ path: file.path, ref });
+      }
+      return this.options.publications.freeze({ deliverableId: deliverable.id, taskId: deliverable.taskId, runId: deliverable.runId, files });
+    };
   }
 
   /** Core 导出失败只保存错误，冻结成果仍可以受控读取及重建。 */
   publish(deliverable: TaskWorkDeliverableRecord): { root: string | null; error: string | null } {
     this.freeze(deliverable);
+    return this.exportDocs(deliverable);
+  }
+
+  /** 在审查事务中冻结成果并登记待导出，阅读副本交由调度器写入。 */
+  markExportPending(deliverable: TaskWorkDeliverableRecord): void {
+    this.freeze(deliverable);
+    this.options.publications.markExportPending(deliverable.id);
+  }
+
+  /** 根据已冻结清单导出阅读目录，保留失败原因供调度循环重试。 */
+  exportDocs(deliverable: TaskWorkDeliverableRecord): { root: string | null; error: string | null } {
     try {
       const root = this.rebuildTask(deliverable.taskId);
       return { root, error: null };
@@ -211,6 +234,7 @@ export class WorkArtifactDelivery {
           contentSha256: deliverable.contentSha256,
           status: deliverable.status,
           exportError: publication.exportError,
+          ...(reworkReviewText(run, deliverable.id) !== undefined ? { reworkReviewPath } : {}),
           files: publication.files.map((file) => ({ path: file.path, sha256: file.ref.contentSha256, bytes: file.ref.contentByteLength, mimeType: file.ref.mimeType })),
         };
       });
@@ -218,19 +242,18 @@ export class WorkArtifactDelivery {
 
   /** 正文按字符偏移有界读取，二进制附件只提供受控物化。 */
   read(run: TaskWorkRunRecord, input: { deliverableId: string; path: string; offset?: number; limit?: number }): Record<string, unknown> {
+    /** 返工意见和前次文件使用相同的交接授权，意见自身来自本轮快照。 */
+    const review = input.path === reworkReviewPath ? reworkReviewText(run, input.deliverableId) : undefined;
+    const offset = boundedInteger(input.offset ?? 0, 0, review === undefined ? maximumArtifactBytes : Number.MAX_SAFE_INTEGER, '读取偏移');
+    const limit = boundedInteger(input.limit ?? 8_000, 1, maximumReadCharacters, '读取上限');
+    if (review !== undefined) {
+      this.requireDeliverable(run, input.deliverableId);
+      return readTextPage(input, review, createHash('sha256').update(review).digest('hex'), offset, limit);
+    }
     const file = this.requireFile(run, input.deliverableId, input.path);
     if (!/^(text\/|application\/(json|xml|javascript))/.test(file.ref.mimeType)) throw scopeError('该附件为二进制，请使用 materialize_artifact 物化后读取。');
-    const offset = boundedInteger(input.offset ?? 0, 0, maximumArtifactBytes, '读取偏移');
-    const limit = boundedInteger(input.limit ?? 8_000, 1, maximumReadCharacters, '读取上限');
     const content = Buffer.from(this.options.artifacts.readAuthorizedSync({ sha256: file.ref.sha256, owner: { kind: 'task_work_deliverable', id: input.deliverableId }, maximumContentBytes: maximumArtifactBytes }).bytes).toString('utf8');
-    return {
-      deliverableId: input.deliverableId,
-      path: file.path,
-      contentSha256: file.ref.contentSha256,
-      content: content.slice(offset, offset + limit),
-      nextOffset: offset + limit < content.length ? offset + limit : null,
-      totalCharacters: content.length,
-    };
+    return readTextPage({ ...input, path: file.path }, content, file.ref.contentSha256, offset, limit);
   }
 
   /** 受控复制到当前工作区相同资料结构；不同内容的已有文件永不覆盖。 */
@@ -334,6 +357,26 @@ export class WorkArtifactDelivery {
     }
     return { links, issues };
   }
+}
+
+/** 只读取当前运行绑定到指定前次成果的冻结意见。 */
+function reworkReviewText(run: TaskWorkRunRecord, deliverableId: string): string | undefined {
+  const { reworkDeliverableId, reworkReview, reworkReason } = run.entrypointSnapshot;
+  if (reworkDeliverableId !== deliverableId) return undefined;
+  const content = reworkReview ?? reworkReason;
+  return typeof content === 'string' ? content : undefined;
+}
+
+/** 文件和返工意见共用字符偏移与单次读取上限，调用方可以继续读到末尾。 */
+function readTextPage(input: { deliverableId: string; path: string }, content: string, contentSha256: string, offset: number, limit: number): Record<string, unknown> {
+  return {
+    deliverableId: input.deliverableId,
+    path: input.path,
+    contentSha256,
+    content: content.slice(offset, offset + limit),
+    nextOffset: offset + limit < content.length ? offset + limit : null,
+    totalCharacters: content.length,
+  };
 }
 
 /** 链接从当前索引位置计算，特殊文件名不能改变 Markdown 或 URL 的解析范围。 */

@@ -1,7 +1,7 @@
+import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
 import type { FilePreviewSourceWorkspace } from '@zeus/shared';
 import { mergeTaskProjection } from '../tasks/taskQueryStore.js';
 import { compareConversationWorkStartedDesc, cloneTaskManagementStatusConfig, defaultTaskManagementStatusConfig, matchesTaskDeadline, projectTerminalOutput, type TaskDeadlineFilter, temporaryWorkspaceId } from '@zeus/shared';
-import { zeusReleaseBaseUrl } from '../../tooling/distribution.js';
 import type { DigitalTeamEntrySelection } from '../digital-teams/DigitalTeamWorkspace.js';
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 import { reuseConversationQueryValue } from '../conversations/conversationQueryReuse.js';
@@ -129,7 +129,6 @@ import {
   taskTableColumnPreferencesEqual,
   type TrackedTaskModelPushState,
 } from './workspaceSupport.js';
-import { resolveProjectWorkspaceTabs } from './projectWorkspacePersistence.js';
 import type { WorkspacePageProps } from './workspaceContracts.js';
 
 export function useWorkspaceQueryState(props: WorkspacePageProps) {
@@ -139,10 +138,10 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const activeNavTarget = props.shellNavigation?.activeNavTarget ?? localActiveNavTarget;
   const setActiveNavTarget = props.shellNavigation?.onNavigate ?? setLocalActiveNavTarget;
   const [activeProjectSection, setActiveProjectSection] = useState<ProjectWorkspaceSection>(() => inferInitialProjectSection(props));
-  /** 旧 Git 链接与源码内的新地址统一打开完整 Git 工作台。 */
+  /** Git 侧栏独立于底层页面；旧链接仍打开同一个工作台。 */
   const [projectGitOpen, setProjectGitOpen] = useState(() => props.initialMainNavTarget === 'git-diff' || (typeof window !== 'undefined' && ['#project-git', '#project-code-git'].includes(window.location.hash)));
-  const [projectCodeWorkspaceMode, setProjectCodeWorkspaceMode] = useState<ProjectCodeWorkspaceMode>(() => (typeof window !== 'undefined' && window.location.hash === '#project-commands' ? 'commands' : 'source'));
-  const [visitedCodeWorkspaceModes, setVisitedCodeWorkspaceModes] = useState<Set<ProjectCodeWorkspaceMode>>(() => new Set(typeof window !== 'undefined' && window.location.hash === '#project-commands' ? ['source', 'commands'] : ['source']));
+  /** 既有导航组件沿用模式参数，源码页面不再承载 Git 底栏。 */
+  const projectCodeWorkspaceMode: ProjectCodeWorkspaceMode = projectGitOpen ? 'git' : 'source';
   /** 弹窗绑定准确项目，后台命令生命周期不依赖弹窗挂载。 */
   const [projectCommandsProjectId, setProjectCommandsProjectId] = useState<string | null>(null);
   const projectSourceWorkspaceRef = useRef<ProjectSourceWorkspaceHandle | null>(null);
@@ -254,7 +253,10 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const selectedNativeConversationIdRef = useRef<string | null>(props.initialSelectedNativeConversationId ?? null);
   const [selectedNativeConversationPresentation, setSelectedNativeConversationPresentation] = useState<'history' | 'interactive'>(() => (props.initialSelectedNativeConversationId ? 'history' : 'interactive'));
   /** 同一工作面的主栏和侧栏各自记录阅读事实，切换后不继承旧工作面的状态。 */
-  const [latestConversationContentVisibility, setLatestConversationContentVisibility] = useState<{ ownerIdentity: string | null; identities: string[] }>({ ownerIdentity: null, identities: [] });
+  const [latestConversationContentVisibility, setLatestConversationContentVisibility] = useState<{ ownerIdentity: string | null; turnsByIdentity: Record<string, string | null> }>({
+    ownerIdentity: null,
+    turnsByIdentity: {},
+  });
   const [zeusWindowForeground, setZeusWindowForeground] = useState(false);
   const [focusedArchivedConversation, setFocusedArchivedConversation] = useState<NativeConversationChoice | null>(null);
   const [optimisticTerminalTaskStatuses, setOptimisticTerminalTaskStatuses] = useState<Record<string, TaskManagementStatus>>({});
@@ -335,11 +337,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const [taskTemplates, setTaskTemplates] = useState<TaskTemplateRecord[]>(() => props.initialTaskTemplates ?? []);
   const [archivedProjects, setArchivedProjects] = useState<ProjectRecord[]>(() => props.initialArchivedProjects ?? []);
   const [conversationDraftOpen, setConversationDraftOpen] = useState(false);
-  const [projectDetail, setProjectDetail] = useState<ProjectRecord | undefined>(() => {
-    const projects = props.snapshot?.projects ?? [];
-    const restoredProjectId = resolveProjectWorkspaceTabs(projects, projects[0]?.id).activeProjectId;
-    return projects.find((project) => project.id === restoredProjectId) ?? projects[0];
-  });
+  const [projectDetail, setProjectDetail] = useState<ProjectRecord | undefined>(() => props.snapshot?.projects[0]);
   const [taskDetail, updateTaskDetail] = useState<TaskRecord | undefined>(() => props.snapshot?.tasks[0]);
   /** 详情、实时事件与写回执统一比较修订，旧读取不能覆盖同一任务的新内容。 */
   const setTaskDetail = useCallback((value: SetStateAction<TaskRecord | undefined>): void => {
@@ -432,10 +430,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       const knownTasks = new Map(current.tasks.map((task) => [task.id, task]));
       return { ...incoming, tasks: incoming.tasks.map((task) => mergeTaskProjection(knownTasks.get(task.id), task)) };
     });
-    const restoredProjectId = resolveProjectWorkspaceTabs(incoming.projects, incoming.projects[0]?.id).activeProjectId;
-    const restoredProject = incoming.projects.find((project) => project.id === restoredProjectId);
     /** 无项目工作的技术归属可能不进入公开目录，保留已经明确加载的身份。 */
-    const nextProject = projectDetail?.id === temporaryWorkspaceId ? (incoming.projects.find((item) => item.id === projectDetail.id) ?? projectDetail) : syncRecordFromSnapshot(projectDetail ?? restoredProject, incoming.projects);
+    const nextProject = projectDetail?.id === temporaryWorkspaceId ? (incoming.projects.find((item) => item.id === projectDetail.id) ?? projectDetail) : syncRecordFromSnapshot(projectDetail, incoming.projects);
     /** 正在查看的临时工作成果不能被下一次目录水合替换为其他任务。 */
     const nextTask = taskDetail?.projectId === temporaryWorkspaceId && taskDetail.id === taskDetailPaneTaskId ? (incoming.tasks.find((item) => item.id === taskDetail.id) ?? taskDetail) : syncRecordFromSnapshot(taskDetail, incoming.tasks);
     setProjectDetail(nextProject);
@@ -556,7 +552,14 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   /** 入口检查与接入期间不展示确认页，失败保留在任务操作旁。 */
   const [taskModelPushEntry, setTaskModelPushEntry] = useState<'checking' | 'choose' | 'custom' | 'confirmation' | 'error'>('confirmation');
   /** 同步阻止入口重复打开，失败时允许按原阶段和工作面身份重查。 */
-  const taskModelPushEntryRef = useRef<{ taskId: string; stage?: TaskStageRecord; origin: TaskModelPushNavigationTarget; pending: boolean } | null>(null);
+  const taskModelPushEntryRef = useRef<{
+    taskId: string;
+    stage?: TaskStageRecord;
+    origin: TaskModelPushNavigationTarget;
+    pending: boolean;
+    /** 重新确认只接续用户打开的那次失败推送。 */
+    recoveryRequestId?: string;
+  } | null>(null);
   const [taskModelPushCapabilities, setTaskModelPushCapabilities] = useState<CodexTaskPushCapabilities | null>(null);
   const [taskModelPushRuntimeCapabilities, setTaskModelPushRuntimeCapabilities] = useState<CodexConversationCapabilities | null>(null);
   const [taskModelPushForm, setTaskModelPushForm] = useState<TaskModelPushForm>({
@@ -1143,34 +1146,41 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
   const visibleConversationIdentity = selectedNativeConversation ? JSON.stringify([selectedNativeConversation.projectId, selectedNativeConversation.id]) : null;
   // 切换工作面即丢弃旧阅读事实，返回同一会话也必须等待正文重新报告。
   if (latestConversationContentVisibility.ownerIdentity !== visibleConversationIdentity) {
-    setLatestConversationContentVisibility({ ownerIdentity: visibleConversationIdentity, identities: [] });
+    setLatestConversationContentVisibility({ ownerIdentity: visibleConversationIdentity, turnsByIdentity: {} });
   }
   /** 拒绝已经卸载会话的迟到可见回调。 */
   const currentVisibleConversationIdentity = useRef(visibleConversationIdentity);
   currentVisibleConversationIdentity.current = visibleConversationIdentity;
   /** 主栏可见性仍单独供当前会话的通知展示使用。 */
   const latestConversationContentVisible = Boolean(
-    visibleConversationIdentity && latestConversationContentVisibility.ownerIdentity === visibleConversationIdentity && latestConversationContentVisibility.identities.includes(visibleConversationIdentity),
+    visibleConversationIdentity && latestConversationContentVisibility.ownerIdentity === visibleConversationIdentity && Object.hasOwn(latestConversationContentVisibility.turnsByIdentity, visibleConversationIdentity),
   );
   /** 提醒修订始终读取实时目录，不使用侧栏创建时保存的会话快照。 */
   const latestContentVisibleConversations = useMemo(
     () =>
       latestConversationContentVisibility.ownerIdentity === visibleConversationIdentity
-        ? nativeConversationChoices.filter((conversation) => latestConversationContentVisibility.identities.includes(JSON.stringify([conversation.projectId, conversation.id])))
+        ? nativeConversationChoices.filter((conversation) => {
+            const identity = JSON.stringify([conversation.projectId, conversation.id]);
+            const turns = latestConversationContentVisibility.turnsByIdentity;
+            return Object.hasOwn(turns, identity) && (!conversation.attentionTurnId || conversation.transportKind !== 'codex_native' || turns[identity] === conversation.attentionTurnId);
+          })
         : [],
     [latestConversationContentVisibility, nativeConversationChoices, visibleConversationIdentity],
   );
   /** 旧组件仍绑定旧工作面；同一工作面中的两个正文按各自身份更新。 */
   const setLatestConversationContentVisible = useCallback(
-    (projectId: string, conversationId: string, visible: boolean) => {
+    (projectId: string, conversationId: string, visible: boolean, turnId: string | null = null) => {
       if (currentVisibleConversationIdentity.current !== visibleConversationIdentity) return;
       /** 项目和真实会话共同决定阅读事实，避免主子会话相互覆盖。 */
       const identity = JSON.stringify([projectId, conversationId]);
       setLatestConversationContentVisibility((current) => {
         /** 工作面切换后只保留新工作面实际报告的身份。 */
-        const identities = current.ownerIdentity === visibleConversationIdentity ? current.identities : [];
-        if (identities.includes(identity) === visible) return current;
-        return { ownerIdentity: visibleConversationIdentity, identities: visible ? [...identities, identity] : identities.filter((entry) => entry !== identity) };
+        const turns: Record<string, string | null> = current.ownerIdentity === visibleConversationIdentity ? current.turnsByIdentity : {};
+        if (visible ? turns[identity] === turnId : !Object.hasOwn(turns, identity)) return current;
+        const next = { ...turns };
+        if (visible) next[identity] = turnId;
+        else delete next[identity];
+        return { ownerIdentity: visibleConversationIdentity, turnsByIdentity: next };
       });
     },
     [visibleConversationIdentity],
@@ -1228,6 +1238,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
               taskCode: task.taskCode?.trim() || task.id,
               taskTitle: task.title,
               managementStatus: resolveTaskManagementStatus(task),
+              canComplete: !terminalTaskIds.has(task.id),
               conversations: conversationTreeHiddenTaskIds.has(task.id) ? [] : [...(projectedTaskConversationChoices[task.id] ?? [])].filter((conversation) => !conversation.archived).sort(compareConversationWorkStartedDesc),
             })),
         };
@@ -1241,6 +1252,7 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
       projectTaskModelPushManagementStatus,
       projectedTaskConversationChoices,
       snapshot.tasks,
+      terminalTaskIds,
     ],
   );
   /** 会话投影只更新状态，项目顺序由独立的小时统计决定。 */
@@ -1641,7 +1653,6 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     pendingWorkspaceLeaveKindRef,
     persistedTaskTableColumns,
     projectCodeWorkspaceMode,
-    visitedCodeWorkspaceModes,
     projectConfig,
     projectConfigCopy,
     projectConfigForm,
@@ -1770,10 +1781,8 @@ export function useWorkspaceQueryState(props: WorkspacePageProps) {
     setPendingTaskStatuses,
     setPatchExportStatus,
     setPendingProjectDeleteId,
-    projectGitOpen,
     setProjectGitOpen,
-    setProjectCodeWorkspaceMode,
-    setVisitedCodeWorkspaceModes,
+    projectGitOpen,
     setProjectConfig,
     setProjectConfigForm,
     setProjectCreateDialogOpen,

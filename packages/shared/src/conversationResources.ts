@@ -49,6 +49,8 @@ interface ConversationResourceBase {
 export interface ConversationFileResource extends ConversationResourceBase {
   kind: 'file';
   projectRelativePath: string;
+  /** 工作区外的 Markdown 文件目标，以完整引用匹配并交给系统打开。 */
+  externalReference?: string;
   location?: ConversationFileLocation;
   mimeType?: string;
   iconKind: ConversationFileIconKind;
@@ -88,6 +90,7 @@ export type ConversationOpenTarget =
   | 'editor:cursor'
   | 'editor:windsurf'
   | 'editor:intellij-idea'
+  | 'editor:datagrip'
   | 'editor:rider'
   | 'editor:webstorm'
   | 'terminal:terminal'

@@ -1,10 +1,11 @@
+import { tokenUsageFields } from '@zeus/shared';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { randomId } from './randomId.js';
 import type { ArtifactRef } from './artifactStore.js';
 import type { ZeusDatabasePort } from './databasePort.js';
 import { conversationProcessProviderItemId, splitEstimatedUsageCosts, sumEstimatedCosts, type CodexUsageEstimate, type ConversationTurnUsage, type TokenUsageBreakdown } from '@zeus/shared';
-import { ConversationTranscriptRepository, hashConversationTranscriptContent, providerEntryId } from './conversationTranscriptStore.js';
+import { ConversationTranscriptRepository, hashConversationTranscriptContent, modelHistoryVisibleInTranscriptSql, providerEntryId } from './conversationTranscriptStore.js';
 
 /** 菜单栏与会话共用测速条件；历史记录中混入用户回答、审批或 MCP 交互的请求也必须排除。 */
 const outputRateMeasurementCondition = `r.measurement_complete = 1
@@ -20,13 +21,48 @@ const outputRateMeasurementCondition = `r.measurement_complete = 1
 
 export const conversationSchemaGeneration = '2026-08-16-unified-conversation-segments';
 
+/** 读取历史时按同一会话、工具配对和句柄还原结果预览，兼容仍内嵌预览的历史。 */
+export function modelHistoryContentWithToolProjectionSql(history: 'conversation_model_history' | 'history'): string {
+  const content = `${history}.content_json`;
+  return `CASE WHEN ${history}.role = 'tool' AND json_valid(${content}) THEN
+    CASE WHEN json_type(${content}, '$.projection') IS NULL THEN COALESCE(
+      (SELECT json_set(${content}, '$.projection', json_extract(result.projection_json, '$.text'))
+         FROM conversation_tool_results AS result
+        WHERE result.handle = json_extract(${content}, '$.handle')
+          AND result.conversation_id = ${history}.conversation_id AND result.tool_pair_id = ${history}.tool_pair_id
+          AND CASE WHEN json_valid(result.projection_json) THEN json_type(result.projection_json, '$.text') = 'text' END),
+      ${content}
+    ) ELSE ${content} END
+  ELSE ${content} END`;
+}
+
+/** 历史读取只返回一份正文，避免同一大字段同时通过 SQLite 原列与还原列返回。 */
+const modelHistoryReadColumns = `id, conversation_id, sequence, turn_id, submission_id, segment_id, role,
+  ${modelHistoryContentWithToolProjectionSql('conversation_model_history')} AS content_json,
+  reasoning_source_json, tool_pair_id, capability_loss_json, confirmed_at`;
+
 /** 执行片段使用实际 Provider 身份决定恢复和归档边界。 */
-export type ConversationRuntimeKind = 'codex' | 'pi' | 'copilot';
+export type ConversationRuntimeKind = 'codex' | 'pi' | 'copilot' | 'antigravity';
 export type ConversationSegmentState = 'provisional' | 'current' | 'sealed' | 'abandoned';
 export type ConversationSwitchState = 'preflight' | 'provisional' | 'outcome_unknown' | 'accepted' | 'failed' | 'cancelled';
 /** 处理过程区分规则上下文更新、模型摘要和实际执行活动。 */
 export type ConversationProcessKind = 'reasoning' | 'tool' | 'command' | 'retry' | 'context_compaction' | 'context_update' | 'waiting' | 'warning';
 export type ConversationConfigEvidenceLayer = 'selected' | 'frozen' | 'adapter_serialized' | 'runtime_acknowledged' | 'provider_echo';
+
+/** 采集事实按本地轮次身份记录，重放不能产生第二条。 */
+export const conversationResourceCapturePrefix = 'conversation_resource_capture:';
+
+/** 只采用失败记录的业务身份和时间筛选缺失用量。 */
+export interface ConversationUsageWriteFailure {
+  /** 本机账本供应商标识。 */
+  providerId: string;
+  /** 发起模型请求的项目。 */
+  projectId: string;
+  /** 此次统计写入对应的模型。 */
+  model: string;
+  /** 对应请求或轮次的结束时间，使用 ISO 8601。 */
+  occurredAt: string;
+}
 
 export interface ConversationExecutionSnapshotRecord {
   id: string;
@@ -136,6 +172,10 @@ export interface ConversationOutputRateMeasurement {
   providerThreadId: string;
   /** 原生轮次身份。 */
   providerTurnId: string;
+  /** 请求观测的稳定身份，用于关联同一笔请求快照。 */
+  requestId: string;
+  /** 供应商响应身份，历史观测也可据此关联请求快照。 */
+  providerRequestId: string | null;
   /** 请求实际使用的模型标识。 */
   modelId: string;
   /** 首个可见 Token 之后的生成间隔数。 */
@@ -602,6 +642,8 @@ export function migrateUnifiedConversationStoreSchema(db: ZeusDatabasePort): voi
   ]);
   db.execute(`CREATE TABLE IF NOT EXISTS conversation_legacy_write_fence (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), current_writer_open INTEGER NOT NULL CHECK (current_writer_open IN (0, 1)))`);
   db.execute(`INSERT OR IGNORE INTO conversation_legacy_write_fence (singleton, current_writer_open) VALUES (1, 1)`);
+  /** 只有尚未迁移的库需要保护旧条目；账本围栏继续保护当前库。 */
+  const legacyItemsPresent = db.get("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'conversation_items'");
   for (const action of ['INSERT', 'UPDATE', 'DELETE'] as const) {
     db.execute(`
       CREATE TRIGGER IF NOT EXISTS reject_legacy_schema_migrations_${action.toLowerCase()}
@@ -611,7 +653,8 @@ export function migrateUnifiedConversationStoreSchema(db: ZeusDatabasePort): voi
         SELECT RAISE(ABORT, 'ZEUS_DOWNGRADE_REQUIRES_SAFE_ROLLBACK_DATABASE');
       END
     `);
-    db.execute(`
+    if (legacyItemsPresent)
+      db.execute(`
       CREATE TRIGGER IF NOT EXISTS reject_legacy_conversation_items_${action.toLowerCase()}
       BEFORE ${action} ON conversation_items
       WHEN (SELECT current_writer_open FROM conversation_legacy_write_fence WHERE singleton = 1) = 0
@@ -1169,6 +1212,17 @@ export class ConversationExecutionRepository {
       }
       const sequence = this.nextSequence(input.conversationId, 'model_history_sequence');
       const id = `conversation_model_history_${randomId(12)}`;
+      /** 工具预览逐字相同时只保留结果引用，调用者提供的其他字段继续原样写入。 */
+      let storedContent = input.content;
+      if (input.role === 'tool' && input.toolPairId && input.content && typeof input.content === 'object' && !Array.isArray(input.content)) {
+        const { projection, ...reference } = parseJsonRecord(input.content);
+        if (typeof projection === 'string' && typeof reference.handle === 'string') {
+          const result = this.getToolResult(reference.handle);
+          if (result?.conversationId === input.conversationId && result.toolPairId === input.toolPairId && parseJsonRecord(result.projectionJson).text === projection) {
+            storedContent = reference;
+          }
+        }
+      }
       this.db.execute(
         `INSERT INTO conversation_model_history
        (id, conversation_id, sequence, turn_id, submission_id, segment_id, role, content_json,
@@ -1182,7 +1236,7 @@ export class ConversationExecutionRepository {
           input.submissionId ?? null,
           input.segmentId,
           input.role,
-          JSON.stringify(input.content),
+          JSON.stringify(storedContent),
           input.reasoningSource === undefined ? null : JSON.stringify(input.reasoningSource),
           input.toolPairId ?? null,
           input.capabilityLoss === undefined ? null : JSON.stringify(input.capabilityLoss),
@@ -1198,7 +1252,7 @@ export class ConversationExecutionRepository {
   confirmedModelHistory(conversationId: string, throughSequence?: number): ConversationModelHistoryRecord[] {
     const clause = throughSequence === undefined ? '' : ' AND sequence <= ?';
     const params = throughSequence === undefined ? [conversationId] : [conversationId, throughSequence];
-    return this.db.select<ModelHistoryRow>(`SELECT * FROM conversation_model_history WHERE conversation_id = ?${clause} ORDER BY sequence`, params).map(mapModelHistory);
+    return this.db.select<ModelHistoryRow>(`SELECT ${modelHistoryReadColumns} FROM conversation_model_history WHERE conversation_id = ?${clause} ORDER BY sequence`, params).map(mapModelHistory);
   }
 
   modelHistoryByProviderItem(conversationId: string, providerItemId: string, itemType: string): ConversationModelHistoryRecord | undefined {
@@ -1561,6 +1615,31 @@ export class ConversationExecutionRepository {
     return id;
   }
 
+  /** 持久保留正常结束轮次的资源采集依据，历史读取可据此确认空清单。 */
+  recordResourceUsageCapture(conversationId: string, turnId: string, occurredAt: string): void {
+    /** 轮次 ID 已由本地仓储分配，用同一主键接续重放。 */
+    const id = `${conversationResourceCapturePrefix}${turnId}`;
+    if (this.db.get('SELECT 1 FROM conversation_timeline_events WHERE id = ?', [id])) return;
+    this.db.execute(
+      `INSERT INTO conversation_timeline_events (id, conversation_id, sequence, event_kind, turn_id, payload_json, occurred_at)
+       VALUES (?, ?, ?, 'resource_usage_captured', ?, '{}', ?)`,
+      [id, conversationId, this.nextSequence(conversationId, 'timeline_sequence'), turnId, occurredAt],
+    );
+  }
+
+  /** 已补齐的统计失败不再影响用量范围。 */
+  listUsageWriteFailures(): ConversationUsageWriteFailure[] {
+    return this.db.select(
+      `SELECT json_extract(payload_json, '$.providerId') AS providerId,
+              json_extract(payload_json, '$.projectId') AS projectId,
+              json_extract(payload_json, '$.model') AS model,
+              updated_at AS occurredAt
+       FROM conversation_persistent_warnings
+       WHERE resolved_at IS NULL AND warning_kind GLOB 'usage_write_failed:*' AND json_valid(payload_json)
+       ORDER BY updated_at, id`,
+    );
+  }
+
   persistWarning(input: { conversationId: string; warningKind: string; payload: unknown; occurredAt: string }): ConversationPersistentWarningRecord {
     const sequence = this.nextSequence(input.conversationId, 'sync_event_sequence');
     const existing = this.db.get<PersistentWarningRow>(`SELECT * FROM conversation_persistent_warnings WHERE conversation_id = ? AND warning_kind = ? AND resolved_at IS NULL`, [input.conversationId, input.warningKind]);
@@ -1656,13 +1735,15 @@ export class ConversationExecutionRepository {
       conversation_id: string;
       provider_thread_id: string;
       provider_turn_id: string;
+      request_id: string;
+      provider_request_id: string | null;
       model_id: string;
       output_tokens: number;
       reasoning_output_tokens: number;
       first_text_output_at: string;
       completed_at: string;
     }>(
-      `SELECT r.conversation_id, t.provider_thread_id, t.provider_turn_id, r.model_id,
+      `SELECT r.conversation_id, t.provider_thread_id, t.provider_turn_id, r.id AS request_id, r.provider_request_id, r.model_id,
               r.output_tokens, r.reasoning_output_tokens, r.first_text_output_at, r.completed_at
          FROM conversation_model_requests r
          JOIN conversation_turns t ON t.id = r.turn_id
@@ -1672,7 +1753,9 @@ export class ConversationExecutionRepository {
     );
     return rows.flatMap((row) => {
       const sample = outputRateSample(row.output_tokens, row.reasoning_output_tokens, row.first_text_output_at, row.completed_at);
-      return sample ? [{ conversationId: row.conversation_id, providerThreadId: row.provider_thread_id, providerTurnId: row.provider_turn_id, modelId: row.model_id, ...sample }] : [];
+      return sample
+        ? [{ conversationId: row.conversation_id, providerThreadId: row.provider_thread_id, providerTurnId: row.provider_turn_id, requestId: row.request_id, providerRequestId: row.provider_request_id, modelId: row.model_id, ...sample }]
+        : [];
     });
   }
 
@@ -1755,6 +1838,8 @@ export class ConversationExecutionRepository {
       confirmedAt: string;
     },
   ): void {
+    // 接纳已保存完整模型输入，只有可见输入取得时间线身份。
+    if (record.role === 'user' && record.submissionId && !this.db.get(`SELECT 1 FROM conversation_model_history WHERE id = ? AND ${modelHistoryVisibleInTranscriptSql}`, [record.id])) return;
     const content = parseJsonRecord(input.content);
     const reasoning = parseJsonRecord(input.reasoningSource);
     /** 工具声明与结果共享调用身份；同阶段的不同工具保持独立。 */
@@ -1763,7 +1848,8 @@ export class ConversationExecutionRepository {
       stringOrNull(input.toolPairId) ??
       (content.agentKind === 'pi' ||
       content.agentKind === 'copilot' ||
-      ['pi', 'copilot'].includes(this.db.get<{ runtime_kind: string }>(`SELECT runtime_kind FROM conversation_runtime_segments WHERE id = ?`, [input.segmentId])?.runtime_kind ?? '')
+      content.agentKind === 'antigravity' ||
+      ['pi', 'copilot', 'antigravity'].includes(this.db.get<{ runtime_kind: string }>(`SELECT runtime_kind FROM conversation_runtime_segments WHERE id = ?`, [input.segmentId])?.runtime_kind ?? '')
         ? stringOrNull(content.stageId)
         : null) ??
       stringOrNull(reasoning.itemId) ??
@@ -1870,7 +1956,7 @@ export class ConversationExecutionRepository {
   }
 
   private modelHistoryById(id: string): ConversationModelHistoryRecord | undefined {
-    const row = this.db.get<ModelHistoryRow>(`SELECT * FROM conversation_model_history WHERE id = ?`, [id]);
+    const row = this.db.get<ModelHistoryRow>(`SELECT ${modelHistoryReadColumns} FROM conversation_model_history WHERE id = ?`, [id]);
     return row ? mapModelHistory(row) : undefined;
   }
 
@@ -1976,7 +2062,7 @@ function sealLegacyProviderSessions(db: ZeusDatabasePort, migratedAt: string): v
     `SELECT id, agent_kind, provider_id, provider_thread_id, provider_thread_path, provider_model,
             provider_protocol_version, provider_binary_version, native_session_path, created_at
        FROM conversations
-      WHERE provider_thread_id IS NOT NULL AND agent_kind IN ('codex', 'pi', 'copilot')
+      WHERE provider_thread_id IS NOT NULL AND agent_kind IN ('codex', 'pi', 'copilot', 'antigravity')
       ORDER BY created_at, id`,
   );
   for (const row of rows) {
@@ -2061,6 +2147,7 @@ function migrateLegacyConversationHistory(db: ZeusDatabasePort, migratedAt: stri
     );
   }
 
+  if (!db.get("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'conversation_items'")) return;
   const items = db.select<{
     id: string;
     conversation_id: string;
@@ -2769,6 +2856,7 @@ export function readConversationTurnUsage(db: Pick<ZeusDatabasePort, 'select'>, 
   for (const row of rows) {
     /** 金额与费率来自同一条已校验账本，不读取当前模型价格。 */
     const estimate = JSON.parse(row.estimate_json) as CodexUsageEstimate;
+    if (estimate.reportedTokenFields?.length === 0) continue;
     /** 已有美元账本沿用原金额，不从当前价格反推历史费用。 */
     const costs = sumEstimatedCosts([estimate]);
     /** 旧整轮账本拆分时也保留缓存和推理分类，避免重复计费。 */
@@ -2788,6 +2876,9 @@ export function readConversationTurnUsage(db: Pick<ZeusDatabasePort, 'select'>, 
     const previous = usageByTurn[row.turn_id];
     /** 金额为零仍是有效记录；缺价则保留空数组。 */
     const usage: ConversationTurnUsage = {
+      ...(estimate.reportedTokenFields || previous?.reportedTokenFields
+        ? { reportedTokenFields: [...new Set([...(previous ? (previous.reportedTokenFields ?? tokenUsageFields) : []), ...(estimate.reportedTokenFields ?? tokenUsageFields)])] }
+        : {}),
       totalTokens: (previous?.totalTokens ?? 0) + row.total_tokens,
       inputTokens: (previous?.inputTokens ?? 0) + row.input_tokens,
       outputTokens: (previous?.outputTokens ?? 0) + row.output_tokens,

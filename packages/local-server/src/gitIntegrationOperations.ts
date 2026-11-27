@@ -1,6 +1,6 @@
 import { conversationExecutionWorkspace, resolveConversationGitRepository } from './conversationGitWorkspace.js';
 import { inspectConversationWorktrees, removeConversationWorktrees } from './conversationWorktreeLifecycle.js';
-import { createAiRuntimeSessionManager, parseModelRef, type AiRuntimeSession } from '@zeus/ai-runtime';
+import { createAiRuntimeSessionManager, isManagedAgentKind, parseModelRef, type AiRuntimeSession, type ManagedAgentKind } from '@zeus/ai-runtime';
 import {
   withGitRepositoryOperation,
   buildGitPatchExport,
@@ -38,7 +38,7 @@ import {
   writeTaskIntegrationDraft,
   writeTaskIntegrationResolution,
 } from '@zeus/git-core';
-import { buildTaskCommitMessageSuggestion, type TaskWorkspaceConflictRecovery } from '@zeus/shared';
+import { buildTaskCommitMessageSuggestion, defaultGitDeliveryMergeMode, type TaskWorkspaceConflictRecovery } from '@zeus/shared';
 import {
   ConversationRepository,
   ConversationSubmissionRepository,
@@ -72,7 +72,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseJsonObject } from './localServerPlatformSupport.js';
 import { createCodexNativeConversationCoordinator } from './codexNativeConversationCoordinator.js';
 import type { NativeConversationSkillInput } from './codexNativeConversationContracts.js';
-import { readNativeSubmissionSkillReferences } from './nativeConversationSubmissionInputs.js';
+import { readNativeSubmissionSkills } from './nativeConversationSubmissionInputs.js';
 import { isNativeApiRecord, nativeApiError } from './conversationApplicationOperations.js';
 import { isPathInsideRoot } from './conversationResourcePreview.js';
 import type { BatchTaskWorkspaceResult, WorkspaceGitExplicitRejection, WorkspaceGitPreparedOpaque } from './index.js';
@@ -1838,7 +1838,9 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     const { task, project, workspace } = requirePreparedWorkspace(opaque);
     if (workspace.state === 'discarded') workspaceGitReject(409, 'ZEUS_TASK_WORKSPACE_CLOSED', 'Discarded task branches cannot be merged.');
     if (value.targetBranch !== undefined && typeof value.targetBranch !== 'string') workspaceGitReject(400, 'ZEUS_TARGET_BRANCH_INVALID', 'targetBranch must be a string');
-    if (value.mode !== undefined && value.mode !== 'merge' && value.mode !== 'squash') workspaceGitReject(400, 'ZEUS_TASK_INTEGRATION_MODE_INVALID', 'mode must be merge or squash');
+    /** 省略合入方式的接口请求采用与交付界面一致的默认值。 */
+    const mode = value.mode === undefined ? defaultGitDeliveryMergeMode : value.mode;
+    if (mode !== 'merge' && mode !== 'squash') workspaceGitReject(400, 'ZEUS_TASK_INTEGRATION_MODE_INVALID', 'mode must be merge or squash');
     if (value.prepareOnly !== undefined && typeof value.prepareOnly !== 'boolean') workspaceGitReject(400, 'ZEUS_TASK_INTEGRATION_PREPARE_ONLY_INVALID', 'prepareOnly must be a boolean');
     const repositoryPath = workspace.repositoryPath || project.localPath;
     const repository = await getGitRepositoryContext(repositoryPath);
@@ -1881,7 +1883,6 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       }
       await db.save();
     }
-    const mode = value.mode === 'squash' ? 'squash' : 'merge';
     const taskHeadSha = await getGitBranchHead(repositoryPath, workspace.branchName);
     /** 使用目标当前提交建立并发基线；unborn 首次交付以空字符串表示尚无提交。 */
     const targetHeadSha = targetUnborn ? '' : await getGitBranchHead(repositoryPath, targetBranch);
@@ -1907,7 +1908,6 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         targetBranch,
         taskBranch: workspace.branchName,
         mode,
-        commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
       });
       if (started.targetHeadSha !== targetHeadSha) throw nativeApiError('ZEUS_TARGET_HEAD_CHANGED', 'Target branch changed while the integration candidate was being created.');
       if (started.taskHeadSha !== taskHeadSha) throw nativeApiError('ZEUS_TASK_HEAD_CHANGED', 'Task branch changed while the integration candidate was being created.');
@@ -2025,7 +2025,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     return workspaceGitResponse(
       {
         path,
-        agentKind: conversation.agentKind === 'copilot' ? 'copilot' : conversation.agentKind === 'pi' ? 'pi' : 'codex',
+        agentKind: isManagedAgentKind(conversation.agentKind) ? conversation.agentKind : 'codex',
         modelSourceId: conversation.modelSourceId,
         modelId: conversation.modelId ?? conversation.providerModel ?? '',
         conversationId: conversation.id,
@@ -2063,8 +2063,10 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
   async function executeTaskIntegrationFinalize(opaque: WorkspaceGitPreparedOpaque): Promise<WorkspaceGitRouteExecution> {
     const { task, project, integration, workspace } = requirePreparedIntegration(opaque);
     if (!integration.integrationPath) workspaceGitReject(409, 'ZEUS_TASK_INTEGRATION_PATH_UNAVAILABLE', 'Integration worktree is unavailable.');
+    /** 核对后用于读取原始提交标题的任务头。 */
+    let taskHeadSha: string;
     try {
-      await assertTaskIntegrationStillCurrent(project, workspace, integration);
+      taskHeadSha = await assertTaskIntegrationStillCurrent(project, workspace, integration);
     } catch (error) {
       if (isStaleTaskIntegrationError(error)) {
         /** 过期候选不能继续占用活跃槽位；保留隔离现场，仅关闭其业务状态。 */
@@ -2074,7 +2076,15 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       }
       throw error;
     }
-    const commit = await completeTaskIntegrationCommit({ integrationPath: integration.integrationPath, mode: integration.mode, commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}` });
+    /** 续提使用原候选的源和目标提交范围。 */
+    const commit = await completeTaskIntegrationCommit({
+      integrationPath: integration.integrationPath,
+      mode: integration.mode,
+      taskBranch: workspace.branchName,
+      taskHeadSha,
+      targetBranch: integration.targetBranch,
+      targetHeadSha: integration.targetHeadSha,
+    });
     const finalized = await finalizeTaskBranchIntegration({
       repositoryPath: workspace.repositoryPath || project.localPath,
       integrationPath: integration.integrationPath,
@@ -2148,8 +2158,8 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     });
   }
 
-  /** 保存冲突草稿或完成本地合入前重新校验候选使用的任务与来源精确提交。 */
-  async function assertTaskIntegrationStillCurrent(project: ZeusProjectRecord, workspace: ZeusTaskWorkspaceRecord, integration: ZeusTaskIntegrationRecord): Promise<void> {
+  /** 校验候选使用的任务与来源提交，并返回已核对的任务头。 */
+  async function assertTaskIntegrationStillCurrent(project: ZeusProjectRecord, workspace: ZeusTaskWorkspaceRecord, integration: ZeusTaskIntegrationRecord): Promise<string> {
     const repositoryPath = workspace.repositoryPath || project.localPath;
     const taskHeadSha = await getGitBranchHead(repositoryPath, workspace.branchName);
     if (!integration.taskHeadSha || integration.taskHeadSha !== taskHeadSha) {
@@ -2157,6 +2167,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     }
     const targetHeadSha = await getGitBranchHead(repositoryPath, integration.targetBranch).catch(() => (integration.targetBranch === workspace.sourceBranch ? workspace.sourceHeadSha : null));
     if (targetHeadSha !== integration.targetHeadSha) throw nativeApiError('ZEUS_TARGET_HEAD_CHANGED', 'Local target branch advanced while the integration was being prepared.');
+    return taskHeadSha;
   }
 
   function isStaleTaskIntegrationError(error: unknown): boolean {
@@ -2196,7 +2207,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     conflictFingerprint: string;
     idempotencyKey: string;
     clientUserMessageId: string;
-    agentKind: 'codex' | 'pi' | 'copilot';
+    agentKind: 'codex' | ManagedAgentKind;
     model: { sourceId: string | null; modelId: string; displayName: string | null };
     /** 准备重试保留本轮全部 Skill；历史单项由共用读取入口归一化。 */
     skills?: NativeConversationSkillInput[];
@@ -2229,7 +2240,6 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         taskBranch: workspace.branchName,
         taskHeadSha,
         mode: integration.mode,
-        commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
         ...(integration.integrationPath ? { localChangesFromPath: integration.integrationPath } : {}),
       });
 
@@ -2253,15 +2263,14 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         lastError: null,
       });
       const settings = conversations.getNextTurnSettings(attempt.conversationId);
-      const selectedPiModelRef = (input.agentKind === 'pi' || input.agentKind === 'copilot') && settings?.model ? parseModelRef(settings.model) : null;
-      const selectedModel =
-        input.agentKind === 'pi' || input.agentKind === 'copilot'
-          ? selectedPiModelRef
-            ? { sourceId: selectedPiModelRef.sourceId, modelId: selectedPiModelRef.modelId, displayName: null }
-            : input.model
-          : settings?.model
-            ? { sourceId: null, modelId: settings.model, displayName: null }
-            : input.model;
+      const selectedManagedModelRef = isManagedAgentKind(input.agentKind) && settings?.model ? parseModelRef(settings.model) : null;
+      const selectedModel = isManagedAgentKind(input.agentKind)
+        ? selectedManagedModelRef
+          ? { sourceId: selectedManagedModelRef.sourceId, modelId: selectedManagedModelRef.modelId, displayName: null }
+          : input.model
+        : settings?.model
+          ? { sourceId: null, modelId: settings.model, displayName: null }
+          : input.model;
       const serviceTierPlan = input.agentKind === 'codex' ? await resolveDefaultModelServiceTierPlan() : null;
       const prompt = buildTaskConflictAiPrompt({
         sourceBranch: integration.targetBranch,
@@ -2341,7 +2350,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
     const conflictPath = required('conflictPath');
     const conflictContent = required('conflictContent');
     const conflictFingerprint = required('conflictFingerprint');
-    const skills = readNativeSubmissionSkillReferences(submission);
+    const skills = readNativeSubmissionSkills(submission);
     if (integrationId !== attempt.integrationId) throw nativeApiError('ZEUS_NATIVE_RESERVED_RESOURCE_CONFLICT', '冲突处理准备信封与业务操作身份不一致。');
     taskIntegrationAttempts.update(attempt.id, { state: 'preparing', lastError: null });
     taskConflictAiOperations.set(attempt.id, { conversationId: conversation.id, submissionId: submission.id, running: false, finalizing: false });
@@ -2357,7 +2366,7 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
         conflictFingerprint,
         idempotencyKey: submission.idempotencyKey,
         clientUserMessageId: submission.clientMessageId,
-        agentKind: conversation.agentKind === 'copilot' ? 'copilot' : conversation.agentKind === 'pi' ? 'pi' : 'codex',
+        agentKind: isManagedAgentKind(conversation.agentKind) ? conversation.agentKind : 'codex',
         model: { sourceId: conversation.modelSourceId, modelId: conversation.modelId ?? conversation.providerModel ?? '', displayName: null },
         ...(skills.length ? { skills } : {}),
         ...(generationIdentity
@@ -2445,10 +2454,14 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       if (attempt.targetHeadSha !== latestTargetHeadSha || attempt.taskHeadSha !== latestTaskHeadSha) {
         throw nativeApiError('ZEUS_TASK_INTEGRATION_ATTEMPT_STALE', '来源分支或任务分支已推进，已保留当前冲突处理成果；请在原会话代码交付中审阅并同步最新分支后继续。');
       }
+      /** 使用 AI 冲突工作树实际纳入的源和目标提交范围。 */
       const commit = await completeTaskIntegrationCommit({
         integrationPath: attempt.worktreePath,
         mode: integration.mode,
-        commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
+        taskBranch: workspace.branchName,
+        taskHeadSha: attempt.taskHeadSha,
+        targetBranch: integration.targetBranch,
+        targetHeadSha: attempt.targetHeadSha,
       });
       const finalized = await finalizeTaskBranchIntegration({
         repositoryPath,
@@ -2562,11 +2575,16 @@ export function createGitIntegrationOperations(dependencies: GitIntegrationOpera
       if ('error' in resolved) throw nativeApiError(resolved.error.error, resolved.error.message);
       const { task, project, integration, workspace } = resolved;
       if (!integration.integrationPath) throw nativeApiError('ZEUS_TASK_INTEGRATION_PATH_UNAVAILABLE', 'Integration worktree is unavailable.');
-      await assertTaskIntegrationStillCurrent(project, workspace, integration);
+      /** AI 续提使用当前候选已核对的任务头。 */
+      const taskHeadSha = await assertTaskIntegrationStillCurrent(project, workspace, integration);
+      /** 沿用当前 AI 会话关联的合入范围。 */
       const commit = await completeTaskIntegrationCommit({
         integrationPath: integration.integrationPath,
         mode: integration.mode,
-        commitMessage: `${task.taskCode}: 合入 ${workspace.branchName}`,
+        taskBranch: workspace.branchName,
+        taskHeadSha,
+        targetBranch: integration.targetBranch,
+        targetHeadSha: integration.targetHeadSha,
       });
       const finalized = await finalizeTaskBranchIntegration({
         repositoryPath: workspace.repositoryPath || project.localPath,

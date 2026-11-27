@@ -152,33 +152,104 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   }
 }
 
-/* 文件复制菜单沿用应用色板，使用顶层浮层避免被文件树和独立弹窗裁切。 */
-.zeus-file-copy-menu {
+/* 自绘右键菜单共用主题色、紧凑行和窗口边缘留白。 */
+:where(.zeus-context-menu) {
+  z-index: 80;
+}
+
+.zeus-context-menu {
   position: fixed;
   inset: auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  inline-size: max-content;
+  min-inline-size: min(144px, calc(100vw - 16px));
+  max-inline-size: min(400px, calc(100vw - 16px));
+  max-block-size: calc(100vh - 16px);
+  overflow: auto;
+  overscroll-behavior: contain;
   margin: 0;
-  padding: 4px;
-  min-width: 150px;
-  border: 1px solid var(--zeus-product-line);
-  border-radius: 7px;
-  background: var(--zeus-product-panel);
-  color: var(--zeus-product-text);
-  box-shadow: 0 6px 20px rgb(0 0 0 / 16%);
+  padding: 5px;
+  border: 1px solid var(--zeus-popover-line, var(--zeus-product-line, ButtonBorder));
+  border-radius: var(--zeus-popover-radius, 10px);
+  background: var(--zeus-popover-bg, var(--zeus-product-panel, Canvas));
+  color: var(--zeus-product-text, CanvasText);
+  box-shadow: 0 3px 9px rgb(0 0 0 / 6%), 0 12px 28px rgb(0 0 0 / 13%);
 }
-.zeus-file-copy-menu button {
-  display: block;
-  width: 100%;
-  padding: 6px 10px;
+
+.zeus-context-menu > button {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  min-inline-size: 0;
+  min-block-size: 28px;
+  padding: 4px 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
   color: inherit;
   font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 18px;
   text-align: start;
+  white-space: nowrap;
+  cursor: pointer;
 }
-.zeus-file-copy-menu button:is(:hover, :focus-visible) {
-  background: var(--zeus-interaction-hover);
-  outline: 2px solid var(--zeus-product-line);
+
+.zeus-context-menu > button > svg {
+  flex: none;
+  inline-size: 16px;
+  block-size: 16px;
+  color: var(--zeus-product-muted, currentColor);
+}
+
+.zeus-context-menu > button > span {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.zeus-context-menu > button > kbd {
+  flex: none;
+  margin-inline-start: auto;
+  color: var(--zeus-product-muted, currentColor);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.zeus-context-menu > button:is(:hover, :focus-visible):not(:disabled):not([aria-disabled='true']) {
+  background: var(--zeus-popover-item-hover-bg, var(--zeus-interaction-hover, color-mix(in srgb, currentColor 7%, transparent)));
+}
+
+.zeus-context-menu > button:focus-visible {
+  outline: 2px solid var(--zeus-product-accent, Highlight);
+  outline-offset: -2px;
+}
+
+.zeus-context-menu > button:is(:disabled, [aria-disabled='true']) {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.zeus-context-menu > button[data-danger] {
+  color: var(--zeus-control-danger-text);
+}
+
+.zeus-context-menu > button[data-danger] > svg {
+  color: currentColor;
+}
+
+.zeus-context-menu > hr {
+  flex: none;
+  margin: 3px 6px;
+  border: 0;
+  border-block-start: 1px solid var(--zeus-product-line, ButtonBorder);
 }
 
 @keyframes zeus-panel-focus-enter {
@@ -403,9 +474,6 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 .macos-ai-app :where(button, input, select, textarea, [role='button'], [role='option']):is(:disabled, [aria-disabled='true']) {
   cursor: not-allowed;
 }
-.macos-ai-app :where(button, [role='button'])[aria-busy='true'] {
-  cursor: progress;
-}
 /* 仅剩外观的退出层不接收鼠标，也不能成为下一个焦点。 */
 .macos-ai-app [inert],
 .macos-ai-app [inert] * {
@@ -416,7 +484,7 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   display: none !important;
 }
 /* 密集菜单有独立滚动，靠近窗口底边时仍能访问最后一个选项。 */
-.macos-ai-app [data-zeus-primitive='menu'] {
+.macos-ai-app [data-zeus-primitive='menu']:not(:where(.zeus-context-menu)) {
   max-inline-size: calc(100vw - 16px);
   max-block-size: calc(100vh - 16px);
   overflow-y: auto;
@@ -705,11 +773,31 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
 }
 
 /* 图标独立占位，避免 SVG 的基线空隙与文字挤在一起；纯图标按钮仍整体居中。 */
-.macos-ai-app .zeus-button[data-zeus-primitive='button'] > svg {
+.macos-ai-app .zeus-button[data-zeus-primitive='button'] > svg,
+.macos-ai-app .zeus-button[data-zeus-primitive='button'] > .zeus-button-labels > span > svg {
   display: block;
   flex: 0 0 auto;
   inline-size: 16px;
   block-size: 16px;
+}
+
+/* 两种文案共用一个网格单元，切换时按较宽的内容保留原位置。 */
+.zeus-button-labels {
+  display: inline-grid;
+  gap: inherit;
+  min-inline-size: 0;
+}
+
+.zeus-button-labels > span {
+  align-items: center;
+  display: inline-flex;
+  gap: inherit;
+  grid-area: 1 / 1;
+  justify-content: center;
+}
+
+.zeus-button-labels > span[aria-hidden='true'] {
+  visibility: hidden;
 }
 
 .macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-size='compact'] {
@@ -774,21 +862,23 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   box-shadow: var(--zeus-control-danger-focus);
 }
 
-.macos-ai-app .zeus-button[data-zeus-primitive='button']:disabled {
+/* 只有明确等待回执或本来不可用的按钮显示禁用底色。 */
+.macos-ai-app .zeus-button[data-zeus-primitive='button']:disabled:where(:not([aria-busy='true'], [data-loading='true']), [data-busy-behavior='background'], [data-button-waiting='true']) {
   background: var(--zeus-control-disabled-bg);
   border-color: var(--zeus-control-disabled-line);
   color: var(--zeus-control-disabled-text);
 }
 
 /* 主操作禁用时保留浅品牌色，与可用态的实心品牌色保持明确区分。 */
-.macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-variant='primary']:disabled {
+.macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-variant='primary']:disabled:where(:not([aria-busy='true'], [data-loading='true']), [data-busy-behavior='background'], [data-button-waiting='true']) {
   background: color-mix(in srgb, var(--zeus-product-accent) 14%, var(--zeus-control-disabled-bg));
   border-color: color-mix(in srgb, var(--zeus-product-accent) 24%, var(--zeus-control-disabled-line));
   color: color-mix(in srgb, var(--zeus-product-accent) 55%, var(--zeus-control-disabled-text));
 }
 
-.macos-ai-app .zeus-button[data-zeus-primitive='button'][data-loading='true'] {
-  cursor: progress;
+/* 等待文案使用正文颜色，便于辨认正在进行的动作。 */
+.macos-ai-app .zeus-button[data-zeus-primitive='button'][data-button-waiting='true']:disabled {
+  color: var(--zeus-control-text);
 }
 
 /* 旧页面尚未迁移为 Button 的危险动作仍强制消费同一语义色和危险焦点环，禁止出现浅色描边。 */
@@ -1285,6 +1375,30 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   z-index: 12000;
 }
 
+/* 网络通知保留主界面操作，窄窗口中说明可换行。 */
+.application-network-notice.macos-ai-app {
+  position: fixed;
+  inset-block-start: 52px;
+  inset-inline-end: 16px;
+  z-index: 121;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  box-sizing: border-box;
+  inline-size: max-content;
+  max-inline-size: min(460px, calc(100% - 32px));
+  padding: 10px 12px;
+  border: 1px solid var(--zeus-product-line);
+  border-radius: 12px;
+  background: var(--zeus-product-panel);
+  color: var(--zeus-product-text);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 12%);
+}
+
 .macos-ai-app .application-error-dialog {
   box-sizing: border-box;
   display: grid;
@@ -1735,6 +1849,12 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
   white-space: nowrap;
 }
 
+/* 网络提示保留完整文案，窄窗口中继续显示原操作按钮。 */
+.macos-ai-app .application-error-inline[data-network-issue] .application-error-inline-summary {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* 长报错不再绘制整块红色底，危险操作与表单字段仍使用原来的警示状态。 */
 .macos-ai-app :is([role='alert'], [role='status'], .is-error):has(> span.application-error-inline) {
   background: transparent;
@@ -1807,150 +1927,4 @@ html[data-zeus-theme='dark'] body > .macos-ai-app {
     transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
-}
-
-/* 保留独立发行的专属界面样式，公共组件跟随上游。 */
-
-:root {
-  --zeus-font-family-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  --zeus-font-family-mono: 'SFMono-Regular', 'SF Mono', Consolas, ui-monospace, monospace;
-  --zeus-font-mono: var(--zeus-font-family-mono);
-  --zeus-code-font-family: var(--zeus-font-family-mono);
-  --zeus-type-size-micro: 10px;
-  --zeus-type-size-caption: 11px;
-  --zeus-type-size-label: 12px;
-  --zeus-type-size-control: 13px;
-  --zeus-type-size-body: 14px;
-  --zeus-type-size-heading: 16px;
-  --zeus-type-size-dialog-title: 19px;
-  --zeus-type-line-tight: 1.35;
-  --zeus-type-line-default: 1.5;
-  --zeus-type-line-relaxed: 1.6;
-  --zeus-type-weight-medium: 560;
-  --zeus-type-weight-semibold: 650;
-  --zeus-type-weight-bold: 700;
-  --zeus-space-1: 4px;
-  --zeus-space-2: 8px;
-  --zeus-space-3: 12px;
-  --zeus-space-4: 16px;
-  --zeus-space-5: 20px;
-  --zeus-space-6: 24px;
-  --zeus-space-7: 28px;
-  --zeus-space-8: 32px;
-  --zeus-control-height: 32px;
-  --zeus-dialog-padding: var(--zeus-space-6);
-  --zeus-dialog-content-gap: var(--zeus-space-4);
-  --zeus-dialog-section-gap: var(--zeus-space-3);
-  --zeus-dialog-footer-padding-block: var(--zeus-space-3);
-  --zeus-dialog-radius: 18px;
-}
-
-.macos-ai-app .project-code-mode-pane:not([hidden]),
-.macos-ai-app .settings-content-column > .settings-product-pane,
-.macos-ai-app .workspace-view-settings > .settings-sidebar-shell {
-  animation: zeus-panel-focus-enter var(--zeus-motion-duration-workspace) var(--zeus-motion-ease-out) both;
-}
-.macos-ai-app :where(button, summary, [role='button'], [role='tab'], a[href]):focus-visible {
-  outline: 2px solid var(--zeus-product-accent);
-  outline-offset: 2px;
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-settings-button,
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button {
-  background: transparent;
-  border-color: transparent;
-  border-radius: 999px;
-  box-shadow: none;
-  block-size: 26px;
-  inline-size: 26px;
-  opacity: 0;
-  pointer-events: none;
-  transform: scale(1);
-  transition:
-    opacity var(--zeus-source-list-row-motion),
-    background-color var(--zeus-source-list-row-motion),
-    border-color var(--zeus-source-list-row-motion),
-    color var(--zeus-source-list-row-motion),
-    transform 120ms var(--zeus-motion-ease-out);
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button {
-  font-size: 15px;
-  letter-spacing: -1px;
-  line-height: 1;
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row:where(:hover:not(:disabled):not([aria-disabled='true']), :focus-within) .zeus-source-list-row-actions > .project-settings-button,
-.macos-ai-app .project-first-sidebar .zeus-source-list-row:where(:hover:not(:disabled):not([aria-disabled='true']), :focus-within) .zeus-source-list-row-actions > .project-row-actions > .project-more-button,
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions.open > .project-more-button {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-settings-button:is(:hover:not(:disabled):not([aria-disabled='true']), :active:not(:disabled), :focus-visible):not(:disabled),
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button:is(:hover:not(:disabled):not([aria-disabled='true']), :active:not(:disabled), :focus-visible):not(:disabled),
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions.open > .project-more-button {
-  background: transparent;
-  border-color: transparent;
-  color: var(--zeus-product-text);
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-settings-button:hover:not(:disabled):not([aria-disabled='true']),
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button:hover:not(:disabled):not([aria-disabled='true']) {
-  background-color: var(--zeus-interaction-hover);
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-settings-button:active:not(:disabled),
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button:active:not(:disabled) {
-  background-color: var(--zeus-interaction-pressed);
-}
-
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-settings-button:focus-visible,
-.macos-ai-app .project-first-sidebar .zeus-source-list-row-actions > .project-row-actions > .project-more-button:focus-visible {
-  box-shadow: var(--zeus-control-focus);
-  outline: 0;
-}
-.zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop > [data-modal-surface] {
-  font-family: var(--zeus-font-family-ui);
-  font-size: var(--zeus-type-size-control);
-  line-height: var(--zeus-type-line-default);
-}
-
-.macos-ai-app .application-error-dialog > footer > :first-child {
-  margin-inline-end: auto;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .macos-ai-app :where(.workspace-view-project-tasks, .workspace-view-project-git, .workspace-view-project-settings),
-  .session-codex-parity-v1 .session-workspace-root,
-  .macos-ai-app .project-code-mode-pane:not([hidden]),
-  .macos-ai-app .settings-content-column > .settings-product-pane,
-  .macos-ai-app .workspace-view-settings > .settings-sidebar-shell,
-  .macos-ai-app [data-motion-surface='list-item'][data-motion-state='entering'],
-  .macos-ai-app :where(.inline-status, .project-inline-recovery-row, .task-list-state-row),
-  .macos-ai-app .task-table-bulk-action-bar,
-  .session-codex-parity-v1 .session-interaction-dock,
-  .session-codex-parity-v1 .session-switch-target-dock,
-  .session-codex-parity-v1 :where(.session-queued-messages, .session-creation-status, .session-transport-failure),
-  .macos-ai-app .project-source-tree-backdrop,
-  .zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop,
-  .zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop > :is([role='dialog'], [data-modal-surface='dialog']),
-  .zeus-modal-portal-root.macos-ai-app[data-zeus-primitive='modal'] .zeus-modal-backdrop > :is([role='alertdialog'], [data-modal-surface='alertdialog']) {
-    animation: none !important;
-    transform: none !important;
-    will-change: auto !important;
-  }
-
-  .macos-ai-app .zeus-button[data-zeus-primitive='button'],
-  .macos-ai-app .zeus-source-list-row,
-  .macos-ai-app .zeus-source-list-row-main,
-  .macos-ai-app .project-source-tree,
-  .macos-ai-app :where(.project-workspace-mode-toolbar button, .settings-section-button, .task-table-status-segment) {
-    transition: none;
-    will-change: auto;
-  }
-}
-.macos-ai-app .project-first-sidebar .zeus-source-list-row:where(:hover:not(:disabled):not([aria-disabled='true']), :focus-within) .zeus-source-list-row-actions > .project-source-button {
-  opacity: 1;
-  pointer-events: auto;
 }

@@ -527,7 +527,7 @@ interface PendingSendEnvelope {
   delivery: 'queue' | 'steer_now';
   expectedTurnId?: string;
   model?: string;
-  agentKind?: 'codex' | 'pi' | 'copilot';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
   effort?: string;
   /** 本次发送冻结的窗口容量。 */
   contextCapacityTokens?: number | null;
@@ -825,14 +825,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
   const requestsAwaitingDetails = new Set<string>();
   const resolvedRequestIds = new Set<string>();
   let targetedHydrationBuffer: BufferedRealtimeEvents | null = null;
-  // 只有当前协议代次的热缓存事件水位才是权威下限；旧协议的较大序号不能压住新代次快照。
-  let lastAppliedSyncEventSequence =
-    state.snapshot?.conversationSchemaGeneration === CONVERSATION_SCHEMA_GENERATION &&
-    state.snapshot.syncStreamGeneration === CONVERSATION_SYNC_STREAM_GENERATION &&
-    Number.isSafeInteger(state.snapshot.throughEventSeq) &&
-    state.snapshot.throughEventSeq >= 0
-      ? state.snapshot.throughEventSeq
-      : 0;
+  let lastAppliedSyncEventSequence = 0;
   let syncProjectionSuspended = false;
   const pendingSyncGapEvents = new Map<number, NativeRealtimeEventEnvelope>();
   const pendingSyncGapEventBytes = new Map<number, number>();
@@ -959,11 +952,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
     return [];
   }
 
-  /** 只有可能携带持久转录位置的动作需要等待位置核对；本地发送、取消和表单状态必须立即落盘。 */
-  function actionRequiresPlacementRecovery(action: Parameters<typeof sessionReducer>[1]): boolean {
-    return action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged' || action.type === 'pending_requests_hydrated' || action.type === 'event_received';
-  }
-
   /** 缓冲动作尚未进入状态，也必须同时核对用户正式身份与事件携带的 Provider 别名。 */
   function actionTranscriptEntryIds(action: Parameters<typeof sessionReducer>[1]): string[] {
     /** 原始身份用于确认别名退休，不能只请求替换后的正式身份。 */
@@ -1062,14 +1050,15 @@ export function createSessionController(options: CreateSessionControllerOptions)
     const incomingMissingPlacement = (action.type === 'snapshot_hydrated' || action.type === 'snapshot_v2_page_merged') && actionTranscripts(action).some((envelope) => envelope.placement.order === null);
     const incomingEpoch =
       action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed' ? action.event.payload.orderEpoch : Math.max(0, ...actionTranscripts(action).map((envelope) => envelope.placement.orderEpoch));
-    const placementSensitive = !immediateAction && actionRequiresPlacementRecovery(action);
-    const placementTakeoverRequired =
+    if (
       !immediateAction &&
       action.type !== 'transcript_placements_hydrated' &&
-      (Boolean(placementRecovery) ||
-        (placementSensitive &&
-          (missingInputPlacement || incomingMissingPlacement || (incomingEpoch > 0 && incomingEpoch !== placementEpoch) || (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed'))));
-    if (placementTakeoverRequired) {
+      (placementRecovery ||
+        missingInputPlacement ||
+        incomingMissingPlacement ||
+        (incomingEpoch > 0 && incomingEpoch !== placementEpoch) ||
+        (action.type === 'event_received' && action.event.type === 'conversation.transcript.placement.changed'))
+    ) {
       placementBufferBytes += new TextEncoder().encode(JSON.stringify(action)).byteLength;
       placementActions.push(action);
       if (placementActions.length > sessionRealtimeBufferBudget.maxEntries || placementBufferBytes > sessionRealtimeBufferBudget.maxBytes) {
@@ -1078,9 +1067,9 @@ export function createSessionController(options: CreateSessionControllerOptions)
         placementRecovery = null;
         placementRecoveryGeneration += 1;
         failConversationSync(new Error('位置接管期间的消息缓冲超过预算。'));
-        // 本地动作仍可安全落盘；携带服务端转录的动作等待重新同步。
-        if (placementSensitive) return;
-      } else if (!placementRecovery) {
+        return;
+      }
+      if (!placementRecovery) {
         const generation = ++placementRecoveryGeneration;
         const recovery = Promise.resolve()
           .then(() => recoverTranscriptPlacements(generation))
@@ -1096,7 +1085,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
           });
         placementRecovery = recovery;
       }
-      if (placementSensitive) return;
+      return;
     }
     const previousThreadId = state.providerThreadId;
     const previousTransportKind = state.snapshot?.transportKind ?? null;
@@ -1298,7 +1287,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
     if (snapshot.conversationSchemaGeneration !== CONVERSATION_SCHEMA_GENERATION || snapshot.syncStreamGeneration !== CONVERSATION_SYNC_STREAM_GENERATION || !Number.isSafeInteger(snapshot.throughEventSeq) || snapshot.throughEventSeq < 0) {
       throw new Error('Zeus Renderer 与本地服务的会话结构代次不匹配，已拒绝猜测旧新字段。');
     }
-    if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) return;
     /** 首屏与完整快照共用正文水位，补齐队列不重复读取 Git 环境和统计。 */
     const refreshMetadata = metadataHydrationConnection !== connectionToken || state.snapshot?.throughEventSeq !== snapshot.throughEventSeq;
     lastAppliedSyncEventSequence = Math.max(lastAppliedSyncEventSequence, snapshot.throughEventSeq);
@@ -1497,10 +1485,8 @@ export function createSessionController(options: CreateSessionControllerOptions)
       if (page.requestedBeforeBaseline) {
         const snapshot = await loadConversationForHydration();
         if (disposed || token !== connectionToken || syncProjectionSuspended) return;
-        if (snapshot.throughEventSeq >= lastAppliedSyncEventSequence) {
-          await applyAuthoritativeSnapshot(snapshot);
-          progressed = true;
-        }
+        await applyAuthoritativeSnapshot(snapshot);
+        progressed = true;
       } else {
         for (const event of page.events) {
           const sequence = event.payload.sequence;
@@ -1834,7 +1820,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
   }
 
   async function reconcilePersistedAcceptance(snapshot: NativeConversationSnapshot): Promise<void> {
-    if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) return;
     for (const persistedEnvelope of [...recoverableSends]) {
       let envelope = recoverableSend(persistedEnvelope.clientUserMessageId);
       if (!envelope) continue;
@@ -1889,7 +1874,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
       if (await reconcileSubmissionReceipt(envelope)) return true;
       const snapshot = await withSessionTimeout(loadConversationForHydration(), conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
       if (disposed || token !== connectionToken || !recoverableSend(envelope.clientUserMessageId)) return true;
-      if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) throw new Error('会话快照早于已接收的实时事件，等待下一次权威核对。');
       await applyAuthoritativeSnapshot(snapshot);
       if (disposed || token !== connectionToken) return false;
       if (!recoverableSend(envelope.clientUserMessageId)) return true;
@@ -2047,7 +2031,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
     try {
       const snapshot = await withSessionTimeout(loadConversationForHydration(), conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
       if (disposed || token !== connectionToken || sendOperations.has(envelope.clientUserMessageId) || !recoverableSend(envelope.clientUserMessageId)) return { kind: 'unknown' };
-      if (snapshot.throughEventSeq < lastAppliedSyncEventSequence) return { kind: 'unknown' };
       await applyAuthoritativeSnapshot(snapshot);
       if (disposed || token !== connectionToken) return { kind: 'unknown' };
       // 位置恢复期间可能已收到成功回执或发起明确重试，旧读取不能重新写回账本。
@@ -2546,8 +2529,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
       const snapshot = await withSessionTimeout(progressiveHydration, conversationHydrationTimeoutMs, () => new ConversationHydrationTimeoutError());
       if (disposed || token !== connectionToken) return;
       const lazySnapshotHydration = options.realtimePolicy === 'lazy' && realtimeMode !== 'required';
-      const subscribeRealtime =
-        realtimeMode === 'required' || (!lazySnapshotHydration && (snapshotNeedsRealtime(snapshot) || stateNeedsRealtime() || recoverableSends.some((envelope) => envelope.deliveryState !== 'failed') || deferredSends.length > 0));
+      const subscribeRealtime = realtimeMode === 'required' || (!lazySnapshotHydration && (snapshotNeedsRealtime(snapshot) || recoverableSends.some((envelope) => envelope.deliveryState !== 'failed') || deferredSends.length > 0));
       if (!subscribeRealtime) {
         await applyAuthoritativeSnapshot(snapshot);
         hasCompleteSnapshot = true;
@@ -2718,15 +2700,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
     return Promise.reject(error);
   }
 
-  /** 发送已明确失败且用户尚未继续编辑时，把原输入放回表单，避免修正设置后还要重新录入。 */
-  function restoreFailedEnvelopeComposer(envelope: PendingSendEnvelope): void {
-    if (envelope.questionAnswer || state.draft || state.attachments.length > 0 || state.browserSubmission || hasConversationContext(state.contextDraft)) return;
-    dispatch({ type: 'draft_changed', draft: envelope.draft });
-    dispatch({ type: 'attachments_changed', attachments: [...envelope.composerAttachments] });
-    dispatch({ type: 'browser_submission_changed', browserSubmission: envelope.browserSubmission ? structuredClone(envelope.browserSubmission) : null });
-    dispatch({ type: 'context_draft_changed', contextDraft: structuredClone(envelope.contextDraft) });
-  }
-
   /** 有明确 HTTP 拒绝且无需恢复时才标记失败；网络和恢复类错误保留为结果未知。 */
   function sendFailureIsExplicit(error: NativeSessionError): boolean {
     return error.recoveryRequired === false && typeof error.status === 'number' && [400, 401, 403, 404, 422].includes(error.status);
@@ -2835,7 +2808,6 @@ export function createSessionController(options: CreateSessionControllerOptions)
                 error: failure,
               },
         );
-        if (explicitFailure) restoreFailedEnvelopeComposer(unresolvedEnvelope);
         persistDraft();
         // 结果未知保留原身份并只读核对；普通待发消息继续保持接纳顺序。
         if (!explicitFailure) {
@@ -3228,19 +3200,19 @@ export function createSessionController(options: CreateSessionControllerOptions)
     if (existing) return existing;
     const request = (async () => {
       let retryAttempt = 0;
-      const maximumAttempts = 4;
-      dispatch({ type: 'v2_content_load_error_changed', conversationId: options.conversationId, handle, error: null });
-      // 正文属于本地不可变历史记录；瞬时错误从第一页有限重试，确定性错误立即反馈到原消息。
+      // 正文属于本地不可变历史记录。瞬时连接、超时或 host 换代只影响读取过程，
+      // 不应把失败状态交给用户；每轮从第一页重新读取并重新执行完整性校验。
       while (!disposed) {
+        const load = options.client.loadNativeConversationContentV2;
+        const current = state.snapshot;
+        const generation = connectionToken;
+        const structureGeneration = current?.snapshotV2?.structureGeneration;
+        const contentItem = current?.items.find((item) => item.payload.v2ContentHandle === handle && (item.payload.v2ContentKind === 'model_history' || item.payload.v2ContentKind === 'process_detail'));
+        const expectedPageKind = contentItem?.payload.v2ContentKind === 'process_detail' ? 'process_detail' : 'model_content';
+        if (!load || !current?.snapshotV2 || !structureGeneration) throw new Error('当前会话不支持 Snapshot V2 内容分页。');
+        if (!contentItem || contentItem.payload.v2ContentTruncated !== true || contentItem.payload.v2ContentCompleteHandle === handle) return;
+
         try {
-          const load = options.client.loadNativeConversationContentV2;
-          const current = state.snapshot;
-          const generation = connectionToken;
-          const structureGeneration = current?.snapshotV2?.structureGeneration;
-          const contentItem = current?.items.find((item) => item.payload.v2ContentHandle === handle && (item.payload.v2ContentKind === 'model_history' || item.payload.v2ContentKind === 'process_detail'));
-          const expectedPageKind = contentItem?.payload.v2ContentKind === 'process_detail' ? 'process_detail' : 'model_content';
-          if (!load || !current?.snapshotV2 || !structureGeneration) throw new Error('当前会话不支持 Snapshot V2 内容分页。');
-          if (!contentItem || contentItem.payload.v2ContentTruncated !== true || contentItem.payload.v2ContentCompleteHandle === handle) return;
           let offset = 0;
           let text = '';
           let redacted = false;
@@ -3270,8 +3242,7 @@ export function createSessionController(options: CreateSessionControllerOptions)
             offset = page.nextOffset;
           }
           if (generationChanged) {
-            retryAttempt += 1;
-            if (retryAttempt >= maximumAttempts) throw Object.assign(new Error('完整正文读取期间连接反复变化，请手动重试。'), { retryable: true });
+            retryAttempt = 0;
             continue;
           }
           if (!redacted) {
@@ -3281,33 +3252,23 @@ export function createSessionController(options: CreateSessionControllerOptions)
           }
           if (disposed) return;
           if (generation !== connectionToken) {
-            retryAttempt += 1;
-            if (retryAttempt >= maximumAttempts) throw Object.assign(new Error('完整正文读取期间连接反复变化，请手动重试。'), { retryable: true });
+            retryAttempt = 0;
             continue;
           }
           const latest = state.snapshot;
           if (!latest?.snapshotV2 || latest.snapshotV2.structureGeneration !== structureGeneration) {
-            retryAttempt += 1;
-            if (retryAttempt >= maximumAttempts) throw Object.assign(new Error('会话结构在全文读取期间反复变化，请手动重试。'), { retryable: true });
+            retryAttempt = 0;
             continue;
           }
           const latestItem = latest.items.find((item) => item.payload.v2ContentHandle === handle && item.payload.v2ContentKind === contentItem.payload.v2ContentKind);
           if (!latestItem || latestItem.payload.v2ContentTruncated !== true || latestItem.payload.v2ContentCompleteHandle === handle) return;
           dispatch({ type: 'v2_content_loaded', conversationId: options.conversationId, handle, text, redacted });
           return;
-        } catch (error) {
+        } catch {
           if (disposed) return;
           const latestItem = state.snapshot?.items.find((item) => item.payload.v2ContentHandle === handle && (item.payload.v2ContentKind === 'model_history' || item.payload.v2ContentKind === 'process_detail'));
           if (!latestItem || latestItem.payload.v2ContentTruncated !== true || latestItem.payload.v2ContentCompleteHandle === handle) return;
           retryAttempt += 1;
-          const status = error && typeof error === 'object' && 'status' in error ? error.status : null;
-          const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
-          const transientByDefault = error instanceof TypeError || (typeof status === 'number' && (status === 408 || status === 429 || status >= 500)) || code === 'ZEUS_LOCAL_API_READ_TIMEOUT';
-          const failure = toSessionError(error, transientByDefault);
-          if (!failure.retryable || retryAttempt >= maximumAttempts) {
-            dispatch({ type: 'v2_content_load_error_changed', conversationId: options.conversationId, handle, error: failure });
-            throw error;
-          }
           await waitForCompleteContentRetry(retryAttempt);
         }
       }

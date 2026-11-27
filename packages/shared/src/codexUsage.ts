@@ -9,8 +9,18 @@ export interface TokenUsageBreakdown {
   reasoningOutputTokens: number;
 }
 
+/** 可观测的 Token 分类与账本字段一致；缺失分类不能展示为零。 */
+export const tokenUsageFields = Object.keys(emptyTokenUsageBreakdown()) as (keyof TokenUsageBreakdown)[];
+
+/** 读取旧快照时允许缺项，新快照只接受账本认识的分类。 */
+export function isReportedTokenFields(value: unknown): value is (keyof TokenUsageBreakdown)[] {
+  return Array.isArray(value) && value.every((field) => tokenUsageFields.includes(field));
+}
+
 /** 助手正文底部的轮次消耗，缺少账本时不生成摘要。 */
 export interface ConversationTurnUsage extends UsageCostBreakdown {
+  /** 本轮有上报依据的分类，旧账本沿用原统计口径。 */
+  reportedTokenFields?: (keyof TokenUsageBreakdown)[];
   /** 本轮已记录的 Token 总数，不是单条正文或会话累计量。 */
   totalTokens: number;
   /** 本轮账本记录的输入 Token，沿用供应商的输入统计口径。 */
@@ -53,6 +63,8 @@ export interface CodexUsageRateSnapshot {
 }
 
 export interface CodexUsageEstimate {
+  /** 此账本实际取得的用量分类，空数组表示供应商未提供用量。 */
+  reportedTokenFields?: (keyof TokenUsageBreakdown)[];
   /** 原币估算金额，币种之间不直接相加。 */
   costs?: import('./modelPricing.js').EstimatedMoney[];
   /** 每次真实请求的不可变价格依据。 */
@@ -74,6 +86,10 @@ export interface NativeTokenUsageSnapshot {
   serviceTier?: string | null;
   total: TokenUsageBreakdown;
   last: TokenUsageBreakdown;
+  /** 原生上下文占用数，单位 Token；null 表示此轮未报告，缺项沿用最近请求。 */
+  contextUsedTokens?: number | null;
+  /** 累计用量中至少有一笔已上报的分类。 */
+  reportedTokenFields?: (keyof TokenUsageBreakdown)[];
   modelContextWindow: number | null;
   cacheHitRate: number | null;
   estimatedCredits: number | null;
@@ -157,10 +173,12 @@ export interface UsageModelCostBreakdown {
   estimatedCosts: import('./modelPricing.js').EstimatedMoney[];
 }
 
-/** 同一模型的可测速文本请求按生成间隔和真实时长加权后的输出速率。 */
+/** 同一模型和速度档位的可测速文本请求按真实时长加权后的输出速率。 */
 export interface UsageModelOutputRateBreakdown {
   /** 请求实际使用的模型标识。 */
   model: string;
+  /** 归一化的请求速度档位；缺少请求级档位依据时为空。 */
+  serviceTier: string | null;
   /** 首个可见 Token 之后的平均生成速率。 */
   outputTokensPerSecond: number;
 }
@@ -174,9 +192,9 @@ export interface UsageOverviewRangeSummary {
   local: CodexLocalUsageTotals;
   /** 当前范围内按模型和历史单价归组的费用依据。 */
   costBreakdown: UsageModelCostBreakdown[];
-  /** 当前范围内按实际请求模型归组的输出速率。 */
+  /** 当前范围内按实际请求模型和速度档位归组的输出速率。 */
   outputRateBreakdown: UsageModelOutputRateBreakdown[];
-  /** 当前范围内所有账本记录是否都包含完整用量。 */
+  /** 当前范围内有完整用量，且没有未补齐的写入失败。 */
   complete: boolean;
 }
 
@@ -206,6 +224,14 @@ export interface KiloAccountUsage {
   error: string | null;
 }
 
+/** 独立用量表格所需的供应商外观，按实际用量来源传递。 */
+export interface UsageModelProviderAppearance {
+  sourceId: string;
+  sourceName: string;
+  templateId?: string;
+  iconDataUrl?: string;
+}
+
 export interface UsageProviderSummary {
   providerId: string;
   sourceId: string;
@@ -226,6 +252,8 @@ export interface UsageProviderSummary {
   /** 菜单栏快捷时间筛选所需的轻量汇总。 */
   overviewRanges: Record<UsageOverviewRange, UsageOverviewRangeSummary>;
   dailyLocal: CodexLocalUsageDay[];
+  /** 本地自然日内有缺报用量或未补齐的账本写入。 */
+  incompleteLocalDates?: string[];
   collectionStartedAt: string | null;
   updatedAt: string;
   stale: boolean;
@@ -304,6 +332,10 @@ export interface UsageProviderAnalytics {
   };
   local: {
     totals: CodexLocalUsageTotals;
+    /** 当前时间、项目和模型筛选下的用量是否完整。 */
+    complete?: boolean;
+    /** 筛选范围内有未补齐写入的本地日期。 */
+    incompleteDates?: string[];
     daily: CodexLocalUsageDay[];
     byModel: CodexLocalUsageGroup[];
     byProject: CodexLocalUsageGroup[];

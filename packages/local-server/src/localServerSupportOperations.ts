@@ -1,4 +1,3 @@
-import { createDistributionContext } from '@zeus/shared';
 import {
   type AiCliAdapterDescriptor,
   type AiRuntimeLogEntry,
@@ -582,13 +581,11 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
   function buildReleaseStatusSnapshot(): ReleaseStatusSnapshot {
     const signingConfigured = Boolean(releaseEnvironment.CSC_LINK && releaseEnvironment.CSC_KEY_PASSWORD);
     const notarizationConfigured = Boolean(releaseEnvironment.APPLE_ID && releaseEnvironment.APPLE_APP_SPECIFIC_PASSWORD && releaseEnvironment.APPLE_TEAM_ID);
-    const distribution = createDistributionContext(options.distribution).zeusDistribution;
-    const caskRelativePath = `Casks/${distribution.cask}.rb`;
-    const caskPath = `${projectRoot}/${caskRelativePath}`;
+    const caskPath = `${projectRoot}/Casks/zeus.rb`;
     const workflowPath = `${projectRoot}/.github/workflows/release.yml`;
     const configuredCurrentVersion = typeof options.currentAppVersion === 'function' ? options.currentAppVersion().trim() : options.currentAppVersion?.trim();
     const currentVersion = configuredCurrentVersion || readProjectVersion(projectRoot);
-    const versionChangelogPath = `releases/${createDistributionContext(options.distribution).zeusDistribution.releaseTagPrefix}${currentVersion}.md`;
+    const versionChangelogPath = `releases/v${currentVersion}.md`;
     const changelogPath = existsSync(`${projectRoot}/${versionChangelogPath}`) ? versionChangelogPath : '';
     const readiness = detectReleaseReadiness({
       hasAppleCertificate: signingConfigured,
@@ -613,7 +610,7 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
       },
       homebrewCask: {
         configured: existsSync(caskPath),
-        label: existsSync(caskPath) ? `已检测到 ${caskRelativePath}` : '等待 Homebrew cask 文件',
+        label: existsSync(caskPath) ? '已检测到 Casks/zeus.rb' : '等待 Homebrew cask 文件',
       },
       releaseWorkflow: {
         configured: releaseWorkflowConfigured,
@@ -629,7 +626,6 @@ export function createLocalServerSupportOperations(dependencies: LocalServerSupp
     /** 运行宿主提供当前应用版本，开发环境才读取项目版本。 */
     const configuredCurrentVersion = typeof options.currentAppVersion === 'function' ? options.currentAppVersion().trim() : options.currentAppVersion?.trim();
     return readReleaseUpdateStatus({
-      distribution: options.distribution,
       currentVersion: configuredCurrentVersion || readProjectVersion(projectRoot),
       manifestUrl: releaseUpdateManifestUrl,
       platformArch: resolveReleaseUpdateArch(),

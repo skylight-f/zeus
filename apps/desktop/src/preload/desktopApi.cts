@@ -1,4 +1,5 @@
 import { createRendererBootstrapReporter, shouldReportRendererWindowError } from './rendererBootstrapState.cjs';
+import type { ZeusBrowserNativePage } from '@zeus/shared';
 
 /** 桌面界面与宿主的通信契约；不向网页暴露底层通信对象。 */
 export interface DesktopTransport {
@@ -262,6 +263,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     restartAfterStartupFailure: () => transport.invoke('zeus:startup-failure:restart'),
     /** 在启动失败后退出应用。 */
     exitAfterStartupFailure: () => transport.invoke('zeus:startup-failure:exit'),
+    /** 打开独立故障窗口，现场留在本机直至用户确认上报。 */
+    openStartupFaultReport: (detail: string) => transport.invoke('zeus:startup-failure:report', detail),
     /** 上报启动阶段及耗时，不包含业务正文。 */
     reportStartupSpan: (input: { stage: string; durationMs: number }) => transport.send('zeus:renderer-startup-span', input),
     /** 通知宿主主页已可交互。 */
@@ -278,8 +281,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     runStorageRecoveryPreflightAndRestart: () => invokeMainCommand('zeus:storage-recovery:preflight-and-restart', 'desktop.storage_recovery.preflight_restart', 'execution_host', 'storage-recovery'),
     /** 打开任务 Git 交付窗口。 */
     openTaskGitDeliveryWindow: (input: unknown) => transport.invoke('zeus:task-git-delivery:open', input),
-    /** 首帧耗时只发送类型和毫秒值，不发送文件正文。 */
-    reportGitDeliveryFrame: (input: { kind: 'window' | 'diff'; durationMs?: number }) => transport.send('zeus:task-git-delivery:frame', input),
+    /** 绘制回执包含阶段、动效偏好或选中文件到差异绘制的毫秒值。 */
+    reportGitDeliveryFrame: (input: { kind: 'surface' | 'window' | 'diff'; durationMs?: number; reduceMotion?: boolean }) => transport.send('zeus:task-git-delivery:frame', input),
     /** 宿主显示预热窗口时显式请求绘制回执，不依赖焦点变化。 */
     onGitDeliveryFrameRequested: (listener: () => void) => transport.subscribe('zeus:task-git-delivery:request-frame', listener),
     /** 提交时隐藏窗口并保留请求，接纳失败时恢复原窗口。 */
@@ -302,6 +305,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     loadProjectGitDiffSnapshot: () => transport.invoke('zeus:project-git-diff:load-snapshot'),
     /** 读取指定项目的 Git 工作台数据。 */
     loadProjectGitWorkbench: (projectId: string, includePatches = true) => transport.invoke('zeus:project-git:load-workbench', projectId, includePatches),
+    /** 读取本机当前分支，展开菜单时再带上候选引用。 */
+    loadProjectGitBranches: (projectId: string, includeReferences: boolean) => transport.invoke('zeus:project-git:load-branches', projectId, includeReferences),
     /** 读取项目 Git 历史记录。 */
     loadProjectGitHistory: (input: unknown) => transport.invoke('zeus:project-git:load-history', input),
     /** 分页读取桌面工作台已落盘的操作记录，不触发 Git 执行。 */
@@ -373,18 +378,15 @@ export function createDesktopApi(transport: DesktopTransport) {
     },
     /** 收起菜单栏用量窗口。 */
     hideMenuBarUsage: () => transport.invoke('zeus:menu-bar-usage:hide'),
+    updateMenuBarUsageTray: (image: unknown) => transport.invoke('zeus:menu-bar-usage:tray', image),
     /** 将内容高度交给主进程校验，菜单栏浮窗宽度保持不变。 */
     resizeMenuBarUsage: (height: number) => transport.invoke('zeus:menu-bar-usage:resize', height),
-    ...(transport.kind === 'electron-ipc'
-      ? {
-          /** 可见刻度订阅只影响本窗口的采集生命周期。 */
-          subscribeConversationAudio: (active: boolean) => transport.invoke('zeus:conversation-audio:subscribe', active),
-          /** 输入仅包含频谱能量和音量，不包含音频样本。 */
-          onConversationAudioFrame: (listener: (frame: { hzPerBin: number; rms: number; powers: string }) => void) => transport.subscribe('zeus:conversation-audio:frame', listener),
-          /** 采集不可用时刻度恢复静态样式。 */
-          onConversationAudioUnavailable: (listener: () => void) => transport.subscribe('zeus:conversation-audio:unavailable', listener),
-        }
-      : {}),
+    /** 可见刻度订阅只影响本窗口的采集生命周期，由 Electron 提供。 */
+    subscribeConversationAudio: transport.kind === 'electron-ipc' ? (active: boolean) => transport.invoke('zeus:conversation-audio:subscribe', active) : undefined,
+    /** 输入仅包含频谱能量和音量，不包含音频样本。 */
+    onConversationAudioFrame: transport.kind === 'electron-ipc' ? (listener: (frame: { hzPerBin: number; rms: number; powers: string }) => void) => transport.subscribe('zeus:conversation-audio:frame', listener) : undefined,
+    /** 采集不可用时刻度恢复静态样式。 */
+    onConversationAudioUnavailable: transport.kind === 'electron-ipc' ? (listener: () => void) => transport.subscribe('zeus:conversation-audio:unavailable', listener) : undefined,
     /** 在鼠标屏幕锚点旁显示独立透明费用明细窗口。 */
     showMenuBarUsageCostDetail: (input: unknown) => transport.invoke('zeus:menu-bar-usage:cost-detail-show', input),
     /** 指针离开触发器或明细窗口时延迟关闭。 */
@@ -415,6 +417,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     quitFromMenuBarUsage: () => transport.invoke('zeus:menu-bar-usage:quit'),
     /** 查询和选择项目的源码工作树。 */
     listProjectSourceWorktrees: (projectId: string) => transport.invoke('zeus:project-source:list-worktrees', projectId),
+    /** 返回当前窗口已授权身份中，磁盘上已消失的根目录。 */
+    findMissingProjectSourceWorktrees: (projectId: string, sourceIds: string[]) => transport.invoke('zeus:project-source:missing-worktrees', projectId, sourceIds),
     selectProjectSourceWorktree: (input: { projectId: string; worktreeId: string }) => transport.invoke('zeus:project-source:select-worktree', input),
     /** 列出项目源码目录条目。 */
     listProjectSourceDirectory: (input: unknown) => transport.invoke('zeus:project-source:list-directory', input),
@@ -422,7 +426,6 @@ export function createDesktopApi(transport: DesktopTransport) {
     searchProjectSourceEntries: (input: unknown) => transport.invoke('zeus:project-source:search', input),
     /** 搜索项目源码正文。 */
     searchProjectSourceContent: (input: unknown) => transport.invoke('zeus:project-source:search-content', input),
-    searchProjectSourceText: (input: unknown) => transport.invoke('zeus:project-source:search-text', input),
     /** 读取项目源码行的 Git 来源。 */
     loadProjectSourceBlame: (input: unknown) => transport.invoke('zeus:project-source:blame', input),
     /** 读取会话工作区源码行的 Git 来源。 */
@@ -460,14 +463,13 @@ export function createDesktopApi(transport: DesktopTransport) {
     /** 将预览图片像素交给系统剪贴板或原生保存对话框。 */
     actOnImagePreview: (dataUrl: string, action: 'copy' | 'export', name: string) => transport.invoke('zeus:image-preview:action', dataUrl, action, name),
     /** 读取文件预览对应版本的来源。 */
-    requestProjectSourceLanguage: (input: unknown) => transport.invoke('zeus:project-source:language', input),
-    releaseProjectSourceLanguage: (projectId: string) => transport.invoke('zeus:project-source:release-language', projectId),
-    updateMenuBarUsageTray: (image: unknown) => transport.invoke('zeus:menu-bar-usage:tray', image),
     loadFilePreviewBlame: (id: string) => transport.invoke('zeus:file-preview:blame', id),
     /** 接收打开预览所属源码工作区的请求。 */
     onFilePreviewSourceWorkspaceRequested: (listener: (workspace: unknown) => void) => transport.subscribe('zeus:file-preview:source-open-workspace', listener),
     /** 读取项目源码文件。 */
     readProjectSourceFile: (input: unknown) => transport.invoke('zeus:project-source:read-file', input),
+    /** 读取当前源码工作树中该文件的 HEAD 正文。 */
+    readProjectSourceGitBaseline: (input: unknown) => transport.invoke('zeus:project-source:git-baseline', input),
     /** 只向受信源码页提供草稿效果预览。 */
     prepareProjectSourcePreview: (input: unknown) => transport.invoke('zeus:project-source:prepare-preview', input),
     /** 关闭页面或切换文件后撤销资源授权。 */
@@ -597,6 +599,10 @@ export function createDesktopApi(transport: DesktopTransport) {
     listConversationResourceOpenTargets: (request: unknown) => transport.invoke('zeus:conversation-resource:list-open-targets', request),
     /** 按所选目标打开已授权的会话资源。 */
     openConversationResource: (request: unknown) => transport.invoke('zeus:conversation-resource:open', request),
+    /** 列出可打开工作目录的本机应用。 */
+    listWorkingDirectoryOpenTargets: () => transport.invoke('zeus:working-directory:list-open-targets'),
+    /** 按会话身份核对工作目录后，在所选应用中打开。 */
+    openWorkingDirectory: (request: unknown) => transport.invoke('zeus:working-directory:open', request),
     /** 打开当前轮次变更涉及的文件。 */
     openTurnChangeFile: (request: unknown) => transport.invoke('zeus:turn-change-file:open', request),
     /** 通知宿主应用外壳设置已变化。 */
@@ -667,6 +673,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     showBrowserMenu: (input: unknown) => transport.invoke('zeus:browser:show-menu', input),
     /** 按会话读取当前浏览器标签快照。 */
     getBrowserSnapshot: (conversationId: string) => transport.invoke('zeus:browser:get-snapshot', conversationId),
+    /** Chromium 在当前浏览器资料中打开受限管理页。 */
+    openNativeBrowserPage: transport.kind === 'chromium-native' ? (page: ZeusBrowserNativePage) => transport.invoke('zeus:browser:open-native-page', page) : undefined,
     /** 按会话身份打开内置浏览器标签。 */
     openBrowserTab: (input: unknown) => transport.invoke('zeus:browser:open-tab', input),
     /** 首发受理后把当前窗口的浏览器草稿归入真实会话。 */
@@ -696,6 +704,8 @@ export function createDesktopApi(transport: DesktopTransport) {
     getBrowserSettings: () => transport.invoke('zeus:browser:get-settings'),
     /** 读取账号元数据，密码不进入 Renderer。 */
     listBrowserPasswords: () => transport.invoke('zeus:browser:list-passwords'),
+    /** 仅在设置中主动展开单条凭据时读取密码，不经过命令账本。 */
+    revealBrowserPassword: (origin: string, id: string) => transport.invoke('zeus:browser:reveal-password', origin, id),
     /** 主进程打开原生选择器并保留 CSV 明文候选。 */
     prepareBrowserPasswordImport: () => transport.invoke('zeus:browser:prepare-password-import'),
     /** 取消尚未提交的导入。 */

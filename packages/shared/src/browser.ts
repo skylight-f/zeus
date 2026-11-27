@@ -1,3 +1,8 @@
+import { isCodexServiceTierId, type CodexServiceTierId } from './codexServiceTier.js';
+
+/** 内置浏览器在文档根挂载的批注层，由页面预加载和弹窗焦点管理共用。 */
+export const browserAnnotationOverlayRootId = 'zeus-browser-annotation-root';
+
 /** 内置浏览器页面中的矩形；坐标均以当前 frame viewport 为参照。 */
 export interface ZeusBrowserRect {
   x: number;
@@ -87,7 +92,7 @@ export interface ZeusBrowserTabSnapshot {
   crashed: boolean;
   annotationMode: boolean;
   /** 译文只属于当前文档；刷新或导航后重新由用户开启。 */
-  translation?: { state: 'working' | 'ready' | 'error'; serviceLabel: string; message?: string };
+  translation?: { state: 'working' | 'ready' | 'error'; serviceLabel: string; modelSourceId?: string; message?: string };
   comments: ZeusBrowserComment[];
   createdAt: string;
   updatedAt: string;
@@ -112,15 +117,23 @@ export type ZeusBrowserScreenshotMode = 'always' | 'necessary';
 export type ZeusWebLinkOpenTarget = 'zeus_browser' | 'system_default';
 export type ZeusFileOpenTarget = 'zeus_source' | 'system_default' | 'editor:vscode' | 'editor:vscode-insiders' | 'editor:cursor' | 'editor:windsurf';
 
-/** 浏览器与桌面操作分别选择模型；空值沿用当前会话，不创建代理。 */
-export interface AutomationModelSettings {
-  /** 浏览器操作使用的完整模型目录身份。 */
-  browser: string | null;
-  /** 桌面操作使用的完整模型目录身份。 */
-  computer: string | null;
+/** 固定模型与速度一起保存，切换模型时不会沿用上一模型的档位。 */
+export interface AutomationModelSelection {
+  /** 用于派发的完整模型目录引用。 */
+  modelRef: string;
+  /** 空值使用标准速度，非空档位由派发时的模型目录校验。 */
+  serviceTier: CodexServiceTierId | null;
 }
 
-/** 缺省配置保留当前会话的执行方式；非法目录身份拒绝保存。 */
+/** 浏览器与桌面操作分别选择模型和速度；空值沿用当前会话。 */
+export interface AutomationModelSettings {
+  /** 浏览器操作使用的固定模型和速度。 */
+  browser: AutomationModelSelection | null;
+  /** 桌面操作使用的固定模型和速度。 */
+  computer: AutomationModelSelection | null;
+}
+
+/** 缺省值跟随当前会话，旧版模型字符串按标准速度读取。 */
 export function normalizeAutomationModelSettings(value: unknown): AutomationModelSettings {
   if (value === undefined) return { browser: null, computer: null };
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('操作模型设置必须为对象。');
@@ -128,10 +141,19 @@ export function normalizeAutomationModelSettings(value: unknown): AutomationMode
   if (Object.keys(input).some((key) => key !== 'browser' && key !== 'computer')) throw new Error('操作模型设置包含未知字段。');
   const result: AutomationModelSettings = { browser: null, computer: null };
   for (const capability of ['browser', 'computer'] as const) {
-    const model = input[capability];
-    if (model === null || model === undefined) continue;
-    if (typeof model !== 'string' || !model.trim() || model.length > 512 || /\p{Cc}/u.test(model)) throw new Error('操作模型身份无效。');
-    result[capability] = model.trim();
+    /** 历史设置只保存完整模型引用。 */
+    const saved = input[capability];
+    if (saved === null || saved === undefined) continue;
+    /** 统一读取新旧设置，同时拒绝未知的选项字段。 */
+    const selection = typeof saved === 'string' ? { modelRef: saved } : saved;
+    if (typeof selection !== 'object' || Array.isArray(selection) || Object.keys(selection).some((key) => key !== 'modelRef' && key !== 'serviceTier')) {
+      throw new Error('操作模型配置无效。');
+    }
+    /** 设置保存只校验格式，模型能力以派发时的目录为准。 */
+    const { modelRef, serviceTier } = selection as Record<string, unknown>;
+    if (typeof modelRef !== 'string' || !modelRef.trim() || modelRef.length > 512 || /\p{Cc}/u.test(modelRef)) throw new Error('操作模型身份无效。');
+    if (serviceTier != null && !isCodexServiceTierId(serviceTier)) throw new Error('操作模型速度档位无效。');
+    result[capability] = { modelRef: modelRef.trim(), serviceTier: serviceTier ?? null };
   }
   return result;
 }
@@ -152,7 +174,7 @@ export interface ZeusBrowserSettings {
   externalConnectionDetail?: string;
 }
 
-/** 密码管理界面只接收账号标识，不接收密码。 */
+/** 密码列表和填充候选中的账号元数据。 */
 export interface ZeusBrowserPasswordAccount {
   id: string;
   origin: string;
@@ -173,6 +195,8 @@ export interface ZeusBrowserPasswordImportPreview {
   token: string;
   fileName: string;
   added: number;
+  /** 确认后会被单一有效候选覆盖的已有账号数量。 */
+  updated: number;
   unchanged: number;
   invalidRows: Array<{ row: number; reason: string }>;
   conflicts: ZeusBrowserPasswordConflict[];
@@ -248,7 +272,25 @@ export interface ZeusBrowserConversationSnapshot {
   pendingApprovals: ZeusBrowserApprovalRequest[];
   /** 工具请求打开后保持为真，直到所属会话实际显示网页或关闭全部标签。 */
   openRequested: boolean;
+  /** 当前会话最近的下载，按发起顺序倒序排列。 */
+  downloads?: ZeusBrowserDownload[];
 }
+
+/** 下载状态和已接收字节数，文件路径由宿主管理。 */
+export interface ZeusBrowserDownload {
+  /** 同名文件也有独立的操作身份。 */
+  id: string;
+  fileName: string;
+  receivedBytes: number;
+  /** 服务端未声明长度时为 null。 */
+  totalBytes: number | null;
+  state: 'downloading' | 'paused' | 'interrupted' | 'completed' | 'cancelled' | 'failed';
+  /** 仅传输对象仍可继续时显示继续操作。 */
+  canResume: boolean;
+}
+
+/** 浏览器原生管理入口，只接受固定页面。 */
+export type ZeusBrowserNativePage = 'extensions' | 'store' | 'downloads';
 
 export interface ZeusBrowserPreparedSubmission {
   tabId: string;
@@ -296,7 +338,9 @@ export type ZeusBrowserCommand =
   | { action: 'set_annotation_mode'; enabled: boolean }
   | { action: 'clear_comments' }
   | { action: 'delete_comment'; commentId: string }
-  | { action: 'focus_comment'; commentId: string };
+  | { action: 'focus_comment'; commentId: string }
+  /** 下载操作只作用于当前会话内由宿主记录的项目。 */
+  | { action: 'download'; downloadId: string; operation: 'pause' | 'resume' | 'cancel' | 'reveal' };
 
 /** 网页权限按本次请求允许或拒绝，不再管理 AI 站点放行。 */
 export type ZeusBrowserApprovalDecision = 'allow_once' | 'deny';

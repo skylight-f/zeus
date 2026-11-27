@@ -55,8 +55,7 @@
 
 .project-source-toolbar-actions > button:not(.zeus-button),
 .project-source-tree-toggle,
-.project-source-operation-modal header button,
-.project-source-message button {
+.project-source-operation-modal header button {
   display: inline-flex;
   min-width: 26px;
   min-height: 26px;
@@ -70,8 +69,7 @@
 }
 
 .project-source-tree-toggle:hover:not(:disabled):not([aria-disabled='true']),
-.project-source-operation-modal header button:hover:not(:disabled):not([aria-disabled='true']),
-.project-source-message button:hover:not(:disabled):not([aria-disabled='true']) {
+.project-source-operation-modal header button:hover:not(:disabled):not([aria-disabled='true']) {
   color: var(--zeus-control-text);
   background: var(--zeus-interaction-hover);
 }
@@ -82,29 +80,6 @@
 }
 .project-source-tree-toggle {
   display: none;
-}
-
-.project-source-message {
-  display: flex;
-  min-height: 32px;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 12px;
-  border-bottom: 0;
-  font-size: 12px;
-}
-
-.project-source-message > span {
-  min-width: 0;
-  flex: 1;
-}
-.project-source-message.failed {
-  color: var(--zeus-control-danger-text);
-  background: color-mix(in srgb, var(--zeus-control-danger-bg) 45%, transparent);
-}
-.project-source-message button {
-  min-height: 24px;
-  font: inherit;
 }
 
 .project-source-main {
@@ -126,7 +101,7 @@
   border-radius: 0;
   background: var(--zeus-product-panel-muted);
 }
-.project-source-conflict-comparison {
+.project-source-comparison {
   width: min(1200px, 94vw);
   height: 80vh;
   display: flex;
@@ -135,7 +110,7 @@
   border-radius: 10px;
   overflow: hidden;
 }
-.project-source-conflict-comparison > header {
+.project-source-comparison > header {
   display: flex;
   justify-content: space-between;
   padding: 12px;
@@ -289,68 +264,6 @@
   padding: 2px 6px 24px;
 }
 
-.project-source-tree-scroll button {
-  display: flex;
-  width: 100%;
-  min-height: 26px;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 7px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--zeus-control-text);
-  background: transparent;
-  text-align: left;
-  font: inherit;
-  font-size: 12px;
-}
-
-.project-source-tree-scroll button:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-interaction-hover);
-}
-.project-source-tree-scroll button.selected {
-  background: color-mix(in srgb, var(--zeus-control-accent) 14%, transparent);
-}
-.project-source-tree-scroll button:focus-visible {
-  outline: 2px solid var(--zeus-control-accent);
-  outline-offset: -2px;
-}
-.project-source-tree-scroll button:disabled {
-  opacity: 0.52;
-}
-.project-source-tree-scroll button > svg {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
-}
-.project-source-tree-scroll button > span:not(.project-source-disclosure) {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.project-source-tree-scroll button > span:has(small) {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-}
-.project-source-tree-scroll button strong,
-.project-source-tree-scroll button small {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.project-source-tree-scroll button small {
-  color: var(--zeus-control-muted-text);
-  font-size: 10px;
-}
-.project-source-disclosure {
-  width: 10px;
-  flex: 0 0 10px;
-  color: var(--zeus-control-muted-text);
-  text-align: center;
-}
 .project-source-empty {
   margin: 12px 8px;
   color: var(--zeus-control-muted-text);
@@ -394,7 +307,7 @@
   background: var(--zeus-code-editor-bg);
 }
 
-/* 标签和工具按钮共用一行，长文件列表单独滚动，入口始终可见。 */
+/* 标签和工具按钮共用一行，更多文件通过标签选择器切换。 */
 .project-source-editor-header {
   display: flex;
   min-width: 0;
@@ -437,17 +350,26 @@
 .project-source-statusbar {
   display: flex;
   min-height: 26px;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 14px;
+  gap: 4px 14px;
   padding: 0 12px;
   border-top: 0;
   color: var(--zeus-control-muted-text);
   background: var(--zeus-product-panel-muted);
   font-size: 10px;
 }
-.project-source-statusbar strong {
-  margin-right: auto;
+/* 恢复按钮随现有状态栏换行，窄窗口仍可操作。 */
+.project-source-status-actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-inline-end: auto;
+}
+.project-source-status-actions strong {
   color: var(--zeus-control-danger-text);
 }
 
@@ -496,39 +418,9 @@
   opacity: 0.65;
 }
 
+/* 源码树右键菜单浮在编辑器和文件区之上。 */
 .project-source-context-menu {
-  position: fixed;
   z-index: 1200;
-  display: flex;
-  width: min(260px, calc(100vw - 24px));
-  flex-direction: column;
-  gap: 2px;
-  padding: 5px;
-  border: 1px solid var(--zeus-control-border);
-  border-radius: 8px;
-  box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
-  background: var(--zeus-solid-surface-bg, var(--zeus-product-panel));
-}
-.project-source-context-menu button {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 28px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--zeus-control-text);
-  background: transparent;
-  text-align: left;
-  font: inherit;
-  font-size: 12px;
-}
-.project-source-context-menu button:hover:not(:disabled):not([aria-disabled='true']) {
-  background: var(--zeus-interaction-hover);
-}
-.project-source-context-menu button.danger {
-  color: var(--zeus-control-danger-text);
 }
 
 .project-source-modal-root {
@@ -670,11 +562,6 @@
 }
 
 /* 快捷键与操作名称并排显示，保留清晰的文件操作范围。 */
-.project-source-context-menu kbd {
-  color: var(--zeus-control-muted-text);
-  font: inherit;
-  white-space: nowrap;
-}
 
 /* 高亮语言可手动兜底，状态栏选择不改变文件的编码或内容。 */
 .project-source-statusbar select {
@@ -689,17 +576,18 @@
 /* 文件效果入口并入已有路径行，避免额外占用一排工具栏。 */
 .project-source-file-toolbar {
   display: flex;
+  flex-wrap: wrap;
   min-width: 0;
   align-items: center;
 }
-.project-source-file-toolbar > .project-source-breadcrumbs {
-  flex: 1;
-  min-width: 0;
-}
 .project-source-view-modes {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-inline-size: 100%;
   flex: 0 0 auto;
   gap: 2px;
+  margin-inline-start: auto;
   padding-inline: 8px;
 }
 .project-source-view-modes button,

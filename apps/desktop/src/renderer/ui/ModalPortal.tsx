@@ -3,18 +3,8 @@ import { createPortal } from 'react-dom';
 import { useNativeCloseLayer } from './nativeCloseLayer.js';
 import { usePresenceSurface } from './MotionPresence.js';
 import { useModalFocus } from './useModalFocus.js';
-import { SystemWindowPortal, type SystemWindowKind } from './SystemWindowPortal.js';
+import { SystemWindowPortal, SystemWindowTitleBar, type SystemWindowKind } from './SystemWindowPortal.js';
 import { WindowDocumentContext, useWindowDocument } from './windowDocument.js';
-
-/** Portal 脱离主工作面后显式复制当前外观，避免弹窗退回无主题的兜底样式。 */
-function modalPortalThemeClassName(): string {
-  if (typeof document === 'undefined') return 'zeus-shell theme-system';
-  const documentAppearance = document.documentElement.dataset.zeusTheme;
-  if (documentAppearance === 'dark' || documentAppearance === 'light' || documentAppearance === 'system') return `zeus-shell theme-${documentAppearance}`;
-  const shell = document.querySelector('.macos-ai-app.zeus-shell');
-  const shellAppearance = shell?.classList.contains('theme-dark') ? 'dark' : shell?.classList.contains('theme-light') ? 'light' : 'system';
-  return `zeus-shell theme-${shellAppearance}`;
-}
 
 /** 弹窗共用遮罩、焦点和关闭规则。 */
 export interface ModalPortalProps {
@@ -55,6 +45,8 @@ export function ModalPortal(props: ModalPortalProps) {
 function ModalSurface(props: ModalPortalProps) {
   /** 下拉和内嵌弹层沿用同一个目标文档。 */
   const ownerDocument = useWindowDocument();
+  /** 门户中的次级弹窗仍使用所属窗口的遮罩。 */
+  const native = Boolean(props.systemWindow && ownerDocument !== document);
   /** 门户根节点同时用于焦点隔离和退出等待。 */
   const rootRef = useRef<HTMLDivElement>(null);
   /** 关闭中的弹窗不再接受任何新的操作。 */
@@ -87,7 +79,7 @@ function ModalSurface(props: ModalPortalProps) {
       aria-label={props['aria-label']}
       aria-labelledby={props['aria-labelledby']}
       aria-describedby={props['aria-describedby']}
-      className={['macos-ai-app', 'zeus-modal-portal-root', modalPortalThemeClassName(), props.rootClassName, props.systemWindow && ownerDocument !== document && 'zeus-system-window-root'].filter(Boolean).join(' ')}
+      className={['macos-ai-app', 'zeus-modal-portal-root', props.rootClassName, native && 'zeus-system-window-root'].filter(Boolean).join(' ')}
       data-zeus-primitive="modal"
       data-motion-state={open ? 'open' : 'closing'}
       inert={!open}
@@ -95,6 +87,7 @@ function ModalSurface(props: ModalPortalProps) {
       tabIndex={-1}
       onKeyDown={containKeyboardFocus}
     >
+      {native ? <SystemWindowTitleBar title={props.windowTitle ?? props['aria-label'] ?? 'Zeus'} /> : null}
       <div
         className={['zeus-modal-backdrop', props.backdropClassName].filter(Boolean).join(' ')}
         data-motion-surface="backdrop"

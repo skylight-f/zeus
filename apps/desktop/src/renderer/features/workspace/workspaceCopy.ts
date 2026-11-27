@@ -106,6 +106,8 @@ export const languageCopy = {
       search: '搜索',
       skills: '扩展管理',
       projects: '项目',
+      /** 侧栏中未归入用户项目的会话分组。 */
+      withoutProject: '无项目',
       projectListLabel: '项目列表',
       selectRepository: '选择本地项目文件夹',
       selectedRepositoryDescription: '已选择的本地项目',
@@ -1032,7 +1034,7 @@ export const languageCopy = {
         releaseSigningWaiting: '等待 Apple 签名证书',
         releaseNotarizationConfigured: '公证凭据已配置',
         releaseNotarizationWaiting: '等待 Apple 公证凭据',
-        releaseCaskDetected: '已检测到 Homebrew Cask',
+        releaseCaskDetected: '已检测到 Casks/zeus.rb',
         releaseCaskWaiting: '等待 Homebrew cask 文件',
         unsignedBuildAvailable: '未签名构建可用',
         unsignedBuildUnavailable: '未签名构建不可用',
@@ -1090,8 +1092,8 @@ export const languageCopy = {
         updateFailed: '更新检查失败，请稍后重试。',
         recommendedActions: {
           none: '无需更新',
-          open_download_page: '查看发行版安装包',
-          download_and_install: '下载并安装更新',
+          open_download_page: '使用 Homebrew 更新',
+          download_and_install: '使用 Homebrew 更新',
         },
       },
       data: {
@@ -1332,6 +1334,8 @@ export const languageCopy = {
       search: 'Search',
       skills: 'Extension management',
       projects: 'Projects',
+      /** 英文沿用项目选择器中的无项目分组名称。 */
+      withoutProject: 'Without a project',
       projectListLabel: 'Project list',
       selectRepository: 'Choose a local project folder',
       selectedRepositoryDescription: 'Selected local project',
@@ -2316,8 +2320,8 @@ export const languageCopy = {
         updateFailed: 'Update check failed. Try again later.',
         recommendedActions: {
           none: 'No update needed',
-          open_download_page: 'View release installer',
-          download_and_install: 'Download and install update',
+          open_download_page: 'Update with Homebrew',
+          download_and_install: 'Update with Homebrew',
         },
       },
       data: {

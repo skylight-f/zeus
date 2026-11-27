@@ -561,9 +561,13 @@ export class TaskWorkRunRepository {
     input: {
       expectedRevision?: number;
       status?: TaskWorkRunStatus;
+      /** 首次派发时持久冻结已解析的入口信息，后续派发回执复用该快照。 */
+      entrypointSnapshot?: Record<string, unknown>;
       enabledSkillIds?: string[];
       skillSnapshot?: Record<string, unknown>;
       conversationId?: string | null;
+      /** 恢复失败的 Agent 运行时必须匹配原会话身份。 */
+      retryConversationId?: string;
       commandRunId?: string | null;
       workspaceSnapshot?: TaskWorkWorkspaceSnapshot | null;
       environmentId?: string | null;
@@ -577,15 +581,19 @@ export class TaskWorkRunRepository {
     const current = this.require(id);
     if (input.expectedRevision !== undefined && current.revision !== input.expectedRevision) conflict('工作运行已更新，请刷新后重试。');
     const status = input.status ?? current.status;
-    assertRunTransition(current.status, status);
+    /** 只有原会话的显式续跑可以恢复失败的运行，普通状态更新仍服从终态约束。 */
+    const resuming = current.status === 'failed' && status === 'active' && current.entrypointKind === 'agent' && input.retryConversationId === current.conversationId && input.conversationId === undefined;
+    if (!resuming) assertRunTransition(current.status, status);
+    if (input.entrypointSnapshot && (current.status !== 'prepared' || status !== 'dispatching')) conflict('只有首次派发可以保存入口快照。');
     const conversationId = input.conversationId === undefined ? current.conversationId : input.conversationId;
     const commandRunId = input.commandRunId === undefined ? current.commandRunId : input.commandRunId;
     if (conversationId && commandRunId) throw new TaskWorkStoreError('ZEUS_TASK_WORK_RUN_REFERENCE_CONFLICT', 'Agent 会话与 Command 运行不能同时绑定。', 400);
     const timestamp = nextTimestamp(current.updatedAt, this.now());
     this.db.execute(
-      `UPDATE task_work_runs SET status = ?, enabled_skill_ids_json = ?, skill_snapshot_json = ?, conversation_id = ?, command_run_id = ?, workspace_snapshot_json = ?, environment_id = ?, error_code = ?, error_message = ?, started_at = ?, runtime_completed_at = ?, completed_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?`,
+      `UPDATE task_work_runs SET status = ?, entrypoint_snapshot_json = COALESCE(?, entrypoint_snapshot_json), enabled_skill_ids_json = ?, skill_snapshot_json = ?, conversation_id = ?, command_run_id = ?, workspace_snapshot_json = ?, environment_id = ?, error_code = ?, error_message = ?, started_at = ?, runtime_completed_at = ?, completed_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?`,
       [
         status,
+        input.entrypointSnapshot ? json(input.entrypointSnapshot) : null,
         JSON.stringify(input.enabledSkillIds ?? current.enabledSkillIds),
         json(input.skillSnapshot ?? current.skillSnapshot),
         conversationId,
@@ -696,11 +704,6 @@ export class TaskWorkDecisionRepository {
 
   listByTask(taskId: string): TaskWorkDecisionRecord[] {
     return this.db.select<TaskWorkDecisionRow>(`SELECT * FROM task_work_decisions WHERE task_id = ? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC`, [identity(taskId, 'taskId')]).map(mapDecision);
-  }
-
-  /** 跨项目待办不受当前打开的任务和历史分页限制。 */
-  listPending(): TaskWorkDecisionRecord[] {
-    return this.db.select<TaskWorkDecisionRow>("SELECT * FROM task_work_decisions WHERE status = 'pending' ORDER BY created_at, id").map(mapDecision);
   }
 
   create(input: Omit<TaskWorkDecisionRecord, 'id' | 'status' | 'responsePayload' | 'revision' | 'createdAt' | 'updatedAt' | 'resolvedAt'> & { id?: string }): TaskWorkDecisionRecord {
@@ -958,7 +961,8 @@ function assertWorkItemTransition(from: TaskWorkItemStatus, to: TaskWorkItemStat
 function assertRunTransition(from: TaskWorkRunStatus, to: TaskWorkRunStatus): void {
   if (from === to) return;
   const allowed: Record<TaskWorkRunStatus, readonly TaskWorkRunStatus[]> = {
-    prepared: ['dispatching', 'cancelled'],
+    // 派发前的交接校验失败时，运行可以直接结束并记录原因。
+    prepared: ['dispatching', 'failed', 'cancelled'],
     dispatching: ['active', 'waiting_input', 'failed', 'outcome_unknown', 'cancelled'],
     active: ['waiting_input', 'runtime_completed', 'succeeded', 'failed', 'outcome_unknown', 'cancelled'],
     waiting_input: ['active', 'failed', 'outcome_unknown', 'cancelled'],

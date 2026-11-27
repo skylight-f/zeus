@@ -10,10 +10,11 @@ export const settingsCommandTypes = {
   projectConfigPut: 'settings.project_config.put',
   projectModelServiceTierPreferencePut: 'settings.project_model_service_tier_preference.put',
   runtimeSettingsPut: 'settings.runtime.put',
-  /** 设置页经用户确认后发起的 Codex 官方程序更新。 */
+  /** 设置页手动操作与主进程静默调度共用的 Codex 官方程序更新。 */
   codexRuntimeUpdate: 'settings.codex_runtime.update',
+  /** 首次安装受管 Codex 程序，版本取官方安装器的稳定版。 */
+  codexRuntimeInstall: 'settings.codex_runtime.install',
   appShellSettingsPut: 'settings.app_shell.put',
-  attentionItemStatePut: 'settings.attention_item_state.put',
   /** 全局规则文件的手动保存。 */
   agentsPut: 'settings.agents.put',
   settingsImport: 'settings.import',
@@ -57,7 +58,7 @@ interface ReplayedExternal {
 }
 
 export const settingsCommandRoutePolicy = {
-  coreApplications: ['PUT /api/projects/:projectId/config', 'PUT /api/projects/:projectId/model-service-tier-preference', 'PUT /api/settings/app-shell', 'PUT /api/attention/item-state'],
+  coreApplications: ['PUT /api/projects/:projectId/config', 'PUT /api/projects/:projectId/model-service-tier-preference', 'PUT /api/settings/app-shell'],
   externalOperations: [
     'PUT /api/projects/:projectId/database/secret',
     'DELETE /api/projects/:projectId/database/secret',

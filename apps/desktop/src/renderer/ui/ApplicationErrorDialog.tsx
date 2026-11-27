@@ -1,6 +1,17 @@
 import { MotionPresence } from './MotionPresence.js';
 import { Collapsible } from './Collapsible.js';
-import { describeUserFacingError, faultReportContext, faultReportDetails, normalizeFaultReportInput, readCommandDeliveryDiagnostic, redactUserFacingErrorDetails, type FaultReportInput, type FaultReportReceipt } from '@zeus/shared';
+import {
+  describeUserFacingError,
+  faultReportContext,
+  faultReportDetails,
+  normalizeFaultReportInput,
+  offlineNetworkNotice,
+  readCommandDeliveryDiagnostic,
+  redactUserFacingErrorDetails,
+  userFacingNetworkIssue,
+  type FaultReportInput,
+  type FaultReportReceipt,
+} from '@zeus/shared';
 import { useEffect, useRef, useState } from 'react';
 import { CheckIcon } from '@phosphor-icons/react/dist/csr/Check';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
@@ -18,12 +29,12 @@ export interface ApplicationErrorOptions {
   summary?: string;
   /** 用户主动查看详情时直接展开，避免再次寻找入口。 */
   showDetails?: boolean;
-  /** 业务可以为诊断区提供更准确的名称，例如 Git 日志。 */
-  detailTitle?: string;
   /** 显示本次失败的操作与对象，避免用户混淆会话。 */
   title?: string;
   /** 由业务场景提供真实处理入口，错误窗口不猜测恢复操作。 */
   action?: { label: string; onClick: () => void | Promise<void> };
+  /** 后台任务的网络失败仅保留诊断。 */
+  background?: boolean;
 }
 
 interface ApplicationErrorEntry {
@@ -37,8 +48,6 @@ interface ApplicationErrorEntry {
   code: string | null;
   /** 当前条目是否由查看详情按钮打开。 */
   showDetails: boolean;
-  /** 诊断区标题跟随当前错误类型，避免所有输出都被笼统称为错误日志。 */
-  detailTitle?: string;
   /** 保留当前错误对应的处理动作。 */
   action?: ApplicationErrorOptions['action'];
   /** 采集发生错误时的现场，重试不能改为后续选中的会话。 */
@@ -67,6 +76,8 @@ export function setApplicationErrorContext(context: Record<string, unknown>): ()
 
 const listeners = new Set<() => void>();
 let queue: ApplicationErrorEntry[] = [];
+/** 当前操作最近一次需要显示的网络提示，可独立关闭。 */
+let networkNotice: Pick<ApplicationErrorEntry, 'language' | 'summary' | 'action'> | undefined;
 let nextErrorId = 1;
 
 const copyByLanguage = {
@@ -148,11 +159,12 @@ function errorOperation(error: unknown): string | null {
   return candidate?.trim() || null;
 }
 
-function errorOccurredAt(error: unknown): string {
+/** 只有错误自带的有效时间用于区分历史故障。 */
+function errorOccurredAt(error: unknown): string | null {
   if (error && typeof error === 'object' && 'occurredAt' in error && typeof error.occurredAt === 'string' && Number.isFinite(Date.parse(error.occurredAt))) {
     return new Date(error.occurredAt).toISOString();
   }
-  return new Date().toISOString();
+  return null;
 }
 
 /** 只取错误字段和最多四层原因，保留服务端详情并排除业务正文。 */
@@ -187,6 +199,8 @@ export function VisibleApplicationError(props: {
   summary?: string;
   /** 详情窗口标明发生问题的对象。 */
   title?: string;
+  /** 需要显式入口的行内提示可以显示可点击的详情文字。 */
+  detailsLabel?: string;
   /** 显式处理入口，不自动重试或重发。 */
   action?: ApplicationErrorOptions['action'];
 }) {
@@ -194,23 +208,29 @@ export function VisibleApplicationError(props: {
   const language = props.language ?? 'zh-CN';
   /** 摘要仅影响首屏，详情窗口始终保留原始错误。 */
   const explanation = describeUserFacingError(props.error, language);
+  /** 已知网络问题留在当前区域，投递结果未知时仍以核对说明为先。 */
+  const networkIssue = userFacingNetworkIssue(props.error, globalThis.navigator?.onLine === false);
+  /** 本机离线已证实时使用统一网络提示。 */
+  const summary = networkIssue === 'offline' && !explanation.outcomeUnconfirmed ? offlineNetworkNotice(language) : (props.summary ?? explanation.message);
   /** 说明按钮使用可读名称，图标不代替键盘与读屏入口。 */
-  const detailsLabel = language === 'zh-CN' ? '查看完整说明' : 'View full explanation';
+  const detailsLabel = props.detailsLabel ?? (language === 'zh-CN' ? '查看完整说明' : 'View full explanation');
   return (
-    <span className={`application-error-inline${props.className ? ` ${props.className}` : ''}`}>
+    <span className={`application-error-inline${props.className ? ` ${props.className}` : ''}`} data-network-issue={networkIssue ?? undefined}>
       <span className="application-error-inline-summary" data-zeus-selectable="text">
-        {props.summary ?? explanation.message}
+        {summary}
       </span>
-      <Button
-        unstyled
-        type="button"
-        className="application-error-details-link"
-        aria-label={detailsLabel}
-        data-icon-tooltip={detailsLabel}
-        onClick={() => reportApplicationError(props.error, { language, summary: props.summary, title: props.title, action: props.action, showDetails: true })}
-      >
-        <WarningCircle aria-hidden="true" />
-      </Button>
+      {networkIssue ? null : (
+        <Button
+          unstyled
+          type="button"
+          className="application-error-details-link"
+          aria-label={detailsLabel}
+          data-icon-tooltip={props.detailsLabel ? undefined : detailsLabel}
+          onClick={() => reportApplicationError(props.error, { language, summary: props.summary, title: props.title, action: props.action, showDetails: true })}
+        >
+          {props.detailsLabel ?? <WarningCircle aria-hidden="true" />}
+        </Button>
+      )}
       {props.action ? (
         <Button
           size="compact"
@@ -236,12 +256,16 @@ export function reportApplicationError(error: unknown, options: ApplicationError
   const type = errorType(error);
   const operation = errorOperation(error);
   const explanation = describeUserFacingError(error, language);
+  /** 网络异常直接使用非模态提示；原有结果未知状态优先于离线文案。 */
+  const networkIssue = userFacingNetworkIssue(error, globalThis.navigator?.onLine === false);
+  /** 同一说明用于原处反馈和调用方返回值。 */
+  const summary = networkIssue === 'offline' && !explanation.outcomeUnconfirmed ? offlineNetworkNotice(language) : (options.summary ?? explanation.message);
   const message = errorMessage(error, language).replace(/\s+/gu, ' ').trim() || copy.unknown;
   const original = code && message !== code && !message.startsWith(`${code}:`) ? `${code}: ${message}` : message;
   const diagnosticContext = explanation.details || original;
   const detailsBody = [
     `${copy.severity}: ERROR`,
-    diagnosticContext.trim() !== (options.summary ?? explanation.message).trim() ? `${copy.visibleMessage}: ${options.summary ?? explanation.message}` : '',
+    diagnosticContext.trim() !== summary.trim() ? `${copy.visibleMessage}: ${summary}` : '',
     code ? `${copy.errorCode}: ${code}` : '',
     type ? `${copy.errorType}: ${type}` : '',
     operation ? `${copy.operation}: ${operation}` : '',
@@ -249,23 +273,34 @@ export function reportApplicationError(error: unknown, options: ApplicationError
   ]
     .filter(Boolean)
     .join('\n');
-  const details = redactDetails(`${copy.occurredAt}: ${errorOccurredAt(error)}\n${detailsBody}`);
+  /** 展开详情和故障报告共用同一次记录时间。 */
+  const recordedAt = errorOccurredAt(error);
+  const occurredAt = recordedAt ?? new Date().toISOString();
+  const details = redactDetails(`${copy.occurredAt}: ${occurredAt}\n${detailsBody}`);
+  if (networkIssue) {
+    if (!options.background) {
+      networkNotice = { language, summary, action: options.action };
+      notifyListeners();
+    }
+    console.warn('[Zeus network]', details);
+    window.zeus?.reportRendererRuntimeError?.(JSON.stringify({ kind: 'network_error', detail: details, context: applicationErrorContext }));
+    return summary;
+  }
   const entry: ApplicationErrorEntry = {
     id: nextErrorId++,
     language,
     title: options.title ?? copy.title,
-    summary: options.summary ?? explanation.message,
+    summary,
     showDetails: options.showDetails === true,
-    detailTitle: options.detailTitle,
     details,
-    dedupeKey: `${options.title ?? copy.title}\n${options.summary ?? explanation.message}\n${detailsBody}`,
+    dedupeKey: `${options.title ?? copy.title}\n${summary}\n${detailsBody}\n${recordedAt ?? ''}`,
     code,
     action: options.action,
     report: normalizeFaultReportInput({
       reportId: crypto.randomUUID(),
-      occurredAt: errorOccurredAt(error),
+      occurredAt,
       title: options.title ?? copy.title,
-      summary: options.summary ?? explanation.message,
+      summary,
       code: code ?? '',
       operation: operation ?? '',
       stack: diagnosticErrorStack(error) || original,
@@ -318,6 +353,12 @@ function dismissCurrentError(): void {
   notifyListeners();
 }
 
+/** 关闭网络通知时保留当前页面和正在处理的内容。 */
+function dismissNetworkNotice(): void {
+  networkNotice = undefined;
+  notifyListeners();
+}
+
 /** 上报失败留在当前窗口，避免错误出口再次弹出自身的故障。 */
 async function submitCurrentFault(entry: ApplicationErrorEntry): Promise<void> {
   if (entry.reporting || entry.receipt) return;
@@ -346,7 +387,8 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
   const copy = copyByLanguage[current?.language ?? props.language];
   /** 同一按钮依次表达上报、发送、回执和重试。 */
   const reportLabel = current?.receipt ? copy.reported : current?.reporting ? copy.reporting : current?.reportError ? copy.retryReport : copy.report;
-  return (
+  /** 保留真实故障原有的模态布局与退出动画。 */
+  const dialog = (
     <MotionPresence>
       {current ? (
         <ModalPortal
@@ -372,7 +414,7 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
               </header>
               <Collapsible open={detailsOpen}>
                 <section className="application-error-dialog-details" aria-labelledby="application-error-dialog-details-title">
-                  <strong id="application-error-dialog-details-title">{current.detailTitle ?? copy.detailTitle}</strong>
+                  <strong id="application-error-dialog-details-title">{copy.detailTitle}</strong>
                   <pre data-zeus-selectable="text">{current.details}</pre>
                 </section>
               </Collapsible>
@@ -441,5 +483,36 @@ export function ApplicationErrorDialogHost(props: { language: ApplicationErrorLa
         </ModalPortal>
       ) : null}
     </MotionPresence>
+  );
+  /** 网络提示不抢占焦点；需要重试时调用原操作提供的处理动作。 */
+  const notice = networkNotice;
+  return (
+    <>
+      {dialog}
+      <span className="visually-hidden" role="status">
+        {notice?.summary}
+      </span>
+      {notice ? (
+        <section className="macos-ai-app application-network-notice">
+          <span>{notice.summary}</span>
+          {notice.action ? (
+            <Button
+              size="compact"
+              onClick={() => {
+                dismissNetworkNotice();
+                return Promise.resolve()
+                  .then(() => notice.action?.onClick())
+                  .catch((error: unknown) => reportApplicationError(error, { language: notice.language, action: notice.action }));
+              }}
+            >
+              {notice.action.label}
+            </Button>
+          ) : null}
+          <Button variant="secondary" size="compact" onClick={dismissNetworkNotice}>
+            {copyByLanguage[notice.language].close}
+          </Button>
+        </section>
+      ) : null}
+    </>
   );
 }

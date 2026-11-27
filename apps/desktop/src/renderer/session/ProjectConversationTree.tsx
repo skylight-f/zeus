@@ -1,5 +1,6 @@
 import { GitBranchIcon as GitBranch } from '@phosphor-icons/react/dist/csr/GitBranch';
 import { type AnimationEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from 'react';
+import { ArchiveIcon as Archive } from '@phosphor-icons/react/dist/csr/Archive';
 import { ChatCircleIcon as ChatCircle } from '@phosphor-icons/react/dist/csr/ChatCircle';
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
 import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
@@ -12,7 +13,7 @@ import { ShieldCheckIcon as ShieldCheck } from '@phosphor-icons/react/dist/csr/S
 import { WarningIcon as Warning } from '@phosphor-icons/react/dist/csr/Warning';
 import { WarningCircleIcon as WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
 import type { NativeConversationChoice, NativeSessionState } from './sessionTypes.js';
-import { compareConversationWorkStartedDesc } from '@zeus/shared';
+import { compareConversationWorkStartedDesc, parseModelRef } from '@zeus/shared';
 import type { SessionUiLanguage } from './ThreadItemView.js';
 import { conversationDisplayTitle } from './conversationDisplayTitle.js';
 import { hasPendingAsyncQuestion } from './AsyncQuestionMessage.js';
@@ -24,12 +25,15 @@ import { beginConversationNavigationTrace } from '../performanceTraceContext.js'
 import { ConversationContextMenu, type ConversationContextMenuLanguage } from './ConversationContextMenu.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { Button } from '../ui/Button.js';
+import { builtinModelProviderName, ModelProviderBadge, useModelProviderAppearances } from '../modelProviderAppearance.js';
 
 export interface ProjectConversationTaskGroup {
   taskId: string;
   taskCode: string;
   taskTitle: string;
   managementStatus: string;
+  /** 只有尚未结束的任务可以从会话行标记完成。 */
+  canComplete?: boolean;
   conversations: NativeConversationChoice[];
 }
 
@@ -57,6 +61,8 @@ export interface ProjectConversationTreeProps {
   onPrepareConversation?: (conversationId: string) => void;
   onStartConversation?: (taskId: string) => void;
   onArchiveConversation?: (conversation: NativeConversationChoice) => Promise<void> | void;
+  /** 请求把关联任务移到其配置的完成状态。 */
+  onCompleteTask?: (taskId: string) => Promise<void>;
   /** 重命名会话 */
   onRenameConversation?: (conversation: NativeConversationChoice, newTitle: string) => Promise<void> | void;
   language: SessionUiLanguage;
@@ -68,6 +74,7 @@ export interface ProjectConversationTreeProps {
   onShowMore?: () => void;
 }
 
+/** 会话树标题、运行状态和快捷操作的界面文案。 */
 const labels = {
   'zh-CN': {
     aria: '项目会话',
@@ -75,6 +82,8 @@ const labels = {
     newThread: '新建会话',
     selectTask: '选择任务',
     ready: '会话就绪',
+    /** 工作区图标的提示与读屏文案。 */
+    workspaceMode: { worktree: '工作树', direct: '项目目录' },
     connecting: '正在连接',
     reconnecting: '正在重连',
     paused: '处理已暂停',
@@ -87,6 +96,8 @@ const labels = {
     archive: '归档会话',
     archiveLegacyUnavailable: '旧版只读会话无法与 Codex 线程同步归档',
     archiving: '正在归档',
+    completeTask: '将任务标记为已完成',
+    completingTask: '正在完成任务',
     showMore: '展开更多',
   },
   'en-US': {
@@ -95,6 +106,8 @@ const labels = {
     newThread: 'New conversation',
     selectTask: 'Choose task',
     ready: 'Thread ready',
+    /** 工作区图标的提示与读屏文案。 */
+    workspaceMode: { worktree: 'Worktree', direct: 'Project folder' },
     connecting: 'Connecting',
     reconnecting: 'Reconnecting',
     paused: 'Processing paused',
@@ -107,6 +120,8 @@ const labels = {
     archive: 'Archive conversation',
     archiveLegacyUnavailable: 'Legacy read-only conversations cannot be archived together with their Codex thread',
     archiving: 'Archiving',
+    completeTask: 'Mark task as completed',
+    completingTask: 'Completing task',
     showMore: 'Show more',
   },
 } as const;
@@ -114,16 +129,20 @@ const labels = {
 interface FlattenedConversation {
   conversation: NativeConversationChoice;
   displayTitle: string;
+  /** 平铺后保留关联任务是否可以完成。 */
+  canCompleteTask?: boolean;
 }
 
 /** 按会话更新时间平铺项目内容，键盘导航只包含当前可见项。 */
 export function ProjectConversationTree(props: ProjectConversationTreeProps) {
   const copy = labels[props.language];
-  const [archivingConversationId, setArchivingConversationId] = useState<string | null>(null);
-  /** 归档失败只归属触发操作的会话行，不打断其他工作面。 */
-  const [archiveError, setArchiveError] = useState<{ conversationId: string; error: unknown } | null>(null);
+  const providerAppearances = useModelProviderAppearances();
+  /** 行末共用位置只显示当前动作的进度。 */
+  const [pendingRowAction, setPendingRowAction] = useState<{ conversationId: string; label: string } | null>(null);
+  /** 失败提示归属于触发操作的会话行。 */
+  const [rowActionError, setRowActionError] = useState<{ conversationId: string; error: unknown } | null>(null);
   /** 在绘制禁用态之前也阻止重复点击。 */
-  const archiveRequestRef = useRef<string | null>(null);
+  const rowActionRequestRef = useRef(false);
   /** 右键菜单状态 */
   const [contextMenuState, setContextMenuState] = useState<{
     conversation: NativeConversationChoice;
@@ -159,20 +178,27 @@ export function ProjectConversationTree(props: ProjectConversationTreeProps) {
   const enteringConversationIds = useNewItemMotionIds(allConversationIds);
   const fallbackTabStopId = props.selectedConversationId && conversationIds.includes(props.selectedConversationId) ? null : (conversationIds[0] ?? null);
 
-  /** 列表同时承接归档进度和失败原因。 */
-  async function archiveConversation(conversation: NativeConversationChoice): Promise<void> {
-    if (!props.onArchiveConversation || archiveRequestRef.current) return;
-    archiveRequestRef.current = conversation.id;
-    setArchivingConversationId(conversation.id);
-    setArchiveError(null);
+  /** 归档和完成任务共用行内进度与错误反馈。 */
+  async function runRowAction(conversationId: string, label: string, run: () => Promise<void> | void): Promise<void> {
+    if (rowActionRequestRef.current) return;
+    rowActionRequestRef.current = true;
+    setPendingRowAction({ conversationId, label });
+    setRowActionError(null);
     try {
-      await props.onArchiveConversation(conversation);
+      await run();
     } catch (error) {
-      setArchiveError({ conversationId: conversation.id, error });
+      setRowActionError({ conversationId, error });
     } finally {
-      archiveRequestRef.current = null;
-      setArchivingConversationId(null);
+      rowActionRequestRef.current = false;
+      setPendingRowAction(null);
     }
+  }
+
+  /** 右键菜单与行末归档按钮调用同一个会话操作。 */
+  function archiveConversation(conversation: NativeConversationChoice): Promise<void> | undefined {
+    /** 客户端就绪后才有持久化归档入口。 */
+    const archive = props.onArchiveConversation;
+    if (archive) return runRowAction(conversation.id, copy.archiving, () => archive(conversation));
   }
 
   /** 右键菜单处理 */
@@ -193,15 +219,31 @@ export function ProjectConversationTree(props: ProjectConversationTreeProps) {
     setContextMenuState(null);
   }
 
-  /** 渲染平铺会话及其运行状态和归档入口。 */
+  /** 渲染平铺会话及其运行状态和快捷入口。 */
   function renderConversationItems(conversations: FlattenedConversation[]) {
-    return conversations.map(({ conversation, displayTitle }) => {
+    return conversations.map(({ conversation, displayTitle, canCompleteTask }) => {
       const navigationId = conversationNavigationId(conversation);
       const current = navigationId === props.selectedConversationId;
-      const worktree = conversation.workspaceMode === 'worktree' || Boolean(conversation.workspaceId || conversation.environmentId);
-      const workspaceLabel = worktree ? (props.language === 'zh-CN' ? '工作树' : 'Worktree') : props.language === 'zh-CN' ? '项目目录' : 'Project folder';
+      /** 历史缓存缺少展示身份时，仍可使用已有的持久型号。 */
+      const model = conversation.displayModel ?? conversation.model;
+      const legacyRef = !conversation.displayModel && !model?.sourceId ? parseModelRef(model?.id ?? conversation.providerModel ?? '') : null;
+      const sourceId = model?.sourceId ?? legacyRef?.sourceId ?? (builtinModelProviderName(conversation.agent?.kind ?? conversation.providerId) ? (conversation.agent?.kind ?? conversation.providerId) : null);
+      const modelId = legacyRef?.modelId ?? model?.id ?? conversation.providerModel;
+      const sourceName = providerAppearances.get(sourceId ?? '')?.name ?? builtinModelProviderName(sourceId);
+      const modelTooltip = [sourceName, modelId].filter(Boolean).join(' / ');
+      /** 工作区类型未取得时先保留图标位置，避免把工作树暂时显示为目录。 */
+      const workspaceMode = conversation.workspaceId || conversation.environmentId ? 'worktree' : conversation.workspaceMode;
+      const workspaceLabel = workspaceMode ? copy.workspaceMode[workspaceMode] : undefined;
       /** 与运行状态筛选和数量限制共用实时状态，缺失时回退到目录快照。 */
       const runtimeState = resolveConversationTreeRuntimeState(conversation, props.conversationStates);
+      /** 快捷操作跟随持久会话的任务归属。 */
+      const taskId = conversation.taskId;
+      const completeTask = props.onCompleteTask;
+      /** 只有空闲且可写的会话可执行快捷操作，已结束的任务不再提交完成。 */
+      const showAction = runtimeState === 'ready' && !conversation.archived && !conversation.readOnly && !conversation.taskPushCreating && (taskId ? canCompleteTask === true && Boolean(completeTask) : Boolean(props.onArchiveConversation));
+      /** 当前会话的入口显示等待进度，其他会话保留原有状态。 */
+      const pendingLabel = pendingRowAction?.conversationId === conversation.id ? pendingRowAction.label : undefined;
+      const actionLabel = pendingLabel ?? (taskId ? copy.completeTask : copy.archive);
       /** 只给尚未打开的持久会话安排后台读取。 */
       const prepareConversation = () => {
         if (!current && conversation.transportKind === 'codex_native' && !conversation.taskPushCreating) props.onPrepareConversation?.(conversation.id);
@@ -216,11 +258,13 @@ export function ProjectConversationTree(props: ProjectConversationTreeProps) {
             aria-current={current ? 'page' : undefined}
             aria-haspopup={conversation.taskPushCreating ? undefined : 'menu'}
             aria-expanded={contextMenuState?.conversation.id === conversation.id}
-            aria-busy={archivingConversationId === conversation.id}
-            disabled={archivingConversationId === conversation.id}
+            aria-busy={Boolean(pendingLabel)}
+            disabled={Boolean(pendingLabel)}
             tabIndex={current || navigationId === fallbackTabStopId ? 0 : -1}
             data-conversation-tree-item="true"
             data-conversation-runtime-state={runtimeState}
+            data-icon-tooltip={modelTooltip ? `${displayTitle} · ${modelTooltip}` : displayTitle}
+            data-icon-tooltip-provider={Boolean(modelTooltip) || undefined}
             onPointerEnter={prepareConversation}
             onFocus={prepareConversation}
             onClick={() => {
@@ -241,24 +285,43 @@ export function ProjectConversationTree(props: ProjectConversationTreeProps) {
               setContextMenuState({ conversation, position: { x: rect.right + 6, y: rect.top } });
             }}
           >
+            <ModelProviderBadge sourceId={sourceId} sourceName={sourceName} />
             <span
               className="session-conversation-workspace-icon"
-              data-workspace-mode={worktree ? 'worktree' : 'direct'}
-              role="img"
+              data-workspace-mode={workspaceMode ?? undefined}
+              role={workspaceLabel ? 'img' : undefined}
               aria-label={workspaceLabel}
-              data-icon-tooltip={[workspaceLabel, conversation.executionPath].filter(Boolean).join(' · ')}
+              data-icon-tooltip={workspaceLabel ? [workspaceLabel, conversation.executionPath].filter(Boolean).join(' · ') : undefined}
             >
-              {worktree ? <GitBranch aria-hidden="true" /> : <Folder aria-hidden="true" />}
+              {workspaceMode === 'worktree' ? <GitBranch aria-hidden="true" /> : workspaceMode === 'direct' ? <Folder aria-hidden="true" /> : null}
             </span>
             <span className="session-conversation-title" data-icon-tooltip={displayTitle}>
               {displayTitle}
             </span>
-            {/* 归档进度复用行末状态位置，完成后恢复会话自身状态。 */}
-            {archivingConversationId === conversation.id ? <ConversationStatusIcon status="running" label={copy.archiving} /> : <ConversationRowState conversation={conversation} runtimeState={runtimeState} language={props.language} />}
+            {!pendingLabel ? <ConversationRowState conversation={conversation} runtimeState={runtimeState} language={props.language} /> : !showAction ? <ConversationStatusIcon status="running" label={pendingLabel} /> : null}
           </Button>
-          {archiveError?.conversationId === conversation.id ? (
+          {showAction ? (
+            <Button
+              unstyled
+              type="button"
+              className="session-conversation-row-action"
+              aria-label={`${actionLabel} · ${displayTitle}`}
+              aria-busy={Boolean(pendingLabel)}
+              aria-disabled={Boolean(pendingRowAction) || undefined}
+              data-icon-tooltip={actionLabel}
+              onContextMenu={(event) => handleContextMenu(event, conversation)}
+              onClick={() => {
+                // 保留当前按钮焦点，清理确认取消后仍可回到原处。
+                if (taskId && completeTask) void runRowAction(conversation.id, copy.completingTask, () => completeTask(taskId));
+                else void archiveConversation(conversation);
+              }}
+            >
+              {pendingLabel ? <ConversationStatusIcon status="running" label={pendingLabel} /> : taskId ? <CheckCircle aria-hidden="true" /> : <Archive aria-hidden="true" />}
+            </Button>
+          ) : null}
+          {rowActionError?.conversationId === conversation.id ? (
             <span className="session-conversation-row-error" role="alert">
-              <VisibleApplicationError error={archiveError.error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+              <VisibleApplicationError error={rowActionError.error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
             </span>
           ) : null}
         </li>
@@ -501,14 +564,15 @@ export function taskRunStatusFromConversationTreeState(runtimeState: Conversatio
 export function resolveConversationTreeRuntimeState(conversation: NativeConversationChoice, conversationStates?: Record<string, ConversationTreeRuntimeState>): ConversationTreeRuntimeState {
   /** 运行状态仍采用实时投影；异步待回复独立保留，避免历史分页或后台刷新漏掉原题。 */
   const runtimeState = conversationStates?.[conversationNavigationId(conversation)] ?? conversationStates?.[conversation.id] ?? conversationTreeRuntimeStateFromConversation(conversation);
-  return conversation.hasPendingAsyncQuestion && runtimeState !== 'pending_approval' ? 'pending_user_input' : runtimeState;
+  if (conversation.hasPendingAsyncQuestion && runtimeState !== 'pending_approval') return 'pending_user_input';
+  return conversation.operationAgentRunning && runtimeState === 'ready' ? 'streaming' : runtimeState;
 }
 
 /** 合并项目直属与任务会话，按显示标题搜索，再按最近创建或主动输入时间排序。 */
 function flattenProjectConversations(project: ProjectConversationGroup, normalizedQuery: string, language: 'zh-CN' | 'en-US'): FlattenedConversation[] {
   return [
     ...(project.conversations ?? []).map((conversation) => ({ conversation, displayTitle: conversationDisplayTitle(conversation.title) })),
-    ...project.tasks.flatMap((task) => task.conversations.map((conversation) => ({ conversation, displayTitle: conversationDisplayTitle(conversation.title, task.taskTitle, language) }))),
+    ...project.tasks.flatMap((task) => task.conversations.map((conversation) => ({ conversation, displayTitle: conversationDisplayTitle(conversation.title, task.taskTitle, language), canCompleteTask: task.canComplete }))),
   ]
     .filter((entry) => !normalizedQuery || entry.displayTitle.toLocaleLowerCase().includes(normalizedQuery))
     .sort((left, right) => compareConversationWorkStartedDesc(left.conversation, right.conversation));
@@ -537,6 +601,8 @@ export function conversationTreeRuntimeStateFromSession(state: NativeSessionStat
     state.conversationState === 'interrupting'
   )
     return 'streaming';
+  // 已入队但尚未开始轮次的提交仍会执行，侧栏继续显示进行中。
+  if (state.queue?.submissions.some((submission) => submission.status === 'queued')) return 'queued';
   return 'ready';
 }
 
@@ -562,9 +628,12 @@ function handleTreeKeyDown(event: KeyboardEvent<HTMLElement>): void {
   if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
   const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[data-conversation-tree-item="true"]:not(:disabled)'));
   if (items.length === 0) return;
-  const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+  /** 主按钮与快捷按钮共享同一行的导航位置。 */
+  const focusedRow = (event.target as HTMLElement).closest('.session-conversation-tree-item')?.querySelector<HTMLButtonElement>('[data-conversation-tree-item="true"]');
+  const currentIndex = focusedRow ? items.indexOf(focusedRow) : -1;
   const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : event.key === 'ArrowDown' ? Math.min(items.length - 1, Math.max(0, currentIndex + 1)) : Math.max(0, currentIndex < 0 ? 0 : currentIndex - 1);
   event.preventDefault();
+  event.stopPropagation();
   const next = items[nextIndex];
   if (!next) return;
   items.forEach((item) => {

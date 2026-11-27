@@ -1,0 +1,1066 @@
+import { distributionAppName } from '../tooling/distribution.js';
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CodexOfficialRateWindow, UsageModelCostBreakdown, UsageModelOutputRateBreakdown, UsageOverviewSnapshot, UsageProviderSummary, UsageOverviewRange, CodexLocalUsageTotals } from '@zeus/shared';
+import { isCodexSubscriptionUsage, hasPositiveCodexCredits, formatCodexCredits } from '@zeus/shared';
+import type { AppShellSettings, DashboardClient } from '../apiClient.js';
+import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
+import { menuBarRateLimitWindows, renderClassicTray } from './menuBarClassicTray.js';
+import './AstraMenuBarUsageWindow.css';
+
+type Language = AppShellSettings['appLanguage'];
+type Appearance = AppShellSettings['appearance'];
+type UsageClient = Pick<DashboardClient, 'loadUsageOverview' | 'subscribeEvents'>;
+
+// 使用主进程提供的运行名称，让开发、测试和正式应用与状态栏提示保持一致。
+const applicationName = new URLSearchParams(window.location.search).get('applicationName')?.trim() || distributionAppName;
+
+const overviewRangeOrder: UsageOverviewRange[] = ['today', '7d', '30d', 'all'];
+type ChartDimension = 'tokens' | 'cost';
+type ChartSource = 'local' | 'account';
+type DailySlot = { date: string; value: number | null; complete: boolean };
+const chartDimensionStorageKey = 'zeus.menu-bar-usage.chart-dimension';
+
+const snapshotStorageKey = 'zeus.menu-bar-usage.snapshot';
+const selectionStorageKey = 'zeus.menu-bar-usage.selection';
+/** 菜单栏独立保存供应商顺序，不改变供应商配置或后台统计顺序。 */
+const providerOrderStorageKey = 'zeus.menu-bar-usage.provider-order';
+
+const copy = {
+  'zh-CN': {
+    all: '全部',
+    overviewRanges: { today: '今日', '7d': '近 7 日', '30d': '近 30 日', all: '全部' },
+    overview: '统计范围',
+    tokens: 'Token',
+    outputRate: '输出速率',
+    estimatedCost: '估算费用',
+    equivalentCost: 'API 等价费用',
+    equivalentCostHint: '按 API 单价换算的等价费用，不代表订阅实际扣款。',
+    remainingCredits: '剩余点数',
+    allProviders: '全部供应源',
+    providers: '供应商',
+    reorderHelp: '拖动排序，或按 ↑ ↓ 调整顺序',
+    reorder: '排序',
+    loading: '正在读取用量',
+    noProviders: '还没有可统计的用量',
+    noProvidersDetail: '使用 AI 后，这里会显示各个服务的用量。',
+    quota: '配额剩余',
+    noQuota: '暂无官方配额数据',
+    todayToken: '今日 token',
+    available: '可用',
+    localOnly: '本机统计',
+    staleStatus: '数据过期',
+    signedOut: '未登录',
+    unavailableStatus: '配额异常',
+    removedStatus: '已移除',
+    officialAndLocal: `官方配额 + ${applicationName} 本地统计`,
+    localQuotaUnavailable: `${applicationName} 本地统计；官方配额暂不可用`,
+    localQuotaSignIn: `${applicationName} 本地统计；登录后可查看官方配额`,
+    today: `今日 ${applicationName} Token`,
+    todayShort: `今日 ${applicationName} Token`,
+    todaySummary: '今日',
+    sevenDays: `近 7 日 ${applicationName} Token`,
+    sevenDaysShort: `近 7 日 ${applicationName}`,
+    sevenDaysSummary: '近 7 日',
+    cache: '缓存命中率',
+    cacheUnsupported: '供应源未提供',
+    cost: '近 7 日估算费用',
+    costShort: '7 日估算费用',
+    pricingBackfill: '含历史补算：按补价时价格估算',
+    noPrice: '暂无价格',
+    recentUsage: `${applicationName} 本地 Token`,
+    accountRecentUsage: 'Codex 账户 Token',
+    statisticsSource: '统计来源',
+    localSource: `${applicationName} 本地统计`,
+    accountSource: 'Codex 账户统计',
+    accountSourceHint: '账户统计包含其他客户端的 Token；官方未提供每日费用。',
+    costDetail: '查看模型费用依据',
+    unitPrice: '单价',
+    consumedTokens: '消耗 Token',
+    model: '模型',
+    officialUsageUnavailable: '官方账户暂未提供日用量',
+    insufficientHistory: '用量积累后显示趋势',
+    missingDay: '暂无数据',
+    fullStatistics: '用量详情',
+    showZeus: `显示 ${applicationName}`,
+    quitZeus: `退出 ${applicationName}`,
+    retry: '重新读取',
+    stale: '上次成功结果',
+    failed: '暂时无法更新用量',
+    failedDetail: '未能读取本地用量数据，请重试。',
+    codexOnlyCompatibility: '当前后台版本只能显示 Codex 用量；后台更新后将显示其他服务。',
+    updated: '更新于',
+    resets: '重置于',
+    subscription: '订阅账户',
+    api: 'API 供应源',
+    deleted: '配置已移除，历史用量保留',
+  },
+  'en-US': {
+    all: 'All',
+    overviewRanges: { today: 'Today', '7d': '7 days', '30d': '30 days', all: 'All' },
+    overview: 'Statistics range',
+    tokens: 'Tokens',
+    outputRate: 'Output rate',
+    estimatedCost: 'Estimated cost',
+    equivalentCost: 'API equivalent cost',
+    equivalentCostHint: 'Converted at API rates; this is not an actual subscription charge.',
+    remainingCredits: 'Credits remaining',
+    allProviders: 'All providers',
+    providers: 'Provider',
+    reorderHelp: 'Drag to reorder, or press ↑ ↓ to move',
+    reorder: 'Reorder',
+    loading: 'Loading usage',
+    noProviders: 'No usage recorded yet',
+    noProvidersDetail: 'Usage for each AI service appears here after you use it.',
+    quota: 'Quota remaining',
+    noQuota: 'No official quota data',
+    todayToken: 'Today tokens',
+    available: 'Available',
+    localOnly: 'Local stats',
+    staleStatus: 'Stale data',
+    signedOut: 'Signed out',
+    unavailableStatus: 'Quota error',
+    removedStatus: 'Removed',
+    officialAndLocal: `Official quota + ${applicationName} local stats`,
+    localQuotaUnavailable: `${applicationName} local stats; official quota unavailable`,
+    localQuotaSignIn: `${applicationName} local stats; sign in for official quota`,
+    today: `${applicationName} tokens today`,
+    todayShort: `${applicationName} today`,
+    todaySummary: 'Today',
+    sevenDays: `${applicationName} tokens in 7 days`,
+    sevenDaysShort: `${applicationName} · 7 days`,
+    sevenDaysSummary: '7 days',
+    cache: 'Cache hit rate',
+    cacheUnsupported: 'Not provided',
+    cost: 'Estimated cost · 7 days',
+    costShort: '7-day estimate',
+    pricingBackfill: 'Includes historical usage estimated at backfill-time prices',
+    noPrice: 'No pricing',
+    recentUsage: `${applicationName} local tokens`,
+    accountRecentUsage: 'Codex account tokens',
+    statisticsSource: 'Statistics source',
+    localSource: `${applicationName} local stats`,
+    accountSource: 'Codex account stats',
+    accountSourceHint: 'Account tokens include other clients; official daily cost is unavailable.',
+    costDetail: 'View model cost details',
+    unitPrice: 'Unit price',
+    consumedTokens: 'Tokens used',
+    model: 'Model',
+    officialUsageUnavailable: 'Official daily account usage is unavailable',
+    insufficientHistory: 'A trend appears after usage is recorded',
+    missingDay: 'No data',
+    fullStatistics: 'Usage details',
+    showZeus: `Show ${applicationName}`,
+    quitZeus: `Quit ${applicationName}`,
+    retry: 'Reload',
+    stale: 'Last successful result',
+    failed: 'Usage cannot be updated',
+    failedDetail: 'Local usage data could not be read. Please retry.',
+    codexOnlyCompatibility: 'The current background service can only show Codex usage. Other services will appear after it is updated.',
+    updated: 'Updated',
+    resets: 'Resets',
+    subscription: 'Subscription',
+    api: 'API provider',
+    deleted: 'Configuration removed; usage history retained',
+  },
+} as const;
+
+export function MenuBarUsageWindow(props: { client: UsageClient; language: Language; appearance: Appearance }) {
+  const [surfaceSettings, setSurfaceSettings] = useState<{ language: Language; appearance: Appearance }>({ language: props.language, appearance: props.appearance });
+  const text = copy[surfaceSettings.language];
+  const [snapshot, setSnapshot] = useState<UsageOverviewSnapshot | null>(() => readStoredSnapshot());
+  const [selection, setSelection] = useState(() => readStoredSelection());
+  /** 首次读取排序偏好，实时快照刷新不覆盖用户选择。 */
+  const [providerOrder, setProviderOrder] = useState(readStoredProviderOrder);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const requestRef = useRef<Promise<void> | null>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
+
+  useEffect(() => window.zeus?.onMenuBarUsageSettingsChanged?.(setSurfaceSettings), []);
+  useEffect(() => {
+    document.title = surfaceSettings.language === 'zh-CN' ? `${applicationName} 用量` : `${applicationName} Usage`;
+  }, [surfaceSettings.language]);
+  const load = useCallback(
+    (refresh: 'if-stale' | 'force' = 'if-stale') => {
+      if (requestRef.current) return requestRef.current;
+      const request = (async () => {
+        setLoading(true);
+        try {
+          const next = await props.client.loadUsageOverview(refresh);
+          if (!Array.isArray(next.providers)) throw new Error('用量概览缺少供应商列表，请重试。');
+          setSnapshot(next);
+          setHasLoaded(true);
+          storeSnapshot(next);
+          setError(null);
+        } catch (cause) {
+          setError(cause);
+        } finally {
+          requestRef.current = null;
+          setLoading(false);
+        }
+      })();
+      requestRef.current = request;
+      return request;
+    },
+    [props.client],
+  );
+
+  useEffect(() => {
+    void load('if-stale');
+    // 浮窗在后台也持续更新状态栏，用户无需先点击才看到额度。
+    const refreshTimer = window.setInterval(() => void load('if-stale'), 60_000);
+    /** 同一批用量通知只请求一次；请求中出现新变化则在完成后再读。 */
+    let dirty = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+    const schedule = () => {
+      if (disposed || timer || !dirty) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (disposed || !dirty) return;
+        if (requestRef.current) {
+          void requestRef.current.finally(schedule);
+          return;
+        }
+        dirty = false;
+        void load('if-stale').finally(schedule);
+      }, 150);
+    };
+    const unsubscribe = props.client.subscribeEvents(
+      (event) => {
+        if (event.type === 'usage.changed' || event.type === 'codex.usage.changed') {
+          dirty = true;
+          schedule();
+        }
+      },
+      () => undefined,
+    );
+    const refreshWhenShown = () => void load('if-stale');
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (document.querySelector('.menu-bar-usage-cost-detail:popover-open')) return;
+      event.preventDefault();
+      void window.zeus?.hideMenuBarUsage?.();
+    };
+    window.addEventListener('focus', refreshWhenShown);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      window.clearInterval(refreshTimer);
+      unsubscribe();
+      window.removeEventListener('focus', refreshWhenShown);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [load, props.client]);
+
+  useEffect(() => {
+    if (!snapshot || selection === 'all' || snapshot.providers.some((provider) => !provider.deleted && provider.providerId === selection)) return;
+    setSelection('all');
+    storeSelection('all');
+  }, [selection, snapshot]);
+
+  const select = (providerId: string) => {
+    setSelection(providerId);
+    storeSelection(providerId);
+  };
+  const handleTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const tabs = Array.from(event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? []);
+    const currentIndex = tabs.indexOf(event.currentTarget);
+    if (currentIndex < 0 || tabs.length === 0) return;
+
+    const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (currentIndex + (event.key === 'ArrowLeft' ? -1 : 1) + tabs.length) % tabs.length;
+    const nextTab = tabs[nextIndex];
+    if (!nextTab) return;
+
+    event.preventDefault();
+    nextTab.click();
+    nextTab.focus();
+  };
+  /** 已保存供应商按偏好排列，新出现的供应商沿用后台顺序追加。 */
+  const providerRanks = new Map(providerOrder.map((id, index) => [id, index]));
+  /** 列表与标签始终使用同一份排序结果，不修改原始快照。 */
+  const providers = (snapshot?.providers ?? []).filter((provider) => !provider.deleted).sort((left, right) => (providerRanks.get(left.providerId) ?? providerOrder.length) - (providerRanks.get(right.providerId) ?? providerOrder.length));
+  /** 拖拽与键盘共用移动入口，忽略已失效的供应商或越界目标。 */
+  const moveProvider = (providerId: string, targetId: string) => {
+    /** 当前可见顺序也是保存后的顺序，失效供应商不重新插入。 */
+    const next = providers.map((provider) => provider.providerId);
+    /** 起点和终点都必须仍在当前快照中。 */
+    const sourceIndex = next.indexOf(providerId);
+    const targetIndex = next.indexOf(targetId);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
+    next.splice(sourceIndex, 1);
+    next.splice(targetIndex, 0, providerId);
+    setProviderOrder(next);
+    try {
+      localStorage.setItem(providerOrderStorageKey, JSON.stringify(next));
+    } catch {
+      // 存储不可写时仍允许本次窗口内排序，与现有选择偏好保持一致。
+    }
+  };
+  const selectedProvider = providers.find((provider) => provider.providerId === selection) ?? null;
+  const trayProvider = selectedProvider ?? snapshot?.providers.find((provider) => provider.providerId === 'codex') ?? snapshot?.providers[0] ?? null;
+  useEffect(() => {
+    if (!window.zeus?.updateMenuBarUsageTray) return;
+    let cancelled = false;
+    void renderClassicTray(trayProvider, !hasLoaded || Boolean(error), surfaceSettings.language)
+      .then((image) => {
+        if (!cancelled) return window.zeus?.updateMenuBarUsageTray(image);
+      })
+      .catch((cause: unknown) => console.warn('状态栏额度更新失败', cause));
+    return () => {
+      cancelled = true;
+    };
+  }, [trayProvider, hasLoaded, error, surfaceSettings.language]);
+  // 顶部时间表示本次用量读取完成时间，供应源数据的新鲜度仍由卡片单独提示。
+  const updatedAt = snapshot?.updatedAt;
+  const stale = Boolean(selectedProvider?.stale || error);
+  const freshness = updatedAt ? formatUpdatedAt(updatedAt, surfaceSettings.language, stale ? text.stale : '') : loading ? text.loading : error ? text.failed : text.loading;
+
+  return (
+    <main
+      className="menu-bar-usage-root"
+      data-appearance={surfaceSettings.appearance}
+      lang={surfaceSettings.language}
+      aria-label={surfaceSettings.language === 'zh-CN' ? `${applicationName} 菜单栏用量浮窗` : `${applicationName} menu bar usage`}
+    >
+      <section className="menu-bar-usage-surface">
+        <header className="menu-bar-usage-header">
+          <span className="menu-bar-usage-identity">
+            <span className="menu-bar-usage-mark" aria-hidden="true" />
+            <strong>{applicationName}</strong>
+          </span>
+          <span className="menu-bar-usage-refresh-status">
+            <small className="menu-bar-usage-freshness" data-stale={stale && !loading ? 'true' : 'false'} aria-live="polite" title={freshness}>
+              {freshness}
+            </small>
+            <button className="menu-bar-usage-refresh" type="button" aria-label={loading ? text.loading : text.retry} title={loading ? text.loading : text.retry} aria-busy={loading} disabled={loading} onClick={() => void load('force')}>
+              {loading ? <RefreshPendingIcon /> : <RefreshIcon />}
+            </button>
+          </span>
+        </header>
+
+        <nav className="menu-bar-usage-tabs" role="tablist" aria-label={text.allProviders}>
+          <button type="button" role="tab" aria-selected={selection === 'all'} tabIndex={selection === 'all' ? 0 : -1} onClick={() => select('all')} onKeyDown={handleTabKeyDown}>
+            {text.all}
+          </button>
+          {providers.map((provider) => (
+            <button
+              key={provider.providerId}
+              type="button"
+              role="tab"
+              aria-label={providerDisplayName(provider)}
+              aria-selected={selection === provider.providerId}
+              tabIndex={selection === provider.providerId ? 0 : -1}
+              title={provider.deleted ? providerDisplayName(provider) : undefined}
+              onClick={() => select(provider.providerId)}
+              onKeyDown={handleTabKeyDown}
+            >
+              {providerDisplayName(provider, true)}
+            </button>
+          ))}
+        </nav>
+
+        <div className="menu-bar-usage-status-stack">
+          {snapshot?.providerCoverage === 'codex-only-compatibility' ? (
+            <div className="menu-bar-usage-notice" data-tone="warning" role="status">
+              <span>{text.codexOnlyCompatibility}</span>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="menu-bar-usage-content" role="tabpanel">
+          {!snapshot && error ? (
+            <UsageLoadFailure error={error} language={surfaceSettings.language} loading={loading} onRetry={() => load('force')} />
+          ) : !snapshot ? (
+            <UsageSkeleton label={text.loading} />
+          ) : selectedProvider ? (
+            <ProviderDetail provider={selectedProvider} language={surfaceSettings.language} />
+          ) : (
+            <AllProviders providers={providers} language={surfaceSettings.language} onSelect={select} onMove={moveProvider} />
+          )}
+        </div>
+
+        <footer className="menu-bar-usage-actions">
+          <button className="menu-bar-usage-primary-action" type="button" onClick={() => void window.zeus?.openMenuBarUsageSettings?.('usage')}>
+            {text.fullStatistics}
+          </button>
+          <button type="button" onClick={() => void window.zeus?.showMainWindowFromMenuBarUsage?.()}>
+            {text.showZeus}
+          </button>
+          <button type="button" onClick={() => void window.zeus?.quitFromMenuBarUsage?.()}>
+            {text.quitZeus}
+          </button>
+        </footer>
+      </section>
+    </main>
+  );
+}
+
+function UsageLoadFailure(props: { error: unknown; language: Language; loading: boolean; onRetry: () => Promise<void> }) {
+  const text = copy[props.language];
+  return (
+    <div className="menu-bar-usage-load-failure" role="alert">
+      <VisibleApplicationError error={props.error} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
+      <button type="button" onClick={() => void props.onRetry()} disabled={props.loading}>
+        {props.loading ? text.loading : text.retry}
+      </button>
+    </div>
+  );
+}
+
+/** 全部供应商列表：独立手柄排序，点击内容仍打开供应商详情。 */
+function AllProviders(props: { providers: UsageProviderSummary[]; language: Language; onSelect: (providerId: string) => void; onMove: (providerId: string, targetId: string) => void }) {
+  const text = copy[props.language];
+  /** 只接收从本列表手柄发起的拖拽，外部文本和文件不会修改顺序。 */
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+  /** 落点仅用于提示，松手后才提交排序，避免悬停时列表来回跳动。 */
+  const [dropId, setDropId] = useState<string | null>(null);
+  /** 键盘移动后向读屏播报当前位置。 */
+  const [announcement, setAnnouncement] = useState('');
+  if (props.providers.length === 0) {
+    return (
+      <div className="menu-bar-usage-empty">
+        <strong>{text.noProviders}</strong>
+        <span>{text.noProvidersDetail}</span>
+      </div>
+    );
+  }
+  return (
+    <section className="menu-bar-usage-provider-list" aria-label={text.allProviders}>
+      {props.providers.length > 1 ? (
+        <span className="menu-bar-usage-sr-only" id="menu-bar-usage-reorder-hint">
+          {text.reorderHelp}
+        </span>
+      ) : null}
+      <span className="menu-bar-usage-sr-only" role="status">
+        {announcement}
+      </span>
+      {props.providers.map((provider, index) => {
+        const fullName = providerDisplayName(provider);
+        const quotaCount = menuBarRateLimitWindows(provider).length;
+        const providerDetail = provider.deleted
+          ? text.deleted
+          : provider.kind === 'subscription'
+            ? [provider.planType || text.subscription, quotaCount ? (props.language === 'zh-CN' ? `${quotaCount} 项官方额度` : `${quotaCount} quota windows`) : null].filter(Boolean).join(' · ')
+            : text.api;
+        return (
+          <div
+            className="menu-bar-usage-provider-row"
+            key={provider.providerId}
+            data-dragging={draggedId === provider.providerId}
+            data-drop={dropId === provider.providerId && draggedId !== provider.providerId ? (props.providers.findIndex((entry) => entry.providerId === draggedId) < index ? 'after' : 'before') : undefined}
+            onDragOver={(event) => {
+              if (!draggedId) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = 'move';
+              setDropId(provider.providerId);
+            }}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropId(null);
+            }}
+            onDrop={(event) => {
+              if (!draggedId) return;
+              event.preventDefault();
+              props.onMove(draggedId, provider.providerId);
+              setDraggedId(null);
+              setDropId(null);
+            }}
+          >
+            {props.providers.length > 1 ? (
+              <button
+                className="menu-bar-usage-drag-handle"
+                type="button"
+                draggable
+                aria-label={`${text.reorder} ${fullName}`}
+                aria-describedby="menu-bar-usage-reorder-hint"
+                title={text.reorderHelp}
+                onDragStart={(event) => {
+                  event.dataTransfer.effectAllowed = 'move';
+                  event.dataTransfer.setData('text/plain', provider.providerId);
+                  setDraggedId(provider.providerId);
+                }}
+                onDragEnd={() => {
+                  setDraggedId(null);
+                  setDropId(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+                  event.preventDefault();
+                  /** 边界按键保持位置和焦点，不循环跳到另一端。 */
+                  const targetIndex = index + (event.key === 'ArrowUp' ? -1 : 1);
+                  const target = props.providers[targetIndex];
+                  if (!target) return;
+                  props.onMove(provider.providerId, target.providerId);
+                  setAnnouncement(`${fullName} · ${targetIndex + 1} / ${props.providers.length}`);
+                }}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M5 3h.01M11 3h.01M5 8h.01M11 8h.01M5 13h.01M11 13h.01" />
+                </svg>
+              </button>
+            ) : null}
+            <button className="menu-bar-usage-provider-open" type="button" title={provider.deleted ? fullName : undefined} onClick={() => props.onSelect(provider.providerId)}>
+              <span className="menu-bar-usage-provider-copy">
+                <strong title={provider.deleted ? fullName : undefined}>{fullName}</strong>
+                <small>{providerDetail}</small>
+              </span>
+              <span className="menu-bar-usage-provider-value">
+                <strong>{formatIncompleteTokens(provider.overviewRanges.today.local.totalTokens, provider.overviewRanges.today.complete, props.language)}</strong>
+                <small>{text.todayShort}</small>
+              </span>
+              <Chevron />
+            </button>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+function ProviderDetail(props: { provider: UsageProviderSummary; language: Language }) {
+  const { provider, language } = props;
+  const text = copy[language];
+  const [range, setRange] = useState<UsageOverviewRange>('7d');
+  const summary = provider.overviewRanges[range];
+  const local = summary.local;
+  const complete = summary.complete === true;
+  const equivalentCost = isCodexSubscriptionUsage(provider);
+  const costLabel = equivalentCost ? text.equivalentCost : text.estimatedCost;
+  return (
+    <article className="menu-bar-usage-detail">
+      <ProviderSummaryCard provider={provider} language={language} />
+      <nav className="menu-bar-usage-range" aria-label={text.overview}>
+        {overviewRangeOrder.map((entry) => (
+          <button key={entry} type="button" aria-pressed={range === entry} onClick={() => setRange(entry)}>
+            {text.overviewRanges[entry]}
+          </button>
+        ))}
+      </nav>
+      <dl className="menu-bar-usage-metrics">
+        <Metric label={text.tokens} value={formatIncompleteTokens(local.totalTokens, summary.complete, language)} />
+        <Metric label={text.cache} value={!complete ? '—' : provider.cacheUsageAvailable ? formatPercent(local.cacheHitRate, language, '—') : text.cacheUnsupported} />
+        <Metric label={costLabel} accessibleLabel={equivalentCost ? text.equivalentCostHint : costLabel} value={complete ? formatCost(local, language, text.noPrice) : '—'} costBreakdown={summary.costBreakdown} language={language} />
+        <Metric label={text.outputRate} value={local.outputTokensPerSecond == null ? '—' : `${formatTokens(local.outputTokensPerSecond, language)} / s`} outputRateBreakdown={summary.outputRateBreakdown} language={language} />
+      </dl>
+      {local.hasBackfilledPricing && <small className="menu-bar-usage-account-source">{text.pricingBackfill}</small>}
+      <DailyBars key={provider.providerId} provider={provider} language={language} />
+    </article>
+  );
+}
+
+/** 展示状态栏可见的官方额度窗口。 */
+function ProviderSummaryCard(props: { provider: UsageProviderSummary; language: Language }) {
+  const { provider, language } = props;
+  const text = copy[language];
+  const name = providerDisplayName(provider);
+  const todayValue = formatIncompleteTokens(provider.overviewRanges.today.local.totalTokens, provider.overviewRanges.today.complete, language);
+  const visibleWindows = menuBarRateLimitWindows(provider);
+  /** 无官方额度时保留原有空态；多项额度按官方顺序逐一显示。 */
+  const windows = visibleWindows.length ? visibleWindows : [undefined];
+  /** 读屏摘要与可见额度保持一致。 */
+  const quotaSummary = visibleWindows.map((window) => `${windowRemainingLabel(window, language)} ${formatPercent(window.remainingPercent / 100, language)}`).join('，') || text.noQuota;
+  const source = visibleWindows.length ? text.officialAndLocal : provider.officialState === 'signed_out' ? text.localQuotaSignIn : text.localQuotaUnavailable;
+  return (
+    <section className="menu-bar-usage-account-card" aria-label={`${name}，${quotaSummary}，${text.todayToken} ${todayValue}`}>
+      <div className="menu-bar-usage-account-body">
+        <div className="menu-bar-usage-account-quotas">
+          {windows.map((window, index) => {
+            /** 名称包含额度池和周期，同名的短期与长期额度也能区分。 */
+            const quotaHeading = window ? windowRemainingLabel(window, language) : text.quota;
+            /** 百分比使用该窗口的官方余额，空态不推算额度。 */
+            const quotaValue = window ? formatPercent(window.remainingPercent / 100, language) : text.noQuota;
+            return (
+              <div key={`${window?.limitId ?? 'default'}-${window?.kind ?? 'empty'}-${index}`} className="menu-bar-usage-account-quota" data-empty={window ? 'false' : 'true'}>
+                <small title={quotaHeading}>{quotaHeading}</small>
+                <strong>{quotaValue}</strong>
+                {window ? (
+                  <>
+                    <span className="menu-bar-usage-progress" role="progressbar" aria-label={quotaHeading} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.remainingPercent}>
+                      <i style={{ inlineSize: `${Math.max(0, Math.min(100, window.remainingPercent))}%` }} />
+                    </span>
+                    {index === 0 && provider.providerId === 'codex' && hasPositiveCodexCredits(provider.officialCreditBalance) ? (
+                      <small title={provider.officialCreditBalance ?? undefined}>
+                        {text.remainingCredits} {formatCodexCredits(provider.officialCreditBalance, language)}
+                      </small>
+                    ) : null}
+                    <time dateTime={window.resetsAt ? new Date(window.resetsAt * 1_000).toISOString() : undefined} title={window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : undefined}>
+                      {window.resetsAt ? formatReset(window.resetsAt, language, text.resets) : '—'}
+                    </time>
+                  </>
+                ) : provider.officialState === 'signed_out' ? (
+                  <small>{text.signedOut}</small>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+        <div className="menu-bar-usage-account-today">
+          <small>{text.todayToken}</small>
+          <strong>{todayValue}</strong>
+        </div>
+      </div>
+
+      <small className="menu-bar-usage-account-source" title={source}>
+        {source}
+      </small>
+    </section>
+  );
+}
+
+/** 按原统计来源展示每日柱形、日期与数值，缺失数据不推算成零。 */
+function DailyBars(props: { provider: UsageProviderSummary; language: Language }) {
+  const text = copy[props.language];
+  /** Codex 可切换来源，首次展示本机账本；其他供应商始终使用本机账本。 */
+  const [source, setSource] = useState<'local' | 'account'>('local');
+  const [localDimension, setLocalDimension] = useState<ChartDimension>(readStoredChartDimension);
+  const codex = props.provider.providerId === 'codex';
+  const accountUsage = codex && source === 'account';
+  const dimension: ChartDimension = accountUsage ? 'tokens' : localDimension;
+  const costDimension = dimension === 'cost';
+  const costLabel = isCodexSubscriptionUsage(props.provider) ? text.equivalentCost : text.estimatedCost;
+  const buckets = accountUsage ? (props.provider.dailyAccount ?? null) : props.provider.dailyLocal;
+  const label = costDimension ? costLabel : accountUsage ? text.accountRecentUsage : text.recentUsage;
+  const sourcePicker = codex ? (
+    <label className="menu-bar-usage-chart-source-picker" title={accountUsage ? text.accountSourceHint : text.localSource}>
+      <span className="menu-bar-usage-sr-only">{text.statisticsSource}</span>
+      <select aria-label={text.statisticsSource} value={source} onChange={(event) => setSource(event.currentTarget.value === 'account' ? 'account' : 'local')}>
+        <option value="local">{text.localSource}</option>
+        <option value="account">{text.accountSource}</option>
+      </select>
+    </label>
+  ) : null;
+  if (buckets === null)
+    return (
+      <div className="menu-bar-usage-chart-empty">
+        {sourcePicker ?? <span>{label}</span>}
+        <small>{text.officialUsageUnavailable}</small>
+      </div>
+    );
+  if (buckets.length === 0 && (accountUsage || !props.provider.collectionStartedAt))
+    return (
+      <div className="menu-bar-usage-chart-empty">
+        {sourcePicker ?? <span>{label}</span>}
+        <small>{text.insufficientHistory}</small>
+      </div>
+    );
+  const slots = buildDailySlots(props.provider, dimension, accountUsage ? 'account' : 'local');
+  const maximum = Math.max(...slots.flatMap((slot) => (slot.value && slot.value > 0 ? [slot.value] : [])), 1);
+  const todayValue = accountUsage
+    ? formatOptionalTokens(props.provider.accountTodayTokens, props.language)
+    : formatIncompleteTokens(props.provider.overviewRanges.today.local.totalTokens, props.provider.overviewRanges.today.complete, props.language);
+  const sevenDayValue = accountUsage
+    ? formatOptionalTokens(props.provider.accountSevenDayTokens, props.language)
+    : formatIncompleteTokens(props.provider.overviewRanges['7d'].local.totalTokens, props.provider.overviewRanges['7d'].complete, props.language);
+  return (
+    <figure className="menu-bar-usage-bars" aria-label={`${providerDisplayName(props.provider)} ${label}`}>
+      <figcaption>
+        {sourcePicker ?? <span>{label}</span>}
+        <dl>
+          <div>
+            <dt>{text.todaySummary}</dt>
+            <dd>{todayValue}</dd>
+          </div>
+          <div>
+            <dt>{text.sevenDaysSummary}</dt>
+            <dd>{sevenDayValue}</dd>
+          </div>
+        </dl>
+      </figcaption>
+      {!accountUsage ? (
+        <nav className="menu-bar-usage-range" aria-label={label}>
+          {(['tokens', 'cost'] as const).map((entry) => (
+            <button
+              key={entry}
+              type="button"
+              aria-pressed={dimension === entry}
+              onClick={() => {
+                setLocalDimension(entry);
+                try {
+                  localStorage.setItem(chartDimensionStorageKey, entry);
+                } catch {
+                  /* 偏好不可写时仅更新当前窗口。 */
+                }
+              }}
+            >
+              {entry === 'tokens' ? text.tokens : costLabel}
+            </button>
+          ))}
+        </nav>
+      ) : null}
+      <div className="menu-bar-usage-bars-plot">
+        {slots.map((slot) => {
+          const state = slot.value === null ? 'missing' : slot.value === 0 ? 'zero' : 'positive';
+          const value = slot.value === null ? text.missingDay : costDimension ? `${slot.complete ? '~' : '≥'}${formatCostAmount(slot.value, 'USD', props.language)}` : `${formatTokens(slot.value, props.language)} Token`;
+          return (
+            <span key={slot.date} data-state={state} aria-label={`${formatShortDate(slot.date, props.language)} ${value}`} title={`${slot.date} · ${value}`}>
+              <span className="menu-bar-usage-bar-slot">{slot.value === null ? <em aria-hidden="true">—</em> : <i style={{ blockSize: slot.value === 0 ? '2px' : `${Math.max(10, (slot.value / maximum) * 100)}%` }} />}</span>
+              <small>{formatShortDate(slot.date, props.language)}</small>
+              <strong className="menu-bar-usage-bar-value">
+                {slot.value === null ? '—' : costDimension ? `${slot.complete ? '~' : '≥'}${formatCostAmount(slot.value, 'USD', props.language)}` : formatOptionalTokens(slot.value, props.language)}
+              </strong>
+            </span>
+          );
+        })}
+      </div>
+    </figure>
+  );
+}
+
+/** 菜单栏指标只显示名称和数值，减少重复说明占用的空间。 */
+function Metric(props: { label: string; accessibleLabel?: string; value: string; costBreakdown?: UsageModelCostBreakdown[]; outputRateBreakdown?: UsageModelOutputRateBreakdown[]; language?: Language }) {
+  const detailId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const positionDetail = useCallback(() => {
+    const trigger = triggerRef.current;
+    const panel = detailRef.current;
+    if (!trigger || !panel?.matches(':popover-open')) return;
+    const anchor = trigger.getBoundingClientRect();
+    const width = panel.getBoundingClientRect().width;
+    const height = panel.getBoundingClientRect().height;
+    panel.style.left = `${Math.max(12, Math.min(anchor.left, window.innerWidth - width - 12))}px`;
+    panel.style.top = `${Math.max(12, Math.min(anchor.bottom + 8, window.innerHeight - height - 12))}px`;
+  }, []);
+  useEffect(() => {
+    window.addEventListener('resize', positionDetail);
+    window.addEventListener('scroll', positionDetail, true);
+    return () => {
+      window.removeEventListener('resize', positionDetail);
+      window.removeEventListener('scroll', positionDetail, true);
+    };
+  }, [positionDetail]);
+  const hasDetail = Boolean((props.costBreakdown?.length || props.outputRateBreakdown?.length) && props.language);
+  const text = props.language ? copy[props.language] : null;
+  return (
+    <div>
+      <dt aria-label={props.accessibleLabel}>
+        {props.label}
+        {hasDetail ? (
+          <button
+            ref={triggerRef}
+            className="menu-bar-usage-cost-detail-trigger"
+            type="button"
+            aria-label={props.outputRateBreakdown ? props.label : text?.costDetail}
+            aria-controls={detailId}
+            aria-expanded={detailOpen}
+            title={props.outputRateBreakdown ? props.label : text?.costDetail}
+            onClick={() => {
+              const panel = detailRef.current;
+              if (!panel) return;
+              if (panel.matches(':popover-open')) panel.hidePopover();
+              else {
+                panel.showPopover();
+                positionDetail();
+              }
+            }}
+          >
+            i
+          </button>
+        ) : null}
+      </dt>
+      <dd>{props.value}</dd>
+      {hasDetail ? (
+        <div
+          ref={detailRef}
+          id={detailId}
+          className="menu-bar-usage-cost-detail"
+          popover="auto"
+          onToggle={(event) => {
+            const open = event.currentTarget.matches(':popover-open');
+            setDetailOpen(open);
+            if (open) positionDetail();
+          }}
+        >
+          <strong>{props.accessibleLabel ?? props.label}</strong>
+          {props.outputRateBreakdown ? (
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">{text?.model}</th>
+                  <th scope="col">{props.label}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.outputRateBreakdown.map((entry) => (
+                  <tr key={entry.model}>
+                    <th scope="row">{entry.model}</th>
+                    <td>{formatTokens(entry.outputTokensPerSecond, props.language!)} Token / s</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : null}
+          <table hidden={Boolean(props.outputRateBreakdown)}>
+            <thead>
+              <tr>
+                <th scope="col">{text?.model}</th>
+                <th scope="col">{text?.unitPrice}</th>
+                <th scope="col">{text?.consumedTokens}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {props.costBreakdown?.map((entry, index) => (
+                <tr key={`${entry.model}:${index}`}>
+                  <th scope="row">
+                    {entry.model}
+                    {entry.serviceTier || entry.longContext ? <small>{[entry.serviceTier, entry.longContext ? 'Long context' : null].filter(Boolean).join(' · ')}</small> : null}
+                  </th>
+                  <td>
+                    {formatModelRate(entry, props.language!)}
+                    {entry.pricePeriod ? <small>{formatPricePeriod(entry.pricePeriod, props.language!)}</small> : null}
+                  </td>
+                  <td>
+                    {formatTokens(entry.usage.totalTokens, props.language!)} Token<small>{formatModelEstimatedCost(entry, props.language!)}</small>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 费用明细保留请求当时的原币单价；未知缓存价不写成零。 */
+function formatModelRate(entry: UsageModelCostBreakdown, language: Language): string {
+  const rate = entry.rate;
+  if (!rate) return copy[language].noPrice;
+  const amount = (value: number) => `${rate.currency} ${new Intl.NumberFormat(language, { maximumFractionDigits: 6 }).format(value)}`;
+  if (rate.perRequest !== null) return `${amount(rate.perRequest)} / ${language === 'zh-CN' ? '次' : 'request'}`;
+  if (!rate.perMillion) return copy[language].noPrice;
+  const parts = [`${language === 'zh-CN' ? '输入' : 'Input'} ${amount(rate.perMillion.input)}`, `${language === 'zh-CN' ? '输出' : 'Output'} ${amount(rate.perMillion.output)}`];
+  if (rate.perMillion.cachedInput !== null) parts.push(`${language === 'zh-CN' ? '缓存读取' : 'Cached input'} ${amount(rate.perMillion.cachedInput)}`);
+  if (rate.perMillion.cacheWrite !== null) parts.push(`${language === 'zh-CN' ? '缓存写入' : 'Cache write'} ${amount(rate.perMillion.cacheWrite)}`);
+  return `${parts.join(' · ')} / 1M Token`;
+}
+
+function UsageSkeleton(props: { label: string }) {
+  return (
+    <div className="menu-bar-usage-skeleton" role="status" aria-label={props.label}>
+      <span />
+      <span />
+      <span />
+    </div>
+  );
+}
+
+function Chevron() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="m6 3.5 4.5 4.5L6 12.5" />
+    </svg>
+  );
+}
+
+/** 双箭头留出清晰开口，小尺寸下仍可辨识刷新方向。 */
+function RefreshIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M13.5 2v4h-4M2.5 14v-4h4M3.1 5.5a5.2 5.2 0 0 1 8.6-1.7L13.5 6M2.5 10l1.8 2.2a5.2 5.2 0 0 0 8.6-1.7" />
+    </svg>
+  );
+}
+
+/** 细圆环在固定按钮内匀速旋转，避免翻转沙漏带来的视觉跳动。 */
+function RefreshPendingIcon() {
+  return <span className="menu-bar-usage-spinner" aria-hidden="true" />;
+}
+
+function providerDisplayName(provider: UsageProviderSummary, compact = false): string {
+  const name = provider.deleted ? provider.sourceId.trim() || provider.providerId : provider.name;
+  if (!compact || !provider.deleted || name.length <= 22) return name;
+  return `${name.slice(0, 12)}…${name.slice(-8)}`;
+}
+
+function buildDailySlots(provider: UsageProviderSummary, dimension: ChartDimension, source: ChartSource): DailySlot[] {
+  /** 账户图使用官方历史；费用维度与普通供应商沿用本地日账本。 */
+  const accountUsage = provider.providerId === 'codex' && source === 'account';
+  const buckets = accountUsage ? (provider.dailyAccount ?? []) : provider.dailyLocal.map((day) => ({ date: day.date, totalTokens: dimension === 'cost' ? day.apiEquivalentUsd : day.totalTokens }));
+  /** 按日期查找数值，本地采集起点只用于普通供应商的空白日期。 */
+  const bucketsByDate = new Map(buckets.map((bucket) => [bucket.date, bucket.totalTokens]));
+  /** 费用有数值也可能只覆盖部分请求，每天独立保留缺价状态。 */
+  const pricingByDate = new Map(provider.dailyLocal.map((day) => [day.date, day.priceCoverage]));
+  const collectionStart = timestampDateKey(provider.collectionStartedAt);
+  /** 以本地自然日对应顶部今日指标，七天范围包含当天。 */
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Array.from({ length: 7 }, (_, index) => {
+    /** 每根柱对应独立自然日，最后一根固定为当天。 */
+    const date = new Date(today);
+    date.setDate(date.getDate() - 6 + index);
+    const dateKey = localDateKey(date);
+    /** 官方缺失继续显示破折号；本地采集后的无记录日期才视作零，未定价日期按缺失处理。 */
+    const recorded = bucketsByDate.get(dateKey);
+    const value = recorded === null ? null : recorded === undefined ? (!accountUsage && collectionStart !== null && dateKey >= collectionStart ? 0 : null) : Math.max(0, recorded);
+    return { date: dateKey, value, complete: value !== null && (dimension !== 'cost' || recorded === undefined || pricingByDate.get(dateKey) === 1) };
+  });
+}
+
+function timestampDateKey(value: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : localDateKey(date);
+}
+
+function localDateKey(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/** 同时标明额度池和周期，缺少名称时保留官方标识，不猜测对应模型。 */
+function windowRemainingLabel(window: CodexOfficialRateWindow, language: Language): string {
+  /** 官方名称优先，标识只在没有名称时补充。 */
+  const name = window.limitName || window.limitId;
+  /** 官方未提供时长时使用窗口类别，避免同一额度池出现无法区分的两行。 */
+  const duration = !window.windowDurationMins
+    ? window.kind === 'primary'
+      ? language === 'zh-CN'
+        ? '主要窗口'
+        : 'Primary window'
+      : language === 'zh-CN'
+        ? '次要窗口'
+        : 'Secondary window'
+    : window.windowDurationMins >= 1_440
+      ? language === 'zh-CN'
+        ? `${window.windowDurationMins / 1_440} 日`
+        : `${window.windowDurationMins / 1_440} day`
+      : language === 'zh-CN'
+        ? `${window.windowDurationMins / 60} 小时`
+        : `${window.windowDurationMins / 60} hour`;
+  return `${name ? `${name} · ` : ''}${duration}${language === 'zh-CN' ? '剩余' : ' remaining'}`;
+}
+
+function formatTokens(value: number, language: Language): string {
+  return new Intl.NumberFormat(language, { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatIncompleteTokens(value: number, complete: boolean | undefined, language: Language): string {
+  const formatted = formatTokens(value, language);
+  return complete === true ? formatted : `≥${formatted}`;
+}
+
+function formatOptionalTokens(value: number | null | undefined, language: Language): string {
+  return value === null || value === undefined ? '—' : formatTokens(value, language);
+}
+
+function formatPercent(value: number | null, language: Language, unavailable = ''): string {
+  return value === null ? unavailable : new Intl.NumberFormat(language, { style: 'percent', maximumFractionDigits: 1 }).format(Math.max(0, value));
+}
+
+/** 原币种分别展示，不把人民币等费用折算成美元。 */
+function formatCost(local: CodexLocalUsageTotals, language: Language, unavailable: string): string {
+  if (!local.priceCoverage) return unavailable;
+  const costs = local.costs ?? (local.apiEquivalentUsd === null ? [] : [{ currency: 'USD', amount: local.apiEquivalentUsd }]);
+  if (!costs.length) return unavailable;
+  const formatted = costs.map(({ currency, amount }) => {
+    if (!Number.isFinite(amount)) return null;
+    try {
+      return new Intl.NumberFormat(language, { style: 'currency', currency, currencyDisplay: 'narrowSymbol', minimumFractionDigits: amount > 0 && amount < 0.01 ? 4 : 2, maximumFractionDigits: 4 }).format(amount);
+    } catch {
+      // 旧快照中的币种不合法时保留数值，避免整个浮窗渲染失败。
+      return `${currency} ${new Intl.NumberFormat(language, { maximumFractionDigits: 4 }).format(amount)}`;
+    }
+  });
+  return formatted.every(Boolean) ? `~${formatted.join(' + ')}` : unavailable;
+}
+
+/** 直接显示本地日期和时间，跨日重置无需悬停猜测。 */
+function formatReset(timestamp: number, language: Language, prefix: string): string {
+  return `${prefix} ${new Intl.DateTimeFormat(language, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp * 1_000))}`;
+}
+
+/** 正常状态仅显示时间；读取失败时保留过期数据说明。 */
+function formatUpdatedAt(value: string, language: Language, prefix: string): string {
+  return `${prefix ? `${prefix} ` : ''}${new Intl.DateTimeFormat(language, { hour: '2-digit', minute: '2-digit' }).format(new Date(value))}`;
+}
+
+function formatShortDate(value: string, language: Language): string {
+  return new Intl.DateTimeFormat(language, { month: 'numeric', day: 'numeric' }).format(new Date(`${value}T12:00:00`));
+}
+
+function readStoredSnapshot(): UsageOverviewSnapshot | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(snapshotStorageKey) ?? 'null') as UsageOverviewSnapshot | null;
+    /** 缓存可能来自旧版结构；缺少当前渲染必需字段时等待实时读取，不能让菜单栏整页崩溃。 */
+    const compatible = value?.providers.every(
+      (provider) =>
+        Array.isArray(provider.dailyLocal) &&
+        overviewRangeOrder.every(
+          (range) =>
+            Boolean(provider.overviewRanges?.[range]?.local) &&
+            Array.isArray(provider.overviewRanges[range].outputRateBreakdown) &&
+            Array.isArray(provider.overviewRanges[range].costBreakdown) &&
+            provider.overviewRanges[range].costBreakdown.every((entry) => typeof entry.longContext === 'boolean' && (entry.serviceTier === null || typeof entry.serviceTier === 'string')),
+        ),
+    );
+    return value && Array.isArray(value.providers) && compatible && typeof value.updatedAt === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeSnapshot(value: UsageOverviewSnapshot): void {
+  try {
+    localStorage.setItem(snapshotStorageKey, JSON.stringify(value));
+  } catch {
+    // 本地快照写入失败不影响当前窗口继续显示实时结果。
+  }
+}
+
+function readStoredSelection(): string {
+  try {
+    return localStorage.getItem(selectionStorageKey)?.trim() || 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+/** 本地存储属于不可信输入：仅接受非空字符串标识，并去除重复项。 */
+function readStoredProviderOrder(): string[] {
+  try {
+    /** 旧偏好或手工修改的内容不得影响窗口启动。 */
+    const value: unknown = JSON.parse(localStorage.getItem(providerOrderStorageKey) ?? '[]');
+    return Array.isArray(value) ? [...new Set(value.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))] : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeSelection(value: string): void {
+  try {
+    localStorage.setItem(selectionStorageKey, value);
+  } catch {
+    // 选择偏好不可写时，仅保留当前窗口内状态。
+  }
+}
+
+function readStoredChartDimension(): ChartDimension {
+  try {
+    return localStorage.getItem(chartDimensionStorageKey) === 'cost' ? 'cost' : 'tokens';
+  } catch {
+    return 'tokens';
+  }
+}
+
+function formatPricePeriod(period: NonNullable<UsageModelCostBreakdown['pricePeriod']>, language: Language): string {
+  return `${period.from}～${period.to ?? (language === 'zh-CN' ? '至今' : 'now')}`;
+}
+
+function formatModelEstimatedCost(entry: UsageModelCostBreakdown, language: Language): string {
+  return entry.estimatedCosts?.length ? entry.estimatedCosts.map(({ currency, amount }) => `~${formatCostAmount(amount, currency, language)}`).join(' + ') : copy[language].noPrice;
+}
+
+function formatCostAmount(value: number, currency: string, language: Language): string {
+  /** 非零的小额费用不能四舍五入成零，使用最小展示单位表达。 */
+  const lessThanMinimum = value > 0 && value < 0.01;
+  const amount = new Intl.NumberFormat(language, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+  if (currency === 'USD') return `${lessThanMinimum ? '<' : ''}$${lessThanMinimum ? '0.01' : amount}`;
+  if (currency === 'CNY') return `${lessThanMinimum ? '<' : ''}¥${lessThanMinimum ? '0.01' : amount}`;
+  return `${currency} ${lessThanMinimum ? '<0.01' : amount}`;
+}

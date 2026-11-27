@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { SQLInputValue } from 'node:sqlite';
 import { randomId } from './randomId.js';
-import { type CodexUsageEstimate, type ConversationResourceKind, type ConversationResourcePresentation, type TokenUsageBreakdown } from '@zeus/shared';
+import { isReportedTokenFields, tokenUsageFields, type CodexUsageEstimate, type ConversationResourceKind, type ConversationResourcePresentation, type NativeTokenUsageSnapshot, type TokenUsageBreakdown } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
 import { captureCompletedInputSuggestion } from './inputSuggestionStore.js';
 import type { ConversationAgentKind } from './conversationItemTypes.js';
@@ -55,6 +55,8 @@ export interface ZeusConversationRecord {
   title: string;
   /** 标题初始、待自动命名、自动完成或用户命名的持久状态。 */
   titleSource: ConversationTitleSource;
+  /** 已使用的最新命名机会，空值表示未记录。 */
+  titleGenerationAttempt: ConversationTitleGenerationAttempt | null;
   summary: string | null;
   status: string;
   stage: ConversationStage;
@@ -98,6 +100,8 @@ export interface ZeusConversationRecord {
 export type ConversationTransportKind = 'legacy_cli' | 'codex_native';
 /** 初始标题只有普通新会话接纳后才进入待命名状态。 */
 export type ConversationTitleSource = 'initial' | 'pending' | 'automatic' | 'manual';
+/** 摘要可提前命名一次，完整回复可使用最后一次机会。 */
+export type ConversationTitleGenerationAttempt = 'summary' | 'reply';
 export type ConversationStage = 'created' | 'connecting' | 'queued' | 'running' | 'waiting_user' | 'waiting_approval' | 'completed' | 'failed' | 'paused' | 'ready' | 'archived';
 export type ConversationAgentTransport = 'app_server' | 'rpc' | 'sdk';
 export type ConversationProviderState = 'unbound' | 'binding' | 'ready' | 'active' | 'waiting' | 'paused' | 'archived' | 'closed' | 'failed';
@@ -221,6 +225,8 @@ export interface CreateConversationInput {
   environmentId?: string;
   sessionId?: string;
   title: string;
+  /** 普通项目会话在创建时保存临时标题和待命名状态。 */
+  automaticTitle?: boolean;
   summary?: string;
   status?: string;
   transportKind?: ConversationTransportKind;
@@ -284,7 +290,7 @@ export interface BindPiConversationProviderInput extends BindConversationProvide
 
 /** SDK 会话绑定必须记录真实 Provider 身份和传输类型。 */
 export interface BindManagedConversationProviderInput extends BindPiConversationProviderInput {
-  agentKind: 'pi' | 'copilot';
+  agentKind: 'pi' | 'copilot' | 'antigravity';
 }
 
 export interface ProviderSequenceSnapshot {
@@ -300,23 +306,8 @@ export interface ConversationProviderSettingsSnapshot extends ProviderSequenceSn
   collaborationMode?: 'plan' | 'default';
 }
 
-export interface ConversationProviderTokenUsageSnapshot extends ProviderSequenceSnapshot {
-  /** 原币费用汇总，保持美元字段的原有语义。 */
-  costs?: import('@zeus/shared').EstimatedMoney[];
-  serviceTier?: string | null;
-  total: TokenUsageBreakdown;
-  last: TokenUsageBreakdown;
-  modelContextWindow: number | null;
-  cacheHitRate: number | null;
-  estimatedCredits: number | null;
-  apiEquivalentUsd: number | null;
-  lastApiEquivalentUsd: number | null;
-  cacheSavingsUsd: number | null;
-  priceCoverage: number | null;
-  pricingCatalogDate: string | null;
-  pricingSourceUrls: string[];
-  historyComplete: boolean;
-}
+/** 持久化的供应商会话用量与原生会话用量采用同一快照结构。 */
+export type ConversationProviderTokenUsageSnapshot = NativeTokenUsageSnapshot;
 
 export interface CodexUsageLedgerRecord {
   id: string;
@@ -383,10 +374,6 @@ export interface CodexRateLimitsState {
 }
 export interface CodexRateLimitsSnapshot extends ProviderSequenceSnapshot {
   value: CodexRateLimitsState;
-}
-export type CodexMcpServerStartupState = string | { status: string; error?: string | null };
-export interface CodexMcpStartupStatusSnapshot extends ProviderSequenceSnapshot {
-  value: Record<string, CodexMcpServerStartupState>;
 }
 
 export type ConversationTurnStatus = 'queued' | 'dispatching' | 'running' | 'waiting' | 'paused' | 'completed' | 'interrupted' | 'failed';
@@ -615,7 +602,7 @@ export class ProviderEventReceiptRepository {
 
 /** 设置仓储保存本机偏好与通知策略，不存储 token、密码等敏感明文。 */
 
-const selectConversationFields = `id, project_id, task_id, session_id, title, title_source, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
+const selectConversationFields = `id, project_id, task_id, session_id, title, title_source, title_generation_attempt, summary, status, stage, stage_updated_at, created_at, updated_at, archived,
   transport_kind, provider_id, provider_thread_id, provider_thread_path, provider_model, provider_state,
   provider_protocol_version, provider_binary_version, legacy_source_conversation_id, provider_settings_json, provider_token_usage_json, permission_mode, collaboration_mode, next_turn_settings_json, completion_unread, attention_kind, attention_revision, attention_turn_id, attention_updated_at, workspace_id, environment_id,
   agent_kind, agent_transport, model_source_id, model_id, native_session_id, native_session_path, capability_snapshot_id,
@@ -624,6 +611,12 @@ const selectConversationMessageFields = `id, conversation_id, role, content, sou
   provider_thread_id, provider_turn_id, provider_item_id, client_message_id`;
 const selectAliasedConversationMessageFields = `message.id, message.conversation_id, message.role, message.content, message.source, message.metadata_json, message.created_at,
   message.provider_thread_id, message.provider_turn_id, message.provider_item_id, message.client_message_id`;
+
+/** SQLite trim 使用与 String.trim() 相同的空白字符，历史列表和发送共用可用性口径。 */
+export const conversationDialogueWhitespaceSql = 'char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279)';
+
+/** 旧消息只将含正文的用户和助手消息用于历史推送。 */
+const legacyDialogueWhereSql = `conversation_id = ? AND role IN ('user', 'assistant') AND trim(content, ${conversationDialogueWhitespaceSql}) <> ''`;
 
 function latestIso(...values: Array<string | null | undefined>): string {
   return values.filter((value): value is string => Boolean(value)).sort((left, right) => right.localeCompare(left))[0] ?? '';
@@ -757,7 +750,7 @@ export class AgentCapabilitySnapshotRepository {
   create(input: CreateAgentCapabilitySnapshotInput): ZeusAgentCapabilitySnapshotRecord {
     const record: ZeusAgentCapabilitySnapshotRecord = {
       id: input.id ?? `agent_capability_${randomId(12)}`,
-      agentKind: assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'agent capability kind'),
+      agentKind: assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'antigravity', 'claude'] as const, 'agent capability kind'),
       transportKind: assertEnum(input.transportKind, ['app_server', 'rpc', 'sdk'] as const, 'agent capability transport'),
       supportStatus: assertEnum(input.supportStatus, ['unavailable', 'framework_only', 'experimental', 'verified'] as const, 'agent capability support status'),
       adapterVersion: input.adapterVersion ?? null,
@@ -782,7 +775,7 @@ export class AgentCapabilitySnapshotRepository {
   }
 
   listByAgent(agentKind: ConversationAgentKind, limit = 20): ZeusAgentCapabilitySnapshotRecord[] {
-    const normalizedAgentKind = assertEnum(agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'agent capability kind');
+    const normalizedAgentKind = assertEnum(agentKind, ['codex', 'pi', 'copilot', 'antigravity', 'claude'] as const, 'agent capability kind');
     const safeLimit = Math.max(1, Math.min(Math.trunc(limit), 200));
     return this.db.select<DbAgentCapabilitySnapshotRow>(`SELECT * FROM agent_capability_snapshots WHERE agent_kind = ? ORDER BY checked_at DESC, id DESC LIMIT ?`, [normalizedAgentKind, safeLimit]).map(mapAgentCapabilitySnapshotRow);
   }
@@ -833,7 +826,7 @@ export class ConversationRepository {
     const providerState = assertEnum(input.providerState ?? 'unbound', ['unbound', 'binding', 'ready', 'active', 'waiting', 'paused', 'archived', 'closed', 'failed'] as const, 'conversation provider state');
     const permissionMode = assertEnum(input.permissionMode ?? 'read-only', ['read-only', 'auto', 'auto-review', 'full-access'] as const, 'conversation permission mode');
     const collaborationMode = assertEnum(input.collaborationMode ?? 'default', ['default', 'plan'] as const, 'conversation collaboration mode');
-    const agentKind = input.agentKind ? assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'claude'] as const, 'conversation agent kind') : transportKind === 'codex_native' ? 'codex' : null;
+    const agentKind = input.agentKind ? assertEnum(input.agentKind, ['codex', 'pi', 'copilot', 'antigravity', 'claude'] as const, 'conversation agent kind') : transportKind === 'codex_native' ? 'codex' : null;
     const agentTransport = input.agentTransport ? assertEnum(input.agentTransport, ['app_server', 'rpc', 'sdk'] as const, 'conversation agent transport') : transportKind === 'codex_native' ? 'app_server' : null;
     const timestamp = nowIso();
     const record: ZeusConversationRecord = {
@@ -844,7 +837,8 @@ export class ConversationRepository {
       environmentId: input.environmentId ?? null,
       sessionId: input.sessionId ?? null,
       title: input.title,
-      titleSource: 'initial',
+      titleSource: input.automaticTitle ? 'pending' : 'initial',
+      titleGenerationAttempt: null,
       summary: input.summary ?? null,
       status: input.status ?? 'open',
       stage: 'created',
@@ -1247,8 +1241,8 @@ export class ConversationRepository {
     return this.getConversationSnapshot<ConversationProviderSettingsSnapshot>(conversationId, 'provider_settings_json');
   }
 
-  upsertProviderTokenUsageSnapshot(conversationId: string, snapshot: ConversationProviderTokenUsageSnapshot): ConversationProviderTokenUsageSnapshot | undefined {
-    return this.upsertConversationSnapshot(conversationId, 'provider_token_usage_json', snapshot);
+  upsertProviderTokenUsageSnapshot(conversationId: string, snapshot: ConversationProviderTokenUsageSnapshot, scope: 'transport' | 'native_session' = 'transport'): ConversationProviderTokenUsageSnapshot | undefined {
+    return this.upsertConversationSnapshot(conversationId, 'provider_token_usage_json', snapshot, scope);
   }
 
   /**
@@ -1298,11 +1292,20 @@ export class ConversationRepository {
     return undefined;
   }
 
-  private upsertConversationSnapshot<T extends ProviderSequenceSnapshot>(conversationId: string, column: 'provider_settings_json' | 'provider_token_usage_json', snapshot: T): T | undefined {
+  private upsertConversationSnapshot<T extends ProviderSequenceSnapshot>(
+    conversationId: string,
+    column: 'provider_settings_json' | 'provider_token_usage_json',
+    snapshot: T,
+    scope: 'transport' | 'native_session' = 'transport',
+  ): T | undefined {
     if (column === 'provider_settings_json') validateProviderSettingsSnapshot(snapshot);
     else validateProviderTokenUsageSnapshot(snapshot);
     const current = this.getConversationSnapshot<T>(conversationId, column);
-    if (!shouldAcceptProviderSnapshot(this.db, snapshot, current)) return current;
+    if (scope === 'native_session') {
+      // ACP 的 generationId 是当前会话身份；同时打开的另一个会话不能把它置为过期。
+      const active = this.db.get<{ id: string }>('SELECT id FROM conversations WHERE id = ? AND native_session_id = ?', [conversationId, snapshot.generationId]);
+      if (!active || (current?.generationId === snapshot.generationId && current.sequence >= snapshot.sequence)) return current;
+    } else if (!shouldAcceptProviderSnapshot(this.db, snapshot, current)) return current;
     this.db.execute(`UPDATE conversations SET ${column} = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(snapshot), nowIso(), conversationId]);
     if (!this.db.get<{ id: string }>(`SELECT id FROM conversations WHERE id = ?`, [conversationId])) throw new Error(`Zeus conversation not found: ${conversationId}`);
     return snapshot;
@@ -1383,6 +1386,16 @@ export class ConversationRepository {
   /** 目录只判断消息是否存在，避免为可见性检查加载整段会话正文。 */
   hasMessages(conversationId: string): boolean {
     return Boolean(this.db.get<{ present: number }>('SELECT 1 AS present FROM conversation_messages WHERE conversation_id = ? LIMIT 1', [conversationId]));
+  }
+
+  /** 旧会话的选项只查询是否存在可发送正文。 */
+  hasLegacyDialogue(conversationId: string): boolean {
+    return Boolean(this.db.get(`SELECT 1 FROM conversation_messages WHERE ${legacyDialogueWhereSql} LIMIT 1`, [conversationId]));
+  }
+
+  /** 用户选中且通过归属校验后，按旧消息的显示顺序读取正文。 */
+  readLegacyDialogue(conversationId: string): Array<{ role: 'user' | 'assistant'; text: string }> {
+    return this.db.select(`SELECT role, content AS text FROM conversation_messages WHERE ${legacyDialogueWhereSql} ORDER BY created_at ASC, id ASC`, [conversationId]);
   }
 
   listMessages(conversationId: string): ZeusConversationMessageRecord[] {
@@ -1512,27 +1525,6 @@ export class ConversationRepository {
     return this.db.select<DbConversationRow>(`SELECT ${selectConversationFields} FROM conversations WHERE archived = 0 AND listing_scope = 'ordinary' ORDER BY updated_at DESC, id DESC`).map(mapConversationRow);
   }
 
-  /** 异步问题按原消息身份关联答复账本，只读取结构化元数据，不读取正文。 */
-  listUnansweredQuestions(): Array<{ conversationId: string; providerTurnId: string; providerItemId: string; metadataJson: string; createdAt: string }> {
-    return this.db.select<{ conversationId: string; providerTurnId: string; providerItemId: string; metadataJson: string; createdAt: string }>(
-      `SELECT message.conversation_id AS conversationId, message.provider_turn_id AS providerTurnId,
-              message.provider_item_id AS providerItemId, message.metadata_json AS metadataJson, message.created_at AS createdAt
-         FROM conversation_messages AS message
-         JOIN conversations AS conversation ON conversation.id = message.conversation_id
-        WHERE conversation.archived = 0 AND conversation.listing_scope = 'ordinary'
-          AND message.role = 'assistant' AND message.provider_turn_id IS NOT NULL AND message.provider_item_id IS NOT NULL
-          AND json_valid(message.metadata_json) AND json_extract(message.metadata_json, '$.delivery') = 'async'
-          AND NOT EXISTS (
-            SELECT 1 FROM conversation_submissions AS submission
-             WHERE submission.conversation_id = message.conversation_id AND json_valid(submission.input_json)
-               AND json_extract(submission.input_json, '$.questionAnswer.providerItemId') = message.provider_item_id
-               AND json_extract(submission.input_json, '$.questionAnswer.providerTurnId') = message.provider_turn_id
-               AND submission.status NOT IN ('failed', 'cancelled', 'deleted')
-          )
-        ORDER BY message.created_at, message.id`,
-    );
-  }
-
   /** 会话选择列表只读取主记录，避免为每条会话加载完整消息正文。 */
   listRecordsByProject(projectId: string, options: ConversationRecordListOptions = {}): ZeusConversationRecord[] {
     return this.db
@@ -1589,12 +1581,14 @@ export class ConversationRepository {
       });
   }
 
-  /** 父任务上下文选择需要同时看到未归档和已归档会话，不改变常规会话列表的隐藏规则。 */
-  listAllByTask(taskId: string): ZeusConversationWithMessagesRecord[] {
-    return this.db.select<DbConversationRow>(`SELECT ${selectConversationFields} FROM conversations WHERE task_id = ? AND listing_scope NOT IN ('expert_internal', 'subagent_internal') ORDER BY created_at ASC, id`, [taskId]).map((row) => {
-      const conversation = mapConversationRow(row);
-      return { ...conversation, messages: this.listMessages(conversation.id) };
-    });
+  /** 推送历史选项按创建顺序列出任务的会话主记录，包含已归档会话。 */
+  listAllRecordsByTask(taskId: string, projectId: string): ZeusConversationRecord[] {
+    return this.db
+      .select<DbConversationRow>(`SELECT ${selectConversationFields} FROM conversations WHERE task_id = ? AND project_id = ? AND listing_scope NOT IN ('expert_internal', 'subagent_internal') ORDER BY created_at ASC, id`, [
+        taskId,
+        projectId,
+      ])
+      .map(mapConversationRow);
   }
 
   listBySessionId(sessionId: string): ZeusConversationWithMessagesRecord[] {
@@ -1674,26 +1668,50 @@ export class ConversationRepository {
     return restored;
   }
 
-  /** 按主键向后恢复自动创建任务的未完成命名，每页最多 25 条，不重复扫描页首。 */
-  listPendingAutomaticTitleIds(afterId: string): string[] {
+  /** 每页恢复最多 25 个已有成功轮次的待命名会话或旧版任务占位。 */
+  listPendingAutomaticTitleIds(afterId: string, legacyPlaceholder: string): string[] {
     return this.db
       .select<{ id: string }>(
         `SELECT conversation.id FROM conversations AS conversation
-       JOIN tasks AS task ON task.id = conversation.task_id AND task.project_id = conversation.project_id
-       WHERE conversation.id > ? AND conversation.title_source IN ('initial', 'pending')
+       LEFT JOIN tasks AS task ON task.id = conversation.task_id AND task.project_id = conversation.project_id
+       WHERE conversation.id > ? AND conversation.title_generation_attempt IS NOT 'reply'
          AND conversation.archived = 0 AND conversation.origin_kind = 'ordinary' AND conversation.listing_scope = 'ordinary'
-         AND task.created_from = 'conversation' AND task.archived = 0 AND task.deleted_at IS NULL
-         AND CASE WHEN json_valid(task.source_context_json) THEN json_extract(task.source_context_json, '$.conversationId') END = conversation.id
+         AND (conversation.title_source = 'pending' OR (task.id IS NOT NULL AND (
+           conversation.title_source = 'initial' OR (
+             conversation.title_source = 'automatic' AND conversation.title_generation_attempt IS NULL AND conversation.title = ? AND task.title = conversation.title
+           )
+         )))
+         AND (conversation.task_id IS NULL OR (
+           task.created_from = 'conversation' AND task.archived = 0 AND task.deleted_at IS NULL
+           AND CASE WHEN json_valid(task.source_context_json) THEN json_extract(task.source_context_json, '$.conversationId') END = conversation.id
+         ))
          AND EXISTS (SELECT 1 FROM conversation_submissions WHERE conversation_id = conversation.id)
+         AND EXISTS (SELECT 1 FROM conversation_turns WHERE conversation_id = conversation.id AND status = 'completed')
        ORDER BY conversation.id LIMIT 25`,
-        [afterId],
+        [afterId, legacyPlaceholder],
       )
       .map((row) => row.id);
   }
 
-  /** 首发及启动恢复可以启用初始标题，手动或已完成命名不会被重新启用。 */
-  enableAutomaticTitle(conversationId: string): void {
-    this.db.execute(`UPDATE conversations SET title_source = 'pending' WHERE id = ? AND title_source = 'initial'`, [conversationId]);
+  /** 发出模型请求前持久记录机会；用完完整回复的机会后结束自动命名。 */
+  claimAutomaticTitleAttempt(conversation: ZeusConversationRecord, attempt: ConversationTitleGenerationAttempt): boolean {
+    return this.db.durableTransactionSync(() => {
+      /** 同一会话的手动名称或另一次已认领的机会不能被旧请求覆盖。 */
+      const current = this.getRecordById(conversation.id);
+      if (
+        !current ||
+        current.archived ||
+        current.titleSource === 'manual' ||
+        current.titleSource !== conversation.titleSource ||
+        current.title !== conversation.title ||
+        current.titleGenerationAttempt !== conversation.titleGenerationAttempt ||
+        current.titleGenerationAttempt === 'reply' ||
+        (attempt === 'summary' && (current.titleGenerationAttempt !== null || current.titleSource === 'automatic'))
+      )
+        return false;
+      this.db.execute(`UPDATE conversations SET title_generation_attempt = ?, title_source = ? WHERE id = ?`, [attempt, attempt === 'reply' ? 'automatic' : 'pending', conversation.id]);
+      return true;
+    });
   }
 
   /** 名称与来源一起保存，手动命名立即阻止后台覆盖。 */
@@ -3000,11 +3018,6 @@ export class ConversationServerRequestRepository {
 export class ConversationPlanActionRepository {
   constructor(private readonly db: ZeusDatabasePort) {}
 
-  /** 全局待办直接读取尚未处理的计划确认。 */
-  listPending(): ZeusConversationPlanActionRecord[] {
-    return this.db.select<DbConversationPlanActionRow>("SELECT * FROM conversation_plan_actions WHERE status = 'pending' ORDER BY created_at, id").map(mapConversationPlanActionRow);
-  }
-
   createPending(input: { conversationId: string; turnId: string; planItemId: string; createdAt: string }): ZeusConversationPlanActionRecord {
     const existing = this.db.get<DbConversationPlanActionRow>(`SELECT * FROM conversation_plan_actions WHERE plan_item_id = ?`, [input.planItemId]);
     if (existing) return mapConversationPlanActionRow(existing);
@@ -3185,10 +3198,13 @@ function validateNextTurnSettings(settings: unknown): asserts settings is Conver
   assertEnum(settings.collaborationMode, ['default', 'plan'] as const, 'conversation next turn collaboration mode');
 }
 
+/** 快照与账本使用同一批 Token 计数键，凭据检查按小写键匹配。 */
+const usageTokenCounterKeys = tokenUsageFields.map((field) => field.toLowerCase());
+
 function validateProviderTokenUsageSnapshot(snapshot: unknown): asserts snapshot is ConversationProviderTokenUsageSnapshot {
   assertProviderSequenceSnapshot(snapshot);
   const candidate = snapshot as ProviderSequenceSnapshot & Record<string, unknown>;
-  assertNoSecretLikeProviderKeys(candidate, new Set(['inputtokens', 'cachedinputtokens', 'cachewriteinputtokens', 'outputtokens', 'reasoningoutputtokens', 'totaltokens']));
+  assertNoSecretLikeProviderKeys(candidate, new Set(['contextusedtokens', ...usageTokenCounterKeys]));
   assertOnlyKeys(
     candidate,
     [
@@ -3198,6 +3214,8 @@ function validateProviderTokenUsageSnapshot(snapshot: unknown): asserts snapshot
       'total',
       'last',
       'modelContextWindow',
+      'contextUsedTokens',
+      'reportedTokenFields',
       'cacheHitRate',
       'estimatedCredits',
       'apiEquivalentUsd',
@@ -3215,6 +3233,8 @@ function validateProviderTokenUsageSnapshot(snapshot: unknown): asserts snapshot
   validateTokenUsageBreakdown(candidate.total);
   validateTokenUsageBreakdown(candidate.last);
   if (candidate.serviceTier !== undefined && candidate.serviceTier !== null && typeof candidate.serviceTier !== 'string') throw new Error('Invalid provider token usage snapshot');
+  if (candidate.reportedTokenFields !== undefined && !isReportedTokenFields(candidate.reportedTokenFields)) throw new Error('Invalid reported token fields');
+  if (candidate.contextUsedTokens != null && (typeof candidate.contextUsedTokens !== 'number' || !Number.isSafeInteger(candidate.contextUsedTokens) || candidate.contextUsedTokens < 0)) throw new Error('Invalid provider context usage');
   for (const value of [candidate.modelContextWindow, candidate.cacheHitRate, candidate.estimatedCredits, candidate.apiEquivalentUsd, candidate.lastApiEquivalentUsd, candidate.cacheSavingsUsd, candidate.priceCoverage]) {
     if (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) throw new Error('Invalid provider token usage snapshot');
   }
@@ -3226,13 +3246,14 @@ function validateProviderTokenUsageSnapshot(snapshot: unknown): asserts snapshot
 
 export function validateTokenUsageBreakdown(value: unknown): asserts value is TokenUsageBreakdown {
   if (!isPlainRecord(value)) throw new Error('Invalid token usage breakdown');
-  assertOnlyKeys(value, ['totalTokens', 'inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens'], 'token usage breakdown');
+  assertOnlyKeys(value, tokenUsageFields, 'token usage breakdown');
   if (Object.values(value).some((entry) => typeof entry !== 'number' || !Number.isSafeInteger(entry) || entry < 0)) throw new Error('Invalid token usage breakdown');
 }
 
 function validateCodexUsageEstimate(value: unknown): asserts value is CodexUsageEstimate {
   if (!isPlainRecord(value) || !isPlainRecord(value.rateSnapshot)) throw new Error('Invalid Codex usage estimate');
   validateEstimatedMoney(value.costs);
+  if (value.reportedTokenFields !== undefined && !isReportedTokenFields(value.reportedTokenFields)) throw new Error('Invalid reported token fields');
   if (value.requests !== undefined) {
     if (!Array.isArray(value.requests)) throw new Error('Invalid request price snapshots');
     const identities = new Set<string>();
@@ -3252,10 +3273,7 @@ function validateCodexUsageEstimate(value: unknown): asserts value is CodexUsage
       validateCodexUsageEstimate(request.estimate);
     }
   }
-  assertNoSecretLikeProviderKeys(
-    value,
-    new Set(['input', 'cachedinput', 'cachewrite', 'output', 'billabletokens', 'pricedtokens', 'totaltokens', 'inputtokens', 'cachedinputtokens', 'cachewriteinputtokens', 'outputtokens', 'reasoningoutputtokens']),
-  );
+  assertNoSecretLikeProviderKeys(value, new Set(['billabletokens', 'pricedtokens', ...usageTokenCounterKeys]));
   for (const candidate of [value.credits, value.apiEquivalentUsd, value.cacheSavingsUsd, value.coverage]) {
     if (candidate !== null && (typeof candidate !== 'number' || !Number.isFinite(candidate) || candidate < 0)) throw new Error('Invalid Codex usage estimate');
   }
@@ -3276,23 +3294,6 @@ export function validateRateLimitsSnapshot(snapshot: unknown): asserts snapshot 
     if (window.remaining !== undefined && (typeof window.remaining !== 'number' || !Number.isFinite(window.remaining))) throw new Error('Invalid Codex rate limits snapshot');
     if (window.usedPercent !== undefined && (typeof window.usedPercent !== 'number' || !Number.isFinite(window.usedPercent))) throw new Error('Invalid Codex rate limits snapshot');
     if (window.resetsAt !== undefined && window.resetsAt !== null && typeof window.resetsAt !== 'number' && typeof window.resetsAt !== 'string') throw new Error('Invalid Codex rate limits snapshot');
-  }
-}
-
-export function validateMcpStartupStatusSnapshot(snapshot: unknown): asserts snapshot is CodexMcpStartupStatusSnapshot {
-  assertProviderSequenceSnapshot(snapshot);
-  const candidate = snapshot as ProviderSequenceSnapshot & Record<string, unknown>;
-  assertOnlyKeys(candidate, ['generationId', 'sequence', 'value'], 'Codex MCP startup snapshot');
-  assertProviderVisibleJson(candidate.value, 'MCP startup status');
-  if (!isPlainRecord(candidate.value)) throw new Error('Invalid Codex MCP startup snapshot');
-  for (const [serverId, state] of Object.entries(candidate.value)) {
-    if (!serverId.trim()) throw new Error('Invalid Codex MCP startup snapshot');
-    // 顶层键是 MCP 服务标识而非负载字段；密钥规则继续应用于每个服务的状态内容。
-    assertNoSecretLikeProviderKeys(state, new Set<string>(), `snapshot.${serverId}`);
-    if (typeof state === 'string') continue;
-    if (!isPlainRecord(state) || typeof state.status !== 'string') throw new Error('Invalid Codex MCP startup snapshot');
-    assertOnlyKeys(state, ['status', 'error'], 'Codex MCP server startup state');
-    if (state.error !== undefined && state.error !== null && typeof state.error !== 'string') throw new Error('Invalid Codex MCP startup snapshot');
   }
 }
 
@@ -3334,7 +3335,9 @@ function assertNoSecretLikeProviderKeys(value: unknown, allowedTokenCounters = n
   seen.add(value);
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
     const normalized = key.replace(/[^a-z0-9]/giu, '').toLowerCase();
-    const tokenLike = normalized.includes('token') && !allowedTokenCounters.has(normalized);
+    /** 只豁免由已定义计数分类组成的元数据数组，凭据检查继续覆盖其他字段和值的结构。 */
+    const knownUsageFields = key === 'reportedTokenFields' && isReportedTokenFields(nested);
+    const tokenLike = normalized.includes('token') && !allowedTokenCounters.has(normalized) && !knownUsageFields;
     const secretKeyLike =
       normalized === 'key' || ['apikey', 'accesskey', 'secretkey', 'privatekey', 'signingkey', 'encryptionkey', 'decryptionkey', 'sessionkey', 'serviceaccountkey', 'clientkey', 'keymaterial'].some((marker) => normalized.includes(marker));
     if (tokenLike || secretKeyLike || ['secret', 'authorization', 'credential', 'password', 'passphrase', 'bearer', 'cookie'].some((marker) => normalized.includes(marker))) {
@@ -3474,6 +3477,8 @@ interface DbConversationRow {
   title: string;
   /** 与标题同时保存的命名状态。 */
   title_source: ConversationTitleSource;
+  /** 已使用的最新命名机会。 */
+  title_generation_attempt: ConversationTitleGenerationAttempt | null;
   summary: string | null;
   status: string;
   stage: ConversationStage;
@@ -3708,6 +3713,7 @@ function mapConversationRow(row: DbConversationRow): ZeusConversationRecord {
     sessionId: row.session_id,
     title: row.title,
     titleSource: row.title_source,
+    titleGenerationAttempt: row.title_generation_attempt,
     summary: row.summary,
     status: row.status,
     stage: assertEnum(row.stage, ['created', 'connecting', 'queued', 'running', 'waiting_user', 'waiting_approval', 'completed', 'failed', 'paused', 'ready', 'archived'] as const, 'conversation stage'),

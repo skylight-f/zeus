@@ -17,13 +17,30 @@
 .macos-ai-app .automations-header,
 .macos-ai-app .automations-header-actions,
 .macos-ai-app .automation-row,
-.macos-ai-app .automation-row-actions,
-.macos-ai-app .automation-inbox-actions {
+.macos-ai-app .automation-row-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
+/* 固定操作文案不拆字，窄窗口按按钮整体换行。 */
+.macos-ai-app :where(.automations-header-actions, .automation-editor footer) {
+  min-inline-size: 0;
+  flex-wrap: wrap;
+}
+.macos-ai-app :where(.automations-workspace, .automation-editor) .zeus-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* 正文可折行，下拉只省略显示，不截断实际配置和可访问名称。 */
+.macos-ai-app :where(.automation-editor label, .automation-editor .zeus-select) {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+.macos-ai-app :where(.automation-editor small, .automation-editor label > span) {
+  overflow-wrap: anywhere;
+}
 .macos-ai-app .automations-header {
   justify-content: space-between;
   gap: 20px;
@@ -52,48 +69,10 @@
   flex-shrink: 0;
 }
 
-.macos-ai-app .automations-workspace .zeus-button svg,
-.macos-ai-app .automations-tabs svg {
+.macos-ai-app .automations-workspace .zeus-button svg {
   inline-size: 16px;
   block-size: 16px;
   flex-shrink: 0;
-}
-
-.macos-ai-app .automations-tabs {
-  display: flex;
-  inline-size: fit-content;
-  gap: 4px;
-}
-
-.macos-ai-app .automations-tabs button {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-block-size: 32px;
-  padding: 4px 12px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--zeus-product-muted);
-  font: inherit;
-}
-
-.macos-ai-app .automations-tabs button[aria-current='page'] {
-  color: var(--zeus-brand-text);
-  font-weight: 600;
-}
-
-.macos-ai-app .automations-tabs button > span {
-  border-radius: 999px;
-  background: var(--zeus-product-panel-muted);
-  padding: 1px 6px;
-  font-size: 11px;
-  text-align: center;
-}
-
-.macos-ai-app .automations-tabs button > .automations-unread-count {
-  background: var(--zeus-product-accent);
-  color: var(--zeus-control-primary-text, white);
 }
 
 .macos-ai-app .automations-layout {
@@ -105,14 +84,12 @@
   overflow: hidden;
 }
 
-.macos-ai-app .automation-row,
-.macos-ai-app .automation-inbox-row {
+.macos-ai-app .automation-row {
   min-inline-size: 0;
   border-block-end: 1px solid var(--zeus-product-line-soft);
 }
 
-.macos-ai-app .automation-row:last-child,
-.macos-ai-app .automation-inbox-row:last-child {
+.macos-ai-app .automation-row:last-child {
   border-block-end: 0;
 }
 
@@ -146,15 +123,13 @@
   background: var(--zeus-product-subtle);
 }
 
-.macos-ai-app .automation-row-main > span:nth-child(2),
-.macos-ai-app .automation-inbox-row > div:first-of-type {
+.macos-ai-app .automation-row-main > span:nth-child(2) {
   display: grid;
   min-inline-size: 0;
   gap: 4px;
 }
 
-.macos-ai-app .automation-row-main strong,
-.macos-ai-app .automation-inbox-row strong {
+.macos-ai-app .automation-row-main strong {
   overflow-wrap: anywhere;
   font-size: 13px;
   font-weight: 600;
@@ -167,7 +142,6 @@
 }
 
 .macos-ai-app .automation-row-main small,
-.macos-ai-app .automation-inbox-row small,
 .macos-ai-app .automation-row-schedule {
   color: var(--zeus-product-muted);
   font-size: 12px;
@@ -187,59 +161,48 @@
   padding: 0;
 }
 
-.macos-ai-app .automation-inbox-row {
-  display: grid;
-  grid-template-columns: 80px minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 16px;
-  padding: 16px;
-}
-
-.macos-ai-app .automation-inbox-row[data-unread='true'] {
-  box-shadow: inset 3px 0 var(--zeus-product-accent);
-}
-
-.macos-ai-app .automation-run-status {
-  inline-size: fit-content;
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: var(--zeus-product-panel-muted);
-  color: var(--zeus-product-muted);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.macos-ai-app .automation-run-status.status-succeeded {
-  color: var(--zeus-status-success-text);
-}
-
-.macos-ai-app .automation-run-status.status-failed,
-.macos-ai-app .automation-run-status.status-outcome_unknown {
-  background: var(--zeus-control-danger-bg);
-  color: var(--zeus-control-danger-text);
-}
-
-.macos-ai-app .automation-run-status.status-blocked,
-.macos-ai-app .automation-inbox-row .automation-warning {
-  background: var(--zeus-warning-bg);
-  color: var(--zeus-product-text);
-}
-
-.macos-ai-app .automation-inbox-row p {
-  margin: 3px 0 0;
-  color: var(--zeus-product-muted);
-  font-size: 12px;
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-}
-
-.macos-ai-app .automation-inbox-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 .macos-ai-app .zeus-form-dialog.automation-editor {
-  inline-size: min(680px, 100%);
+  inline-size: min(1160px, 100%);
+}
+
+/* 只扩展自动化表单的内容布局，头尾和滚动仍由公共弹窗管理。 */
+.macos-ai-app .automation-editor-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 8fr) minmax(0, 5fr);
+  align-items: start;
+  gap: 24px;
+  min-inline-size: 0;
+}
+
+/* 指令与项目保持独立分组，右栏按现有顺序呈现全部条件字段。 */
+.macos-ai-app .automation-editor-settings {
+  display: grid;
+  position: relative;
+  align-content: start;
+  gap: 16px;
+  min-inline-size: 0;
+}
+
+/* 分隔线居于两栏间距中央，不额外挤占右栏宽度。 */
+.macos-ai-app .automation-editor-settings::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: -12px;
+  border-inline-start: 1px solid var(--zeus-product-line-soft);
+  pointer-events: none;
+}
+
+/* 权限等独占一行的字段使用完整栏宽，避免空出半栏。 */
+.macos-ai-app .automation-editor-settings .automation-form-grid > :only-child {
+  grid-column: 1 / -1;
+}
+
+/* 双栏分隔由右栏承担，内容区不再重复绘制底部分隔线。 */
+.macos-ai-app .automation-form-section.automation-editor-content {
+  align-content: start;
+  padding-block-end: 0;
+  border-block-end: 0;
 }
 
 .macos-ai-app .automation-form-section {
@@ -265,6 +228,7 @@
 }
 
 .macos-ai-app .automation-editor textarea {
+  block-size: 320px;
   min-block-size: 120px;
 }
 
@@ -349,12 +313,25 @@
   font-size: 13px;
   line-height: 1.55;
 }
-
-.macos-ai-app .automations-tabs button:focus-visible,
 .macos-ai-app .automation-row-main:focus-visible,
 .macos-ai-app .automation-editor summary:focus-visible {
   outline: 2px solid var(--zeus-product-accent);
   outline-offset: -2px;
+}
+
+/* 窄窗口恢复原有阅读顺序，避免双栏挤压长文本和下拉控件。 */
+@media (width < 980px) {
+  .macos-ai-app .automation-editor-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .macos-ai-app .automation-editor-settings::before {
+    display: none;
+  }
+  .macos-ai-app .automation-form-section.automation-editor-content {
+    padding-block-end: 16px;
+    border-block-end: 1px solid var(--zeus-product-line-soft);
+  }
 }
 
 @media (max-width: 680px) {
@@ -376,14 +353,6 @@
   }
   .macos-ai-app .automation-row-schedule {
     grid-column: 2;
-  }
-  .macos-ai-app .automation-inbox-row {
-    grid-template-columns: auto minmax(0, 1fr);
-    gap: 12px;
-  }
-  .macos-ai-app .automation-inbox-actions {
-    grid-column: 2;
-    justify-content: flex-start;
   }
 }
 
@@ -600,23 +569,6 @@
   margin: 0;
 }
 
-.macos-ai-app .extension-mcp-sources {
-  display: grid;
-  gap: 12px;
-  margin: 16px 0;
-}
-
-.macos-ai-app .extension-mcp-sources dd {
-  margin: 4px 0 0;
-  overflow-wrap: anywhere;
-}
-
-.macos-ai-app .extension-mcp-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-
 .macos-ai-app .extension-component-row {
   align-items: center;
   display: flex;
@@ -675,7 +627,8 @@
 }
 
 .macos-ai-app .extension-source-tabs button[aria-pressed='true'] {
-  background: var(--zeus-product-panel);
+  /* 选中态独立于内容底色，页面合并表面后仍保持可辨认。 */
+  background: light-dark(var(--zeus-product-panel), var(--zeus-product-selected));
   color: var(--zeus-product-text);
   box-shadow: none;
   font-weight: 600;
@@ -769,121 +722,5 @@
   .macos-ai-app .extension-form-grid,
   .macos-ai-app .extension-path-control {
     grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-/* MCP 目录沿用插件列表密度，来源与状态在窄窗口内可换行。 */
-.macos-ai-app .extension-mcp-catalog {
-  margin-block-end: 24px;
-}
-.macos-ai-app .extension-mcp-filters {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin-block: 12px;
-}
-.macos-ai-app .extension-mcp-filters label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-}
-.macos-ai-app .extension-mcp-count {
-  color: var(--zeus-product-subtle);
-  font-size: 12px;
-}
-.macos-ai-app .extension-mcp-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-.macos-ai-app .extension-mcp-list li {
-  border-block-start: 1px solid var(--zeus-product-line-soft);
-  padding-block: 12px;
-}
-.macos-ai-app .extension-mcp-list li > span:first-child {
-  min-width: 0;
-  flex: 1;
-  overflow-wrap: anywhere;
-}
-.macos-ai-app .extension-mcp-sources {
-  margin-block-start: 12px;
-  font-size: 12px;
-  color: var(--zeus-product-subtle);
-}
-.macos-ai-app .extension-mcp-sources summary {
-  cursor: pointer;
-}
-.macos-ai-app .extension-mcp-sources dl {
-  display: grid;
-  gap: 10px;
-}
-.macos-ai-app .extension-mcp-sources dd {
-  margin-inline-start: 0;
-  overflow-wrap: anywhere;
-}
-
-.macos-ai-app .extension-mcp-filters > .zeus-select {
-  width: min(240px, 100%);
-  flex: 0 1 240px;
-}
-.macos-ai-app .extension-mcp-source-note {
-  color: var(--zeus-product-subtle);
-  font-size: 12px;
-}
-.macos-ai-app .extension-mcp-list li > span:last-child {
-  font-size: 12px;
-  color: var(--zeus-product-subtle);
-}
-
-/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
-
-.macos-ai-app .automation-advanced-settings > .automation-form-section {
-  margin-block-start: 16px;
-}
-
-/* 新增功能沿用本地既有规则；以下仅补充新增界面状态。 */
-.macos-ai-app .automation-editor-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 8fr) minmax(0, 5fr);
-  align-items: start;
-  gap: 24px;
-  min-inline-size: 0;
-}
-.macos-ai-app .automation-editor-settings {
-  display: grid;
-  position: relative;
-  align-content: start;
-  gap: 16px;
-  min-inline-size: 0;
-}
-.macos-ai-app .automation-editor-settings::before {
-  content: '';
-  position: absolute;
-  inset-block: 0;
-  inset-inline-start: -12px;
-  border-inline-start: 1px solid var(--zeus-product-line-soft);
-  pointer-events: none;
-}
-.macos-ai-app .automation-editor-settings .automation-form-grid > :only-child {
-  grid-column: 1 / -1;
-}
-.macos-ai-app .automation-form-section.automation-editor-content {
-  align-content: start;
-  padding-block-end: 0;
-  border-block-end: 0;
-}
-@media (width < 980px) {
-  .macos-ai-app .automation-editor-layout {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
-  }
-  .macos-ai-app .automation-editor-settings::before {
-    display: none;
-  }
-  .macos-ai-app .automation-form-section.automation-editor-content {
-    padding-block-end: 16px;
-    border-block-end: 1px solid var(--zeus-product-line-soft);
   }
 }

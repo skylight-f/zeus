@@ -43,8 +43,6 @@ import {
   itemTypeFromValue,
   liveProgressProjection,
   nativePendingRequestProjection,
-  normalizeMcpStartupStatusMap,
-  normalizeSingleMcpStartupStatus,
   normalizeTurnPlan,
   parseJsonRecord,
   phaseFromItem,
@@ -64,6 +62,7 @@ import {
   serializeError,
   tokenUsageBreakdown,
 } from './codexNativeConversationPolicy.js';
+import { codexMcpStartupNotification, compactNewCommandOutput } from './conversationStorageCompaction.js';
 
 export interface CodexProviderEventProjectionDependencies {
   options: CreateCodexNativeConversationCoordinatorOptions;
@@ -228,7 +227,8 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     submissionPresentation,
     syncItemResources,
   } = dependencies;
-  if (closed) return;
+  /** MCP 启动通知是初始化诊断，不产生会话事实或补拉事件。 */
+  if (closed || event.method === codexMcpStartupNotification) return;
   const identity = codexProviderEventIdentity(event);
   if (hasProcessedProviderEvent(event, identity)) return;
   const params: Record<string, unknown> = isRecord(event.params) ? event.params : {};
@@ -340,15 +340,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
 
   function broadcastLinkedFileApprovalChanges(providerItemId: string, providerTurnId: string): void {
     if (!conversation) return;
-    const linkedRequests = options.requests.listPendingByConversation(conversation.id).filter((request) => {
-      if (request.requestKind !== 'file') return false;
-      const payload = parseJsonRecord(request.payloadJson);
-      if (payload.itemId !== providerItemId) return false;
-      // 某些兼容来源只保证 itemId 在 turn 内唯一；有轮次证据时禁止唤醒其他轮次的授权卡片。
-      if (typeof payload.turnId === 'string' && payload.turnId) return payload.turnId === providerTurnId;
-      const requestTurn = request.turnId ? options.turns.getById(request.turnId) : undefined;
-      return !requestTurn?.providerTurnId || requestTurn.providerTurnId === providerTurnId;
-    });
+    const linkedRequests = options.requests.listPendingByConversation(conversation.id).filter((request) => request.requestKind === 'file' && parseJsonRecord(request.payloadJson).itemId === providerItemId);
     if (linkedRequests.length === 0) return;
     const approvalContext = contexts.get(conversation.id) ?? contextFromConversation(conversation);
     for (const request of linkedRequests) {
@@ -731,7 +723,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     });
     const ephemeral = contexts.get(conversation.id)?.ephemeral === true;
     const conversationGoal = options.goals.get(conversation.id);
-    if (!internalContextCompaction && !ephemeral && !conversationGoal) {
+    /** 正常交接等待子任务回传，失败和中断仍按自身终态提醒。 */
+    const operationHandoff = !failed && !interrupted && options.isOperationHandoff?.(conversation.id, terminalTurn.id) === true;
+    if (!internalContextCompaction && !ephemeral && !conversationGoal && !operationHandoff) {
       options.conversations.markAttentionUnread(conversation.id, {
         kind: failed ? 'failed' : interrupted ? 'interrupted' : 'completed',
         turnId: providerTurnId,
@@ -775,11 +769,12 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
         providerTurnId,
         status: terminalStatus,
         completedAt: timestamp,
+        ...(operationHandoff ? { operationHandoff: true } : {}),
         ...(failureRecord ? { error: projectConversationTurnFailure(failureRecord) } : {}),
         hasUnreadAttention: options.conversations.getById(conversation.id)?.attentionUnread === true,
-        notificationEligible: !internalContextCompaction && !conversationGoal,
+        notificationEligible: !internalContextCompaction && !conversationGoal && !operationHandoff,
         /** 正常实时完成才允许预测下一句，独立于桌面通知和目标模式。 */
-        inputSuggestionEligible: !internalContextCompaction,
+        inputSuggestionEligible: !internalContextCompaction && !operationHandoff,
         ...(internalContextCompaction ? { internalOperation: 'context_compaction' } : {}),
       },
     };
@@ -791,7 +786,14 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const providerItemId = providerItemIdFrom(params);
     const turn = providerTurnId ? options.turns.listByConversation(conversation.id).find((candidate) => candidate.providerTurnId === providerTurnId) : undefined;
     if (!providerTurnId || !providerItemId || !turn) return;
-    const presentedItemPayload = sanitizeConversationItemPayload(itemPayload.type === 'userMessage' ? { ...itemPayload, ...submissionPresentation(conversation.id, turn, itemPayload) } : itemPayload);
+    /** 交接正文在首个条目事件起使用处理过程展示语义。 */
+    const presentedItemPayload = sanitizeConversationItemPayload(
+      itemPayload.type === 'userMessage'
+        ? { ...itemPayload, ...submissionPresentation(conversation.id, turn, itemPayload) }
+        : itemPayload.type === 'agentMessage'
+          ? { ...itemPayload, operationHandoff: options.isOperationHandoff?.(conversation.id, turn.id) || undefined }
+          : itemPayload,
+    );
     const itemType = itemTypeFromValue(itemPayload.type);
     // 兼容 app-server 不发送 rawResponseItem/completed 的版本：模型一旦产出工具、命令、
     // 文件变更等非文本项，本次请求即不能用总输出 Token 计算纯文本生成速率。
@@ -1022,6 +1024,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     if (params.delta.trim()) modelRequestTiming.observe(conversation.id, turn.id, firstVisibleReceiptAt(receiptEvents, event.receivedAt), 'visible_text');
     // 增量本身不声明正文阶段，沿用已知分类；缺少开始事件时等待完成事件确认。
     const existing = options.providerItems.getByProvider(threadId, providerItemId);
+    const existingPayload = existing ? parseJsonRecord(existing.payloadJson) : {};
+    /** 从已有标记接续流式正文；丢失开始事件时核对持久交接记录。 */
+    const operationHandoff = event.method === 'item/agentMessage/delta' && (existingPayload.operationHandoff === true || options.isOperationHandoff?.(conversation.id, turn.id) === true);
     const item = options.providerItems.appendDelta({
       conversationId: conversation.id,
       turnId: turn.id,
@@ -1030,7 +1035,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       providerItemId,
       itemType: itemTypeFromMethod(event.method),
       phase: existing?.phase ?? 'prework',
-      payload: { ...(existing ? parseJsonRecord(existing.payloadJson) : {}), ...params },
+      payload: { ...existingPayload, ...params, ...(operationHandoff ? { operationHandoff: true } : {}) },
       delta: params.delta,
       updatedAt: event.receivedAt,
     });
@@ -1072,7 +1077,14 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const providerItemId = providerItemIdFrom(params);
     const turn = providerTurnId ? options.turns.listByConversation(conversation.id).find((candidate) => candidate.providerTurnId === providerTurnId) : undefined;
     if (!providerTurnId || !providerItemId || !turn) return;
-    const presentedItemPayload = sanitizeConversationItemPayload(itemPayload.type === 'userMessage' ? { ...itemPayload, ...submissionPresentation(conversation.id, turn, itemPayload) } : itemPayload);
+    /** 只有受信的交接轮次把模型最终输出归入过程。 */
+    const presentedItemPayload = sanitizeConversationItemPayload(
+      itemPayload.type === 'userMessage'
+        ? { ...itemPayload, ...submissionPresentation(conversation.id, turn, itemPayload) }
+        : itemPayload.type === 'agentMessage'
+          ? { ...itemPayload, operationHandoff: options.isOperationHandoff?.(conversation.id, turn.id) || undefined }
+          : itemPayload,
+    );
     const itemType = itemTypeFromValue(itemPayload.type);
     const existing = options.providerItems.getByProvider(threadId, providerItemId);
     const userMessageProjection = itemType === 'userMessage' ? projectProviderUserMessage(conversation, turn, presentedItemPayload, itemText(itemPayload), providerItemId, event.receivedAt) : null;
@@ -1081,6 +1093,24 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     const completedProjection = userMessageProjection
       ? { ...completedItemProjection(existing, presentedItemPayload, itemType), textContent: userMessageProjection.content }
       : completedItemProjection(existing, presentedItemPayload, itemType);
+    /** 先持久化原件，再将可从该原件恢复的命令输出替换为句柄。 */
+    const executionSegment = options.execution.segmentByNativeSession(threadId, conversation.id);
+    const rawCommandResult = completedProjection.textContent || (itemType === 'commandExecution' ? JSON.stringify(completedProjection.payload) : '');
+    const archivedCommand =
+      itemType === 'commandExecution' && executionSegment && executionSegment.state !== 'sealed' && typeof completedProjection.payload.aggregatedOutput === 'string'
+        ? await options.toolResults.store({
+            conversationId: conversation.id,
+            turnId: turn.id,
+            segmentId: executionSegment.id,
+            toolPairId: providerItemId,
+            toolKind: 'command',
+            text: rawCommandResult,
+            createdAt: event.receivedAt,
+          })
+        : undefined;
+    const storedPayload = archivedCommand ? compactNewCommandOutput(completedProjection.payload, archivedCommand.record, rawCommandResult) : completedProjection.payload;
+    /** Provider 预览与归档正文相同也只保留一份。 */
+    const storedText = storedPayload !== completedProjection.payload && completedProjection.textContent === completedProjection.payload.aggregatedOutput ? '' : completedProjection.textContent;
     const item = options.providerItems.upsertCompleted({
       conversationId: conversation.id,
       turnId: turn.id,
@@ -1089,9 +1119,9 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       providerItemId,
       itemType,
       // 完成事件省略阶段时保留已知分类，避免把过程说明误判成正文。
-      phase: phaseFromItem(completedProjection.payload),
-      payload: completedProjection.payload,
-      textContent: completedProjection.textContent,
+      phase: phaseFromItem(storedPayload),
+      payload: storedPayload,
+      textContent: storedText,
       status: itemPayload.status === 'failed' ? 'failed' : 'completed',
       startedAt: typeof itemPayload.startedAt === 'string' ? itemPayload.startedAt : null,
       completedAt: event.receivedAt,
@@ -1109,12 +1139,11 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       providerItemId,
       itemType: item.itemType,
       status: item.status === 'failed' ? 'failed' : 'completed',
-      payload: completedProjection.payload,
+      payload: storedPayload,
       text: item.textContent,
       occurredAt: event.receivedAt,
     });
     if (isToolResultItem(item.itemType)) sessionMetricsChanged = true;
-    const executionSegment = options.execution.segmentByNativeSession(threadId, conversation.id);
     if (executionSegment && executionSegment.state !== 'sealed') {
       if (item.itemType === 'agentMessage' && !options.execution.modelHistoryByProviderItem(conversation.id, providerItemId, 'agentMessage')) {
         options.execution.appendModelHistory({
@@ -1155,21 +1184,23 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
       } else if (isToolResultItem(item.itemType)) {
         const rawText = item.textContent || JSON.stringify(completedProjection.payload);
         const toolKind = item.itemType === 'commandExecution' ? 'command' : /search/i.test(item.itemType) ? 'search' : 'other';
-        const stored = await options.toolResults.store({
-          conversationId: conversation.id,
-          turnId: turn.id,
-          segmentId: executionSegment.id,
-          toolPairId: providerItemId,
-          toolKind,
-          text: rawText,
-          createdAt: event.receivedAt,
-        });
+        const stored =
+          archivedCommand ??
+          (await options.toolResults.store({
+            conversationId: conversation.id,
+            turnId: turn.id,
+            segmentId: executionSegment.id,
+            toolPairId: providerItemId,
+            toolKind,
+            text: rawText,
+            createdAt: event.receivedAt,
+          }));
         options.execution.appendModelHistory({
           conversationId: conversation.id,
           turnId: turn.id,
           segmentId: executionSegment.id,
           role: 'assistant',
-          content: { type: 'tool_call', itemType: item.itemType, payload: completedProjection.payload },
+          content: { type: 'tool_call', itemType: item.itemType, payload: storedPayload },
           submissionId: turn.clientSubmissionId,
           toolPairId: providerItemId,
           confirmedAt: event.receivedAt,
@@ -1509,16 +1540,6 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
     options.usage.handleSparseRateLimitUpdate();
   } else if (event.method === 'account/updated') {
     options.usage.handleAccountChanged();
-  } else if (event.method === 'mcpServer/startupStatus/updated') {
-    const legacyStatuses = isRecord(params.statuses) ? normalizeMcpStartupStatusMap(params.statuses) : null;
-    const currentStatus = legacyStatuses ? null : normalizeSingleMcpStartupStatus(params);
-    const currentSnapshot = options.settings.getCodexMcpStartupStatusSnapshot();
-    const value = legacyStatuses ?? Object.fromEntries([...(currentSnapshot?.generationId === event.generationId ? Object.entries(currentSnapshot.value) : []), [currentStatus!.serverId, currentStatus!.state]]);
-    const snapshot = { generationId: event.generationId, sequence: event.sequence, value };
-    const stored = options.settings.upsertCodexMcpStartupStatusSnapshot(snapshot);
-    if (stored?.generationId === snapshot.generationId && stored.sequence === snapshot.sequence) {
-      broadcast = { type: 'codex.mcp_startup_status.updated', payload: snapshot };
-    }
   } else if (event.requestId !== undefined && conversation && threadId) {
     const requestKind = requestKindFromMethod(event.method);
     if (requestKind) {
@@ -1637,8 +1658,10 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
           broadcast = { type: 'conversation.native.error', payload: { conversationId: conversation.id, providerThreadId: threadId, providerTurnId, ...recoveryError } };
         }
       } else if (request.status === 'pending') {
-        const conversationContext = contexts.get(conversation.id) ?? contextFromConversation(conversation);
-        const sessionFileEditGrantApplies = requestKind === 'file' && options.conversations.hasSessionFileEditGrant(conversation.id) && hasAuditableFileApprovalTarget(params, conversation, conversationContext, options.providerItems);
+        const sessionFileEditGrantApplies =
+          requestKind === 'file' &&
+          options.conversations.hasSessionFileEditGrant(conversation.id) &&
+          hasAuditableFileApprovalTarget(params, conversation, contexts.get(conversation.id) ?? contextFromConversation(conversation), options.providerItems);
         let automaticallyApproved = false;
         if (sessionFileEditGrantApplies) {
           try {
@@ -1686,7 +1709,7 @@ export async function projectCodexProviderEvent(dependencies: CodexProviderEvent
               providerTurnId,
               request: nativePendingRequestProjection(request, {
                 conversation,
-                projectRoot: conversationContext.projectLocalPath,
+                projectRoot: (contexts.get(conversation.id) ?? contextFromConversation(conversation)).projectLocalPath,
                 providerItems: options.providerItems,
                 transcripts: options.transcripts,
               }),

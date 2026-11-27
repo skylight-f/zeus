@@ -12,7 +12,7 @@ export interface AppShellMenuActions {
   applicationName: string;
   settings: MainAppShellSettings;
   createNewConversation: () => void | Promise<void>;
-  toggleMenuBarUsage: () => void;
+  toggleMenuBarUsage?: () => void;
   showMainWindow: () => void;
   openSettings: () => void | Promise<void>;
   /** 退出清理后没有可用的更新窗口，菜单项以禁用状态显示。 */
@@ -109,7 +109,7 @@ export function buildAppShellMenuTemplate(actions: AppShellMenuActions): AppShel
     {
       label: zh ? '显示' : 'View',
       submenu: [
-        { label: zh ? '菜单栏用量' : 'Menu Bar Usage', click: actions.toggleMenuBarUsage },
+        ...(actions.toggleMenuBarUsage ? [{ label: zh ? '菜单栏用量' : 'Menu Bar Usage', click: actions.toggleMenuBarUsage }] : []),
         { role: 'reload', label: zh ? '重新加载页面' : 'Reload Page' },
         {
           // 交给 Electron 定位当前菜单所属窗口，避免多窗口时误操作最后创建的窗口。

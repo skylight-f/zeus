@@ -6,16 +6,18 @@ import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/Caret
 import { CheckCircleIcon as CheckCircle } from '@phosphor-icons/react/dist/csr/CheckCircle';
 import { CircleIcon as Circle } from '@phosphor-icons/react/dist/csr/Circle';
 import { CircleNotchIcon as CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
-import { BookOpenIcon as BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
-import { PencilSimpleIcon as PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
-import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
-import { WrenchIcon as Wrench } from '@phosphor-icons/react/dist/csr/Wrench';
-import { BrowserIcon as Browser } from '@phosphor-icons/react/dist/csr/Browser';
+import { StackSimpleIcon as StackSimple } from '@phosphor-icons/react/dist/csr/StackSimple';
+import { FileTextIcon as FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
 import { ImageIcon as Image } from '@phosphor-icons/react/dist/csr/Image';
 import { ImagesIcon as Images } from '@phosphor-icons/react/dist/csr/Images';
 import { ListChecksIcon as ListChecks } from '@phosphor-icons/react/dist/csr/ListChecks';
 import { MagnifyingGlassIcon as MagnifyingGlass } from '@phosphor-icons/react/dist/csr/MagnifyingGlass';
+import { NotePencilIcon as NotePencil } from '@phosphor-icons/react/dist/csr/NotePencil';
 import { PlugsIcon as Plugs } from '@phosphor-icons/react/dist/csr/Plugs';
+import { TerminalIcon as Terminal } from '@phosphor-icons/react/dist/csr/Terminal';
+import { ToolboxIcon as Toolbox } from '@phosphor-icons/react/dist/csr/Toolbox';
+import { GlobeSimpleIcon as GlobeSimple } from '@phosphor-icons/react/dist/csr/GlobeSimple';
 import { DesktopIcon as Desktop } from '@phosphor-icons/react/dist/csr/Desktop';
 import { CubeIcon as Cube } from '@phosphor-icons/react/dist/csr/Cube';
 import { activityOutcome, activityOutcomeLabel, nativeActivityTitle, nativeActivityTool } from './activityPresentation.js';
@@ -244,17 +246,6 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
   const skillActivity = activitySkillNames([props.item]).length > 0;
   /** 打开处理过程不自动打开命令，也不提前读取截断正文。 */
   const [open, setOpen] = useReadingState(`activity:${props.item.key}`, false);
-  const [loadingCompleteContent, setLoadingCompleteContent] = useState(false);
-  const contentLoadError = props.item.payload.v2ContentLoadError;
-  const contentHandle = typeof props.item.payload.v2ContentHandle === 'string' ? props.item.payload.v2ContentHandle : null;
-  const loadCompleteContent = () => {
-    if (!contentHandle || !props.onLoadContent || loadingCompleteContent) return;
-    setLoadingCompleteContent(true);
-    void props
-      .onLoadContent(contentHandle)
-      .catch(() => undefined)
-      .finally(() => setLoadingCompleteContent(false));
-  };
   const Icon = activityItemIcon(props.item);
   const toolResult = activityToolResult(props.item);
   const titleNode = target ? (
@@ -283,8 +274,8 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
             open={open}
             onToggle={(event) => {
               setOpen(event.currentTarget.open);
-              if (event.currentTarget.open && props.item.payload.v2ContentTruncated === true && contentHandle && !contentLoadError) {
-                loadCompleteContent();
+              if (event.currentTarget.open && props.item.payload.v2ContentTruncated === true && typeof props.item.payload.v2ContentHandle === 'string') {
+                return props.onLoadContent?.(props.item.payload.v2ContentHandle).catch(() => undefined);
               }
             }}
           >
@@ -311,16 +302,6 @@ const ActivityItemRow = memo(function ActivityItemRow(props: {
                     language={props.language}
                     onLoadToolResult={props.onLoadToolResult}
                   />
-                ) : null}
-                {contentLoadError ? (
-                  <div className="session-message-delivery-error" role="alert">
-                    <VisibleApplicationError error={contentLoadError} language={props.language === 'zh-CN' ? 'zh-CN' : 'en'} />
-                    <div className="session-message-delivery-actions">
-                      <button type="button" disabled={!props.onLoadContent || loadingCompleteContent} onClick={loadCompleteContent}>
-                        {loadingCompleteContent ? (props.language === 'zh-CN' ? '正在重试…' : 'Retrying…') : props.language === 'zh-CN' ? '重试加载完整内容' : 'Retry full content'}
-                      </button>
-                    </div>
-                  </div>
                 ) : null}
               </div>
             ) : null}
@@ -683,6 +664,10 @@ export function SessionTurnDuration(props: { turn: NativeTurnSnapshot; requests:
 export function SessionTurnProcessDisclosure(props: {
   language: SessionUiLanguage;
   children: ReactNode;
+  /** 轮次摘要下方的进度在处理过程收起时也保留。 */
+  afterSummary?: ReactNode;
+  /** 操作任务仍在执行时，用当前状态覆盖轮次用时。 */
+  summaryLabel?: string;
   onOpen?: () => void | Promise<void>;
   /** 目录晚于用户展开抵达时，按同一持久分组补读一次。 */
   loadKey?: string;
@@ -739,7 +724,8 @@ export function SessionTurnProcessDisclosure(props: {
   /** 阶段入口保持固定数量，整轮入口未传数量时显示真实用时。 */
   const visibleCountLabel = props.labelKind !== 'details' ? countLabel : null;
   /** 悬停提示和无障碍名称仍说明查看或收起动作，并保留真实操作数量。 */
-  const accessibleLabel = countLabel ? `${label}${props.language === 'zh-CN' ? '，' : ', '}${countLabel}` : label;
+  const detailLabel = props.summaryLabel ?? countLabel;
+  const accessibleLabel = detailLabel ? `${label}${props.language === 'zh-CN' ? '，' : ', '}${detailLabel}` : label;
   return (
     <section className="session-turn-process" data-label-kind={props.labelKind ?? 'process'} data-open={open || undefined} aria-busy={props.loading || undefined}>
       <div className="session-turn-process-control">
@@ -756,10 +742,13 @@ export function SessionTurnProcessDisclosure(props: {
             return props.onOpenChange?.(nextOpen, event.currentTarget);
           }}
         >
-          <span>{visibleCountLabel ?? (props.turn ? <SessionTurnDuration turn={props.turn} requests={props.requests ?? []} language={props.language} fallback={label} replyVisible={props.replyVisible} /> : label)}</span>
+          <span>
+            {props.summaryLabel ?? visibleCountLabel ?? (props.turn ? <SessionTurnDuration turn={props.turn} requests={props.requests ?? []} language={props.language} fallback={label} replyVisible={props.replyVisible} /> : label)}
+          </span>
           <CaretDown className="session-turn-process-caret" aria-hidden="true" weight="bold" />
         </Button>
       </div>
+      {props.afterSummary}
       <Collapsible id={bodyId} open={open} animateHeight>
         <div className="session-turn-process-body">
           {props.loading || (props.contentPending && !props.error) ? (
@@ -926,26 +915,27 @@ function activityItemTarget(
   };
 }
 
-/** 实时行与历史行沿用本地图标。 */
+/** 实时行与历史行共用图标，按文件、目录、命令、上下文整理及编辑操作显示对应轮廓。 */
 function activityItemIcon(item: NativeSessionItemBuffer) {
   /** 名称必须命中原生注册命名空间才显示操作环境图标。 */
   const tool = nativeActivityTool(item.payload);
-  if (tool) return tool.kind === 'browser' ? Browser : Desktop;
+  if (tool) return tool.kind === 'browser' ? GlobeSimple : Desktop;
   if (activitySkillNames([item]).length > 0) return Cube;
   const type = normalizeType(item.type);
   if (type === 'commandexecution' || type === 'command') {
     const actionType = primitive(commandActions(item)[0]?.type);
-    if (actionType === 'read' || actionType === 'listFiles') return BookOpen;
+    if (actionType === 'read') return FileText;
+    if (actionType === 'listFiles') return FolderOpen;
     if (actionType === 'search') return MagnifyingGlass;
-    return TerminalWindow;
+    return Terminal;
   }
   if (type === 'websearch') return MagnifyingGlass;
   if (type === 'imageview') return Image;
-  if (type === 'contextcompaction') return BookOpen;
-  if (type === 'filechange' || type === 'file') return PencilSimple;
+  if (type === 'contextcompaction') return StackSimple;
+  if (type === 'filechange' || type === 'file') return NotePencil;
   if (type === 'mcptoolcall') return Plugs;
-  if (type === 'dynamictoolcall' || type === 'toolcall' || type === 'tool') return Wrench;
-  return Wrench;
+  if (type === 'dynamictoolcall' || type === 'toolcall' || type === 'tool') return Toolbox;
+  return Toolbox;
 }
 
 /** 预览字段为空时仍保留不可变详情句柄的展开入口，点击后才读取全文。 */

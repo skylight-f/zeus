@@ -120,6 +120,11 @@
   gap: 4px;
 }
 
+/* 复用任务原位保存动效，在紧凑胶囊内替换箭头并保持垂直居中。 */
+.macos-ai-app .task-data-table-status > .task-save-spinner {
+  inset-block-start: calc(50% - 6px);
+}
+
 /* 冲突操作在已有弹层中显示，不挤高虚拟行。 */
 .task-data-table-priority-feedback {
   display: flex;
@@ -139,15 +144,10 @@
   inset: 32px 0 0;
   display: grid;
   place-items: center;
-  background: var(--zeus-card-background);
+  /* 空态与加载态继续覆盖正文底层，避免表格切换时整块变亮。 */
+  background: var(--zeus-product-canvas);
 }
 
 .task-data-table-overlay > section {
   max-width: 100%;
-}
-
-/* 新增功能的布局沿用本地主题，其余既有样式保持不变。 */
-
-.macos-ai-app .task-data-table-status > .task-save-spinner {
-  inset-block-start: calc(50% - 6px);
 }

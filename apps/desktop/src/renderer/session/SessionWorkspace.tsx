@@ -1,5 +1,3 @@
-import { useAttentionWorkspace } from '../features/attention/attentionContext.js';
-
 import { CachedQuery } from '../cachedQuery.js';
 import { modelCatalogGeneration } from '../features/integrations/modelCatalogEvents.js';
 import { Button } from '../ui/Button.js';
@@ -9,14 +7,14 @@ import { SideQuestionWorkspace, type SideQuestionStartInput, type SideQuestionSt
 import { createInitialSessionState, sessionReducer } from './sessionReducer.js';
 import { ProjectToolContext } from '../features/workspace/projectToolContext.js';
 import { platformShortcutLabel } from '../platform.js';
-import { systemMessageScope, recordSystemMessage, recoverSystemMessageOperation, bindDraftSystemMessages, useConversationSystemMessages, handledMessageDeliveryErrors, isLocalNetworkOffline } from './conversationSystemMessages.js';
+import { systemMessageScope, recordSystemMessage, recoverSystemMessageOperation, bindDraftSystemMessages, useConversationSystemMessages, handledMessageDeliveryErrors } from './conversationSystemMessages.js';
 import type { ConversationProcessGroup } from '@zeus/shared';
 import { ActivitySkillCatalogContext } from './SessionActivity.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
 import { ReadingStateScope, useReadingScroll } from '../ui/readingState.js';
-import { temporaryWorkspaceId, isConversationWorktreeOptions, userFacingErrorCause, type ConversationWorktreeOptions, type AsyncQuestionAnswer, type UserFacingErrorCause } from '@zeus/shared';
+import { temporaryWorkspaceId, isConversationWorktreeOptions, offlineNetworkNotice, userFacingErrorCause, userFacingNetworkIssue, type ConversationWorktreeOptions, type AsyncQuestionAnswer, type UserFacingErrorCause } from '@zeus/shared';
 import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -110,6 +108,7 @@ import type {
   TurnChangeSet,
   TurnChangeSetOperationResult,
 } from './sessionTypes.js';
+import { activeNativeSubagentStatuses } from './sessionTypes.js';
 import { normalizeServiceTierSelection, selectionFromEffectiveServiceTier, serviceTierSelectionValue, serviceTierWireOverride } from './serviceTierSelection.js';
 import { type SessionController, type SessionControllerClient, useSessionControllerInstance, useSessionControllerSelector } from './useSessionController.js';
 import { createConversationComposerStateSelector, createConversationQueueStateSelector, createConversationTranscriptStateSelector, createSessionWorkspaceStateSelector } from './sessionStateSlices.js';
@@ -133,11 +132,11 @@ import { readProjectConversationCreationPreferences, writeProjectConversationCre
 import { contextCapacitySelectionAllowed } from './contextCapacitySelection.js';
 import { hasAvailableConversationModel, resolveModelCapability } from './modelSelection.js';
 import { GoalPanel, GoalRail } from './GoalPanel.js';
-import { modelSourceDisplayName, presentModelOptions } from '../modelOptionPresentation.js';
+import { presentModelOptions } from '../modelOptionPresentation.js';
 import { NewConversationExecutionContext } from './NewConversationExecutionContext.js';
 import { formatVisibleApplicationError, modelSetupRequestedEvent, reportApplicationError, VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import type { ConversationModelSetupContext } from '../settings/useModelSetup.js';
-import { StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
+import { reconcileTokens, selectionFromTokens, StructuredComposerInput, type StructuredComposerSelection } from './StructuredComposerInput.js';
 import { isSessionTerminalShortcut, SessionTerminalPanel, type SessionTerminalClient } from './SessionTerminal.js';
 import { useSessionTerminalVisibility } from './useSessionTerminalVisibility.js';
 import { createSideQuestionState, replaceArchivedSideQuestion, restoreSideQuestionWorkspace, useSessionContextWorkspace, type SessionContextWorkspace } from './useSessionContextWorkspace.js';
@@ -187,7 +186,7 @@ export interface SessionWorkspaceStartInput {
   serviceTierSelection: NativeServiceTierSelection;
   model?: string;
   effort?: string;
-  agentKind?: 'codex' | 'pi' | 'copilot';
+  agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
   goalObjective?: string;
   skillId?: string;
   pluginReferences?: PluginSkillReference[];
@@ -362,7 +361,7 @@ type StartNativeConversationPayload =
       serviceTier?: string | null;
       model?: string;
       effort?: string;
-      agentKind?: 'codex' | 'pi' | 'copilot';
+      agentKind?: 'codex' | 'pi' | 'copilot' | 'antigravity';
       goalObjective?: string;
       skillId?: string;
       pluginReferences?: PluginSkillReference[];
@@ -461,7 +460,8 @@ export interface ConnectedSessionWorkspaceProps {
   readOnlyGate?: SessionReadOnlyGate;
   onOpenTaskGitDelivery?: SessionWorkspaceActions['onOpenTaskGitDelivery'];
   /** 按真实项目与会话上报最新正文可见性，主栏和侧栏分别确认已读。 */
-  onLatestContentVisibilityChange?: (projectId: string, conversationId: string, visible: boolean) => void;
+  /** 正文可见性携带已看见的实际轮次，用于确认对应的提醒。 */
+  onLatestContentVisibilityChange?: (projectId: string, conversationId: string, visible: boolean, turnId?: string | null) => void;
   /** 面板被关闭或其他工作面遮住时，不把已挂载的正文当作可见。 */
   contentVisible?: boolean;
 }
@@ -600,6 +600,18 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
   }, [controller, controllerEnabled, props.pendingCodeComments, props.onCodeCommentsStaged]);
   const workspaceStateSelector = useMemo(createSessionWorkspaceStateSelector, [controller]);
   const state = useSessionControllerSelector(controller, workspaceStateSelector);
+  /** 空闲历史页可以没有实时订阅，同一未读版本只补读一次。 */
+  const attentionRefresh = useRef<{ controller: SessionController; revision: number } | null>(null);
+  const { hasUnreadAttention, attentionTurnId, attentionKind, attentionRevision } = props.conversation;
+  /** 使用目录中的轮次身份，避免用缓存中的旧正文确认新结果。 */
+  const attentionTurnStatus = hasUnreadAttention && attentionTurnId ? (state.turnsByProviderId[attentionTurnId] ?? Object.values(state.turnsByProviderId).find((turn) => turn.id === attentionTurnId))?.status : undefined;
+  useEffect(() => {
+    if (!controllerEnabled || props.contentVisible === false || !hasUnreadAttention || !attentionTurnId || state.transportState !== 'ready') return;
+    if (attentionTurnStatus && (attentionKind === 'unread' || attentionTurnStatus === attentionKind)) return;
+    if (attentionRefresh.current?.controller === controller && attentionRefresh.current.revision === attentionRevision) return;
+    attentionRefresh.current = { controller, revision: attentionRevision };
+    controller.refreshAfterReveal(false);
+  }, [controller, controllerEnabled, props.contentVisible, hasUnreadAttention, attentionTurnId, attentionTurnStatus, attentionKind, attentionRevision, state.transportState]);
   /** 同一选区交给控制器后，父页面刷新不能再次派发。 */
   const handledExplanationId = useRef<string | null>(null);
   useEffect(() => {
@@ -632,27 +644,41 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
   }, [controller, props.conversation.id, props.conversation.archived, props.onArchivedSideQuestion, state.snapshot?.archived]);
   const [subagentScope, setSubagentScope] = useState<ScopedSubagentSnapshot>(() => ({ conversationId: props.conversation.id, snapshot: null }));
   const subagentListSnapshot = subagentScope.conversationId === props.conversation.id ? subagentScope.snapshot : null;
-  /** 工具完成后补读托管子代理，流式文字增量不触发额外查询。 */
-  const subagentReadRevision = Object.values(state.items)
-    .filter((item) => item.status === 'completed' || item.status === 'failed')
-    .map((item) => `${item.key}:${item.status}`)
-    .join('|');
-  useEffect(() => {
-    const loadSubagents = props.client.loadNativeSubagents;
-    if (!loadSubagents || props.conversation.transportKind !== 'codex_native') return;
+  /** 正文与右侧面板复用同一个在途列表请求。 */
+  const subagentListRequestRef = useRef<{ conversationId: string; promise: Promise<NativeSubagentListSnapshot> } | null>(null);
+  const loadSubagentList = useCallback((): Promise<NativeSubagentListSnapshot> => {
     const conversationId = props.conversation.id;
-    let active = true;
-    void loadSubagents(props.conversation.projectId, conversationId)
+    if (subagentListRequestRef.current?.conversationId === conversationId) return subagentListRequestRef.current.promise;
+    const promise: Promise<NativeSubagentListSnapshot> = props.client.loadNativeSubagents!(props.conversation.projectId, conversationId)
       .then((snapshot) => {
-        if (active) setSubagentScope({ conversationId, snapshot });
+        if (subagentListRequestRef.current?.promise === promise && snapshot.conversationId === conversationId) setSubagentScope({ conversationId, snapshot });
+        return snapshot;
       })
-      .catch(() => {
-        // 智能体预读失败不影响主会话；用户打开面板时仍可手动重试。
+      .finally(() => {
+        if (subagentListRequestRef.current?.promise === promise) subagentListRequestRef.current = null;
       });
-    return () => {
-      active = false;
-    };
-  }, [props.client, props.conversation.id, props.conversation.projectId, props.conversation.transportKind, subagentReadRevision]);
+    subagentListRequestRef.current = { conversationId, promise };
+    return promise;
+  }, [props.client, props.conversation.id, props.conversation.projectId]);
+  /** 工具完成后补读托管子代理，流式文字增量不触发额外查询。 */
+  const subagentReadRevision = useMemo(() => {
+    const items = Object.values(state.items);
+    const completedItems = items.filter((item) => item.status === 'completed' || item.status === 'failed').map((item) => `${item.key}:${item.status}`);
+    return `${projectSubagentActivity(items).revision}|${completedItems.join('|')}`;
+  }, [state.items]);
+  /** 只刷新当前露出的真实会话。 */
+  const readSubagents = controllerEnabled && Boolean(props.client.loadNativeSubagents) && props.conversation.transportKind === 'codex_native' && props.contentVisible !== false;
+  const operationAgentRunning = props.conversation.operationAgentRunning === true;
+  /** 父轮次可以先结束，子任务列表继续刷新到子任务完成为止。 */
+  const pollSubagents = readSubagents && (operationAgentRunning || Boolean(subagentListSnapshot?.items.some((item) => activeNativeSubagentStatuses.has(item.status))));
+  useEffect(() => {
+    if (readSubagents) void loadSubagentList().catch(() => undefined);
+  }, [readSubagents, loadSubagentList, subagentReadRevision, operationAgentRunning]);
+  useEffect(() => {
+    if (!pollSubagents) return;
+    const timer = window.setInterval(() => void loadSubagentList().catch(() => undefined), 2_000);
+    return () => window.clearInterval(timer);
+  }, [loadSubagentList, pollSubagents]);
   const [capabilitiesScope, setCapabilitiesScope] = useState<ScopedConversationCapabilities>(() => ({
     projectId: props.conversation.projectId,
     value: props.initialCapabilities ?? readCachedCodexConversationCapabilities(props.client, props.conversation.projectId),
@@ -856,15 +882,17 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
       ...(props.client.loadNativeConversationInformation ? { onLoadConversationInformation: (signal: AbortSignal) => props.client.loadNativeConversationInformation!(projectId, conversationId, signal) } : {}),
       ...(props.client.loadNativeSubagents && props.client.loadNativeSubagentThread
         ? {
-            onLoadSubagents: () => props.client.loadNativeSubagents!(projectId, conversationId),
+            onLoadSubagents: loadSubagentList,
             onLoadSubagentThread: (threadId: string) => props.client.loadNativeSubagentThread!(projectId, conversationId, threadId),
             onStopOperationAgent: async (threadId?: string) => {
               /** 仅处理服务端确认归属当前会话的操作代理。 */
               const snapshot = await props.client.loadNativeSubagents!(projectId, conversationId);
               for (const agent of snapshot.items.filter((item) => item.operation && (!threadId || item.id === threadId) && ['pending', 'running', 'waiting'].includes(item.status))) {
-                /** 先取消未发送输入，停止当前轮次后不能继续旧补充任务。 */
-                const queue = await props.client.loadNativeConversationQueueV2(projectId, agent.id);
-                for (const submission of queue.submissions.filter((item) => !item.providerTurnId && ['queued', 'paused'].includes(item.status))) await props.client.deleteNativeQueuedSubmission(projectId, agent.id, submission.id);
+                /** 未知送达先走核对；仍无回执时保留该提交，再处理已知轮次。 */
+                const currentQueue = await props.client.loadNativeConversationQueueV2(projectId, agent.id);
+                const queue = currentQueue.submissions.some((item) => item.pausedReason === 'outcome_unknown') ? await props.client.recoverNativeQueue(projectId, agent.id, 'check') : currentQueue;
+                for (const submission of queue.submissions.filter((item) => !item.providerTurnId && item.pausedReason !== 'outcome_unknown' && ['queued', 'paused'].includes(item.status)))
+                  await props.client.deleteNativeQueuedSubmission(projectId, agent.id, submission.id);
                 /** 子线程详情提供真实 Provider 轮次身份，不使用父轮次猜测。 */
                 const thread = await props.client.loadNativeSubagentThread!(projectId, conversationId, agent.id);
                 /** 只中断仍在执行的轮次，结束的线程保留原结果。 */
@@ -894,6 +922,7 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
     controllerInteractive,
     historySnapshotOnly,
     loadConversationCapabilities,
+    loadSubagentList,
     props.client,
     props.conversation.id,
     props.conversation.projectId,
@@ -997,7 +1026,7 @@ export function ConnectedSessionWorkspace(props: ConnectedSessionWorkspaceProps)
                 renderConversation={(conversation, annotations, onStaged) => (
                   <ConnectedSessionWorkspace
                     {...props}
-                    conversation={conversation}
+                    conversation={props.choices?.find((choice) => choice.id === conversation.id) ?? conversation}
                     initialCachedState={undefined}
                     initialOptimisticState={{
                       ...createInitialSessionState(),
@@ -1203,6 +1232,7 @@ export function nativeConversationChoiceFromAcceptance(acceptance: NativeOperati
   const nativeSession = isRecord(conversation.nativeSession) ? conversation.nativeSession : {};
   return {
     id: acceptance.conversation.id,
+    ...nativeConversationWorkspaceFromAcceptance(conversation),
     /** 使用会话原始创建身份，续接回执不能改用本次续发操作身份。 */
     creationOperationIdentity: nullableStringField(conversation.creationOperationIdentity),
     projectId: stringField(conversation.projectId) ?? task.projectId,
@@ -1323,8 +1353,7 @@ export function projectConversationChoiceFromAcceptance(acceptance: NativeOperat
   const nativeSession = isRecord(conversation.nativeSession) ? conversation.nativeSession : {};
   return {
     id: conversation.id,
-    workspaceMode: conversation.workspaceMode === 'direct' || conversation.workspaceMode === 'worktree' ? conversation.workspaceMode : undefined,
-    executionPath: nullableStringField(conversation.executionPath),
+    ...nativeConversationWorkspaceFromAcceptance(conversation),
     projectId: stringField(conversation.projectId) ?? owner.projectId,
     taskId: nullableStringField(conversation.taskId),
     title: stringField(conversation.title) ?? owner.projectName,
@@ -1546,6 +1575,16 @@ function nullableStringField(value: unknown): string | null {
   return value === null ? null : stringField(value);
 }
 
+/** 任务和项目会话从持久回执读取相同的工作区类型、身份和目录。 */
+function nativeConversationWorkspaceFromAcceptance(conversation: Record<string, unknown>): Pick<NativeConversationChoice, 'workspaceMode' | 'executionPath' | 'workspaceId' | 'environmentId'> {
+  return {
+    workspaceMode: conversation.workspaceMode === 'direct' || conversation.workspaceMode === 'worktree' ? conversation.workspaceMode : undefined,
+    executionPath: nullableStringField(conversation.executionPath),
+    workspaceId: nullableStringField(conversation.workspaceId),
+    environmentId: nullableStringField(conversation.environmentId),
+  };
+}
+
 function nativeAgentAndModelIdentity(conversation: Record<string, unknown>): Pick<NativeConversationChoice, 'agent' | 'model'> {
   const agent = isRecord(conversation.agent) ? conversation.agent : {};
   const model = isRecord(conversation.model) ? conversation.model : {};
@@ -1760,7 +1799,7 @@ function isStartNativeConversationRequest(value: unknown): value is StartNativeC
           typeof request.model === 'string' &&
           Boolean(request.model) &&
           (request.effort === undefined || typeof request.effort === 'string') &&
-          (request.agentKind === 'codex' || request.agentKind === 'pi' || request.agentKind === 'copilot'))) &&
+          (request.agentKind === 'codex' || request.agentKind === 'pi' || request.agentKind === 'copilot' || request.agentKind === 'antigravity'))) &&
       permissionModeField(request.permissionMode) !== undefined &&
       (request.collaborationMode === 'default' || request.collaborationMode === 'plan') &&
       serviceTierOverrideField(request.serviceTier) &&
@@ -1832,7 +1871,6 @@ export interface NewConversationDraft {
   selectedEffort: string;
   serviceTierSelection: NativeServiceTierSelection;
   goalInputOpen: boolean;
-  goalObjective: string;
   tokenDraft: { current: import('./StructuredComposerInput.js').StructuredToken[] };
 }
 
@@ -1897,8 +1935,8 @@ export interface SessionWorkspaceProps {
   loadState?: 'empty' | 'loading' | 'error';
   loadError?: string | null;
   autoFocusNewConversation?: boolean;
-  /** 最新正文的阅读事实归属实际渲染的会话。 */
-  onLatestContentVisibilityChange?: (projectId: string, conversationId: string, visible: boolean) => void;
+  /** 正文可见性携带已看见的实际轮次，用于确认对应的提醒。 */
+  onLatestContentVisibilityChange?: (projectId: string, conversationId: string, visible: boolean, turnId?: string | null) => void;
   /** 隐藏的侧栏仍可保持挂载，但不能确认已读。 */
   contentVisible?: boolean;
   creationStatus?: SessionCreationStatus;
@@ -1985,7 +2023,6 @@ const labels = {
     goalInput: '目标内容',
     goalPlaceholder: '说明要达成什么、如何验证，以及何时停止',
     exitGoal: '退出目标输入',
-    normalDraftPreserved: '普通消息草稿已保留',
     attach: '添加附件',
     removeAttachment: '移除附件',
     runtimeDetails: '运行详情',
@@ -2039,7 +2076,6 @@ const labels = {
     goalInput: 'Goal objective',
     goalPlaceholder: 'Describe the outcome, validation, and stopping condition',
     exitGoal: 'Exit goal input',
-    normalDraftPreserved: 'Message draft preserved',
     attach: 'Add attachment',
     removeAttachment: 'Remove attachment',
     runtimeDetails: 'Run details',
@@ -2097,9 +2133,6 @@ function LegacyConversationTranscript(props: { label: string; children: ReactNod
 }
 
 export function SessionWorkspace(props: SessionWorkspaceProps) {
-  const openedAttentionQuestion = useRef<number | null>(null);
-  const attentionWorkspace = useAttentionWorkspace();
-  const attentionTarget = attentionWorkspace.navigation?.target.kind === 'conversation' && attentionWorkspace.navigation.target.conversationId === props.conversation?.id ? attentionWorkspace.navigation.target : null;
   const copy = labels[props.language];
   const actions = props.actions ?? {};
   const owner: SessionConversationOwner | undefined = props.owner ?? (props.task ? { kind: 'task', projectId: props.task.projectId, projectName: props.task.projectId, taskId: props.task.id, taskTitle: props.task.title } : undefined);
@@ -2122,6 +2155,10 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   /** 防止关闭后的空标签通知重复触发同一会话的清理。 */
   const closingBrowserConversationsRef = useRef(new Set<string>());
   const [requestErrors, setRequestErrors] = useState<Record<string, string>>({});
+  /** 只为当前会话主动提交的修改意见保留原计划卡。 */
+  const [planRefinement, setPlanRefinement] = useState<{ conversationId: string | null; request: NativePlanImplementationRequest } | null>(null);
+  /** 底部切换时量取接替内容的自然高度。 */
+  const bottomInputRef = useRef<HTMLDivElement>(null);
   const [interruptArmed, setInterruptArmed] = useState(false);
   /** 打开的工作区与源码标签属于会话，切换或卸载不自动关闭。 */
   const {
@@ -2147,7 +2184,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const contextWorkspaceRef = useRef<SessionContextWorkspace>(contextWorkspace);
   contextWorkspaceRef.current = contextWorkspace;
   const [quickActionsPersistentHost, setQuickActionsPersistentHost] = useState<HTMLDivElement | null>(null);
-  /** 浏览器标签与文件标题直接挂在会话顶栏，避免内容上方再叠一层工具栏。 */
+  /** 右侧工作面的标签和标题直接挂在会话顶栏。 */
   const [contextToolbarHost, setContextToolbarHost] = useState<HTMLDivElement | null>(null);
   /** 环境卡在浏览器旁占用实际空间，避免遮盖原生网页。 */
   const [browserEnvironmentHost, setBrowserEnvironmentHost] = useState<HTMLDivElement | null>(null);
@@ -2177,10 +2214,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const projectTools = useContext(ProjectToolContext);
   /** 仅当前可见的会话工作面可以占用全宽。 */
   const contextFullWidth = requestedContextFullWidth;
-  /** 关闭期间保留原工作面的资源，重开或切换入口会中断退出。 */
-  const [closingContext, setClosingContext] = useState<SessionContextWorkspace | null>(null);
-  /** 工作面身份变化后，旧关闭请求不再影响当前面板。 */
-  const contextClosing = closingContext !== null && closingContext === contextWorkspace;
+  /** 退出期间保留工作面身份和退场前的排版宽度，单位为 CSS 像素。 */
+  const [closingContext, setClosingContext] = useState<{ workspace: SessionContextWorkspace; paneWidth?: number; toolbarWidth?: number } | null>(null);
+  /** 工作面身份变化后，旧关闭请求的宽度不再影响当前面板。 */
+  const contextExit = closingContext?.workspace === contextWorkspace ? closingContext : null;
+  const contextClosing = contextExit !== null;
   /** 交互在收拢开始时关闭，画面在收拢结束时移除。 */
   const contextOpen = contextWorkspace.kind !== 'none' && !contextClosing;
   /** 顶栏和正文由同一个元素上的宽度过渡驱动。 */
@@ -2188,16 +2226,16 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   /** 关闭全宽面板时立即恢复正文的交互。 */
   const contextCoversConversation = contextOpen && (contextFullWidth || browserLayoutWidth <= 840);
   /** 支持顶栏挂载的工作面在退出期间继续显示标签及标题。 */
-  const contextToolbarPresent = contextPresent && ['browser', 'source', 'file', 'question'].includes(contextWorkspace.kind);
+  const contextToolbarPresent = contextPresent && ['browser', 'source', 'file', 'question', 'subagents', 'plan', 'turn_diff'].includes(contextWorkspace.kind);
   /** 阅读回执使用持久项目身份，不使用面板导航身份。 */
   const contentProjectId = props.conversation?.projectId;
   /** 正文会话身份在提醒字段刷新时保持稳定。 */
   const contentConversationId = props.conversation?.id;
   /** 可见事实携带正文身份；全宽上下文或隐藏侧栏不代表用户读过正文。 */
   const reportLatestContentVisibility = useCallback(
-    (visible: boolean): void => {
+    (visible: boolean, turnId?: string | null): void => {
       if (!contentProjectId || !contentConversationId) return;
-      props.onLatestContentVisibilityChange?.(contentProjectId, contentConversationId, visible && props.contentVisible !== false && !contextCoversConversation);
+      props.onLatestContentVisibilityChange?.(contentProjectId, contentConversationId, visible && props.contentVisible !== false && !contextCoversConversation, turnId);
     },
     [contentProjectId, contentConversationId, contextCoversConversation, props.contentVisible, props.onLatestContentVisibilityChange],
   );
@@ -2210,8 +2248,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const planWorkspaceItem = contextWorkspace.kind === 'plan' ? contextWorkspace.item : null;
   const sessionReady = props.state != null;
   const resolvedBrowserTargetWidth = resolveBrowserTargetWidth(browserLayoutWidth, browserPaneShare, contextFullWidth);
-  /** 环境卡常驻判定只用正文列真实可用宽度：右侧浏览器工作面、停靠终端和全宽工作面占用的空间都不算正文空间。 */
-  const conversationColumnWidth = contextFullWidth && contextPresent ? 0 : Math.max(0, browserLayoutWidth - (contextPresent ? resolvedBrowserTargetWidth : 0));
+  /** 环境卡随会话分栏归还空间。原生网页退出后才切换环境卡的位置，避免中途挤压网页。 */
+  const conversationColumnWidth = Math.max(0, browserLayoutWidth - (contextOpen || browserPresent ? resolvedBrowserTargetWidth : 0));
   const currentHeader = useMemo(() => createSessionHeaderSnapshot(props.conversation, props.task, owner, props.language), [owner, props.conversation, props.task, props.language]);
   const displayedHeader = currentHeader;
   // 本地缓存只支撑会话重挂载的首帧；没有待确认用户修改时，后续以服务端快照为权威。
@@ -2291,21 +2329,51 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   const conversationSurfaceError = props.historyOnly ? null : props.loadState === 'error' ? (props.loadError ?? copy.failed) : (transportError ?? contextWorkspaceError);
   const pendingRequests = props.historyOnly ? [] : (props.state?.pendingRequests.filter((request) => request.status === 'pending' && hasPendingRequestDetails(request)) ?? []);
   const pendingPlanImplementationRequests = props.historyOnly ? [] : (props.state?.planImplementationRequests.filter((request) => request.status === 'pending').slice(-1) ?? []);
-  const blockingPendingRequest =
-    (pendingPlanImplementationRequests.some((request) => request.id === attentionTarget?.planId) ? null : (pendingRequests.find((request) => request.id === attentionTarget?.requestId) ?? pendingRequests[0])) ?? null;
+  const blockingPendingRequest = pendingRequests[0] ?? null;
   const blockingPlanImplementationRequest = blockingPendingRequest ? null : (pendingPlanImplementationRequests[0] ?? null);
   /** 异步问题使用同一个底部位置，正式阻塞请求保持原有优先级。 */
   const asyncQuestionDock = useAsyncQuestionDock(props.state, transcriptInteractionsEnabled && !props.suppressComposer && Boolean(actions.onAnswerAsyncQuestion));
-  useEffect(() => {
-    const navigation = attentionWorkspace.navigation;
-    if (!navigation || !attentionTarget?.questionItemId || openedAttentionQuestion.current === navigation.nonce) return;
-    const question = Object.values(props.state?.items ?? {}).find((item) => item.turnId === attentionTarget.turnId && (item.providerItemId ?? item.itemId) === attentionTarget.questionItemId);
-    if (!question) return;
-    openedAttentionQuestion.current = navigation.nonce;
-    asyncQuestionDock.open(question);
-  }, [attentionWorkspace.navigation, attentionTarget, props.state?.items, asyncQuestionDock]);
   /** 底部一次只显示一个交互表单，后台异步执行不转成等待状态。 */
   const dockedAsyncQuestion = blockingPendingRequest || blockingPlanImplementationRequest ? null : asyncQuestionDock.selected;
+  /** 普通输入框继续让位于阻塞表单及只读入口。 */
+  const showConversationComposer = !props.readOnlyGate && !props.suppressComposer && !blockingPendingRequest && !blockingPlanImplementationRequest && !dockedAsyncQuestion;
+  /** 卡片退场后由共享动效边界卸载；业务状态可以立即切换。 */
+  const { ref: planDockRef, present: planDockPresent } = useMotionPresence<HTMLElement>(Boolean(blockingPlanImplementationRequest && !props.suppressComposer && !props.historyOnly));
+  /** HTTP 或实时事件都能确认接纳，仅接纳同一修改请求才退场。 */
+  const outgoingPlan =
+    planRefinement &&
+    planRefinement.conversationId === (props.conversation?.id ?? null) &&
+    showConversationComposer &&
+    !props.historyOnly &&
+    !contextCoversConversation &&
+    planDockPresent &&
+    props.state?.planImplementationRequests.some((request) => request.id === planRefinement.request.id && request.status === 'refinement_requested')
+      ? planRefinement.request
+      : null;
+
+  useLayoutEffect(() => {
+    /** 新输入区参与布局，旧卡片固定在同一底边。 */
+    const incoming = bottomInputRef.current;
+    const outgoing = planDockRef.current;
+    if (!outgoingPlan || !incoming || !outgoing || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    /** 高度包含计划卡所在区域的底部留白，单位为 CSS 像素。 */
+    const style = getComputedStyle(outgoing);
+    const from = outgoing.offsetHeight + Number.parseFloat(style.marginBlockEnd);
+    const to = incoming.offsetHeight;
+    if (Math.abs(from - to) < 1) return;
+    /** 与接续动效共用时长（毫秒）和缓动曲线。 */
+    const animation = incoming.animate([{ blockSize: `${from}px` }, { blockSize: `${to}px` }], {
+      duration: Number.parseFloat(style.getPropertyValue('--zeus-motion-duration-layer-enter')) || 160,
+      easing: style.getPropertyValue('--zeus-motion-ease-out').trim() || 'ease-out',
+    });
+    return () => animation.cancel();
+  }, [outgoingPlan, planDockRef]);
+
+  useEffect(() => {
+    if (!planRefinement || blockingPlanImplementationRequest?.id === planRefinement.request.id || outgoingPlan) return;
+    setPlanRefinement((current) => (current === planRefinement ? null : current));
+  }, [blockingPlanImplementationRequest?.id, outgoingPlan, planRefinement]);
+
   const blockingInteractionCount = pendingRequests.length + pendingPlanImplementationRequests.length + Number(Boolean(dockedAsyncQuestion));
   const turnDiffChangeSet = contextWorkspace.kind === 'turn_diff' ? (props.state?.changeSetsByProviderId[contextWorkspace.turnId] ?? null) : null;
   const dockedPlan = props.state ? selectDockedTurnPlan(props.state) : null;
@@ -2318,13 +2386,22 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       reason: capabilityGoals?.supported && capabilityGoals?.enabled ? 'available' : capabilityGoals?.supported ? 'disabled' : 'unverified',
     } as const);
   const selectedComposerModel = resolveModelCapability(props.capabilities?.models, composerRuntimeSettings?.model ?? props.state?.snapshot?.nextTurnSettings?.model ?? props.state?.providerSettings?.model);
-  const assistantLabel = modelSourceDisplayName(selectedComposerModel?.sourceName) || ((selectedComposerModel?.agentKind ?? props.state?.snapshot?.agent?.kind ?? props.conversation?.agent?.kind) === 'pi' ? 'Pi' : 'OpenAI');
+  const assistantLabel = selectedComposerModel?.sourceName?.trim() || ((selectedComposerModel?.agentKind ?? props.state?.snapshot?.agent?.kind ?? props.conversation?.agent?.kind) === 'pi' ? 'Pi' : 'Codex');
   const goalAvailable = !legacy && (selectedComposerModel?.features?.goals.state === 'available' || (!selectedComposerModel?.features && goalCapability.supported && goalCapability.enabled));
   /** 历史会话可显式操作目标，归档、只读和不支持目标的会话仍禁止写入。 */
   const goalWritable = goalAvailable && !hardInteractionReadOnly;
   const subagentActivity = useMemo(() => projectSubagentActivity(Object.values(props.state?.items ?? {})), [props.state?.items]);
   const subagentThreadIds = useMemo(() => [...new Set([...subagentActivity.threadIds, ...(props.subagentListSnapshot?.items.map((item) => item.id) ?? [])])].sort(), [props.subagentListSnapshot?.items, subagentActivity.threadIds]);
-  const subagentSnapshotRevision = props.subagentListSnapshot?.items.map((item) => `${item.id}:${item.status}:${item.updatedAt ?? ''}`).join('|') ?? '';
+  /** 正文只展示能定位到父轮次且仍活动的子智能体。 */
+  const activeSubagents = useMemo(() => props.subagentListSnapshot?.items.filter((item) => item.parentTurnId && activeNativeSubagentStatuses.has(item.status)) ?? [], [props.subagentListSnapshot?.items]);
+  /** 列表刷新只改变状态时复用历史交接集合，避免重建正文投影。 */
+  const operationHandoffKey = (props.subagentListSnapshot?.items ?? [])
+    .flatMap((item) => item.operationHandoffTurnIds ?? [])
+    .sort()
+    .join('\u0000');
+  const operationHandoffTurnIds = useMemo(() => (operationHandoffKey ? operationHandoffKey.split('\u0000') : []), [operationHandoffKey]);
+  /** 面板中的实际选择用于点亮对应的轮次入口。 */
+  const [selectedSubagentThreadId, setSelectedSubagentThreadId] = useState<string | null>(null);
 
   useLayoutEffect(() => {
     contextReturnFocusRef.current = null;
@@ -2334,6 +2411,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     composerRuntimeSettingsDirtyRef.current = false;
     lastNextTurnSettingsSyncRef.current = null;
     setRequestErrors({});
+    setPlanRefinement(null);
     setInterruptArmed(false);
     escapeController.reset();
     clearInterruptResetTimer(interruptResetTimerRef);
@@ -2633,7 +2711,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     }
   }
 
-  /** 完全访问先持久化后续轮次设置，再把当前 Pi 轮次的新工具调用切换为完全访问。 */
+  /** 完全访问先持久化后续轮次设置；失败时保留待审批请求，避免仅批准本次。 */
   async function respond(request: NativePendingRequest, response: Record<string, unknown>, fullAccess = false): Promise<void> {
     if (!actions.onRespondToRequest || !responseGuard.begin(request.id)) return;
     const conversationId = workspaceIdentityRef.current;
@@ -2645,13 +2723,13 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     try {
       if (fullAccess) {
         if (!composerRuntimeSettings || !actions.onNextTurnSettingsChange) throw new Error('完全访问设置暂不可用，请刷新后重试。');
-        /** 后续轮次沿用完全访问；当前轮次通过专用响应标记获得同等授权。 */
+        /** 正在执行的轮次保留冻结权限，只更改后续轮次的设置。 */
         const settings = { ...composerRuntimeSettings, permissionMode: 'full-access' as const };
         await actions.onNextTurnSettingsChange(settings);
         if (workspaceIdentityRef.current !== conversationId) return;
         updateComposerRuntimeSettings(settings);
       }
-      await actions.onRespondToRequest(request.id, fullAccess ? { ...response, zeusGrantFullAccess: true } : response);
+      await actions.onRespondToRequest(request.id, response);
     } catch (error) {
       if (workspaceIdentityRef.current !== conversationId) return;
       setRequestErrors((current) => ({ ...current, [request.id]: formatVisibleApplicationError(error, props.language === 'zh-CN' ? 'zh-CN' : 'en') }));
@@ -2719,13 +2797,31 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     },
   ): Promise<void> {
     if (!actions.onRespondToPlanImplementationRequest || !responseGuard.begin(request.id)) return;
+    /** 请求发起后仍绑定原会话，切换会话时只丢弃局部反馈。 */
     const conversationId = workspaceIdentityRef.current;
     setRequestErrors((current) => {
+      if (!(request.id in current)) return current;
       const next = { ...current };
       delete next[request.id];
       return next;
     });
     try {
+      if (input.action === 'refine') {
+        /** 先让表单呈现提交状态。帧被限流时，34 毫秒后继续提交。 */
+        await new Promise<void>((resolve) => {
+          /** 定时回退和绘制机会只有一个会继续执行请求。 */
+          const fallback = window.setTimeout(() => {
+            window.cancelAnimationFrame(frame);
+            resolve();
+          }, 34);
+          /** 等当前帧有机会绘制后再开始请求。 */
+          const frame = window.requestAnimationFrame(() => {
+            window.clearTimeout(fallback);
+            window.setTimeout(resolve, 0);
+          });
+        });
+        if (workspaceIdentityRef.current === conversationId) setPlanRefinement({ conversationId, request });
+      }
       await actions.onRespondToPlanImplementationRequest(request.id, input);
     } catch (error) {
       if (workspaceIdentityRef.current !== conversationId) return;
@@ -2853,10 +2949,26 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
     return result;
   }
 
+  /** 顶部入口和轮次入口打开同一个右侧面板，后者会直接选择一个线程。 */
+  function openSubagentWorkspace(trigger: HTMLButtonElement, threadId?: string): void {
+    contextReturnFocusRef.current = trigger;
+    if (threadId && selectedSubagentThreadId === threadId && contextOpen && contextWorkspace.kind === 'subagents') {
+      closeContextWorkspace();
+      return;
+    }
+    setContextFullWidth(false);
+    setContextWorkspace({ kind: 'subagents', ...(threadId ? { threadRequest: { threadId } } : {}) });
+  }
+
   /** 开始收拢时交还焦点，原生标签在视区缩到零后释放。 */
   function closeContextWorkspace(options: { focusComposer?: boolean } = {}): void {
-    if (contextClosing || contextWorkspaceRef.current.kind === 'none') return;
-    setClosingContext(contextWorkspaceRef.current);
+    const workspace = contextWorkspaceRef.current;
+    if (contextClosing || workspace.kind === 'none') return;
+    /** 动画开始前量取实际宽度，包含尚在进行的全宽或分栏过渡。 */
+    const pane = browserSplitRef.current?.querySelector(':scope > .session-context-sidecar > .session-browser-pane');
+    const paneWidth = pane?.getBoundingClientRect().width;
+    const toolbarWidth = sessionContextToolbarWidth(contextMotionRef.current);
+    setClosingContext((current) => (current?.workspace === workspace ? current : { workspace, paneWidth, toolbarWidth }));
     setContextWorkspaceError(null);
     window.zeus?.notifySessionContextActivity?.({ active: false, kind: 'none' });
     /** 显式返回输入框时不再恢复工具入口。 */
@@ -2866,13 +2978,14 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
   }
 
   useEffect(() => {
-    if (!contextClosing || contextPresent) return;
+    if (!contextExit || contextPresent) return;
     /** 异步宿主回执只更新发起关闭的工作面。 */
+    const { workspace } = contextExit;
     const conversationId = workspaceIdentityRef.current;
-    const isCurrent = (): boolean => workspaceIdentityRef.current === conversationId && contextWorkspaceRef.current === closingContext;
+    const isCurrent = (): boolean => workspaceIdentityRef.current === conversationId && contextWorkspaceRef.current === workspace;
     /** 先让原生视区走完分栏过渡，再执行原有标签清理。 */
     async function finishClose(): Promise<void> {
-      if (closingContext?.kind === 'browser' && conversationId && window.zeus?.closeBrowserConversation) {
+      if (workspace.kind === 'browser' && conversationId && window.zeus?.closeBrowserConversation) {
         if (closingBrowserConversationsRef.current.has(conversationId)) return;
         closingBrowserConversationsRef.current.add(conversationId);
         try {
@@ -2894,7 +3007,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
       setClosingContext(null);
     }
     void finishClose();
-  }, [closingContext, contextClosing, contextPresent, setContextWorkspace, setContextFullWidth]);
+  }, [contextExit, contextPresent, setContextWorkspace, setContextFullWidth]);
 
   async function runGoalAction(action: (() => void | Promise<void>) | undefined, closeAfter = false): Promise<boolean> {
     if (!action || goalBusy) return false;
@@ -3081,7 +3194,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
             key={blockingPendingRequest.id}
             request={blockingPendingRequest}
             language={props.language}
-            agentKind={props.state?.snapshot?.agent?.kind === 'pi' || props.conversation?.agent?.kind === 'pi' ? 'pi' : 'codex'}
             permissionMode={props.state?.snapshot?.permissionMode ?? 'read-only'}
             filePaths={linkedFileApprovalPaths(props.state, blockingPendingRequest)}
             autoFocus
@@ -3096,18 +3208,26 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
         </section>
       );
     }
-    if (blockingPlanImplementationRequest) {
+    /** 退场期间继续使用同一张表单，以保留显示中的正文和附件。 */
+    const planRequest = blockingPlanImplementationRequest ?? outgoingPlan;
+    if (planRequest) {
       return (
-        <section className="session-interaction-dock" aria-label={props.language === 'zh-CN' ? '待处理交互' : 'Pending interaction'}>
+        <section
+          ref={planDockRef}
+          className="session-interaction-dock"
+          data-plan-refinement-exiting={outgoingPlan ? true : undefined}
+          inert={Boolean(outgoingPlan)}
+          aria-label={props.language === 'zh-CN' ? '待处理交互' : 'Pending interaction'}
+        >
           {renderQueuedConversationMessages()}
           <PlanImplementationRequestSurface
-            key={blockingPlanImplementationRequest.id}
-            request={blockingPlanImplementationRequest}
+            key={planRequest.id}
+            request={planRequest}
             language={props.language}
             autoFocus
-            busy={isRequestResponseBusy(props.state?.busyOperation ?? null, blockingPlanImplementationRequest.id)}
-            error={requestErrors[blockingPlanImplementationRequest.id]}
-            onRespond={(_requestId, response) => respondToPlanImplementationRequest(blockingPlanImplementationRequest, response)}
+            busy={Boolean(outgoingPlan) || isRequestResponseBusy(props.state?.busyOperation ?? null, planRequest.id)}
+            error={outgoingPlan ? undefined : requestErrors[planRequest.id]}
+            onRespond={(_requestId, response) => respondToPlanImplementationRequest(planRequest, response)}
             onChooseAttachments={actions.onChooseStartAttachments}
           />
         </section>
@@ -3184,6 +3304,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 ) : (
                   <strong data-icon-tooltip={displayedHeader.title}>{displayedHeader.title}</strong>
                 )}
+                {conversationInformation}
                 {displayedHeader.taskId && displayedHeader.taskManagementStatus && displayedHeader.taskManagementStatusOptions?.length && actions.onTaskManagementStatusChange ? (
                   <TaskManagementStatusSelect
                     size="compact"
@@ -3214,12 +3335,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   </span>
                 ) : null}
               </span>
-              {!legacy && props.state ? <div className="session-thread-header-runtime session-thread-runtime-summary">{conversationInformation}</div> : null}
             </div>
           ) : null}
           <div className="session-context-header-tools">
-            <div ref={setContextToolbarHost} className="session-context-toolbar-host" inert={!contextOpen} />
             <div className="session-thread-header-actions">
+              {props.embeddedInTask ? conversationInformation : null}
               {!legacy && props.conversation && props.state ? (
                 <SessionQuickActionsCard
                   gitContext={props.gitContext}
@@ -3229,7 +3349,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   task={props.task}
                   persistentHost={quickActionsPersistentHost}
                   dockHost={browserPresent ? browserEnvironmentHost : null}
-                  forceCollapsed={contextOpen || attentionWorkspace.open}
                   conversationColumnWidth={conversationColumnWidth}
                   suppressed={props.quickActionsSuppressed}
                   capabilities={props.capabilities}
@@ -3278,15 +3397,7 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                   }
                   subagentCount={subagentThreadIds.length}
                   onStopOperationAgent={actions.onStopOperationAgent}
-                  onOpenSubagents={
-                    actions.onLoadSubagents && actions.onLoadSubagentThread
-                      ? (trigger) => {
-                          contextReturnFocusRef.current = trigger;
-                          setContextFullWidth(false);
-                          setContextWorkspace({ kind: 'subagents' });
-                        }
-                      : undefined
-                  }
+                  onOpenSubagents={actions.onLoadSubagents && actions.onLoadSubagentThread ? openSubagentWorkspace : undefined}
                   onStartCodeReview={(selection: SessionCodeReviewSelection) => {
                     if (props.conversation && !props.conversation.workspaceId && !props.conversation.environmentId && owner && actions.onStartProjectConversation) {
                       return actions.onStartProjectConversation({
@@ -3331,8 +3442,9 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 />
               ) : null}
             </div>
+            <div ref={setContextToolbarHost} className="session-context-toolbar-host" inert={!contextOpen} style={sessionContextToolbarExitStyle(contextExit?.toolbarWidth)} />
           </div>
-          {/* 旧会话或未就绪会话仅在标题下保留项目名称。 */}
+          {/* 运行详情归左侧正文；旧会话或未就绪会话仅在标题下保留项目名称。 */}
           {(legacy || !props.state) && displayedHeader.contextLabel ? (
             <div className="session-thread-subtitle-row">
               <small className="session-thread-project-name" data-icon-tooltip={displayedHeader.contextLabel}>
@@ -3401,12 +3513,6 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 data-browser-resizing={browserResizing || undefined}
               >
                 <div className="session-conversation-pane" inert={contextCoversConversation}>
-                  {/* 任务内隐藏会话标题时，仍在正文顶部保留运行详情入口。 */}
-                  {props.embeddedInTask || !displayedHeader ? (
-                    <div key={`runtime:${navigationId ?? props.state.conversationId}`} className="session-thread-subtitle-row session-thread-runtime-summary">
-                      {conversationInformation}
-                    </div>
-                  ) : null}
                   <SessionTranscriptProjection
                     state={props.state}
                     controller={props.stateController}
@@ -3418,6 +3524,12 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     projectPersistedPlans={props.projectPersistedPlans}
                     localSubmissionRevision={localSubmissionRevision}
                     historyLoading={Boolean(props.transcriptLoading ?? ((props.state.transportState === 'hydrating' || props.state.transportState === 'connecting') && !props.state.snapshot)) && !props.state.snapshot}
+                    attentionTurnId={props.conversation?.hasUnreadAttention ? props.conversation.attentionTurnId : null}
+                    activeSubagents={activeSubagents}
+                    operationHandoffTurnIds={operationHandoffTurnIds}
+                    operationAgentRunning={props.conversation?.operationAgentRunning}
+                    selectedSubagentThreadId={contextOpen && contextWorkspace.kind === 'subagents' ? selectedSubagentThreadId : null}
+                    onOpenSubagent={actions.onLoadSubagents && actions.onLoadSubagentThread ? openSubagentWorkspace : undefined}
                     onLatestContentVisibilityChange={reportLatestContentVisibility}
                     creationStatus={props.creationStatus}
                     onEditUserItem={
@@ -3438,9 +3550,10 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     onCancelPendingSend={transcriptInteractionsEnabled ? actions.onCancelPendingSend : undefined}
                     onCancelQueuedSubmission={transcriptInteractionsEnabled ? actions.onDeleteQueuedSubmission : undefined}
                     onOpenAsyncQuestion={transcriptInteractionsEnabled && !props.suppressComposer && actions.onAnswerAsyncQuestion ? asyncQuestionDock.open : undefined}
-                    openPlanItem={planWorkspaceItem}
-                    onOpenPlan={(item) => {
-                      contextReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+                    openPlanItem={contextOpen ? planWorkspaceItem : null}
+                    onSelectPlan={(item, trigger) => {
+                      if (!item) return closeContextWorkspace();
+                      contextReturnFocusRef.current = trigger;
                       setContextFullWidth(false);
                       setContextWorkspace({ kind: 'plan', item });
                     }}
@@ -3457,11 +3570,13 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                       transcriptReadActionsEnabled
                         ? (changeSet, fileId) => {
                             contextReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-                            setContextFullWidth(false);
+                            // 首次进入审阅使用全宽，已打开时保留用户选择的分栏模式。
+                            if (!contextOpen || contextWorkspace.kind !== 'turn_diff') setContextFullWidth(true);
                             setContextWorkspace({
                               kind: 'turn_diff',
                               turnId: changeSet.providerTurnId,
-                              ...(fileId ? { initialFileId: fileId } : {}),
+                              filesOpen: fileId === undefined,
+                              fileRequest: fileId === undefined ? undefined : { id: fileId },
                             });
                             // 审阅入口也负责重试尚未补齐的正文，不能只打开空白摘要。
                             if (changeSet.contentProjection === 'summary') void actions.onLoadTurnArtifacts?.(changeSet.providerTurnId);
@@ -3475,42 +3590,44 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     onRemoveResponseAnnotation={contextDraftWritable ? removeResponseAnnotation : undefined}
                   />
                   {props.suppressComposer || props.historyOnly || !dockedPlan ? null : <SessionPlanProgress plan={dockedPlan} language={props.language} />}
-                  {renderBottomInteraction()}
-                  {transcriptPreparationError ? (
-                    <p className="session-composer-unavailable" role="status">
-                      <span>
-                        {props.language === 'zh-CN'
-                          ? transcriptPreparationError.message
-                          : transcriptPreparationError.retryable
-                            ? 'Conversation history is still being prepared. Try again later.'
-                            : 'Conversation history could not be prepared. View the error details.'}
-                      </span>
-                      {transcriptPreparationError.retryable && actions.onReconnect ? (
-                        <Button unstyled type="button" onClick={() => actions.onReconnect?.()}>
-                          {props.language === 'zh-CN' ? '重试' : 'Retry'}
-                        </Button>
-                      ) : (
-                        <Button unstyled type="button" onClick={() => reportApplicationError(transcriptPreparationError, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' })}>
-                          {props.language === 'zh-CN' ? '查看详情' : 'View details'}
-                        </Button>
-                      )}
-                    </p>
-                  ) : props.state?.transcriptInitializing && props.state.snapshot ? (
-                    <p className="session-composer-unavailable" role="status">
-                      {props.language === 'zh-CN' ? '正在准备会话历史，当前内容已保留。' : 'Preparing conversation history. Your current content is preserved.'}
-                    </p>
-                  ) : null}
-                  {props.readOnlyGate ? (
-                    taskReadOnlyAction
-                  ) : props.suppressComposer || blockingPendingRequest || blockingPlanImplementationRequest || dockedAsyncQuestion ? null : (
-                    <>
-                      {goal ? <GoalRail goal={goal} language={props.language} onOpen={() => setGoalPanelOpen(true)} /> : null}
-                      <div className="session-composer-stack">
-                        {renderQueuedConversationMessages()}
-                        {renderConversationComposer()}
-                      </div>
-                    </>
-                  )}
+                  <div ref={bottomInputRef} className="session-bottom-input" data-plan-refinement-transition={outgoingPlan ? true : undefined}>
+                    {renderBottomInteraction()}
+                    {transcriptPreparationError ? (
+                      <p className="session-composer-unavailable" role="status">
+                        <span>
+                          {props.language === 'zh-CN'
+                            ? transcriptPreparationError.message
+                            : transcriptPreparationError.retryable
+                              ? 'Conversation history is still being prepared. Try again later.'
+                              : 'Conversation history could not be prepared. View the error details.'}
+                        </span>
+                        {transcriptPreparationError.retryable && actions.onReconnect ? (
+                          <Button unstyled type="button" onClick={() => actions.onReconnect?.()}>
+                            {props.language === 'zh-CN' ? '重试' : 'Retry'}
+                          </Button>
+                        ) : (
+                          <Button unstyled type="button" onClick={() => reportApplicationError(transcriptPreparationError, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en' })}>
+                            {props.language === 'zh-CN' ? '查看详情' : 'View details'}
+                          </Button>
+                        )}
+                      </p>
+                    ) : props.state?.transcriptInitializing && props.state.snapshot ? (
+                      <p className="session-composer-unavailable" role="status">
+                        {props.language === 'zh-CN' ? '正在准备会话历史，当前内容已保留。' : 'Preparing conversation history. Your current content is preserved.'}
+                      </p>
+                    ) : null}
+                    {props.readOnlyGate ? (
+                      taskReadOnlyAction
+                    ) : showConversationComposer ? (
+                      <>
+                        {goal ? <GoalRail goal={goal} language={props.language} onOpen={() => setGoalPanelOpen(true)} /> : null}
+                        <div className="session-composer-stack">
+                          {renderQueuedConversationMessages()}
+                          {renderConversationComposer()}
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
                   {!props.historyOnly && interruptArmed ? (
                     <p className="session-interrupt-confirm" role="status">
                       {copy.interruptConfirm}
@@ -3526,7 +3643,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                     aria-label={contextWorkspaceLabel(contextWorkspace, props.language)}
                     aria-hidden={!contextOpen}
                     inert={!contextOpen}
-                    data-native-viewport-transition={contextClosing || undefined}
+                    // 只有内置网页的占位区按动画收拢，PDF 等原生内容在退出交互时隐藏。
+                    data-native-viewport-transition={(browserPresent && contextClosing) || undefined}
                   >
                     <div
                       className="session-browser-resizer"
@@ -3547,7 +3665,12 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                       }}
                       onKeyDown={handleBrowserResizeKeyDown}
                     />
-                    <div className="session-browser-pane" data-environment-open={(browserPresent && quickActionsPopoverOpen) || undefined} data-environment-stacked={resolvedBrowserTargetWidth < 760 || undefined}>
+                    <div
+                      className="session-browser-pane"
+                      style={browserPresent || !contextExit ? undefined : { minInlineSize: contextExit.paneWidth }}
+                      data-environment-open={(browserPresent && quickActionsPopoverOpen) || undefined}
+                      data-environment-stacked={resolvedBrowserTargetWidth < 760 || undefined}
+                    >
                       <ReadingStateScope id={JSON.stringify([props.conversation.projectId, navigationId])}>
                         {sideQuestionState && props.renderSideQuestion
                           ? props.renderSideQuestion(sideQuestionState, setSideQuestionState, contextWorkspace.kind === 'question', contextFullWidth, setContextFullWidth, closeContextWorkspace, contextToolbarHost)
@@ -3581,9 +3704,11 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                           <SubagentWorkspace
                             language={props.language}
                             conversationId={props.state.conversationId ?? props.conversation.id}
-                            activityRevision={`${subagentActivity.revision}|${subagentSnapshotRevision}`}
-                            hintCount={subagentThreadIds.length}
                             initialSnapshot={props.subagentListSnapshot}
+                            threadRequest={contextWorkspace.threadRequest}
+                            onSelectedThreadChange={setSelectedSubagentThreadId}
+                            toolbarHost={contextToolbarHost}
+                            canSplit={browserLayoutWidth > 840}
                             fullWidth={contextFullWidth}
                             onFullWidthChange={setContextFullWidth}
                             onClose={closeContextWorkspace}
@@ -3593,7 +3718,16 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                           />
                         ) : null}
                         {contextWorkspace.kind === 'plan' && planWorkspaceItem ? (
-                          <PlanWorkspace item={planWorkspaceItem} language={props.language} fullWidth={contextFullWidth} onFullWidthChange={setContextFullWidth} onClose={closeContextWorkspace} />
+                          <PlanWorkspace
+                            item={planWorkspaceItem}
+                            language={props.language}
+                            toolbarHost={contextToolbarHost}
+                            open={contextOpen}
+                            canSplit={browserLayoutWidth > 840}
+                            fullWidth={contextFullWidth}
+                            onFullWidthChange={setContextFullWidth}
+                            onClose={closeContextWorkspace}
+                          />
                         ) : null}
                         {contextWorkspace.kind === 'file' ? (
                           <FilePreviewWorkspace
@@ -3640,8 +3774,12 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                         ) : null}
                         {contextWorkspace.kind === 'turn_diff' && turnDiffChangeSet ? (
                           <TurnDiffWorkspace
+                            toolbarHost={contextToolbarHost}
+                            canSplit={browserLayoutWidth > 840}
                             changeSet={turnDiffChangeSet}
-                            initialFileId={contextWorkspace.initialFileId}
+                            fileRequest={contextWorkspace.fileRequest}
+                            filesOpen={contextWorkspace.filesOpen}
+                            onFilesOpenChange={(filesOpen) => setContextWorkspace((current) => (current.kind === 'turn_diff' ? { ...current, filesOpen } : current))}
                             language={props.language}
                             fullWidth={contextFullWidth}
                             onFullWidthChange={setContextFullWidth}
@@ -3915,8 +4053,8 @@ export function NewConversationComposer(props: {
   const projectTools = useContext(ProjectToolContext);
   /** 浏览器工作面随当前输入草稿恢复。 */
   const [browserOpen, setBrowserOpen] = useState(() => restoredDraft?.browserOpen ?? false);
-  /** 关闭释放标签，批注暂存只收拢网页以供首发迁移。 */
-  const [browserClosing, setBrowserClosing] = useState<'close' | 'hide' | null>(null);
+  /** 关闭释放标签，暂存只收拢网页，两者都保留退场前的标签栏宽度。 */
+  const [browserClosing, setBrowserClosing] = useState<{ action: 'close' | 'hide'; toolbarWidth?: number } | null>(null);
   /** 退出时立即关闭交互，重新打开时从当前宽度反向过渡。 */
   const browserVisible = browserOpen && !browserClosing;
   /** 新会话和已有会话共用同一分栏过渡。 */
@@ -4004,7 +4142,7 @@ export function NewConversationComposer(props: {
   );
   /** 主动发送失败先判断原始原因，离线反馈只留在输入区。 */
   function showSubmissionFailure(failure: NativeConversationStartFailure, error: unknown = failure.cause ?? failure): void {
-    if (isLocalNetworkOffline(error)) {
+    if (userFacingNetworkIssue(error, window.navigator.onLine === false) === 'offline') {
       setOfflineSubmission(userFacingErrorCause(error).code === 'ZEUS_LOCAL_API_WRITE_OUTCOME_UNKNOWN' ? 'unconfirmed' : 'blocked');
       return;
     }
@@ -4032,7 +4170,6 @@ export function NewConversationComposer(props: {
   const modelSetupRequestRef = useRef<AbortController | null>(null);
   useEffect(() => () => modelSetupRequestRef.current?.abort(), [props.owner?.projectId]);
   const [goalInputOpen, setGoalInputOpen] = useState(() => restoredDraft?.goalInputOpen ?? false);
-  const [goalObjective, setGoalObjective] = useState(() => restoredDraft?.goalObjective ?? '');
   /** 本页失败后的输入恢复提交到界面后，移除对应的备用草稿。 */
   const [restoredSubmission, setRestoredSubmission] = useState<NewConversationDraft>();
   useLayoutEffect(() => {
@@ -4052,7 +4189,6 @@ export function NewConversationComposer(props: {
       serviceTierSelection,
       contextCapacityTokens,
       goalInputOpen,
-      goalObjective,
       tokenDraft,
     });
   }, [
@@ -4073,7 +4209,6 @@ export function NewConversationComposer(props: {
     serviceTierSelection,
     contextCapacityTokens,
     goalInputOpen,
-    goalObjective,
     tokenDraft,
   ]);
 
@@ -4101,20 +4236,25 @@ export function NewConversationComposer(props: {
   }, [browserDraft.conversationId]);
 
   /** 开始收拢时恢复输入框焦点，保持原生视图随尺寸同步。 */
-  const closeBrowser = useCallback((action: 'close' | 'hide' = 'close'): void => {
-    setBrowserClosing((current) => current ?? action);
-    window.zeus?.notifySessionContextActivity?.({ active: false, kind: 'none' });
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  const closeBrowser = useCallback(
+    (action: 'close' | 'hide' = 'close'): void => {
+      const toolbarWidth = sessionContextToolbarWidth(browserMotionRef.current);
+      setBrowserClosing((current) => current ?? { action, toolbarWidth });
+      window.zeus?.notifySessionContextActivity?.({ active: false, kind: 'none' });
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [browserMotionRef],
+  );
 
   useEffect(() => {
     if (!browserClosing || browserPresent) return;
+    const { action } = browserClosing;
     /** 重开浏览器后忽略已过期的关闭回执。 */
     let cancelled = false;
     /** 动画结束后按关闭来源释放或保留原生标签。 */
     async function finishClose(): Promise<void> {
       try {
-        if (browserClosing === 'close') {
+        if (action === 'close') {
           await window.zeus?.closeBrowserConversation?.(browserDraft.conversationId);
           if (cancelled) return;
           recoverDraftOperation('browser_close');
@@ -4218,7 +4358,12 @@ export function NewConversationComposer(props: {
         }
       })
       .catch((error: unknown) => {
-        if (active && !isLocalNetworkOffline(error)) recordSystemMessage(systemScope, error, 'model_capabilities', '模型选项读取失败。');
+        if (!active) return;
+        if (userFacingNetworkIssue(error, window.navigator.onLine === false)) {
+          reportApplicationError(error, { language: props.language === 'zh-CN' ? 'zh-CN' : 'en', background: true });
+          return;
+        }
+        recordSystemMessage(systemScope, error, 'model_capabilities', '模型选项读取失败。');
       })
       .finally(() => {
         if (active) setCapabilitiesLoading(false);
@@ -4243,8 +4388,8 @@ export function NewConversationComposer(props: {
   const goalAvailable = Boolean(selectedModel?.features?.goals.state === 'available' || (!selectedModel?.features && activeCapabilities?.goals?.supported && activeCapabilities?.goals?.enabled));
   const goalInputActive = goalInputOpen && goalAvailable;
   /** 目标已进入首发消息时，输入区按空内容计数，原目标仍可在失败后恢复。 */
-  const goalCount = startingTranscript ? 0 : [...goalObjective.trim()].length;
-  const goalObjectiveValid = goalCount > 0 && goalCount <= 4_000;
+  const goalCount = goalInputActive ? [...composerState.draft.trim()].length : 0;
+  const goalDraftValid = goalCount > 0 && goalCount <= 4_000;
 
   useEffect(() => {
     // 能力尚未返回时保留目标草稿，避免导航恢复被误判为不支持目标。
@@ -4288,16 +4433,28 @@ export function NewConversationComposer(props: {
     setCollaborationMode(remembered?.workMode ?? 'default');
   }
 
-  /** 创建会话并在受理后记录实际选择。 */
-  async function submit(overrides: { content?: string; goalObjective?: string } = {}): Promise<void> {
+  /** 目标编辑器修改同一份草稿，并同步调整引用位置。 */
+  function changeGoalDraft(value: string): void {
+    tokenDraft.current = reconcileTokens(content, value, tokenDraft.current);
+    setContent(value);
+  }
+
+  /** 模式切换后将焦点交给当前输入框。 */
+  function changeGoalInput(open: boolean): void {
+    setGoalInputOpen(open);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
+  /** 创建会话时，目标模式以同一段草稿作为首条消息和目标。 */
+  async function submit(goalDraft = goalInputActive ? content : undefined): Promise<void> {
     // 键盘提交也需等待导入完成，避免附件落回已发送的草稿。
     if (inputResources.processing) return;
-    const structured = structuredSelectionRef.current;
-    const submittedContent = overrides.content ?? structured.promptText;
+    /** 目标输入期间，引用来自当前正文及其标签位置。 */
+    const structured = goalDraft === undefined ? structuredSelectionRef.current : selectionFromTokens(goalDraft, tokenDraft.current);
+    const submittedContent = goalDraft ?? structured.promptText;
     const submittedDisplayText =
-      (overrides.content === undefined ? structured.displayText : overrides.content) ||
-      (browserDraft.submission ? (props.language === 'zh-CN' ? `${browserDraft.submission.comments.length} 条网页批注` : `${browserDraft.submission.comments.length} browser comments`) : '');
-    const submittedGoal = (overrides.goalObjective ?? (goalInputActive ? goalObjective : '')).trim();
+      (goalDraft ?? structured.displayText) || (browserDraft.submission ? (props.language === 'zh-CN' ? `${browserDraft.submission.comments.length} 条网页批注` : `${browserDraft.submission.comments.length} browser comments`) : '');
+    const submittedGoal = goalDraft?.trim();
     if (
       !props.owner ||
       submitting ||
@@ -4307,11 +4464,11 @@ export function NewConversationComposer(props: {
       (!selectedModel && !needsModelSetup) ||
       (selectedModel && !contextCapacitySelectionAllowed(contextCapacityTokens, selectedModel.contextCapacity)) ||
       (!needsModelSetup && !submittedContent.trim() && attachments.length === 0 && !browserDraft.submission) ||
-      (goalInputActive && !submittedGoal)
+      (goalDraft !== undefined && (!submittedGoal || [...submittedGoal].length > 4_000))
     )
       return;
     /** Codex 和 Copilot 依赖远端服务；自定义模型仍可通过本机端点运行。 */
-    if (window.navigator.onLine === false && (selectedModel?.sourceId === 'codex' || selectedModel?.sourceId === 'copilot')) {
+    if (window.navigator.onLine === false && (selectedModel?.sourceId === 'codex' || selectedModel?.sourceId === 'copilot' || selectedModel?.sourceId === 'antigravity')) {
       setOfflineSubmission('blocked');
       return;
     }
@@ -4322,10 +4479,15 @@ export function NewConversationComposer(props: {
       /** 同一次接入只刷新此项目和此草稿，不自动创建会话或发送消息。 */
       const request = new AbortController();
       modelSetupRequestRef.current = request;
-      /** 显式选中的供应商模型加入项目后，刷新目录并预选供用户确认。 */
+      /** 接入目录和完成回调始终使用打开弹窗时的项目。 */
       const conversationContext: ConversationModelSetupContext = {
         projectId: props.owner.projectId,
         signal: request.signal,
+        loadModels: async () => {
+          const refreshed = await props.onLoadCapabilities?.(conversationContext.projectId, true);
+          if (!refreshed) throw new Error('ZEUS_MODEL_UNAVAILABLE');
+          return refreshed.models;
+        },
         onComplete: async (reference) => {
           /** 读取最新目录；失败保留引导和全部草稿内容。 */
           const refreshed = await props.onLoadCapabilities?.(conversationContext.projectId, true);
@@ -4383,6 +4545,8 @@ export function NewConversationComposer(props: {
         }),
       );
       submittedDraft = props.drafts?.active.get(draftKey);
+      // 直接提交 /goal 时，保存去掉命令后的目标草稿以供失败恢复。
+      if (submittedDraft && goalDraft !== undefined && !goalInputActive) submittedDraft = { ...submittedDraft, content: goalDraft, goalInputOpen: true };
       props.drafts?.active.delete(draftKey);
       let accepted: void | boolean | NativeConversationStartPreparation | NativeConversationStartFailure;
       if (props.owner.kind === 'project') {
@@ -4463,7 +4627,6 @@ export function NewConversationComposer(props: {
         /** 原浏览器已迁移到受理会话，后续空草稿使用独立归属。 */
         setBrowserDraft({ conversationId: `browser-draft-${crypto.randomUUID()}`, submission: null });
         setGoalInputOpen(false);
-        setGoalObjective('');
         tokenDraft.current = [];
       }
       await props.onAccepted?.();
@@ -4517,13 +4680,7 @@ export function NewConversationComposer(props: {
     >
       {offlineSubmission ? (
         <p className="session-composer-unavailable" role="status">
-          {offlineSubmission === 'unconfirmed'
-            ? props.language === 'zh-CN'
-              ? '暂未确认发送结果，联网后可重试。'
-              : 'Delivery is unconfirmed. Retry when you’re back online.'
-            : props.language === 'zh-CN'
-              ? '网络已断开，联网后可重试。'
-              : 'You’re offline. Retry when you’re back online.'}
+          {offlineSubmission === 'unconfirmed' ? (props.language === 'zh-CN' ? '暂未确认发送结果，联网后可重试。' : 'Delivery is unconfirmed. Retry when you’re back online.') : offlineNetworkNotice(props.language)}
         </p>
       ) : null}
       <ConversationComposerAttachments
@@ -4560,18 +4717,8 @@ export function NewConversationComposer(props: {
           <div className="session-goal-compose-context">
             <Target aria-hidden="true" weight="regular" />
             <strong>{copy.createGoal}</strong>
-            {composerState.draft.trim() || composerState.attachments.length > 0 ? <small>{copy.normalDraftPreserved}</small> : null}
             <span className={goalCount > 4_000 ? 'session-goal-compose-count is-invalid' : 'session-goal-compose-count'}>{goalCount} / 4000</span>
-            <Button
-              unstyled
-              type="button"
-              aria-label={copy.exitGoal}
-              onClick={() => {
-                setGoalInputOpen(false);
-                requestAnimationFrame(() => textareaRef.current?.focus());
-              }}
-              disabled={submitting}
-            >
+            <Button unstyled type="button" aria-label={copy.exitGoal} onClick={() => changeGoalInput(false)} disabled={submitting}>
               <X aria-hidden="true" weight="bold" />
             </Button>
           </div>
@@ -4585,9 +4732,9 @@ export function NewConversationComposer(props: {
             aria-keyshortcuts="Enter Shift+Enter Escape"
             autoFocus={props.autoFocus}
             placeholder={copy.goalPlaceholder}
-            value={startingTranscript ? '' : goalObjective}
+            value={composerState.draft}
             disabled={submitting || !props.owner}
-            onChange={(event) => setGoalObjective(event.currentTarget.value)}
+            onChange={(event) => changeGoalDraft(event.currentTarget.value)}
             onCompositionStart={() => setIsComposing(true)}
             onCompositionEnd={() => setIsComposing(false)}
             onKeyDown={(event) => {
@@ -4595,10 +4742,10 @@ export function NewConversationComposer(props: {
               if (intent === 'escape') {
                 event.preventDefault();
                 event.stopPropagation();
-                setGoalInputOpen(false);
+                changeGoalInput(false);
               } else if (intent === 'submit') {
                 event.preventDefault();
-                if (goalObjectiveValid) return submit({ content: content.trim() ? content : goalObjective, goalObjective });
+                if (goalDraftValid) return submit();
               }
             }}
           />
@@ -4642,8 +4789,7 @@ export function NewConversationComposer(props: {
               onPlanMode={() => setCollaborationMode((current) => (current === 'plan' ? 'default' : 'plan'))}
               onGoalMode={() => {
                 if (!goalAvailable) return;
-                setGoalInputOpen(true);
-                requestAnimationFrame(() => textareaRef.current?.focus());
+                changeGoalInput(true);
               }}
               onOpenComputerSettings={props.onOpenComputerSettings}
               onCompositionStart={() => {
@@ -4657,7 +4803,7 @@ export function NewConversationComposer(props: {
               }}
               onKeyDown={(event) => {
                 if (!isComposing && suggestion.handleKeyDown(event, textareaRef.current)) return;
-                if (!goalInputActive) inputResources.handlePasteShortcut(event);
+                inputResources.handlePasteShortcut(event);
                 const intent = resolveComposerKeyIntent({
                   key: event.key,
                   shiftKey: event.shiftKey,
@@ -4665,34 +4811,19 @@ export function NewConversationComposer(props: {
                   keyCode: event.nativeEvent.keyCode,
                   repeat: event.repeat,
                 });
-                if (intent === 'escape' && goalInputActive) {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setGoalInputOpen(false);
-                  return;
-                }
                 if (intent !== 'submit') return;
                 event.preventDefault();
-                if (goalInputActive) {
-                  if (goalObjectiveValid) void submit({ content: content.trim() ? content : goalObjective, goalObjective });
-                  return;
-                }
                 if (/^\/goal(?:\s|$)/u.test(content.trim()) && goalAvailable) {
                   if (structuredSelectionRef.current.expertMentions.length > 0) {
                     setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
                     return;
                   }
-                  const objective = content.trim().slice('/goal'.length).trim();
-                  if (['pause', 'resume', 'clear'].includes(objective)) return;
-                  setContent('');
-                  if (!objective) {
-                    setGoalInputOpen(true);
-                    requestAnimationFrame(() => textareaRef.current?.focus());
-                    return;
-                  }
-                  setGoalObjective(objective);
-                  setGoalInputOpen(true);
-                  void submit({ content: objective, goalObjective: objective });
+                  // 只移除命令和前导空白，引用按原正文的后缀位置保留。
+                  const objective = content.trimStart().slice('/goal'.length).trimStart();
+                  if (['pause', 'resume', 'clear'].includes(objective.trimEnd())) return;
+                  changeGoalDraft(objective);
+                  changeGoalInput(true);
+                  if (objective) void submit(objective);
                   return;
                 }
                 return submit();
@@ -4741,8 +4872,7 @@ export function NewConversationComposer(props: {
                       setLocalError(props.language === 'zh-CN' ? '目标模式暂不支持指定数字员工。请退出目标模式后再选择。' : 'Goal mode does not support choosing a digital employee. Exit goal mode before selecting one.');
                       return;
                     }
-                    setGoalInputOpen((open) => !open);
-                    requestAnimationFrame(() => textareaRef.current?.focus());
+                    changeGoalInput(!goalInputActive);
                   }}
                 >
                   <Target aria-hidden="true" weight={goalInputActive ? 'fill' : 'regular'} />
@@ -4799,7 +4929,7 @@ export function NewConversationComposer(props: {
                 type="button"
                 className={needsModelSetup ? 'session-send-button is-model-setup' : 'session-send-button'}
                 aria-label={needsModelSetup ? (props.language === 'zh-CN' ? '配置模型' : 'Set up model') : goalInputActive ? copy.createGoal : copy.send}
-                onClick={() => submit(goalInputActive ? { content: content.trim() ? content : goalObjective, goalObjective } : {})}
+                onClick={() => submit()}
                 disabled={
                   submitting ||
                   executionContextBusy ||
@@ -4809,7 +4939,7 @@ export function NewConversationComposer(props: {
                   runtimeProjectId !== props.owner.projectId ||
                   (!selectedModel && !needsModelSetup) ||
                   Boolean(selectedModel && !contextCapacitySelectionAllowed(contextCapacityTokens, selectedModel.contextCapacity)) ||
-                  (!needsModelSetup && (goalInputActive ? !goalObjectiveValid : !content.trim() && attachments.length === 0 && !browserDraft.submission))
+                  (!needsModelSetup && (goalInputActive ? !goalDraftValid : !content.trim() && attachments.length === 0 && !browserDraft.submission))
                 }
                 aria-busy={submitting || undefined}
               >
@@ -4847,7 +4977,6 @@ export function NewConversationComposer(props: {
           <strong>{props.language === 'zh-CN' ? '新对话' : 'New conversation'}</strong>
         </div>
         <div className="session-context-header-tools">
-          <div ref={setBrowserToolbarHost} className="session-context-toolbar-host" inert={!browserVisible} />
           <div className="session-thread-header-actions">
             <Button
               unstyled
@@ -4862,6 +4991,7 @@ export function NewConversationComposer(props: {
               <GlobeSimple aria-hidden="true" weight="regular" />
             </Button>
           </div>
+          <div ref={setBrowserToolbarHost} className="session-context-toolbar-host" inert={!browserVisible} style={sessionContextToolbarExitStyle(browserClosing?.toolbarWidth)} />
         </div>
       </header>
       <div ref={browserLayoutRef} className="session-conversation-browser-layout" data-browser-open={browserVisible || undefined} data-browser-expanded={(browserVisible && browserExpanded) || undefined}>
@@ -5026,11 +5156,16 @@ function SessionRuntimeDetails(props: {
   const unifiedUsage = metrics?.usage ?? props.state.unifiedUsage;
   const conversationUsage = unifiedUsage?.conversationTotal ?? null;
   const latestRequest = unifiedUsage?.latestModelRequest ?? null;
-  const totalTokens = conversationUsage?.totalTokens ?? usage?.total.totalTokens ?? null;
-  const inputTokens = conversationUsage?.inputTokens ?? usage?.total.inputTokens ?? null;
-  const outputTokens = conversationUsage?.outputTokens ?? usage?.total.outputTokens ?? null;
-  const reasoningTokens = conversationUsage?.reasoningOutputTokens ?? usage?.total.reasoningOutputTokens ?? null;
-  const cacheHitRate = nullableCacheHitRate(conversationUsage?.inputTokens ?? null, conversationUsage?.cachedInputTokens ?? null) ?? usage?.cacheHitRate ?? null;
+  /** ACP 只提供整轮用量，合并账本可覆盖同一会话早先的其他引擎。 */
+  const usageCount = (field: 'totalTokens' | 'inputTokens' | 'outputTokens' | 'reasoningOutputTokens' | 'cachedInputTokens') =>
+    usage?.reportedTokenFields ? (usage.reportedTokenFields.includes(field) ? usage.total[field] : null) : (conversationUsage?.[field] ?? usage?.total[field] ?? null);
+  const totalTokens = usageCount('totalTokens');
+  const inputTokens = usageCount('inputTokens');
+  const outputTokens = usageCount('outputTokens');
+  const reasoningTokens = usageCount('reasoningOutputTokens');
+  const cacheHitRate = usage?.reportedTokenFields
+    ? nullableCacheHitRate(inputTokens, usageCount('cachedInputTokens'))
+    : (nullableCacheHitRate(conversationUsage?.inputTokens ?? null, conversationUsage?.cachedInputTokens ?? null) ?? usage?.cacheHitRate ?? null);
   const cost = metrics?.cost ?? {
     costs: usage?.costs,
     apiEquivalentUsd: usage?.apiEquivalentUsd ?? null,
@@ -5059,8 +5194,14 @@ function SessionRuntimeDetails(props: {
       inputTokens: runtimeFact(inputTokens, props.language === 'zh-CN' ? '暂无累计输入用量。' : 'Total input usage is unavailable.'),
       outputTokens: runtimeFact(outputTokens, props.language === 'zh-CN' ? '暂无累计输出用量。' : 'Total output usage is unavailable.'),
       reasoningOutputTokens: runtimeFact(reasoningTokens, props.language === 'zh-CN' ? '暂无累计推理用量。' : 'Total reasoning usage is unavailable.'),
-      contextTokens: runtimeFact(latestRequest?.totalTokens ?? usage?.last.totalTokens ?? null, props.language === 'zh-CN' ? '暂无最近请求的上下文用量。' : 'Context usage for the latest request is unavailable.'),
-      contextWindow: runtimeFact(latestRequest?.contextWindow ?? usage?.modelContextWindow ?? null, props.language === 'zh-CN' ? '尚未读取到模型可处理的最大长度。' : 'The model’s maximum context length is unavailable.'),
+      contextTokens: runtimeFact(
+        usage?.contextUsedTokens !== undefined ? usage.contextUsedTokens : (latestRequest?.totalTokens ?? usage?.last.totalTokens ?? null),
+        props.language === 'zh-CN' ? '暂无最近请求的上下文用量。' : 'Context usage for the latest request is unavailable.',
+      ),
+      contextWindow: runtimeFact(
+        usage?.contextUsedTokens !== undefined ? usage.modelContextWindow : (latestRequest?.contextWindow ?? usage?.modelContextWindow ?? null),
+        props.language === 'zh-CN' ? '尚未读取到模型可处理的最大长度。' : 'The model’s maximum context length is unavailable.',
+      ),
       cacheHitRate: runtimeFact(cacheHitRate, props.language === 'zh-CN' ? '暂无缓存使用比例。' : 'The cache usage ratio is unavailable.'),
       costs: cost.costs,
       apiEquivalentUsd: runtimeFact(cost.apiEquivalentUsd, props.language === 'zh-CN' ? '当前模型没有可用于计算费用的价格。' : 'No price is available to calculate this model’s cost.'),
@@ -5105,17 +5246,9 @@ function nullableCacheHitRate(inputTokens: number | null, cachedInputTokens: num
 }
 
 function linkedFileApprovalPaths(state: NativeSessionState | null, request: NativePendingRequest): string[] {
-  const providerItemId = stringField(request.payload.itemId) ?? request.itemId;
+  const providerItemId = stringField(request.payload.itemId);
   if (!state || requestKind(request) !== 'file' || !providerItemId) return [];
-  const requestTurnIdentity = stringField(request.payload.turnId) ?? request.turnId;
-  const requestTurnIdentities = new Set([requestTurnIdentity].filter((identity): identity is string => Boolean(identity)));
-  for (const turn of Object.values(state.turnsByProviderId)) {
-    if (!requestTurnIdentities.has(turn.id) && (!turn.providerTurnId || !requestTurnIdentities.has(turn.providerTurnId))) continue;
-    requestTurnIdentities.add(turn.id);
-    if (turn.providerTurnId) requestTurnIdentities.add(turn.providerTurnId);
-  }
-  const candidates = Object.values(state.items).filter((item) => item.itemId === providerItemId || item.providerItemId === providerItemId);
-  const linkedItem = candidates.find((item) => requestTurnIdentities.has(item.turnId)) ?? (requestTurnIdentities.size === 0 && candidates.length === 1 ? candidates[0] : undefined);
+  const linkedItem = Object.values(state.items).find((item) => item.itemId === providerItemId || item.providerItemId === providerItemId);
   if (!linkedItem || linkedItem.type.replace(/[^a-z]/gi, '').toLowerCase() !== 'filechange' || !Array.isArray(linkedItem.payload.changes)) return [];
   return [
     ...new Set(
@@ -5159,6 +5292,16 @@ function historySessionHasActiveWork(state: NativeSessionState | null | undefine
     // 完成事件登记两种轮次身份，旧快照不能因使用内部 ID 而绕过终态。
     (turn) => !state.terminalTurnIds[turn.id] && !(turn.providerTurnId && state.terminalTurnIds[turn.providerTurnId]) && (turn.status === 'running' || turn.status === 'dispatching' || turn.status === 'waiting'),
   );
+}
+
+/** 量取当前分栏的门户宽度，避免退场时标题和标签在裁切区内重新排版。 */
+function sessionContextToolbarWidth(layout: HTMLElement | null): number | undefined {
+  return layout?.querySelector(':scope > .session-thread-header > .session-context-header-tools > .session-context-toolbar-host')?.getBoundingClientRect().width;
+}
+
+/** 向标签栏提供退场前的 CSS 像素宽度，裁切宽度仍由门户外层决定。 */
+function sessionContextToolbarExitStyle(width: number | undefined): CSSProperties | undefined {
+  return width === undefined ? undefined : ({ '--session-context-toolbar-content-width': `${width}px` } as CSSProperties);
 }
 
 function resolveBrowserTargetWidth(layoutWidth: number, paneShare: number, expanded: boolean): number {

@@ -12,7 +12,6 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-root {
-  --usage-bg: rgb(251 251 252 / 97%);
   --usage-panel: rgb(255 255 255 / 76%);
   --usage-panel-strong: rgb(255 255 255 / 94%);
   --usage-text: #202126;
@@ -24,49 +23,20 @@ body:has(.menu-bar-usage-root),
   --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 10%, white);
   --usage-danger: #b64949;
   box-sizing: border-box;
-  inline-size: 100%;
+  /* 菜单栏主体始终占用固定原生宽度，费用明细由独立透明窗口承载。 */
+  inline-size: min(360px, 100%);
   block-size: 100%;
+  margin-inline: auto;
   /* 缩小浮窗外侧留白，让固定宽度更多用于内容。 */
-  padding: 12px 10px;
+  padding: 12px;
   color: var(--usage-text);
   color-scheme: light;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif;
-  font-size: 13px;
+  /* 正文与操作使用紧凑字号；关键数字单独强调，点击区域保持原尺寸。 */
+  font-size: 12px;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   user-select: none;
-}
-
-.menu-bar-usage-root[data-appearance='dark'] {
-  --usage-bg: rgb(35 35 38 / 97%);
-  --usage-panel: rgb(255 255 255 / 5%);
-  --usage-panel-strong: rgb(255 255 255 / 9%);
-  --usage-text: #f3f3f5;
-  --usage-muted: #a7a8b0;
-  --usage-faint: #858690;
-  --usage-line: rgb(255 255 255 / 10%);
-  --usage-edge: rgb(255 255 255 / 15%);
-  --usage-accent: var(--zeus-brand-primary);
-  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 18%, transparent);
-  --usage-danger: #ff9393;
-  color-scheme: dark;
-}
-
-@media (prefers-color-scheme: dark) {
-  .menu-bar-usage-root[data-appearance='system'] {
-    --usage-bg: rgb(35 35 38 / 97%);
-    --usage-panel: rgb(255 255 255 / 5%);
-    --usage-panel-strong: rgb(255 255 255 / 9%);
-    --usage-text: #f3f3f5;
-    --usage-muted: #a7a8b0;
-    --usage-faint: #858690;
-    --usage-line: rgb(255 255 255 / 10%);
-    --usage-edge: rgb(255 255 255 / 15%);
-    --usage-accent: var(--zeus-brand-primary);
-    --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 18%, transparent);
-    --usage-danger: #ff9393;
-    color-scheme: dark;
-  }
 }
 
 .menu-bar-usage-root *,
@@ -101,14 +71,14 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-identity strong {
-  font-size: 14px;
-  font-weight: 730;
+  font-size: 16px;
+  font-weight: 650;
 }
 
 .menu-bar-usage-freshness {
   overflow: hidden;
   color: var(--usage-muted);
-  font-size: 10px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -118,7 +88,7 @@ body:has(.menu-bar-usage-root),
   inline-size: 24px;
   block-size: 24px;
   flex: 0 0 24px;
-  background: url('../../../assets/icon.png') center / contain no-repeat;
+  background: url('../../../assets/startup-mark.png') center / contain no-repeat;
 }
 
 /* 时间与刷新按钮作为一组，长文案省略但保留完整悬浮提示。 */
@@ -164,6 +134,10 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
   min-block-size: 28px;
   flex: 0 0 auto;
   padding: 4px 10px;
@@ -173,7 +147,17 @@ body:has(.menu-bar-usage-root),
   color: var(--usage-muted);
   font: inherit;
   font-size: 12px;
-  font-weight: 620;
+  font-weight: 550;
+}
+
+.menu-bar-usage-root .model-provider-badge {
+  --model-provider-size: 18px;
+}
+
+.menu-bar-usage-provider-copy .model-provider-labelled > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .menu-bar-usage-tabs button[aria-selected='true'] {
@@ -280,11 +264,78 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-provider-list {
+  /* 表头与按钮共用列宽，窄窗口优先给名称和完整金额留空间。 */
+  --usage-provider-columns: minmax(0, 1fr) clamp(38px, 17vw, 62px) clamp(69px, 21vw, 76px) 14px;
+  --usage-provider-gap: 7px;
   display: grid;
-  overflow: hidden;
   border: 0;
   border-radius: var(--usage-radius-card, 12px);
   background: var(--usage-panel);
+}
+
+/* All 周期与摘要卡等宽，复用共享分段控件的高度和选中样式。 */
+.menu-bar-usage-all-range {
+  margin-block-end: var(--usage-space-2, 8px);
+}
+
+.menu-bar-usage-all-range .menu-bar-usage-range {
+  display: flex;
+  padding-inline: 2px;
+}
+
+.menu-bar-usage-all-range .menu-bar-usage-range button {
+  flex: 1 1 0;
+  min-inline-size: 0;
+  white-space: normal;
+}
+
+/* 总量和使用供应商数共用一块摘要，色彩随现有浮窗主题变化。 */
+.menu-bar-usage-provider-total {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-block-size: 59px;
+  padding: 8px 11px;
+  border: 1px solid var(--usage-accent-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--usage-accent) 6%, var(--usage-panel));
+}
+
+.menu-bar-usage-provider-total span {
+  display: grid;
+  gap: 3px;
+}
+
+.menu-bar-usage-provider-total small {
+  color: var(--usage-muted);
+  font-size: 10px;
+}
+
+.menu-bar-usage-provider-total strong {
+  font-size: clamp(18px, 7vw, 25px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 列表只在表头说明所选统计周期，避免每行重复文案。 */
+.menu-bar-usage-provider-heading {
+  display: grid;
+  grid-template-columns: var(--usage-provider-columns);
+  gap: var(--usage-provider-gap);
+  padding: 12px 4px 8px;
+  color: var(--usage-muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* 有独立拖动手柄时，表头偏移同样的宽度来保持数字列对齐。 */
+.menu-bar-usage-provider-list[data-reorderable='true'] .menu-bar-usage-provider-heading {
+  padding-inline-start: 28px;
+}
+
+.menu-bar-usage-provider-heading span:last-child {
+  text-align: end;
 }
 
 /* 手柄与详情按钮分开，拖动排序不会误打开详情。 */
@@ -294,6 +345,7 @@ body:has(.menu-bar-usage-root),
   align-items: center;
   margin-block: 2px;
   border-radius: 6px;
+  border-block-end: 1px solid var(--usage-line);
 }
 
 .menu-bar-usage-provider-row .menu-bar-usage-provider-open {
@@ -315,6 +367,7 @@ body:has(.menu-bar-usage-root),
 
 .menu-bar-usage-provider-row[data-dragging='true'] {
   opacity: 0.5;
+  background: var(--usage-accent-soft);
 }
 
 /* 落点线表示最终插入位置，拖拽过程中不重排内容。 */
@@ -350,12 +403,11 @@ body:has(.menu-bar-usage-root),
   min-inline-size: 0;
   border-radius: 6px;
   display: grid;
-  /* 移除字母头像后，供应商名称直接占据首列。 */
-  grid-template-columns: minmax(0, 1fr) auto 14px;
+  grid-template-columns: var(--usage-provider-columns);
   align-items: center;
-  gap: 9px;
-  min-block-size: 65px;
-  padding: 9px 4px;
+  gap: var(--usage-provider-gap);
+  min-block-size: 44px;
+  padding: 5px 4px;
   border: 0;
   background: transparent;
   color: var(--usage-text);
@@ -386,6 +438,7 @@ body:has(.menu-bar-usage-root),
 
 .menu-bar-usage-provider-copy strong {
   font-size: 12px;
+  font-weight: 550;
 }
 
 .menu-bar-usage-provider-copy small,
@@ -395,12 +448,42 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-provider-value {
-  max-inline-size: 102px;
+  font-variant-numeric: tabular-nums;
   text-align: end;
+}
+
+.menu-bar-usage-provider-value small {
+  font-size: 12px;
+}
+
+.menu-bar-usage-provider-value small:only-child {
+  font-weight: 650;
 }
 
 .menu-bar-usage-provider-value strong {
   font-size: 13px;
+}
+
+/* 每个柱位保留一个自然日，缺失日留空，末柱用强调色区分今日。 */
+.menu-bar-usage-provider-trend {
+  display: flex;
+  align-items: end;
+  gap: 2px;
+  block-size: 20px;
+}
+
+.menu-bar-usage-provider-trend:not(:empty) {
+  border-block-end: 1px solid var(--usage-line);
+}
+
+.menu-bar-usage-provider-trend i {
+  flex: 1;
+  border-radius: 2px 2px 0 0;
+  background: color-mix(in srgb, var(--usage-accent) 62%, var(--usage-panel));
+}
+
+.menu-bar-usage-provider-trend i:last-child {
+  background: var(--usage-accent);
 }
 
 .menu-bar-usage-root svg {
@@ -415,83 +498,113 @@ body:has(.menu-bar-usage-root),
 
 .menu-bar-usage-detail {
   display: grid;
-  gap: 8px;
-  padding-block-end: 10px;
+  gap: 0;
 }
 
+/* 每个额度池只出现一次名称，周期、进度和余额共享一行。 */
 .menu-bar-usage-account-card {
   display: grid;
-  min-block-size: 108px;
-  gap: 8px;
-  padding: 10px 2px;
+  gap: 6px;
+  padding: 4px 0 12px;
   border: 0;
-  border-radius: var(--usage-radius-card, 12px);
-  background: color-mix(in srgb, var(--usage-accent-soft) 82%, var(--usage-panel-strong));
+  background: var(--usage-panel);
 }
 
-.menu-bar-usage-account-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 86px;
-  align-items: start;
-  gap: 14px;
+.menu-bar-usage-quota-group h3 {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
-/* 各额度独立排列，保留余额和重置时间；内容超高时复用浮窗滚动区域。 */
-.menu-bar-usage-account-quotas {
+/* 账户总余额单独成行；窄窗口允许金额换行，不与 Pass 百分比争用列宽。 */
+.menu-bar-usage-kilo-balance {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.menu-bar-usage-quota-group {
   display: grid;
   min-inline-size: 0;
-  gap: 10px;
-}
-
-.menu-bar-usage-account-quota,
-.menu-bar-usage-account-today {
-  display: grid;
-  min-inline-size: 0;
-}
-
-.menu-bar-usage-account-quota {
-  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
 }
 
-.menu-bar-usage-account-quota > small:first-child,
-.menu-bar-usage-account-today small,
-.menu-bar-usage-account-source,
-.menu-bar-usage-account-quota time,
-.menu-bar-usage-account-quota[data-empty='true'] > small:last-child {
-  overflow: hidden;
+.menu-bar-usage-quota-group h3 {
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.menu-bar-usage-account-quota {
+  display: grid;
+  grid-template-columns: minmax(44px, auto) minmax(0, 1fr) minmax(42px, auto);
+  align-items: center;
+  gap: 0 8px;
+  min-inline-size: 0;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.menu-bar-usage-quota-duration {
+  max-inline-size: 88px;
+  color: var(--usage-muted);
+  overflow-wrap: anywhere;
+}
+
+.menu-bar-usage-account-quota > strong {
+  font-size: 13px;
+  font-weight: 600;
+  text-align: end;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 无点数余额时，重置日期保持与进度条右端对齐。 */
+.menu-bar-usage-quota-meta {
+  grid-column: 2;
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  min-inline-size: 0;
+}
+
+/* 有余额时共用完整说明行，不挤占百分比列或缩短进度条。 */
+.menu-bar-usage-quota-meta[data-with-credits='true'] {
+  grid-column: 2 / -1;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-block-start: 4px;
+}
+
+/* 重置日期和余额使用同一字号，长日期仍可完整换行。 */
+.menu-bar-usage-account-quota time {
+  text-align: end;
   color: var(--usage-muted);
   font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
-.menu-bar-usage-account-quota > strong,
-.menu-bar-usage-account-today strong {
-  overflow: hidden;
-  font-size: 17px;
-  font-weight: 730;
-  line-height: 1.15;
-  letter-spacing: -0.025em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.menu-bar-usage-account-quota[data-empty='true'] > strong {
-  margin-block: 2px;
+/* 剩余点数在百分比下方以单行淡色文字显示，标签和数字不再分层堆叠。 */
+.menu-bar-usage-account-credits {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  text-align: end;
+  color: color-mix(in srgb, var(--usage-muted) 80%, var(--usage-text));
   font-size: 11px;
-  letter-spacing: 0;
-}
-
-.menu-bar-usage-account-today {
-  align-content: start;
-  gap: 4px;
+  font-weight: 500;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .menu-bar-usage-progress {
   display: block;
   block-size: 4px;
-  margin-block-start: 1px;
   overflow: hidden;
   border-radius: var(--usage-radius-pill, 999px);
   background: color-mix(in srgb, var(--usage-accent) 12%, transparent);
@@ -504,25 +617,19 @@ body:has(.menu-bar-usage-root),
   background: var(--usage-accent);
 }
 
-.menu-bar-usage-account-source {
-  align-self: end;
-}
-
-/* 重置日期和数据来源必须完整可读，英文较长时允许换行。 */
-.menu-bar-usage-account-quota time,
-.menu-bar-usage-account-source {
-  white-space: normal;
-  line-height: 1.4;
-}
-
+/* 两列逐行展示范围合计与加权平均，所有快捷时间范围共用同一布局。 */
 .menu-bar-usage-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
   margin: 0;
-  padding: 10px 0;
+  padding: 8px 0;
   border: 0;
-  border-radius: var(--usage-radius-card, 12px);
   background: var(--usage-panel);
+}
+
+.menu-bar-usage-overview {
+  border-block-start: 1px solid var(--usage-line);
 }
 
 .menu-bar-usage-metrics > div {
@@ -530,7 +637,7 @@ body:has(.menu-bar-usage-root),
   align-content: start;
   min-inline-size: 0;
   gap: 3px;
-  padding-inline: 2px;
+  padding-inline: 0;
 }
 
 .menu-bar-usage-root dt,
@@ -539,148 +646,331 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-metrics dt {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-block-size: 24px;
   overflow-wrap: anywhere;
   color: var(--usage-muted);
   font-size: 11px;
   line-height: 1.4;
 }
 
-.menu-bar-usage-metrics dd {
-  overflow: hidden;
-  font-size: 13px;
-  font-weight: 680;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.menu-bar-usage-metrics dt > span {
+  min-inline-size: 0;
 }
 
-/* 明细留在浮窗顶层，不改变本地三列指标卡片的高度。 */
+/* 触发器保留独立悬停与点击区域，浮层仍由原生 Popover 负责点击外部关闭。 */
+.menu-bar-usage-cost-detail-control {
+  display: inline-grid;
+  inline-size: 24px;
+  block-size: 24px;
+  flex: 0 0 24px;
+  place-items: center;
+}
+
+/* 视觉上是紧邻名称的小问号，实际按钮保留 24px 键盘与触控目标。 */
 .menu-bar-usage-cost-detail-trigger {
   display: inline-grid;
+  inline-size: 24px;
+  block-size: 24px;
   place-items: center;
-  inline-size: 15px;
-  block-size: 15px;
-  margin-inline-start: 4px;
   padding: 0;
-  border: 1px solid var(--usage-edge);
-  border-radius: 50%;
+  border: 0;
   background: transparent;
   color: var(--usage-muted);
-  font-size: 10px;
-  font-weight: 700;
   cursor: pointer;
 }
 
-.menu-bar-usage-cost-detail:popover-open {
-  position: fixed;
-  inline-size: min(360px, calc(100vw - 24px));
-  max-block-size: min(320px, calc(100vh - 24px));
-  margin: 0;
-  padding: 12px;
-  overflow: auto;
-  border: 1px solid var(--usage-edge);
-  border-radius: var(--usage-radius-card, 12px);
-  background: var(--usage-bg);
+.menu-bar-usage-cost-detail-trigger > span {
+  display: grid;
+  inline-size: 13px;
+  block-size: 13px;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.menu-bar-usage-cost-detail-trigger:hover {
+  color: var(--usage-accent-strong);
+}
+
+.menu-bar-usage-cost-detail-trigger:focus-visible {
   color: var(--usage-text);
-  box-shadow: 0 12px 30px rgb(0 0 0 / 16%);
-  font: inherit;
+  outline: 2px solid color-mix(in srgb, var(--usage-text) 48%, transparent);
+  outline-offset: -2px;
+  border-radius: 5px;
+}
+
+/* 独立原生窗口只让真实面板着色，四周留白保持完全透明并容纳阴影。 */
+.menu-bar-usage-cost-detail-window-root {
+  inline-size: fit-content;
+  block-size: fit-content;
+  margin: 0;
+  padding: 8px;
+  overflow: hidden;
+  user-select: auto;
+}
+
+/* 明细按列内容决定自然宽度，面板上限为 640px，窄窗口内允许换行。 */
+.menu-bar-usage-cost-detail-window {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 4px;
+  inline-size: fit-content;
+  max-inline-size: min(640px, calc(100vw - 16px));
+  min-inline-size: 0;
+  max-block-size: calc(100vh - 16px);
+  margin: 0;
+  /* 描边占用原有内边距，保持表格可用宽高。 */
+  padding: 9px;
+  overflow: hidden;
+  /* 明细和图表提示气泡共用面板底色与浅边线。 */
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-card);
+  background: var(--usage-panel-strong);
+  /* 近处的浅影勾勒轮廓，向下扩散的柔影在透明留白内渐隐。 */
+  box-shadow:
+    0 0 3px rgb(0 0 0 / 9%),
+    0 4px 9px -4px rgb(0 0 0 / 28%);
+  color: var(--usage-text);
+  font-size: 11px;
 }
 
 .menu-bar-usage-cost-detail > strong {
-  display: block;
-  margin-block-end: 8px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.menu-bar-usage-cost-table-scroll {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 超过八行时固定为八行可视高度并启用纵向滚动，短列表继续按内容收缩。 */
+.menu-bar-usage-cost-table-scroll[data-scrollable='true'] {
+  max-block-size: 493px;
+  padding-inline-end: 8px;
+  overflow-y: auto;
+  scrollbar-color: color-mix(in srgb, var(--usage-muted) 18%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+/* 独立费用窗口不继承工作台滚动条作用域，因此在此复用透明轨道与低对比度圆角滑块。 */
+.menu-bar-usage-cost-table-scroll[data-scrollable='true']::-webkit-scrollbar {
+  inline-size: 8px;
+}
+
+.menu-bar-usage-cost-table-scroll[data-scrollable='true']::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.menu-bar-usage-cost-table-scroll[data-scrollable='true']::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--usage-muted) 18%, transparent);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+}
+
+.menu-bar-usage-cost-table-scroll[data-scrollable='true']::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--usage-accent) 28%, transparent);
+  background-clip: padding-box;
+}
+
+.menu-bar-usage-cost-table-scroll[data-scrollable='true']::-webkit-scrollbar-thumb:active {
+  background: color-mix(in srgb, var(--usage-accent) 42%, transparent);
+  background-clip: padding-box;
 }
 
 .menu-bar-usage-cost-detail table {
-  inline-size: 100%;
+  /* 表格先采用内容自然宽度，达到面板上限后再换行，始终不产生横向滚动。 */
+  inline-size: max-content;
+  max-inline-size: 100%;
   border-collapse: collapse;
-  font-size: 11px;
+  table-layout: auto;
   text-align: start;
+  user-select: text;
 }
 
-.menu-bar-usage-cost-detail :is(th, td) {
-  padding: 6px 4px;
+.menu-bar-usage-cost-detail th,
+.menu-bar-usage-cost-detail td {
+  padding: 6px 5px;
   border-block-start: 1px solid var(--usage-line);
+  overflow-wrap: anywhere;
   text-align: start;
   vertical-align: top;
-  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .menu-bar-usage-cost-detail thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  border-block-start: 0;
+  background: var(--usage-panel-strong);
   color: var(--usage-muted);
+  font-size: 10px;
+  font-weight: 550;
+}
+
+.menu-bar-usage-cost-detail th:last-child,
+.menu-bar-usage-cost-detail td:last-child {
+  text-align: end;
+}
+
+.menu-bar-usage-cost-detail tbody th {
   font-weight: 600;
+}
+
+/* 模型名在其涵盖的全部费用明细中垂直居中。 */
+.menu-bar-usage-cost-detail th[scope='rowgroup'] {
+  vertical-align: middle;
+}
+
+/* 长列表统一最小行高，让滚动阈值稳定对应八条记录，短列表仍按内容收缩。 */
+.menu-bar-usage-cost-table-scroll[data-scrollable='true'] tbody th[scope='row'],
+.menu-bar-usage-cost-table-scroll[data-scrollable='true'] tbody td {
+  block-size: 58px;
+}
+
+.menu-bar-usage-cost-detail td span {
+  display: block;
+  color: var(--usage-muted);
+  line-height: 1.45;
+}
+
+/* 长上下文标记与单价使用次级字号，按语义定位，适配跨行的模型列。 */
+.menu-bar-usage-cost-detail .menu-bar-usage-long-context,
+.menu-bar-usage-cost-detail .menu-bar-usage-unit-price span {
+  font-size: 10px;
+}
+
+/* 第三行只说明价格目录周期，使用次级颜色避免与单价争夺层级。 */
+.menu-bar-usage-cost-detail .menu-bar-usage-unit-price .menu-bar-usage-price-period {
+  color: var(--usage-muted);
+  font-size: 9px;
+}
+
+/* 每行金额与 Token 共用结果列，金额使用主文字颜色和较粗字重。 */
+.menu-bar-usage-cost-detail td .menu-bar-usage-model-estimated-cost {
+  color: var(--usage-text);
+  font-weight: 650;
+}
+
+.menu-bar-usage-metrics dd {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .menu-bar-usage-bars {
   display: grid;
-  gap: 7px;
+  gap: 8px;
   margin: 0;
-  padding: 8px 2px;
-  border-radius: var(--usage-radius-card, 12px);
+  padding: 8px 0 2px;
   background: var(--usage-panel);
 }
 
 .menu-bar-usage-bars figcaption {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 8px;
   font-size: 12px;
+  /* 来源和维度控件共享紧凑行高。 */
+  line-height: 1.4;
 }
 
-.menu-bar-usage-bars figcaption > span {
-  overflow: hidden;
-  color: var(--usage-muted);
-  font-weight: 620;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.menu-bar-usage-chart-source-picker {
+/* 账户来源与原生悬浮说明并排，说明图标不挤压标题行。 */
+.menu-bar-usage-chart-source {
   display: inline-flex;
   align-items: center;
-  min-inline-size: 0;
+  color: var(--usage-muted);
+  font-weight: 550;
 }
 
-.menu-bar-usage-chart-source-picker select {
-  max-inline-size: 100%;
-  min-block-size: 24px;
-  padding: 2px 18px 2px 4px;
+/* 原生下拉框保留系统交互，仅把入口收敛为与“指标”一致的胶囊样式。 */
+.menu-bar-usage-source-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--usage-muted);
+}
+
+/* 自绘箭头避免系统默认外观破坏浮窗的统一视觉。 */
+.menu-bar-usage-source-select::after {
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-end: 10px;
+  inline-size: 6px;
+  block-size: 6px;
+  border-inline-end: 1.5px solid currentcolor;
+  border-block-end: 1.5px solid currentcolor;
+  content: '';
+  pointer-events: none;
+  transform: translateY(-65%) rotate(45deg);
+}
+
+.menu-bar-usage-source-select select {
+  inline-size: 124px;
+  min-block-size: 26px;
+  padding: 2px 26px 2px 9px;
   border: 1px solid var(--usage-line);
-  border-radius: 6px;
+  border-radius: var(--usage-radius-pill, 999px);
+  appearance: none;
   background: var(--usage-panel-strong);
   color: var(--usage-text);
   font: inherit;
-  font-weight: 620;
+  font-size: 11px;
+  font-weight: 550;
   cursor: pointer;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease;
 }
 
-.menu-bar-usage-bars figcaption dl {
-  display: grid;
-  grid-template-columns: repeat(2, auto);
-  gap: 10px;
-  margin: 0;
-  text-align: end;
+/* 悬浮态沿用现有品牌浅底，不额外引入新的颜色体系。 */
+.menu-bar-usage-source-select:hover select {
+  border-color: var(--usage-accent-border);
+  background: var(--zeus-brand-hover);
 }
 
-.menu-bar-usage-bars figcaption dl > div {
-  display: grid;
-  gap: 1px;
+/* 原生下拉自身已有边界，选择后不再叠加额外焦点圈。 */
+.menu-bar-usage-source-select select:focus-visible {
+  outline: 0;
 }
 
-.menu-bar-usage-bars figcaption dt {
+.menu-bar-usage-source-select:focus-within {
   color: var(--usage-muted);
-  font-size: 10px;
 }
 
-.menu-bar-usage-bars figcaption dd {
-  font-size: 12px;
-  font-weight: 680;
+.menu-bar-usage-source-info {
+  display: inline-grid;
+  place-items: center;
+  inline-size: 24px;
+  block-size: 24px;
+  flex: 0 0 24px;
+  cursor: help;
+}
+
+/* 原生提示同时提供可聚焦入口和完整读屏文案。 */
+.menu-bar-usage-source-info:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--usage-text) 48%, transparent);
+  border-radius: 4px;
 }
 
 .menu-bar-usage-bars-plot {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
-  /* 柱高与两行标签分开，新增每日数值不压缩柱形。 */
+  /* 顶部为数值预留高度，最高柱的标签也不会撞到图表标题。 */
   block-size: 100px;
   gap: 4px;
 }
@@ -688,50 +978,55 @@ body:has(.menu-bar-usage-root),
 .menu-bar-usage-bars-plot > span {
   display: grid;
   block-size: 100%;
-  grid-template-rows: minmax(0, 1fr) auto auto;
-  gap: 2px;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 4px;
   text-align: center;
 }
 
 .menu-bar-usage-bar-slot {
-  display: grid;
+  display: flex;
   min-block-size: 0;
   align-items: end;
+  justify-content: center;
+  padding-block-start: 20px;
+}
+
+/* 数值跟随实际柱顶，零值与缺失值仍保留独立的文字语义。 */
+.menu-bar-usage-bar-column {
+  position: relative;
+  inline-size: min(14px, 100%);
 }
 
 .menu-bar-usage-bar-slot i {
   display: block;
-  inline-size: min(14px, 100%);
-  justify-self: center;
+  block-size: 100%;
+  inline-size: 100%;
   border-radius: 3px 3px 1px 1px;
   background: var(--usage-accent);
   opacity: 0.78;
 }
 
-.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
+.menu-bar-usage-bars-plot > span:not([data-state='positive']) .menu-bar-usage-bar-slot i {
   background: var(--usage-muted);
   opacity: 0.42;
-}
-
-.menu-bar-usage-bar-slot em {
-  align-self: end;
-  color: var(--usage-faint);
-  font-size: 11px;
-  font-style: normal;
 }
 
 .menu-bar-usage-bars-plot small {
   overflow: hidden;
   color: var(--usage-muted);
-  font-size: 10px;
+  font-size: 11px;
   text-overflow: clip;
   white-space: nowrap;
 }
 
 /* 每日数值直接可读；空白日期继续显示破折号，零消耗显示 0。 */
 .menu-bar-usage-bar-value {
-  font-size: 10.5px;
-  font-weight: 650;
+  position: absolute;
+  inset-block-end: calc(100% + 3px);
+  inset-inline-start: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-weight: 500;
   line-height: 1.4;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -767,7 +1062,7 @@ body:has(.menu-bar-usage-root),
   color: var(--usage-text);
   font: inherit;
   font-size: 12px;
-  font-weight: 630;
+  font-weight: 550;
   line-height: 1.4;
   white-space: nowrap;
 }
@@ -781,7 +1076,7 @@ body:has(.menu-bar-usage-root),
 }
 
 .menu-bar-usage-root button:focus-visible {
-  outline: 2px solid var(--usage-accent);
+  outline: 2px solid color-mix(in srgb, var(--usage-text) 48%, transparent);
   outline-offset: 2px;
 }
 
@@ -827,100 +1122,366 @@ body:has(.menu-bar-usage-root),
   }
 }
 
-/* 底层为原生 Liquid Glass，不叠加实色或整窗 opacity。 */
+/*
+ * AgentDesk 视觉参考层。
+ * 菜单栏浮窗的颜色、材质、边界与账户摘要卡片参考 AgentDesk。
+ */
 .menu-bar-usage-root {
-  --usage-bg: transparent;
-  --usage-panel: rgb(255 255 255 / 52%);
-  --usage-panel-strong: rgb(255 255 255 / 68%);
-  --usage-text: #29292c;
-  --usage-muted: #515156;
-  --usage-faint: #88888d;
-  --usage-line: rgb(0 0 0 / 7%);
-  --usage-edge: rgb(0 0 0 / 22%);
+  --usage-panel: rgb(255 255 255 / 74%);
+  --usage-panel-strong: rgb(255 255 255 / 92%);
+  --usage-panel-inset: rgb(238 243 255 / 74%);
+  --usage-text: #111827;
+  --usage-muted: #4b5563;
+  --usage-faint: #6b7280;
+  --usage-line: rgb(148 163 184 / 28%);
+  --usage-edge: rgb(148 163 184 / 42%);
   --usage-accent: var(--zeus-brand-primary);
   --usage-accent-strong: var(--zeus-brand-text);
   --usage-accent-secondary: var(--zeus-brand-highlight);
-  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
-  --usage-accent-border: color-mix(in srgb, var(--zeus-brand-primary) 34%, transparent);
-  --usage-progress-track: color-mix(in srgb, var(--zeus-brand-primary) 10%, transparent);
-  --usage-warning: #a25c00;
-  --usage-danger: #ff453a;
+  --usage-accent-highlight: #daa3fa;
+  --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 13%, transparent);
+  --usage-accent-border: color-mix(in srgb, var(--usage-accent) 34%, transparent);
   --usage-radius-control: 8px;
-  --usage-radius-card: 8px;
+  --usage-radius-card: 12px;
+  --usage-radius-surface: 18px;
   --usage-radius-pill: 999px;
   --usage-radius-tab: 8px;
-  position: relative;
-  isolation: isolate;
-  padding: 14px;
-  background: transparent;
-  color: var(--usage-text);
+  --usage-progress-track: color-mix(in srgb, var(--usage-accent) 10%, transparent);
+  --usage-warning: #a25c00;
+  --usage-warning-soft: rgb(217 119 6 / 11%);
+  --usage-danger: #b4232d;
+  --usage-danger-soft: rgb(220 38 38 / 10%);
+  /* 菜单栏正常状态与主窗口共用品牌色。 */
+  --usage-ok: var(--zeus-brand-text);
+  --usage-shadow: 0 20px 48px -28px rgb(31 41 55 / 38%);
+  --usage-shadow-soft: 0 12px 30px -24px rgb(31 41 55 / 30%);
 }
-/* 原生 NSPopover 在网页外绘制箭头，网页只保留内容内边距。 */
-.menu-bar-usage-root::before,
-.menu-bar-usage-root::after {
-  content: none;
-}
-.menu-bar-usage-root[data-appearance='dark'] {
-  --usage-bg: transparent;
-  --usage-panel: rgb(255 255 255 / 8%);
-  --usage-panel-strong: rgb(255 255 255 / 10%);
-  --usage-text: #f2f2f7;
-  --usage-muted: #c6c6cb;
-  --usage-faint: #929297;
-  --usage-line: rgb(255 255 255 / 10%);
-  --usage-edge: rgb(255 255 255 / 20%);
-  --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
-  --usage-warning: #ffb340;
-}
-@media (prefers-color-scheme: dark) {
-  .menu-bar-usage-root[data-appearance='system'] {
-    --usage-bg: transparent;
-    --usage-panel: rgb(255 255 255 / 8%);
-    --usage-panel-strong: rgb(255 255 255 / 10%);
-    --usage-text: #f2f2f7;
-    --usage-muted: #c6c6cb;
-    --usage-faint: #929297;
-    --usage-line: rgb(255 255 255 / 10%);
-    --usage-edge: rgb(255 255 255 / 20%);
-    --usage-accent-soft: color-mix(in srgb, var(--zeus-brand-primary) 12%, transparent);
-    --usage-warning: #ffb340;
-  }
-}
+
 .menu-bar-usage-surface {
   background: transparent;
+  box-shadow: none;
 }
-.menu-bar-usage-header {
-  min-block-size: 30px;
-  padding: 0;
-}
+
 .menu-bar-usage-identity strong {
   color: var(--usage-text);
   letter-spacing: -0.015em;
 }
-.menu-bar-usage-tabs {
-  gap: 4px;
-  padding-inline: 0;
+
+.menu-bar-usage-identity small,
+.menu-bar-usage-freshness,
+.menu-bar-usage-empty span,
+.menu-bar-usage-load-failure span,
+.menu-bar-usage-provider-copy small,
+.menu-bar-usage-provider-value small,
+.menu-bar-usage-account-quota time,
+.menu-bar-usage-metrics dt,
+.menu-bar-usage-bars figcaption dt,
+.menu-bar-usage-bars-plot small {
+  color: var(--usage-muted);
 }
+
+.menu-bar-usage-refresh {
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
+}
+
+.menu-bar-usage-refresh:hover:not(:disabled),
+.menu-bar-usage-refresh:focus-visible {
+  background: var(--zeus-brand-hover);
+  color: var(--usage-text);
+}
+
+/* 使用品牌色细圆环，沿用全局减少动态效果设置。 */
+.menu-bar-usage-spinner {
+  inline-size: 14px;
+  block-size: 14px;
+  border: 1.5px solid var(--usage-accent-soft);
+  border-block-start-color: var(--zeus-brand-text);
+  border-inline-end-color: var(--zeus-brand-text);
+  border-radius: 50%;
+  animation: menu-bar-usage-spin 800ms linear infinite;
+}
+
 .menu-bar-usage-tabs button {
-  min-block-size: 30px;
-  padding-inline: 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
 }
+
+.menu-bar-usage-tabs button:hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: var(--usage-accent-border);
+  background: var(--zeus-brand-hover);
+  color: var(--usage-text);
+}
+
 .menu-bar-usage-tabs button[aria-selected='true'] {
   border-color: var(--usage-accent-border);
   background: var(--usage-accent-soft);
+  box-shadow: none;
   color: var(--usage-accent-strong);
 }
-.menu-bar-usage-root button:hover:not(:disabled) {
-  background: var(--usage-accent-soft);
+
+.menu-bar-usage-notice {
+  border: 0;
+  background: var(--usage-panel);
+  box-shadow: none;
 }
+
+.menu-bar-usage-notice[data-tone='warning'] {
+  border-color: color-mix(in srgb, var(--usage-warning) 28%, var(--usage-line));
+  background: var(--usage-warning-soft);
+  color: var(--usage-warning);
+}
+
+.menu-bar-usage-load-failure strong {
+  color: var(--usage-danger);
+}
+
+.menu-bar-usage-load-failure button {
+  border-color: var(--usage-accent-border);
+  background: var(--usage-panel-strong);
+  box-shadow: none;
+  color: var(--usage-accent-strong);
+}
+
+.menu-bar-usage-provider-list {
+  border: 0;
+  background: var(--usage-panel-strong);
+  box-shadow: none;
+  backdrop-filter: blur(18px) saturate(145%);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+}
+
+.menu-bar-usage-provider-open {
+  transition:
+    background-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.menu-bar-usage-provider-open:hover:not(:disabled):not([aria-disabled='true']),
+.menu-bar-usage-provider-open:focus-visible {
+  background: var(--zeus-brand-hover);
+  box-shadow: none;
+}
+
+.menu-bar-usage-account-card {
+  border: 0;
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+
+.menu-bar-usage-progress {
+  background: var(--usage-progress-track);
+}
+
+.menu-bar-usage-progress i {
+  background: linear-gradient(90deg, var(--zeus-brand-highlight), var(--usage-accent), var(--usage-accent-secondary));
+  box-shadow: 0 0 8px -2px color-mix(in srgb, var(--usage-accent) 70%, transparent);
+}
+
+.menu-bar-usage-metrics {
+  border: 0;
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+
+.menu-bar-usage-bars {
+  border-block-start: 1px solid var(--usage-line);
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+
+.menu-bar-usage-bar-slot i {
+  background: linear-gradient(180deg, var(--usage-accent-secondary), var(--usage-accent));
+  box-shadow: 0 4px 8px -6px color-mix(in srgb, var(--usage-accent) 90%, transparent);
+}
+
+.menu-bar-usage-bars-plot > span:not([data-state='positive']) .menu-bar-usage-bar-slot i {
+  background: var(--usage-faint);
+}
+
+.menu-bar-usage-chart-empty {
+  border: 0;
+  background: var(--usage-panel);
+  box-shadow: none;
+}
+
+.menu-bar-usage-actions {
+  background: transparent;
+}
+
+/* 浮窗操作按钮同样使用纯色，键盘焦点环保持独立。 */
+.menu-bar-usage-actions button {
+  border: 1px solid var(--usage-line);
+  background: var(--usage-panel);
+  box-shadow: none;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    color 140ms ease;
+}
+
+.menu-bar-usage-actions .menu-bar-usage-primary-action {
+  border-color: var(--usage-line);
+  background: var(--usage-panel-strong);
+  color: var(--usage-muted);
+}
+
+.menu-bar-usage-actions button:hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: var(--usage-accent-border);
+  background: var(--zeus-brand-hover);
+  color: var(--usage-text);
+  filter: none;
+}
+
+.menu-bar-usage-actions .menu-bar-usage-primary-action:hover:not(:disabled):not([aria-disabled='true']) {
+  border-color: var(--usage-accent-border);
+  background: var(--zeus-brand-hover);
+  color: var(--usage-text);
+}
+
 .menu-bar-usage-root button:focus-visible {
-  outline: 2px solid var(--usage-accent);
-  outline-offset: 2px;
+  border-color: color-mix(in srgb, var(--usage-text) 36%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--usage-text) 12%, transparent);
+  outline: 0;
 }
+
+.menu-bar-usage-skeleton span {
+  border: 0;
+  background: linear-gradient(90deg, var(--usage-panel) 20%, var(--usage-panel-strong) 50%, var(--usage-panel) 80%);
+  box-shadow: none;
+}
+
+/* 状态栏弹窗与主工作区共享 AgentDesk 的 4 / 8 / 12 / 16 间距阶梯。 */
+.menu-bar-usage-root {
+  --usage-space-1: 4px;
+  --usage-space-2: 8px;
+  --usage-space-3: 12px;
+  --usage-space-4: 16px;
+}
+
+.menu-bar-usage-header {
+  min-block-size: 28px;
+  padding: 0;
+}
+
+.menu-bar-usage-tabs {
+  gap: var(--usage-space-1);
+  padding-inline: 0;
+}
+
+.menu-bar-usage-tabs button {
+  min-block-size: 30px;
+  padding-inline: var(--usage-space-2);
+  border-radius: 8px;
+}
+
+.menu-bar-usage-content {
+  padding-inline: 0;
+}
+
+.menu-bar-usage-notice {
+  margin-inline: 0;
+  padding-inline: var(--usage-space-2);
+  border-radius: 8px;
+}
+
+.menu-bar-usage-actions {
+  gap: var(--usage-space-2);
+  padding: 0;
+}
+
+.menu-bar-usage-actions button {
+  min-block-size: 32px;
+  padding-inline: var(--usage-space-2);
+  border-radius: 8px;
+}
+
+.menu-bar-usage-actions button:not(.menu-bar-usage-primary-action) {
+  background: var(--usage-panel-strong);
+  color: var(--usage-muted);
+}
+
+.menu-bar-usage-actions button:not(.menu-bar-usage-primary-action):hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--zeus-brand-hover);
+  color: var(--usage-text);
+}
+
+/* 只有菜单栏主体铺满窗口底色，明细窗口留白由系统透明合成。 */
+.menu-bar-usage-root:not(.menu-bar-usage-cost-detail-window-root) {
+  background: var(--usage-panel);
+}
+
+/* 用量窗口使用实色面板，避免系统模糊材质透入。 */
+.menu-bar-usage-root,
+.menu-bar-usage-root[data-appearance='dark'],
+.menu-bar-usage-root[data-appearance='system'] {
+  --usage-panel: #fff;
+  --usage-panel-strong: #fff;
+  --usage-panel-inset: rgb(120 128 140 / 8%);
+  --usage-line: rgb(100 110 125 / 16%);
+  --usage-edge: var(--usage-line);
+}
+.menu-bar-usage-root[data-appearance='dark'] {
+  /* 深色主题统一消费两层中性表面，禁止恢复旧的蓝色或透明玻璃底。 */
+  --usage-panel: var(--zeus-dark-surface);
+  --usage-panel-strong: var(--zeus-dark-surface);
+  --usage-text: var(--zeus-dark-text);
+  --usage-muted: var(--zeus-dark-muted);
+  --usage-faint: var(--zeus-dark-subtle);
+  --usage-line: var(--zeus-dark-line);
+  --usage-edge: var(--zeus-dark-line-strong);
+  --usage-accent: var(--zeus-brand-primary);
+  --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 22%, transparent);
+  --usage-danger: #ff8c88;
+  color-scheme: dark;
+  /* 独立浮窗内部保持一张连续表面，不再切出深色块。 */
+  --usage-panel-inset: var(--zeus-dark-surface);
+  --usage-accent-border: color-mix(in srgb, var(--usage-accent-secondary) 46%, transparent);
+  --usage-progress-track: color-mix(in srgb, var(--usage-accent) 16%, transparent);
+  --usage-warning: #f5b14c;
+  --usage-warning-soft: rgb(245 158 11 / 16%);
+  --usage-danger-soft: rgb(255 69 58 / 15%);
+  --usage-shadow: 0 22px 52px -26px rgb(0 0 0 / 70%);
+  --usage-shadow-soft: 0 14px 34px -24px rgb(0 0 0 / 58%);
+}
+@media (prefers-color-scheme: dark) {
+  .menu-bar-usage-root[data-appearance='system'] {
+    /* 深色主题统一消费两层中性表面，禁止恢复旧的蓝色或透明玻璃底。 */
+    --usage-panel: var(--zeus-dark-surface);
+    --usage-panel-strong: var(--zeus-dark-surface);
+    --usage-text: var(--zeus-dark-text);
+    --usage-muted: var(--zeus-dark-muted);
+    --usage-faint: var(--zeus-dark-subtle);
+    --usage-line: var(--zeus-dark-line);
+    --usage-edge: var(--zeus-dark-line-strong);
+    --usage-accent: var(--zeus-brand-primary);
+    --usage-accent-soft: color-mix(in srgb, var(--usage-accent) 22%, transparent);
+    --usage-danger: #ff8c88;
+    color-scheme: dark;
+    /* 独立浮窗内部保持一张连续表面，不再切出深色块。 */
+    --usage-panel-inset: var(--zeus-dark-surface);
+    --usage-accent-border: color-mix(in srgb, var(--usage-accent-secondary) 46%, transparent);
+    --usage-progress-track: color-mix(in srgb, var(--usage-accent) 16%, transparent);
+    --usage-warning: #f5b14c;
+    --usage-warning-soft: rgb(245 158 11 / 16%);
+    --usage-danger-soft: rgb(255 69 58 / 15%);
+    --usage-shadow: 0 22px 52px -26px rgb(0 0 0 / 70%);
+    --usage-shadow-soft: 0 14px 34px -24px rgb(0 0 0 / 58%);
+  }
+}
+
+/* 独立菜单栏窗口的按下、禁用与减少动态效果也遵循同一反馈层级。 */
 .menu-bar-usage-root button:active:not(:disabled) {
-  background: var(--usage-accent-border);
+  background: color-mix(in srgb, var(--usage-accent) 16%, transparent);
+}
+.menu-bar-usage-actions .menu-bar-usage-primary-action:active:not(:disabled) {
+  background: color-mix(in srgb, var(--usage-accent) 16%, transparent);
+  color: var(--usage-text);
 }
 .menu-bar-usage-root button:disabled {
   cursor: not-allowed;
@@ -928,94 +1489,131 @@ body:has(.menu-bar-usage-root),
 .menu-bar-usage-root button[aria-busy='true'] {
   cursor: progress;
 }
-.menu-bar-usage-freshness[data-stale='true'] {
-  color: var(--usage-warning);
-}
-.menu-bar-usage-provider-list,
-.menu-bar-usage-metrics,
-.menu-bar-usage-bars,
-.menu-bar-usage-chart-empty {
-  border: 1px solid var(--usage-line);
-  border-radius: var(--usage-radius-card);
-  background: var(--usage-panel);
-  box-shadow: none;
-}
-.menu-bar-usage-account-card {
-  padding: 10px;
-  border: 1px solid var(--usage-accent-border);
-  border-radius: var(--usage-radius-card);
-  background: var(--usage-accent-soft);
-  box-shadow: none;
-}
-.menu-bar-usage-account-body {
-  gap: 10px;
-}
-.menu-bar-usage-metrics {
-  padding: 10px 8px;
-}
-.menu-bar-usage-bars {
-  padding: 10px 8px;
-}
-.menu-bar-usage-progress {
-  background: var(--usage-progress-track);
-}
-.menu-bar-usage-progress i {
-  background: linear-gradient(90deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
-}
-.menu-bar-usage-bar-slot i {
-  background: linear-gradient(180deg, var(--zeus-brand-highlight), var(--zeus-brand-primary));
-}
-.menu-bar-usage-bars-plot > span[data-state='zero'] .menu-bar-usage-bar-slot i {
-  background: var(--usage-faint);
-}
-.menu-bar-usage-actions {
-  gap: 8px;
-  padding: 0;
-  background: transparent;
-}
-.menu-bar-usage-actions button,
-.menu-bar-usage-actions .menu-bar-usage-primary-action {
-  min-block-size: 32px;
-  padding-inline: 8px;
-  border: 1px solid var(--usage-line);
-  border-radius: 8px;
-  background: var(--usage-panel);
-  color: var(--usage-muted);
-  box-shadow: none;
-}
-.menu-bar-usage-spinner {
-  inline-size: 14px;
-  block-size: 14px;
-  border: 1.5px solid var(--usage-accent-soft);
-  border-block-start-color: var(--usage-accent);
-  border-inline-end-color: var(--usage-accent);
-  border-radius: 50%;
-  animation: menu-bar-usage-spin 800ms linear infinite;
+@media (prefers-reduced-motion: reduce) {
+  .menu-bar-usage-root *,
+  .menu-bar-usage-root *::before,
+  .menu-bar-usage-root *::after {
+    transition: none !important;
+  }
 }
 
-.menu-bar-usage-range {
-  display: flex;
-  gap: 4px;
-  margin-block: 8px;
+/* 用量概览：标题、快捷范围与固定指标网格共处一栏。 */
+.menu-bar-usage-overview {
+  display: grid;
+  gap: 0;
+  border-block-start: 1px solid var(--usage-line);
+  background: var(--usage-panel);
 }
+
+.menu-bar-usage-overview-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-block-size: 24px;
+  padding-block-start: var(--usage-space-2, 8px);
+}
+
+.menu-bar-usage-overview-head h3 {
+  margin: 0;
+  margin-inline-end: auto;
+  color: var(--usage-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+/* 快捷时间范围使用紧凑分段控件，在 360px 浮窗内仍完整展示四项。 */
+.menu-bar-usage-range {
+  display: inline-flex;
+  min-inline-size: 0;
+  flex: 0 1 auto;
+  gap: 1px;
+  padding: 1px;
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-pill, 999px);
+  background: var(--usage-panel);
+}
+
 .menu-bar-usage-range button {
-  flex: 1;
-  border: 0;
-  border-radius: 6px;
-  padding: 4px 6px;
+  min-block-size: 20px;
+  padding: 1px 5px;
+  border: 1px solid transparent;
+  border-radius: var(--usage-radius-pill, 999px);
   background: transparent;
-  color: inherit;
+  color: var(--usage-muted);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.menu-bar-usage-range button[aria-pressed='true'] {
+  border-color: var(--usage-accent-border);
+  background: var(--usage-accent-soft);
+  color: var(--usage-accent-strong);
+}
+
+/* 柱图图注只容纳来源和最右侧维度切换，避免重复展示七日汇总。 */
+.menu-bar-usage-bars figcaption {
+  position: relative;
+  gap: var(--usage-space-1, 4px);
+}
+
+/* 原生 title 在无边框透明浮窗里不显示，改为随悬浮或键盘焦点出现的真实气泡。 */
+.menu-bar-usage-source-hint {
+  position: absolute;
+  inset-block-start: calc(100% + 4px);
+  inset-inline-start: 0;
+  z-index: 2;
+  inline-size: 240px;
+  padding: 6px 8px;
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-control, 8px);
+  background: var(--usage-panel-strong);
+  box-shadow: var(--usage-shadow-soft);
+  color: var(--usage-text);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: start;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 说明气泡只由信息图标触发，操作下拉框时不遮挡图表。 */
+.menu-bar-usage-source-info:hover .menu-bar-usage-source-hint,
+.menu-bar-usage-source-info:focus .menu-bar-usage-source-hint {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* 分段控件保持紧凑，选中态只用品牌浅底和描边区分，边框常驻避免切换时跳动。 */
+.menu-bar-usage-dimension {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  gap: 1px;
+  padding: 1px;
+  border: 1px solid var(--usage-line);
+  border-radius: var(--usage-radius-pill, 999px);
+  background: var(--usage-panel);
+}
+
+.menu-bar-usage-dimension button {
+  min-block-size: 20px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--usage-radius-pill, 999px);
+  background: transparent;
+  color: var(--usage-muted);
   font: inherit;
   font-size: 11px;
-  cursor: pointer;
+  font-weight: 550;
 }
-.menu-bar-usage-range button[aria-pressed='true'] {
-  background: rgb(118 56 245 / 12%);
-  color: #7638f5;
-}
-.menu-bar-usage-cost-detail td small,
-.menu-bar-usage-cost-detail th small {
-  display: block;
-  margin-block-start: 4px;
-  font-size: 10px;
+
+.menu-bar-usage-dimension button[aria-pressed='true'] {
+  border-color: var(--usage-accent-border);
+  background: var(--usage-accent-soft);
+  color: var(--usage-accent-strong);
 }

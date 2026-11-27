@@ -88,24 +88,23 @@ import { Form } from '../../ui/Form.js';
 import { ResourceLoading } from '../../ui/ResourceLoading.js';
 
 /** 全局数字员工与数字团队均从首页独立进入。 */
-/** 全局数字员工与数字团队均从首页独立进入。 */
 export type MainNavTarget = 'projects' | 'conversations' | 'automations' | 'skills' | 'digital-employees' | 'digital-teams' | 'settings';
 export type LegacyMainNavTarget = MainNavTarget | 'dashboard' | 'tasks' | 'runtime' | 'git-diff' | 'telegram' | 'settings-data';
-export type ProjectWorkspaceSection = 'tasks' | 'git' | 'code' | 'sessions';
-export type ProjectCodeWorkspaceMode = 'source' | 'git' | 'commands';
-export type ProjectWorkspaceEntryId = 'tasks' | 'git' | 'source' | 'commands';
+/** 项目工作区仅保留任务、源码和会话，Git 归属源码内部。 */
+export type ProjectWorkspaceSection = 'tasks' | 'code' | 'sessions';
+/** 源码编辑与完整 Git 工作台共用同一工作区。 */
+export type ProjectCodeWorkspaceMode = 'source' | 'git';
+/** 左侧项目导航保留任务，源码、命令与 Git 由右侧工具栏承载。 */
+export type ProjectWorkspaceEntryId = 'tasks';
+/** 项目导航文案与快捷键提示共用入口定义。 */
 export type ProjectWorkspaceEntry = Readonly<{
   id: ProjectWorkspaceEntryId;
   shortcutKey: '1' | '2' | '3' | '4' | '5';
   section: ProjectWorkspaceSection;
   codeMode: ProjectCodeWorkspaceMode | undefined;
 }>;
-export const PROJECT_WORKSPACE_ENTRIES = [
-  { id: 'tasks', shortcutKey: '1', section: 'tasks', codeMode: undefined },
-  { id: 'git', shortcutKey: '2', section: 'git', codeMode: undefined },
-  { id: 'source', shortcutKey: '3', section: 'code', codeMode: 'source' },
-  { id: 'commands', shortcutKey: '4', section: 'code', codeMode: 'commands' },
-] as const satisfies readonly ProjectWorkspaceEntry[];
+/** 左侧任务入口沿用原有快捷键和项目导航。 */
+export const PROJECT_WORKSPACE_ENTRIES = [{ id: 'tasks', shortcutKey: '1', section: 'tasks', codeMode: undefined }] as const satisfies readonly ProjectWorkspaceEntry[];
 export type ProjectDetailPanel = 'diff' | 'edit' | 'config' | 'archive' | undefined;
 export type ConversationDrawer = 'runtime' | 'context' | 'changes' | 'templates' | undefined;
 
@@ -240,6 +239,7 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
     | 'remoteControl'
     | 'checkRuntimeAdapter'
     | 'checkCodexUpdate'
+    | 'installCodex'
     | 'updateCodex'
     | 'loadProjectConversationChoices'
     | 'loadProjectConversationChoiceGroups'
@@ -254,6 +254,12 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
     | 'loadDigitalEmployeeCapabilities'
     | 'refreshTaskPushRepositoryRemote'
     | 'loadCodexAccount'
+    | 'loadAntigravityAccount'
+    | 'loadAntigravityVerification'
+    | 'refreshAntigravityAccount'
+    | 'startAntigravityLogin'
+    | 'cancelAntigravityLogin'
+    | 'logoutAntigravityAccount'
     | 'loadCopilotAccount'
     | 'refreshCopilotAccount'
     | 'startCopilotLogin'
@@ -278,8 +284,6 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
     | 'removeSkill'
     | 'loadPlugins'
     | 'loadPluginRuntimeStatus'
-    | 'loadMcpConfiguration'
-    | 'loadCodexMcpServers'
     | 'installPlugin'
     | 'updatePlugin'
     | 'setPluginEnabled'
@@ -321,6 +325,7 @@ export type NativeConversationAppClient = import('../../git/GitDeliveryRunContro
     | 'updateTaskBoard'
     | 'moveTaskBoardTask'
     | 'loadProjectGitWorkbench'
+    | 'loadProjectGitBranches'
     // 控制台与 Git 工作台通过同一个原生客户端读取耐久历史。
     | 'loadProjectGitOperations'
     | 'loadProjectGitCommit'
@@ -632,6 +637,7 @@ export function applyRuntimeEndedEventToConversation(conversation: ConversationH
 
 export const nativeConversationListLifecycleEventTypes = new Set([
   'conversation.title.changed',
+  'conversation.next_turn_settings.changed',
   'conversation.transport.changed',
   'conversation.thread.changed',
   'conversation.turn.started',
@@ -1400,7 +1406,6 @@ export function inferInitialMainNavTarget(props: {
     (props.snapshot?.tasks.length ?? 0) > 0
   )
     return 'conversations';
-  if (props.initialAppShellSettings?.mainLayout === 'current') return 'conversations';
   if (props.snapshot?.projects.length) return 'projects';
   return 'projects';
 }
@@ -1408,7 +1413,6 @@ export function inferInitialMainNavTarget(props: {
 /** 源码保持整页，Git 与命令入口保留任务或会话背景。 */
 export function inferInitialProjectSection(props: {
   initialMainNavTarget?: LegacyMainNavTarget;
-  initialAppShellSettings?: AppShellSettings;
   initialTaskEvents?: TaskEventRecord[];
   initialTaskTemplates?: TaskTemplateRecord[];
   initialRuntimeStatus?: RuntimeStatusSnapshot;
@@ -1426,10 +1430,7 @@ export function inferInitialProjectSection(props: {
   snapshot?: WorkspaceSnapshot;
 }): ProjectWorkspaceSection {
   if (props.snapshot?.projects[0]?.id === temporaryWorkspaceId) return 'sessions';
-  if (typeof window !== 'undefined' && window.location.hash === '#project-git') return 'git';
-  if (typeof window !== 'undefined' && (window.location.hash === '#project-commands' || window.location.hash.startsWith('#project-code'))) return 'code';
-  if (typeof window !== 'undefined' && (window.location.hash === '#project-tasks' || window.location.hash === '#tasks')) return 'tasks';
-  if (typeof window !== 'undefined' && (window.location.hash === '#project-sessions' || window.location.hash === '#conversations')) return 'sessions';
+  if (typeof window !== 'undefined' && ['#project-code-source', '#project-code'].includes(window.location.hash)) return 'code';
   if (props.initialMainNavTarget === 'tasks') return 'tasks';
   if (props.initialMainNavTarget === 'git-diff') return 'tasks';
   if (props.initialMainNavTarget === 'projects') return 'code';
@@ -1447,8 +1448,7 @@ export function inferInitialProjectSection(props: {
   )
     return 'sessions';
   if (props.initialArchivedProjects?.length) return 'code';
-  // 紧凑布局默认打开会话，明确指定的工作区入口仍优先。
-  return props.initialAppShellSettings?.mainLayout === 'current' ? 'sessions' : 'tasks';
+  return 'tasks';
 }
 
 export function syncRecordFromSnapshot<T extends { id: string }>(current: T | undefined, records: T[]): T | undefined {

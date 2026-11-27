@@ -1,10 +1,12 @@
 import { contextCapacitySelectionAllowed, contextCapacitySelectionOptions, contextCapacitySelectionFromValue, contextCapacitySelectionValue } from '../session/contextCapacitySelection.js';
 import { usePresenceOpen } from '../ui/MotionPresence.js';
+import { BranchPicker } from '../git/GitRepositoryControls.js';
 import { type Dispatch, type FormEvent, type SetStateAction, useEffect, useMemo, useRef, useState } from 'react';
 import {
   formatZeusDateTime,
   buildTaskPushLayout,
   type TaskPushContextConversationOption,
+  type TaskPushConversationHistory,
   type TaskPushContextOption,
   type TaskPushMessageLayout,
   type TaskPushParentContextOption,
@@ -35,13 +37,14 @@ import { Button } from '../ui/Button.js';
 import { ModalPortal } from '../ui/ModalPortal.js';
 import { VisibleApplicationError } from '../ui/ApplicationErrorDialog.js';
 import { ZeusSelect } from '../ZeusSelect.js';
-import { presentModelOptions } from '../modelOptionPresentation.js';
+import { modelProviderOptionForRef, presentModelOptions } from '../modelOptionPresentation.js';
 import { TaskPushSupplementalAttachmentCards } from './TaskPushSupplementalAttachmentCards.js';
 import { SkillSelector } from '../features/skills/SkillSelector.js';
 import { readSkillWorkflowDefault } from '../features/skills/skillWorkflowPreferences.js';
 import type { CodexApiClient } from '../features/codex/codexApiClient.js';
 import { browserProjectModelPreferenceStorage, readProjectModelPreferences, writeProjectModelPreferences } from '../session/projectModelPreferences.js';
 import { Form } from '../ui/Form.js';
+import { XIcon } from '@phosphor-icons/react/dist/csr/X';
 
 export interface TaskModelPushForm {
   /** 缺省使用模型默认，具体数值仅用于本次工作。 */
@@ -89,7 +92,8 @@ type TaskPushContextCapability = CodexTaskPushCapabilities['parentContextOptions
 type TaskPushEnvironmentCapability = NonNullable<CodexTaskPushCapabilities['existingEnvironments']>[number];
 
 interface TaskPushCommonSource {
-  key: string;
+  /** 分支树展示去掉完整引用命名空间后的名称。 */
+  ref: string;
   label: string;
   kind: TaskPushSourceRef['kind'];
   group: string;
@@ -115,6 +119,11 @@ export function normalizeTaskModelPushCapabilities(capabilities: CodexTaskPushCa
 
 function taskPushSourceIdentity(source: TaskPushSourceRef): string {
   return JSON.stringify([source.kind, source.kind === 'remote' ? source.group : '', source.label]);
+}
+
+/** 分支树使用短引用，表单通过原候选恢复完整引用。 */
+function taskPushBranchRef(source: TaskPushSourceRef): string {
+  return source.ref.replace(/^refs\/(?:heads|remotes)\//u, '');
 }
 
 /** 只聚合每个仓库都唯一存在的同来源分支，避免批量选择时猜测真实 Git 引用。 */
@@ -146,21 +155,12 @@ function resolveTaskPushCommonSources(repositories: TaskPushRepositoryCapability
     }
     if (!complete) continue;
     const source = firstMatches[0]!;
-    commonSources.push({ key, label: source.label, kind: source.kind, group: source.kind === 'remote' ? source.group : '', refsByRepository });
+    commonSources.push({ ref: taskPushBranchRef(source), label: source.label, kind: source.kind, group: source.kind === 'remote' ? source.group : '', refsByRepository });
   }
   return commonSources.sort((left, right) => {
     if (left.kind !== right.kind) return left.kind === 'local' ? -1 : 1;
     return left.group.localeCompare(right.group) || left.label.localeCompare(right.label);
   });
-}
-
-function resolveSelectedTaskPushCommonSourceKey(repositories: TaskPushRepositoryCapability[], selections: TaskModelPushForm['repositorySelections'], commonSources: TaskPushCommonSource[]): string {
-  return commonSources.find((source) => repositories.every((repository) => selections[repository.id]?.sourceRef === source.refsByRepository[repository.id]))?.key ?? '';
-}
-
-function taskPushCommonSourceLabel(source: TaskPushCommonSource, repositoryCount: number, zh: boolean): string {
-  if (zh) return `${source.label} · ${source.kind === 'local' ? '本地' : `${source.group} 远端`} · ${repositoryCount} 个仓库`;
-  return `${source.label} · ${source.kind === 'local' ? 'local' : `${source.group} remote`} · ${repositoryCount} repositories`;
 }
 
 export function taskPushEnvironmentLabel(environment: TaskPushEnvironmentCapability, zh: boolean, availableAfterStop = false): string {
@@ -187,7 +187,7 @@ export function buildTaskModelPushLayout(
   task: Pick<TaskRecord, 'id' | 'taskCode' | 'title' | 'taskType' | 'description' | 'defectCurrentState' | 'defectExpectedOutcome' | 'defectReproductionSteps' | 'optimizationCurrentState' | 'optimizationExpectedOutcome' | 'tags'>,
   supplementalInfo: string,
   currentAttachments: TaskPushPromptAttachment[] = [],
-  currentConversationPaths: string[] = [],
+  currentConversationHistory: TaskPushConversationHistory[] = [],
   parentContexts: TaskPushPromptParentContext[] = [],
   relatedContexts: TaskPushPromptRelatedContext[] = [],
   supplementalAttachments: TaskPushSupplementalAttachment[] = [],
@@ -205,7 +205,7 @@ export function buildTaskModelPushLayout(
     optimizationExpectedOutcome: task.optimizationExpectedOutcome,
     tags: task.tags,
     attachments: currentAttachments,
-    conversationPaths: currentConversationPaths,
+    conversationHistory: currentConversationHistory,
     supplementalInfo,
     supplementalAttachments,
     parentContexts,
@@ -257,9 +257,10 @@ export function mergeTaskPushSupplementalAttachments(current: TaskPushSupplement
   return [...byIdentity.values()];
 }
 
-export function selectedTaskPushCurrentConversationPaths(options: TaskPushContextConversationOption[], conversationIds: string[]): string[] {
+/** 预览只投影用户选中的会话身份，正文由服务端在发送时读取。 */
+export function selectedTaskPushConversationHistory(options: TaskPushContextConversationOption[], conversationIds: string[]): TaskPushConversationHistory[] {
   const selectedConversationIds = new Set(conversationIds);
-  return options.filter((conversation) => selectedConversationIds.has(conversation.id) && conversation.available && conversation.path).map((conversation) => conversation.path!);
+  return options.filter((conversation) => selectedConversationIds.has(conversation.id) && conversation.available).map(({ id, title }) => ({ id, title }));
 }
 
 /** 按服务端给出的根到父顺序生成正文上下文；附件只走结构化通道，不进入文本。 */
@@ -278,7 +279,6 @@ function selectedTaskPushContexts<T extends TaskPushContextOption>(
   return options.flatMap((option) => {
     const selection = selections[option.taskId];
     if (!selection?.selected) return [];
-    const selectedConversationIds = new Set(selection.conversationIds);
     const selectedAttachmentKeys = new Set(selection.attachmentKeys);
     return [
       {
@@ -294,7 +294,7 @@ function selectedTaskPushContexts<T extends TaskPushContextOption>(
         optimizationExpectedOutcome: option.optimizationExpectedOutcome,
         tags: option.tags,
         attachments: option.attachments.filter((attachment) => selectedAttachmentKeys.has(attachment.key) && attachment.available),
-        conversationPaths: option.conversations.filter((conversation) => selectedConversationIds.has(conversation.id) && conversation.available && conversation.path).map((conversation) => conversation.path!),
+        conversationHistory: selectedTaskPushConversationHistory(option.conversations, selection.conversationIds),
       },
     ];
   });
@@ -329,10 +329,7 @@ function TaskPushCurrentConversationPicker(props: { options: TaskPushContextConv
                         {props.zh ? '最后更新：' : 'Last updated: '}
                         <time dateTime={conversation.activityAt}>{formatZeusDateTime(conversation.activityAt, props.zh ? 'zh-CN' : 'en-US', { dateStyle: 'medium', timeStyle: 'medium' })}</time>
                       </small>
-                      <small>
-                        {conversation.archived ? (props.zh ? '已归档 · ' : 'Archived · ') : ''}
-                        {conversation.available ? conversation.path : conversation.unavailableReason}
-                      </small>
+                      {conversation.archived || conversation.unavailableReason ? <small>{[conversation.archived ? (props.zh ? '已归档' : 'Archived') : '', conversation.unavailableReason].filter(Boolean).join(' · ')}</small> : null}
                     </span>
                   </label>
                 ))}
@@ -422,10 +419,7 @@ function TaskPushContextPicker(props: {
                               {props.zh ? '最后更新：' : 'Last updated: '}
                               <time dateTime={conversation.activityAt}>{formatZeusDateTime(conversation.activityAt, props.zh ? 'zh-CN' : 'en-US', { dateStyle: 'medium', timeStyle: 'medium' })}</time>
                             </small>
-                            <small>
-                              {conversation.archived ? (props.zh ? '已归档 · ' : 'Archived · ') : ''}
-                              {conversation.available ? conversation.path : conversation.unavailableReason}
-                            </small>
+                            {conversation.archived || conversation.unavailableReason ? <small>{[conversation.archived ? (props.zh ? '已归档' : 'Archived') : '', conversation.unavailableReason].filter(Boolean).join(' · ')}</small> : null}
                           </span>
                         </label>
                       ))
@@ -508,9 +502,12 @@ export function TaskPushLayoutPreview(props: { layout: TaskPushMessageLayout; la
               {field.text ? <p>{field.text}</p> : null}
             </section>
           ))}
-          {block.conversationPaths.length > 0 ? (
+          {block.conversationHistory?.length || block.conversationPaths.length > 0 ? (
             <section className="task-push-layout-field">
-              <strong>{block.contextKind === 'current' ? '当前任务历史会话信息：' : '会话文件路径：'}</strong>
+              <strong>{props.language === 'zh-CN' ? '历史会话' : 'Conversation history'}</strong>
+              {block.conversationHistory?.map((conversation) => (
+                <p key={conversation.id}>{conversation.title}</p>
+              ))}
               {block.conversationPaths.map((path) => (
                 <code key={path}>{path}</code>
               ))}
@@ -772,7 +769,9 @@ export function TaskModelPushModal(props: {
   const runtimeCapabilities = props.capabilities ?? props.runtimeCapabilities;
   const codexAccount = props.runtimeCapabilities?.codexAccount ?? props.capabilities?.codexAccount;
   const requestedModel = resolveModelCapability(runtimeCapabilities?.models, props.form.model);
-  const modelPresentation = useMemo(() => presentModelOptions(runtimeCapabilities?.models ?? [], requestedModel?.id ?? props.form.model, props.language), [props.form.model, props.language, requestedModel?.id, runtimeCapabilities?.models]);
+  /** 目录选项使用稳定引用，历史型号已解析时也用它匹配选中项。 */
+  const modelValue = requestedModel?.id ?? props.form.model;
+  const modelPresentation = useMemo(() => presentModelOptions(runtimeCapabilities?.models ?? [], modelValue, props.language), [modelValue, props.language, runtimeCapabilities?.models]);
   // 目录变化不能静默替换用户选中的模型；失效时保留原选择并请求处理。
   const selectedModel = requestedModel?.available === false ? undefined : requestedModel;
   if (!props.open || !props.task) return null;
@@ -810,8 +809,8 @@ export function TaskModelPushModal(props: {
       setAttachingRepositoryId(null);
     }
   }
-  const selectedCommonSourceKey = resolveSelectedTaskPushCommonSourceKey(repositories, props.form.repositorySelections, commonSources);
-  const selectedCommonSource = commonSources.find((source) => source.key === selectedCommonSourceKey);
+  /** 批量选择只在各仓选中的完整引用都匹配时显示选中。 */
+  const selectedCommonSource = commonSources.find((source) => repositories.every((repository) => props.form.repositorySelections[repository.id]?.sourceRef === source.refsByRepository[repository.id]));
   const hasRepositorySourceSelection = repositories.some((repository) => Boolean(props.form.repositorySelections[repository.id]?.sourceRef));
   const directWorkspaceBusy = (props.capabilities?.directWorkspace.activeWritableConversationCount ?? 0) > 0;
   const directWorkspaceNeedsConfirmation = directWorkspaceBusy && props.form.permissionMode !== 'read-only';
@@ -819,14 +818,14 @@ export function TaskModelPushModal(props: {
   const relatedContextOptions = props.capabilities?.relatedContextOptions ?? [];
   const currentAttachments = props.capabilities?.currentAttachmentOptions ?? [];
   const currentConversationOptions = props.capabilities?.currentConversationOptions ?? [];
-  const selectedCurrentConversationPaths = selectedTaskPushCurrentConversationPaths(currentConversationOptions, props.form.currentConversationIds);
+  const selectedCurrentConversationHistory = selectedTaskPushConversationHistory(currentConversationOptions, props.form.currentConversationIds);
   const selectedParentContexts = selectedTaskPushParentContexts(parentContextOptions, props.form.parentContextSelections);
   const selectedRelatedContexts = selectedTaskPushRelatedContexts(relatedContextOptions, props.form.relatedContextSelections);
   const taskPushLayout = buildTaskModelPushLayout(
     props.task,
     props.form.supplementalInfo,
     currentAttachments,
-    selectedCurrentConversationPaths,
+    selectedCurrentConversationHistory,
     selectedParentContexts,
     selectedRelatedContexts,
     taskPushSupplementalLayoutAttachments(props.form.supplementalAttachments),
@@ -842,8 +841,8 @@ export function TaskModelPushModal(props: {
     props.onChange({ ...props.form, [field]: { ...props.form[field], [taskId]: next } });
   }
 
-  function applyCommonSource(sourceKey: string): void {
-    const commonSource = commonSources.find((source) => source.key === sourceKey);
+  function applyCommonSource(ref: string, kind: TaskPushSourceRef['kind']): void {
+    const commonSource = commonSources.find((source) => source.ref === ref && source.kind === kind);
     if (!commonSource) return;
     const repositorySelections = { ...props.form.repositorySelections };
     for (const repository of repositories) {
@@ -862,7 +861,7 @@ export function TaskModelPushModal(props: {
   const modal = (
     <ModalPortal
       systemWindow="task-push"
-      windowTitle={`${props.language === 'zh-CN' ? '推送任务' : 'Push task'} · ${props.task?.taskCode ?? props.task?.title ?? 'Zeus'}`}
+      windowTitle={zh ? '推送任务' : 'Push task'}
       rootClassName="task-model-push-portal-root"
       backdropClassName="task-model-push-backdrop"
       dismissDisabled={busy}
@@ -890,7 +889,7 @@ export function TaskModelPushModal(props: {
             <small>{props.projectName ? `${props.projectName} · ${props.task.taskCode ?? props.task.id}` : (props.task.taskCode ?? props.task.id)}</small>
           </span>
           <Button unstyled type="button" aria-label={zh ? '关闭' : 'Close'} onClick={props.onClose} disabled={busy}>
-            ×
+            <XIcon size={16} aria-hidden="true" />
           </Button>
         </header>
 
@@ -941,10 +940,11 @@ export function TaskModelPushModal(props: {
                 <ZeusSelect
                   size="regular"
                   ariaLabel={zh ? '模型' : 'Model'}
-                  value={props.form.model}
+                  value={modelValue}
                   options={modelPresentation.options}
                   pinning={modelPresentation.pinning}
                   triggerLabel={selectedModel ? modelPresentation.triggerLabel : props.form.model || (zh ? '选择或接入模型' : 'Choose or connect a model')}
+                  triggerIcon={modelValue ? modelProviderOptionForRef(modelValue).icon : undefined}
                   onChange={onModelChange}
                   disabled={!runtimeCapabilities || modelPresentation.options.length === 0 || busy || Boolean(props.form.stageId)}
                   searchPlaceholder={zh ? '搜索供应商或模型' : 'Search providers or models'}
@@ -984,7 +984,7 @@ export function TaskModelPushModal(props: {
                   size="regular"
                   ariaLabel={zh ? '速度' : 'Speed'}
                   value={serviceTierPickerValue(props.form.serviceTier, selectedModel)}
-                  options={serviceTierOptions(selectedModel, props.language)}
+                  options={serviceTierOptions(selectedModel, 'en-US')}
                   onChange={(value) => {
                     if (!selectedModel) return;
                     const selection = selectionFromEffectiveServiceTier(value);
@@ -1309,32 +1309,18 @@ export function TaskModelPushModal(props: {
                       <small>{zh ? `${repositories.length} 个仓库` : `${repositories.length} repositories`}</small>
                     </span>
                     {commonSources.length > 0 ? (
-                      <ZeusSelect
-                        size="regular"
+                      <BranchPicker
+                        zh={zh}
                         ariaLabel={zh ? '批量选择来源分支' : 'Select source branch for all repositories'}
                         ariaDescribedBy="task-model-push-batch-source-description"
-                        value={selectedCommonSourceKey}
+                        value={selectedCommonSource}
                         triggerLabel={
-                          selectedCommonSource
-                            ? taskPushCommonSourceLabel(selectedCommonSource, repositories.length, zh)
-                            : hasRepositorySourceSelection
-                              ? zh
-                                ? '逐仓选择不一致'
-                                : 'Repository selections differ'
-                              : zh
-                                ? '批量选择来源分支'
-                                : 'Select a source branch for all repositories'
+                          selectedCommonSource ? selectedCommonSource.ref : hasRepositorySourceSelection ? (zh ? '逐仓选择不一致' : 'Repository selections differ') : zh ? '批量选择来源分支' : 'Select a source branch for all repositories'
                         }
-                        options={commonSources.map((source) => ({
-                          value: source.key,
-                          label: taskPushCommonSourceLabel(source, repositories.length, zh),
-                          group: source.kind === 'local' ? (zh ? '本地分支' : 'Local branches') : zh ? `${source.group} 远端分支` : `${source.group} remote branches`,
-                        }))}
+                        localBranches={commonSources.filter((source) => source.kind === 'local').map((source) => source.ref)}
+                        remoteBranches={commonSources.filter((source) => source.kind === 'remote').map((source) => source.ref)}
                         onChange={applyCommonSource}
                         disabled={busy || props.refreshingRepositoryId !== null}
-                        searchable
-                        searchPlaceholder={zh ? '搜索全部仓库共有的分支' : 'Search branches shared by all repositories'}
-                        emptyLabel={zh ? '没有匹配的共同来源分支' : 'No matching common source branch'}
                       />
                     ) : (
                       <p className="task-model-push-batch-source-empty" role="status">
@@ -1363,6 +1349,8 @@ export function TaskModelPushModal(props: {
                     includeLocalChanges: false,
                   };
                   const selectedSource = repository.sourceRefs.find((source) => source.ref === selection.sourceRef);
+                  /** 选中态使用原引用对应的短名称和分支类型。 */
+                  const selectedBranch = selectedSource ? { ref: taskPushBranchRef(selectedSource), kind: selectedSource.kind } : undefined;
                   /** unborn 来源的项目文件就是初始代码，不作为可选的“未提交修改”。 */
                   const selectedSourceUnborn = !repository.headSha && selectedSource?.kind === 'local' && selectedSource.current;
                   const refreshing = props.refreshingRepositoryId === repository.id;
@@ -1385,26 +1373,23 @@ export function TaskModelPushModal(props: {
                       <div className="task-model-push-workspace-grid">
                         <label>
                           <span>{zh ? '来源分支（必选）' : 'Source branch (required)'}</span>
-                          <ZeusSelect
-                            size="regular"
+                          <BranchPicker
+                            zh={zh}
                             ariaLabel={`${repository.name} ${zh ? '来源分支' : 'source branch'}`}
-                            value={selection.sourceRef}
-                            options={[
-                              { value: '', label: zh ? '请选择来源分支' : 'Select source branch', disabled: true },
-                              ...repository.sourceRefs.map((source) => ({
-                                value: source.ref,
-                                label: `${source.label}${source.current ? (zh ? ' · 当前分支' : ' · current branch') : ''}`,
-                                group: source.kind === 'local' ? (zh ? '本地分支' : 'Local branches') : zh ? `${source.group} 远端分支` : `${source.group} remote branches`,
-                              })),
-                            ]}
-                            onChange={(sourceRef) =>
+                            triggerLabel={selectedBranch?.ref ?? (zh ? '选择来源分支' : 'Select source branch')}
+                            value={selectedBranch}
+                            localBranches={repository.sourceRefs.filter((source) => source.kind === 'local').map(taskPushBranchRef)}
+                            remoteBranches={repository.sourceRefs.filter((source) => source.kind === 'remote').map(taskPushBranchRef)}
+                            onChange={(ref, kind) => {
+                              /** 返回给推送表单的值必须是既有候选的完整引用。 */
+                              const sourceRef = repository.sourceRefs.find((source) => source.kind === kind && taskPushBranchRef(source) === ref)?.ref;
+                              if (!sourceRef) return;
                               props.onChange({
                                 ...props.form,
                                 repositorySelections: { ...props.form.repositorySelections, [repository.id]: { ...selection, sourceRef } },
-                              })
-                            }
+                              });
+                            }}
                             disabled={!props.capabilities || busy || refreshing}
-                            searchPlaceholder={zh ? '搜索分支' : 'Search branches'}
                           />
                         </label>
                         <label>

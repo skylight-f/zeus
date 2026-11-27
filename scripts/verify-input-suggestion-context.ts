@@ -480,7 +480,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     assert.equal(requests, 0);
     assert.equal((await generate()).text, answer);
     assert.equal(requests, 1);
-    for (const required of ['不能自动提交', '也不新增执行授权', '继续完善', '全局规则样例', '项目规则样例', 'feature/AGENTS.md']) assert.ok(material.includes(required), required);
+    for (const required of ['不能自动提交', '不能代替用户确认和验收', '继续完善', '全局规则样例', '项目规则样例', 'feature/AGENTS.md']) assert.ok(material.includes(required), required);
     /** 建议与润色都显式携带规则，每次只产生一次模型请求。 */
     assert.equal((await generate({ ...payload, mode: 'suggest', draft: '' })).text, answer);
     assert.equal(requests, 2);

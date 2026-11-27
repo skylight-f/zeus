@@ -2,6 +2,8 @@ import type { ConversationFileLocation } from './conversationResources.js';
 
 /** 文件审阅沿用 Git 差异视图的行结构。 */
 export interface FileReviewDiff {
+  /** Git 模式识别的子模块引用。 */
+  isSubmodule?: boolean;
   /** 变更前后的仓库相对路径。 */
   oldPath: string;
   newPath: string;

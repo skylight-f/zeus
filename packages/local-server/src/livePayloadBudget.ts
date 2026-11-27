@@ -14,33 +14,27 @@ export const maximumLivePayloadStringLength = 8 * 1024;
 export const maximumLivePayloadArrayItems = 200;
 
 /** 递归裁剪实时载荷：超长字符串与超长数组降级为带说明的摘要，保证事件不顶到协议上限。 */
-export function boundLiveValue(value: unknown, depth = 0, onTruncate?: () => void): unknown {
+export function boundLiveValue(value: unknown, depth = 0): unknown {
   if (typeof value === 'string') {
-    if (value.length <= maximumLivePayloadStringLength) return value;
-    onTruncate?.();
-    return `${value.slice(0, maximumLivePayloadStringLength)}\n…[内容过长已截断，完整明细见本地存储]`;
+    return value.length > maximumLivePayloadStringLength ? `${value.slice(0, maximumLivePayloadStringLength)}\n…[内容过长已截断，完整明细见本地存储]` : value;
   }
   if (Array.isArray(value)) {
     if (value.length > maximumLivePayloadArrayItems) {
-      onTruncate?.();
-      return [...value.slice(0, maximumLivePayloadArrayItems).map((entry) => boundLiveValue(entry, depth + 1, onTruncate)), `…[已省略 ${value.length - maximumLivePayloadArrayItems} 项]`];
+      return [...value.slice(0, maximumLivePayloadArrayItems).map((entry) => boundLiveValue(entry, depth + 1)), `…[已省略 ${value.length - maximumLivePayloadArrayItems} 项]`];
     }
-    return value.map((entry) => boundLiveValue(entry, depth + 1, onTruncate));
+    return value.map((entry) => boundLiveValue(entry, depth + 1));
   }
   // 深度上限防止异常结构递归过深；Provider JSON 事件本身不可能有环。
   if (value && typeof value === 'object' && depth < 8) {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, boundLiveValue(entry, depth + 1, onTruncate)]));
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, boundLiveValue(entry, depth + 1)]));
   }
   return value;
 }
 
 /** 只约束实时事件里的处理项载荷；超预算时连原始 Provider 报文一起降级，绝不把整条事件顶到上限。 */
 export function boundLiveProcessPayload(itemPayload: Record<string, unknown>): { itemPayload: Record<string, unknown>; truncated: boolean } {
-  let truncated = false;
-  const bounded = boundLiveValue(itemPayload, 0, () => {
-    truncated = true;
-  }) as Record<string, unknown>;
-  if (Buffer.byteLength(JSON.stringify(bounded), 'utf8') <= maximumLivePayloadBytes) return { itemPayload: bounded, truncated };
+  const bounded = boundLiveValue(itemPayload) as Record<string, unknown>;
+  if (Buffer.byteLength(JSON.stringify(bounded), 'utf8') <= maximumLivePayloadBytes) return { itemPayload: bounded, truncated: false };
   const detail = bounded.detail && typeof bounded.detail === 'object' && !Array.isArray(bounded.detail) ? (bounded.detail as Record<string, unknown>) : {};
   return { itemPayload: { ...bounded, detail: { ...detail, payload: null, truncated: true } }, truncated: true };
 }

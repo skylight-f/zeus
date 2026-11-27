@@ -42,7 +42,6 @@ export interface ConversationContextMenuProps {
 /** 菜单与重命名弹窗的中英文文案。 */
 const labels = {
   'zh-CN': {
-    actions: '会话操作',
     rename: '重命名',
     renameShortcut: platformShortcutLabel('⌥⌘R'),
     archive: '归档',
@@ -55,7 +54,6 @@ const labels = {
     renameSaving: '保存中...',
   },
   'en-US': {
-    actions: 'Conversation actions',
     rename: 'Rename',
     renameShortcut: platformShortcutLabel('⌥⌘R'),
     archive: 'Archive',
@@ -107,10 +105,9 @@ export function ConversationContextMenu(props: ConversationContextMenuProps) {
   /** 保存真实会话标题，失败后保留草稿供重试。 */
   function handleRenameSubmit(event: FormEvent<HTMLFormElement>): void | Promise<void> {
     event.preventDefault();
-    if (renameBusy) return;
     const trimmed = renameDraft.trim();
     if (!trimmed || trimmed === conversation.title || !onRename) {
-      handleRenameCancel();
+      setRenameDialogOpen(false);
       return;
     }
     setRenameBusy(true);
@@ -130,10 +127,8 @@ export function ConversationContextMenu(props: ConversationContextMenuProps) {
 
   /** 取消本次标题编辑。 */
   function handleRenameCancel(): void {
-    if (renameBusy) return;
     setRenameDialogOpen(false);
     setRenameDraft(conversation.title);
-    onClose();
   }
 
   // 菜单项点击处理
@@ -156,29 +151,28 @@ export function ConversationContextMenu(props: ConversationContextMenuProps) {
   const menuPortalHost = document.querySelector<HTMLElement>('.macos-ai-app.zeus-shell') ?? document.body;
   return (
     <>
-      {!renameDialogOpen &&
-        createPortal(
-          <MenuSurface onClose={onClose} style={{ left: position.x, top: position.y }} className="conversation-context-menu zeus-quiet-more-menu">
-            {/* 重命名 */}
-            {onRename ? (
-              <Button unstyled type="button" role="menuitem" onClick={handleRename}>
-                <PencilSimple aria-hidden="true" />
-                <span>{copy.rename}</span>
-                <kbd>{copy.renameShortcut}</kbd>
-              </Button>
-            ) : null}
+      {createPortal(
+        <MenuSurface onClose={onClose} style={{ left: position.x, top: position.y }} className="zeus-context-menu conversation-context-menu" aria-label={language === 'zh-CN' ? '会话操作' : 'Conversation actions'}>
+          {/* 重命名 */}
+          {onRename ? (
+            <Button unstyled type="button" role="menuitem" onClick={handleRename}>
+              <PencilSimple aria-hidden="true" />
+              <span>{copy.rename}</span>
+              <kbd>{copy.renameShortcut}</kbd>
+            </Button>
+          ) : null}
 
-            {/* 归档/取消归档 */}
-            {(onArchive || onRestore) && (
-              <Button unstyled type="button" role="menuitem" onClick={handleArchive}>
-                <Archive aria-hidden="true" />
-                <span>{conversation.archived ? copy.archive.replace('归档', '取消归档').replace('Archive', 'Restore') : copy.archive}</span>
-                <kbd>{copy.archiveShortcut}</kbd>
-              </Button>
-            )}
-          </MenuSurface>,
-          menuPortalHost,
-        )}
+          {/* 归档/取消归档 */}
+          {(onArchive || onRestore) && (
+            <Button unstyled type="button" role="menuitem" onClick={handleArchive}>
+              <Archive aria-hidden="true" />
+              <span>{conversation.archived ? copy.archive.replace('归档', '取消归档').replace('Archive', 'Restore') : copy.archive}</span>
+              <kbd>{copy.archiveShortcut}</kbd>
+            </Button>
+          )}
+        </MenuSurface>,
+        menuPortalHost,
+      )}
 
       {/* 重命名对话框 */}
       {renameDialogOpen && (

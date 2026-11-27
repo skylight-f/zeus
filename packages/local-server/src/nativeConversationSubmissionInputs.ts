@@ -89,37 +89,8 @@ export function readNativeSubmissionSkills(submission: ZeusConversationSubmissio
   return values.map(readPersistedSkill);
 }
 
-/** 读取持久化选择的身份，不访问源文件；派发时必须由本轮冻结目录提供实际路径。 */
-export function readNativeSubmissionSkillReferences(submission: ZeusConversationSubmissionRecord): NativeConversationSkillInput[] {
-  const input = parseJsonRecord(submission.inputJson);
-  const values = input.skills ?? (input.skill === undefined ? [] : [input.skill]);
-  if (!Array.isArray(values) || values.length > 8) throw coordinatorError('ZEUS_NATIVE_PERSISTED_STATE_INVALID', 'Skill 选择必须为最多 8 项的数组。');
-  return values.map(readPersistedSkillReference);
-}
-
-/** 显式选择按当前目录重新解析；已删除的技能必须重新选择，不能沿用旧路径。 */
-export function resolveCurrentNativeSkills(skills: readonly NativeConversationSkillInput[], skillCatalog: readonly NativeConversationSkillInput[]): NativeConversationSkillInput[] {
-  return skills.map((skill) => {
-    const current = skillCatalog.find((candidate) => candidate.id === skill.id);
-    if (!current) throw coordinatorError('ZEUS_SKILL_NOT_FOUND', `Skill “${skill.name}” 已不在当前目录中，请重新选择。`);
-    return current;
-  });
-}
-
 /** 校验一个持久化 Skill，避免模型请求使用未经目录确认的路径。 */
 function readPersistedSkill(value: unknown): NativeConversationSkillInput {
-  const reference = readPersistedSkillReference(value);
-  if (!isRecord(value) || typeof value.path !== 'string' || !isAbsolute(value.path)) throw coordinatorError('ZEUS_NATIVE_PERSISTED_STATE_INVALID', 'Persisted Skill selection is invalid.');
-  try {
-    const canonicalPath = realpathSync(reference.path);
-    if (!statSync(canonicalPath).isFile()) throw new Error('Skill path is not a file.');
-    return { ...reference, path: canonicalPath };
-  } catch {
-    throw coordinatorError('ZEUS_SKILL_NOT_FOUND', `所选 Skill “${reference.name}” 已不存在，请重新选择。`);
-  }
-}
-
-function readPersistedSkillReference(value: unknown): NativeConversationSkillInput {
   if (
     !isRecord(value) ||
     typeof value.id !== 'string' ||
@@ -132,12 +103,18 @@ function readPersistedSkillReference(value: unknown): NativeConversationSkillInp
   ) {
     throw coordinatorError('ZEUS_NATIVE_PERSISTED_STATE_INVALID', 'Persisted Skill selection is invalid.');
   }
-  return {
-    id: value.id,
-    name: value.name.trim(),
-    description: typeof value.description === 'string' ? value.description.trim() : value.name.trim(),
-    path: value.path,
-  };
+  try {
+    const canonicalPath = realpathSync(value.path);
+    if (!statSync(canonicalPath).isFile()) throw new Error('Skill path is not a file.');
+    return {
+      id: value.id,
+      name: value.name.trim(),
+      description: typeof value.description === 'string' ? value.description.trim() : value.name.trim(),
+      path: canonicalPath,
+    };
+  } catch {
+    throw coordinatorError('ZEUS_SKILL_NOT_FOUND', `所选 Skill “${value.name}” 已不存在，请重新选择。`);
+  }
 }
 
 /** 恢复最近一轮完整的显式选择，空数组表示明确清除。 */
@@ -145,15 +122,6 @@ export function readNativeConversationSkills(submissions: readonly ZeusConversat
   for (let index = submissions.length - 1; index >= 0; index -= 1) {
     const input = parseJsonRecord(submissions[index]!.inputJson);
     if (input.skills !== undefined || input.skill !== undefined) return readNativeSubmissionSkills(submissions[index]!);
-  }
-  return [];
-}
-
-/** 恢复跨轮次显式选择的身份，不读取已被本轮快照替代的源文件。 */
-export function readNativeConversationSkillReferences(submissions: readonly ZeusConversationSubmissionRecord[]): NativeConversationSkillInput[] {
-  for (let index = submissions.length - 1; index >= 0; index -= 1) {
-    const input = parseJsonRecord(submissions[index]!.inputJson);
-    if (input.skills !== undefined || input.skill !== undefined) return readNativeSubmissionSkillReferences(submissions[index]!);
   }
   return [];
 }

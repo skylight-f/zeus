@@ -63,7 +63,7 @@ import {
   evaluateCommandApproval,
   existingDirectoryRealpath,
   failedTurnErrorFromRecord,
-  hasReviewableFileApprovalTarget,
+  hasAuditableFileApprovalTarget,
   invalidServerRequestResponse,
   isAdvertisedCommandDecision,
   isExecpolicyAmendmentDecision,
@@ -100,9 +100,9 @@ import { codexPluginDynamicTools } from './zeusConversationPluginRuntime.js';
 import {
   appendConversationResourceContext,
   conversationTurnHasCompletedOutput,
-  readNativeSubmissionSkills,
   type PersistedSubmissionInput,
   readNativeSubmissionRecoveryKind,
+  readNativeSubmissionSkills,
   readNativeSubmissionTaskPushLayout,
 } from './nativeConversationSubmissionInputs.js';
 import { inferNativeConversationRunState } from './codexNativeRunStateProjection.js';
@@ -375,6 +375,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
         trustedAttachmentRoots: options.trustedAttachmentRoots,
         generatedImageRoot: options.generatedImageRoot,
         artifactsDirectory: options.artifactsDirectory,
+        htmlArtifactsDirectory: options.htmlArtifactsDirectory,
         now: timestamp,
       },
       resources,
@@ -443,12 +444,12 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
 
   const contextFromSubmission = (submission: ZeusConversationSubmissionRecord): ConversationDispatchContext => contextFromPersistedSubmission(submission, options.conversations.getById(submission.conversationId));
 
-  async function ensureConversationExecutionContext(conversationId: string, mode: 'reconcile' | 'submit' | 'dispatch' | 'recover_queue' | 'restore', allowProductConversation = false): Promise<void> {
+  async function ensureConversationExecutionContext(conversationId: string, mode: 'reconcile' | 'submit' | 'dispatch' | 'recover_queue' | 'restore', allowProductConversation = false, beforeWorkspaceWrite?: () => void): Promise<void> {
     await transcriptInitialization.waitUntilReady(conversationId);
     const existing = executionContextPromises.get(conversationId);
     if (existing) return existing;
     const promise = (async () => {
-      const resolved = await options.ensureExecutionContext({ conversationId, mode });
+      const resolved = await options.ensureExecutionContext({ conversationId, mode, beforeWorkspaceWrite });
       if (!resolved) return;
       const conversation = allowProductConversation ? requireProductConversation(conversationId) : requireConversation(conversationId);
       const current = contexts.get(conversationId) ?? contextFromConversation(conversation);
@@ -1281,7 +1282,6 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
       ...(input.browserComments?.length ? { browserComments: input.browserComments } : {}),
       ...(input.browserCommentContent ? { browserCommentContent: input.browserCommentContent } : {}),
       ...(input.conversationContext ? { conversationContext: input.conversationContext } : {}),
-      ...((input.skills ?? undefined) ? { skills: input.skills } : {}),
       context,
       ...(input.displayText ? { displayText: input.displayText } : {}),
       delivery: 'steer_now',
@@ -2147,15 +2147,15 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
   async function restoreArchivedConversation(input: RestoreArchivedConversationInput): Promise<NativeQueueSnapshot> {
     assertOpen();
     let conversation = requireConversation(input.conversationId);
-    if (await restoreUnboundConversationLocally(options, conversation, () => (runStates.set(conversation.id, { type: 'idle' }), contexts.delete(conversation.id)))) return toQueueSnapshot(conversation.id);
+    if (await restoreUnboundConversationLocally(options, conversation, () => (runStates.set(conversation.id, { type: 'idle' }), contexts.delete(conversation.id)), input.beforeLocalRestore)) return toQueueSnapshot(conversation.id);
     if (!conversation.providerThreadId) throw coordinatorError('ZEUS_NATIVE_PROVIDER_STATE_UNCONFIRMED', '缺少可核对的会话身份，尚未恢复。');
-    input.beforeExternalWrite?.();
     if (conversation.providerState === 'archived') {
       await ensureGenerationReconciled([conversation.id]);
       conversation = requireConversation(input.conversationId);
-      if (conversation.providerState === 'archived') await restoreArchivedProviderThread(conversation.id);
+      if (conversation.providerState === 'archived') await restoreArchivedProviderThread(conversation.id, input.beforeExternalWrite);
     }
-    if (conversation.archived) await ensureConversationExecutionContext(conversation.id, 'restore');
+    if (conversation.archived) await ensureConversationExecutionContext(conversation.id, 'restore', false, input.beforeExternalWrite);
+    input.beforeExternalWrite?.();
     if (conversation.archived) {
       options.conversations.restore(conversation.id);
       await persist();
@@ -2170,12 +2170,13 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     await drainQueuedSubmissions();
     return toQueueSnapshot(conversation.id);
   }
-  async function restoreArchivedProviderThread(conversationId: string): Promise<NativeQueueSnapshot> {
+  /** 先验证与恢复工作目录，再开始 Provider 解档。 */
+  async function restoreArchivedProviderThread(conversationId: string, beforeExternalWrite?: () => void): Promise<NativeQueueSnapshot> {
     assertOpen();
     let conversation = requireConversation(conversationId);
     if (conversation.providerState !== 'archived') return toQueueSnapshot(conversation.id);
     const providerThreadId = requireString(conversation.providerThreadId, 'provider thread id');
-    await ensureConversationExecutionContext(conversation.id, 'restore');
+    await ensureConversationExecutionContext(conversation.id, 'restore', false, beforeExternalWrite);
     assertOpen();
     conversation = requireConversation(conversation.id);
     const context = contexts.get(conversation.id) ?? contextFromConversation(conversation);
@@ -2183,6 +2184,7 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     restoringArchivedConversations.add(conversationId);
     options.broadcast('conversation.queue.changed', { conversationId, queueDispatchRequested: false });
     try {
+      beforeExternalWrite?.();
       await options.plugins?.prepare({
         conversationId: conversation.id,
         projectId: context.projectId,
@@ -2295,8 +2297,10 @@ export function createCodexNativeConversationCoordinator(options: CreateCodexNat
     }
     if (request.requestKind === 'file') {
       if (response.type !== 'file') throw invalidServerRequestResponse('Response type does not match the pending file approval.');
-      if (isGrantDecision(response.decision) && !hasReviewableFileApprovalTarget(payload, conversation, context, options.providerItems)) {
-        throw invalidServerRequestResponse('The pending file approval does not identify a reviewable target.');
+      if (isGrantDecision(response.decision) && payload.grantRoot !== undefined && payload.grantRoot !== null) {
+        throw invalidServerRequestResponse('File approvals cannot grant provider-requested root scope.');
+      } else if (isGrantDecision(response.decision) && !hasAuditableFileApprovalTarget(payload, conversation, context, options.providerItems)) {
+        throw invalidServerRequestResponse('The pending file approval does not identify an auditable project-local target.');
       }
     }
     if (request.requestKind === 'permissions') {

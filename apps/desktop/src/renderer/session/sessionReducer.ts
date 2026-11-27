@@ -1,5 +1,4 @@
-import { compareTranscriptTimelineOrder } from './transcriptReconciliation.js';
-import { classifyAssistantMessage, type AsyncQuestionAnswer, type AsyncQuestionResponse, type TurnChangeSet } from '@zeus/shared';
+import { classifyAssistantMessage, isReportedTokenFields, type AsyncQuestionAnswer, type AsyncQuestionResponse, type TurnChangeSet } from '@zeus/shared';
 import { userFacingErrorCause } from '@zeus/shared';
 import type {
   ConversationState,
@@ -36,7 +35,7 @@ import { type ConversationContextDraft, emptyConversationContextDraft, type Task
 import { mergeConversationContentV2, reconcileConversationHistoryCache } from './conversationSnapshotV2Adapter.js';
 import { latestReasoningSummaryText, reconcileCurrentReasoningItem } from './reasoningSummary.js';
 import { isTranscriptContentUpdate } from './transcriptProjection.js';
-import { mergeDurableItemResources, orderTranscriptCandidates, mergeTranscriptItem, newestTranscriptPlacement, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
+import { compareTranscriptTimelineOrder, mergeDurableItemResources, mergeTranscriptItem, newestTranscriptPlacement, reconcileTranscriptItems, transcriptContentRevision } from './transcriptReconciliation.js';
 import { mergeSystemMessages } from './systemMessageProjection.js';
 import { isUnacceptedTranscriptMessage } from './conversationQueuePresentation.js';
 import { retainResourcesOwnedByItem } from './conversationResourceProjection.js';
@@ -52,7 +51,6 @@ export type NativeSessionAction =
   | { type: 'snapshot_hydrated'; snapshot: NativeConversationSnapshot }
   | { type: 'snapshot_v2_page_merged'; snapshot: NativeConversationSnapshot }
   | { type: 'v2_content_loaded'; conversationId: string; handle: string; text: string; redacted: boolean }
-  | { type: 'v2_content_load_error_changed'; conversationId: string; handle: string; error: NativeSessionError | null }
   /** 差异全文是按需读取结果，不复用已经消费过的实时事件身份。 */
   | { type: 'turn_change_set_loaded'; changeSet: TurnChangeSet }
   | { type: 'session_metrics_hydrated'; conversationId: string; sessionMetrics: NativeSessionMetricsSnapshot }
@@ -129,11 +127,6 @@ export type NativeSessionAction =
 
 export function nativeSessionItemKey(conversationId: string, threadId: string, turnId: string, itemId: string): string {
   return [conversationId, threadId, turnId, itemId].map((part) => encodeURIComponent(part)).join('/');
-}
-
-/** Provider item 的兼容短编号只能在所属轮次内参与关联。 */
-function scopedProviderItemIdentity(turnId: string, providerItemId: string): string {
-  return `${encodeURIComponent(turnId)}:${encodeURIComponent(providerItemId)}`;
 }
 
 export function createInitialSessionState(): NativeSessionState {
@@ -216,8 +209,6 @@ export function sessionReducer(state: NativeSessionState, action: NativeSessionA
       return mergeSnapshotV2Page(state, action.snapshot);
     case 'v2_content_loaded':
       return mergeCompleteContent(state, action);
-    case 'v2_content_load_error_changed':
-      return changeCompleteContentLoadError(state, action);
     case 'turn_change_set_loaded':
       return mergeTurnChangeSet(state, action.changeSet);
     case 'execution_context_hydrated':
@@ -477,7 +468,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
   state.itemOrder.forEach((key, index) => {
     const item = state.items[key];
     if (!item || item.conversationId !== snapshot.id) return;
-    if (item.providerItemId) previousItemsByProviderId.set(scopedProviderItemIdentity(item.turnId, item.providerItemId), item);
+    if (item.providerItemId) previousItemsByProviderId.set(item.providerItemId, item);
     if (item.localItemId) previousItemsByLocalId.set(item.localItemId, item);
     if (!isUserMessageItem(item)) return;
     const durableIdentity = durableUserMessageIdentity(item);
@@ -491,13 +482,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     }
   });
   let stableIndex = 0;
-  const providerItemKeyById = new Map<string, string | null>();
-  const indexProviderItemKey = (providerItemId: string | null | undefined, key: string): void => {
-    if (!providerItemId) return;
-    const existing = providerItemKeyById.get(providerItemId);
-    if (existing === undefined) providerItemKeyById.set(providerItemId, key);
-    else if (existing !== key) providerItemKeyById.set(providerItemId, null);
-  };
+  const providerItemKeyById = new Map<string, string>();
   const providerUserItemKeyByClientId = new Map<string, string>();
   const durableClientIds = new Set<string>();
   const durableUserClientIds = new Set<string>();
@@ -531,7 +516,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     if (existingProviderUserKey) {
       // Provider 可能用多个 item 回放同一客户端用户消息；别名也要指向已有可见项，
       // 否则其持久消息会失去身份并以原始纯文本再次进入时间线。
-      indexProviderItemKey(item.providerItemId, existingProviderUserKey);
+      if (item.providerItemId) providerItemKeyById.set(item.providerItemId, existingProviderUserKey);
       continue;
     }
     // 同一条用户消息从本地发送态交接为 Provider item 时沿用可见身份，避免气泡被卸载后重建。
@@ -544,10 +529,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     // 投影为空。资源属于同一持久 item 的展示增量，必须按稳定身份合并，不能在新一轮
     // 对账时倒退为“图片不可用”。
     const previousDurableItem =
-      previousItemsByEntryId.get(item.transcript.placement.entryId) ??
-      state.items[key] ??
-      (item.providerItemId ? previousItemsByProviderId.get(scopedProviderItemIdentity(turnId, item.providerItemId)) : undefined) ??
-      previousItemsByLocalId.get(item.id);
+      previousItemsByEntryId.get(item.transcript.placement.entryId) ?? state.items[key] ?? (item.providerItemId ? previousItemsByProviderId.get(item.providerItemId) : undefined) ?? previousItemsByLocalId.get(item.id);
     const previousCompleteContent = matchingCompleteContent(previousDurableItem, item);
     const projectedPayload = previousUserItem ? mergeStableUserMessagePresentation(previousUserItem.payload, item.payload) : item.payload;
     items[key] = {
@@ -574,7 +556,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     };
     if (previousDurableItem) items[key] = mergeSnapshotPageItem(previousDurableItem, items[key]!, key);
     orderedItems.push({ key, order: items[key]!.transcript?.placement.order ?? null, stableIndex: stableIndexForClient(itemClientId) });
-    indexProviderItemKey(item.providerItemId, key);
+    if (item.providerItemId) providerItemKeyById.set(item.providerItemId, key);
     if (itemClientId) {
       durableClientIds.add(itemClientId);
       providerUserItemKeyByClientId.set(itemClientId, key);
@@ -593,7 +575,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
   );
   const projectedProviderItemIds = new Set(
     Object.values(items)
-      .flatMap((item) => (item.providerItemId ? [scopedProviderItemIdentity(item.turnId, item.providerItemId)] : []))
+      .map((item) => item.providerItemId)
       .filter((identity): identity is string => Boolean(identity)),
   );
   /** 来源行和轮次编号可以变化；同一持久正文只能在缓存中占一个位置。 */
@@ -606,7 +588,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
       key in items ||
       (previous.transcript ? projectedEntryIds.has(previous.transcript.placement.entryId) : false) ||
       (previous.localItemId ? projectedLocalItemIds.has(previous.localItemId) : false) ||
-      (previous.providerItemId ? projectedProviderItemIds.has(scopedProviderItemIdentity(previous.turnId, previous.providerItemId)) : false) ||
+      (previous.providerItemId ? projectedProviderItemIds.has(previous.providerItemId) : false) ||
       !shouldPreserveBoundedTranscriptItem(previous, activeTurnIdentities, historyReconciliation.preserveCachedHistory)
     )
       continue;
@@ -627,7 +609,7 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     if (message.role === 'assistant') continue;
     if (message.role === 'user' && clientUserMessageId && durableUserClientIds.has(clientUserMessageId)) continue;
     if (message.role === 'user' && clientUserMessageId) durableUserClientIds.add(clientUserMessageId);
-    const providerItemKey = (message.providerItemId ? (providerItemKeyById.get(message.providerItemId) ?? undefined) : undefined) ?? (clientUserMessageId ? providerUserItemKeyByClientId.get(clientUserMessageId) : undefined);
+    const providerItemKey = message.providerItemId ? providerItemKeyById.get(message.providerItemId) : clientUserMessageId ? providerUserItemKeyByClientId.get(clientUserMessageId) : undefined;
     if (message.role === 'user' && providerItemKey) {
       const providerItem = items[providerItemKey];
       if (providerItem) {
@@ -705,15 +687,12 @@ function hydrateSnapshot(state: NativeSessionState, incomingSnapshot: NativeConv
     const placement = newestTranscriptPlacement(previousRequests.get(request.id)?.transcript, request.transcript);
     return request.transcript && placement ? { ...request, transcript: { ...request.transcript, placement } } : request;
   });
-  /** 先建立可回退的候选顺序，再只在有持久位置的槽位之间重排。 */
-  const candidateItems = orderedItems
-    .map((entry, candidateIndex) => ({ entry, candidateIndex }))
-    .sort((left, right) => left.entry.stableIndex - right.entry.stableIndex || left.candidateIndex - right.candidateIndex)
-    .map(({ entry }) => entry);
-  const projectedItemOrder = orderTranscriptCandidates(candidateItems, (entry) => ({
-    order: entry.order,
-    entryId: items[entry.key]?.transcript?.placement.entryId ?? entry.key,
-  })).map((entry) => entry.key);
+  const projectedItemOrder = orderedItems
+    .sort((left, right) => {
+      if (left.order !== null && right.order !== null) return left.order - right.order;
+      return left.stableIndex - right.stableIndex;
+    })
+    .map((entry) => entry.key);
   /** 轻量快照会合并旧资源，合并之后仍须按权威消息归属去掉历史错误关联。 */
   const resourceMetadataById = new Map((snapshot.v2Paging?.resources.items ?? []).map((resource) => [resource.id, resource]));
   for (const [key, item] of Object.entries(items)) {
@@ -834,12 +813,9 @@ function shouldPreserveBoundedTranscriptItem(item: NativeSessionItemBuffer, acti
 
 function mergeSnapshotPageItem(previous: NativeSessionItemBuffer, projected: NativeSessionItemBuffer, canonicalKey: string): NativeSessionItemBuffer {
   const merged = mergeTranscriptItem(previous, projected);
-  const previousLoadError = previous.payload.v2ContentLoadError;
-  const preserveLoadError = previousLoadError !== undefined && merged.payload.v2ContentLoadError === undefined && projected.payload.v2ContentTruncated === true && previous.payload.v2ContentHandle === projected.payload.v2ContentHandle;
   return {
     ...merged,
     key: canonicalKey,
-    ...(preserveLoadError ? { payload: { ...merged.payload, v2ContentLoadError: previousLoadError } } : {}),
     optimistic: previous.optimistic === true && projected.optimistic === true,
     resources: mergeDurableItemResources(previous.resources, projected.resources),
     timelineAt: previous.timelineAt ?? projected.timelineAt,
@@ -884,42 +860,17 @@ function mergeCompleteContent(state: NativeSessionState, action: Extract<NativeS
   const items = { ...state.items };
   for (const key of matchingKeys) {
     const item = items[key]!;
-    const payload: Record<string, unknown> = {
-      ...item.payload,
-      ...completeSnapshotItem.payload,
-      v2ContentRedacted: item.payload.v2ContentRedacted === true || completeSnapshotItem.payload.v2ContentRedacted === true,
-    };
-    delete payload.v2ContentLoadError;
     items[key] = {
       ...item,
       text: completeSnapshotItem.text,
-      payload,
+      payload: {
+        ...item.payload,
+        ...completeSnapshotItem.payload,
+        v2ContentRedacted: item.payload.v2ContentRedacted === true || completeSnapshotItem.payload.v2ContentRedacted === true,
+      },
     };
   }
   return { ...state, snapshot, items, transcriptRevision: state.transcriptRevision + 1 };
-}
-
-/** 全文读取错误只属于当前展示副本，重试与成功后立即清除。 */
-function changeCompleteContentLoadError(state: NativeSessionState, action: Extract<NativeSessionAction, { type: 'v2_content_load_error_changed' }>): NativeSessionState {
-  if (state.conversationId !== action.conversationId) return state;
-  const matchingKeys = state.itemOrder.filter((key) => {
-    const item = state.items[key];
-    return item?.payload.v2ContentHandle === action.handle && item.payload.v2ContentTruncated === true;
-  });
-  if (matchingKeys.length === 0) return state;
-  const items = { ...state.items };
-  let changed = false;
-  for (const key of matchingKeys) {
-    const item = items[key]!;
-    const current = item.payload.v2ContentLoadError;
-    if ((action.error === null && current === undefined) || current === action.error) continue;
-    const payload = { ...item.payload };
-    if (action.error) payload.v2ContentLoadError = action.error;
-    else delete payload.v2ContentLoadError;
-    items[key] = { ...item, payload };
-    changed = true;
-  }
-  return changed ? { ...state, items, transcriptRevision: state.transcriptRevision + 1 } : state;
 }
 
 /**
@@ -945,14 +896,29 @@ function mergeSnapshotV2Page(state: NativeSessionState, snapshot: NativeConversa
   }
 
   const canonicalOrderKey = (key: string): string => canonicalKeyByAlias.get(key) ?? key;
+  const previousOrder = new Map<string, number>();
+  state.itemOrder.forEach((key, index) => {
+    const canonicalKey = canonicalOrderKey(key);
+    if (!previousOrder.has(canonicalKey)) previousOrder.set(canonicalKey, index);
+  });
   const stableOrder = [...new Set([...state.itemOrder, ...hydrated.itemOrder].map(canonicalOrderKey))];
-  const itemOrder = orderTranscriptCandidates(
-    stableOrder.filter((key) => Boolean(items[key])),
-    (key) => ({
-      order: items[key]?.transcript?.placement.order,
-      entryId: items[key]?.transcript?.placement.entryId ?? key,
-    }),
-  );
+  const stableOrderIndex = new Map(stableOrder.map((key, index) => [key, index]));
+  const itemOrder = stableOrder
+    .filter((key) => Boolean(items[key]))
+    .sort((leftKey, rightKey) =>
+      compareTranscriptTimelineOrder(
+        {
+          entryId: items[leftKey]!.transcript?.placement.entryId ?? leftKey,
+          order: items[leftKey]!.transcript?.placement.order ?? null,
+          fallbackIndex: previousOrder.get(leftKey) ?? stableOrderIndex.get(leftKey) ?? Number.MAX_SAFE_INTEGER,
+        },
+        {
+          entryId: items[rightKey]!.transcript?.placement.entryId ?? rightKey,
+          order: items[rightKey]!.transcript?.placement.order ?? null,
+          fallbackIndex: previousOrder.get(rightKey) ?? stableOrderIndex.get(rightKey) ?? Number.MAX_SAFE_INTEGER,
+        },
+      ),
+    );
 
   const turnsByProviderId = { ...hydrated.turnsByProviderId };
   for (const [turnId, previous] of Object.entries(state.turnsByProviderId)) {
@@ -1184,6 +1150,7 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
         providerTurnId: existingTurn?.providerTurnId ?? turnId,
         submissionId: existingTurn?.submissionId ?? stringValue(payload.submissionId),
         status,
+        ...(payload.operationHandoff === true || existingTurn?.operationHandoff === true ? { operationHandoff: true } : {}),
         error: nativeTurnFailureFrom(payload.error) ?? existingTurn?.error ?? null,
         plan: existingTurn?.plan ?? null,
         startedAt: existingTurn?.startedAt ?? stringValue(payload.startedAt),
@@ -1369,17 +1336,7 @@ function reduceNativeEvent(state: NativeSessionState, event: NativeConversationE
             updatedAt: event.createdAt,
           };
       const providerPlanItemId = stringValue(payload.providerPlanItemId);
-      const formalPlanTurnIdentities = new Set([updated.turnId].filter(Boolean));
-      for (const turn of Object.values(base.turnsByProviderId)) {
-        if (!formalPlanTurnIdentities.has(turn.id) && (!turn.providerTurnId || !formalPlanTurnIdentities.has(turn.providerTurnId))) continue;
-        formalPlanTurnIdentities.add(turn.id);
-        if (turn.providerTurnId) formalPlanTurnIdentities.add(turn.providerTurnId);
-      }
-      const providerPlanEntries = providerPlanItemId === null ? [] : Object.entries(base.items).filter(([, item]) => item.providerItemId === providerPlanItemId);
-      const formalPlanEntry =
-        Object.entries(base.items).find(([, item]) => item.localItemId === updated.planItemId || item.itemId === updated.planItemId) ??
-        providerPlanEntries.find(([, item]) => formalPlanTurnIdentities.has(item.turnId)) ??
-        (providerPlanEntries.length === 1 ? providerPlanEntries[0] : undefined);
+      const formalPlanEntry = Object.entries(base.items).find(([, item]) => (providerPlanItemId !== null && item.providerItemId === providerPlanItemId) || item.localItemId === updated.planItemId || item.itemId === updated.planItemId);
       const items = formalPlanEntry
         ? {
             ...base.items,
@@ -1534,11 +1491,8 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
   const incomingResources = Array.isArray(payload.itemResources) ? payload.itemResources : null;
   const effectiveType = completed ? (incomingType ?? providerItem?.type ?? 'providerItem') : (providerItem?.type ?? incomingType ?? 'providerItem');
   const providerClientId = isUserMessageType(effectiveType) && incomingPayload ? (stringValue(incomingPayload.clientId) ?? stringValue(incomingPayload.clientUserMessageId)) : null;
-  // 客户端身份优先；缺失时仍可用同一 turn 内的 Provider 复合身份接管，既避免跨轮串线，也避免重复气泡。
   const matchedUserEntry = isUserMessageType(effectiveType)
-    ? Object.entries(state.items).find(
-        ([, item]) => isUserMessageItem(item) && ((providerClientId !== null && userMessageClientIds(item).includes(providerClientId)) || (!item.optimistic && item.turnId === turnId && item.providerItemId === itemId)),
-      )
+    ? Object.entries(state.items).find(([, item]) => isUserMessageItem(item) && ((providerClientId !== null && userMessageClientIds(item).includes(providerClientId)) || (!item.optimistic && item.providerItemId === itemId)))
     : undefined;
   const optimisticEntry = matchedUserEntry?.[1].optimistic ? matchedUserEntry : undefined;
   const matchedUserItem = matchedUserEntry?.[1];
@@ -1553,7 +1507,7 @@ function reduceItemEvent(state: NativeSessionState, event: Extract<NativeConvers
   if (previous && isTerminalItemStatus(previous.status) && !completed) return state;
   const optimisticText = optimisticEntry?.[1].text ?? '';
   const matchedUserText = matchedUserItem?.text ?? '';
-  const resolvedClientId = providerClientId ?? matchedUserItem?.clientUserMessageId ?? matchedUserItem?.durableClientUserMessageId;
+  const resolvedClientId = matchedUserItem?.clientUserMessageId ?? matchedUserItem?.durableClientUserMessageId ?? providerClientId;
   const compatibilitySnapshotItem = /^item-\d+$/u.test(itemId) || Boolean(incomingPayload && stringValue(incomingPayload.compatibilitySnapshotItemId));
   const durableUserText = compatibilitySnapshotItem && resolvedClientId ? durableUserMessageText(state, resolvedClientId) : null;
   const completedText = compatibilitySnapshotItem && durableUserText !== null && incomingText !== durableUserText ? durableUserText : incomingText;
@@ -2295,6 +2249,8 @@ function tokenUsageFrom(payload: Record<string, unknown>): NativeTokenUsageSnaps
     ...(Object.prototype.hasOwnProperty.call(payload, 'serviceTier') && (payload.serviceTier === null || typeof payload.serviceTier === 'string') ? { serviceTier: payload.serviceTier } : {}),
     total,
     last,
+    ...(isReportedTokenFields(payload.reportedTokenFields) ? { reportedTokenFields: payload.reportedTokenFields } : {}),
+    ...(payload.contextUsedTokens !== undefined ? { contextUsedTokens: numberValue(payload.contextUsedTokens) } : {}),
     modelContextWindow: numberValue(payload.modelContextWindow),
     cacheHitRate: numberValue(payload.cacheHitRate),
     estimatedCredits: numberValue(payload.estimatedCredits),

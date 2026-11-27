@@ -1,34 +1,22 @@
 import { useWindowDocument } from '../ui/windowDocument.js';
 import { FilePreviewDialog, FilePreviewOpenContext } from '../code/FilePreview.js';
+import { prepareFilePreview } from '../code/preparedFilePreview.js';
+import { VideoPlayer } from '../code/VideoPlayer.js';
 import { MotionPresence } from '../ui/MotionPresence.js';
 import { useMotionPresence } from '../ui/useMotionPresence.js';
-import { type ComponentType, type CSSProperties, type KeyboardEvent, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { type CSSProperties, type KeyboardEvent, type ReactNode, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { CaretDownIcon as CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
-import { FileIcon as File } from '@phosphor-icons/react/dist/csr/File';
-import { FileArchiveIcon as FileArchive } from '@phosphor-icons/react/dist/csr/FileArchive';
 import { FileCodeIcon as FileCode } from '@phosphor-icons/react/dist/csr/FileCode';
-import { FileCssIcon as FileCss } from '@phosphor-icons/react/dist/csr/FileCss';
-import { FileDocIcon as FileDoc } from '@phosphor-icons/react/dist/csr/FileDoc';
-import { FileHtmlIcon as FileHtml } from '@phosphor-icons/react/dist/csr/FileHtml';
-import { FileImageIcon as FileImage } from '@phosphor-icons/react/dist/csr/FileImage';
-import { FileJsIcon as FileJs } from '@phosphor-icons/react/dist/csr/FileJs';
-import { FileMdIcon as FileMd } from '@phosphor-icons/react/dist/csr/FileMd';
-import { FilePdfIcon as FilePdf } from '@phosphor-icons/react/dist/csr/FilePdf';
-import { FilePptIcon as FilePpt } from '@phosphor-icons/react/dist/csr/FilePpt';
-import { FileSqlIcon as FileSql } from '@phosphor-icons/react/dist/csr/FileSql';
-import { FileTsIcon as FileTs } from '@phosphor-icons/react/dist/csr/FileTs';
-import { FileXlsIcon as FileXls } from '@phosphor-icons/react/dist/csr/FileXls';
 import { GlobeSimpleIcon as GlobeSimple } from '@phosphor-icons/react/dist/csr/GlobeSimple';
 import { GithubLogoIcon as GithubLogo } from '@phosphor-icons/react/dist/csr/GithubLogo';
 import { AppWindowIcon as AppWindow } from '@phosphor-icons/react/dist/csr/AppWindow';
 import { TerminalWindowIcon as TerminalWindow } from '@phosphor-icons/react/dist/csr/TerminalWindow';
 import { CopyIcon as Copy } from '@phosphor-icons/react/dist/csr/Copy';
-
 import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/csr/FolderOpen';
-
+import { FileTypeIcon } from '../code/FileTypeIcon.js';
 import type { ConversationFileIconKind, ConversationFileLocation, ConversationOpenTarget, ConversationResource, ConversationResourceOpenTarget, ConversationResourcePreview } from '@zeus/shared';
-import { userFacingErrorCause } from '@zeus/shared';
+import { filePreviewKind, filePreviewMime, userFacingErrorCause } from '@zeus/shared';
 import { listConversationResourceOpenTargetsInMain } from '../appShellBridge.js';
 import type { NativeConversationAttachment } from './sessionTypes.js';
 import type { SessionUiLanguage } from './ThreadItemView.js';
@@ -222,7 +210,7 @@ function ConversationPendingAttachmentImage(props: { attachment: NativeConversat
       >
         {failed ? (
           <span className="session-resource-image-placeholder" role="status">
-            <FileImage aria-hidden="true" weight="regular" />
+            <FileTypeIcon path={props.attachment.name} />
             <span>{props.compact ? (props.language === 'zh-CN' ? '打开' : 'Open') : props.language === 'zh-CN' ? '缩略图不可用，点击查看文件与可用操作' : 'Thumbnail unavailable. Open file preview and actions.'}</span>
           </span>
         ) : previewUrl ? (
@@ -322,13 +310,13 @@ export function ConversationInlineResource(
         type="button"
         className="session-inline-resource"
         data-file-path={props.resource.kind === 'file' ? props.resource.projectRelativePath : undefined}
-        data-icon-tooltip={props.resource.kind === 'file' ? label : title}
+        data-icon-tooltip={props.resource.kind === 'file' ? (props.resource.externalReference ?? label) : title}
         aria-label={`${label}${location ? ` ${location}` : ''}`}
         aria-busy={busy || undefined}
         data-error={Boolean(error) || undefined}
         onClick={() => open()}
       >
-        <ResourceIcon resource={props.resource} />
+        <ResourceIcon resource={props.resource} size={14} />
         {props.resource.kind === 'file' ? '\u00a0' : null}
         <span>{label}</span>
         {location ? (
@@ -547,7 +535,7 @@ function ConversationImagePreview(
         </>
       ) : error || unavailable ? (
         <span className={props.placeholderClassName} role="status">
-          <FileImage aria-hidden="true" weight="regular" />
+          <ResourceIcon resource={props.resource} />
           <span>{props.compact ? compactStatus : status}</span>
           {error && !props.compact ? <span>{previewTooLarge ? (props.language === 'zh-CN' ? '点击打开' : 'Click to open') : props.language === 'zh-CN' ? '点击重试' : 'Click to retry'}</span> : null}
         </span>
@@ -559,13 +547,63 @@ function ConversationImagePreview(
   );
 }
 
-/** 图片只显示缩略图；附件直接预览，项目文件保留打开方式。 */
+/** 正文视频使用短期文件预览令牌，离开虚拟行时归还授权。 */
+export function ConversationResourceVideo(props: ConversationResourceInteraction & { resource: ConversationResource; language: SessionUiLanguage }) {
+  /** 同一份资源修订对应一次读取，调用方以修订身份挂载播放器。 */
+  const { projectId, conversationId, id: resourceId } = props.resource;
+  /** 未收到文件地址时保留播放器位置，失败时恢复可打开的文件引用。 */
+  const [preview, setPreview] = useState<{ url: string } | { reason?: string } | null>(null);
+  /** 加载和解码失败使用会话语言，保留已有文件打开入口。 */
+  const zh = props.language === 'zh-CN';
+  const unavailable = zh ? '无法预览视频。' : 'Video preview is unavailable.';
+
+  useEffect(() => {
+    /** 挂载结束后，迟到的响应由共享预览读取器自动归还。 */
+    let active = true;
+    /** 只申请当前会话与资源编号对应的预览。 */
+    const file = prepareFilePreview({ kind: 'resource', projectId, conversationId, resourceId });
+    void file.read.then(
+      ([item]) => {
+        if (!active) return;
+        setPreview(item?.kind === 'video' && item.url ? { url: item.url } : { reason: item?.reason });
+      },
+      () => {
+        if (active) setPreview({});
+      },
+    );
+    return () => {
+      active = false;
+      file.dispose();
+    };
+  }, [projectId, conversationId, resourceId]);
+
+  return (
+    <div className="session-resource-video">
+      {preview && 'url' in preview ? (
+        <VideoPlayer key={preview.url} url={preview.url} name={props.resource.displayName} zh={zh} onError={() => setPreview({})} />
+      ) : preview ? (
+        <div className="session-resource-video-fallback">
+          <span role="status">{preview.reason || unavailable}</span>
+          <ConversationInlineResource {...props} label={props.resource.displayName} />
+        </div>
+      ) : (
+        <div className="session-resource-video-loading" aria-busy="true">
+          <ResourceLoading label={zh ? '正在读取视频' : 'Loading video'} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 图片只显示缩略图；助手交付的视频在会话内播放。 */
 export function ConversationResourceCards(
   props: ConversationResourceInteraction & {
     resources: ConversationResource[];
     language: SessionUiLanguage;
     /** 任务字段的附件列表避免大幅挤占正文空间。 */
     compact?: boolean;
+    /** 仅完整的助手消息允许资源卡展开播放器。 */
+    showVideos?: boolean;
   },
 ) {
   const resources = props.resources.filter((resource) => resource.presentation === 'card');
@@ -577,6 +615,8 @@ export function ConversationResourceCards(
       {resources.map((resource) =>
         isImageResource(resource) ? (
           <ConversationResourceImage key={resource.id} resource={resource} language={props.language} compact={props.compact} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
+        ) : props.showVideos && props.onOpenResource && isVideoResource(resource) ? (
+          <ConversationResourceVideo key={`${resource.id}:${resource.updatedAt}`} resource={resource} language={props.language} onOpenResource={props.onOpenResource} />
         ) : (
           <ConversationResourceCard key={resource.id} resource={resource} language={props.language} compact={props.compact} onOpenResource={props.onOpenResource} onLoadResourcePreview={props.onLoadResourcePreview} />
         ),
@@ -608,7 +648,7 @@ function ConversationResourceImage(
 }
 
 /** 文件名保留完整悬停说明，自动转换的文本显示易读名称。 */
-function ConversationResourceCard(
+export function ConversationResourceCard(
   props: ConversationResourceInteraction & {
     resource: ConversationResource;
     language: SessionUiLanguage;
@@ -635,7 +675,7 @@ function ConversationResourceCard(
   }
 
   return (
-    <article className="session-resource-card" data-resource-kind={props.resource.kind} data-compact={props.compact || undefined} data-error={Boolean(error) || undefined}>
+    <article className="session-resource-card" data-resource-kind={props.resource.kind} data-web-page={isWebPageResource(props.resource) || undefined} data-compact={props.compact || undefined} data-error={Boolean(error) || undefined}>
       <Button unstyled type="button" className="session-resource-card-main" data-file-name={props.resource.displayName} data-icon-tooltip={props.resource.displayName} aria-busy={busy || undefined} onClick={() => open()}>
         <span className="session-resource-card-icon">
           <ResourceIcon resource={props.resource} />
@@ -914,22 +954,34 @@ function focusAdjacentDocumentControl(trigger: HTMLButtonElement | null, backwar
 /** 会话文件交由统一入口选择预览容器，网页进入内置浏览器；邮件链接交给邮件应用。 */
 export function defaultOpenTarget(resource: ConversationResource): ConversationOpenTarget {
   if (resource.kind === 'website') return resource.url.startsWith('mailto:') ? 'system_default' : 'zeus_browser';
+  if (resource.kind === 'file' && resource.externalReference) return 'system_default';
   return resource.iconKind === 'html' ? 'zeus_browser' : 'zeus_source';
 }
 
 export function isImageResource(resource: ConversationResource): boolean {
-  return resource.kind === 'attachment' ? resource.previewKind === 'image' : resource.kind === 'file' && resource.iconKind === 'image';
+  return resource.kind === 'attachment' ? resource.previewKind === 'image' : resource.kind === 'file' && !resource.externalReference && resource.iconKind === 'image';
 }
 
-export function ResourceIcon(props: { resource: ConversationResource }) {
-  if (props.resource.kind === 'file' && props.resource.presentation === 'card' && props.resource.iconKind === 'html') {
-    return <GlobeSimple aria-hidden="true" weight="duotone" />;
-  }
+/** 视频类型沿用文件预览器的格式范围，项目文件以真实的相对路径为准。 */
+export function isVideoResource(resource: ConversationResource): boolean {
+  if (resource.kind === 'website') return false;
+  if (resource.kind === 'file') return !resource.externalReference && filePreviewKind(filePreviewMime(resource.projectRelativePath)) === 'video';
+  return [resource.mimeType ?? '', filePreviewMime(resource.attachmentRef), filePreviewMime(resource.displayName)].some((mime) => filePreviewKind(mime) === 'video');
+}
+
+/** 浏览器可打开的网页资源共用卡片外观，邮件链接保持原入口。 */
+function isWebPageResource(resource: ConversationResource): boolean {
+  return resource.kind === 'website' ? !resource.url.startsWith('mailto:') : resource.kind === 'file' && resource.iconKind === 'html';
+}
+
+/** 文件和附件共用类型图标，网址显示站点标识。 */
+export function ResourceIcon(props: { resource: ConversationResource; size?: number }) {
   if (props.resource.kind === 'website') {
-    return props.resource.domain.toLocaleLowerCase().replace(/^www\./u, '') === 'github.com' ? <GithubLogo aria-hidden="true" weight="fill" /> : <GlobeSimple aria-hidden="true" weight="duotone" />;
+    return props.resource.domain.toLocaleLowerCase().replace(/^www\./u, '') === 'github.com' ? <GithubLogo aria-hidden="true" weight="regular" /> : <GlobeSimple aria-hidden="true" weight="regular" />;
   }
-  const Icon = fileIcon(props.resource.iconKind);
-  return <Icon aria-hidden="true" weight="duotone" />;
+  /** 引用使用登记的真实路径，附件使用原文件名。 */
+  const path = props.resource.kind === 'file' ? props.resource.projectRelativePath : props.resource.displayName;
+  return <FileTypeIcon path={path} size={props.size} />;
 }
 
 /** 行号保留英文表达，实际打开仍使用原始位置字段。 */
@@ -999,22 +1051,3 @@ function localizedTargetLabel(target: ConversationResourceOpenTarget, language: 
   };
   return labels[target.id] ?? target.label;
 }
-
-function fileIcon(kind: ConversationFileIconKind): ComponentType<{ weight?: 'duotone'; 'aria-hidden'?: string }> {
-  if (kind === 'javascript') return FileJs;
-  if (kind === 'typescript') return FileTs;
-  if (kind === 'sql') return FileSql;
-  if (kind === 'html') return FileHtml;
-  if (kind === 'css') return FileCss;
-  if (kind === 'markdown') return FileMd;
-  if (kind === 'image') return FileImage;
-  if (kind === 'pdf') return FilePdf;
-  if (kind === 'spreadsheet') return FileXls;
-  if (kind === 'presentation') return FilePpt;
-  if (kind === 'document') return FileDoc;
-  if (kind === 'archive') return FileArchive;
-  if (sourceIconKinds.has(kind)) return FileCode;
-  return File;
-}
-
-const sourceIconKinds = new Set<ConversationFileIconKind>(['code', 'java', 'javascript', 'typescript', 'json', 'markdown', 'sql', 'css']);

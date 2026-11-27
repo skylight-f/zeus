@@ -83,22 +83,6 @@ export function reconcileTranscriptItems(current: readonly NativeItemSnapshot[],
   return { items, changedEntryIds: [...changedEntryIds], movedEntryIds };
 }
 
-/**
- * 只在已有持久位置的槽位之间重排；缺少位置的条目保留候选槽位和相对顺序。
- *
- * 不能用“双方都有 order 时比较 order，否则比较候选下标”的混合比较器：
- * positioned(3) < missing、missing < positioned(1)，同时 positioned(1) < positioned(3)，
- * 会形成不满足传递性的比较环，使结果依赖排序实现和输入排列。
- */
-export function orderTranscriptCandidates<T>(candidates: readonly T[], evidenceFor: (candidate: T) => { order: number | null | undefined; entryId: string }): T[] {
-  const described = candidates.map((candidate, candidateIndex) => {
-    const evidence = evidenceFor(candidate);
-    return { candidate, candidateIndex, entryId: evidence.entryId, order: evidence.order ?? null };
-  });
-  const positioned = described.filter((candidate) => candidate.order !== null).sort((left, right) => (left.order ?? 0) - (right.order ?? 0) || left.entryId.localeCompare(right.entryId) || left.candidateIndex - right.candidateIndex);
-  let positionedIndex = 0;
-  return described.map((candidate) => (candidate.order === null ? candidate.candidate : positioned[positionedIndex++]!.candidate));
-}
 /** 读取条目的产品级稳定身份。 */
 export function transcriptEntryId(item: Pick<NativeItemSnapshot, 'transcript'>): string {
   return item.transcript.placement.entryId;
@@ -123,27 +107,21 @@ export function mergeDurableItemResources(previous: ConversationResource[] | und
 export function mergeTranscriptItem<T extends TranscriptContent>(previous: T, incoming: T): T {
   const previousRevision = transcriptContentRevision(previous.transcript);
   const incomingRevision = transcriptContentRevision(incoming.transcript);
-  const previousComplete = transcriptContentComplete(previous.payload);
-  const incomingComplete = transcriptContentComplete(incoming.payload);
-  const previousRecoverable = transcriptContentRecoverable(previous.payload);
-  const incomingRecoverable = transcriptContentRecoverable(incoming.payload);
+  /** 活动首屏的正文和载荷也有截断标记，不能将其当作完整内容挡住过程详情。 */
+  const previousComplete = previous.payload.v2ContentTruncated !== true && previous.payload.v2PayloadTruncated !== true && previous.payload.v2TextTruncated !== true;
+  /** 不同读取来源使用各自的截断字段，完整性判断保持一致。 */
+  const incomingComplete = incoming.payload.v2ContentTruncated !== true && incoming.payload.v2PayloadTruncated !== true && incoming.payload.v2TextTruncated !== true;
   const keepContent =
-    incomingRevision < previousRevision ||
-    (incomingRevision === previousRevision &&
-      ((previousComplete && !incomingComplete) ||
-        (!previousComplete && !incomingComplete && previousRecoverable && !incomingRecoverable) ||
-        (previous.payload.v2ContentKind === 'process_detail' && incoming.payload.v2ContentKind !== 'process_detail')));
+    incomingRevision < previousRevision || (incomingRevision === previousRevision && ((previousComplete && !incomingComplete) || (previous.payload.v2ContentKind === 'process_detail' && incoming.payload.v2ContentKind !== 'process_detail')));
   const content = keepContent ? previous : incoming;
   const placement = newestTranscriptPlacement(previous.transcript, incoming.transcript);
   const transcript = content.transcript && placement ? { ...content.transcript, placement } : (content.transcript ?? incoming.transcript);
-  const status = reconcileTranscriptStatus(previous.status, incoming.status, previousRevision, incomingRevision);
   /** 图片归档独立于正文修订，不因采用较新的正文而丢掉迟到资源。 */
   const resources = mergeDurableItemResources(previous.resources, incoming.resources);
   if (
     content === previous &&
     (resources === previous.resources || (!previous.resources && !incoming.resources)) &&
     transcript?.placement === previous.transcript?.placement &&
-    status === previous.status &&
     (!incoming.messageCreatedAt || incoming.messageCreatedAt === previous.messageCreatedAt)
   )
     return previous;
@@ -153,20 +131,9 @@ export function mergeTranscriptItem<T extends TranscriptContent>(previous: T, in
     messageCreatedAt: incoming.messageCreatedAt ?? previous.messageCreatedAt,
     payload: content.payload,
     ...(previous.resources || incoming.resources ? { resources } : {}),
-    // 正文来源和状态来源彼此独立：较完整的旧正文不能把随后确认的 completed/failed 状态留在进行中。
-    status,
+    status: terminalStatus(previous.status, content.status),
     ...(transcript ? { transcript } : {}),
   };
-}
-
-/** 活动首屏和历史分页使用不同截断字段，合并时必须归一为同一个完整性判断。 */
-function transcriptContentComplete(payload: Record<string, unknown>): boolean {
-  return payload.v2ContentTruncated !== true && payload.v2TextTruncated !== true && payload.v2PayloadTruncated !== true && payload.v2RefreshRequired !== true;
-}
-
-/** 同样不完整时优先保留可按稳定句柄恢复全文的副本。 */
-function transcriptContentRecoverable(payload: Record<string, unknown>): boolean {
-  return payload.v2ContentTruncated === true && (payload.v2ContentKind === 'model_history' || payload.v2ContentKind === 'process_detail') && typeof payload.v2ContentHandle === 'string' && payload.v2ContentHandle.length > 0;
 }
 
 /** 正文携带的来源集合只描述实际采用的载荷，不能混入更晚的其他副本。 */
@@ -183,13 +150,7 @@ export function newestTranscriptPlacement(previous: ConversationTranscriptEnvelo
     : previous.placement;
 }
 
-/** 条目终态单调推进；终态互相冲突时只接受不旧于当前正文证据的状态。 */
-function reconcileTranscriptStatus(previous: string, incoming: string, previousRevision: number, incomingRevision: number): string {
-  const terminal = (status: string): boolean => status === 'completed' || status === 'failed' || status === 'interrupted' || status === 'resolved';
-  const previousTerminal = terminal(previous);
-  const incomingTerminal = terminal(incoming);
-  if (previousTerminal && !incomingTerminal) return previous;
-  if (!previousTerminal && incomingTerminal) return incoming;
-  if (previousTerminal && incomingTerminal && incomingRevision < previousRevision) return previous;
-  return incoming;
+/** 条目完成后不能被较晚到达的进行中投影倒退。 */
+function terminalStatus(previous: string, incoming: string): string {
+  return (previous === 'completed' || previous === 'failed' || previous === 'resolved') && (incoming === 'in_progress' || incoming === 'running') ? previous : incoming;
 }

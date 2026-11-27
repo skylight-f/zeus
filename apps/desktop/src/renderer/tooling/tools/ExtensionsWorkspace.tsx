@@ -1,11 +1,8 @@
-import { McpServiceCatalog } from './McpServiceCatalog.js';
 import { MotionPresence } from '../toolPageHost.js';
 import { Collapsible } from '../toolPageHost.js';
 import { FormDialog } from '../toolPageHost.js';
-
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { formatVisibleApplicationError } from '../toolPageHost.js';
-
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { ArrowClockwiseIcon as ArrowClockwise } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import { ShieldCheckIcon as ShieldCheck } from '@phosphor-icons/react/dist/csr/ShieldCheck';
@@ -20,7 +17,6 @@ import { ExtensionSourceFields, emptyExtensionSource, type ExtensionSourceDraft 
 import { ZeusApiError } from '../toolPageHost.js';
 import { SkillsWorkspace } from './SkillsWorkspace.js';
 import { skillCatalogChangedEvent } from '../toolPageHost.js';
-import { CodexMcpCatalog } from './CodexMcpCatalog.js';
 
 type ExtensionsClient = Pick<
   NativeConversationAppClient,
@@ -28,9 +24,7 @@ type ExtensionsClient = Pick<
   | 'installSkill'
   | 'removeSkill'
   | 'loadPlugins'
-  | 'loadMcpConfiguration'
   | 'loadPluginRuntimeStatus'
-  | 'loadCodexMcpServers'
   | 'installPlugin'
   | 'updatePlugin'
   | 'setPluginEnabled'
@@ -46,13 +40,12 @@ type ExtensionsClient = Pick<
   | 'setPluginMcpPolicy'
 >;
 
-type Tab = 'plugins' | 'skills' | 'marketplaces' | 'mcp';
+type Tab = 'plugins' | 'skills' | 'marketplaces';
 
 /** 扩展管理统一承载插件、技能、来源目录及操作状态。 */
 export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; language: 'zh-CN' | 'en-US'; projectId?: string | null; onChooseDirectory?: () => Promise<string | null> }) {
   const zh = props.language === 'zh-CN';
   const [tab, setTab] = useState<Tab>('plugins');
-  const [mcpRefreshRevision, setMcpRefreshRevision] = useState(0);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [dangerousHookTrustBypass, setDangerousHookTrustBypass] = useState(false);
   const [marketplaces, setMarketplaces] = useState<PluginMarketplaceCatalog[]>([]);
@@ -63,12 +56,10 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
   const [scope, setScope] = useState<PluginScope>('personal');
   /** 安装插件与添加来源使用同一份表单草稿。 */
   const [source, setSource] = useState<ExtensionSourceDraft>(emptyExtensionSource);
-  const loadRevision = useRef(0);
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!props.client) return;
-    const revision = ++loadRevision.current;
     setBusyKey('load');
     setError(null);
     try {
@@ -77,23 +68,17 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         props.client.loadPluginMarketplaces(props.projectId ?? undefined),
         props.client.loadPluginRuntimeStatus(),
       ]);
-      if (revision !== loadRevision.current) return;
       setPlugins(nextPlugins);
       setMarketplaces(nextMarketplaces);
       setDangerousHookTrustBypass(runtimeStatus.dangerouslyBypassHookTrust);
     } catch (reason) {
-      if (revision === loadRevision.current) setError(message(reason, zh ? 'zh-CN' : 'en'));
+      setError(message(reason, zh ? 'zh-CN' : 'en'));
     } finally {
-      if (revision === loadRevision.current) setBusyKey(null);
+      setBusyKey(null);
     }
   }, [props.client, props.projectId, zh]);
 
-  useEffect(() => {
-    void load();
-    return () => {
-      loadRevision.current += 1;
-    };
-  }, [load]);
+  useEffect(() => void load(), [load]);
 
   async function mutate(key: string, operation: () => Promise<unknown>): Promise<boolean> {
     if (!props.client || busyKey) return false;
@@ -109,7 +94,6 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
       setPlugins(nextPlugins);
       setMarketplaces(nextMarketplaces);
       setDangerousHookTrustBypass(runtimeStatus.dangerouslyBypassHookTrust);
-      setMcpRefreshRevision((value) => value + 1);
       window.dispatchEvent(new Event(skillCatalogChangedEvent));
       return true;
     } catch (reason) {
@@ -174,23 +158,14 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
             <h1>{zh ? '扩展管理' : 'Extension management'}</h1>
             <p>{zh ? '更改对新对话生效。' : 'Changes apply to new conversations.'}</p>
           </div>
-          {tab !== 'skills' && tab !== 'mcp' ? (
-            <Button
-              variant="secondary"
-              size="regular"
-              busy={busyKey === 'load'}
-              onClick={() => {
-                setMcpRefreshRevision((value) => value + 1);
-                void load();
-              }}
-              disabled={!props.client || Boolean(busyKey)}
-            >
+          {tab !== 'skills' ? (
+            <Button variant="secondary" size="regular" busy={busyKey === 'load'} onClick={() => load()} disabled={!props.client || Boolean(busyKey)}>
               <ArrowClockwise aria-hidden="true" /> {zh ? '刷新' : 'Refresh'}
             </Button>
           ) : null}
         </div>
         <nav className="extension-tabs" aria-label={zh ? '扩展类型' : 'Extension type'}>
-          {(['plugins', 'mcp', 'skills', 'marketplaces'] as const).map((value) => (
+          {(['plugins', 'skills', 'marketplaces'] as const).map((value) => (
             <Button unstyled key={value} type="button" className={tab === value ? 'is-active' : ''} aria-current={tab === value ? 'page' : undefined} onClick={() => setTab(value)}>
               {tabLabel(value, zh)}
             </Button>
@@ -212,25 +187,7 @@ export function ExtensionsWorkspace(props: { client: ExtensionsClient | null; la
         </p>
       ) : null}
       {tab === 'skills' ? <SkillsWorkspace client={props.client} language={props.language} onChooseDirectory={props.onChooseDirectory} embedded /> : null}
-      {tab === 'mcp' ? <CodexMcpCatalog client={props.client} zh={zh} /> : null}
-      {tab === 'plugins' ? (
-        <>
-          <McpServiceCatalog
-            client={props.client}
-            plugins={plugins}
-            refreshRevision={mcpRefreshRevision}
-            pluginsLoading={busyKey === 'load'}
-            pluginsFailed={Boolean(error)}
-            zh={zh}
-            onManagePlugin={(id) => {
-              setExpanded(id);
-              window.requestAnimationFrame(() => document.getElementById(`extension-plugin-${id}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
-            }}
-          />
-          <PluginCatalog plugins={plugins} zh={zh} busyKey={busyKey} expanded={expanded} onExpanded={setExpanded} onInstall={() => setInstallOpen(true)} onMutate={mutate} client={props.client} />
-        </>
-      ) : null}
-
+      {tab === 'plugins' ? <PluginCatalog plugins={plugins} zh={zh} busyKey={busyKey} expanded={expanded} onExpanded={setExpanded} onInstall={() => setInstallOpen(true)} onMutate={mutate} client={props.client} /> : null}
       {tab === 'marketplaces' ? <MarketplaceCatalog marketplaces={marketplaces} plugins={plugins} zh={zh} busyKey={busyKey} onAdd={() => setMarketplaceOpen(true)} onMutate={mutate} client={props.client} /> : null}
 
       <MotionPresence>
@@ -292,7 +249,7 @@ function PluginCatalog(props: {
           const open = props.expanded === plugin.id;
           const untrusted = descriptor.hooks.filter((hook) => hook.enabled && hook.trustedDefinitionSha256 !== hook.definitionSha256).length;
           return (
-            <article key={plugin.id} id={`extension-plugin-${plugin.id}`} className="extension-plugin-row" data-enabled={plugin.enabled ? 'true' : 'false'}>
+            <article key={plugin.id} className="extension-plugin-row" data-enabled={plugin.enabled ? 'true' : 'false'}>
               <header>
                 <Button unstyled type="button" className="extension-plugin-summary" aria-expanded={open} onClick={() => props.onExpanded(open ? null : plugin.id)}>
                   <CaretRight className="extension-expand-icon" aria-hidden="true" />
@@ -574,6 +531,7 @@ function ConnectorDialog(props: {
       zh={props.zh}
       busy={Boolean(props.busyKey)}
       submitLabel={props.zh ? '保存连接' : 'Save connection'}
+      submitBusyLabel={props.zh ? '保存中…' : 'Saving…'}
       submitDisabled={!connectorId.trim() || !config.trim()}
       onClose={props.onClose}
       onSubmit={(event) => submit(event)}
@@ -764,7 +722,6 @@ function SourceDialog(props: {
 
 /** 导航使用当前语言的产品名称。 */
 function tabLabel(tab: Tab, zh: boolean): string {
-  if (tab === 'mcp') return zh ? 'MCP 服务' : 'MCP servers';
   if (tab === 'plugins') return zh ? '插件' : 'Plugins';
   if (tab === 'marketplaces') return zh ? '插件市场' : 'Marketplaces';
   return zh ? '技能' : 'Skills';

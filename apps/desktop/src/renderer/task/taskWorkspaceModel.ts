@@ -1,5 +1,4 @@
-import { formatTaskDeadline, taskDeadlineTimes, matchesTaskDeadline } from '@zeus/shared';
-import { taskTypeOrder } from '@zeus/shared';
+import { defaultTaskManagementStatusLabels, formatTaskDeadline, matchesTaskDeadline, taskDeadlineTimes, taskManagementStatusOrder, taskTypeOrder } from '@zeus/shared';
 import type {
   AiRuntimeSession,
   AiRuntimeSessionStatus,
@@ -25,7 +24,8 @@ export type TaskBranchStatus = 'action_required' | 'active' | 'pushed' | 'merged
 export type TaskSourceLabels = Partial<Record<string, string>>;
 export type { TaskAgentRunStatus } from '../apiClient.js';
 
-export const taskManagementStatuses: TaskManagementStatus[] = ['todo', 'in_development', 'in_testing', 'awaiting_acceptance', 'blocked', 'completed', 'cancelled'];
+/** 全局配置尚未加载时，任务表使用内置状态顺序。 */
+export const taskManagementStatuses: TaskManagementStatus[] = [...taskManagementStatusOrder];
 /** 表格与详情沿用共享分类，避免快捷创建出现无法筛选的类型。 */
 export const taskTypes: TaskType[] = [...taskTypeOrder];
 export const defaultTaskTableColumnOrder: TaskTableColumnKey[] = [
@@ -70,7 +70,7 @@ export const defaultTaskTableColumnWidths: Record<TaskTableColumnKey, number> = 
 };
 export const defaultTaskTableEnumSortOrders: TaskTableEnumSortOrders = {
   priority: ['p0', 'p1', 'p2', 'p3', 'p4'],
-  managementStatus: ['todo', 'in_development', 'in_testing', 'awaiting_acceptance', 'blocked', 'completed', 'cancelled'],
+  managementStatus: [...taskManagementStatusOrder],
   runStatus: ['not_started', 'connecting', 'reconnecting', 'running', 'waiting_user', 'waiting_approval', 'paused', 'idle', 'failed', 'legacy_readonly'],
 };
 const taskBranchStatusSortOrder: TaskBranchStatus[] = ['action_required', 'active', 'pushed', 'merged', 'discarded', 'not_created'];
@@ -746,17 +746,9 @@ export function resolveTaskAgentRunStatusConversation(conversations: NativeConve
   return [...conversations].sort(compareConversationStageUpdatedDesc)[0];
 }
 
+/** 优先显示当前配置的名称，缺少配置时使用内置中文名称。 */
 export function formatTaskManagementStatus(status: TaskManagementStatus, labels?: Partial<Record<TaskManagementStatus, string>>): string {
-  const defaultLabels: Record<string, string> = {
-    todo: '待开始',
-    in_development: '开发中',
-    in_testing: '测试中',
-    awaiting_acceptance: '待验收',
-    blocked: '已阻塞',
-    completed: '已完成',
-    cancelled: '已取消',
-  };
-  return labels?.[status] ?? defaultLabels[status] ?? status;
+  return labels?.[status] ?? defaultTaskManagementStatusLabels['zh-CN'][status] ?? status;
 }
 
 export function resolveTaskManagementStatus(task: Pick<TaskRecord, 'managementStatus' | 'status'>): TaskManagementStatus {
@@ -818,6 +810,8 @@ const taskEventCopy: Readonly<Record<string, readonly [string, string]>> = {
   'task.model_push.started': ['任务已加入 AI 对话', 'Task added to an AI conversation'],
   'task.model_push.turn_not_started': ['对话已创建，AI 尚未开始处理', 'Conversation created; AI processing has not started'],
   'task.conversation.worktree.rehydrated': ['任务工作目录已恢复', 'Task working folder restored'],
+  /** 仅自动恢复中确认目录不可用的会话保持归档。 */
+  'task.conversation.restore.skipped': ['工作目录不可用，相关会话保持归档', 'Conversations remain archived because their working folders are unavailable'],
   'task.work_item.automation_created': ['自动化已创建工作项', 'Automation created a work item'],
   'task.digital_employee.started': ['数字员工已开始处理任务', 'Digital employee started the task'],
   'task.digital_employee.stage_output_ready': ['阶段方案已生成，等待确认', 'Stage plan ready for review'],

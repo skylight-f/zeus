@@ -1,10 +1,18 @@
-import type { ZeusSelectPinning } from './ZeusSelect.js';
+import { createElement } from 'react';
+import { parseModelRef } from '@zeus/shared';
+import type { ZeusSelectOption, ZeusSelectPinning } from './ZeusSelect.js';
+import { ModelProviderBadge } from './modelProviderAppearance.js';
 
 export interface ModelOptionSource {
   id: string;
   model: string;
   displayName?: string;
   sourceName?: string;
+  /** 指向实际供应商连接，同名模型可以来自不同来源。 */
+  sourceId?: string;
+  /** 接入草稿尚未登记连接时使用模板或上传图标。 */
+  templateId?: Parameters<typeof ModelProviderBadge>[0]['templateId'];
+  iconDataUrl?: string | null;
   available?: boolean;
   supports1MContext?: boolean;
   speedLabel?: 'standard' | 'high_speed' | 'flash' | 'turbo';
@@ -15,13 +23,23 @@ export interface PresentedModelGroup<Model extends ModelOptionSource> {
   models: readonly Model[];
 }
 
-export interface PresentedModelOption {
+export interface PresentedModelOption extends Pick<ZeusSelectOption<string>, 'icon' | 'showIconInTrigger'> {
   value: string;
   label: string;
   group?: string;
   searchText: string;
-  /** 置顶区和单供应商目录需要来源；已有供应商分组时不重复渲染。 */
-  description?: string;
+  /** 置顶区仍需标明供应商，单供应商目录也保留来源。 */
+  description: string;
+}
+
+/** 手工构造选项的入口与共享目录使用同一个供应商图标。 */
+export function modelProviderOption({ sourceId, sourceName, templateId, iconDataUrl }: Parameters<typeof ModelProviderBadge>[0]): Pick<ZeusSelectOption<string>, 'icon' | 'showIconInTrigger'> {
+  return { icon: createElement(ModelProviderBadge, { sourceId, sourceName, templateId, iconDataUrl }), showIconInTrigger: true };
+}
+
+/** 目录暂时缺失时，已保存的复合引用仍带有供应商身份。 */
+export function modelProviderOptionForRef(reference: string): Pick<ZeusSelectOption<string>, 'icon' | 'showIconInTrigger'> {
+  return modelProviderOption({ sourceId: parseModelRef(reference)?.sourceId });
 }
 
 export interface ModelOptionPresentation<Model extends ModelOptionSource> {
@@ -35,15 +53,8 @@ export interface ModelOptionPresentation<Model extends ModelOptionSource> {
   pinning: ZeusSelectPinning;
 }
 
-/** 将旧版内置供应商名称映射为当前对用户展示的 OpenAI。 */
-export function modelSourceDisplayName(sourceName: string | null | undefined): string | undefined {
-  const normalized = sourceName?.trim();
-  if (!normalized) return undefined;
-  return normalized.toLowerCase() === 'codex' ? 'OpenAI' : normalized;
-}
-
 function providerName(model: ModelOptionSource, zh: boolean): string {
-  return modelSourceDisplayName(model.sourceName) || (zh ? '未命名供应商' : 'Unnamed provider');
+  return model.sourceName?.trim() || (zh ? '未命名供应商' : 'Unnamed provider');
 }
 
 function modelName(model: ModelOptionSource): string {
@@ -53,8 +64,9 @@ function modelName(model: ModelOptionSource): string {
 /** 固定英文排序避免系统语言改变 A–Z 顺序，忽略大小写及名称分隔符。 */
 const modelNameCollator = new Intl.Collator('en', { numeric: true, sensitivity: 'base', ignorePunctuation: true });
 
-/** 文本按 A–Z，数字及点分数字段按降序；不把点分型号转成小数。 */
-export function compareModelNames(left: string, right: string): number {
+/** 文本按 A–Z，数字段默认降序；点分型号按各段数值比较。 */
+export function compareModelNames(left: string, right: string, numericOrder: 'ascending' | 'descending' = 'descending'): number {
+  if (numericOrder === 'ascending') return modelNameCollator.compare(left, right);
   /** 连续点分数字作为一个型号段，确保 6.10 在 6.2 和 6 之前。 */
   const leftParts = left.match(/\d+(?:\.\d+)*|[^\d]+/g) ?? [];
   /** 保留文本段以维持同一型号内的名称升序。 */
@@ -123,10 +135,11 @@ export function presentModelOptions<Model extends ModelOptionSource>(
       const badges = [speed, contextBadge].filter((item): item is string => Boolean(item));
       return {
         value: model.id,
+        ...modelProviderOption(model),
         label: badges.length > 0 ? `${displayName} · ${badges.join(' · ')}` : displayName,
         ...(showProviderGroups ? { group: group.providerName } : {}),
         searchText: `${group.providerName} ${displayName} ${model.model}${contextBadge ? ' 1M' : ''}`,
-        description: showProviderGroups ? undefined : group.providerName,
+        description: group.providerName,
       } satisfies PresentedModelOption;
     }),
   );

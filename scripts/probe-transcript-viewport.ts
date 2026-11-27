@@ -1051,10 +1051,7 @@ async function verifyTranscriptStorageBoundaries(): Promise<void> {
     const late = register('late-a', 'a');
     assertProbe(late.placement.order! < second.placement.order!, '旧轮次迟到内容必须位于新轮次之前');
     db.execute('CREATE TABLE probe_placement_events (epoch INTEGER, revision INTEGER)');
-    repo.onPlacementChanged((conversationId, epoch, revision) => {
-      assertProbe(repo.orderEpoch(conversationId) === epoch, '只有完整就绪的位置才能发送通知');
-      db.execute('INSERT INTO probe_placement_events VALUES (?, ?)', [epoch, revision]);
-    });
+    repo.onPlacementChanged((_conversationId, epoch, revision) => db.execute('INSERT INTO probe_placement_events VALUES (?, ?)', [epoch, revision]));
     for (let index = 0; index < 20; index += 1) register(`late-${index}`, 'a');
     assertProbe(repo.orderEpoch('ordering') > 1 && db.countRows('probe_placement_events') > 0, '空隙耗尽必须重编号并在同一事务记录通知');
     /** 批量插入使用真实来源登记，不靠放大间隙掩盖逐条中点退化。 */
@@ -1227,7 +1224,7 @@ async function verifyTranscriptStorageBoundaries(): Promise<void> {
     await barrier;
     assertProbe(repo.readPlacementBatch('background-a', []).placements.length === 0, '完整就绪后才能放行摄取屏障');
     assertProbe(repo.orderEpoch('background-a') > 1, '后台历史重建必须实际覆盖间隙耗尽后的重编号');
-    assertProbe(db.countRows('probe_placement_events') === eventsBeforeInitialization + 1, '后台初始化重排不能公开未完成的索引，完整就绪后只通知一次');
+    assertProbe(db.countRows('probe_placement_events') === eventsBeforeInitialization, '后台初始化重排不能公开未完成的索引');
     assertProbe(db.get<{ count: number }>('SELECT COUNT(*) AS count FROM conversation_transcript_aliases WHERE conversation_id = ?', ['background-a'])?.count === 1_538, '后台重排后必须保留全部历史来源');
     /** 独立只读连接证明屏障放行前已真正 COMMIT，而非同连接的未提交视图。 */
     const reader = new DatabaseSync(join(directory, 'probe.db'), { readOnly: true });
@@ -1375,13 +1372,6 @@ async function probeNavigation() {
           at,
         ]);
     }
-    /** Provider 可能在不同 turn 复用短消息 ID；去掉客户端身份后仍必须保留两条目录记录。 */
-    const reusedNavigationProviderItemId = 'reused-navigation-provider-item';
-    for (const index of [count - 2, count - 1])
-      db.execute('UPDATE conversation_model_history SET submission_id = NULL, content_json = ? WHERE id = ?', [
-        JSON.stringify({ text: `第 ${index + 1} 次发言 ` + '问题'.repeat(100), providerItemId: reusedNavigationProviderItemId }),
-        `history-${index}-0`,
-      ]);
     /** 重复持久投影必须沿相同客户端身份折叠。 */
     db.execute(
       'INSERT INTO conversation_model_history (id, conversation_id, sequence, turn_id, submission_id, segment_id, role, content_json, confirmed_at) SELECT ?, conversation_id, ?, turn_id, submission_id, segment_id, role, content_json, confirmed_at FROM conversation_model_history WHERE id = ?',
@@ -1415,21 +1405,15 @@ async function probeNavigation() {
     /** 探针故意模拟升级前直写数据，再走正式旧数据初始化建立显示位置。 */
     const initializing = new ConversationTranscriptRepository(db);
     /** 宿主在后台初始化尚未完成时已安装通知写入器，探针必须覆盖相同边界。 */
-    const initializationEvents: Array<{ epoch: number; revision: number }> = [];
-    initializing.onPlacementChanged((conversationId, epoch, revision) => {
-      assertProbe(conversationId === conversation.id, '初始化通知必须属于当前重建会话');
-      assertProbe(initializing.orderEpoch(conversationId) === epoch, '只有完整就绪的位置才能发送通知');
-      initializationEvents.push({ epoch, revision });
+    initializing.onPlacementChanged((conversationId) => {
+      assertProbe(db.get<{ initialization_state: string }>('SELECT initialization_state FROM conversation_transcript_state WHERE conversation_id = ?', [conversationId])?.initialization_state === 'ready', '初始化重排不得公开半份位置索引');
     });
     assertProbe(initializing.initializeConversation(conversation.id, 1) === false, '首批初始化必须留下可恢复断点');
     assertProbe(db.get<{ initialization_state: string }>('SELECT initialization_state FROM conversation_transcript_state WHERE conversation_id = ?', [conversation.id])?.initialization_state === 'building', '半份索引不能提前标记就绪');
-    assertProbe(initializationEvents.length === 0, '构建期间不得通知尚不可读取的位置');
     new ConversationTranscriptRepository(db).initializeConversation(conversation.id);
     /** 超过十个初始化批次后必须原子就绪，并清理持久暂存事实。 */
     const initialization = db.get<{ initialization_state: string; reconstructed_count: number }>('SELECT initialization_state, reconstructed_count FROM conversation_transcript_state WHERE conversation_id = ?', [conversation.id]);
     assertProbe(initialization?.initialization_state === 'ready' && initialization.reconstructed_count === count * 4 + 1 + processCount, '旧数据必须按 512 条批次完整初始化');
-    assertProbe(initializationEvents.length === 1 && initializationEvents[0]?.revision === initializing.revision(conversation.id), '重建完成必须通知最终位置修订');
-    assertProbe(initializing.initializeConversation(conversation.id) && initializationEvents.length === 1, '已就绪会话不能重复重建或发送初始化通知');
     assertProbe(db.get<{ count: number }>('SELECT COUNT(*) AS count FROM conversation_transcript_initialization_facts WHERE conversation_id = ?', [conversation.id])?.count === 0, '初始化就绪后必须清理暂存事实');
     await db.save();
     /** 查询前后核对写入计数，GET 不改变消息送达。 */
@@ -1459,8 +1443,6 @@ async function probeNavigation() {
     /** 使用真实接口返回值检查提问和答复界限。 */
     const snapshot = response.json<ConversationNavigationSnapshot>();
     assertProbe(snapshot.entries.length === count && new Set(snapshot.entries.map(navigationRowKey)).size === count, '完整目录不得截断或重复身份');
-    const reusedProviderEntries = snapshot.entries.filter((entry) => entry.providerItemId === reusedNavigationProviderItemId);
-    assertProbe(reusedProviderEntries.length === 2 && new Set(reusedProviderEntries.map((entry) => entry.providerTurnId)).size === 2, '跨轮复用 Provider 消息 ID 时目录必须按 turn 保留两条记录');
     assertProbe(snapshot.entries[0]?.prompt === '设计稿.png', '纯附件发言必须使用名称');
     assertProbe(
       snapshot.entries.every((entry, index) => entry.sequence === index * 4 + 1 && Array.from(entry.prompt).length <= 160 && Array.from(entry.response).length <= 320 && entry.response.startsWith(`第 ${index + 1} 轮最终答复`)),

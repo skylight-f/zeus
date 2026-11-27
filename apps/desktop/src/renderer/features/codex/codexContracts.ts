@@ -1,4 +1,3 @@
-export type { CodexMcpCatalog } from '@zeus/shared';
 export type CodexLegacyImportRunStatus = 'prepared' | 'waiting' | 'completed' | 'failed';
 
 export interface CodexLegacyImportEligibleSession {
@@ -208,5 +207,3 @@ export interface PluginMarketplaceCatalog {
   displayName: string;
   entries: Array<{ name: string; description: string; version: string | null; source: PluginDirectSource }>;
 }
-
-export type { McpConfigurationCatalog } from '@zeus/shared';

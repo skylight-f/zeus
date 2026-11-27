@@ -18,7 +18,7 @@ import {
   type TaskType,
 } from '@zeus/shared';
 import type { ZeusDatabasePort } from './databasePort.js';
-import { canonicalJson, type CodexMcpStartupStatusSnapshot, type CodexRateLimitsSnapshot, shouldAcceptProviderSnapshot, validateMcpStartupStatusSnapshot, validateRateLimitsSnapshot } from './conversationStore.js';
+import { canonicalJson, type CodexRateLimitsSnapshot, shouldAcceptProviderSnapshot, validateRateLimitsSnapshot } from './conversationStore.js';
 
 export { isTaskManagementStatus, isTaskPriority, isTaskType } from '@zeus/shared';
 export type { TaskManagementStatus, TaskPriority, TaskType } from '@zeus/shared';
@@ -670,29 +670,17 @@ export class SettingRepository {
     return record;
   }
 
+  /** 只有来源代次与序号更新的限流快照才能覆盖旧值。 */
   upsertCodexRateLimitsSnapshot(snapshot: CodexRateLimitsSnapshot): CodexRateLimitsSnapshot | undefined {
-    return this.upsertSequencedSnapshot('codex.native.rate_limits', snapshot);
+    validateRateLimitsSnapshot(snapshot);
+    const current = this.getCodexRateLimitsSnapshot();
+    if (!shouldAcceptProviderSnapshot(this.db, snapshot, current)) return current;
+    this.setJson('codex.native.rate_limits', snapshot);
+    return snapshot;
   }
 
   getCodexRateLimitsSnapshot(): CodexRateLimitsSnapshot | undefined {
     return this.getJson<CodexRateLimitsSnapshot>('codex.native.rate_limits');
-  }
-
-  upsertCodexMcpStartupStatusSnapshot(snapshot: CodexMcpStartupStatusSnapshot): CodexMcpStartupStatusSnapshot | undefined {
-    return this.upsertSequencedSnapshot('codex.native.mcp_startup_status', snapshot);
-  }
-
-  getCodexMcpStartupStatusSnapshot(): CodexMcpStartupStatusSnapshot | undefined {
-    return this.getJson<CodexMcpStartupStatusSnapshot>('codex.native.mcp_startup_status');
-  }
-
-  private upsertSequencedSnapshot<T extends CodexRateLimitsSnapshot | CodexMcpStartupStatusSnapshot>(key: 'codex.native.rate_limits' | 'codex.native.mcp_startup_status', snapshot: T): T | undefined {
-    if (key === 'codex.native.rate_limits') validateRateLimitsSnapshot(snapshot);
-    else validateMcpStartupStatusSnapshot(snapshot);
-    const current = this.getJson<T>(key);
-    if (!shouldAcceptProviderSnapshot(this.db, snapshot, current)) return current;
-    this.setJson(key, snapshot);
-    return snapshot;
   }
 }
 
@@ -1005,10 +993,11 @@ export class TaskRepository {
     });
   }
 
-  getById(taskId: string): ZeusTaskRecord | undefined {
+  /** 按身份读取任务；后台操作可限定未归档的任务。 */
+  getById(taskId: string, { includeArchived = true }: { includeArchived?: boolean } = {}): ZeusTaskRecord | undefined {
     const row = this.db.get<DbTaskRow>(
       `SELECT ${selectTaskFields}
-       FROM tasks WHERE id = ? AND deleted_at IS NULL`,
+       FROM tasks WHERE id = ? AND deleted_at IS NULL${includeArchived ? '' : ' AND archived = 0'}`,
       [taskId],
     );
     return row ? this.withRelatedTaskIds(mapTaskRow(row)) : undefined;
@@ -2263,6 +2252,20 @@ export class TaskEventRepository {
 
   listByTask(taskId: string): ZeusTaskEventRecord[] {
     return this.db.select<DbTaskEventRow>(`SELECT id, task_id, event_type, title, payload_json, created_at FROM task_events WHERE task_id = ? ORDER BY rowid ASC`, [taskId]).map(mapTaskEventRow);
+  }
+
+  /** 任务标题曾由内容编辑修改时，不再用首次会话的标题覆盖。 */
+  hasTitleEdit(taskId: string): boolean {
+    return Boolean(
+      this.db.get(
+        `SELECT 1 FROM task_events AS event
+         WHERE event.task_id = ? AND event.event_type = 'task.updated' AND EXISTS (
+           SELECT 1 FROM json_each(CASE WHEN json_valid(event.payload_json) THEN event.payload_json END, '$.changedFields')
+           WHERE value = 'title'
+         ) LIMIT 1`,
+        [taskId],
+      ),
+    );
   }
 
   getProjectionCursor(eventId: string): { id: string; taskId: string; sequence: number } | null {
